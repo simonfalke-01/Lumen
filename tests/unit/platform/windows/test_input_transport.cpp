@@ -311,6 +311,23 @@ TEST_F(send_input_transport_test, BuildsUnicodeDownThenUpInputs) {
   EXPECT_EQ(api->submitted[1].ki.dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
 }
 
+TEST_F(send_input_transport_test, InterleavesEachUtf16UnicodeDownAndUp) {
+  constexpr std::string_view utf8 {"ab"};
+
+  const auto result = transport->unicode(utf8.data(), static_cast<int>(utf8.size()));
+
+  ASSERT_TRUE(result);
+  ASSERT_EQ(api->submitted.size(), 4);
+  EXPECT_EQ(api->submitted[0].ki.wScan, L'a');
+  EXPECT_EQ(api->submitted[0].ki.dwFlags, KEYEVENTF_UNICODE);
+  EXPECT_EQ(api->submitted[1].ki.wScan, L'a');
+  EXPECT_EQ(api->submitted[1].ki.dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+  EXPECT_EQ(api->submitted[2].ki.wScan, L'b');
+  EXPECT_EQ(api->submitted[2].ki.dwFlags, KEYEVENTF_UNICODE);
+  EXPECT_EQ(api->submitted[3].ki.wScan, L'b');
+  EXPECT_EQ(api->submitted[3].ki.dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+}
+
 TEST_F(send_input_transport_test, RejectsInvalidUnicodeInput) {
   const auto result = transport->unicode(nullptr, 0);
 
@@ -381,6 +398,16 @@ TEST_F(send_input_transport_test, NeutralizeIsIdempotent) {
 
   EXPECT_TRUE(result);
   EXPECT_EQ(api->submitted.size(), submissions_after_first_neutralize);
+}
+
+TEST_F(send_input_transport_test, ResetSessionNeutralizesHeldState) {
+  ASSERT_TRUE(transport->keyboard('A', false, 0));
+
+  const auto result = transport->reset_session();
+
+  ASSERT_TRUE(result);
+  ASSERT_EQ(api->submitted.size(), 2);
+  EXPECT_EQ(api->submitted[1].ki.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
 }
 
 #else

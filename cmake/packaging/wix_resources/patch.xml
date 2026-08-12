@@ -2,4 +2,25 @@
   <CPackWiXFragment Id="CM_G_Core">
     <FeatureRef Id="RunSunshineInstallScripts"/>
   </CPackWiXFragment>
+  <CPackWiXFragment Id="CM_C_virtual_hid_driver">
+    <Level Value="0" Condition="LUMEN_INSTALL_VHID = 0"/>
+    <Level Value="1" Condition="LUMEN_INSTALL_VHID = 1"/>
+  </CPackWiXFragment>
+  <CPackWiXFragment Id="CM_CP_tools.sunshinesvc.exe">
+    <ServiceInstall Id="InstallSunshineService"
+                    Name="SunshineService"
+                    DisplayName="Sunshine Service"
+                    Description="Sunshine is a self-hosted game stream host for Moonlight."
+                    Type="ownProcess"
+                    Start="demand"
+                    ErrorControl="normal"
+                    Account="LocalSystem"
+                    Vital="yes"/>
+    <ServiceControl Id="ControlSunshineService"
+                    Name="SunshineService"
+                    Start="install"
+                    Stop="both"
+                    Remove="uninstall"
+                    Wait="yes"/>
+  </CPackWiXFragment>
 </CPackWiXPatch>

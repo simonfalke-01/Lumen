@@ -1,9 +1,9 @@
-; Lumen root-enumerated UMDF 2 HID minidriver.
+; Lumen root-enumerated UMDF 2.15 VHF source driver.
 
 [Version]
 Signature = "$WINDOWS NT$"
-Class = HIDClass
-ClassGuid = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Class = SoftwareComponent
+ClassGuid = {5c4c3332-344d-483c-8739-259e934c9cc8}
 Provider = %LumenProvider%
 DriverVer = 08/12/2026,1.0.0.0
 CatalogFile = LumenVirtualHid.cat
@@ -26,20 +26,20 @@ LumenVirtualHid.dll = 1
 
 [LumenVirtualHid.Install.NT]
 CopyFiles = LumenVirtualHid.CopyFiles
-Include = MsHidUmdf.inf
-Needs = MsHidUmdf.NT
 Include = WUDFRD.inf
 Needs = WUDFRD_LowerFilter.NT
 
 [LumenVirtualHid.Install.NT.HW]
-Include = MsHidUmdf.inf
-Needs = MsHidUmdf.NT.HW
+AddReg = LumenVirtualHid.Device.AddReg
 Include = WUDFRD.inf
 Needs = WUDFRD_LowerFilter.NT.HW
 
+[LumenVirtualHid.Device.AddReg]
+HKR,,"LowerFilters",0x00010000,"vhf"
+HKR,,VhfMode,0x00010001,0x1
+HKR,,Security,,"D:P(A;;GA;;;SY)"
+
 [LumenVirtualHid.Install.NT.Services]
-Include = MsHidUmdf.inf
-Needs = MsHidUmdf.NT.Services
 Include = WUDFRD.inf
 Needs = WUDFRD_LowerFilter.NT.Services
 
@@ -51,12 +51,11 @@ Needs = WUDFRD_LowerFilter.NT.Filters
 UmdfService = "LumenVirtualHid", LumenVirtualHid.Wdf
 UmdfServiceOrder = LumenVirtualHid
 UmdfKernelModeClientPolicy = AllowKernelModeClients
-UmdfFileObjectPolicy = AllowNullAndUnknownFileObjects
-UmdfMethodNeitherAction = Copy
-UmdfFsContextUsePolicy = CanUseFsContext2
+UmdfFileObjectPolicy = RejectNullAndUnknownFileObjects
+UmdfDeviceGroupId = LumenVirtualHid
 
 [LumenVirtualHid.Wdf]
-UmdfLibraryVersion = $UMDFVERSION$
+UmdfLibraryVersion = 2.15
 ServiceBinary = "%13%\LumenVirtualHid.dll"
 
 [LumenVirtualHid.CopyFiles]
@@ -65,4 +64,4 @@ LumenVirtualHid.dll
 [Strings]
 LumenProvider = "LizardByte"
 InstallationMedia = "Lumen Virtual HID installation media"
-LumenVirtualHid.DeviceDesc = "Lumen Virtual HID Keyboard and Mouse"
+LumenVirtualHid.DeviceDesc = "Lumen Virtual HID Input Source"

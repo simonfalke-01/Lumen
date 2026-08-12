@@ -44,10 +44,9 @@ namespace platf::win_input {
    * @brief Runtime backend selected for stateful keyboard and mouse input.
    */
   enum class backend_t {
-    probing,  ///< The Virtual HID protocol is being validated.
+    probing,  ///< The Virtual HID driver is being probed.
     send_input,  ///< Win32 `SendInput` compatibility backend.
     virtual_hid,  ///< Lumen Virtual HID driver backend.
-    quiescing,  ///< Virtual HID is being fenced before fallback.
     fail_closed  ///< No further stateful input is permitted.
   };
 
@@ -122,6 +121,12 @@ namespace platf::win_input {
     virtual result_t unicode(const char *utf8, int size) = 0;
 
     /**
+     * @brief Complete a higher-level input reset after its pressed maps clear.
+     * @return Operation result.
+     */
+    virtual result_t reset_session() = 0;
+
+    /**
      * @brief Release all keyboard keys and mouse buttons owned by the transport.
      * @return Operation result.
      */
@@ -181,6 +186,7 @@ namespace platf::win_input {
     result_t horizontal_scroll(std::int32_t distance) override;
     result_t keyboard(std::uint16_t modcode, bool release, std::uint8_t flags) override;
     result_t unicode(const char *utf8, int size) override;
+    result_t reset_session() override;
     result_t neutralize() override;
 
   private:

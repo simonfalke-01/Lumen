@@ -1160,6 +1160,13 @@ namespace platf {
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags);
 #ifdef _WIN32
   /**
+   * @brief Complete a Windows input-session reset after pressed maps clear.
+   *
+   * @param input Platform input backend to reset.
+   */
+  void reset_input_session(input_t &input);
+
+  /**
    * @brief Check whether the Windows input backend currently owns keyboard repeat.
    *
    * @param input Platform input backend to query.

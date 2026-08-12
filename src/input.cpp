@@ -1869,6 +1869,11 @@ namespace input {
         platf::keyboard_update(platf_input, vk_from_kpid(kp.first) & 0x00FF, true, flags_from_kpid(kp.first));
         key_press[kp.first] = false;
       }
+#ifdef _WIN32
+      // The platform reset is deliberately last: Virtual HID recovery is safe
+      // only after every higher-level pressed-state map has been cleared.
+      platf::reset_input_session(platf_input);
+#endif
     }));
   }
 
