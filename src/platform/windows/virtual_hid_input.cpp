@@ -3,21 +3,19 @@
  * @brief Lumen Virtual HID application transport implementation.
  */
 
-// Define the device-interface GUID in this translation unit.
-#include <initguid.h>
-
 // local includes
+#include "virtual_hid_input.h"
+
 #include "keylayout.h"
 #include "src/config.h"
 #include "src/logging.h"
-#include "virtual_hid_input.h"
 
 // platform includes
+#include <hidsdi.h>
 #include <SetupAPI.h>
 
 // standard includes
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -77,9 +75,31 @@ namespace platf::win_input {
       }
     }
 
-    /**
-     * @brief Production SetupAPI and `DeviceIoControl` channel.
-     */
+    /** @brief Return whether an open handle is the Lumen vendor control collection. */
+    bool is_lumen_control_collection(HANDLE handle) {
+      HIDD_ATTRIBUTES attributes {};
+      attributes.Size = sizeof(attributes);
+      if (!HidD_GetAttributes(handle, &attributes) ||
+          attributes.VendorID != LUMEN_VHID_VENDOR_ID ||
+          attributes.ProductID != LUMEN_VHID_PRODUCT_ID ||
+          attributes.VersionNumber != LUMEN_VHID_VERSION_NUMBER) {
+        return false;
+      }
+
+      PHIDP_PREPARSED_DATA preparsed_data = nullptr;
+      if (!HidD_GetPreparsedData(handle, &preparsed_data)) {
+        return false;
+      }
+      HIDP_CAPS capabilities {};
+      const auto status = HidP_GetCaps(preparsed_data, &capabilities);
+      HidD_FreePreparsedData(preparsed_data);
+      return status == HIDP_STATUS_SUCCESS &&
+             capabilities.UsagePage == LUMEN_VHID_VENDOR_USAGE_PAGE &&
+             capabilities.Usage == LUMEN_VHID_VENDOR_USAGE &&
+             capabilities.FeatureReportByteLength == LUMEN_VHID_FEATURE_REPORT_SIZE;
+    }
+
+    /** @brief Production HID feature-report control channel. */
     class system_virtual_hid_channel_t final: public virtual_hid_channel_t {
     public:
       ~system_virtual_hid_channel_t() override {
@@ -91,101 +111,113 @@ namespace platf::win_input {
           return {};
         }
 
-        const auto devices = SetupDiGetClassDevsW(
-          &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID,
-          nullptr,
-          nullptr,
-          DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
-        );
+        GUID hid_guid {};
+        HidD_GetHidGuid(&hid_guid);
+        const auto devices = SetupDiGetClassDevsW(&hid_guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
         if (devices == INVALID_HANDLE_VALUE) {
           return classify_channel_error(GetLastError());
         }
 
-        SP_DEVICE_INTERFACE_DATA interface_data {};
-        interface_data.cbSize = sizeof(interface_data);
-        if (!SetupDiEnumDeviceInterfaces(
-              devices,
-              nullptr,
-              &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID,
-              0,
-              &interface_data
-            )) {
-          const auto status = GetLastError();
-          SetupDiDestroyDeviceInfoList(devices);
-          return classify_channel_error(status);
-        }
+        DWORD result_status = ERROR_FILE_NOT_FOUND;
+        for (DWORD index = 0;; ++index) {
+          SP_DEVICE_INTERFACE_DATA interface_data {};
+          interface_data.cbSize = sizeof(interface_data);
+          if (!SetupDiEnumDeviceInterfaces(devices, nullptr, &hid_guid, index, &interface_data)) {
+            const auto status = GetLastError();
+            if (status != ERROR_NO_MORE_ITEMS) {
+              result_status = status;
+            }
+            break;
+          }
 
-        DWORD detail_size = 0;
-        SetupDiGetDeviceInterfaceDetailW(devices, &interface_data, nullptr, 0, &detail_size, nullptr);
-        if (detail_size < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) {
-          const auto status = GetLastError();
-          SetupDiDestroyDeviceInfoList(devices);
-          return classify_channel_error(status ? status : ERROR_INVALID_DATA);
-        }
+          DWORD detail_size = 0;
+          SetupDiGetDeviceInterfaceDetailW(devices, &interface_data, nullptr, 0, &detail_size, nullptr);
+          if (detail_size < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) {
+            continue;
+          }
+          std::vector<std::byte> detail_buffer(detail_size);
+          auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(detail_buffer.data());
+          detail->cbSize = sizeof(*detail);
+          if (!SetupDiGetDeviceInterfaceDetailW(
+                devices,
+                &interface_data,
+                detail,
+                detail_size,
+                nullptr,
+                nullptr
+              )) {
+            continue;
+          }
 
-        std::vector<std::byte> detail_buffer(detail_size);
-        auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(detail_buffer.data());
-        detail->cbSize = sizeof(*detail);
-        if (!SetupDiGetDeviceInterfaceDetailW(
-              devices,
-              &interface_data,
-              detail,
-              detail_size,
-              nullptr,
-              nullptr
-            )) {
-          const auto status = GetLastError();
-          SetupDiDestroyDeviceInfoList(devices);
-          return classify_channel_error(status);
-        }
+          const auto probe = CreateFileW(
+            detail->DevicePath,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+          );
+          if (probe == INVALID_HANDLE_VALUE) {
+            continue;
+          }
+          const auto matches = is_lumen_control_collection(probe);
+          CloseHandle(probe);
+          if (!matches) {
+            continue;
+          }
 
-        handle_ = CreateFileW(
-          detail->DevicePath,
-          GENERIC_READ | GENERIC_WRITE,
-          FILE_SHARE_READ | FILE_SHARE_WRITE,
-          nullptr,
-          OPEN_EXISTING,
-          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-          nullptr
-        );
-        const auto status = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+          handle_ = CreateFileW(
+            detail->DevicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+          );
+          if (handle_ == INVALID_HANDLE_VALUE) {
+            result_status = GetLastError();
+          }
+          break;
+        }
         SetupDiDestroyDeviceInfoList(devices);
-        return handle_ == INVALID_HANDLE_VALUE ? classify_channel_error(status) : channel_result_t {};
+        return handle_ == INVALID_HANDLE_VALUE ? classify_channel_error(result_status) : channel_result_t {};
       }
 
       channel_result_t get_capabilities(
         const LUMEN_VHID_GET_CAPABILITIES_REQUEST &request,
         LUMEN_VHID_GET_CAPABILITIES_RESPONSE &response
       ) override {
-        return ioctl(IOCTL_LUMEN_VHID_GET_PROTOCOL_CAPABILITIES, request, response);
+        return feature_exchange(request, response);
       }
 
       channel_result_t claim(
         const LUMEN_VHID_CLAIM_SESSION_REQUEST &request,
         LUMEN_VHID_CLAIM_SESSION_RESPONSE &response
       ) override {
-        return ioctl(IOCTL_LUMEN_VHID_CLAIM_INPUT_SESSION, request, response);
+        return feature_exchange(request, response);
       }
 
       channel_result_t submit(
         const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request,
         LUMEN_VHID_SUBMIT_REPORT_RESPONSE &response
       ) override {
-        return ioctl(IOCTL_LUMEN_VHID_SUBMIT_INPUT_REPORT, request, response);
+        return feature_exchange(request, response);
       }
 
       channel_result_t reset(
         const LUMEN_VHID_SESSION_REQUEST &request,
         LUMEN_VHID_SESSION_RESPONSE &response
       ) override {
-        return ioctl(IOCTL_LUMEN_VHID_RESET_INPUT_SESSION, request, response);
+        return feature_exchange(request, response);
       }
 
       channel_result_t release(
         const LUMEN_VHID_SESSION_REQUEST &request,
         LUMEN_VHID_SESSION_RESPONSE &response
       ) override {
-        return ioctl(IOCTL_LUMEN_VHID_RELEASE_INPUT_SESSION, request, response);
+        return feature_exchange(request, response);
       }
 
       channel_result_t cleanup() override {
@@ -194,47 +226,10 @@ namespace platf::win_input {
         }
 
         const auto handle = std::exchange(handle_, INVALID_HANDLE_VALUE);
-        const auto close_result = close_device_handle(handle);
-        if (!close_result) {
-          if (pending_) {
-            static_cast<void>(pending_.release());
-          }
-          return close_result;
-        }
-
-        if (pending_) {
-          // CloseHandle cancels all I/O issued by this file object. Give the I/O
-          // manager a second bounded interval to retire the caller-owned buffers.
-          // If a broken driver does not complete, retain the allocation permanently
-          // rather than permit a late kernel write into freed user memory.
-          if (WaitForSingleObject(pending_->overlapped.hEvent, ioctl_cancel_timeout_ms) == WAIT_OBJECT_0) {
-            pending_.reset();
-          } else {
-            static_cast<void>(pending_.release());
-          }
-        }
-        return {};
+        return close_device_handle(handle);
       }
 
     private:
-      /**
-       * @brief Heap-owned buffers retained until overlapped I/O is retired.
-       */
-      struct pending_io_t {
-        /**
-         * @brief Close the completion event.
-         */
-        ~pending_io_t() {
-          if (overlapped.hEvent) {
-            CloseHandle(overlapped.hEvent);
-          }
-        }
-
-        OVERLAPPED overlapped {};  ///< Overlapped request state.
-        std::array<std::byte, LUMEN_VHID_MAX_CONTROL_SIZE> input {};  ///< Stable request buffer.
-        std::array<std::byte, LUMEN_VHID_MAX_CONTROL_SIZE> output {};  ///< Stable response buffer.
-      };
-
       /**
        * @brief State owned by the bounded device-handle close worker.
        */
@@ -310,74 +305,43 @@ namespace platf::win_input {
       }
 
       /**
-       * @brief Issue a fixed-size buffered protocol request.
+       * @brief Exchange fixed protocol structures through HID feature reports.
        * @tparam Request Request structure type.
        * @tparam Response Response structure type.
-       * @param code Control code.
        * @param request Input structure.
        * @param response Output structure.
        * @return Channel result.
        */
       template<class Request, class Response>
-      channel_result_t ioctl(DWORD code, const Request &request, Response &response) {
+      channel_result_t feature_exchange(const Request &request, Response &response) {
         if (handle_ == INVALID_HANDLE_VALUE) {
           return {channel_completion_t::removed, ERROR_INVALID_HANDLE};
         }
-        if (pending_) {
-          return {channel_completion_t::ambiguous, ERROR_TIMEOUT};
+        virtual_hid_feature_report_t request_report {};
+        if (!encode_virtual_hid_feature_request(&request, sizeof(request), request_report)) {
+          return {channel_completion_t::definite_reject, ERROR_INVALID_DATA};
+        }
+        if (!HidD_SetFeature(handle_, request_report.data(), request_report.size())) {
+          // HID class may have delivered the request before surfacing a lower
+          // stack failure, so state-changing requests cannot be replayed.
+          return {channel_completion_t::ambiguous, GetLastError()};
         }
 
-        auto pending = std::make_unique<pending_io_t>();
-        pending->overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!pending->overlapped.hEvent) {
-          return classify_channel_error(GetLastError());
+        virtual_hid_feature_report_t response_report {};
+        response_report[0] = LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID;
+        if (!HidD_GetFeature(handle_, response_report.data(), response_report.size())) {
+          return {channel_completion_t::ambiguous, GetLastError()};
         }
-        std::memcpy(pending->input.data(), &request, sizeof(request));
-
-        const auto started = DeviceIoControl(
-          handle_,
-          code,
-          pending->input.data(),
-          sizeof(request),
-          pending->output.data(),
-          sizeof(response),
-          nullptr,
-          &pending->overlapped
-        );
-        const auto start_status = started ? ERROR_SUCCESS : GetLastError();
-        if (!started && start_status != ERROR_IO_PENDING) {
-          return classify_channel_error(start_status);
-        }
-
-        const auto wait_result = WaitForSingleObject(pending->overlapped.hEvent, ioctl_timeout_ms);
-        if (wait_result != WAIT_OBJECT_0) {
-          const auto wait_status = wait_result == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
-          CancelIoEx(handle_, &pending->overlapped);
-          if (WaitForSingleObject(pending->overlapped.hEvent, ioctl_cancel_timeout_ms) != WAIT_OBJECT_0) {
-            pending_ = std::move(pending);
-          }
-          return {channel_completion_t::ambiguous, wait_status};
-        }
-
-        DWORD returned = 0;
-        if (!GetOverlappedResult(handle_, &pending->overlapped, &returned, FALSE)) {
-          return classify_channel_error(GetLastError());
-        }
-        if (returned != sizeof(response)) {
-          // The IOCTL completed successfully and may already have changed
-          // driver/VHF state. A truncated acknowledgement is ambiguous.
+        if (!decode_virtual_hid_feature_response(response_report, &response, sizeof(response))) {
+          // SET_FEATURE completed, so a malformed acknowledgement remains ambiguous.
           return {channel_completion_t::ambiguous, ERROR_INVALID_DATA};
         }
-        std::memcpy(&response, pending->output.data(), sizeof(response));
         return {};
       }
 
-      static constexpr DWORD ioctl_timeout_ms = 500;  ///< Per-request completion deadline.
-      static constexpr DWORD ioctl_cancel_timeout_ms = 250;  ///< Cancellation drain deadline.
       static constexpr DWORD close_timeout_ms = 500;  ///< Driver cleanup deadline.
       static constexpr DWORD close_worker_settle_timeout_ms = 50;  ///< Worker retirement deadline.
       HANDLE handle_ {INVALID_HANDLE_VALUE};  ///< Open driver interface handle.
-      std::unique_ptr<pending_io_t> pending_;  ///< Timed-out request retained for memory safety.
     };
 
     /**
@@ -620,6 +584,36 @@ namespace platf::win_input {
       return button >= 1 && button <= 5 ? static_cast<std::uint8_t>(1U << (button - 1)) : 0;
     }
   }  // namespace
+
+  bool encode_virtual_hid_feature_request(
+    const void *request,
+    std::size_t request_size,
+    virtual_hid_feature_report_t &report
+  ) noexcept {
+    if (request == nullptr || request_size == 0 || request_size > LUMEN_VHID_FEATURE_PAYLOAD_SIZE) {
+      return false;
+    }
+    report.fill(0);
+    report[0] = LUMEN_VHID_FEATURE_REQUEST_REPORT_ID;
+    std::memcpy(report.data() + 1, request, request_size);
+    return true;
+  }
+
+  bool decode_virtual_hid_feature_response(
+    const virtual_hid_feature_report_t &report,
+    void *response,
+    std::size_t response_size
+  ) noexcept {
+    if (response == nullptr || response_size == 0 || response_size > LUMEN_VHID_FEATURE_PAYLOAD_SIZE ||
+        report[0] != LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID ||
+        !std::all_of(report.begin() + static_cast<std::ptrdiff_t>(response_size + 1), report.end(), [](std::uint8_t byte) {
+          return byte == 0;
+        })) {
+      return false;
+    }
+    std::memcpy(response, report.data() + 1, response_size);
+    return true;
+  }
 
   std::optional<std::uint8_t> map_key_to_hid_usage(
     std::uint16_t modcode,
@@ -866,8 +860,8 @@ namespace platf::win_input {
           sizeof(response)
         ) ||
         response.session_token != session_token_ || response.accepted_sequence != next_sequence) {
-      // DeviceIoControl succeeded, so the driver may already have submitted the
-      // report to VHF. A malformed acknowledgement is therefore ambiguous and
+      // SET_FEATURE succeeded, so the driver may already have submitted the
+      // report to HID. A malformed acknowledgement is therefore ambiguous and
       // its stateless delta must never be replayed through SendInput.
       return {channel_completion_t::ambiguous, ERROR_INVALID_DATA};
     }

@@ -18,11 +18,11 @@
 #include <stddef.h>
 
 #if defined(_KERNEL_MODE)
-  typedef UCHAR uint8_t;
-  typedef SHORT int16_t;
-  typedef USHORT uint16_t;
-  typedef ULONG uint32_t;
-  typedef ULONGLONG uint64_t;
+typedef UCHAR uint8_t;
+typedef SHORT int16_t;
+typedef USHORT uint16_t;
+typedef ULONG uint32_t;
+typedef ULONGLONG uint64_t;
   #ifndef UINT16_MAX
     #define UINT16_MAX 0xffffu
   #endif
@@ -91,6 +91,19 @@ extern "C" {
 #define LUMEN_VHID_MAX_REPORT_PAYLOAD 512u
 /** Number of keyboard bitmap bytes covering usages 00-DF. */
 #define LUMEN_VHID_NKRO_BITMAP_SIZE 28u
+
+/** @name Fixed HID collection identity and feature-report framing
+ * @{ */
+#define LUMEN_VHID_VENDOR_ID 0x4c42u
+#define LUMEN_VHID_PRODUCT_ID 0x0001u
+#define LUMEN_VHID_VERSION_NUMBER 0x0001u
+#define LUMEN_VHID_VENDOR_USAGE_PAGE 0xff00u
+#define LUMEN_VHID_VENDOR_USAGE 0x0001u
+#define LUMEN_VHID_FEATURE_REQUEST_REPORT_ID 0x40u
+#define LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID 0x41u
+#define LUMEN_VHID_FEATURE_PAYLOAD_SIZE LUMEN_VHID_MAX_CONTROL_SIZE
+#define LUMEN_VHID_FEATURE_REPORT_SIZE (1u + LUMEN_VHID_FEATURE_PAYLOAD_SIZE)
+/** @} */
 
 /** @name Wire operation identifiers
  * @{ */
@@ -421,6 +434,7 @@ extern "C" {
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_KEYBOARD_REPORT) == 30, keyboard_report_size);
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_RELATIVE_MOUSE_REPORT) == 10, relative_report_size);
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_ABSOLUTE_MOUSE_REPORT) == 10, absolute_report_size);
+  LUMEN_VHID_STATIC_ASSERT(LUMEN_VHID_FEATURE_REPORT_SIZE == 4097, feature_report_size);
   LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_GET_PROTOCOL_CAPABILITIES & 3u) == METHOD_BUFFERED, get_ioctl_buffered);
   LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_CLAIM_INPUT_SESSION & 3u) == METHOD_BUFFERED, claim_ioctl_buffered);
   LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_SUBMIT_INPUT_REPORT & 3u) == METHOD_BUFFERED, submit_ioctl_buffered);

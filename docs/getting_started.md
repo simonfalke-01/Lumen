@@ -371,10 +371,10 @@ reason in the log. There is no backend setting to configure. Install and repair 
 starting the service and roll back if required setup fails.
 
 > [!IMPORTANT]
-> Lumen currently ships a test-signed Virtual HID driver. Disable Secure Boot before running the MSI. The installer
-> trusts the bundled Lumen development certificate, enables Windows test-signing mode, and requests a restart. A
-> one-shot `SYSTEM` startup task finishes the driver installation after that restart. Uninstall removes the trusted
-> certificate and disables test-signing mode when Lumen enabled it, which requires one final restart.
+> Lumen ships a user-mode UMDF Virtual HID driver. The installer validates the driver catalog, trusts the bundled
+> Lumen certificate in the local machine certificate stores, and installs the package directly. Secure Boot can remain
+> enabled and Windows test-signing mode is not required. Uninstall removes the trusted certificate. Windows may still
+> request a restart when a Plug and Play driver operation cannot complete immediately.
 
 > [!NOTE]
 > Only the service account (`SYSTEM`) can submit Virtual HID input. Launching Sunshine directly uses `SendInput`, even

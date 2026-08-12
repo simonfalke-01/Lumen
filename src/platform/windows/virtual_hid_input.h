@@ -9,7 +9,9 @@
 #include "virtual_hid_protocol.h"
 
 // standard includes
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -19,6 +21,36 @@
 #include <unordered_map>
 
 namespace platf::win_input {
+  /** Complete HID feature report used by the UMDF control collection. */
+  using virtual_hid_feature_report_t =
+    std::array<std::uint8_t, LUMEN_VHID_FEATURE_REPORT_SIZE>;
+
+  /**
+   * @brief Frame one fixed protocol request as a SET_FEATURE report.
+   * @param request Protocol request bytes.
+   * @param request_size Exact request structure size.
+   * @param report Destination feature report.
+   * @return `true` when the request fits and was framed.
+   */
+  bool encode_virtual_hid_feature_request(
+    const void *request,
+    std::size_t request_size,
+    virtual_hid_feature_report_t &report
+  ) noexcept;
+
+  /**
+   * @brief Decode one fixed protocol response from a GET_FEATURE report.
+   * @param report Source feature report.
+   * @param response Destination protocol response.
+   * @param response_size Exact response structure size.
+   * @return `true` when the report ID and zero padding are valid.
+   */
+  bool decode_virtual_hid_feature_response(
+    const virtual_hid_feature_report_t &report,
+    void *response,
+    std::size_t response_size
+  ) noexcept;
+
   /**
    * @brief Completion classes returned by the Virtual HID control channel.
    */

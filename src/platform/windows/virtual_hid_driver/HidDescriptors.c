@@ -1,18 +1,20 @@
 /**
  * @file HidDescriptors.c
- * @brief Composite NKRO keyboard and relative/absolute mouse descriptor.
+ * @brief Composite NKRO keyboard, mouse, and vendor-control descriptor.
  */
 
+#include "Driver.h"
 #include "HidDescriptors.h"
 
 /*
  * Keyboard report 1 is an eight-bit modifier state followed by 224 one-bit
- * Keyboard/Keypad usages (00-DF). Mouse reports 2 and 3 live in one mouse
- * top-level collection so their complete five-button state belongs to one
- * logical mouse while relative and absolute coordinate semantics remain
- * unambiguous.
+ * Keyboard/Keypad usages (00-DF). Relative mouse report 2 and absolute mouse
+ * report 3 use separate top-level collections because mouhid requires one
+ * coordinate mode per mouse collection. A separate vendor-defined top-level
+ * collection transports one bounded Lumen protocol message in each direction
+ * via feature reports.
  */
-const UCHAR LumenVhidReportDescriptor[] = {
+const BYTE LumenVhidReportDescriptor[] = {
   /* NKRO keyboard top-level collection. */
   0x05, 0x01,        /* Usage Page (Generic Desktop) */
   0x09, 0x06,        /* Usage (Keyboard) */
@@ -33,7 +35,7 @@ const UCHAR LumenVhidReportDescriptor[] = {
   0x81, 0x02,        /*   Input (Data, Variable, Absolute) */
   0xc0,              /* End Collection */
 
-  /* One mouse top-level collection with relative and absolute report IDs. */
+  /* Relative mouse top-level collection. */
   0x05, 0x01,        /* Usage Page (Generic Desktop) */
   0x09, 0x02,        /* Usage (Mouse) */
   0xa1, 0x01,        /* Collection (Application) */
@@ -68,7 +70,15 @@ const UCHAR LumenVhidReportDescriptor[] = {
   0x75, 0x10,        /*     Report Size (16) */
   0x95, 0x01,        /*     Report Count (1) */
   0x81, 0x06,        /*     Input (Data, Variable, Relative) */
+  0xc0,              /*   End Collection (Physical) */
+  0xc0,              /* End Collection (Application) */
 
+  /* Absolute mouse top-level collection. */
+  0x05, 0x01,        /* Usage Page (Generic Desktop) */
+  0x09, 0x02,        /* Usage (Mouse) */
+  0xa1, 0x01,        /* Collection (Application) */
+  0x09, 0x01,        /*   Usage (Pointer) */
+  0xa1, 0x00,        /*   Collection (Physical) */
   0x85, 0x03,        /*     Report ID (3, absolute) */
   0x05, 0x09,        /*     Usage Page (Button) */
   0x19, 0x01,        /*     Usage Minimum (Button 1) */
@@ -103,6 +113,29 @@ const UCHAR LumenVhidReportDescriptor[] = {
   0x95, 0x01,        /*     Report Count (1) */
   0x81, 0x06,        /*     Input (Data, Variable, Relative) */
   0xc0,              /*   End Collection (Physical) */
+  0xc0,              /* End Collection (Application) */
+
+  /* Vendor-defined protocol-control top-level collection. */
+  0x06, (BYTE) (LUMEN_VHID_VENDOR_USAGE_PAGE & 0xffu),
+  (BYTE) (LUMEN_VHID_VENDOR_USAGE_PAGE >> 8), /* Usage Page (Vendor Defined) */
+  0x09, (BYTE) LUMEN_VHID_VENDOR_USAGE, /* Usage (vendor control) */
+  0xa1, 0x01,        /* Collection (Application) */
+  0x85, LUMEN_VHID_FEATURE_REQUEST_REPORT_ID, /* Report ID (0x40, request) */
+  0x09, 0x01,        /*   Usage (1) */
+  0x15, 0x00,        /*   Logical Minimum (0) */
+  0x26, 0xff, 0x00,  /*   Logical Maximum (255) */
+  0x75, 0x08,        /*   Report Size (8) */
+  0x96, (BYTE) (LUMEN_VHID_FEATURE_PAYLOAD_SIZE & 0xffu),
+  (BYTE) (LUMEN_VHID_FEATURE_PAYLOAD_SIZE >> 8), /* Report Count (4096) */
+  0xb1, 0x02,        /*   Feature (Data, Variable, Absolute) */
+  0x85, LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID, /* Report ID (0x41, response) */
+  0x09, 0x02,        /*   Usage (2) */
+  0x15, 0x00,        /*   Logical Minimum (0) */
+  0x26, 0xff, 0x00,  /*   Logical Maximum (255) */
+  0x75, 0x08,        /*   Report Size (8) */
+  0x96, (BYTE) (LUMEN_VHID_FEATURE_PAYLOAD_SIZE & 0xffu),
+  (BYTE) (LUMEN_VHID_FEATURE_PAYLOAD_SIZE >> 8), /* Report Count (4096) */
+  0xb1, 0x02,        /*   Feature (Data, Variable, Absolute) */
   0xc0               /* End Collection (Application) */
 };
 

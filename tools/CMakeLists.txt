@@ -51,6 +51,7 @@ target_compile_options(sunshinesvc PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 add_executable(lumen-vhidctl lumen-vhidctl.cpp)
 target_link_libraries(lumen-vhidctl
         cfgmgr32
+        hid
         setupapi
         shell32)
 target_compile_options(lumen-vhidctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})

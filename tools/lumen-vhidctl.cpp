@@ -15,7 +15,9 @@
 #include <cctype>
 #include <cfgmgr32.h>
 #include <cstdint>
+#include <cstring>
 #include <cwchar>
+#include <hidsdi.h>
 #include <iostream>
 #include <optional>
 #include <setupapi.h>
@@ -46,6 +48,16 @@ namespace {
   using update_driver_fn = BOOL(WINAPI *)(HWND, LPCWSTR, LPCWSTR, DWORD, PBOOL);
   /** Dynamically loaded NewDev uninstall API signature. */
   using uninstall_driver_fn = BOOL(WINAPI *)(HWND, LPCWSTR, DWORD, PBOOL);
+
+  /** Resolve one dynamically loaded function without incompatible-function casts. */
+  template<class Function>
+  Function resolve_function(HMODULE module, const char *name) {
+    const auto procedure = GetProcAddress(module, name);
+    static_assert(sizeof(Function) == sizeof(procedure));
+    Function function = nullptr;
+    std::memcpy(&function, &procedure, sizeof(function));
+    return function;
+  }
 
   /** RAII wrapper for a SetupAPI device information set. */
   class device_info_set {
@@ -131,10 +143,18 @@ namespace {
     DWORD error = ERROR_SUCCESS;
   };
 
-  /** Published Lumen driver interface lookup result. */
-  struct interface_info {
-    std::wstring path;
+  /** Started HID collections published by the Lumen transport. */
+  struct collection_inventory {
+    std::wstring control_path;
+    unsigned keyboard_count = 0;
+    unsigned mouse_count = 0;
+    unsigned control_count = 0;
     DWORD error = ERROR_SUCCESS;
+
+    /** Return whether every required Lumen HID collection is present. */
+    [[nodiscard]] bool healthy() const noexcept {
+      return keyboard_count == 1 && mouse_count == 2 && control_count == 1;
+    }
   };
 
   /** Format a Win32 error without embedded line breaks. */
@@ -242,15 +262,65 @@ namespace {
     return result;
   }
 
-  /** Find the present device interface published by the exact Lumen root node. */
-  interface_info find_present_interface() {
-    interface_info result;
-    device_info_set set(SetupDiGetClassDevsW(
-      &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID,
-      nullptr,
-      nullptr,
-      DIGCF_DEVICEINTERFACE | DIGCF_PRESENT
-    ));
+  /** Verify that every descendant of the Lumen root node started without a PnP problem. */
+  bool descendants_started(DEVINST parent, ULONG &problem, CONFIGRET &error) {
+    DEVINST child = 0;
+    error = CM_Get_Child(&child, parent, 0);
+    if (error == CR_NO_SUCH_DEVNODE) {
+      error = CR_SUCCESS;
+      return true;
+    }
+    if (error != CR_SUCCESS) {
+      return false;
+    }
+
+    for (;;) {
+      ULONG child_status = 0;
+      problem = 0;
+      error = CM_Get_DevNode_Status(&child_status, &problem, child, 0);
+      if (error != CR_SUCCESS || (child_status & DN_STARTED) == 0 ||
+          (child_status & DN_HAS_PROBLEM) != 0 || !descendants_started(child, problem, error)) {
+        return false;
+      }
+      DEVINST sibling = 0;
+      error = CM_Get_Sibling(&sibling, child, 0);
+      if (error == CR_NO_SUCH_DEVNODE) {
+        error = CR_SUCCESS;
+        return true;
+      }
+      if (error != CR_SUCCESS) {
+        return false;
+      }
+      child = sibling;
+    }
+  }
+
+  /** Read the top-level HID capabilities for a Lumen collection. */
+  bool get_lumen_collection_caps(HANDLE handle, HIDP_CAPS &capabilities) {
+    HIDD_ATTRIBUTES attributes {};
+    attributes.Size = sizeof(attributes);
+    if (!HidD_GetAttributes(handle, &attributes) ||
+        attributes.VendorID != LUMEN_VHID_VENDOR_ID ||
+        attributes.ProductID != LUMEN_VHID_PRODUCT_ID ||
+        attributes.VersionNumber != LUMEN_VHID_VERSION_NUMBER) {
+      return false;
+    }
+
+    PHIDP_PREPARSED_DATA preparsed_data = nullptr;
+    if (!HidD_GetPreparsedData(handle, &preparsed_data)) {
+      return false;
+    }
+    const auto status = HidP_GetCaps(preparsed_data, &capabilities);
+    HidD_FreePreparsedData(preparsed_data);
+    return status == HIDP_STATUS_SUCCESS;
+  }
+
+  /** Inventory every started Lumen HID top-level collection. */
+  collection_inventory find_present_collections() {
+    collection_inventory result;
+    GUID hid_guid {};
+    HidD_GetHidGuid(&hid_guid);
+    device_info_set set(SetupDiGetClassDevsW(&hid_guid, nullptr, nullptr, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT));
     if (!set.valid()) {
       result.error = GetLastError();
       return result;
@@ -259,7 +329,7 @@ namespace {
     for (DWORD index = 0;; ++index) {
       SP_DEVICE_INTERFACE_DATA interface_data {};
       interface_data.cbSize = sizeof(interface_data);
-      if (!SetupDiEnumDeviceInterfaces(set.get(), nullptr, &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID, index, &interface_data)) {
+      if (!SetupDiEnumDeviceInterfaces(set.get(), nullptr, &hid_guid, index, &interface_data)) {
         const DWORD error = GetLastError();
         if (error != ERROR_NO_MORE_ITEMS) {
           result.error = error;
@@ -276,16 +346,70 @@ namespace {
       std::vector<BYTE> buffer(required, 0);
       auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buffer.data());
       detail->cbSize = sizeof(*detail);
-      SP_DEVINFO_DATA device {};
-      device.cbSize = sizeof(device);
-      if (!SetupDiGetDeviceInterfaceDetailW(set.get(), &interface_data, detail, required, nullptr, &device)) {
+      if (!SetupDiGetDeviceInterfaceDetailW(set.get(), &interface_data, detail, required, nullptr, nullptr)) {
         continue;
       }
-      if (device_has_hardware_id(set.get(), device)) {
-        result.path = detail->DevicePath;
-        return result;
+
+      const auto probe = CreateFileW(
+        detail->DevicePath,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+      );
+      if (probe == INVALID_HANDLE_VALUE) {
+        continue;
+      }
+      HIDP_CAPS capabilities {};
+      const auto matches = get_lumen_collection_caps(probe, capabilities);
+      CloseHandle(probe);
+      if (!matches) {
+        continue;
+      }
+      if (capabilities.UsagePage == HID_USAGE_PAGE_GENERIC &&
+          capabilities.Usage == HID_USAGE_GENERIC_KEYBOARD) {
+        ++result.keyboard_count;
+      } else if (capabilities.UsagePage == HID_USAGE_PAGE_GENERIC &&
+                 capabilities.Usage == HID_USAGE_GENERIC_MOUSE) {
+        ++result.mouse_count;
+      } else if (capabilities.UsagePage == LUMEN_VHID_VENDOR_USAGE_PAGE &&
+                 capabilities.Usage == LUMEN_VHID_VENDOR_USAGE &&
+                 capabilities.FeatureReportByteLength == LUMEN_VHID_FEATURE_REPORT_SIZE) {
+        ++result.control_count;
+        result.control_path = detail->DevicePath;
       }
     }
+  }
+
+  /** Exchange one protocol operation through the fixed HID feature reports. */
+  template<class Request, class Response>
+  bool feature_exchange(HANDLE device, const Request &request, Response &response, DWORD &error) {
+    std::array<std::uint8_t, LUMEN_VHID_FEATURE_REPORT_SIZE> request_report {};
+    request_report[0] = LUMEN_VHID_FEATURE_REQUEST_REPORT_ID;
+    std::memcpy(request_report.data() + 1, &request, sizeof(request));
+    if (!HidD_SetFeature(device, request_report.data(), static_cast<ULONG>(request_report.size()))) {
+      error = GetLastError();
+      return false;
+    }
+
+    std::array<std::uint8_t, LUMEN_VHID_FEATURE_REPORT_SIZE> response_report {};
+    response_report[0] = LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID;
+    if (!HidD_GetFeature(device, response_report.data(), static_cast<ULONG>(response_report.size()))) {
+      error = GetLastError();
+      return false;
+    }
+    if (response_report[0] != LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID ||
+        !std::all_of(response_report.begin() + sizeof(response) + 1, response_report.end(), [](std::uint8_t byte) {
+          return byte == 0;
+        })) {
+      error = ERROR_INVALID_DATA;
+      return false;
+    }
+    std::memcpy(&response, response_report.data() + 1, sizeof(response));
+    error = ERROR_SUCCESS;
+    return true;
   }
 
   /** Query protocol and capability metadata when the interface ACL permits it. */
@@ -316,18 +440,8 @@ namespace {
     request.header.total_size = sizeof(request);
 
     LUMEN_VHID_GET_CAPABILITIES_RESPONSE response {};
-    DWORD returned = 0;
-    const BOOL ok = DeviceIoControl(
-      device,
-      IOCTL_LUMEN_VHID_GET_PROTOCOL_CAPABILITIES,
-      &request,
-      sizeof(request),
-      &response,
-      sizeof(response),
-      &returned,
-      nullptr
-    );
-    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    DWORD error = ERROR_SUCCESS;
+    const bool ok = feature_exchange(device, request, response, error);
     CloseHandle(device);
 
     if (!ok) {
@@ -335,7 +449,7 @@ namespace {
     }
     if (!lumen_vhid_validate_message_header(
           &response.header,
-          returned,
+          sizeof(response),
           LUMEN_VHID_OPERATION_GET_PROTOCOL_CAPABILITIES,
           sizeof(response)
         )) {
@@ -561,33 +675,45 @@ namespace {
     }
 
     bool started = false;
+    bool children_started = false;
     ULONG problem = 0;
     ULONG device_status = 0;
+    CONFIGRET child_error = CR_SUCCESS;
     for (const SP_DEVINFO_DATA &device : devices.devices) {
       if (CM_Get_DevNode_Status(&device_status, &problem, device.DevInst, 0) == CR_SUCCESS &&
           (device_status & DN_STARTED) != 0) {
         started = true;
+        children_started = descendants_started(device.DevInst, problem, child_error);
         break;
       }
     }
 
-    const interface_info interface = find_present_interface();
-    if (interface.error != ERROR_SUCCESS) {
-      const exit_code code = error_code(exit_code::setup_api_failure, interface.error);
-      return fail(code, L"enumerate-interface", interface.error);
+    const collection_inventory collections = find_present_collections();
+    if (collections.error != ERROR_SUCCESS) {
+      const exit_code code = error_code(exit_code::setup_api_failure, collections.error);
+      return fail(code, L"enumerate-interface", collections.error);
     }
-    if (!started || interface.path.empty()) {
-      std::wcout << L"state=absent reason=" << (!started ? L"device-not-started" : L"interface-not-published")
+    if (!started || !children_started || !collections.healthy()) {
+      const wchar_t *reason = !started ? L"device-not-started" :
+                              !children_started ? L"child-not-started" : L"collection-not-started";
+      std::wcout << L"state=unhealthy reason=" << reason
                  << L" hardware_id=\"" << LUMEN_VHID_ROOT_HARDWARE_ID_W << L"\""
                  << L" cm_status=" << device_status << L" cm_problem=" << problem
+                 << L" cm_error=" << child_error
+                 << L" keyboards=" << collections.keyboard_count
+                 << L" mice=" << collections.mouse_count
+                 << L" controls=" << collections.control_count
                  << L" protocol=" << LUMEN_VHID_PROTOCOL_MAJOR << L'.' << LUMEN_VHID_PROTOCOL_MINOR << L'\n';
       return static_cast<int>(exit_code::not_installed);
     }
 
     std::wcout << L"state=installed hardware_id=\"" << LUMEN_VHID_ROOT_HARDWARE_ID_W
-               << L"\" interface=\"" << interface.path << L"\" protocol="
+               << L"\" interface=\"" << collections.control_path << L"\""
+               << L" keyboards=" << collections.keyboard_count
+               << L" mice=" << collections.mouse_count
+               << L" controls=" << collections.control_count << L" protocol="
                << LUMEN_VHID_PROTOCOL_MAJOR << L'.' << LUMEN_VHID_PROTOCOL_MINOR << L' '
-               << protocol_query(interface.path) << L'\n';
+               << protocol_query(collections.control_path) << L'\n';
     return static_cast<int>(exit_code::success);
   }
 
@@ -646,7 +772,7 @@ namespace {
       }
       return fail(error_code(exit_code::setup_api_failure, error), L"load-newdev", error);
     }
-    const auto update_driver = reinterpret_cast<update_driver_fn>(GetProcAddress(newdev.get(), "UpdateDriverForPlugAndPlayDevicesW"));
+    const auto update_driver = resolve_function<update_driver_fn>(newdev.get(), "UpdateDriverForPlugAndPlayDevicesW");
     if (update_driver == nullptr) {
       error = ERROR_PROC_NOT_FOUND;
       if (created) {
@@ -670,15 +796,24 @@ namespace {
 
     if (!reboot) {
       for (int attempt = 0; attempt < kInterfaceWaitAttempts; ++attempt) {
-        const interface_info interface = find_present_interface();
-        if (!interface.path.empty()) {
+        const collection_inventory collections = find_present_collections();
+        auto installed_devices = enumerate_devices(DIGCF_ALLCLASSES | DIGCF_PRESENT);
+        ULONG child_problem = 0;
+        CONFIGRET child_error = CR_SUCCESS;
+        const bool children_started = installed_devices.error == ERROR_SUCCESS &&
+          installed_devices.devices.size() == 1 &&
+          descendants_started(installed_devices.devices[0].DevInst, child_problem, child_error);
+        if (collections.healthy() && children_started) {
           std::wcout << L"result=success action=install-or-update hardware_id=\""
                      << LUMEN_VHID_ROOT_HARDWARE_ID_W << L"\" protocol="
                      << LUMEN_VHID_PROTOCOL_MAJOR << L'.' << LUMEN_VHID_PROTOCOL_MINOR << L'\n';
           return static_cast<int>(exit_code::success);
         }
-        if (interface.error != ERROR_SUCCESS) {
-          return fail(error_code(exit_code::setup_api_failure, interface.error), L"verify-interface", interface.error);
+        if (collections.error != ERROR_SUCCESS) {
+          return fail(error_code(exit_code::setup_api_failure, collections.error), L"verify-interface", collections.error);
+        }
+        if (installed_devices.error != ERROR_SUCCESS) {
+          return fail(error_code(exit_code::setup_api_failure, installed_devices.error), L"verify-devices", installed_devices.error);
         }
         Sleep(100);
       }
@@ -717,7 +852,7 @@ namespace {
         error = GetLastError();
         return fail(error_code(exit_code::driver_store_failure, error), L"load-newdev", error);
       }
-      const auto uninstall_driver = reinterpret_cast<uninstall_driver_fn>(GetProcAddress(newdev.get(), "DiUninstallDriverW"));
+      const auto uninstall_driver = resolve_function<uninstall_driver_fn>(newdev.get(), "DiUninstallDriverW");
       if (uninstall_driver == nullptr) {
         return fail(exit_code::driver_store_failure, L"resolve-uninstall-driver", ERROR_PROC_NOT_FOUND);
       }

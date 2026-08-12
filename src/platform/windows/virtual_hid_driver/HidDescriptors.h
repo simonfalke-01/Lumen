@@ -1,16 +1,16 @@
 /**
  * @file HidDescriptors.h
- * @brief HID report descriptor exported by the persistent VHF source device.
+ * @brief HID descriptors for the UMDF keyboard, mouse, and control collections.
  */
 
 #ifndef LUMEN_VIRTUAL_HID_DESCRIPTORS_H
 #define LUMEN_VIRTUAL_HID_DESCRIPTORS_H
 
-#include <ntddk.h>
+#include <windows.h>
 
-/** Composite NKRO keyboard and single logical mouse report descriptor. */
-extern const UCHAR LumenVhidReportDescriptor[];
-/** Descriptor byte count passed to VHF_CONFIG_INIT. */
+/** Composite NKRO keyboard, mouse, and vendor-control report descriptor. */
+extern const BYTE LumenVhidReportDescriptor[];
+/** Descriptor byte count returned to HIDClass. */
 extern const USHORT LumenVhidReportDescriptorLength;
 
 #endif /* LUMEN_VIRTUAL_HID_DESCRIPTORS_H */

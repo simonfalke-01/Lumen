@@ -311,10 +311,11 @@ installer and select repair. Repair installs or updates the driver before restar
 logs are stored in `%%TEMP%/Sunshine/logs/install/`; uninstall logs are stored in
 `%%TEMP%/Sunshine/logs/uninstall/`. The helper is not included in standalone/lite packages.
 
-The current Lumen driver is test-signed. Secure Boot must be disabled, Windows test-signing mode must be active, and
-the machine must be restarted after the first MSI installation. The installer enables test-signing mode and registers
-a one-shot startup task named `Lumen Virtual HID Driver Install` to finish installation after restart. If the task is
-still present after reboot, inspect the install log and run the MSI repair action.
+The Lumen driver is a user-mode UMDF package. The installer validates its catalog signature, trusts the bundled
+certificate in the local machine certificate stores, and installs the package directly. Secure Boot can remain
+enabled and Windows test-signing mode is not required. Windows may request a restart only when a Plug and Play driver
+operation cannot complete immediately; after restarting, run the MSI repair action if the helper still reports a
+missing or unusable driver.
 
 > [!NOTE]
 > A direct Sunshine launch cannot access the Virtual HID report interface, even when run as Administrator. Run the

@@ -308,6 +308,48 @@ TEST_F(virtual_hid_input_test, StartsInProbingState) {
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::probing);
 }
 
+TEST(VirtualHidFeatureFramingTest, EncodesRequestWithReportIdAndZeroPadding) {
+  LUMEN_VHID_CLAIM_SESSION_REQUEST request {};
+  request.header = response_header(LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION, sizeof(request));
+  request.required_capabilities = LUMEN_VHID_CAP_REQUIRED;
+  platf::win_input::virtual_hid_feature_report_t report;
+  report.fill(0xA5);
+
+  ASSERT_TRUE(platf::win_input::encode_virtual_hid_feature_request(&request, sizeof(request), report));
+  EXPECT_EQ(report[0], LUMEN_VHID_FEATURE_REQUEST_REPORT_ID);
+  EXPECT_EQ(std::memcmp(report.data() + 1, &request, sizeof(request)), 0);
+  EXPECT_TRUE(std::ranges::all_of(report.begin() + sizeof(request) + 1, report.end(), [](std::uint8_t byte) {
+    return byte == 0;
+  }));
+}
+
+TEST(VirtualHidFeatureFramingTest, DecodesResponseAndRequiresExactZeroPadding) {
+  LUMEN_VHID_SUBMIT_REPORT_RESPONSE expected {};
+  expected.header = response_header(LUMEN_VHID_OPERATION_SUBMIT_INPUT_REPORT, sizeof(expected));
+  expected.session_token = initial_session_token;
+  expected.accepted_sequence = 42;
+  platf::win_input::virtual_hid_feature_report_t report {};
+  report[0] = LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID;
+  std::memcpy(report.data() + 1, &expected, sizeof(expected));
+
+  LUMEN_VHID_SUBMIT_REPORT_RESPONSE actual {};
+  ASSERT_TRUE(platf::win_input::decode_virtual_hid_feature_response(report, &actual, sizeof(actual)));
+  EXPECT_EQ(std::memcmp(&actual, &expected, sizeof(actual)), 0);
+
+  report.back() = 1;
+  EXPECT_FALSE(platf::win_input::decode_virtual_hid_feature_response(report, &actual, sizeof(actual)));
+}
+
+TEST(VirtualHidFeatureFramingTest, RejectsWrongIdsAndOversizedPayloads) {
+  platf::win_input::virtual_hid_feature_report_t report {};
+  std::array<std::uint8_t, LUMEN_VHID_FEATURE_PAYLOAD_SIZE + 1> oversized {};
+  EXPECT_FALSE(platf::win_input::encode_virtual_hid_feature_request(oversized.data(), oversized.size(), report));
+
+  report[0] = LUMEN_VHID_FEATURE_REQUEST_REPORT_ID;
+  std::uint8_t response = 0;
+  EXPECT_FALSE(platf::win_input::decode_virtual_hid_feature_response(report, &response, sizeof(response)));
+}
+
 TEST_F(virtual_hid_input_test, InitializesThroughHandshakeClaimAndNeutralReports) {
   ASSERT_TRUE(transport->initialize());
 

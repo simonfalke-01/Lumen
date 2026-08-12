@@ -204,7 +204,7 @@ For ARM64: To build frontend, you also need to install [Node.JS](https://nodejs.
 ##### Lumen Virtual HID driver
 
 The Windows application and Lumen Virtual HID driver use separate toolchains. Continue to build the application in
-MSYS2 UCRT64 for AMD64 or MSYS2 CLANGARM64 for ARM64. Build the KMDF/VHF driver with MSVC from Visual Studio and the
+MSYS2 UCRT64 for AMD64 or MSYS2 CLANGARM64 for ARM64. Build the UMDF HID driver with MSVC from Visual Studio and the
 Windows Driver Kit (WDK); do not build the driver with the MSYS2 application toolchain.
 
 Install [Visual Studio 2022](https://visualstudio.microsoft.com/vs/) with the **Desktop development with C++** workload,
@@ -222,18 +222,16 @@ msbuild src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj /m /t:Bu
 | AMD64                    | MSYS2 UCRT64          | x64             | `src/platform/windows/virtual_hid_driver/build/x64/Release/package` |
 | ARM64                    | MSYS2 CLANGARM64      | ARM64           | `src/platform/windows/virtual_hid_driver/build/ARM64/Release/package` |
 
-Each package supplied to CMake contains `LumenVirtualHid.inf`, `LumenVirtualHid.cat`, `LumenVirtualHid.sys`, and the
-test-signing certificate `LumenVirtualHid.cer`. CI or local packaging may
+Each package supplied to CMake contains `LumenVirtualHid.inf`, `LumenVirtualHid.cat`, `LumenVirtualHid.dll`, and the
+locally trusted signing certificate `LumenVirtualHid.cer`. CI or local packaging may
 override the MSBuild output to `cmake-build-virtual-hid-driver-<arch>/package`. Supply the package directory to the
 application CMake configure step with `SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR`. The regular CMake build does not build
 or sign the driver.
 
-Use an isolated Windows VM with Secure Boot disabled for
-[test-signed driver development](https://learn.microsoft.com/windows-hardware/drivers/install/test-signing-a-driver-package).
-The Lumen MSI trusts its bundled development certificate and enables test-signing mode to make the driver installable.
-Secure Boot must be disabled, and a restart is required before Windows will load the driver. Signing the application
-executable or installer does not satisfy Windows driver-signing requirements. The lite package remains usable through
-the `SendInput` fallback.
+The installer validates that the catalog is signed by the bundled certificate, trusts that certificate in the local
+machine `Root` and `TrustedPublisher` stores, and installs the UMDF package directly. This does not require Windows
+test-signing mode or disabling Secure Boot. Windows may still request a restart when a Plug and Play driver operation
+cannot complete immediately. The lite package remains usable through the `SendInput` fallback.
 
 ### Clone
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:

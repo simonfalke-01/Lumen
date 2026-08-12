@@ -104,6 +104,7 @@ list(PREPEND PLATFORM_LIBRARIES
         dwmapi
         dxgi
         iphlpapi
+        hid
         ksuser
         libssp.a
         libstdc++.a

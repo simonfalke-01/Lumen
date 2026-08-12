@@ -1,24 +1,27 @@
 /**
  * @file Driver.c
- * @brief Root-enumerated KMDF source driver backed by Virtual HID Framework.
+ * @brief Root-enumerated UMDF 2 HID minidriver for Lumen input injection.
  */
-
-#include <initguid.h>
 
 #include "Driver.h"
 #include "HidDescriptors.h"
 
-#define LUMEN_VHID_TRACE_INFO(message) \
-  KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "LumenVirtualHid: %s\n", message))
-#define LUMEN_VHID_TRACE_STATUS(message, status) \
-  KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-             "LumenVirtualHid: %s (0x%08X)\n", message, (ULONG) (status)))
+#include <limits.h>
 
-static VOID LumenVhidFillResponseHeader(LUMEN_VHID_MESSAGE_HEADER *header,
+#define LUMEN_VHID_RESPONSE_LEASE_MS 5000ULL
+
+/** UMDF-translated HID transfer packet using separately marshalled buffers. */
+typedef struct LUMEN_VHID_TRANSFER_PACKET {
+  BYTE *report_buffer;  /**< Complete report buffer, including its report ID. */
+  ULONG report_buffer_length;  /**< Accessible report-buffer length. */
+  BYTE report_id;  /**< Report identifier supplied by mshidumdf.sys. */
+} LUMEN_VHID_TRANSFER_PACKET;
+
+static void LumenVhidFillResponseHeader(LUMEN_VHID_MESSAGE_HEADER *header,
                                         uint16_t operation,
                                         uint16_t negotiated_minor,
                                         uint32_t total_size) {
-  RtlZeroMemory(header, sizeof(*header));
+  ZeroMemory(header, sizeof(*header));
   header->magic = LUMEN_VHID_PROTOCOL_MAGIC;
   header->protocol_major = LUMEN_VHID_PROTOCOL_MAJOR;
   header->protocol_minor = negotiated_minor;
@@ -33,7 +36,7 @@ static uint16_t LumenVhidNegotiatedMinor(uint16_t client_minor) {
 
 static NTSTATUS LumenVhidAllocateSessionToken(LUMEN_VHID_DEVICE_CONTEXT *context,
                                               uint64_t *session_token) {
-  if (context->next_session_token == UINT64_MAX || session_token == NULL) {
+  if (session_token == NULL || context->next_session_token == UINT64_MAX) {
     return STATUS_INTEGER_OVERFLOW;
   }
   ++context->next_session_token;
@@ -41,217 +44,187 @@ static NTSTATUS LumenVhidAllocateSessionToken(LUMEN_VHID_DEVICE_CONTEXT *context
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS LumenVhidSubmitRawReport(VHFHANDLE vhf_handle,
-                                         UCHAR report_id,
-                                         PVOID report_buffer,
-                                         ULONG report_size) {
-  HID_XFER_PACKET packet;
-  if (vhf_handle == NULL || report_buffer == NULL || report_size == 0) {
-    return STATUS_DEVICE_NOT_READY;
-  }
-  RtlZeroMemory(&packet, sizeof(packet));
-  packet.reportBuffer = (PUCHAR) report_buffer;
-  packet.reportBufferLen = report_size;
-  packet.reportId = report_id;
-  return VhfReadReportSubmit(vhf_handle, &packet);
-}
-
-/* Caller holds session_lock. Every collection is attempted even after failure. */
-static NTSTATUS LumenVhidSubmitNeutralState(LUMEN_VHID_DEVICE_CONTEXT *context) {
-  LUMEN_VHID_KEYBOARD_REPORT keyboard;
-  LUMEN_VHID_RELATIVE_MOUSE_REPORT relative_mouse;
-  NTSTATUS status;
-  NTSTATUS first_failure = STATUS_SUCCESS;
-
-  RtlZeroMemory(&keyboard, sizeof(keyboard));
-  keyboard.report_id = LUMEN_VHID_REPORT_ID_KEYBOARD;
-  status = LumenVhidSubmitRawReport(context->vhf_handle, keyboard.report_id,
-                                   &keyboard, (ULONG) sizeof(keyboard));
-  if (!NT_SUCCESS(status)) {
-    first_failure = status;
-  }
-
-  RtlZeroMemory(&relative_mouse, sizeof(relative_mouse));
-  relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-  status = LumenVhidSubmitRawReport(context->vhf_handle, relative_mouse.report_id,
-                                   &relative_mouse, (ULONG) sizeof(relative_mouse));
-  if (!NT_SUCCESS(status) && NT_SUCCESS(first_failure)) {
-    first_failure = status;
-  }
-
-  /* An absolute report is intentionally omitted: coordinates are stateful and
-   * no absolute value is neutral. The relative button snapshot releases the
-   * single logical mouse without moving the cursor. */
-  context->mouse_buttons = 0;
-  return first_failure;
-}
-
-static VOID LumenVhidReleaseOwnerLocked(LUMEN_VHID_DEVICE_CONTEXT *context,
-                                        WDFFILEOBJECT file_object,
-                                        uint64_t released_token) {
-  LUMEN_VHID_FILE_CONTEXT *file_context;
-  if (file_object != NULL) {
-    file_context = LumenVhidGetFileContext(file_object);
-    file_context->last_released_token = released_token;
-    file_context->last_released_sequence = context->last_sequence;
-  }
-  context->owner_file = NULL;
-  context->session_token = 0;
-  context->retired_session_token = 0;
-  context->last_sequence = 0;
-  context->session_exhausted = FALSE;
-  context->mouse_buttons = 0;
-}
-
-static NTSTATUS LumenVhidValidateRequestBuffer(WDFREQUEST request,
-                                               size_t input_length,
-                                               size_t expected_input_length,
-                                               size_t output_length,
-                                               size_t expected_output_length,
-                                               PVOID *input_buffer,
-                                               PVOID *output_buffer) {
-  NTSTATUS status;
-  if (input_buffer == NULL || output_buffer == NULL ||
-      input_length != expected_input_length || output_length != expected_output_length ||
-      input_length > LUMEN_VHID_MAX_CONTROL_SIZE ||
-      output_length > LUMEN_VHID_MAX_CONTROL_SIZE) {
-    return STATUS_INVALID_BUFFER_SIZE;
-  }
-  status = WdfRequestRetrieveInputBuffer(request, expected_input_length, input_buffer, NULL);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  return WdfRequestRetrieveOutputBuffer(request, expected_output_length, output_buffer, NULL);
-}
-
-static NTSTATUS LumenVhidHandleGetCapabilities(WDFREQUEST request,
-                                               size_t input_length,
-                                               size_t output_length,
-                                               size_t *information) {
-  LUMEN_VHID_GET_CAPABILITIES_REQUEST local_request;
-  LUMEN_VHID_GET_CAPABILITIES_REQUEST *input;
-  LUMEN_VHID_GET_CAPABILITIES_RESPONSE *output;
+static NTSTATUS LumenVhidCopyToRequest(WDFREQUEST request,
+                                       const void *source,
+                                       size_t source_size) {
+  WDFMEMORY output_memory;
+  size_t output_size;
   NTSTATUS status;
 
-  status = LumenVhidValidateRequestBuffer(request, input_length, sizeof(*input),
-                                          output_length, sizeof(*output),
-                                          (PVOID *) &input, (PVOID *) &output);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  RtlCopyMemory(&local_request, input, sizeof(local_request));
-  if (!lumen_vhid_validate_message_header(&local_request.header, sizeof(local_request),
-                                          LUMEN_VHID_OPERATION_GET_PROTOCOL_CAPABILITIES,
-                                          sizeof(local_request))) {
-    return STATUS_REVISION_MISMATCH;
-  }
-
-  RtlZeroMemory(output, sizeof(*output));
-  LumenVhidFillResponseHeader(&output->header,
-                              LUMEN_VHID_OPERATION_GET_PROTOCOL_CAPABILITIES,
-                              LumenVhidNegotiatedMinor(local_request.header.protocol_minor),
-                              (uint32_t) sizeof(*output));
-  output->capabilities = LUMEN_VHID_CAP_KNOWN_MASK;
-  output->required_capabilities = LUMEN_VHID_CAP_REQUIRED;
-  output->max_control_size = LUMEN_VHID_MAX_CONTROL_SIZE;
-  output->max_report_payload = LUMEN_VHID_MAX_REPORT_PAYLOAD;
-  output->keyboard_report_size = (uint16_t) sizeof(LUMEN_VHID_KEYBOARD_REPORT);
-  output->relative_mouse_report_size = (uint16_t) sizeof(LUMEN_VHID_RELATIVE_MOUSE_REPORT);
-  output->absolute_mouse_report_size = (uint16_t) sizeof(LUMEN_VHID_ABSOLUTE_MOUSE_REPORT);
-  output->min_minor_get_capabilities = LUMEN_VHID_MIN_MINOR_GET_PROTOCOL_CAPABILITIES;
-  output->min_minor_claim = LUMEN_VHID_MIN_MINOR_CLAIM_INPUT_SESSION;
-  output->min_minor_submit = LUMEN_VHID_MIN_MINOR_SUBMIT_INPUT_REPORT;
-  output->min_minor_reset = LUMEN_VHID_MIN_MINOR_RESET_INPUT_SESSION;
-  output->min_minor_release = LUMEN_VHID_MIN_MINOR_RELEASE_INPUT_SESSION;
-  *information = sizeof(*output);
-  return STATUS_SUCCESS;
-}
-
-static NTSTATUS LumenVhidHandleClaim(WDFDEVICE device,
-                                     WDFFILEOBJECT file_object,
-                                     WDFREQUEST request,
-                                     size_t input_length,
-                                     size_t output_length,
-                                     size_t *information) {
-  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
-  LUMEN_VHID_FILE_CONTEXT *file_context;
-  LUMEN_VHID_CLAIM_SESSION_REQUEST local_request;
-  LUMEN_VHID_CLAIM_SESSION_REQUEST *input;
-  LUMEN_VHID_CLAIM_SESSION_RESPONSE *output;
-  NTSTATUS status;
-  uint64_t token = 0;
-
-  status = LumenVhidValidateRequestBuffer(request, input_length, sizeof(*input),
-                                          output_length, sizeof(*output),
-                                          (PVOID *) &input, (PVOID *) &output);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  if (file_object == NULL) {
-    return STATUS_INVALID_HANDLE;
-  }
-  file_context = LumenVhidGetFileContext(file_object);
-  if (InterlockedCompareExchange(&file_context->closing, 0, 0) != 0) {
-    return STATUS_FILE_CLOSED;
-  }
-
-  RtlCopyMemory(&local_request, input, sizeof(local_request));
-  if (!lumen_vhid_validate_message_header(&local_request.header, sizeof(local_request),
-                                          LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION,
-                                          sizeof(local_request)) ||
-      local_request.reserved0 != 0 ||
-      (local_request.required_capabilities & ~LUMEN_VHID_CAP_KNOWN_MASK) != 0) {
+  if (source == NULL || source_size == 0) {
     return STATUS_INVALID_PARAMETER;
   }
-
-  status = WdfWaitLockAcquire(context->session_lock, NULL);
+  status = WdfRequestRetrieveOutputMemory(request, &output_memory);
   if (!NT_SUCCESS(status)) {
     return status;
   }
-  if (InterlockedCompareExchange(&file_context->closing, 0, 0) != 0) {
-    status = STATUS_FILE_CLOSED;
-  } else if (context->stopping || context->vhf_handle == NULL) {
-    status = STATUS_DEVICE_NOT_READY;
-  } else if (context->owner_file == file_object) {
-    token = context->session_token;
-    status = STATUS_SUCCESS;
-  } else if (context->owner_file != NULL) {
-    status = STATUS_SHARING_VIOLATION;
-  } else {
-    status = LumenVhidAllocateSessionToken(context, &token);
-    if (NT_SUCCESS(status)) {
-      status = LumenVhidSubmitNeutralState(context);
-    }
-    if (NT_SUCCESS(status)) {
-      context->owner_file = file_object;
-      context->session_token = token;
-      context->retired_session_token = 0;
-      context->last_sequence = 0;
-      context->session_exhausted = FALSE;
-      file_context->last_released_token = 0;
-      file_context->last_released_sequence = 0;
-      LUMEN_VHID_TRACE_INFO("writer session claimed");
-    }
+  WdfMemoryGetBuffer(output_memory, &output_size);
+  if (output_size < source_size) {
+    return STATUS_INVALID_BUFFER_SIZE;
   }
-
+  status = WdfMemoryCopyFromBuffer(output_memory, 0, (void *) source, source_size);
   if (NT_SUCCESS(status)) {
-    RtlZeroMemory(output, sizeof(*output));
-    LumenVhidFillResponseHeader(&output->header,
-                                LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION,
-                                LumenVhidNegotiatedMinor(local_request.header.protocol_minor),
-                                (uint32_t) sizeof(*output));
-    output->session_token = token;
-    output->granted_capabilities = LUMEN_VHID_CAP_KNOWN_MASK;
-    *information = sizeof(*output);
+    WdfRequestSetInformation(request, source_size);
   }
-  WdfWaitLockRelease(context->session_lock);
   return status;
 }
 
-static NTSTATUS LumenVhidSubmitValidatedReport(LUMEN_VHID_DEVICE_CONTEXT *context,
-                                              const LUMEN_VHID_SUBMIT_REPORT_REQUEST *input) {
+static NTSTATUS LumenVhidGetWritePacket(WDFREQUEST request,
+                                        LUMEN_VHID_TRANSFER_PACKET *packet) {
+  WDFMEMORY input_memory;
+  WDFMEMORY output_memory;
+  size_t input_size;
+  size_t report_id_value;
   NTSTATUS status;
+
+  if (packet == NULL) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  status = WdfRequestRetrieveOutputMemory(request, &output_memory);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  WdfMemoryGetBuffer(output_memory, &report_id_value);
+  if (report_id_value > UINT8_MAX) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  status = WdfRequestRetrieveInputMemory(request, &input_memory);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  packet->report_buffer = (BYTE *) WdfMemoryGetBuffer(input_memory, &input_size);
+  if (input_size > ULONG_MAX) {
+    return STATUS_INVALID_BUFFER_SIZE;
+  }
+  packet->report_buffer_length = (ULONG) input_size;
+  packet->report_id = (BYTE) report_id_value;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS LumenVhidGetReadPacket(WDFREQUEST request,
+                                       LUMEN_VHID_TRANSFER_PACKET *packet) {
+  WDFMEMORY input_memory;
+  WDFMEMORY output_memory;
+  size_t input_size;
+  size_t output_size;
+  BYTE *input_buffer;
+  NTSTATUS status;
+
+  if (packet == NULL) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  status = WdfRequestRetrieveInputMemory(request, &input_memory);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  input_buffer = (BYTE *) WdfMemoryGetBuffer(input_memory, &input_size);
+  if (input_size < sizeof(*input_buffer)) {
+    return STATUS_INVALID_BUFFER_SIZE;
+  }
+  status = WdfRequestRetrieveOutputMemory(request, &output_memory);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  packet->report_buffer = (BYTE *) WdfMemoryGetBuffer(output_memory, &output_size);
+  if (output_size > ULONG_MAX) {
+    return STATUS_INVALID_BUFFER_SIZE;
+  }
+  packet->report_buffer_length = (ULONG) output_size;
+  packet->report_id = input_buffer[0];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS LumenVhidCopyReportToPendingRequest(WDFREQUEST request,
+                                                    const void *report,
+                                                    size_t report_size) {
+  WDFMEMORY output_memory;
+  size_t output_size;
+  NTSTATUS status;
+
+  status = WdfRequestRetrieveOutputMemory(request, &output_memory);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  WdfMemoryGetBuffer(output_memory, &output_size);
+  if (output_size < report_size) {
+    return STATUS_INVALID_BUFFER_SIZE;
+  }
+  return WdfMemoryCopyFromBuffer(output_memory, 0, (void *) report, report_size);
+}
+
+static NTSTATUS LumenVhidCompleteOneReport(WDFQUEUE read_queue,
+                                           const void *report,
+                                           size_t report_size) {
+  WDFREQUEST read_request;
+  NTSTATUS status;
+
+  status = WdfIoQueueRetrieveNextRequest(read_queue, &read_request);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  status = LumenVhidCopyReportToPendingRequest(read_request, report, report_size);
+  WdfRequestCompleteWithInformation(read_request,
+                                    status,
+                                    NT_SUCCESS(status) ? report_size : 0);
+  return status;
+}
+
+static NTSTATUS LumenVhidReturnRequestToQueue(WDFREQUEST request,
+                                              WDFQUEUE queue,
+                                              NTSTATUS original_status) {
+  NTSTATUS status = WdfRequestForwardToIoQueue(request, queue);
+  if (!NT_SUCCESS(status)) {
+    WdfRequestComplete(request, status);
+    return status;
+  }
+  return original_status;
+}
+
+/* Caller holds session_lock. Both neutral reports are prepared before either completes. */
+static NTSTATUS LumenVhidSubmitNeutralState(LUMEN_VHID_DEVICE_CONTEXT *context) {
+  LUMEN_VHID_KEYBOARD_REPORT keyboard;
+  LUMEN_VHID_RELATIVE_MOUSE_REPORT mouse;
+  WDFREQUEST keyboard_request;
+  WDFREQUEST mouse_request;
+  NTSTATUS status;
+
+  status = WdfIoQueueRetrieveNextRequest(context->input_reads, &keyboard_request);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  status = WdfIoQueueRetrieveNextRequest(context->input_reads, &mouse_request);
+  if (!NT_SUCCESS(status)) {
+    return LumenVhidReturnRequestToQueue(keyboard_request, context->input_reads, status);
+  }
+
+  ZeroMemory(&keyboard, sizeof(keyboard));
+  keyboard.report_id = LUMEN_VHID_REPORT_ID_KEYBOARD;
+  status = LumenVhidCopyReportToPendingRequest(keyboard_request, &keyboard, sizeof(keyboard));
+  if (!NT_SUCCESS(status)) {
+    (void) LumenVhidReturnRequestToQueue(mouse_request, context->input_reads, status);
+    return LumenVhidReturnRequestToQueue(keyboard_request, context->input_reads, status);
+  }
+
+  ZeroMemory(&mouse, sizeof(mouse));
+  mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
+  status = LumenVhidCopyReportToPendingRequest(mouse_request, &mouse, sizeof(mouse));
+  if (!NT_SUCCESS(status)) {
+    (void) LumenVhidReturnRequestToQueue(keyboard_request, context->input_reads, status);
+    return LumenVhidReturnRequestToQueue(mouse_request, context->input_reads, status);
+  }
+
+  WdfRequestCompleteWithInformation(keyboard_request, STATUS_SUCCESS, sizeof(keyboard));
+  WdfRequestCompleteWithInformation(mouse_request, STATUS_SUCCESS, sizeof(mouse));
+  context->mouse_buttons = 0;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS LumenVhidSubmitValidatedReport(
+  LUMEN_VHID_DEVICE_CONTEXT *context,
+  const LUMEN_VHID_SUBMIT_REPORT_REQUEST *input) {
   size_t payload_end;
+  NTSTATUS status;
+
   if (!lumen_vhid_checked_add_size(offsetof(LUMEN_VHID_SUBMIT_REPORT_REQUEST, payload),
                                    input->payload_size, &payload_end) ||
       payload_end > sizeof(*input)) {
@@ -265,18 +238,16 @@ static NTSTATUS LumenVhidSubmitValidatedReport(LUMEN_VHID_DEVICE_CONTEXT *contex
 
   if (input->report_id == LUMEN_VHID_REPORT_ID_KEYBOARD) {
     LUMEN_VHID_KEYBOARD_REPORT report;
-    RtlCopyMemory(&report, input->payload, sizeof(report));
-    return LumenVhidSubmitRawReport(context->vhf_handle, report.report_id,
-                                   &report, (ULONG) sizeof(report));
+    CopyMemory(&report, input->payload, sizeof(report));
+    return LumenVhidCompleteOneReport(context->input_reads, &report, sizeof(report));
   }
   if (input->report_id == LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE) {
     LUMEN_VHID_RELATIVE_MOUSE_REPORT report;
-    RtlCopyMemory(&report, input->payload, sizeof(report));
+    CopyMemory(&report, input->payload, sizeof(report));
     if ((report.buttons & 0xe0u) != 0) {
       return STATUS_INVALID_PARAMETER;
     }
-    status = LumenVhidSubmitRawReport(context->vhf_handle, report.report_id,
-                                     &report, (ULONG) sizeof(report));
+    status = LumenVhidCompleteOneReport(context->input_reads, &report, sizeof(report));
     if (NT_SUCCESS(status)) {
       context->mouse_buttons = report.buttons;
     }
@@ -284,12 +255,11 @@ static NTSTATUS LumenVhidSubmitValidatedReport(LUMEN_VHID_DEVICE_CONTEXT *contex
   }
   if (input->report_id == LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE) {
     LUMEN_VHID_ABSOLUTE_MOUSE_REPORT report;
-    RtlCopyMemory(&report, input->payload, sizeof(report));
+    CopyMemory(&report, input->payload, sizeof(report));
     if ((report.buttons & 0xe0u) != 0) {
       return STATUS_INVALID_PARAMETER;
     }
-    status = LumenVhidSubmitRawReport(context->vhf_handle, report.report_id,
-                                     &report, (ULONG) sizeof(report));
+    status = LumenVhidCompleteOneReport(context->input_reads, &report, sizeof(report));
     if (NT_SUCCESS(status)) {
       context->mouse_buttons = report.buttons;
       context->absolute_x = report.x;
@@ -300,399 +270,507 @@ static NTSTATUS LumenVhidSubmitValidatedReport(LUMEN_VHID_DEVICE_CONTEXT *contex
   return STATUS_INVALID_PARAMETER;
 }
 
-static NTSTATUS LumenVhidHandleSubmit(WDFDEVICE device,
-                                      WDFFILEOBJECT file_object,
-                                      WDFREQUEST request,
-                                      size_t input_length,
-                                      size_t output_length,
-                                      size_t *information) {
-  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
-  LUMEN_VHID_FILE_CONTEXT *file_context;
-  LUMEN_VHID_SUBMIT_REPORT_REQUEST local_request;
-  LUMEN_VHID_SUBMIT_REPORT_REQUEST *input;
-  LUMEN_VHID_SUBMIT_REPORT_RESPONSE *output;
-  NTSTATUS status;
-
-  status = LumenVhidValidateRequestBuffer(request, input_length, sizeof(*input),
-                                          output_length, sizeof(*output),
-                                          (PVOID *) &input, (PVOID *) &output);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  if (file_object == NULL) {
-    return STATUS_INVALID_HANDLE;
-  }
-  file_context = LumenVhidGetFileContext(file_object);
-  if (InterlockedCompareExchange(&file_context->closing, 0, 0) != 0) {
-    return STATUS_FILE_CLOSED;
+static NTSTATUS LumenVhidHandleGetCapabilities(
+  const LUMEN_VHID_GET_CAPABILITIES_REQUEST *input,
+  LUMEN_VHID_GET_CAPABILITIES_RESPONSE *output,
+  size_t *output_size) {
+  if (!lumen_vhid_validate_message_header(&input->header, sizeof(*input),
+                                          LUMEN_VHID_OPERATION_GET_PROTOCOL_CAPABILITIES,
+                                          sizeof(*input))) {
+    return STATUS_REVISION_MISMATCH;
   }
 
-  RtlCopyMemory(&local_request, input, sizeof(local_request));
-  if (!lumen_vhid_validate_message_header(&local_request.header, sizeof(local_request),
-                                          LUMEN_VHID_OPERATION_SUBMIT_INPUT_REPORT,
-                                          sizeof(local_request)) ||
-      local_request.reserved0 != 0 || local_request.reserved1 != 0) {
-    return STATUS_INVALID_PARAMETER;
-  }
-
-  status = WdfWaitLockAcquire(context->session_lock, NULL);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  if (InterlockedCompareExchange(&file_context->closing, 0, 0) != 0) {
-    status = STATUS_FILE_CLOSED;
-  } else if (context->stopping || context->vhf_handle == NULL) {
-    status = STATUS_DEVICE_NOT_READY;
-  } else if (context->owner_file != file_object ||
-             local_request.session_token == 0 ||
-             local_request.session_token != context->session_token) {
-    status = STATUS_ACCESS_DENIED;
-  } else if (!lumen_vhid_is_next_sequence(context->last_sequence,
-                                           context->session_exhausted,
-                                           local_request.sequence)) {
-    status = STATUS_INVALID_DEVICE_STATE;
-  } else {
-    status = LumenVhidSubmitValidatedReport(context, &local_request);
-    if (NT_SUCCESS(status)) {
-      context->last_sequence = local_request.sequence;
-      context->session_exhausted = local_request.sequence == UINT64_MAX;
-      RtlZeroMemory(output, sizeof(*output));
-      LumenVhidFillResponseHeader(&output->header,
-                                  LUMEN_VHID_OPERATION_SUBMIT_INPUT_REPORT,
-                                  LumenVhidNegotiatedMinor(local_request.header.protocol_minor),
-                                  (uint32_t) sizeof(*output));
-      output->session_token = context->session_token;
-      output->accepted_sequence = context->last_sequence;
-      *information = sizeof(*output);
-    }
-  }
-  WdfWaitLockRelease(context->session_lock);
-  return status;
+  ZeroMemory(output, sizeof(*output));
+  LumenVhidFillResponseHeader(&output->header,
+                              LUMEN_VHID_OPERATION_GET_PROTOCOL_CAPABILITIES,
+                              LumenVhidNegotiatedMinor(input->header.protocol_minor),
+                              (uint32_t) sizeof(*output));
+  output->capabilities = LUMEN_VHID_CAP_KNOWN_MASK;
+  output->required_capabilities = LUMEN_VHID_CAP_REQUIRED;
+  output->max_control_size = LUMEN_VHID_MAX_CONTROL_SIZE;
+  output->max_report_payload = LUMEN_VHID_MAX_REPORT_PAYLOAD;
+  output->keyboard_report_size = (uint16_t) sizeof(LUMEN_VHID_KEYBOARD_REPORT);
+  output->relative_mouse_report_size = (uint16_t) sizeof(LUMEN_VHID_RELATIVE_MOUSE_REPORT);
+  output->absolute_mouse_report_size = (uint16_t) sizeof(LUMEN_VHID_ABSOLUTE_MOUSE_REPORT);
+  output->min_minor_get_capabilities = LUMEN_VHID_MIN_MINOR_GET_PROTOCOL_CAPABILITIES;
+  output->min_minor_claim = LUMEN_VHID_MIN_MINOR_CLAIM_INPUT_SESSION;
+  output->min_minor_submit = LUMEN_VHID_MIN_MINOR_SUBMIT_INPUT_REPORT;
+  output->min_minor_reset = LUMEN_VHID_MIN_MINOR_RESET_INPUT_SESSION;
+  output->min_minor_release = LUMEN_VHID_MIN_MINOR_RELEASE_INPUT_SESSION;
+  *output_size = sizeof(*output);
+  return STATUS_SUCCESS;
 }
 
-static NTSTATUS LumenVhidHandleReset(WDFDEVICE device,
+static NTSTATUS LumenVhidHandleClaim(LUMEN_VHID_DEVICE_CONTEXT *context,
                                      WDFFILEOBJECT file_object,
-                                     WDFREQUEST request,
-                                     size_t input_length,
-                                     size_t output_length,
-                                     size_t *information) {
-  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
-  LUMEN_VHID_FILE_CONTEXT *file_context;
-  LUMEN_VHID_SESSION_REQUEST local_request;
-  LUMEN_VHID_SESSION_REQUEST *input;
-  LUMEN_VHID_SESSION_RESPONSE *output;
+                                     const LUMEN_VHID_CLAIM_SESSION_REQUEST *input,
+                                     LUMEN_VHID_CLAIM_SESSION_RESPONSE *output,
+                                     size_t *output_size) {
+  uint64_t token;
   NTSTATUS status;
-  uint64_t new_token = 0;
 
-  status = LumenVhidValidateRequestBuffer(request, input_length, sizeof(*input),
-                                          output_length, sizeof(*output),
-                                          (PVOID *) &input, (PVOID *) &output);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  if (file_object == NULL) {
-    return STATUS_INVALID_HANDLE;
-  }
-  file_context = LumenVhidGetFileContext(file_object);
-  RtlCopyMemory(&local_request, input, sizeof(local_request));
-  if (!lumen_vhid_validate_message_header(&local_request.header, sizeof(local_request),
-                                          LUMEN_VHID_OPERATION_RESET_INPUT_SESSION,
-                                          sizeof(local_request)) ||
-      local_request.reserved0 != 0 || local_request.session_token == 0) {
+  if (!lumen_vhid_validate_message_header(&input->header, sizeof(*input),
+                                          LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION,
+                                          sizeof(*input)) ||
+      input->reserved0 != 0 ||
+      (input->required_capabilities & ~LUMEN_VHID_CAP_KNOWN_MASK) != 0) {
     return STATUS_INVALID_PARAMETER;
   }
 
-  status = WdfWaitLockAcquire(context->session_lock, NULL);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  if (InterlockedCompareExchange(&file_context->closing, 0, 0) != 0) {
-    status = STATUS_FILE_CLOSED;
-  } else if (context->stopping || context->vhf_handle == NULL) {
-    status = STATUS_DEVICE_NOT_READY;
-  } else if (context->owner_file != file_object) {
-    status = STATUS_ACCESS_DENIED;
-  } else if (local_request.session_token == context->retired_session_token) {
-    new_token = context->session_token;
-    status = STATUS_SUCCESS;
-  } else if (local_request.session_token != context->session_token) {
-    status = STATUS_ACCESS_DENIED;
-  } else if (context->next_session_token == UINT64_MAX) {
-    status = STATUS_INTEGER_OVERFLOW;
+  if (file_object != NULL && context->owner_file == file_object) {
+    token = context->session_token;
   } else {
-    status = LumenVhidSubmitNeutralState(context);
-    if (NT_SUCCESS(status)) {
-      context->retired_session_token = context->session_token;
-      status = LumenVhidAllocateSessionToken(context, &new_token);
-      if (NT_SUCCESS(status)) {
-        context->session_token = new_token;
-        context->last_sequence = 0;
-        context->session_exhausted = FALSE;
-        LUMEN_VHID_TRACE_INFO("writer session reset and neutralized");
+    if (context->owner_file != NULL) {
+      status = LumenVhidSubmitNeutralState(context);
+      if (!NT_SUCCESS(status)) {
+        return status;
       }
     }
+    status = LumenVhidAllocateSessionToken(context, &token);
+    if (!NT_SUCCESS(status)) {
+      return status;
+    }
+    context->owner_file = file_object;
+    context->session_token = token;
+    context->retired_session_token = 0;
+    context->last_sequence = 0;
+    context->session_exhausted = FALSE;
   }
+  context->last_activity_ms = GetTickCount64();
 
-  if (NT_SUCCESS(status)) {
-    RtlZeroMemory(output, sizeof(*output));
-    LumenVhidFillResponseHeader(&output->header,
-                                LUMEN_VHID_OPERATION_RESET_INPUT_SESSION,
-                                LumenVhidNegotiatedMinor(local_request.header.protocol_minor),
-                                (uint32_t) sizeof(*output));
-    output->session_token = new_token;
-    output->last_sequence = 0;
-    *information = sizeof(*output);
-  }
-  WdfWaitLockRelease(context->session_lock);
-  return status;
+  ZeroMemory(output, sizeof(*output));
+  LumenVhidFillResponseHeader(&output->header,
+                              LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION,
+                              LumenVhidNegotiatedMinor(input->header.protocol_minor),
+                              (uint32_t) sizeof(*output));
+  output->session_token = token;
+  output->granted_capabilities = LUMEN_VHID_CAP_KNOWN_MASK;
+  *output_size = sizeof(*output);
+  return STATUS_SUCCESS;
 }
 
-static NTSTATUS LumenVhidHandleRelease(WDFDEVICE device,
-                                       WDFFILEOBJECT file_object,
-                                       WDFREQUEST request,
-                                       size_t input_length,
-                                       size_t output_length,
-                                       size_t *information) {
-  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
-  LUMEN_VHID_FILE_CONTEXT *file_context;
-  LUMEN_VHID_SESSION_REQUEST local_request;
-  LUMEN_VHID_SESSION_REQUEST *input;
-  LUMEN_VHID_SESSION_RESPONSE *output;
+static NTSTATUS LumenVhidHandleSubmit(LUMEN_VHID_DEVICE_CONTEXT *context,
+                                      WDFFILEOBJECT file_object,
+                                      const LUMEN_VHID_SUBMIT_REPORT_REQUEST *input,
+                                      LUMEN_VHID_SUBMIT_REPORT_RESPONSE *output,
+                                      size_t *output_size) {
   NTSTATUS status;
-  uint64_t final_sequence = 0;
 
-  status = LumenVhidValidateRequestBuffer(request, input_length, sizeof(*input),
-                                          output_length, sizeof(*output),
-                                          (PVOID *) &input, (PVOID *) &output);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  if (file_object == NULL) {
-    return STATUS_INVALID_HANDLE;
-  }
-  file_context = LumenVhidGetFileContext(file_object);
-  RtlCopyMemory(&local_request, input, sizeof(local_request));
-  if (!lumen_vhid_validate_message_header(&local_request.header, sizeof(local_request),
-                                          LUMEN_VHID_OPERATION_RELEASE_INPUT_SESSION,
-                                          sizeof(local_request)) ||
-      local_request.reserved0 != 0 || local_request.session_token == 0) {
+  if (!lumen_vhid_validate_message_header(&input->header, sizeof(*input),
+                                          LUMEN_VHID_OPERATION_SUBMIT_INPUT_REPORT,
+                                          sizeof(*input)) ||
+      input->reserved0 != 0 || input->reserved1 != 0) {
     return STATUS_INVALID_PARAMETER;
   }
-
-  status = WdfWaitLockAcquire(context->session_lock, NULL);
+  if ((context->owner_file != NULL && context->owner_file != file_object) ||
+      input->session_token == 0 || input->session_token != context->session_token) {
+    return STATUS_ACCESS_DENIED;
+  }
+  if (!lumen_vhid_is_next_sequence(context->last_sequence,
+                                   context->session_exhausted,
+                                   input->sequence)) {
+    return STATUS_INVALID_DEVICE_STATE;
+  }
+  status = LumenVhidSubmitValidatedReport(context, input);
   if (!NT_SUCCESS(status)) {
     return status;
   }
-  if (InterlockedCompareExchange(&file_context->closing, 0, 0) != 0) {
-    status = STATUS_FILE_CLOSED;
-  } else if (file_context->last_released_token == local_request.session_token) {
-    final_sequence = file_context->last_released_sequence;
-    status = STATUS_SUCCESS;
-  } else if (context->owner_file != file_object ||
-             context->session_token != local_request.session_token) {
-    status = STATUS_ACCESS_DENIED;
-  } else if (context->stopping || context->vhf_handle == NULL) {
-    status = STATUS_DEVICE_NOT_READY;
+
+  context->last_sequence = input->sequence;
+  context->session_exhausted = input->sequence == UINT64_MAX;
+  context->last_activity_ms = GetTickCount64();
+  ZeroMemory(output, sizeof(*output));
+  LumenVhidFillResponseHeader(&output->header,
+                              LUMEN_VHID_OPERATION_SUBMIT_INPUT_REPORT,
+                              LumenVhidNegotiatedMinor(input->header.protocol_minor),
+                              (uint32_t) sizeof(*output));
+  output->session_token = context->session_token;
+  output->accepted_sequence = context->last_sequence;
+  *output_size = sizeof(*output);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS LumenVhidHandleReset(LUMEN_VHID_DEVICE_CONTEXT *context,
+                                     WDFFILEOBJECT file_object,
+                                     const LUMEN_VHID_SESSION_REQUEST *input,
+                                     LUMEN_VHID_SESSION_RESPONSE *output,
+                                     size_t *output_size) {
+  uint64_t new_token;
+  NTSTATUS status;
+
+  if (!lumen_vhid_validate_message_header(&input->header, sizeof(*input),
+                                          LUMEN_VHID_OPERATION_RESET_INPUT_SESSION,
+                                          sizeof(*input)) ||
+      input->reserved0 != 0 || input->session_token == 0) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (context->owner_file != NULL && context->owner_file != file_object) {
+    return STATUS_ACCESS_DENIED;
+  }
+  if (input->session_token == context->retired_session_token && context->session_token != 0) {
+    new_token = context->session_token;
+  } else if (input->session_token != context->session_token) {
+    return STATUS_ACCESS_DENIED;
+  } else {
+    if (context->next_session_token == UINT64_MAX) {
+      return STATUS_INTEGER_OVERFLOW;
+    }
+    status = LumenVhidSubmitNeutralState(context);
+    if (!NT_SUCCESS(status)) {
+      return status;
+    }
+    context->retired_session_token = context->session_token;
+    status = LumenVhidAllocateSessionToken(context, &new_token);
+    if (!NT_SUCCESS(status)) {
+      return status;
+    }
+    context->session_token = new_token;
+    context->last_sequence = 0;
+    context->session_exhausted = FALSE;
+  }
+  context->last_activity_ms = GetTickCount64();
+
+  ZeroMemory(output, sizeof(*output));
+  LumenVhidFillResponseHeader(&output->header,
+                              LUMEN_VHID_OPERATION_RESET_INPUT_SESSION,
+                              LumenVhidNegotiatedMinor(input->header.protocol_minor),
+                              (uint32_t) sizeof(*output));
+  output->session_token = new_token;
+  *output_size = sizeof(*output);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS LumenVhidHandleRelease(LUMEN_VHID_DEVICE_CONTEXT *context,
+                                       WDFFILEOBJECT file_object,
+                                       const LUMEN_VHID_SESSION_REQUEST *input,
+                                       LUMEN_VHID_SESSION_RESPONSE *output,
+                                       size_t *output_size) {
+  uint64_t final_sequence;
+  NTSTATUS status;
+
+  if (!lumen_vhid_validate_message_header(&input->header, sizeof(*input),
+                                          LUMEN_VHID_OPERATION_RELEASE_INPUT_SESSION,
+                                          sizeof(*input)) ||
+      input->reserved0 != 0 || input->session_token == 0) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (input->session_token == context->last_released_token &&
+      (context->owner_file == file_object || context->owner_file == NULL || file_object == NULL)) {
+    final_sequence = context->last_released_sequence;
+  } else if (input->session_token != context->session_token) {
+    return STATUS_ACCESS_DENIED;
   } else {
     final_sequence = context->last_sequence;
     status = LumenVhidSubmitNeutralState(context);
-    if (NT_SUCCESS(status)) {
-      LumenVhidReleaseOwnerLocked(context, file_object, local_request.session_token);
-      LUMEN_VHID_TRACE_INFO("writer session neutralized and released");
+    if (!NT_SUCCESS(status)) {
+      return status;
     }
+    context->last_released_token = context->session_token;
+    context->last_released_sequence = final_sequence;
+    context->owner_file = NULL;
+    context->session_token = 0;
+    context->retired_session_token = 0;
+    context->last_sequence = 0;
+    context->session_exhausted = FALSE;
+    context->last_activity_ms = GetTickCount64();
   }
 
+  ZeroMemory(output, sizeof(*output));
+  LumenVhidFillResponseHeader(&output->header,
+                              LUMEN_VHID_OPERATION_RELEASE_INPUT_SESSION,
+                              LumenVhidNegotiatedMinor(input->header.protocol_minor),
+                              (uint32_t) sizeof(*output));
+  output->session_token = input->session_token;
+  output->last_sequence = final_sequence;
+  *output_size = sizeof(*output);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS LumenVhidDispatchProtocol(LUMEN_VHID_DEVICE_CONTEXT *context,
+                                          WDFFILEOBJECT file_object,
+                                          const uint8_t *request_payload,
+                                          uint8_t *response_payload,
+                                          size_t *response_size) {
+  union {
+    LUMEN_VHID_GET_CAPABILITIES_REQUEST get_capabilities;
+    LUMEN_VHID_CLAIM_SESSION_REQUEST claim;
+    LUMEN_VHID_SUBMIT_REPORT_REQUEST submit;
+    LUMEN_VHID_SESSION_REQUEST session;
+  } local_request;
+  union {
+    LUMEN_VHID_GET_CAPABILITIES_RESPONSE get_capabilities;
+    LUMEN_VHID_CLAIM_SESSION_RESPONSE claim;
+    LUMEN_VHID_SUBMIT_REPORT_RESPONSE submit;
+    LUMEN_VHID_SESSION_RESPONSE session;
+  } local_response;
+  LUMEN_VHID_MESSAGE_HEADER header;
+  NTSTATUS status;
+
+  CopyMemory(&header, request_payload, sizeof(header));
+  if (header.total_size > LUMEN_VHID_MAX_CONTROL_SIZE ||
+      header.total_size < sizeof(header)) {
+    return STATUS_INVALID_BUFFER_SIZE;
+  }
+  ZeroMemory(&local_request, sizeof(local_request));
+  ZeroMemory(&local_response, sizeof(local_response));
+  switch (header.operation) {
+    case LUMEN_VHID_OPERATION_GET_PROTOCOL_CAPABILITIES:
+      CopyMemory(&local_request.get_capabilities,
+                 request_payload,
+                 sizeof(local_request.get_capabilities));
+      status = LumenVhidHandleGetCapabilities(&local_request.get_capabilities,
+                                              &local_response.get_capabilities,
+                                              response_size);
+      break;
+    case LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION:
+      CopyMemory(&local_request.claim, request_payload, sizeof(local_request.claim));
+      status = LumenVhidHandleClaim(context,
+                                    file_object,
+                                    &local_request.claim,
+                                    &local_response.claim,
+                                    response_size);
+      break;
+    case LUMEN_VHID_OPERATION_SUBMIT_INPUT_REPORT:
+      CopyMemory(&local_request.submit, request_payload, sizeof(local_request.submit));
+      status = LumenVhidHandleSubmit(context,
+                                     file_object,
+                                     &local_request.submit,
+                                     &local_response.submit,
+                                     response_size);
+      break;
+    case LUMEN_VHID_OPERATION_RESET_INPUT_SESSION:
+      CopyMemory(&local_request.session, request_payload, sizeof(local_request.session));
+      status = LumenVhidHandleReset(context,
+                                    file_object,
+                                    &local_request.session,
+                                    &local_response.session,
+                                    response_size);
+      break;
+    case LUMEN_VHID_OPERATION_RELEASE_INPUT_SESSION:
+      CopyMemory(&local_request.session, request_payload, sizeof(local_request.session));
+      status = LumenVhidHandleRelease(context,
+                                      file_object,
+                                      &local_request.session,
+                                      &local_response.session,
+                                      response_size);
+      break;
+    default:
+      return STATUS_INVALID_DEVICE_REQUEST;
+  }
   if (NT_SUCCESS(status)) {
-    RtlZeroMemory(output, sizeof(*output));
-    LumenVhidFillResponseHeader(&output->header,
-                                LUMEN_VHID_OPERATION_RELEASE_INPUT_SESSION,
-                                LumenVhidNegotiatedMinor(local_request.header.protocol_minor),
-                                (uint32_t) sizeof(*output));
-    output->session_token = local_request.session_token;
-    output->last_sequence = final_sequence;
-    *information = sizeof(*output);
+    CopyMemory(response_payload, &local_response, *response_size);
+  }
+  return status;
+}
+
+static NTSTATUS LumenVhidSetFeature(LUMEN_VHID_DEVICE_CONTEXT *context,
+                                    WDFREQUEST request) {
+  LUMEN_VHID_TRANSFER_PACKET packet;
+  WDFFILEOBJECT file_object = WdfRequestGetFileObject(request);
+  LUMEN_VHID_FILE_CONTEXT *file_context = NULL;
+  uint8_t local_response[LUMEN_VHID_FEATURE_PAYLOAD_SIZE];
+  size_t response_size = 0;
+  NTSTATUS status;
+
+  status = LumenVhidGetWritePacket(request, &packet);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  if (packet.report_id != LUMEN_VHID_FEATURE_REQUEST_REPORT_ID ||
+      packet.report_buffer_length != LUMEN_VHID_FEATURE_REPORT_SIZE ||
+      packet.report_buffer[0] != LUMEN_VHID_FEATURE_REQUEST_REPORT_ID) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  if (file_object != NULL) {
+    file_context = LumenVhidGetFileContext(file_object);
+  }
+  if (file_context != NULL && file_context->closing) {
+    return STATUS_FILE_CLOSED;
+  }
+
+  ZeroMemory(local_response, sizeof(local_response));
+  status = WdfWaitLockAcquire(context->session_lock, NULL);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  if (context->feature_response_size != 0) {
+    ULONGLONG age_ms = GetTickCount64() - context->response_started_ms;
+    if (age_ms <= LUMEN_VHID_RESPONSE_LEASE_MS) {
+      WdfWaitLockRelease(context->session_lock);
+      return STATUS_DEVICE_BUSY;
+    }
+    context->response_file = NULL;
+    context->feature_response_size = 0;
+    ZeroMemory(context->feature_response, sizeof(context->feature_response));
+  }
+  status = LumenVhidDispatchProtocol(context,
+                                     file_object,
+                                     packet.report_buffer + 1,
+                                     local_response,
+                                     &response_size);
+  if (NT_SUCCESS(status)) {
+    CopyMemory(context->feature_response, local_response, response_size);
+    if (response_size < sizeof(context->feature_response)) {
+      ZeroMemory(context->feature_response + response_size,
+                 sizeof(context->feature_response) - response_size);
+    }
+    context->feature_response_size = response_size;
+    context->response_file = file_object;
+    context->response_started_ms = GetTickCount64();
+    WdfRequestSetInformation(request, LUMEN_VHID_FEATURE_REPORT_SIZE);
   }
   WdfWaitLockRelease(context->session_lock);
   return status;
 }
 
-VOID LumenVhidEvtIoDeviceControl(WDFQUEUE queue,
+static NTSTATUS LumenVhidGetFeature(LUMEN_VHID_DEVICE_CONTEXT *context,
+                                    WDFREQUEST request) {
+  LUMEN_VHID_TRANSFER_PACKET packet;
+  WDFFILEOBJECT file_object = WdfRequestGetFileObject(request);
+  NTSTATUS status;
+
+  status = LumenVhidGetReadPacket(request, &packet);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  if (packet.report_id != LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID ||
+      packet.report_buffer_length < LUMEN_VHID_FEATURE_REPORT_SIZE) {
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  status = WdfWaitLockAcquire(context->session_lock, NULL);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  if (context->feature_response_size == 0) {
+    status = STATUS_DEVICE_NOT_READY;
+  } else if (context->response_file != NULL && file_object != NULL &&
+             context->response_file != file_object) {
+    status = STATUS_ACCESS_DENIED;
+  } else {
+    ZeroMemory(packet.report_buffer, LUMEN_VHID_FEATURE_REPORT_SIZE);
+    packet.report_buffer[0] = LUMEN_VHID_FEATURE_RESPONSE_REPORT_ID;
+    CopyMemory(packet.report_buffer + 1,
+               context->feature_response,
+               context->feature_response_size);
+    WdfRequestSetInformation(request, LUMEN_VHID_FEATURE_REPORT_SIZE);
+    context->feature_response_size = 0;
+    context->response_file = NULL;
+    context->response_started_ms = 0;
+    status = STATUS_SUCCESS;
+  }
+  WdfWaitLockRelease(context->session_lock);
+  return status;
+}
+
+void LumenVhidEvtFileCleanup(WDFFILEOBJECT file_object) {
+  WDFDEVICE device = WdfFileObjectGetDevice(file_object);
+  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
+  LUMEN_VHID_FILE_CONTEXT *file_context = LumenVhidGetFileContext(file_object);
+
+  file_context->closing = TRUE;
+  if (!NT_SUCCESS(WdfWaitLockAcquire(context->session_lock, NULL))) {
+    return;
+  }
+  if (context->response_file == file_object) {
+    context->response_file = NULL;
+    context->feature_response_size = 0;
+    ZeroMemory(context->feature_response, sizeof(context->feature_response));
+  }
+  if (context->owner_file == file_object) {
+    (void) LumenVhidSubmitNeutralState(context);
+    context->last_released_token = context->session_token;
+    context->last_released_sequence = context->last_sequence;
+    context->owner_file = NULL;
+    context->session_token = 0;
+    context->retired_session_token = 0;
+    context->last_sequence = 0;
+    context->session_exhausted = FALSE;
+  }
+  WdfWaitLockRelease(context->session_lock);
+}
+
+static NTSTATUS LumenVhidQueueReadReport(LUMEN_VHID_DEVICE_CONTEXT *context,
+                                         WDFREQUEST request,
+                                         size_t output_buffer_length,
+                                         BOOLEAN *complete_request) {
+  NTSTATUS status;
+
+  if (output_buffer_length < sizeof(LUMEN_VHID_RELATIVE_MOUSE_REPORT)) {
+    return STATUS_INVALID_BUFFER_SIZE;
+  }
+  status = WdfRequestForwardToIoQueue(request, context->input_reads);
+  if (NT_SUCCESS(status)) {
+    *complete_request = FALSE;
+  }
+  return status;
+}
+
+void LumenVhidEvtIoDeviceControl(WDFQUEUE queue,
                                  WDFREQUEST request,
                                  size_t output_buffer_length,
                                  size_t input_buffer_length,
                                  ULONG io_control_code) {
   WDFDEVICE device = WdfIoQueueGetDevice(queue);
-  WDFFILEOBJECT file_object = WdfRequestGetFileObject(request);
+  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
+  BOOLEAN complete_request = TRUE;
   NTSTATUS status;
-  size_t information = 0;
 
-  if (input_buffer_length > LUMEN_VHID_MAX_CONTROL_SIZE ||
-      output_buffer_length > LUMEN_VHID_MAX_CONTROL_SIZE ||
-      (io_control_code & 3u) != METHOD_BUFFERED) {
-    WdfRequestComplete(request, STATUS_INVALID_BUFFER_SIZE);
-    return;
-  }
+  UNREFERENCED_PARAMETER(input_buffer_length);
 
   switch (io_control_code) {
-    case IOCTL_LUMEN_VHID_GET_PROTOCOL_CAPABILITIES:
-      status = LumenVhidHandleGetCapabilities(request, input_buffer_length,
-                                              output_buffer_length, &information);
+    case IOCTL_HID_GET_DEVICE_DESCRIPTOR:
+      status = LumenVhidCopyToRequest(request,
+                                      &context->hid_descriptor,
+                                      context->hid_descriptor.bLength);
       break;
-    case IOCTL_LUMEN_VHID_CLAIM_INPUT_SESSION:
-      status = LumenVhidHandleClaim(device, file_object, request, input_buffer_length,
-                                    output_buffer_length, &information);
+    case IOCTL_HID_GET_DEVICE_ATTRIBUTES:
+      status = LumenVhidCopyToRequest(request,
+                                      &context->hid_attributes,
+                                      sizeof(context->hid_attributes));
       break;
-    case IOCTL_LUMEN_VHID_SUBMIT_INPUT_REPORT:
-      status = LumenVhidHandleSubmit(device, file_object, request, input_buffer_length,
-                                     output_buffer_length, &information);
+    case IOCTL_HID_GET_REPORT_DESCRIPTOR:
+      status = LumenVhidCopyToRequest(request,
+                                      LumenVhidReportDescriptor,
+                                      LumenVhidReportDescriptorLength);
       break;
-    case IOCTL_LUMEN_VHID_RESET_INPUT_SESSION:
-      status = LumenVhidHandleReset(device, file_object, request, input_buffer_length,
-                                    output_buffer_length, &information);
+    case IOCTL_HID_READ_REPORT:
+      status = LumenVhidQueueReadReport(context,
+                                        request,
+                                        output_buffer_length,
+                                        &complete_request);
       break;
-    case IOCTL_LUMEN_VHID_RELEASE_INPUT_SESSION:
-      status = LumenVhidHandleRelease(device, file_object, request, input_buffer_length,
-                                      output_buffer_length, &information);
+    case IOCTL_UMDF_HID_SET_FEATURE:
+      status = LumenVhidSetFeature(context, request);
+      break;
+    case IOCTL_UMDF_HID_GET_FEATURE:
+      status = LumenVhidGetFeature(context, request);
+      break;
+    case IOCTL_HID_ACTIVATE_DEVICE:
+    case IOCTL_HID_DEACTIVATE_DEVICE:
+      status = STATUS_SUCCESS;
       break;
     default:
-      status = STATUS_INVALID_DEVICE_REQUEST;
+      status = STATUS_NOT_IMPLEMENTED;
       break;
   }
 
-  if (!NT_SUCCESS(status)) {
-    LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
-    if (InterlockedCompareExchange(&context->rejection_logged, 1, 0) == 0) {
-      LUMEN_VHID_TRACE_STATUS("control request rejected (further rejects suppressed)", status);
-    }
-  }
-  WdfRequestCompleteWithInformation(request, status, information);
-}
-
-VOID LumenVhidEvtFileCleanup(WDFFILEOBJECT file_object) {
-  WDFDEVICE device = WdfFileObjectGetDevice(file_object);
-  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
-  LUMEN_VHID_FILE_CONTEXT *file_context = LumenVhidGetFileContext(file_object);
-  VHFHANDLE failed_vhf_handle = NULL;
-  NTSTATUS status = STATUS_SUCCESS;
-
-  InterlockedExchange(&file_context->closing, 1);
-  status = WdfWaitLockAcquire(context->session_lock, NULL);
-  if (!NT_SUCCESS(status)) {
-    LUMEN_VHID_TRACE_STATUS("file cleanup could not acquire session lock", status);
-    WdfDeviceSetFailed(device, WdfDeviceFailedAttemptRestart);
-    return;
-  }
-  if (context->owner_file == file_object) {
-    if (context->vhf_handle != NULL && !context->stopping) {
-      status = LumenVhidSubmitNeutralState(context);
-      if (!NT_SUCCESS(status)) {
-        /* A failed neutral report cannot leave a persistent stuck device.
-         * Stop new writes and synchronously remove VHF as the stronger fence;
-         * KMDF then restarts the root function device and recreates VHF. */
-        context->stopping = TRUE;
-        failed_vhf_handle = context->vhf_handle;
-        context->vhf_handle = NULL;
-      }
-    }
-    /* A closing file can never retain ownership, even if VHF is being removed. */
-    LumenVhidReleaseOwnerLocked(context, file_object, context->session_token);
-    if (NT_SUCCESS(status)) {
-      LUMEN_VHID_TRACE_INFO("file cleanup neutralized and released writer");
-    } else if (failed_vhf_handle == NULL) {
-      LUMEN_VHID_TRACE_STATUS("file cleanup could not submit every neutral report", status);
-    }
-  }
-  WdfWaitLockRelease(context->session_lock);
-
-  if (failed_vhf_handle != NULL) {
-    VhfDelete(failed_vhf_handle, TRUE);
-    LUMEN_VHID_TRACE_STATUS("cleanup neutralization failed; VHF removed for restart", status);
-    WdfDeviceSetFailed(device, WdfDeviceFailedAttemptRestart);
+  if (complete_request) {
+    WdfRequestComplete(request, status);
   }
 }
 
-NTSTATUS LumenVhidEvtDevicePrepareHardware(WDFDEVICE device,
-                                           WDFCMRESLIST resources_raw,
-                                           WDFCMRESLIST resources_translated) {
-  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
-  VHF_CONFIG vhf_config;
-  NTSTATUS status;
+static NTSTATUS LumenVhidCreateManualQueue(WDFDEVICE device, WDFQUEUE *queue) {
+  WDF_IO_QUEUE_CONFIG queue_config;
+  WDF_OBJECT_ATTRIBUTES queue_attributes;
 
-  UNREFERENCED_PARAMETER(resources_raw);
-  UNREFERENCED_PARAMETER(resources_translated);
-
-  status = WdfWaitLockAcquire(context->session_lock, NULL);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  if (context->vhf_handle != NULL) {
-    context->stopping = FALSE;
-    WdfWaitLockRelease(context->session_lock);
-    return STATUS_SUCCESS;
-  }
-
-  context->stopping = TRUE;
-  VHF_CONFIG_INIT(&vhf_config,
-                  WdfDeviceWdmGetDeviceObject(device),
-                  LumenVhidReportDescriptorLength,
-                  (PUCHAR) LumenVhidReportDescriptor);
-  status = VhfCreate(&vhf_config, &context->vhf_handle);
-  if (NT_SUCCESS(status)) {
-    status = VhfStart(context->vhf_handle);
-  }
-  if (!NT_SUCCESS(status) && context->vhf_handle != NULL) {
-    VhfDelete(context->vhf_handle, TRUE);
-    context->vhf_handle = NULL;
-  }
-  context->stopping = !NT_SUCCESS(status);
-  WdfWaitLockRelease(context->session_lock);
-
-  if (NT_SUCCESS(status)) {
-    LUMEN_VHID_TRACE_INFO("persistent VHF keyboard and mouse collections started");
-  } else {
-    LUMEN_VHID_TRACE_STATUS("VHF creation/start failed", status);
-  }
-  return status;
-}
-
-NTSTATUS LumenVhidEvtDeviceReleaseHardware(WDFDEVICE device,
-                                           WDFCMRESLIST resources_translated) {
-  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
-  VHFHANDLE vhf_handle;
-  NTSTATUS status;
-  NTSTATUS neutral_status = STATUS_SUCCESS;
-
-  UNREFERENCED_PARAMETER(resources_translated);
-
-  status = WdfWaitLockAcquire(context->session_lock, NULL);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  context->stopping = TRUE;
-  if (context->vhf_handle != NULL && context->owner_file != NULL) {
-    neutral_status = LumenVhidSubmitNeutralState(context);
-  }
-  if (context->owner_file != NULL) {
-    LumenVhidReleaseOwnerLocked(context, context->owner_file, context->session_token);
-  }
-  vhf_handle = context->vhf_handle;
-  context->vhf_handle = NULL;
-  WdfWaitLockRelease(context->session_lock);
-
-  if (vhf_handle != NULL) {
-    VhfDelete(vhf_handle, TRUE);
-    LUMEN_VHID_TRACE_INFO("VHF device deleted during PnP release");
-  }
-  if (!NT_SUCCESS(neutral_status)) {
-    LUMEN_VHID_TRACE_STATUS("PnP release neutral report failed before VHF delete",
-                            neutral_status);
-  }
-  /* Confirmed VHF deletion is the PnP quiescence fence. */
-  return STATUS_SUCCESS;
+  WDF_IO_QUEUE_CONFIG_INIT(&queue_config, WdfIoQueueDispatchManual);
+  WDF_OBJECT_ATTRIBUTES_INIT(&queue_attributes);
+  queue_attributes.ParentObject = device;
+  return WdfIoQueueCreate(device, &queue_config, &queue_attributes, queue);
 }
 
 NTSTATUS LumenVhidEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
-  WDF_PNPPOWER_EVENT_CALLBACKS pnp_callbacks;
   WDF_FILEOBJECT_CONFIG file_config;
   WDF_OBJECT_ATTRIBUTES file_attributes;
   WDF_OBJECT_ATTRIBUTES device_attributes;
@@ -700,48 +778,38 @@ NTSTATUS LumenVhidEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
   WDF_IO_QUEUE_CONFIG queue_config;
   WDFDEVICE device;
   LUMEN_VHID_DEVICE_CONTEXT *context;
-  DECLARE_CONST_UNICODE_STRING(system_only_sddl, L"D:P(A;;GA;;;SY)");
   NTSTATUS status;
 
   UNREFERENCED_PARAMETER(driver);
 
-  WdfDeviceInitSetDeviceType(device_init, FILE_DEVICE_UNKNOWN);
-  WdfDeviceInitSetCharacteristics(
-    device_init,
-    FILE_AUTOGENERATED_DEVICE_NAME | FILE_DEVICE_SECURE_OPEN,
-    FALSE
-  );
-  WdfDeviceInitSetIoType(device_init, WdfDeviceIoBuffered);
-  status = WdfDeviceInitAssignSDDLString(device_init, &system_only_sddl);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-
-  WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp_callbacks);
-  pnp_callbacks.EvtDevicePrepareHardware = LumenVhidEvtDevicePrepareHardware;
-  pnp_callbacks.EvtDeviceReleaseHardware = LumenVhidEvtDeviceReleaseHardware;
-  WdfDeviceInitSetPnpPowerEventCallbacks(device_init, &pnp_callbacks);
-
+  WdfFdoInitSetFilter(device_init);
   WDF_FILEOBJECT_CONFIG_INIT(&file_config,
                              WDF_NO_EVENT_CALLBACK,
                              WDF_NO_EVENT_CALLBACK,
                              LumenVhidEvtFileCleanup);
   WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&file_attributes, LUMEN_VHID_FILE_CONTEXT);
   file_attributes.ExecutionLevel = WdfExecutionLevelPassive;
-  file_attributes.SynchronizationScope = WdfSynchronizationScopeNone;
   WdfDeviceInitSetFileObjectConfig(device_init, &file_config, &file_attributes);
-
   WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&device_attributes, LUMEN_VHID_DEVICE_CONTEXT);
   device_attributes.ExecutionLevel = WdfExecutionLevelPassive;
-  device_attributes.SynchronizationScope = WdfSynchronizationScopeNone;
   status = WdfDeviceCreate(&device_init, &device_attributes, &device);
   if (!NT_SUCCESS(status)) {
     return status;
   }
 
   context = LumenVhidGetDeviceContext(device);
-  RtlZeroMemory(context, sizeof(*context));
-  context->stopping = TRUE;
+  context->device = device;
+  context->hid_descriptor.bLength = sizeof(HID_DESCRIPTOR);
+  context->hid_descriptor.bDescriptorType = HID_HID_DESCRIPTOR_TYPE;
+  context->hid_descriptor.bcdHID = HID_REVISION;
+  context->hid_descriptor.bCountry = 0;
+  context->hid_descriptor.bNumDescriptors = 1;
+  context->hid_descriptor.DescriptorList[0].bReportType = HID_REPORT_DESCRIPTOR_TYPE;
+  context->hid_descriptor.DescriptorList[0].wReportLength = LumenVhidReportDescriptorLength;
+  context->hid_attributes.Size = sizeof(HID_DEVICE_ATTRIBUTES);
+  context->hid_attributes.VendorID = LUMEN_VHID_VENDOR_ID;
+  context->hid_attributes.ProductID = LUMEN_VHID_PRODUCT_ID;
+  context->hid_attributes.VersionNumber = LUMEN_VHID_VERSION_NUMBER;
 
   WDF_OBJECT_ATTRIBUTES_INIT(&lock_attributes);
   lock_attributes.ParentObject = device;
@@ -749,39 +817,22 @@ NTSTATUS LumenVhidEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
   if (!NT_SUCCESS(status)) {
     return status;
   }
-
-  status = WdfDeviceCreateDeviceInterface(device,
-                                          &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID,
-                                          NULL);
+  status = LumenVhidCreateManualQueue(device, &context->input_reads);
   if (!NT_SUCCESS(status)) {
     return status;
   }
 
   WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queue_config, WdfIoQueueDispatchParallel);
   queue_config.EvtIoDeviceControl = LumenVhidEvtIoDeviceControl;
-  status = WdfIoQueueCreate(device, &queue_config, WDF_NO_OBJECT_ATTRIBUTES, NULL);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-
-  LUMEN_VHID_TRACE_INFO("SYSTEM-only control interface published");
-  return STATUS_SUCCESS;
+  return WdfIoQueueCreate(device, &queue_config, WDF_NO_OBJECT_ATTRIBUTES, NULL);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_path) {
   WDF_DRIVER_CONFIG config;
   WDF_OBJECT_ATTRIBUTES attributes;
-  NTSTATUS status;
 
   WDF_DRIVER_CONFIG_INIT(&config, LumenVhidEvtDeviceAdd);
   WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
   attributes.ExecutionLevel = WdfExecutionLevelPassive;
-  status = WdfDriverCreate(driver_object, registry_path, &attributes, &config,
-                           WDF_NO_HANDLE);
-  if (NT_SUCCESS(status)) {
-    LUMEN_VHID_TRACE_INFO("driver started");
-  } else {
-    LUMEN_VHID_TRACE_STATUS("WdfDriverCreate failed", status);
-  }
-  return status;
+  return WdfDriverCreate(driver_object, registry_path, &attributes, &config, WDF_NO_HANDLE);
 }
