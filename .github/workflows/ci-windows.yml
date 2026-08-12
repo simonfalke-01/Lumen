@@ -55,6 +55,7 @@ on:
 
 env:
   PYTHON_VERSION: '3.14'
+  WDK_VERSION: '10.0.26100.0'
 
 jobs:
   build_windows:
@@ -97,7 +98,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $wdkBuildProps = Join-Path `
             ${env:ProgramFiles(x86)} `
-            'Windows Kits\10\build\10.0.26100.0\WindowsDriver.Default.props'
+            "Windows Kits\10\build\$env:WDK_VERSION\WindowsDriver.Default.props"
+          $wdkHeader = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Windows Kits\10\Include\$env:WDK_VERSION\km\ntddk.h"
           if (-not (Test-Path $wdkBuildProps -PathType Leaf)) {
             winget install `
               --id Microsoft.WindowsWDK.10.0.26100 `
@@ -112,6 +116,55 @@ jobs:
           }
           if (-not (Test-Path $wdkBuildProps -PathType Leaf)) {
             throw "WDK build integration not found after installation: $wdkBuildProps"
+          }
+          if (-not (Test-Path $wdkHeader -PathType Leaf)) {
+            throw "WDK kernel headers not found after installation: $wdkHeader"
+          }
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = & $vswhere `
+            -latest `
+            -products '*' `
+            -requires Microsoft.Component.MSBuild `
+            -property installationPath | Select-Object -First 1
+          if (-not $vsInstall) {
+            throw 'Visual Studio with MSBuild was not found.'
+          }
+
+          $toolsetPattern = Join-Path `
+            $vsInstall `
+            'MSBuild\Microsoft\VC\v*\Platforms\${{ matrix.driver_platform }}\PlatformToolsets\WindowsKernelModeDriver10.0\Toolset.props'
+          $toolsetProps = @(Get-ChildItem $toolsetPattern -File -ErrorAction SilentlyContinue)
+          if ($toolsetProps.Count -eq 0) {
+            $vsSetup = Join-Path `
+              ${env:ProgramFiles(x86)} `
+              'Microsoft Visual Studio\Installer\setup.exe'
+            Push-Location $env:RUNNER_TEMP
+            try {
+              $quotedVsInstall = '"' + $vsInstall + '"'
+              $setupProcess = Start-Process `
+                -FilePath $vsSetup `
+                -ArgumentList @(
+                  'modify',
+                  '--installPath', $quotedVsInstall,
+                  '--add', 'Component.Microsoft.Windows.DriverKit',
+                  '--quiet',
+                  '--norestart'
+                ) `
+                -Wait `
+                -PassThru
+            } finally {
+              Pop-Location
+            }
+            if ($setupProcess.ExitCode -notin @(0, 3010)) {
+              throw "Visual Studio WDK component installation failed with exit code $($setupProcess.ExitCode)."
+            }
+            $toolsetProps = @(Get-ChildItem $toolsetPattern -File -ErrorAction SilentlyContinue)
+          }
+          if ($toolsetProps.Count -eq 0) {
+            throw "WDK MSBuild toolset is not registered for ${{ matrix.driver_platform }}: $toolsetPattern"
           }
 
       - name: Build and validate Lumen Virtual HID driver
@@ -154,6 +207,7 @@ jobs:
             /warnaserror `
             /p:Configuration=Release `
             /p:Platform=${{ matrix.driver_platform }} `
+            /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
             /p:OutDir="$driverBinDir\" `
             /p:IntDir="$driverObjDir\" `
             /p:SignMode=Off `
