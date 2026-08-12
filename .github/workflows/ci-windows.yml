@@ -310,10 +310,7 @@ jobs:
                 'Release packaging requires a Microsoft-signed driver artifact for ' + `
                 '${{ matrix.driver_arch }}.'
             }
-            Write-Warning `
-              'Using the locally generated unsigned Virtual HID driver package. ' + `
-              'Windows production systems will use the SendInput fallback until ' + `
-              'a Microsoft-signed driver package is configured.'
+            Write-Warning 'Using the locally generated unsigned Virtual HID driver package; SendInput remains available as a fallback.'
             $packageSource = $env:UNSIGNED_DRIVER_PACKAGE
           }
 
