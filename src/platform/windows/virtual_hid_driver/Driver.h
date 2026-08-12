@@ -6,8 +6,6 @@
 #ifndef LUMEN_VIRTUAL_HID_DRIVER_H
 #define LUMEN_VIRTUAL_HID_DRIVER_H
 
-#include "../virtual_hid_protocol.h"
-
 #define WIN32_NO_STATUS
 #include <windows.h>
 #undef WIN32_NO_STATUS
@@ -16,6 +14,8 @@
 #include <wdf.h>
 
 /* VHF requires the NT and WDF declarations above. */
+#include "../virtual_hid_protocol.h"
+
 #include <vhf.h>
 
 /** Per-open marker used to ensure requests originate from framework-owned files. */

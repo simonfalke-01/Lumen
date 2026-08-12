@@ -7,6 +7,8 @@
 
 #include "HidDescriptors.h"
 
+#include <limits.h>
+
 /** Concrete definition for the control device-interface GUID. */
 const GUID GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID = {
   0xaec36f6e,
