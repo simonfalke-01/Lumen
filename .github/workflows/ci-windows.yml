@@ -235,12 +235,12 @@ jobs:
           Import-Certificate `
             -FilePath $certificatePath `
             -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
-          & $signTool.FullName verify /kp /v $catalog.FullName
+          & $signTool.FullName verify /pa /v $catalog.FullName
           if ($LASTEXITCODE -ne 0) {
             throw "Verifying the signed Virtual HID catalog failed with exit code $LASTEXITCODE."
           }
           $driverBinary = Get-Item (Join-Path $driverPackageDir 'LumenVirtualHid.sys')
-          & $signTool.FullName verify /kp /v /c $catalog.FullName $driverBinary.FullName
+          & $signTool.FullName verify /pa /v /c $catalog.FullName $driverBinary.FullName
           if ($LASTEXITCODE -ne 0) {
             throw "The signed Virtual HID catalog does not cover the driver binary."
           }
