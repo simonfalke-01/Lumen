@@ -20,9 +20,9 @@ LumenVirtualHid.CopyFiles = 13
 LumenVirtualHid.sys = 1
 
 [Manufacturer]
-%LumenProvider% = LumenVirtualHid.Models, NT$ARCH$
+%LumenProvider% = LumenVirtualHid.Models, NT$ARCH$.10.0...16299
 
-[LumenVirtualHid.Models.NT$ARCH$]
+[LumenVirtualHid.Models.NT$ARCH$.10.0...16299]
 %LumenVirtualHid.DeviceDesc% = LumenVirtualHid.Install, ROOT\LumenVirtualHid
 
 [LumenVirtualHid.Install.NT]
