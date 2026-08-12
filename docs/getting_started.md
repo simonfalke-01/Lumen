@@ -369,6 +369,20 @@ brew uninstall sunshine
 > Installer logs can be found in the following directory:
 > `%%TEMP%/Sunshine/logs/install/`
 
+The Windows installer includes the architecture-matched Lumen Virtual HID keyboard and mouse driver. Sunshine
+automatically prefers this driver for input when it runs through `SunshineService`. If the driver is missing,
+unavailable, or incompatible, Sunshine uses the Windows `SendInput` backend for that input session and records the
+reason in the log. There is no backend setting to configure. Install and repair operations update the driver before
+starting the service and roll back if required setup fails.
+
+> [!NOTE]
+> Only the service account (`SYSTEM`) can submit Virtual HID input. Launching Sunshine directly uses `SendInput`, even
+> when it is run as Administrator. Unicode text also continues to use `SendInput` while Virtual HID handles normal
+> keyboard and mouse input.
+
+In Virtual HID mode, Windows controls the repeat cadence for held keys. The `key_repeat_delay` and
+`key_repeat_frequency` settings apply when Sunshine uses the `SendInput` fallback.
+
 > [!CAUTION]
 > You should carefully select or unselect the options you want to install. Do not blindly install or
 > enable features.
@@ -381,6 +395,9 @@ overflow menu. Different versions of Windows may provide slightly different step
 > [!WARNING]
 > By using this package instead of the installer, performance will be reduced. This package is not
 > recommended for most users. No support will be provided!
+
+The lite package does not install the Lumen Virtual HID driver. It uses `SendInput` unless a compatible driver is
+already installed and Sunshine runs through `SunshineService`.
 
 1. Download and extract based on your architecture:
 

@@ -1,0 +1,37 @@
+/** @file resource.rc @brief Version metadata for the kernel driver binary. */
+
+#include <windows.h>
+#include "resource.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION LUMEN_VHID_FILE_VERSION
+ PRODUCTVERSION LUMEN_VHID_FILE_VERSION
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DRV
+ FILESUBTYPE VFT2_DRV_SYSTEM
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "LizardByte\0"
+      VALUE "FileDescription", "Lumen Virtual HID source driver\0"
+      VALUE "FileVersion", LUMEN_VHID_FILE_VERSION_STRING
+      VALUE "InternalName", "LumenVirtualHid.sys\0"
+      VALUE "LegalCopyright", "Copyright (C) 2026 LizardByte\0"
+      VALUE "OriginalFilename", "LumenVirtualHid.sys\0"
+      VALUE "ProductName", "Lumen\0"
+      VALUE "ProductVersion", LUMEN_VHID_FILE_VERSION_STRING
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

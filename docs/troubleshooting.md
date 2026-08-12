@@ -289,6 +289,52 @@ launchctl load -w /Library/LaunchAgents/org.freedesktop.dbus-session.plist
 
 ## Windows
 
+### Virtual keyboard or mouse is unavailable
+
+Sunshine automatically uses the Lumen Virtual HID keyboard and mouse driver when a compatible driver is available to
+`SunshineService`. If discovery, access, protocol validation, or input submission fails, Sunshine records the failed
+stage and status and switches the complete keyboard and mouse input session to `SendInput`.
+
+Check the log in the web UI's `Troubleshooting` tab or at `config/sunshine.log` in the Sunshine installation directory.
+Then check the installed driver from Command Prompt:
+
+```bat
+cd /d "%ProgramFiles%\Sunshine"
+tools\lumen-vhidctl.exe status
+```
+
+The command does not require elevation. `state=installed` confirms that the root device is started and its interface is
+available; `state=absent` means the driver needs repair.
+
+If the helper reports that the driver is missing, incompatible, or unusable, rerun the architecture-matched Sunshine
+installer and select repair. Repair installs or updates the driver before restarting the service. Installer and repair
+logs are stored in `%%TEMP%/Sunshine/logs/install/`; uninstall logs are stored in
+`%%TEMP%/Sunshine/logs/uninstall/`. The helper is not included in standalone/lite packages.
+
+> [!NOTE]
+> A direct Sunshine launch cannot access the Virtual HID report interface, even when run as Administrator. Run the
+> installed `SunshineService` to use Virtual HID. Standalone/lite and development builds use `SendInput` when no
+> compatible, accessible driver is installed.
+
+If the installed driver and application use incompatible protocol versions, keep both on the same Sunshine release or
+run installer repair. Uninstalling Sunshine stops the service before removing the Virtual HID device and driver
+package. Use Windows **Installed apps** to repair or uninstall Sunshine; Windows may require a restart to finish
+removing an in-use driver.
+
+If a runtime failure cannot safely release the Virtual HID session, Sunshine stops keyboard and mouse injection for
+that input session instead of risking duplicate or stuck input. Disconnect the Moonlight client, restart
+`SunshineService`, and review the recorded failure before reconnecting.
+
+Look for one of these backend-selection messages in `sunshine.log`:
+
+```text
+Windows keyboard and mouse backend: Lumen Virtual HID
+Windows keyboard and mouse backend: SendInput fallback (stage=..., status=...)
+```
+
+`SendInput` remains subject to Windows User Interface Privilege Isolation (UIPI). It may not control an application at
+a higher integrity level, and Windows does not reliably identify UIPI as the reason an input call failed.
+
 ### No gamepad detected
 You must install ViGEmBus to use virtual gamepads. You can install this from the troubleshooting tab of the web UI.
 

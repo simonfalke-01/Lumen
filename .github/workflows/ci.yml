@@ -162,6 +162,8 @@ jobs:
       azure_signing_account: ${{ vars.AZURE_SIGNING_ACCOUNT }}
       azure_signing_cert_profile: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
       azure_signing_endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+      signed_driver_artifact_amd64: ${{ vars.SIGNED_DRIVER_ARTIFACT_AMD64 }}
+      signed_driver_artifact_arm64: ${{ vars.SIGNED_DRIVER_ARTIFACT_ARM64 }}
       publish_release: ${{ needs.release-setup.outputs.publish_release }}
       release_commit: ${{ needs.release-setup.outputs.release_commit }}
       release_version: ${{ needs.release-setup.outputs.release_version }}

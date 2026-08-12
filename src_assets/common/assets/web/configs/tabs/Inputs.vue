@@ -112,6 +112,16 @@ const config = ref(props.config)
       <div class="form-text">{{ $t('config.back_button_timeout_desc') }}</div>
     </div>
 
+    <!-- Windows keyboard and mouse backend -->
+    <div class="mb-3" v-if="platform === 'windows'">
+      <label for="windows_input_backend" class="form-label">{{ $t('config.windows_input_backend') }}</label>
+      <select id="windows_input_backend" class="form-select" v-model="config.windows_input_backend">
+        <option value="auto">{{ $t('config.windows_input_backend_auto') }}</option>
+        <option value="sendinput">{{ $t('config.windows_input_backend_sendinput') }}</option>
+      </select>
+      <div class="form-text">{{ $t('config.windows_input_backend_desc') }}</div>
+    </div>
+
     <!-- Enable Keyboard Input -->
     <hr>
     <Checkbox class="mb-3"

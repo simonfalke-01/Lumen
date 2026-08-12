@@ -847,12 +847,14 @@ namespace config {
       platf::supported_gamepads(nullptr).front().name.data(),
       platf::supported_gamepads(nullptr).front().name.size(),
     },  // Default gamepad
+    "auto",  // prefer Virtual HID with SendInput fallback on Windows
     true,  // back as touchpad click enabled (manual DS4 only)
     true,  // client gamepads with motion events are emulated as DS4
     true,  // client gamepads with touchpads are emulated as DS4
     true,  // ds5_inputtino_randomize_mac
 
     true,  // keyboard enabled
+    false,  // right alt to Windows key disabled
     true,  // mouse enabled
     true,  // controller enabled
     true,  // always send scancodes
@@ -1789,6 +1791,7 @@ namespace config {
     }
 
     string_restricted_f(vars, "gamepad"s, input.gamepad, get_supported_gamepad_options());
+    string_restricted_f(vars, "windows_input_backend", input.windows_input_backend, {"auto"sv, "sendinput"sv});
     bool_f(vars, "ds4_back_as_touchpad_click", input.ds4_back_as_touchpad_click);
     bool_f(vars, "motion_as_ds4", input.motion_as_ds4);
     bool_f(vars, "touchpad_as_ds4", input.touchpad_as_ds4);
