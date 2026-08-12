@@ -286,6 +286,9 @@ jobs:
       - name: Select installer driver package
         shell: pwsh
         env:
+          REQUIRE_SIGNED_DRIVER: >-
+            ${{ inputs.publish_release == 'true' &&
+                startsWith(github.repository, 'LizardByte/') }}
           SIGNED_DRIVER_ARTIFACT: >-
             ${{ matrix.driver_arch == 'x64' &&
                 inputs.signed_driver_artifact_amd64 ||
@@ -299,14 +302,18 @@ jobs:
           Remove-Item $selectedPackage -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $selectedPackage | Out-Null
 
-          if ('${{ inputs.publish_release }}' -eq 'true') {
-            if (-not $env:SIGNED_DRIVER_ARTIFACT) {
+          if ($env:SIGNED_DRIVER_ARTIFACT) {
+            $packageSource = Join-Path $env:GITHUB_WORKSPACE 'signed-driver-package'
+          } else {
+            if ($env:REQUIRE_SIGNED_DRIVER -eq 'true') {
               throw `
                 'Release packaging requires a Microsoft-signed driver artifact for ' + `
                 '${{ matrix.driver_arch }}.'
             }
-            $packageSource = Join-Path $env:GITHUB_WORKSPACE 'signed-driver-package'
-          } else {
+            Write-Warning `
+              'Using the locally generated unsigned Virtual HID driver package. ' + `
+              'Windows production systems will use the SendInput fallback until ' + `
+              'a Microsoft-signed driver package is configured.'
             $packageSource = $env:UNSIGNED_DRIVER_PACKAGE
           }
 
@@ -348,7 +355,7 @@ jobs:
             throw "Selected driver INF validation failed with exit code $LASTEXITCODE."
           }
 
-          if ('${{ inputs.publish_release }}' -eq 'true') {
+          if ($env:SIGNED_DRIVER_ARTIFACT) {
             $signTool = Get-ChildItem (Join-Path $kitsRoot 'bin') `
               -Recurse -File -Filter signtool.exe |
               Sort-Object FullName -Descending |
