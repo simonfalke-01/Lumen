@@ -10,8 +10,8 @@ CatalogFile = LumenVirtualHid.cat
 PnpLockdown = 1
 
 [DestinationDirs]
-DefaultDestDir = 12
-LumenVirtualHid.CopyFiles = 12
+DefaultDestDir = 13
+LumenVirtualHid.CopyFiles = 13
 
 [SourceDisksNames]
 1 = %InstallationMedia%,,,
@@ -45,7 +45,7 @@ DisplayName = %LumenVirtualHid.ServiceDesc%
 ServiceType = 1
 StartType = 3
 ErrorControl = 1
-ServiceBinary = %12%\LumenVirtualHid.sys
+ServiceBinary = %13%\LumenVirtualHid.sys
 
 [LumenVirtualHid.Install.NT.Wdf]
 KmdfService = LumenVirtualHid, LumenVirtualHid.Wdf

@@ -198,6 +198,7 @@ jobs:
           $driverObjDir = Join-Path $driverBuildDir 'obj'
           $unsignedPackageDir = Join-Path $driverBuildDir 'package-unsigned'
           New-Item -ItemType Directory -Path $driverBinDir, $driverObjDir -Force | Out-Null
+          $apiValidatorEnabled = '${{ matrix.driver_arch }}' -ne 'arm64'
 
           & $msbuild `
             $driverProject `
@@ -210,6 +211,7 @@ jobs:
             /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
             /p:OutDir="$driverBinDir\" `
             /p:IntDir="$driverObjDir\" `
+            /p:ApiValidator_Enable=$apiValidatorEnabled `
             /p:SkipPackageVerification=true `
             /p:SignMode=Off `
             /p:RunCodeAnalysis=true `
@@ -335,8 +337,9 @@ jobs:
               "Selected driver architecture is $actualMachine; expected $expectedMachine."
           }
 
-          $kitsBinRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-          $infVerif = Get-ChildItem $kitsBinRoot -Recurse -File -Filter InfVerif.exe |
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $infVerif = Get-ChildItem (Join-Path $kitsRoot 'tools') `
+            -Recurse -File -Filter InfVerif.exe |
             Sort-Object FullName -Descending |
             Select-Object -First 1
           $selectedInf = Get-ChildItem $selectedPackage -File -Filter '*.inf'
@@ -346,7 +349,8 @@ jobs:
           }
 
           if ('${{ inputs.publish_release }}' -eq 'true') {
-            $signTool = Get-ChildItem $kitsBinRoot -Recurse -File -Filter signtool.exe |
+            $signTool = Get-ChildItem (Join-Path $kitsRoot 'bin') `
+              -Recurse -File -Filter signtool.exe |
               Sort-Object FullName -Descending |
               Select-Object -First 1
             if (-not $signTool) {
