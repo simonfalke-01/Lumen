@@ -104,6 +104,7 @@
   </ItemGroup>
   <ItemGroup>
     <Inf Include="LumenVirtualHid.inf" />
+    <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="resource.rc" />

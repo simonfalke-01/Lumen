@@ -218,13 +218,9 @@ jobs:
             throw "Virtual HID driver build failed with exit code $LASTEXITCODE."
           }
 
-          $driverFiles = @{}
-          foreach ($extension in @('inf', 'sys')) {
-            $matches = @(Get-ChildItem $driverBuildDir -Recurse -File -Filter "*.$extension")
-            if ($matches.Count -ne 1) {
-              throw "Expected exactly one $extension output; found $($matches.Count)."
-            }
-            $driverFiles[$extension] = $matches[0]
+          $driverFiles = @{
+            inf = Get-Item (Join-Path $driverBinDir 'LumenVirtualHid.inf')
+            sys = Get-Item (Join-Path $driverBinDir 'LumenVirtualHid.sys')
           }
 
           Remove-Item $unsignedPackageDir -Recurse -Force -ErrorAction SilentlyContinue
