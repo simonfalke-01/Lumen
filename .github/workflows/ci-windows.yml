@@ -614,8 +614,12 @@ jobs:
 
       - name: Debug wix
         if: always()
-        shell: msys2 {0}
-        run: cat ./build/cpack_artifacts/_CPack_Packages/win64/WIX/wix.log || true
+        shell: pwsh
+        run: |
+          $wixLog = './build/cpack_artifacts/_CPack_Packages/win64/WIX/wix.log'
+          if (Test-Path $wixLog -PathType Leaf) {
+            Get-Content $wixLog
+          }
 
       - name: Initialize tray icon
         working-directory: build/tests
