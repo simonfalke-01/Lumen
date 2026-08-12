@@ -55,9 +55,6 @@ INPUT = ../README.md \
         contributing.md \
         ../third-party/doxyconfig/docs/source_code.md \
         ../src
-EXCLUDE = ../src/platform/windows/virtual_hid_driver \
-          ../src/platform/windows/virtual_hid_protocol.h
-
 # extra css
 HTML_EXTRA_STYLESHEET += doc-styles.css
 
