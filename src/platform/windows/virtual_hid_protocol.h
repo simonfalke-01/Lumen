@@ -16,7 +16,28 @@
 #define LUMEN_PLATFORM_WINDOWS_VIRTUAL_HID_PROTOCOL_H
 
 #include <stddef.h>
-#include <stdint.h>
+
+#if defined(_KERNEL_MODE)
+  typedef UCHAR uint8_t;
+  typedef SHORT int16_t;
+  typedef USHORT uint16_t;
+  typedef ULONG uint32_t;
+  typedef ULONGLONG uint64_t;
+  #ifndef UINT16_MAX
+    #define UINT16_MAX 0xffffu
+  #endif
+  #ifndef UINT64_MAX
+    #define UINT64_MAX 0xffffffffffffffffULL
+  #endif
+  #ifndef UINT64_C
+    #define UINT64_C(value) value##ULL
+  #endif
+  #ifndef SIZE_MAX
+    #define SIZE_MAX ((size_t) -1)
+  #endif
+#else
+  #include <stdint.h>
+#endif
 
 #if defined(_WIN32) || defined(_KERNEL_MODE)
   #include <guiddef.h>
