@@ -83,7 +83,7 @@ jobs:
             arch: aarch64
             driver_arch: arm64
             driver_platform: ARM64
-            inf2cat_os: 10_ARM64
+            inf2cat_os: Server10_ARM64
             msystem: clangarm64
             toolchain: clang-aarch64
     steps:
