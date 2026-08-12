@@ -227,11 +227,13 @@ jobs:
           New-Item -ItemType Directory -Path $unsignedPackageDir | Out-Null
           Copy-Item $driverFiles.inf.FullName, $driverFiles.sys.FullName -Destination $unsignedPackageDir
 
-          $kitsBinRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-          $infVerif = Get-ChildItem $kitsBinRoot -Recurse -File -Filter InfVerif.exe |
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $infVerif = Get-ChildItem (Join-Path $kitsRoot 'tools') `
+            -Recurse -File -Filter InfVerif.exe |
             Sort-Object FullName -Descending |
             Select-Object -First 1
-          $inf2Cat = Get-ChildItem $kitsBinRoot -Recurse -File -Filter Inf2Cat.exe |
+          $inf2Cat = Get-ChildItem (Join-Path $kitsRoot 'bin') `
+            -Recurse -File -Filter Inf2Cat.exe |
             Sort-Object FullName -Descending |
             Select-Object -First 1
           if (-not $infVerif -or -not $inf2Cat) {
