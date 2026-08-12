@@ -7,6 +7,8 @@
 
 #include "../virtual_hid_protocol.h"
 
+#include <limits.h>
+
 /*
  * Report 1 is an eight-bit modifier state followed by 224 one-bit
  * Keyboard/Keypad usages (00-DF). Report 2 is a five-button relative mouse

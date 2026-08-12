@@ -8,9 +8,15 @@
 
 #include "../virtual_hid_protocol.h"
 
-#include <vhf.h>
-#include <wdf.h>
+#define WIN32_NO_STATUS
 #include <windows.h>
+#undef WIN32_NO_STATUS
+
+#include <ntstatus.h>
+#include <wdf.h>
+
+/* VHF requires the NT and WDF declarations above. */
+#include <vhf.h>
 
 /** Per-open marker used to ensure requests originate from framework-owned files. */
 typedef struct LUMEN_VHID_FILE_CONTEXT {
