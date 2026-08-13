@@ -27,6 +27,20 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Validate installer script
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'src_assets/windows/misc/sunshine-setup.ps1'),
+            [ref]$null,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw 'The Windows installer script contains syntax errors.'
+          }
+
       - name: Install Windows Driver Kit
         shell: pwsh
         run: |
@@ -175,6 +189,63 @@ jobs:
             throw 'Inf2Cat did not generate exactly one catalog.'
           }
 
+          $signTool = Get-ChildItem (Join-Path $kitsRoot 'bin') `
+            -Recurse -File -Filter signtool.exe | Where-Object {
+              $_.FullName -match '\\x64\\signtool\.exe$'
+            } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signTool) {
+            throw 'The x64 SignTool was not found in the installed WDK.'
+          }
+
+          $certificate = New-SelfSignedCertificate `
+            -Subject 'CN=Lumen Virtual HID Development Driver' `
+            -FriendlyName 'Lumen Virtual HID Development Driver' `
+            -Type CodeSigningCert `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -KeyAlgorithm RSA `
+            -KeyLength 3072 `
+            -HashAlgorithm SHA256 `
+            -KeyExportPolicy Exportable `
+            -NotAfter (Get-Date).AddYears(10)
+          $certificatePath = Join-Path $driverPackageDir 'LumenVirtualHid.cer'
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'LumenVirtualHid.pfx'
+          $pfxPasswordText = [Guid]::NewGuid().ToString('N')
+          $pfxPassword = ConvertTo-SecureString $pfxPasswordText -AsPlainText -Force
+          Export-Certificate -Cert $certificate -FilePath $certificatePath -Force | Out-Null
+          Export-PfxCertificate `
+            -Cert $certificate `
+            -FilePath $pfxPath `
+            -Password $pfxPassword `
+            -Force | Out-Null
+
+          $catalog = Get-ChildItem $driverPackageDir -File -Filter '*.cat'
+          & $signTool.FullName sign `
+            /f $pfxPath `
+            /p $pfxPasswordText `
+            /fd SHA256 `
+            /v `
+            $catalog.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signing the Virtual HID catalog failed with exit code $LASTEXITCODE."
+          }
+
+          Import-Certificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+          Import-Certificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+          & $signTool.FullName verify /pa /v $catalog.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Verifying the signed Virtual HID catalog failed with exit code $LASTEXITCODE."
+          }
+          $driverBinary = Get-Item (Join-Path $driverPackageDir 'LumenVirtualHid.sys')
+          & $signTool.FullName verify /pa /v /c $catalog.FullName $driverBinary.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "The signed Virtual HID catalog does not cover the driver binary."
+          }
+          Remove-Item $pfxPath -Force
+
           "DRIVER_PACKAGE_DIR=$driverPackageDir" >> $env:GITHUB_ENV
 
       - name: Setup MSYS2 dependencies
@@ -273,8 +344,9 @@ jobs:
 
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'lumen-vhidctl.exe' | wc -l)" -ge 1
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname '*.sys' | wc -l)" -ge 1
+          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname '*.cer' | wc -l)" -ge 1
           if 7z l ../artifacts/Sunshine-Windows-AMD64-lite.zip | grep -Eiq \
-              'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|\.sys$'; then
+              'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|\.sys$|\.cer$'; then
             echo 'The lite ZIP unexpectedly contains Virtual HID installation files.'
             exit 1
           fi

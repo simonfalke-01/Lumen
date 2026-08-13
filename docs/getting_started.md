@@ -348,10 +348,6 @@ brew uninstall sunshine
 
 ### Windows
 
-> [!NOTE]
-> Sunshine supports ARM64 on Windows; however, this should be considered experimental. This version does not properly
-> support GPU scheduling and any hardware acceleration.
-
 #### Installer (recommended)
 
 > [!CAUTION]
@@ -363,7 +359,6 @@ brew uninstall sunshine
    | Architecture          | Installer                                                                                                                                    |
    |-----------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
    | AMD64/x64 (Intel/AMD) | [Sunshine-Windows-AMD64-installer.msi](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.msi) |
-   | ARM64                 | [Sunshine-Windows-ARM64-installer.msi](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-ARM64-installer.msi) |
 
 > [!TIP]
 > Installer logs can be found in the following directory:
@@ -374,6 +369,12 @@ automatically prefers this driver for input when it runs through `SunshineServic
 unavailable, or incompatible, Sunshine uses the Windows `SendInput` backend for that input session and records the
 reason in the log. There is no backend setting to configure. Install and repair operations update the driver before
 starting the service and roll back if required setup fails.
+
+> [!IMPORTANT]
+> Lumen currently ships a test-signed Virtual HID driver. Disable Secure Boot before running the MSI. The installer
+> trusts the bundled Lumen development certificate, enables Windows test-signing mode, and requests a restart. A
+> one-shot `SYSTEM` startup task finishes the driver installation after that restart. Uninstall removes the trusted
+> certificate and disables test-signing mode when Lumen enabled it, which requires one final restart.
 
 > [!NOTE]
 > Only the service account (`SYSTEM`) can submit Virtual HID input. Launching Sunshine directly uses `SendInput`, even
@@ -403,8 +404,7 @@ already installed and Sunshine runs through `SunshineService`.
 
    | Architecture          | Installer                                                                                                                          |
    |-----------------------|------------------------------------------------------------------------------------------------------------------------------------|
-   | AMD64/x64 (Intel/AMD) | [Sunshine-Windows-AMD64-lite.zip](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-lite.zip) |
-   | ARM64                 | [Sunshine-Windows-ARM64-lite.zip](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-ARM64lite.zip)  |
+   | AMD64/x64 (Intel/AMD) | `Sunshine-Windows-AMD64-lite.zip` |
 
 2. Open command prompt as administrator
 3. Firewall rules

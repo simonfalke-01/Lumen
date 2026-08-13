@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory=$false)]
     [ValidateSet(
             "install",
+            "install-driver",
             "uninstall",
             "rollback",
             "commit"
@@ -555,6 +556,218 @@ function Get-VirtualHidInfPath {
     return $infFiles[0].FullName
 }
 
+function Get-VirtualHidCertificatePath {
+    $driverDirectory = Join-Path $RootDir "drivers\virtual-hid"
+    if (-not (Test-Path $driverDirectory -PathType Container)) {
+        throw "Required Virtual HID driver directory not found: $driverDirectory"
+    }
+
+    $certificateFiles = @(Get-ChildItem -Path $driverDirectory -Filter "*.cer" -File)
+    if ($certificateFiles.Count -ne 1) {
+        throw "Expected exactly one Virtual HID certificate in $driverDirectory; found $($certificateFiles.Count)."
+    }
+    return $certificateFiles[0].FullName
+}
+
+$virtualHidInstallTaskName = "Lumen Virtual HID Driver Install"
+$virtualHidTestSigningKey = "HKLM:\SOFTWARE\Lumen\VirtualHid"
+
+function Test-SecureBootEnabled {
+    $secureBootState = Get-ItemProperty `
+        -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" `
+        -Name "UEFISecureBootEnabled" `
+        -ErrorAction SilentlyContinue
+    return $null -ne $secureBootState -and $secureBootState.UEFISecureBootEnabled -eq 1
+}
+
+function Test-TestSigningActive {
+    $systemStartOptions = Get-ItemPropertyValue `
+        -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control" `
+        -Name "SystemStartOptions" `
+        -ErrorAction SilentlyContinue
+    return [string]$systemStartOptions -match '(^|\s)TESTSIGNING($|\s)'
+}
+
+function Install-VirtualHidCertificate {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$CertificatePath
+    )
+
+    $certUtilPath = Join-Path $env:SystemRoot "System32\certutil.exe"
+    if (-not (Test-Path $certUtilPath -PathType Leaf)) {
+        throw "Required certificate utility not found: $certUtilPath"
+    }
+
+    foreach ($storeName in @("Root", "TrustedPublisher")) {
+        Write-LogMessage `
+            -Message "Trusting the Lumen Virtual HID development certificate in $storeName" `
+            -Level "Step"
+        $output = & $certUtilPath -f -addstore $storeName $CertificatePath 2>&1
+        $exitCode = $LASTEXITCODE
+        $output | ForEach-Object {
+            if ($_ -and $_.ToString().Trim()) {
+                Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
+            }
+        }
+        if ($exitCode -ne 0) {
+            throw "Installing the Virtual HID certificate in $storeName failed with exit code $exitCode."
+        }
+    }
+}
+
+function Assert-VirtualHidPackageSignature {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$CertificatePath
+    )
+
+    $driverDirectory = Split-Path -Parent $CertificatePath
+    $catalogFiles = @(Get-ChildItem -Path $driverDirectory -Filter "*.cat" -File)
+    if ($catalogFiles.Count -ne 1) {
+        throw "Expected exactly one Virtual HID catalog in $driverDirectory; found $($catalogFiles.Count)."
+    }
+
+    $expectedCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $CertificatePath
+    )
+    $signature = Get-AuthenticodeSignature -LiteralPath $catalogFiles[0].FullName
+    if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+        $null -eq $signature.SignerCertificate -or
+        $signature.SignerCertificate.Thumbprint -ne $expectedCertificate.Thumbprint) {
+        throw "The Virtual HID catalog is not validly signed by the bundled certificate."
+    }
+}
+
+function Remove-VirtualHidCertificate {
+    param(
+        [string]$Thumbprint
+    )
+
+    foreach ($storeName in @("Root", "TrustedPublisher")) {
+        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+            $storeName,
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+        )
+        try {
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            foreach ($certificate in @($store.Certificates)) {
+                $matchesLumenCertificate = `
+                    $certificate.Subject -eq "CN=Lumen Virtual HID Development Driver"
+                $matchesRequestedCertificate = `
+                    [string]::IsNullOrWhiteSpace($Thumbprint) -or `
+                    $certificate.Thumbprint -eq $Thumbprint
+                if ($matchesLumenCertificate -and $matchesRequestedCertificate) {
+                    $store.Remove($certificate)
+                }
+            }
+        } finally {
+            $store.Close()
+        }
+    }
+}
+
+function Remove-VirtualHidInstallTask {
+    Unregister-ScheduledTask `
+        -TaskName $virtualHidInstallTaskName `
+        -Confirm:$false `
+        -ErrorAction SilentlyContinue
+}
+
+function Register-VirtualHidInstallTask {
+    $powerShellPath = Join-Path `
+        $env:SystemRoot `
+        "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $setupScriptPath = Join-Path $RootDir "scripts\sunshine-setup.ps1"
+    $taskAction = New-ScheduledTaskAction `
+        -Execute $powerShellPath `
+        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$setupScriptPath`" -Action install-driver -Silent"
+    $taskTrigger = New-ScheduledTaskTrigger -AtStartup
+    $taskPrincipal = New-ScheduledTaskPrincipal `
+        -UserId "SYSTEM" `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
+    $taskSettings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+
+    Register-ScheduledTask `
+        -TaskName $virtualHidInstallTaskName `
+        -Action $taskAction `
+        -Trigger $taskTrigger `
+        -Principal $taskPrincipal `
+        -Settings $taskSettings `
+        -Description "Finishes installing the test-signed Lumen Virtual HID driver after restart." `
+        -Force | Out-Null
+}
+
+function Enable-VirtualHidTestSigning {
+    if (Test-SecureBootEnabled) {
+        throw "Secure Boot is enabled. Disable Secure Boot in UEFI firmware, then run the Lumen installer again so Windows can load the test-signed Virtual HID driver."
+    }
+
+    $bcdEditPath = Join-Path $env:SystemRoot "System32\bcdedit.exe"
+    if (-not (Test-Path $bcdEditPath -PathType Leaf)) {
+        throw "Required boot configuration utility not found: $bcdEditPath"
+    }
+
+    Write-LogMessage -Message "Enabling Windows test-signing mode" -Level "Step"
+    $output = & $bcdEditPath /set testsigning on 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object {
+        if ($_ -and $_.ToString().Trim()) {
+            Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
+        }
+    }
+    if ($exitCode -ne 0) {
+        throw "Enabling Windows test-signing mode failed with exit code $exitCode."
+    }
+
+    New-Item -Path $virtualHidTestSigningKey -Force | Out-Null
+    New-ItemProperty `
+        -Path $virtualHidTestSigningKey `
+        -Name "TestSigningEnabledByLumen" `
+        -PropertyType DWord `
+        -Value 1 `
+        -Force | Out-Null
+
+    Register-VirtualHidInstallTask
+    $script:RebootRequired = $true
+    Write-LogMessage `
+        -Message "Restart Windows to activate test-signing mode and finish installing the Virtual HID driver." `
+        -Level "Warning"
+}
+
+function Disable-VirtualHidTestSigningIfOwned {
+    $enabledByLumen = Get-ItemPropertyValue `
+        -LiteralPath $virtualHidTestSigningKey `
+        -Name "TestSigningEnabledByLumen" `
+        -ErrorAction SilentlyContinue
+    if ($enabledByLumen -ne 1) {
+        return
+    }
+
+    $bcdEditPath = Join-Path $env:SystemRoot "System32\bcdedit.exe"
+    if (-not (Test-Path $bcdEditPath -PathType Leaf)) {
+        throw "Required boot configuration utility not found: $bcdEditPath"
+    }
+
+    Write-LogMessage -Message "Disabling Lumen-owned Windows test-signing mode" -Level "Step"
+    $output = & $bcdEditPath /set testsigning off 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object {
+        if ($_ -and $_.ToString().Trim()) {
+            Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
+        }
+    }
+    if ($exitCode -ne 0) {
+        throw "Disabling Windows test-signing mode failed with exit code $exitCode."
+    }
+
+    Remove-Item -LiteralPath $virtualHidTestSigningKey -Recurse -Force -ErrorAction SilentlyContinue
+    $script:RebootRequired = $true
+}
+
 $programDataDirectory = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::CommonApplicationData
 )
@@ -959,7 +1172,34 @@ function Invoke-PersistedRollback {
 Write-Information ""
 
 try {
-if ($Action -eq "install") {
+if ($Action -eq "install-driver") {
+    $driverInfPath = Get-VirtualHidInfPath
+    $driverCertificatePath = Get-VirtualHidCertificatePath
+    Install-VirtualHidCertificate -CertificatePath $driverCertificatePath
+    Assert-VirtualHidPackageSignature -CertificatePath $driverCertificatePath
+
+    if (-not (Test-TestSigningActive)) {
+        throw "Windows test-signing mode is not active after restart; the Virtual HID driver cannot be loaded."
+    }
+
+    Invoke-VirtualHidCtl `
+        -Arguments @("install-or-update", "`"$driverInfPath`"") `
+        -Description "Finishing Lumen Virtual HID driver installation" | Out-Null
+    Remove-VirtualHidInstallTask
+
+    $installedService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
+    if ($null -ne $installedService) {
+        if ($installedService.Status -ne "Stopped") {
+            Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
+            $installedService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+        }
+        Start-Service -Name "SunshineService" -ErrorAction Stop
+        $installedService.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+    }
+    Write-FramedText `
+        -Message "✓ Lumen Virtual HID driver installation completed successfully!" `
+        -Level "Success"
+} elseif ($Action -eq "install") {
     Write-FramedText `
         -Message "🔅 Sunshine Installation Script" `
         -Level "Information" `
@@ -1084,6 +1324,9 @@ if ($Action -eq "install") {
         -Status "Installing Lumen Virtual HID driver" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $driverInfPath = Get-VirtualHidInfPath
+    $driverCertificatePath = Get-VirtualHidCertificatePath
+    Install-VirtualHidCertificate -CertificatePath $driverCertificatePath
+    Assert-VirtualHidPackageSignature -CertificatePath $driverCertificatePath
     $driverStatus = Invoke-VirtualHidCtl `
         -Arguments @("status") `
         -Description "Checking Lumen Virtual HID driver status" `
@@ -1103,9 +1346,14 @@ if ($Action -eq "install") {
         Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
         $existingService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
     }
-    Invoke-VirtualHidCtl `
-        -Arguments @("install-or-update", "`"$driverInfPath`"") `
-        -Description "Installing or updating the Lumen Virtual HID driver" | Out-Null
+    if (Test-TestSigningActive) {
+        Invoke-VirtualHidCtl `
+            -Arguments @("install-or-update", "`"$driverInfPath`"") `
+            -Description "Installing or updating the Lumen Virtual HID driver" | Out-Null
+        Remove-VirtualHidInstallTask
+    } else {
+        Enable-VirtualHidTestSigning
+    }
     Write-Information ""
 
     # 5. Install service
@@ -1138,7 +1386,13 @@ if ($Action -eq "install") {
     if (-not $Msi) {
         Remove-InstallRollbackArtifacts
     }
-    Write-FramedText -Message "✓ Sunshine installation completed successfully!" -Level "Success"
+    if ($script:RebootRequired) {
+        Write-FramedText `
+            -Message "✓ Lumen installed. Restart Windows to activate the Virtual HID driver." `
+            -Level "Warning"
+    } else {
+        Write-FramedText -Message "✓ Sunshine installation completed successfully!" -Level "Success"
+    }
 
     # Open documentation in browser (only if not running silently)
     if (-not $Silent) {
@@ -1165,6 +1419,8 @@ if ($Action -eq "install") {
 
     $totalSteps = 5
     $currentStep = 0
+
+    Remove-VirtualHidInstallTask
 
     $driverStatus = Invoke-VirtualHidCtl `
         -Arguments @("status") `
@@ -1211,6 +1467,8 @@ if ($Action -eq "install") {
     Invoke-VirtualHidCtl `
         -Arguments @("uninstall") `
         -Description "Removing the Lumen Virtual HID device and driver package" | Out-Null
+    Remove-VirtualHidCertificate
+    Disable-VirtualHidTestSigningIfOwned
     Write-Information ""
 
     # 3. Delete firewall rules
@@ -1280,6 +1538,22 @@ if ($Action -eq "install") {
             if ($rollbackApplied) {
                 Write-LogMessage -Message "Failed setup changes were rolled back." -Level "Success"
             }
+            if ($Action -eq "install") {
+                Remove-VirtualHidInstallTask
+                try {
+                    $bundledCertificatePath = Get-VirtualHidCertificatePath
+                    $bundledCertificate = `
+                        [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                            $bundledCertificatePath
+                        )
+                    Remove-VirtualHidCertificate -Thumbprint $bundledCertificate.Thumbprint
+                } catch {
+                    Write-LogMessage `
+                        -Message "Could not remove the bundled Virtual HID certificate: $($_.Exception.Message)" `
+                        -Level "Warning"
+                }
+                Disable-VirtualHidTestSigningIfOwned
+            }
         } catch {
             Write-LogMessage -Message $_.Exception.Message -Level "Error"
         }
@@ -1293,7 +1567,7 @@ if ($Action -eq "install") {
 Write-Information ""
 if ($script:RebootRequired) {
     Write-LogMessage `
-        -Message "Windows must be restarted to finish Virtual HID driver cleanup." `
+        -Message "Windows must be restarted to finish the Virtual HID driver operation." `
         -Level "Warning"
     # Windows Installer treats every nonzero executable custom-action result as
     # failure. The driver APIs have already scheduled their reboot work, so MSI
