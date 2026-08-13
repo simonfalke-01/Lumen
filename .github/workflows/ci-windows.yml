@@ -366,6 +366,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          dump_wix_log() {
+            find ./cpack_artifacts/_CPack_Packages/win64/WIX \
+              -type f -name wix.log \
+              -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \; 2>/dev/null || true
+          }
+          trap dump_wix_log ERR
+
           mkdir -p artifacts
           cd build
           cpack -G WIX
@@ -396,13 +403,14 @@ jobs:
           )
           function Read-MsiRows([string]$query, [int]$columns) {
             $view = $database.OpenView($query)
-            $view.Execute()
-            $rows = @()
+            [void]$view.Execute()
+            $rows = [Collections.Generic.List[object[]]]::new()
             while ($record = $view.Fetch()) {
-              $rows += ,@(1..$columns | ForEach-Object { $record.StringData($_) })
+              $row = [object[]]@(1..$columns | ForEach-Object { $record.StringData($_) })
+              $rows.Add($row)
             }
-            $view.Close()
-            return $rows
+            [void]$view.Close()
+            return ,$rows.ToArray()
           }
           $actions = Read-MsiRows `
             'SELECT `Action`,`Type`,`Source`,`Target` FROM `CustomAction`' 4
