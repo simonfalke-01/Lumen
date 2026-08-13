@@ -1,57 +1,12 @@
 ---
-name: CI-Windows
+name: Windows Build
 permissions: {}
 
 on:
-  workflow_call:
-    inputs:
-      # Azure Artifact Signing account name
-      azure_signing_account:
-        required: false
-        type: string
-        default: ''
-      # Azure Artifact Signing certificate profile name
-      azure_signing_cert_profile:
-        required: false
-        type: string
-        default: ''
-      # Azure Artifact Signing account endpoint
-      # e.g. https://<region>.codesigning.azure.net
-      azure_signing_endpoint:
-        required: false
-        type: string
-        default: ''
-      # Artifact produced by the Microsoft attestation/WHQL signing workflow.
-      # The artifact must contain exactly one x64 INF/CAT/SYS package.
-      signed_driver_artifact_amd64:
-        required: false
-        type: string
-        default: ''
-      # Artifact produced by the Microsoft attestation/WHQL signing workflow.
-      # The artifact must contain exactly one ARM64 INF/CAT/SYS package.
-      signed_driver_artifact_arm64:
-        required: false
-        type: string
-        default: ''
-      publish_release:
-        required: true
-        type: string
-      release_commit:
-        required: true
-        type: string
-      release_version:
-        required: true
-        type: string
-    secrets:
-      # Azure Client ID (App Registration) for Artifact Signing
-      AZURE_CLIENT_ID:
-        required: false
-      # Azure Client Secret for Artifact Signing
-      AZURE_CLIENT_SECRET:
-        required: false
-      # Azure Tenant ID for Artifact Signing
-      AZURE_TENANT_ID:
-        required: false
+  push:
+    branches:
+      - master
+  workflow_dispatch:
 
 env:
   PYTHON_VERSION: '3.14'
@@ -59,33 +14,13 @@ env:
 
 jobs:
   build_windows:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    name: Windows-AMD64
+    runs-on: windows-2022
     defaults:
       run:
         shell: msys2 {0}
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows-AMD64
-            os: windows-2022
-            arch: x86_64
-            driver_arch: x64
-            driver_platform: x64
-            inf2cat_os: 10_X64
-            msystem: ucrt64
-            toolchain: ucrt-x86_64
-          - name: Windows-ARM64
-            os: windows-11-arm
-            arch: aarch64
-            driver_arch: arm64
-            driver_platform: ARM64
-            inf2cat_os: Server10_ARM64
-            msystem: clangarm64
-            toolchain: clang-aarch64
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -135,39 +70,34 @@ jobs:
 
           $toolsetPattern = Join-Path `
             $vsInstall `
-            'MSBuild\Microsoft\VC\v*\Platforms\${{ matrix.driver_platform }}\PlatformToolsets\WindowsKernelModeDriver10.0\Toolset.props'
+            'MSBuild\Microsoft\VC\v*\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0\Toolset.props'
           $toolsetProps = @(Get-ChildItem $toolsetPattern -File -ErrorAction SilentlyContinue)
           if ($toolsetProps.Count -eq 0) {
             $vsSetup = Join-Path `
               ${env:ProgramFiles(x86)} `
               'Microsoft Visual Studio\Installer\setup.exe'
-            Push-Location $env:RUNNER_TEMP
-            try {
-              $quotedVsInstall = '"' + $vsInstall + '"'
-              $setupProcess = Start-Process `
-                -FilePath $vsSetup `
-                -ArgumentList @(
-                  'modify',
-                  '--installPath', $quotedVsInstall,
-                  '--add', 'Component.Microsoft.Windows.DriverKit',
-                  '--quiet',
-                  '--norestart'
-                ) `
-                -Wait `
-                -PassThru
-            } finally {
-              Pop-Location
-            }
+            $quotedVsInstall = '"' + $vsInstall + '"'
+            $setupProcess = Start-Process `
+              -FilePath $vsSetup `
+              -ArgumentList @(
+                'modify',
+                '--installPath', $quotedVsInstall,
+                '--add', 'Component.Microsoft.Windows.DriverKit',
+                '--quiet',
+                '--norestart'
+              ) `
+              -Wait `
+              -PassThru
             if ($setupProcess.ExitCode -notin @(0, 3010)) {
               throw "Visual Studio WDK component installation failed with exit code $($setupProcess.ExitCode)."
             }
             $toolsetProps = @(Get-ChildItem $toolsetPattern -File -ErrorAction SilentlyContinue)
           }
           if ($toolsetProps.Count -eq 0) {
-            throw "WDK MSBuild toolset is not registered for ${{ matrix.driver_platform }}: $toolsetPattern"
+            throw "WDK MSBuild toolset is not registered for x64: $toolsetPattern"
           }
 
-      - name: Build and validate Lumen Virtual HID driver
+      - name: Build Virtual HID driver
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -175,10 +105,6 @@ jobs:
           $driverProject = Join-Path `
             $env:GITHUB_WORKSPACE `
             'src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj'
-          if (-not (Test-Path $driverProject -PathType Leaf)) {
-            throw "Virtual HID driver project not found: $driverProject"
-          }
-
           $vswhere = Join-Path `
             ${env:ProgramFiles(x86)} `
             'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -191,14 +117,11 @@ jobs:
             throw 'MSBuild was not found.'
           }
 
-          $driverBuildDir = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'cmake-build-virtual-hid-driver-${{ matrix.driver_arch }}'
+          $driverBuildDir = Join-Path $env:GITHUB_WORKSPACE 'build-virtual-hid-driver'
           $driverBinDir = Join-Path $driverBuildDir 'bin'
           $driverObjDir = Join-Path $driverBuildDir 'obj'
-          $unsignedPackageDir = Join-Path $driverBuildDir 'package-unsigned'
+          $driverPackageDir = Join-Path $driverBuildDir 'package'
           New-Item -ItemType Directory -Path $driverBinDir, $driverObjDir -Force | Out-Null
-          $apiValidatorEnabled = '${{ matrix.driver_arch }}' -ne 'arm64'
 
           & $msbuild `
             $driverProject `
@@ -207,11 +130,10 @@ jobs:
             /t:Build `
             /warnaserror `
             /p:Configuration=Release `
-            /p:Platform=${{ matrix.driver_platform }} `
+            /p:Platform=x64 `
             /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
             /p:OutDir="$driverBinDir\" `
             /p:IntDir="$driverObjDir\" `
-            /p:ApiValidator_Enable=$apiValidatorEnabled `
             /p:SkipPackageVerification=true `
             /p:SignMode=Off `
             /p:RunCodeAnalysis=true `
@@ -220,14 +142,12 @@ jobs:
             throw "Virtual HID driver build failed with exit code $LASTEXITCODE."
           }
 
-          $driverFiles = @{
-            inf = Get-Item (Join-Path $driverBinDir 'LumenVirtualHid.inf')
-            sys = Get-Item (Join-Path $driverBinDir 'LumenVirtualHid.sys')
-          }
-
-          Remove-Item $unsignedPackageDir -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $unsignedPackageDir | Out-Null
-          Copy-Item $driverFiles.inf.FullName, $driverFiles.sys.FullName -Destination $unsignedPackageDir
+          Remove-Item $driverPackageDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $driverPackageDir | Out-Null
+          Copy-Item `
+            (Join-Path $driverBinDir 'LumenVirtualHid.inf'), `
+            (Join-Path $driverBinDir 'LumenVirtualHid.sys') `
+            -Destination $driverPackageDir
 
           $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
           $infVerif = Get-ChildItem (Join-Path $kitsRoot 'tools') `
@@ -242,239 +162,44 @@ jobs:
             throw 'InfVerif and Inf2Cat were not found in the installed WDK.'
           }
 
-          $packagedInf = Get-ChildItem $unsignedPackageDir -File -Filter '*.inf'
+          $packagedInf = Get-Item (Join-Path $driverPackageDir 'LumenVirtualHid.inf')
           & $infVerif.FullName /v /w $packagedInf.FullName
           if ($LASTEXITCODE -ne 0) {
             throw "InfVerif failed with exit code $LASTEXITCODE."
           }
-
-          & $inf2Cat.FullName `
-            "/driver:$unsignedPackageDir" `
-            "/os:${{ matrix.inf2cat_os }}" `
-            /verbose
+          & $inf2Cat.FullName "/driver:$driverPackageDir" /os:10_X64 /verbose
           if ($LASTEXITCODE -ne 0) {
             throw "Inf2Cat failed with exit code $LASTEXITCODE."
           }
-
-          $catalogs = @(Get-ChildItem $unsignedPackageDir -File -Filter '*.cat')
-          if ($catalogs.Count -ne 1) {
-            throw "Expected exactly one generated catalog; found $($catalogs.Count)."
+          if (@(Get-ChildItem $driverPackageDir -File -Filter '*.cat').Count -ne 1) {
+            throw 'Inf2Cat did not generate exactly one catalog.'
           }
 
-          "UNSIGNED_DRIVER_PACKAGE=$unsignedPackageDir" >> $env:GITHUB_ENV
+          "DRIVER_PACKAGE_DIR=$driverPackageDir" >> $env:GITHUB_ENV
 
-      - name: Download Microsoft-signed x64 driver package
-        if: >-
-          inputs.publish_release == 'true' &&
-          matrix.driver_arch == 'x64' &&
-          inputs.signed_driver_artifact_amd64 != ''
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
-        with:
-          name: ${{ inputs.signed_driver_artifact_amd64 }}
-          path: signed-driver-package
-
-      - name: Download Microsoft-signed ARM64 driver package
-        if: >-
-          inputs.publish_release == 'true' &&
-          matrix.driver_arch == 'arm64' &&
-          inputs.signed_driver_artifact_arm64 != ''
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
-        with:
-          name: ${{ inputs.signed_driver_artifact_arm64 }}
-          path: signed-driver-package
-
-      - name: Select installer driver package
-        shell: pwsh
-        env:
-          REQUIRE_SIGNED_DRIVER: >-
-            ${{ inputs.publish_release == 'true' &&
-                startsWith(github.repository, 'LizardByte/') }}
-          SIGNED_DRIVER_ARTIFACT: >-
-            ${{ matrix.driver_arch == 'x64' &&
-                inputs.signed_driver_artifact_amd64 ||
-                inputs.signed_driver_artifact_arm64 }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $selectedPackage = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'cmake-build-virtual-hid-driver-${{ matrix.driver_arch }}\package'
-          Remove-Item $selectedPackage -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $selectedPackage | Out-Null
-
-          if ($env:SIGNED_DRIVER_ARTIFACT) {
-            $packageSource = Join-Path $env:GITHUB_WORKSPACE 'signed-driver-package'
-          } else {
-            if ($env:REQUIRE_SIGNED_DRIVER -eq 'true') {
-              throw `
-                'Release packaging requires a Microsoft-signed driver artifact for ' + `
-                '${{ matrix.driver_arch }}.'
-            }
-            Write-Warning 'Using the locally generated unsigned Virtual HID driver package; SendInput remains available as a fallback.'
-            $packageSource = $env:UNSIGNED_DRIVER_PACKAGE
-          }
-
-          foreach ($extension in @('inf', 'cat', 'sys')) {
-            $matches = @(Get-ChildItem $packageSource -Recurse -File -Filter "*.$extension")
-            if ($matches.Count -ne 1) {
-              throw `
-                "Expected exactly one $extension in the selected driver package; " + `
-                "found $($matches.Count)."
-            }
-            Copy-Item $matches[0].FullName -Destination $selectedPackage
-          }
-
-          $selectedSys = Get-ChildItem $selectedPackage -File -Filter '*.sys'
-          $driverStream = [System.IO.File]::OpenRead($selectedSys.FullName)
-          try {
-            $peReader = [System.Reflection.PortableExecutable.PEReader]::new($driverStream)
-            $actualMachine = $peReader.PEHeaders.CoffHeader.Machine.ToString()
-          } finally {
-            if ($peReader) {
-              $peReader.Dispose()
-            }
-            $driverStream.Dispose()
-          }
-          $expectedMachine = if ('${{ matrix.driver_arch }}' -eq 'x64') { 'Amd64' } else { 'Arm64' }
-          if ($actualMachine -ne $expectedMachine) {
-            throw `
-              "Selected driver architecture is $actualMachine; expected $expectedMachine."
-          }
-
-          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
-          $infVerif = Get-ChildItem (Join-Path $kitsRoot 'tools') `
-            -Recurse -File -Filter InfVerif.exe |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          $selectedInf = Get-ChildItem $selectedPackage -File -Filter '*.inf'
-          & $infVerif.FullName /v /w $selectedInf.FullName
-          if ($LASTEXITCODE -ne 0) {
-            throw "Selected driver INF validation failed with exit code $LASTEXITCODE."
-          }
-
-          if ($env:SIGNED_DRIVER_ARTIFACT) {
-            $signTool = Get-ChildItem (Join-Path $kitsRoot 'bin') `
-              -Recurse -File -Filter signtool.exe |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1
-            if (-not $signTool) {
-              throw 'SignTool was not found in the installed WDK.'
-            }
-            $selectedCat = Get-ChildItem $selectedPackage -File -Filter '*.cat'
-            & $signTool.FullName verify /kp /v $selectedCat.FullName
-            if ($LASTEXITCODE -ne 0) {
-              throw 'The release driver catalog is not production-signed for kernel loading.'
-            }
-            & $signTool.FullName verify /kp /v /c $selectedCat.FullName $selectedSys.FullName
-            if ($LASTEXITCODE -ne 0) {
-              throw 'The release driver binary is not covered by the signed catalog.'
-            }
-          }
-
-          "DRIVER_PACKAGE_DIR=$selectedPackage" >> $env:GITHUB_ENV
-
-      - name: Setup Dependencies Windows
-        # if a dependency needs to be pinned, see https://github.com/LizardByte/build-deps/pull/186
+      - name: Setup MSYS2 dependencies
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2.32.0
         with:
-          msystem: ${{ matrix.msystem }}
+          msystem: ucrt64
           update: true
           install: >-
-            wget
+            git
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-harfbuzz
+            mingw-w64-ucrt-x86_64-libtiff
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-qt6-static
+            mingw-w64-ucrt-x86_64-toolchain
 
-      - name: Update Windows dependencies
-        env:
-          # MSYSTEM is a built-in environment variable of MSYS2.
-          # Do not use this environment variable name.
-          MATRIX_MSYSTEM: ${{ matrix.msystem }}
-          TOOLCHAIN: ${{ matrix.toolchain }}
-        shell: msys2 {0}
-        run: |
-          # variables
-          declare -A pinned_deps
-
-          # dependencies
-          dependencies=(
-            "git"
-            "mingw-w64-${TOOLCHAIN}-boost"
-            "mingw-w64-${TOOLCHAIN}-cmake"
-            "mingw-w64-${TOOLCHAIN}-cppwinrt"
-            "mingw-w64-${TOOLCHAIN}-curl-winssl"
-            "mingw-w64-${TOOLCHAIN}-gcc"
-            "mingw-w64-${TOOLCHAIN}-graphviz"
-            "mingw-w64-${TOOLCHAIN}-miniupnpc"
-            "mingw-w64-${TOOLCHAIN}-nlohmann-json"
-            "mingw-w64-${TOOLCHAIN}-onevpl"
-            "mingw-w64-${TOOLCHAIN}-openssl"
-            "mingw-w64-${TOOLCHAIN}-opus"
-            "mingw-w64-${TOOLCHAIN}-toolchain"
-            "mingw-w64-${TOOLCHAIN}-qt6-static"
-          )
-
-          if [[ "${MATRIX_MSYSTEM}" == "ucrt64" ]]; then
-            dependencies+=(
-              "mingw-w64-${TOOLCHAIN}-MinHook"
-              "mingw-w64-${TOOLCHAIN}-nsis"
-            )
-          fi
-
-          # do not modify below this line
-
-          ignore_packages=()
-          tarballs=""
-          for pkg in "${!pinned_deps[@]}"; do
-            ignore_packages+=("${pkg}")
-            version="${pinned_deps[$pkg]}"
-            tarball="${pkg}-${version}-any.pkg.tar.zst"
-
-            # download working version
-            wget "https://repo.msys2.org/mingw/${MATRIX_MSYSTEM}/${tarball}"
-
-            tarballs="${tarballs} ${tarball}"
-          done
-
-          # Create the ignore string for pacman
-          ignore_list=$(IFS=,; echo "${ignore_packages[*]}")
-
-          # install pinned dependencies
-          if [ -n "${tarballs}" ]; then
-            pacman -U --noconfirm "${tarballs}"
-          fi
-
-          # Only add --ignore if we have packages to ignore
-          if [ -n "${ignore_list}" ]; then
-            pacman -Syu --noconfirm --ignore="${ignore_list}" "${dependencies[@]}"
-          else
-            pacman -Syu --noconfirm "${dependencies[@]}"
-          fi
-
-      - name: Install Doxygen
-        # GCC compiled doxygen has issues when running graphviz
-        env:
-          DOXYGEN_VERSION: "1.11.0"
-        shell: pwsh
-        run: |
-          # Set version variables
-          $doxy_ver = $env:DOXYGEN_VERSION
-          $_doxy_ver = $doxy_ver.Replace(".", "_")
-
-          # Download the Doxygen installer
-          Invoke-WebRequest -Uri `
-            "https://github.com/doxygen/doxygen/releases/download/Release_${_doxy_ver}/doxygen-${doxy_ver}-setup.exe" `
-            -OutFile "doxygen-setup.exe"
-
-          # Run the installer
-          Start-Process `
-            -FilePath .\doxygen-setup.exe `
-            -ArgumentList `
-              '/VERYSILENT' `
-          -Wait `
-          -NoNewWindow
-
-          # Clean up
-          Remove-Item -Path doxygen-setup.exe
-
-      - name: Setup dotnet  # needed for wix
+      - name: Setup dotnet
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
         with:
           dotnet-version: '10.x'
@@ -484,19 +209,11 @@ jobs:
         with:
           node-version: 'lts/*'
 
-      - name: NodeJS Path
+      - name: Export NodeJS path
         shell: pwsh
         run: |
-          # get NodeJS PATH
-          $NODEJS_BINARY_PATH = (Get-Command node).Source
-          $NODEJS_PATH = Split-Path -Path "$NODEJS_BINARY_PATH" -Parent
-
-          # setup environment variables
-          echo "NODEJS_PATH=$NODEJS_PATH" >> $env:GITHUB_ENV
-
-          # step output
-          echo "nodejs-path=$NODEJS_PATH"
-          echo "nodejs-path=$NODEJS_PATH" >> $env:GITHUB_OUTPUT
+          $nodePath = Split-Path -Parent (Get-Command node).Source
+          "NODEJS_PATH=$nodePath" >> $env:GITHUB_ENV
 
       - name: Setup python
         id: setup-python
@@ -509,128 +226,37 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Sync Python tools
+      - name: Setup Python build tools
         shell: msys2 {0}
         env:
           MSYS2_PATH_TYPE: inherit
           UV_PYTHON: ${{ steps.setup-python.outputs.python-path }}
-        run: |
-          uv sync --locked \
-            --no-python-downloads \
-            --no-install-project
+        run: uv sync --locked --no-python-downloads --no-install-project
 
       - name: Build Windows
         shell: msys2 {0}
         env:
-          # MSYSTEM is a built-in environment variable of MSYS2.
-          # Do not use this environment variable name.
-          MATRIX_MSYSTEM: ${{ matrix.msystem }}
-          BRANCH: ${{ github.head_ref || github.ref_name }}
-          BUILD_VERSION: ${{ inputs.release_version }}
-          COMMIT: ${{ inputs.release_commit }}
+          BRANCH: ${{ github.ref_name }}
+          BUILD_VERSION: 0.0.${{ github.run_number }}
+          COMMIT: ${{ github.sha }}
         run: |
-          # setup NodeJS PATH
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
           export PATH="$PATH:$NODEJS_PATH"
           DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$DRIVER_PACKAGE_DIR")
 
-          mkdir -p build
           cmake \
             -B build \
             -G Ninja \
             -S . \
-            -DBUILD_WERROR=ON \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
             -DSUNSHINE_ASSETS_DIR=assets \
             -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR="$DRIVER_PACKAGE_CMAKE_PATH" \
             -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
-            -DSUNSHINE_PUBLISHER_WEBSITE="https://app.lizardbyte.dev" \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://app.lizardbyte.dev/support"
-          echo "::add-matcher::.github/matchers/gcc.json"
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/${GITHUB_REPOSITORY}" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/${GITHUB_REPOSITORY}/issues"
           ninja -C build
-          echo "::remove-matcher owner=gcc::"
-
-      - name: Check Windows linkage
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-
-          binaries=(
-            build/sunshine.exe
-            build/tools/audio-info.exe
-            build/tools/dxgi-info.exe
-            build/tools/lumen-vhidctl.exe
-            build/tools/sunshinesvc.exe
-            build/tests/test_sunshine.exe
-          )
-
-          unexpected_deps=""
-          for binary in "${binaries[@]}"; do
-            echo "::group::ldd ${binary}"
-            if ! linkage="$(ldd "${binary}")"; then
-              echo "${linkage}"
-              exit 1
-            fi
-            echo "${linkage}"
-            echo "::endgroup::"
-
-            unexpected_for_binary="$(awk '
-              BEGIN { IGNORECASE = 1 }
-              $1 == "zlib1.dll" { next }
-              $1 ~ /^minhook-detours\..*\.dll$/ { next }
-              $1 ~ /^api-ms-win-/ { next }
-              $1 ~ /^ext-ms-win-/ { next }
-              $0 ~ /=>[[:space:]]+not found/ { print }
-              $0 ~ /=>[[:space:]]+\/(clangarm64|clang64|mingw32|mingw64|ucrt64)\/bin\// { print }
-            ' <<< "${linkage}")"
-
-            if [[ -n "${unexpected_for_binary}" ]]; then
-              unexpected_deps="${unexpected_deps}"$'\n'"${binary}:"$'\n'"${unexpected_for_binary}"
-            fi
-          done
-
-          if [[ -n "${unexpected_deps}" ]]; then
-            echo "Unexpected non-packaged runtime dependencies were found:"
-            echo "${unexpected_deps}"
-            exit 1
-          fi
-
-      - name: Sign Windows executables
-        # ARM64 is not currently supported, see https://github.com/Azure/artifact-signing-action/issues/92
-        if: inputs.publish_release == 'true' && inputs.azure_signing_account != '' && matrix.name != 'Windows-ARM64'
-        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
-        with:
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          certificate-profile-name: ${{ inputs.azure_signing_cert_profile }}
-          endpoint: ${{ inputs.azure_signing_endpoint }}
-          files: |
-            ${{ github.workspace }}/build/sunshine.exe
-            ${{ github.workspace }}/build/tools/audio-info.exe
-            ${{ github.workspace }}/build/tools/dxgi-info.exe
-            ${{ github.workspace }}/build/tools/lumen-vhidctl.exe
-            ${{ github.workspace }}/build/tools/sunshinesvc.exe
-          files-folder: src_assets/windows
-          files-folder-filter: ps1
-          files-folder-recurse: true
-          signing-account-name: ${{ inputs.azure_signing_account }}
-
-      - name: Validate Virtual HID install component
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-
-          validation_root="build/virtual-hid-package-validation"
-          rm -rf "${validation_root}"
-          cmake --install build \
-            --prefix "${validation_root}" \
-            --component virtual_hid_driver
-
-          test -f "${validation_root}/tools/lumen-vhidctl.exe"
-          test "$(find "${validation_root}/drivers/virtual-hid" -maxdepth 1 -type f -iname '*.inf' | wc -l)" -eq 1
-          test "$(find "${validation_root}/drivers/virtual-hid" -maxdepth 1 -type f -iname '*.cat' | wc -l)" -eq 1
-          test "$(find "${validation_root}/drivers/virtual-hid" -maxdepth 1 -type f -iname '*.sys' | wc -l)" -eq 1
 
       - name: Package Windows
         shell: msys2 {0}
@@ -639,125 +265,23 @@ jobs:
 
           mkdir -p artifacts
           cd build
-
-          # package
           cpack -G WIX
           cpack -G ZIP
 
-          # move
-          mv ./cpack_artifacts/Sunshine.msi ../artifacts/Sunshine-${{ matrix.name }}-installer.msi
-          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-${{ matrix.name }}-lite.zip
+          mv ./cpack_artifacts/Sunshine.msi ../artifacts/Sunshine-Windows-AMD64-installer.msi
+          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-lite.zip
 
-          # The privileged driver payload is required in the MSI and excluded
-          # from the non-installing lite ZIP.
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'lumen-vhidctl.exe' | wc -l)" -ge 1
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname '*.sys' | wc -l)" -ge 1
-          if 7z l ../artifacts/Sunshine-${{ matrix.name }}-lite.zip | grep -Eiq \
+          if 7z l ../artifacts/Sunshine-Windows-AMD64-lite.zip | grep -Eiq \
               'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|\.sys$'; then
-            echo 'The lite ZIP unexpectedly contains privileged Virtual HID installation files.'
+            echo 'The lite ZIP unexpectedly contains Virtual HID installation files.'
             exit 1
           fi
 
-      - name: Sign Windows installers
-        # ARM64 is not currently supported, see https://github.com/Azure/artifact-signing-action/issues/92
-        if: inputs.publish_release == 'true' && inputs.azure_signing_account != '' && matrix.name != 'Windows-ARM64'
-        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
-        with:
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          certificate-profile-name: ${{ inputs.azure_signing_cert_profile }}
-          endpoint: ${{ inputs.azure_signing_endpoint }}
-          files-folder: artifacts
-          files-folder-filter: msi
-          files-folder-recurse: false
-          signing-account-name: ${{ inputs.azure_signing_account }}
-
-      - name: Debug wix
-        if: always()
-        shell: pwsh
-        run: |
-          $wixLog = './build/cpack_artifacts/_CPack_Packages/win64/WIX/wix.log'
-          if (Test-Path $wixLog -PathType Leaf) {
-            Get-Content $wixLog
-          }
-
-      - name: Initialize tray icon
-        working-directory: build/tests
-        env:
-          SUNSHINE_CONFIGURE_TRAY_ICONS: '1'
-        run: >-
-          ./test_sunshine.exe
-          --gtest_color=yes
-          --gtest_filter=SystemTrayTest.InitializesTrayForWorkflowConfiguration
-
-      - name: Configure Windows tray screenshots
-        uses: LizardByte/tray/.github/actions/configure-windows-tray-screenshots@master
-
-      - name: Run tests
-        id: test
-        shell: msys2 {0}
-        working-directory: build/tests
-        run: ./test_sunshine.exe --gtest_color=yes --gtest_output=xml:test_results.xml
-
-      - name: Upload system tray screenshots
-        if: >-
-          always() &&
-          (steps.test.outcome == 'success' || steps.test.outcome == 'failure')
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: sunshine-screenshots-${{ matrix.name }}
-          path: build/tests/screenshots
-          if-no-files-found: error
-
-      - name: Generate gcov report
-        id: test_report
-        # any except canceled or skipped
-        if: >-
-          always() &&
-          (steps.test.outcome == 'success' || steps.test.outcome == 'failure')
-        shell: msys2 {0}
-        working-directory: build
-        env:
-          MSYS2_PATH_TYPE: inherit
-        run: |
-          uv run --project .. --locked --no-sync gcovr . -r ../src \
-            --exclude-noncode-lines \
-            --exclude-throw-branches \
-            --exclude-unreachable-branches \
-            --verbose \
-            --xml-pretty \
-            -o coverage.xml
-
-      - name: Upload coverage artifact
-        if: >-
-          always() &&
-          (steps.test_report.outcome == 'success')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: coverage-${{ matrix.name }}
-          path: |
-            build/coverage.xml
-            build/tests/test_results.xml
-          if-no-files-found: error
-
-      - name: Package Windows Debug Info
-        shell: pwsh
-        working-directory: build
-        run: |
-          # use .dbg file extension for binaries to avoid confusion with real packages
-          Get-ChildItem -File -Recurse | `
-            % { Rename-Item -Path $_.PSPath -NewName $_.Name.Replace(".exe",".dbg") }
-
-          # save the binaries with debug info
-          7z -r `
-            "-xr!CMakeFiles" `
-            "-xr!cpack_artifacts" `
-            a "../artifacts/Sunshine-${{ matrix.name }}-debuginfo.7z" "*.dbg"
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: build-${{ matrix.name }}
+          name: build-Windows-AMD64
           path: artifacts/
           if-no-files-found: error
