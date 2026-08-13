@@ -366,6 +366,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          dump_wix_log() {
+            find ./cpack_artifacts/_CPack_Packages/win64/WIX \
+              -type f -name wix.log \
+              -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \; 2>/dev/null || true
+          }
+          trap dump_wix_log ERR
+
           mkdir -p artifacts
           cd build
           cpack -G WIX
