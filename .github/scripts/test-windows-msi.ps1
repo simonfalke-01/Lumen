@@ -48,6 +48,11 @@ function Assert-VirtualHidHealthy {
         Get-Content (Join-Path $artifactDirectory $FailureLog)
         throw "Virtual HID status failed with exit code $LASTEXITCODE."
     }
+    & $helper probe --json
+    if ($LASTEXITCODE -ne 0) {
+        Get-Content (Join-Path $artifactDirectory $FailureLog)
+        throw "Virtual HID protocol probe failed with exit code $LASTEXITCODE."
+    }
 }
 
 switch ($Scenario) {

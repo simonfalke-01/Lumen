@@ -70,8 +70,13 @@ foreach ($setterName in $setterNames) {
         throw "Generated MSI is missing a command setter: $setterName"
     }
     $command = $setter[0][3]
+    $expectedScript = if ($setterName -eq 'SetSunshineUninstallCommitData') {
+        ' -File "\[CommonAppDataFolder\]LumenVirtualHidInstallerV2\\\[ProductCode\]\\uninstall\\sunshine-setup\.ps1" '
+    } else {
+        ' -File "\[INSTALL_ROOT\]scripts\\sunshine-setup\.ps1" '
+    }
     if ($command -notmatch '^"\[SystemFolder\]WindowsPowerShell\\v1\.0\\powershell\.exe" ' -or
-        $command -notmatch ' -File "\[INSTALL_ROOT\]scripts\\sunshine-setup\.ps1" ' -or
+        $command -notmatch $expectedScript -or
         $command -notmatch ' -Msi ' -or
         $command -notmatch ' -ProductCode "\[ProductCode\]" ' -or
         $command -notmatch ' -TransactionKind (install|uninstall) ' -or

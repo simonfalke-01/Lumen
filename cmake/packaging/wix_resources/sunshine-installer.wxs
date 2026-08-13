@@ -172,7 +172,7 @@
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_SunshineUninstallCommit"
                  Action="SetSunshineUninstallCommitData"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="SetSunshineUninstallData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
   </Fragment>

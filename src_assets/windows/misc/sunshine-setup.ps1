@@ -915,6 +915,7 @@ $rollbackProductDirectory = Join-Path $rollbackRootDirectory $ProductCode
 $rollbackDirectory = Join-Path $rollbackProductDirectory $TransactionKind.ToLowerInvariant()
 $rollbackStatePath = Join-Path $rollbackDirectory "virtual-hid-rollback.json"
 $rollbackDriverDirectory = Join-Path $rollbackDirectory "virtual-hid-driver"
+$rollbackScriptPath = Join-Path $rollbackDirectory "sunshine-setup.ps1"
 $script:RebootRequired = $false
 
 function New-InstallRollbackDirectoryAcl {
@@ -1004,7 +1005,8 @@ function Initialize-InstallRollbackDirectory {
 
 function Assert-NoPendingRollbackTransaction {
     if ((Test-Path -LiteralPath $rollbackStatePath) -or
-        (Test-Path -LiteralPath $rollbackDriverDirectory)) {
+        (Test-Path -LiteralPath $rollbackDriverDirectory) -or
+        (Test-Path -LiteralPath $rollbackScriptPath)) {
         throw "A pending Virtual HID installer rollback transaction must be resolved before continuing."
     }
 }
@@ -1104,8 +1106,8 @@ function Remove-InstallRollbackArtifacts {
 
 function Get-InstalledVirtualHidInfName {
     $devices = @(
-        Get-PnpDevice -ErrorAction Stop | Where-Object {
-            $_.InstanceId -match '^ROOT\\LumenVirtualHid\\[^\\]+$'
+        Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+            @($_.HardwareID) -contains "ROOT\LumenVirtualHid"
         }
     )
     if ($devices.Count -ne 1) {
@@ -1113,7 +1115,7 @@ function Get-InstalledVirtualHidInfName {
     }
 
     $driverInfProperty = Get-PnpDeviceProperty `
-        -InstanceId $devices[0].InstanceId `
+        -InstanceId $devices[0].PNPDeviceID `
         -KeyName "DEVPKEY_Device_DriverInfPath" `
         -ErrorAction Stop
     $driverInfName = [string]$driverInfProperty.Data
@@ -1267,6 +1269,13 @@ function Start-PersistedRollbackTransaction {
             -PreviousDriverSignerThumbprint $PreviousDriverSignerThumbprint `
             -DriverRollbackComplete $DriverRollbackComplete `
             -ServiceRollbackComplete $ServiceRollbackComplete
+        if ($TransactionKind -eq "Uninstall") {
+            Copy-Item `
+                -LiteralPath $PSCommandPath `
+                -Destination $rollbackScriptPath `
+                -Force `
+                -ErrorAction Stop
+        }
     } catch {
         throw "Could not create rollback state; partial protected artifacts were preserved: $($_.Exception.Message)"
     }
@@ -1554,7 +1563,8 @@ function Invoke-PersistedCommit {
 
 function Invoke-ExactCurrentRecovery {
     if ((Test-Path -LiteralPath $rollbackStatePath) -or
-        (Test-Path -LiteralPath $rollbackDriverDirectory)) {
+        (Test-Path -LiteralPath $rollbackDriverDirectory) -or
+        (Test-Path -LiteralPath $rollbackScriptPath)) {
         Assert-InstallRollbackDirectorySecure
         if (-not (Test-Path -LiteralPath $rollbackStatePath -PathType Leaf)) {
             throw "The exact current installer transaction is incomplete and was preserved."
