@@ -6,7 +6,7 @@
     <Level Value="0" Condition="LUMEN_INSTALL_VHID = 0"/>
     <Level Value="1" Condition="LUMEN_INSTALL_VHID = 1"/>
   </CPackWiXFragment>
-  <CPackWiXFragment Id="CM_CP_tools.sunshinesvc.exe">
+  <CPackWiXFragment Id="CM_CP_application.tools.sunshinesvc.exe">
     <ServiceInstall Id="InstallSunshineService"
                     Name="SunshineService"
                     DisplayName="Sunshine Service"
