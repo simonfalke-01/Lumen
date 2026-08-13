@@ -437,17 +437,20 @@ jobs:
     if: >-
       always() &&
       (inputs.artifact_run_id != '' || needs.build_windows.result == 'success')
-    runs-on: windows-2022
+    runs-on: ${{ matrix.runner }}
     permissions:
       actions: read
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        scenario:
-          - install-no-vhid
-          - install-vhid
-          - upgrade
+        include:
+          - scenario: install-no-vhid
+            runner: windows-2022
+          - scenario: install-vhid
+            runner: windows-2025
+          - scenario: upgrade
+            runner: windows-2025
     steps:
       - name: Checkout validation scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
