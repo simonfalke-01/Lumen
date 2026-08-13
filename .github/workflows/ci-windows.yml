@@ -403,12 +403,14 @@ jobs:
           )
           function Read-MsiRows([string]$query, [int]$columns) {
             $view = $database.OpenView($query)
-            $view.Execute()
+            [void]$view.Execute()
+            $rows = [Collections.Generic.List[object[]]]::new()
             while ($record = $view.Fetch()) {
-              $row = @(1..$columns | ForEach-Object { $record.StringData($_) })
-              Write-Output -NoEnumerate $row
+              $row = [object[]]@(1..$columns | ForEach-Object { $record.StringData($_) })
+              $rows.Add($row)
             }
-            $view.Close()
+            [void]$view.Close()
+            return ,$rows.ToArray()
           }
           $actions = Read-MsiRows `
             'SELECT `Action`,`Type`,`Source`,`Target` FROM `CustomAction`' 4
