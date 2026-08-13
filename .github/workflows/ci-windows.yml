@@ -404,12 +404,11 @@ jobs:
           function Read-MsiRows([string]$query, [int]$columns) {
             $view = $database.OpenView($query)
             $view.Execute()
-            $rows = @()
             while ($record = $view.Fetch()) {
-              $rows += ,@(1..$columns | ForEach-Object { $record.StringData($_) })
+              $row = @(1..$columns | ForEach-Object { $record.StringData($_) })
+              Write-Output -NoEnumerate $row
             }
             $view.Close()
-            return $rows
           }
           $actions = Read-MsiRows `
             'SELECT `Action`,`Type`,`Source`,`Target` FROM `CustomAction`' 4
