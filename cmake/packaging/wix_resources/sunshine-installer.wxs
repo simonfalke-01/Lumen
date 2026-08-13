@@ -176,7 +176,7 @@
     <SetProperty Id="CA_SunshineUninstallRollback"
                  Action="SetSunshineUninstallRollbackData"
                  Value="-ProductCode &amp;quot;[ProductCode]&amp;quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
-                 Before="CA_SunshineUninstallRollback" Sequence="execute"
+                 After="InstallInitialize" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_SunshineUninstall"
                  Action="SetSunshineUninstallData"
