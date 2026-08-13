@@ -48,10 +48,51 @@ function Assert-VirtualHidHealthy {
         Get-Content (Join-Path $artifactDirectory $FailureLog)
         throw "Virtual HID status failed with exit code $LASTEXITCODE."
     }
-    & $helper probe --json
-    if ($LASTEXITCODE -ne 0) {
-        Get-Content (Join-Path $artifactDirectory $FailureLog)
-        throw "Virtual HID protocol probe failed with exit code $LASTEXITCODE."
+    $taskName = "Lumen-VHID-Probe-$([Guid]::NewGuid().ToString('N'))"
+    $probeScript = Join-Path $artifactDirectory 'lumen-vhid-probe.ps1'
+    $probeOutput = Join-Path $artifactDirectory 'lumen-vhid-probe.json'
+    $probeExit = Join-Path $artifactDirectory 'lumen-vhid-probe.exit'
+    $escapedHelper = $helper.Replace("'", "''")
+    $escapedOutput = $probeOutput.Replace("'", "''")
+    $escapedExit = $probeExit.Replace("'", "''")
+    Remove-Item $probeOutput, $probeExit -Force -ErrorAction SilentlyContinue
+    @"
+& '$escapedHelper' probe --json | Set-Content -LiteralPath '$escapedOutput' -Encoding UTF8
+`$probeExitCode = `$LASTEXITCODE
+Set-Content -LiteralPath '$escapedExit' -Value `$probeExitCode -NoNewline
+"@ | Set-Content -LiteralPath $probeScript -Encoding UTF8
+
+    $action = New-ScheduledTaskAction `
+        -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$probeScript`""
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId 'SYSTEM' `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
+    try {
+        Register-ScheduledTask `
+            -TaskName $taskName `
+            -Action $action `
+            -Principal $principal `
+            -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        $deadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $probeExit -PathType Leaf) -and
+            (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not (Test-Path -LiteralPath $probeExit -PathType Leaf)) {
+            throw 'Virtual HID protocol probe timed out.'
+        }
+        Get-Content -LiteralPath $probeOutput
+        $probeExitCode = [int](Get-Content -LiteralPath $probeExit -Raw)
+        if ($probeExitCode -ne 0) {
+            Get-Content (Join-Path $artifactDirectory $FailureLog)
+            throw "Virtual HID protocol probe failed with exit code $probeExitCode."
+        }
+    } finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item $probeScript, $probeExit -Force -ErrorAction SilentlyContinue
     }
 }
 

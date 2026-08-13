@@ -76,12 +76,12 @@
     <!-- Service installation/removal remains in MSI service tables. These two
          actions select the declaratively installed service's start mode. -->
     <CustomAction Id="CA_SunshineServiceAutoStart"
-                  Directory="SystemFolder"
-                  ExeCommand="&quot;[SystemFolder]sc.exe&quot; config SunshineService start= auto"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config SunshineService start= auto"
                   Execute="deferred" Return="check" Impersonate="no"/>
     <CustomAction Id="CA_SunshineServiceDemandStart"
-                  Directory="SystemFolder"
-                  ExeCommand="&quot;[SystemFolder]sc.exe&quot; config SunshineService start= demand"
+                  Directory="System64Folder"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config SunshineService start= demand"
                   Execute="deferred" Return="check" Impersonate="no"/>
 
     <!-- MSI service ownership is declarative above. WixQuietExec is used here
@@ -147,32 +147,32 @@
 
     <SetProperty Id="CA_SunshineInstallRollback"
                  Action="SetSunshineInstallRollbackData"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="InstallFiles" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_SunshineInstall"
                  Action="SetSunshineInstallData"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="SetSunshineInstallRollbackData" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_SunshineInstallCommit"
                  Action="SetSunshineInstallCommitData"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="SetSunshineInstallData" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_SunshineUninstallRollback"
                  Action="SetSunshineUninstallRollbackData"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="InstallInitialize" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_SunshineUninstall"
                  Action="SetSunshineUninstallData"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="SetSunshineUninstallRollbackData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_SunshineUninstallCommit"
                  Action="SetSunshineUninstallCommitData"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="SetSunshineUninstallData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
   </Fragment>

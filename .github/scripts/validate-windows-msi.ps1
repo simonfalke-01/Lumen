@@ -75,7 +75,7 @@ foreach ($setterName in $setterNames) {
     } else {
         ' -File "\[INSTALL_ROOT\]scripts\\sunshine-setup\.ps1" '
     }
-    if ($command -notmatch '^"\[SystemFolder\]WindowsPowerShell\\v1\.0\\powershell\.exe" ' -or
+    if ($command -notmatch '^"\[System64Folder\]WindowsPowerShell\\v1\.0\\powershell\.exe" ' -or
         $command -notmatch $expectedScript -or
         $command -notmatch ' -Msi ' -or
         $command -notmatch ' -ProductCode "\[ProductCode\]" ' -or
