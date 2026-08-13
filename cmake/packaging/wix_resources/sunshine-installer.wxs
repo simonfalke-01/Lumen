@@ -52,23 +52,35 @@
         </Directory>
     </StandardDirectory>
 
-    <!-- Install: Run sunshine-setup.ps1 with -Action install, add -Silent if UILevel <= 3 (silent/basic UI) -->
-    <CustomAction Id="CA_SunshineInstall" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install" Execute="deferred" Return="ignore" Impersonate="no" />
-    <CustomAction Id="CA_SunshineInstallSilent" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install -Silent" Execute="deferred" Return="ignore" Impersonate="no" />
+    <!-- Install/repair/upgrade: failures abort MSI and activate the rollback action. -->
+    <CustomAction Id="CA_SunshineInstallRollback" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi" Execute="rollback" Return="ignore" Impersonate="no" />
+    <CustomAction Id="CA_SunshineInstallRollbackSilent" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi" Execute="rollback" Return="ignore" Impersonate="no" />
+    <CustomAction Id="CA_SunshineInstall" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install -Msi" Execute="deferred" Return="check" Impersonate="no" />
+    <CustomAction Id="CA_SunshineInstallSilent" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install -Silent -Msi" Execute="deferred" Return="check" Impersonate="no" />
+    <CustomAction Id="CA_SunshineTransactionCommit" Directory="SystemFolder" ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command &quot;$p = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)) 'LumenVirtualHidInstaller'; if (Test-Path -LiteralPath $p) { $i = Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { Remove-Item -LiteralPath $p -Force } else { Remove-Item -LiteralPath $p -Recurse -Force } }&quot;" Execute="commit" Return="ignore" Impersonate="no" />
 
     <!-- Uninstall: Run sunshine-setup.ps1 with -Action uninstall, add -Silent if UILevel <= 3 (silent/basic UI) -->
-    <CustomAction Id="CA_SunshineUninstall" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall" Execute="deferred" Return="ignore" Impersonate="no" />
-    <CustomAction Id="CA_SunshineUninstallSilent" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall -Silent" Execute="deferred" Return="ignore" Impersonate="no" />
+    <CustomAction Id="CA_SunshineUninstallRollback" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi" Execute="rollback" Return="ignore" Impersonate="no" />
+    <CustomAction Id="CA_SunshineUninstallRollbackSilent" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi" Execute="rollback" Return="ignore" Impersonate="no" />
+    <CustomAction Id="CA_SunshineUninstall" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall -Msi" Execute="deferred" Return="check" Impersonate="no" />
+    <CustomAction Id="CA_SunshineUninstallSilent" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall -Silent -Msi" Execute="deferred" Return="check" Impersonate="no" />
 
     <InstallExecuteSequence>
-        <!-- Run installation script after files are installed -->
+        <!-- Register rollback before the deferred install action. -->
+        <Custom Action="CA_SunshineInstallRollback" Before="CA_SunshineInstall" Condition="NOT (REMOVE=&quot;ALL&quot;) AND UILevel &gt; 3" />
+        <Custom Action="CA_SunshineInstallRollbackSilent" Before="CA_SunshineInstallSilent" Condition="NOT (REMOVE=&quot;ALL&quot;) AND UILevel &lt;= 3" />
+
+        <!-- Run after files are installed for fresh installs, repairs, and upgrades. -->
         <!-- UILevel > 3 means Full UI (interactive), UILevel <= 3 means Silent/Basic UI -->
-        <Custom Action="CA_SunshineInstall" After="InstallFiles" Condition="NOT Installed AND UILevel &gt; 3" />
-        <Custom Action="CA_SunshineInstallSilent" After="InstallFiles" Condition="NOT Installed AND UILevel &lt;= 3" />
+        <Custom Action="CA_SunshineInstall" After="InstallFiles" Condition="NOT (REMOVE=&quot;ALL&quot;) AND UILevel &gt; 3" />
+        <Custom Action="CA_SunshineInstallSilent" After="InstallFiles" Condition="NOT (REMOVE=&quot;ALL&quot;) AND UILevel &lt;= 3" />
 
         <!-- Run uninstallation script before files are removed -->
+        <Custom Action="CA_SunshineUninstallRollback" Before="CA_SunshineUninstall" Condition="REMOVE=&quot;ALL&quot; AND UILevel &gt; 3" />
+        <Custom Action="CA_SunshineUninstallRollbackSilent" Before="CA_SunshineUninstallSilent" Condition="REMOVE=&quot;ALL&quot; AND UILevel &lt;= 3" />
         <Custom Action="CA_SunshineUninstall" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND UILevel &gt; 3" />
         <Custom Action="CA_SunshineUninstallSilent" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND UILevel &lt;= 3" />
+        <Custom Action="CA_SunshineTransactionCommit" Before="InstallFinalize" />
     </InstallExecuteSequence>
 
     <!-- We need this in order to actually run our custom actions, but let's hide it -->

@@ -1,0 +1,61 @@
+; Lumen root-enumerated Virtual HID source driver.
+
+[Version]
+Signature = "$WINDOWS NT$"
+Class = System
+ClassGuid = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider = %LumenProvider%
+DriverVer = 08/12/2026,1.0.0.0
+CatalogFile = LumenVirtualHid.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+LumenVirtualHid.CopyFiles = 13
+
+[SourceDisksNames]
+1 = %InstallationMedia%,,,
+
+[SourceDisksFiles]
+LumenVirtualHid.sys = 1
+
+[Manufacturer]
+%LumenProvider% = LumenVirtualHid.Models, NT$ARCH$.10.0...16299
+
+[LumenVirtualHid.Models.NT$ARCH$.10.0...16299]
+%LumenVirtualHid.DeviceDesc% = LumenVirtualHid.Install, ROOT\LumenVirtualHid
+
+[LumenVirtualHid.Install.NT]
+CopyFiles = LumenVirtualHid.CopyFiles
+
+[LumenVirtualHid.CopyFiles]
+LumenVirtualHid.sys
+
+[LumenVirtualHid.Install.NT.HW]
+AddReg = LumenVirtualHid.AddReg
+
+[LumenVirtualHid.AddReg]
+HKR,,LowerFilters,0x00010000,"vhf"
+
+[LumenVirtualHid.Install.NT.Services]
+AddService = LumenVirtualHid, %SPSVCINST_ASSOCSERVICE%, LumenVirtualHid.Service
+
+[LumenVirtualHid.Service]
+DisplayName = %LumenVirtualHid.ServiceDesc%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %13%\LumenVirtualHid.sys
+
+[LumenVirtualHid.Install.NT.Wdf]
+KmdfService = LumenVirtualHid, LumenVirtualHid.Wdf
+
+[LumenVirtualHid.Wdf]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+LumenProvider = "LizardByte"
+InstallationMedia = "Lumen Virtual HID installation media"
+LumenVirtualHid.DeviceDesc = "Lumen Virtual HID Keyboard and Mouse"
+LumenVirtualHid.ServiceDesc = "Lumen Virtual HID source driver"

@@ -9,12 +9,16 @@ extern "C" {
 }
 
 // standard includes
+#include <algorithm>
 #include <bitset>
 #include <chrono>
 #include <cmath>
+#include <future>
 #include <list>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 // lib includes
 #include <boost/endian/buffers.hpp>
@@ -155,7 +159,11 @@ namespace input {
 
   static task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
   static std::unordered_map<key_press_id_t, bool> key_press {};
-  static std::array<std::uint8_t, 5> mouse_press {};
+  static std::array<std::uint8_t, BUTTON_X2 + 1> mouse_press {};  ///< Pressed state indexed by Moonlight button ID.
+  static_assert(mouse_press.size() > BUTTON_X2, "Mouse state must include every Moonlight button ID");
+  static std::mutex reset_tasks_mutex;
+  static std::vector<std::future<void>> reset_tasks;
+  static bool input_shutting_down {false};
 
   static platf::input_t platf_input;
   static std::bitset<platf::MAX_GAMEPADS> gamepadMask {};
@@ -725,7 +733,7 @@ namespace input {
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
     auto button = util::endian::big(packet->button);
-    if (button > 0 && button < mouse_press.size()) {
+    if (button >= BUTTON_LEFT && button <= BUTTON_X2) {
       if (mouse_press[button] != release) {
         // button state is already what we want
         return;
@@ -908,7 +916,16 @@ namespace input {
       return;
     }
 
+    // A hardware-style Virtual HID keyboard is repeated by the Windows keyboard stack.
+    // Keep this task scheduled without injecting while that transport is active so a
+    // one-way runtime fallback can resume the portable cadence without a second task.
+#ifdef _WIN32
+    if (!platf::uses_native_keyboard_repeat(platf_input)) {
+      send_key_and_modifiers(key_code, false, flags, synthetic_modifiers);
+    }
+#else
     send_key_and_modifiers(key_code, false, flags, synthetic_modifiers);
+#endif
 
     key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, key_code, flags, synthetic_modifiers).task_id;
   }
@@ -1829,11 +1846,18 @@ namespace input {
     task_pool.cancel(input->mouse_left_button_timeout);
 
     // Ensure input is synchronous, by using the task_pool
-    task_pool.push([]() {
-      for (int x = 0; x < mouse_press.size(); ++x) {
-        if (mouse_press[x]) {
-          platf::button_mouse(platf_input, x, true);
-          mouse_press[x] = false;
+    std::lock_guard lock(reset_tasks_mutex);
+    if (input_shutting_down) {
+      return;
+    }
+    std::erase_if(reset_tasks, [](std::future<void> &reset) {
+      return reset.wait_for(0s) == std::future_status::ready;
+    });
+    reset_tasks.emplace_back(task_pool.push([]() {
+      for (int button = BUTTON_LEFT; button <= BUTTON_X2; ++button) {
+        if (mouse_press[button]) {
+          platf::button_mouse(platf_input, button, true);
+          mouse_press[button] = false;
         }
       }
 
@@ -1845,7 +1869,7 @@ namespace input {
         platf::keyboard_update(platf_input, vk_from_kpid(kp.first) & 0x00FF, true, flags_from_kpid(kp.first));
         key_press[kp.first] = false;
       }
-    });
+    }));
   }
 
   /**
@@ -1857,6 +1881,15 @@ namespace input {
      * @brief Destroy the input subsystem deinitializer.
      */
     ~deinit_t() override {
+      std::vector<std::future<void>> pending_resets;
+      {
+        std::lock_guard lock(reset_tasks_mutex);
+        input_shutting_down = true;
+        pending_resets.swap(reset_tasks);
+      }
+      for (auto &reset : pending_resets) {
+        reset.wait();
+      }
       platf_input.reset();
     }
   };
@@ -1865,6 +1898,11 @@ namespace input {
    * @brief Initialize the platform input backend.
    */
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init() {
+    {
+      std::lock_guard lock(reset_tasks_mutex);
+      input_shutting_down = false;
+      reset_tasks.clear();
+    }
     platf_input = platf::input();
 
     return std::make_unique<deinit_t>();

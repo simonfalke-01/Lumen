@@ -275,6 +275,7 @@ namespace config {
     std::chrono::duration<double> key_repeat_period;  ///< Interval between repeated keyboard key events.
 
     std::string gamepad;  ///< Virtual controller backend selected by configuration.
+    std::string windows_input_backend;  ///< Windows keyboard and mouse backend selector.
     bool ds4_back_as_touchpad_click;  ///< Map the DS4 Back button to a touchpad click.
     bool motion_as_ds4;  ///< Expose motion controls through the DS4 protocol.
     bool touchpad_as_ds4;  ///< Expose touchpad input through the DS4 protocol.

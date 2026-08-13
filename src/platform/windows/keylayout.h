@@ -7,6 +7,7 @@
 // standard includes
 #include <array>
 #include <cstdint>
+#include <limits>
 
 namespace platf {
   // Virtual Key to Scan Code mapping for the US English layout (00000409).

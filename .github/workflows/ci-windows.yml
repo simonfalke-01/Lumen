@@ -21,6 +21,18 @@ on:
         required: false
         type: string
         default: ''
+      # Artifact produced by the Microsoft attestation/WHQL signing workflow.
+      # The artifact must contain exactly one x64 INF/CAT/SYS package.
+      signed_driver_artifact_amd64:
+        required: false
+        type: string
+        default: ''
+      # Artifact produced by the Microsoft attestation/WHQL signing workflow.
+      # The artifact must contain exactly one ARM64 INF/CAT/SYS package.
+      signed_driver_artifact_arm64:
+        required: false
+        type: string
+        default: ''
       publish_release:
         required: true
         type: string
@@ -43,6 +55,7 @@ on:
 
 env:
   PYTHON_VERSION: '3.14'
+  WDK_VERSION: '10.0.26100.0'
 
 jobs:
   build_windows:
@@ -60,11 +73,17 @@ jobs:
           - name: Windows-AMD64
             os: windows-2022
             arch: x86_64
+            driver_arch: x64
+            driver_platform: x64
+            inf2cat_os: 10_X64
             msystem: ucrt64
             toolchain: ucrt-x86_64
           - name: Windows-ARM64
             os: windows-11-arm
             arch: aarch64
+            driver_arch: arm64
+            driver_platform: ARM64
+            inf2cat_os: Server10_ARM64
             msystem: clangarm64
             toolchain: clang-aarch64
     steps:
@@ -72,6 +91,287 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           submodules: recursive
+
+      - name: Install Windows Driver Kit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wdkBuildProps = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Windows Kits\10\build\$env:WDK_VERSION\WindowsDriver.Default.props"
+          $wdkHeader = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Windows Kits\10\Include\$env:WDK_VERSION\km\ntddk.h"
+          if (-not (Test-Path $wdkBuildProps -PathType Leaf)) {
+            winget install `
+              --id Microsoft.WindowsWDK.10.0.26100 `
+              --exact `
+              --silent `
+              --accept-package-agreements `
+              --accept-source-agreements `
+              --disable-interactivity
+            if ($LASTEXITCODE -ne 0) {
+              throw "WDK installation failed with exit code $LASTEXITCODE."
+            }
+          }
+          if (-not (Test-Path $wdkBuildProps -PathType Leaf)) {
+            throw "WDK build integration not found after installation: $wdkBuildProps"
+          }
+          if (-not (Test-Path $wdkHeader -PathType Leaf)) {
+            throw "WDK kernel headers not found after installation: $wdkHeader"
+          }
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = & $vswhere `
+            -latest `
+            -products '*' `
+            -requires Microsoft.Component.MSBuild `
+            -property installationPath | Select-Object -First 1
+          if (-not $vsInstall) {
+            throw 'Visual Studio with MSBuild was not found.'
+          }
+
+          $toolsetPattern = Join-Path `
+            $vsInstall `
+            'MSBuild\Microsoft\VC\v*\Platforms\${{ matrix.driver_platform }}\PlatformToolsets\WindowsKernelModeDriver10.0\Toolset.props'
+          $toolsetProps = @(Get-ChildItem $toolsetPattern -File -ErrorAction SilentlyContinue)
+          if ($toolsetProps.Count -eq 0) {
+            $vsSetup = Join-Path `
+              ${env:ProgramFiles(x86)} `
+              'Microsoft Visual Studio\Installer\setup.exe'
+            Push-Location $env:RUNNER_TEMP
+            try {
+              $quotedVsInstall = '"' + $vsInstall + '"'
+              $setupProcess = Start-Process `
+                -FilePath $vsSetup `
+                -ArgumentList @(
+                  'modify',
+                  '--installPath', $quotedVsInstall,
+                  '--add', 'Component.Microsoft.Windows.DriverKit',
+                  '--quiet',
+                  '--norestart'
+                ) `
+                -Wait `
+                -PassThru
+            } finally {
+              Pop-Location
+            }
+            if ($setupProcess.ExitCode -notin @(0, 3010)) {
+              throw "Visual Studio WDK component installation failed with exit code $($setupProcess.ExitCode)."
+            }
+            $toolsetProps = @(Get-ChildItem $toolsetPattern -File -ErrorAction SilentlyContinue)
+          }
+          if ($toolsetProps.Count -eq 0) {
+            throw "WDK MSBuild toolset is not registered for ${{ matrix.driver_platform }}: $toolsetPattern"
+          }
+
+      - name: Build and validate Lumen Virtual HID driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $driverProject = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj'
+          if (-not (Test-Path $driverProject -PathType Leaf)) {
+            throw "Virtual HID driver project not found: $driverProject"
+          }
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere `
+            -latest `
+            -products '*' `
+            -requires Microsoft.Component.MSBuild `
+            -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) {
+            throw 'MSBuild was not found.'
+          }
+
+          $driverBuildDir = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'cmake-build-virtual-hid-driver-${{ matrix.driver_arch }}'
+          $driverBinDir = Join-Path $driverBuildDir 'bin'
+          $driverObjDir = Join-Path $driverBuildDir 'obj'
+          $unsignedPackageDir = Join-Path $driverBuildDir 'package-unsigned'
+          New-Item -ItemType Directory -Path $driverBinDir, $driverObjDir -Force | Out-Null
+          $apiValidatorEnabled = '${{ matrix.driver_arch }}' -ne 'arm64'
+
+          & $msbuild `
+            $driverProject `
+            /m `
+            /restore `
+            /t:Build `
+            /warnaserror `
+            /p:Configuration=Release `
+            /p:Platform=${{ matrix.driver_platform }} `
+            /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
+            /p:OutDir="$driverBinDir\" `
+            /p:IntDir="$driverObjDir\" `
+            /p:ApiValidator_Enable=$apiValidatorEnabled `
+            /p:SkipPackageVerification=true `
+            /p:SignMode=Off `
+            /p:RunCodeAnalysis=true `
+            /p:EnableCppCodeAnalysis=true
+          if ($LASTEXITCODE -ne 0) {
+            throw "Virtual HID driver build failed with exit code $LASTEXITCODE."
+          }
+
+          $driverFiles = @{
+            inf = Get-Item (Join-Path $driverBinDir 'LumenVirtualHid.inf')
+            sys = Get-Item (Join-Path $driverBinDir 'LumenVirtualHid.sys')
+          }
+
+          Remove-Item $unsignedPackageDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $unsignedPackageDir | Out-Null
+          Copy-Item $driverFiles.inf.FullName, $driverFiles.sys.FullName -Destination $unsignedPackageDir
+
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $infVerif = Get-ChildItem (Join-Path $kitsRoot 'tools') `
+            -Recurse -File -Filter InfVerif.exe |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          $inf2Cat = Get-ChildItem (Join-Path $kitsRoot 'bin') `
+            -Recurse -File -Filter Inf2Cat.exe |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $infVerif -or -not $inf2Cat) {
+            throw 'InfVerif and Inf2Cat were not found in the installed WDK.'
+          }
+
+          $packagedInf = Get-ChildItem $unsignedPackageDir -File -Filter '*.inf'
+          & $infVerif.FullName /v /w $packagedInf.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "InfVerif failed with exit code $LASTEXITCODE."
+          }
+
+          & $inf2Cat.FullName `
+            "/driver:$unsignedPackageDir" `
+            "/os:${{ matrix.inf2cat_os }}" `
+            /verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inf2Cat failed with exit code $LASTEXITCODE."
+          }
+
+          $catalogs = @(Get-ChildItem $unsignedPackageDir -File -Filter '*.cat')
+          if ($catalogs.Count -ne 1) {
+            throw "Expected exactly one generated catalog; found $($catalogs.Count)."
+          }
+
+          "UNSIGNED_DRIVER_PACKAGE=$unsignedPackageDir" >> $env:GITHUB_ENV
+
+      - name: Download Microsoft-signed x64 driver package
+        if: >-
+          inputs.publish_release == 'true' &&
+          matrix.driver_arch == 'x64' &&
+          inputs.signed_driver_artifact_amd64 != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: ${{ inputs.signed_driver_artifact_amd64 }}
+          path: signed-driver-package
+
+      - name: Download Microsoft-signed ARM64 driver package
+        if: >-
+          inputs.publish_release == 'true' &&
+          matrix.driver_arch == 'arm64' &&
+          inputs.signed_driver_artifact_arm64 != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: ${{ inputs.signed_driver_artifact_arm64 }}
+          path: signed-driver-package
+
+      - name: Select installer driver package
+        shell: pwsh
+        env:
+          REQUIRE_SIGNED_DRIVER: >-
+            ${{ inputs.publish_release == 'true' &&
+                startsWith(github.repository, 'LizardByte/') }}
+          SIGNED_DRIVER_ARTIFACT: >-
+            ${{ matrix.driver_arch == 'x64' &&
+                inputs.signed_driver_artifact_amd64 ||
+                inputs.signed_driver_artifact_arm64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $selectedPackage = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'cmake-build-virtual-hid-driver-${{ matrix.driver_arch }}\package'
+          Remove-Item $selectedPackage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $selectedPackage | Out-Null
+
+          if ($env:SIGNED_DRIVER_ARTIFACT) {
+            $packageSource = Join-Path $env:GITHUB_WORKSPACE 'signed-driver-package'
+          } else {
+            if ($env:REQUIRE_SIGNED_DRIVER -eq 'true') {
+              throw `
+                'Release packaging requires a Microsoft-signed driver artifact for ' + `
+                '${{ matrix.driver_arch }}.'
+            }
+            Write-Warning 'Using the locally generated unsigned Virtual HID driver package; SendInput remains available as a fallback.'
+            $packageSource = $env:UNSIGNED_DRIVER_PACKAGE
+          }
+
+          foreach ($extension in @('inf', 'cat', 'sys')) {
+            $matches = @(Get-ChildItem $packageSource -Recurse -File -Filter "*.$extension")
+            if ($matches.Count -ne 1) {
+              throw `
+                "Expected exactly one $extension in the selected driver package; " + `
+                "found $($matches.Count)."
+            }
+            Copy-Item $matches[0].FullName -Destination $selectedPackage
+          }
+
+          $selectedSys = Get-ChildItem $selectedPackage -File -Filter '*.sys'
+          $driverStream = [System.IO.File]::OpenRead($selectedSys.FullName)
+          try {
+            $peReader = [System.Reflection.PortableExecutable.PEReader]::new($driverStream)
+            $actualMachine = $peReader.PEHeaders.CoffHeader.Machine.ToString()
+          } finally {
+            if ($peReader) {
+              $peReader.Dispose()
+            }
+            $driverStream.Dispose()
+          }
+          $expectedMachine = if ('${{ matrix.driver_arch }}' -eq 'x64') { 'Amd64' } else { 'Arm64' }
+          if ($actualMachine -ne $expectedMachine) {
+            throw `
+              "Selected driver architecture is $actualMachine; expected $expectedMachine."
+          }
+
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $infVerif = Get-ChildItem (Join-Path $kitsRoot 'tools') `
+            -Recurse -File -Filter InfVerif.exe |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          $selectedInf = Get-ChildItem $selectedPackage -File -Filter '*.inf'
+          & $infVerif.FullName /v /w $selectedInf.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Selected driver INF validation failed with exit code $LASTEXITCODE."
+          }
+
+          if ($env:SIGNED_DRIVER_ARTIFACT) {
+            $signTool = Get-ChildItem (Join-Path $kitsRoot 'bin') `
+              -Recurse -File -Filter signtool.exe |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signTool) {
+              throw 'SignTool was not found in the installed WDK.'
+            }
+            $selectedCat = Get-ChildItem $selectedPackage -File -Filter '*.cat'
+            & $signTool.FullName verify /kp /v $selectedCat.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The release driver catalog is not production-signed for kernel loading.'
+            }
+            & $signTool.FullName verify /kp /v /c $selectedCat.FullName $selectedSys.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The release driver binary is not covered by the signed catalog.'
+            }
+          }
+
+          "DRIVER_PACKAGE_DIR=$selectedPackage" >> $env:GITHUB_ENV
 
       - name: Setup Dependencies Windows
         # if a dependency needs to be pinned, see https://github.com/LizardByte/build-deps/pull/186
@@ -232,6 +532,7 @@ jobs:
           # setup NodeJS PATH
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
           export PATH="$PATH:$NODEJS_PATH"
+          DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$DRIVER_PACKAGE_DIR")
 
           mkdir -p build
           cmake \
@@ -241,6 +542,7 @@ jobs:
             -DBUILD_WERROR=ON \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DSUNSHINE_ASSETS_DIR=assets \
+            -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR="$DRIVER_PACKAGE_CMAKE_PATH" \
             -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
             -DSUNSHINE_PUBLISHER_WEBSITE="https://app.lizardbyte.dev" \
             -DSUNSHINE_PUBLISHER_ISSUE_URL="https://app.lizardbyte.dev/support"
@@ -257,6 +559,7 @@ jobs:
             build/sunshine.exe
             build/tools/audio-info.exe
             build/tools/dxgi-info.exe
+            build/tools/lumen-vhidctl.exe
             build/tools/sunshinesvc.exe
             build/tests/test_sunshine.exe
           )
@@ -306,15 +609,34 @@ jobs:
             ${{ github.workspace }}/build/sunshine.exe
             ${{ github.workspace }}/build/tools/audio-info.exe
             ${{ github.workspace }}/build/tools/dxgi-info.exe
+            ${{ github.workspace }}/build/tools/lumen-vhidctl.exe
             ${{ github.workspace }}/build/tools/sunshinesvc.exe
           files-folder: src_assets/windows
           files-folder-filter: ps1
           files-folder-recurse: true
           signing-account-name: ${{ inputs.azure_signing_account }}
 
+      - name: Validate Virtual HID install component
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          validation_root="build/virtual-hid-package-validation"
+          rm -rf "${validation_root}"
+          cmake --install build \
+            --prefix "${validation_root}" \
+            --component virtual_hid_driver
+
+          test -f "${validation_root}/tools/lumen-vhidctl.exe"
+          test "$(find "${validation_root}/drivers/virtual-hid" -maxdepth 1 -type f -iname '*.inf' | wc -l)" -eq 1
+          test "$(find "${validation_root}/drivers/virtual-hid" -maxdepth 1 -type f -iname '*.cat' | wc -l)" -eq 1
+          test "$(find "${validation_root}/drivers/virtual-hid" -maxdepth 1 -type f -iname '*.sys' | wc -l)" -eq 1
+
       - name: Package Windows
         shell: msys2 {0}
         run: |
+          set -euo pipefail
+
           mkdir -p artifacts
           cd build
 
@@ -325,6 +647,16 @@ jobs:
           # move
           mv ./cpack_artifacts/Sunshine.msi ../artifacts/Sunshine-${{ matrix.name }}-installer.msi
           mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-${{ matrix.name }}-lite.zip
+
+          # The privileged driver payload is required in the MSI and excluded
+          # from the non-installing lite ZIP.
+          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'lumen-vhidctl.exe' | wc -l)" -ge 1
+          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname '*.sys' | wc -l)" -ge 1
+          if 7z l ../artifacts/Sunshine-${{ matrix.name }}-lite.zip | grep -Eiq \
+              'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|\.sys$'; then
+            echo 'The lite ZIP unexpectedly contains privileged Virtual HID installation files.'
+            exit 1
+          fi
 
       - name: Sign Windows installers
         # ARM64 is not currently supported, see https://github.com/Azure/artifact-signing-action/issues/92
@@ -343,8 +675,12 @@ jobs:
 
       - name: Debug wix
         if: always()
-        shell: msys2 {0}
-        run: cat ./build/cpack_artifacts/_CPack_Packages/win64/WIX/wix.log || true
+        shell: pwsh
+        run: |
+          $wixLog = './build/cpack_artifacts/_CPack_Packages/win64/WIX/wix.log'
+          if (Test-Path $wixLog -PathType Leaf) {
+            Get-Content $wixLog
+          }
 
       - name: Initialize tray icon
         working-directory: build/tests

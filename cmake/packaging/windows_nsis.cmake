@@ -15,15 +15,35 @@ endif()
 SET(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
         "${CPACK_NSIS_EXTRA_INSTALL_COMMANDS}
         ${NSIS_LOGSET_COMMAND}
-        IfSilent +3 0
+        IfSilent sunshine_install_silent sunshine_install_interactive
+        sunshine_install_interactive:
         nsExec::ExecToLog \
           'powershell -ExecutionPolicy Bypass \
           -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action install'
-        Goto +2
+        Goto sunshine_install_check
+        sunshine_install_silent:
         nsExec::ExecToLog \
           'powershell -ExecutionPolicy Bypass \
           -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action install -Silent'
-        install_done:
+        sunshine_install_check:
+        Pop $0
+        StrCmp $0 '0' sunshine_install_done
+        StrCmp $0 '3010' sunshine_install_reboot
+        StrCpy $1 $0
+        nsExec::ExecToLog \
+          'powershell -ExecutionPolicy Bypass \
+          -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action rollback -Silent'
+        Pop $2
+        StrCmp $2 '0' sunshine_install_rollback_done
+        StrCmp $2 '3010' sunshine_install_rollback_reboot
+        Abort 'Sunshine setup failed with exit code $1, and rollback failed with exit code $2. Protected recovery state was preserved.'
+        sunshine_install_rollback_reboot:
+        SetRebootFlag true
+        sunshine_install_rollback_done:
+        Abort 'Sunshine setup failed with exit code $1. Installation changes were rolled back.'
+        sunshine_install_reboot:
+        SetRebootFlag true
+        sunshine_install_done:
         ")
 
 # Extra uninstall commands
@@ -34,6 +54,13 @@ set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS
         nsExec::ExecToLog \
           'powershell -ExecutionPolicy Bypass \
           -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action uninstall'
+        Pop $0
+        StrCmp $0 '0' sunshine_uninstall_done
+        StrCmp $0 '3010' sunshine_uninstall_reboot
+        Abort 'Sunshine cleanup failed with exit code $0. See the setup log for recovery details.'
+        sunshine_uninstall_reboot:
+        SetRebootFlag true
+        sunshine_uninstall_done:
         MessageBox MB_YESNO|MB_ICONQUESTION \
           'Do you want to remove $INSTDIR (this includes the configuration, cover images, and settings)?' \
           /SD IDNO IDNO no_delete

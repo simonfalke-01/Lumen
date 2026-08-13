@@ -201,6 +201,39 @@ To create a WiX installer, you also need to install [.NET](https://dotnet.micros
 
 For ARM64: To build frontend, you also need to install [Node.JS](https://nodejs.org/en/download)
 
+##### Lumen Virtual HID driver
+
+The Windows application and Lumen Virtual HID driver use separate toolchains. Continue to build the application in
+MSYS2 UCRT64 for AMD64 or MSYS2 CLANGARM64 for ARM64. Build the KMDF/VHF driver with MSVC from Visual Studio and the
+Windows Driver Kit (WDK); do not build the driver with the MSYS2 application toolchain.
+
+Install [Visual Studio 2022](https://visualstudio.microsoft.com/vs/) with the **Desktop development with C++** workload,
+a Windows 11 SDK, and the matching [Windows Driver Kit](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk).
+From a Visual Studio 2022 Developer Command Prompt in the repository root, build both driver platforms when producing
+packages:
+
+```bat
+msbuild src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj /m /t:Build /p:Configuration=Release /p:Platform=x64
+msbuild src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj /m /t:Build /p:Configuration=Release /p:Platform=ARM64
+```
+
+| Application architecture | Application toolchain | Driver platform | Default driver package output |
+|:-------------------------|:----------------------|:----------------|:------------------------------|
+| AMD64                    | MSYS2 UCRT64          | x64             | `src/platform/windows/virtual_hid_driver/build/x64/Release/package` |
+| ARM64                    | MSYS2 CLANGARM64      | ARM64           | `src/platform/windows/virtual_hid_driver/build/ARM64/Release/package` |
+
+Each output contains `LumenVirtualHid.inf`, `LumenVirtualHid.cat`, and `LumenVirtualHid.sys`. CI or local packaging may
+override the MSBuild output to `cmake-build-virtual-hid-driver-<arch>/package`. Supply the package directory to the
+application CMake configure step with `SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR`. The regular CMake build does not build
+or sign the driver.
+
+Use an isolated Windows VM with Secure Boot disabled for
+[test-signed driver development](https://learn.microsoft.com/windows-hardware/drivers/install/test-signing-a-driver-package).
+Test-signing results are only development evidence; public installers require a Microsoft-accepted production-signed
+catalog and driver package. Signing the application executable or installer does not satisfy Windows driver-signing
+requirements. When a matching signed driver is unavailable, development and lite packages remain usable through the
+`SendInput` fallback.
+
 ### Clone
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:
 

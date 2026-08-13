@@ -34,6 +34,62 @@ install(TARGETS audio-info RUNTIME DESTINATION "tools" COMPONENT audio)
 # Mandatory tools
 install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
 
+# Lumen Virtual HID driver
+#
+# The kernel driver is built separately with MSBuild/WDK. The application build
+# receives the architecture-matched, validated package directory from CI (or a
+# local packager) and stages it without attempting to rebuild MSVC artifacts
+# from the MSYS2 toolchain.
+set(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR "" CACHE PATH
+        "Directory containing the architecture-matched Lumen Virtual HID INF, CAT, and SYS files")
+
+if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
+    if(NOT IS_DIRECTORY "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
+        message(FATAL_ERROR
+                "SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR does not exist: "
+                "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
+    endif()
+
+    file(GLOB VIRTUAL_HID_DRIVER_INF
+            CONFIGURE_DEPENDS
+            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*.inf")
+    file(GLOB VIRTUAL_HID_DRIVER_CAT
+            CONFIGURE_DEPENDS
+            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*.cat")
+    file(GLOB VIRTUAL_HID_DRIVER_SYS
+            CONFIGURE_DEPENDS
+            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*.sys")
+
+    list(LENGTH VIRTUAL_HID_DRIVER_INF VIRTUAL_HID_DRIVER_INF_COUNT)
+    list(LENGTH VIRTUAL_HID_DRIVER_CAT VIRTUAL_HID_DRIVER_CAT_COUNT)
+    list(LENGTH VIRTUAL_HID_DRIVER_SYS VIRTUAL_HID_DRIVER_SYS_COUNT)
+    if(NOT VIRTUAL_HID_DRIVER_INF_COUNT EQUAL 1
+            OR NOT VIRTUAL_HID_DRIVER_CAT_COUNT EQUAL 1
+            OR NOT VIRTUAL_HID_DRIVER_SYS_COUNT EQUAL 1)
+        message(FATAL_ERROR
+                "The Lumen Virtual HID package must contain exactly one INF, CAT, and SYS file: "
+                "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
+    endif()
+
+    if(NOT TARGET lumen-vhidctl)
+        message(FATAL_ERROR
+                "The lumen-vhidctl target is required when packaging the Lumen Virtual HID driver")
+    endif()
+
+    install(TARGETS lumen-vhidctl
+            RUNTIME DESTINATION "tools"
+            COMPONENT virtual_hid_driver)
+    install(FILES
+            ${VIRTUAL_HID_DRIVER_INF}
+            ${VIRTUAL_HID_DRIVER_CAT}
+            ${VIRTUAL_HID_DRIVER_SYS}
+            DESTINATION "drivers/virtual-hid"
+            COMPONENT virtual_hid_driver)
+else()
+    message(STATUS
+            "Lumen Virtual HID driver package not supplied; installer generation will not include the driver")
+endif()
+
 # Mandatory scripts
 install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sunshine-setup.ps1"
         DESTINATION "scripts"
@@ -100,6 +156,32 @@ set(CPACK_COMPONENT_ASSETS_DISPLAY_NAME "Required Assets")
 set(CPACK_COMPONENT_ASSETS_DESCRIPTION "Shaders, default box art, and web UI.")
 set(CPACK_COMPONENT_ASSETS_GROUP "Core")
 set(CPACK_COMPONENT_ASSETS_REQUIRED true)
+
+# Lumen Virtual HID driver and management helper
+set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISPLAY_NAME "Virtual Keyboard and Mouse")
+set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
+        "Required Lumen Virtual HID keyboard and mouse driver and management tool.")
+set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_GROUP "Core")
+set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_REQUIRED true)
+set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DEPENDS application)
+
+# ZIP packages are intentionally non-privileged. Keep the driver package and
+# its install/remove helper out of the lite archive so unpacked builds use the
+# SendInput fallback unless a matching driver is already installed.
+get_cmake_property(SUNSHINE_WINDOWS_PACKAGE_COMPONENTS COMPONENTS)
+set(SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG
+        "${CMAKE_CURRENT_BINARY_DIR}/SunshineWindowsCPackOptions.cmake")
+string(CONCAT SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT
+        "if(CPACK_GENERATOR STREQUAL \"ZIP\")\n"
+        "  set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)\n"
+        "  set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)\n"
+        "  set(CPACK_COMPONENTS_ALL \"${SUNSHINE_WINDOWS_PACKAGE_COMPONENTS}\")\n"
+        "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_hid_driver)\n"
+        "endif()\n")
+file(GENERATE
+        OUTPUT "${SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG}"
+        CONTENT "${SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT}")
+set(CPACK_PROJECT_CONFIG_FILE "${SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG}")
 
 # audio tool
 set(CPACK_COMPONENT_AUDIO_DISPLAY_NAME "audio-info")

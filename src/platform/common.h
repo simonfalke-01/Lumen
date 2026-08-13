@@ -1158,6 +1158,15 @@ namespace platf {
    * @param flags Bit flags that modify the requested operation.
    */
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags);
+#ifdef _WIN32
+  /**
+   * @brief Check whether the Windows input backend currently owns keyboard repeat.
+   *
+   * @param input Platform input backend to query.
+   * @return `true` while the active Virtual HID transport delegates repeat to Windows.
+   */
+  bool uses_native_keyboard_repeat(input_t &input);
+#endif
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state);
   /**
    * @brief Submit UTF-8 text input to the keyboard backend.
