@@ -8,14 +8,26 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Existing Windows Build run ID to validate without rebuilding
+        required: false
+        type: string
 
 env:
   PYTHON_VERSION: '3.14'
   WDK_VERSION: '10.0.26100.0'
 
+concurrency:
+  group: >-
+    windows-${{ github.workflow }}-${{ github.ref }}-${{
+      github.event.inputs.artifact_run_id || 'build' }}
+  cancel-in-progress: true
+
 jobs:
   build_windows:
     name: Windows-AMD64
+    if: github.event_name != 'workflow_dispatch' || inputs.artifact_run_id == ''
     runs-on: windows-2022
     defaults:
       run:
@@ -23,6 +35,9 @@ jobs:
     permissions:
       actions: read
       contents: read
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -42,6 +57,9 @@ jobs:
             $errors | ForEach-Object { Write-Error $_.Message }
             throw 'The Windows installer script contains syntax errors.'
           }
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba  # v0.0.11
 
       - name: Install Windows Driver Kit
         shell: pwsh
@@ -144,6 +162,11 @@ jobs:
           $driverPackageDir = Join-Path $driverBuildDir 'package'
           New-Item -ItemType Directory -Path $driverBinDir, $driverObjDir -Force | Out-Null
 
+          $sccacheWrapperDir = Join-Path $env:RUNNER_TEMP 'sccache-msbuild'
+          New-Item -ItemType Directory -Path $sccacheWrapperDir -Force | Out-Null
+          $sccache = (Get-Command sccache -ErrorAction Stop).Source
+          Copy-Item $sccache (Join-Path $sccacheWrapperDir 'cl.exe') -Force
+
           & $msbuild `
             $driverProject `
             /m `
@@ -155,6 +178,10 @@ jobs:
             /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
             /p:OutDir="$driverBinDir\" `
             /p:IntDir="$driverObjDir\" `
+            /p:CLToolExe="$sccacheWrapperDir\cl.exe" `
+            /p:TrackFileAccess=false `
+            /p:UseMultiToolTask=true `
+            /p:DebugInformationFormat=OldStyle `
             /p:SkipPackageVerification=true `
             /p:SignMode=Off `
             /p:RunCodeAnalysis=true `
@@ -305,6 +332,7 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: 'lts/*'
+          cache: npm
 
       - name: Export NodeJS path
         shell: pwsh
@@ -340,6 +368,7 @@ jobs:
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
           export PATH="$PATH:$NODEJS_PATH"
           DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$DRIVER_PACKAGE_DIR")
+          SCCACHE_CMAKE_PATH=$(cygpath -m "$(command -v sccache)")
 
           cmake \
             -B build \
@@ -348,6 +377,8 @@ jobs:
             -DBUILD_DOCS=OFF \
             -DBUILD_TESTS=ON \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER="$SCCACHE_CMAKE_PATH" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="$SCCACHE_CMAKE_PATH" \
             -DSUNSHINE_ASSETS_DIR=assets \
             -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR="$DRIVER_PACKAGE_CMAKE_PATH" \
             -DSUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON \
@@ -393,238 +424,73 @@ jobs:
             exit 1
           fi
 
-      - name: Validate generated MSI tables
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $msiPath = Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi'
-          $installer = New-Object -ComObject WindowsInstaller.Installer
-          $database = $installer.GetType().InvokeMember(
-            'OpenDatabase', 'InvokeMethod', $null, $installer, @($msiPath.Path, 0)
-          )
-          function Read-MsiRows([string]$query, [int]$columns) {
-            $view = $database.OpenView($query)
-            [void]$view.Execute()
-            $rows = [Collections.Generic.List[object[]]]::new()
-            while ($record = $view.Fetch()) {
-              $row = [object[]]@(1..$columns | ForEach-Object { $record.StringData($_) })
-              $rows.Add($row)
-            }
-            [void]$view.Close()
-            return ,$rows.ToArray()
-          }
-          $actions = Read-MsiRows `
-            'SELECT `Action`,`Type`,`Source`,`Target` FROM `CustomAction`' 4
-          $sequence = Read-MsiRows `
-            'SELECT `Action`,`Condition`,`Sequence` FROM `InstallExecuteSequence`' 3
-          $services = Read-MsiRows `
-            'SELECT `ServiceInstall`,`Name`,`StartType`,`Component_` FROM `ServiceInstall`' 4
-          $features = Read-MsiRows `
-            'SELECT `Feature`,`Level` FROM `Feature`' 2
-          $properties = Read-MsiRows `
-            'SELECT `Property`,`Value` FROM `Property`' 2
-          $requiredActions = @(
-            'CA_SunshineInstall', 'CA_SunshineInstallRollback', 'CA_SunshineInstallCommit',
-            'CA_SunshineUninstall', 'CA_SunshineUninstallRollback', 'CA_SunshineUninstallCommit'
-          )
-          $actionNames = @($actions | ForEach-Object { $_[0] })
-          $sequenceNames = @($sequence | ForEach-Object { $_[0] })
-          foreach ($action in $requiredActions) {
-            if ($actionNames -notcontains $action -or $sequenceNames -notcontains $action) {
-              throw "Generated MSI is missing custom action or sequence row: $action"
-            }
-          }
-          if ($services.Count -ne 1 -or $services[0][1] -ne 'SunshineService') {
-            throw 'Generated MSI does not contain the declarative SunshineService row.'
-          }
-          if ($sequenceNames -notcontains 'RemoveExistingProducts') {
-            throw 'Generated MSI is missing RemoveExistingProducts.'
-          }
-          $setterNames = @(
-            'SetSunshineInstallRollbackData', 'SetSunshineInstallData', 'SetSunshineInstallCommitData',
-            'SetSunshineUninstallRollbackData', 'SetSunshineUninstallData', 'SetSunshineUninstallCommitData'
-          )
-          foreach ($setterName in $setterNames) {
-            $setter = @($actions | Where-Object { $_[0] -eq $setterName })
-            if ($setter.Count -ne 1 -or
-                $setter[0][3] -notmatch '^1\|\[ProductCode\]\|(install|uninstall)\|\[LUMEN_INSTALL_VHID\]$') {
-              throw "Generated MSI has invalid structured CustomActionData: $setterName"
-            }
-            if ($setter[0][3] -match '&(?:amp;)?quot;|\[CustomActionData\]') {
-              throw "Generated MSI contains escaped or nested CustomActionData text: $setterName"
-            }
-          }
-          $deferredActions = @($actions | Where-Object { $_[0] -in $requiredActions })
-          foreach ($deferredAction in $deferredActions) {
-            if ($deferredAction[3] -notmatch '-MsiData "\[CustomActionData\]"') {
-              throw "Deferred MSI action does not pass the structured transaction data: $($deferredAction[0])"
-            }
-          }
-          foreach ($commitAction in @('CA_SunshineInstallCommit', 'CA_SunshineUninstallCommit')) {
-            $commit = @($actions | Where-Object { $_[0] -eq $commitAction })
-            if ($commit.Count -ne 1 -or ([int]$commit[0][1] -band 0x40) -ne 0) {
-              throw "MSI commit cleanup must fail the transaction when cleanup fails: $commitAction"
-            }
-          }
-          $installSetterRows = @($sequence | Where-Object { $_[0] -eq 'SetSunshineInstallData' })
-          if ($installSetterRows.Count -ne 1) {
-            throw 'Generated MSI must set CA_SunshineInstall CustomActionData exactly once.'
-          }
-          $removeExistingProducts = @($sequence | Where-Object { $_[0] -eq 'RemoveExistingProducts' })
-          $installDeferred = @($sequence | Where-Object { $_[0] -eq 'CA_SunshineInstall' })
-          if ([int]$removeExistingProducts[0][2] -le [int]$installDeferred[0][2]) {
-            throw 'The new product must finish its install action before removing the old product.'
-          }
-          $vhidFeature = @($features | Where-Object { $_[0] -eq 'CM_C_virtual_hid_driver' })
-          if ($vhidFeature.Count -ne 1) {
-            throw 'Generated MSI is missing the Virtual HID feature.'
-          }
-          $productCode = @($properties | Where-Object { $_[0] -eq 'ProductCode' })
-          if ($productCode.Count -ne 1 -or
-              $productCode[0][1] -notmatch '^\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}$') {
-            throw 'Generated MSI has an invalid ProductCode.'
-          }
-          "MSI_PRODUCT_CODE=$($productCode[0][1])" >> $env:GITHUB_ENV
-
-      - name: Smoke test MSI install without Virtual HID
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $msiPath = (Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi').Path
-          $installLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-install-no-vhid.log'
-          $uninstallLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-uninstall-no-vhid.log'
-          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=0',
-            '/L*V', "`"$installLog`""
-          )
-          if ($install.ExitCode -notin @(0, 3010)) {
-            Get-Content $installLog
-            throw "MSI install without Virtual HID failed with exit code $($install.ExitCode)."
-          }
-          $service = Get-Service SunshineService -ErrorAction Stop
-          if ($service.Status -ne 'Running') {
-            throw 'SunshineService is not running after MSI installation.'
-          }
-          if (Test-Path 'C:\Program Files\Sunshine\drivers\virtual-hid') {
-            throw 'Virtual HID files were installed despite LUMEN_INSTALL_VHID=0.'
-          }
-          $uninstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/x', $env:MSI_PRODUCT_CODE, '/qn', '/norestart', '/L*V', "`"$uninstallLog`""
-          )
-          if ($uninstall.ExitCode -notin @(0, 3010)) {
-            Get-Content $uninstallLog
-            throw "MSI uninstall without Virtual HID failed with exit code $($uninstall.ExitCode)."
-          }
-
-      - name: Smoke test MSI install with Virtual HID
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $msiPath = (Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi').Path
-          $installLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-install-vhid.log'
-          $uninstallLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-uninstall-vhid.log'
-          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=1',
-            '/L*V', "`"$installLog`""
-          )
-          if ($install.ExitCode -notin @(0, 3010)) {
-            Get-Content $installLog
-            throw "MSI install with Virtual HID failed with exit code $($install.ExitCode)."
-          }
-          $helper = 'C:\Program Files\Sunshine\tools\lumen-vhidctl.exe'
-          & $helper status --json
-          if ($LASTEXITCODE -ne 0) {
-            Get-Content $installLog
-            throw "Virtual HID status failed with exit code $LASTEXITCODE."
-          }
-          $uninstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/x', $env:MSI_PRODUCT_CODE, '/qn', '/norestart', '/L*V', "`"$uninstallLog`""
-          )
-          if ($uninstall.ExitCode -notin @(0, 3010)) {
-            Get-Content $uninstallLog
-            throw "MSI uninstall with Virtual HID failed with exit code $($uninstall.ExitCode)."
-          }
-          if (Test-Path $helper) {
-            throw 'Virtual HID helper remains after MSI uninstall.'
-          }
-
-      - name: Smoke test MSI upgrade from 0.0.9
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $oldArtifactId = 9136389283
-          $oldArtifactZip = Join-Path $env:RUNNER_TEMP 'lumen-0.0.9.zip'
-          $oldArtifactDir = Join-Path $env:RUNNER_TEMP 'lumen-0.0.9'
-          $headers = @{
-            Accept = 'application/vnd.github+json'
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            'X-GitHub-Api-Version' = '2022-11-28'
-          }
-          Invoke-WebRequest `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$oldArtifactId/zip" `
-            -Headers $headers `
-            -OutFile $oldArtifactZip
-          Expand-Archive -LiteralPath $oldArtifactZip -DestinationPath $oldArtifactDir
-          $oldMsi = (Get-ChildItem $oldArtifactDir -Filter '*.msi' -File -Recurse | Select-Object -First 1).FullName
-          if (-not $oldMsi) {
-            throw 'The 0.0.9 regression artifact does not contain an MSI.'
-          }
-          $newMsi = (Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi').Path
-          $oldLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-install-0.0.9.log'
-          $upgradeLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-upgrade.log'
-          $uninstallLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-upgrade-uninstall.log'
-
-          $oldInstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/i', "`"$oldMsi`"", '/qn', '/norestart', '/L*V', "`"$oldLog`""
-          )
-          if ($oldInstall.ExitCode -notin @(0, 3010)) {
-            Get-Content $oldLog
-            throw "Installing the 0.0.9 MSI fixture failed with exit code $($oldInstall.ExitCode)."
-          }
-          $sentinel = 'C:\Program Files\Sunshine\config\upgrade-ci-sentinel.txt'
-          Set-Content -LiteralPath $sentinel -Value 'preserve-me' -NoNewline
-
-          $upgrade = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/i', "`"$newMsi`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=1',
-            '/L*V', "`"$upgradeLog`""
-          )
-          if ($upgrade.ExitCode -notin @(0, 3010)) {
-            Get-Content $upgradeLog
-            throw "MSI upgrade from 0.0.9 failed with exit code $($upgrade.ExitCode)."
-          }
-          if ((Get-Content -LiteralPath $sentinel -Raw) -ne 'preserve-me') {
-            throw 'MSI upgrade did not preserve the existing configuration sentinel.'
-          }
-          $service = Get-Service SunshineService -ErrorAction Stop
-          if ($service.Status -ne 'Running') {
-            throw 'SunshineService is not running after MSI upgrade.'
-          }
-          $helper = 'C:\Program Files\Sunshine\tools\lumen-vhidctl.exe'
-          & $helper status --json
-          if ($LASTEXITCODE -ne 0) {
-            Get-Content $upgradeLog
-            throw "Virtual HID status after MSI upgrade failed with exit code $LASTEXITCODE."
-          }
-          $oldProduct = Get-ItemProperty `
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{77391323-4F4F-4189-9ABA-151A7F048675}' `
-            -ErrorAction SilentlyContinue
-          if ($null -ne $oldProduct) {
-            throw 'The 0.0.9 product is still registered after the major upgrade.'
-          }
-
-          $uninstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-            '/x', $env:MSI_PRODUCT_CODE, '/qn', '/norestart', '/L*V', "`"$uninstallLog`""
-          )
-          if ($uninstall.ExitCode -notin @(0, 3010)) {
-            Get-Content $uninstallLog
-            throw "Uninstall after MSI upgrade failed with exit code $($uninstall.ExitCode)."
-          }
-
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: build-Windows-AMD64
           path: artifacts/
           if-no-files-found: error
+
+  validate_msi:
+    name: Windows MSI (${{ matrix.scenario }})
+    needs: build_windows
+    if: >-
+      always() &&
+      (inputs.artifact_run_id != '' || needs.build_windows.result == 'success')
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - install-no-vhid
+          - install-vhid
+          - upgrade
+    steps:
+      - name: Checkout validation scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
+        with:
+          name: build-Windows-AMD64
+          path: artifacts
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+
+      - name: Validate generated MSI tables
+        shell: pwsh
+        run: ./.github/scripts/validate-windows-msi.ps1
+
+      - name: Run ${{ matrix.scenario }} MSI scenario
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/test-windows-msi.ps1 -Scenario '${{ matrix.scenario }}'
+
+      - name: Collect installer script logs
+        if: always()
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:SystemRoot 'Temp\Sunshine\logs'
+          if (Test-Path -LiteralPath $source -PathType Container) {
+            Copy-Item `
+              -LiteralPath $source `
+              -Destination 'artifacts/installer-script-logs' `
+              -Recurse `
+              -Force
+          }
+
+      - name: Upload MSI validation logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-msi-${{ matrix.scenario }}-logs
+          path: artifacts/**/*.log
+          if-no-files-found: warn
+          retention-days: 14

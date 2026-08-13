@@ -27,10 +27,7 @@ param(
 
     [Parameter(Mandatory=$false)]
     [ValidateSet("0", "1")]
-    [string]$InstallVirtualHid,
-
-    [Parameter(Mandatory=$false)]
-    [string]$MsiData
+    [string]$InstallVirtualHid
 )
 
 # Constants
@@ -278,10 +275,6 @@ if (-not $isAdmin) {
     if ($InstallVirtualHid) {
         $arguments += " -InstallVirtualHid $InstallVirtualHid"
     }
-    if ($MsiData) {
-        $arguments += " -MsiData `"$MsiData`""
-    }
-
     try {
         # Relaunch the script with elevation
         $elevatedProcess = Start-Process `
@@ -319,7 +312,6 @@ $script:LogPath = $LogPath
 # product has already installed into the shared directory, that legacy action
 # must not remove resources now owned by the new product.
 $legacyMajorUpgradeUninstall = $Msi -and $Action -eq "uninstall" -and
-    [string]::IsNullOrWhiteSpace($MsiData) -and
     [string]::IsNullOrWhiteSpace($ProductCode) -and
     [string]::IsNullOrWhiteSpace($TransactionKind)
 if ($legacyMajorUpgradeUninstall) {
@@ -877,27 +869,6 @@ $programDataDirectory = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::CommonApplicationData
 )
 $installerRegistryPath = "HKLM:\SOFTWARE\LizardByte\Lumen\VirtualHid"
-
-function Set-MsiTransactionArguments {
-    if (-not $Msi) {
-        return
-    }
-    if ([string]::IsNullOrWhiteSpace($MsiData)) {
-        throw "MsiData is required for Windows Installer actions."
-    }
-    $parts = $MsiData.Split([char]'|')
-    if ($parts.Count -ne 4 -or
-        $parts[0] -ne "1" -or
-        $parts[2] -notin @("install", "uninstall") -or
-        $parts[3] -notin @("0", "1")) {
-        throw "MsiData has an unsupported format."
-    }
-    $script:ProductCode = $parts[1]
-    $script:TransactionKind = $parts[2]
-    $script:InstallVirtualHid = $parts[3]
-}
-
-Set-MsiTransactionArguments
 
 function ConvertTo-CanonicalProductCode {
     param(
