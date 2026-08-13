@@ -446,7 +446,8 @@ jobs:
           )
           foreach ($setterName in $setterNames) {
             $setter = @($actions | Where-Object { $_[0] -eq $setterName })
-            if ($setter.Count -ne 1 -or $setter[0][3] -notmatch '^1\|\[ProductCode\]\|(install|uninstall)\|[01]$') {
+            if ($setter.Count -ne 1 -or
+                $setter[0][3] -notmatch '^1\|\[ProductCode\]\|(install|uninstall)\|\[LUMEN_INSTALL_VHID\]$') {
               throw "Generated MSI has invalid structured CustomActionData: $setterName"
             }
             if ($setter[0][3] -match '&(?:amp;)?quot;|\[CustomActionData\]') {
