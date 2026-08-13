@@ -1,4 +1,4 @@
-/** @file resource.h @brief Version-resource constants for LumenVirtualHid.sys. */
+/** @file resource.h @brief Version-resource constants for LumenVirtualHid.dll. */
 
 #ifndef LUMEN_VIRTUAL_HID_RESOURCE_H
 #define LUMEN_VIRTUAL_HID_RESOURCE_H

@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - master
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -48,9 +49,9 @@ jobs:
           $wdkBuildProps = Join-Path `
             ${env:ProgramFiles(x86)} `
             "Windows Kits\10\build\$env:WDK_VERSION\WindowsDriver.Default.props"
-          $wdkHeader = Join-Path `
+          $wdkUmdfIncludeDir = Join-Path `
             ${env:ProgramFiles(x86)} `
-            "Windows Kits\10\Include\$env:WDK_VERSION\km\ntddk.h"
+            'Windows Kits\10\Include\wdf\umdf'
           if (-not (Test-Path $wdkBuildProps -PathType Leaf)) {
             winget install `
               --id Microsoft.WindowsWDK.10.0.26100 `
@@ -66,8 +67,13 @@ jobs:
           if (-not (Test-Path $wdkBuildProps -PathType Leaf)) {
             throw "WDK build integration not found after installation: $wdkBuildProps"
           }
-          if (-not (Test-Path $wdkHeader -PathType Leaf)) {
-            throw "WDK kernel headers not found after installation: $wdkHeader"
+          $wdkHeader = Get-ChildItem $wdkUmdfIncludeDir `
+            -Recurse `
+            -File `
+            -Filter wdf.h `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $wdkHeader) {
+            throw "WDK UMDF headers not found after installation: $wdkUmdfIncludeDir"
           }
 
           $vswhere = Join-Path `
@@ -84,7 +90,7 @@ jobs:
 
           $toolsetPattern = Join-Path `
             $vsInstall `
-            'MSBuild\Microsoft\VC\v*\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0\Toolset.props'
+            'MSBuild\Microsoft\VC\v*\Platforms\x64\PlatformToolsets\WindowsUserModeDriver10.0\Toolset.props'
           $toolsetProps = @(Get-ChildItem $toolsetPattern -File -ErrorAction SilentlyContinue)
           if ($toolsetProps.Count -eq 0) {
             $vsSetup = Join-Path `
@@ -160,7 +166,7 @@ jobs:
           New-Item -ItemType Directory -Path $driverPackageDir | Out-Null
           Copy-Item `
             (Join-Path $driverBinDir 'LumenVirtualHid.inf'), `
-            (Join-Path $driverBinDir 'LumenVirtualHid.sys') `
+            (Join-Path $driverBinDir 'LumenVirtualHid.dll') `
             -Destination $driverPackageDir
 
           $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
@@ -176,19 +182,6 @@ jobs:
             throw 'InfVerif and Inf2Cat were not found in the installed WDK.'
           }
 
-          $packagedInf = Get-Item (Join-Path $driverPackageDir 'LumenVirtualHid.inf')
-          & $infVerif.FullName /v /w $packagedInf.FullName
-          if ($LASTEXITCODE -ne 0) {
-            throw "InfVerif failed with exit code $LASTEXITCODE."
-          }
-          & $inf2Cat.FullName "/driver:$driverPackageDir" /os:10_X64 /verbose
-          if ($LASTEXITCODE -ne 0) {
-            throw "Inf2Cat failed with exit code $LASTEXITCODE."
-          }
-          if (@(Get-ChildItem $driverPackageDir -File -Filter '*.cat').Count -ne 1) {
-            throw 'Inf2Cat did not generate exactly one catalog.'
-          }
-
           $signTool = Get-ChildItem (Join-Path $kitsRoot 'bin') `
             -Recurse -File -Filter signtool.exe | Where-Object {
               $_.FullName -match '\\x64\\signtool\.exe$'
@@ -198,15 +191,15 @@ jobs:
           }
 
           $certificate = New-SelfSignedCertificate `
-            -Subject 'CN=Lumen Virtual HID Development Driver' `
-            -FriendlyName 'Lumen Virtual HID Development Driver' `
+            -Subject 'CN=Lumen Virtual HID Driver' `
+            -FriendlyName 'Lumen Virtual HID Driver' `
             -Type CodeSigningCert `
             -CertStoreLocation 'Cert:\CurrentUser\My' `
             -KeyAlgorithm RSA `
             -KeyLength 3072 `
             -HashAlgorithm SHA256 `
             -KeyExportPolicy Exportable `
-            -NotAfter (Get-Date).AddYears(10)
+            -NotAfter (Get-Date).AddYears(100)
           $certificatePath = Join-Path $driverPackageDir 'LumenVirtualHid.cer'
           $pfxPath = Join-Path $env:RUNNER_TEMP 'LumenVirtualHid.pfx'
           $pfxPasswordText = [Guid]::NewGuid().ToString('N')
@@ -218,7 +211,32 @@ jobs:
             -Password $pfxPassword `
             -Force | Out-Null
 
-          $catalog = Get-ChildItem $driverPackageDir -File -Filter '*.cat'
+          $driverBinary = Get-Item (Join-Path $driverPackageDir 'LumenVirtualHid.dll')
+          & $signTool.FullName sign `
+            /f $pfxPath `
+            /p $pfxPasswordText `
+            /fd SHA256 `
+            /v `
+            $driverBinary.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signing the Virtual HID DLL failed with exit code $LASTEXITCODE."
+          }
+
+          $packagedInf = Get-Item (Join-Path $driverPackageDir 'LumenVirtualHid.inf')
+          & $infVerif.FullName /v /w $packagedInf.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "InfVerif failed with exit code $LASTEXITCODE."
+          }
+          & $inf2Cat.FullName "/driver:$driverPackageDir" /os:10_X64 /verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inf2Cat failed with exit code $LASTEXITCODE."
+          }
+          $catalogs = @(Get-ChildItem $driverPackageDir -File -Filter '*.cat')
+          if ($catalogs.Count -ne 1) {
+            throw 'Inf2Cat did not generate exactly one catalog.'
+          }
+          $catalog = $catalogs[0]
+
           & $signTool.FullName sign `
             /f $pfxPath `
             /p $pfxPasswordText `
@@ -235,14 +253,21 @@ jobs:
           Import-Certificate `
             -FilePath $certificatePath `
             -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+          & $signTool.FullName verify /pa /v $driverBinary.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Verifying the signed Virtual HID DLL failed with exit code $LASTEXITCODE."
+          }
           & $signTool.FullName verify /pa /v $catalog.FullName
           if ($LASTEXITCODE -ne 0) {
             throw "Verifying the signed Virtual HID catalog failed with exit code $LASTEXITCODE."
           }
-          $driverBinary = Get-Item (Join-Path $driverPackageDir 'LumenVirtualHid.sys')
+          & $signTool.FullName verify /pa /v /c $catalog.FullName $packagedInf.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "The signed Virtual HID catalog does not cover the INF."
+          }
           & $signTool.FullName verify /pa /v /c $catalog.FullName $driverBinary.FullName
           if ($LASTEXITCODE -ne 0) {
-            throw "The signed Virtual HID catalog does not cover the driver binary."
+            throw "The signed Virtual HID catalog does not cover the DLL."
           }
           Remove-Item $pfxPath -Force
 
@@ -320,14 +345,21 @@ jobs:
             -G Ninja \
             -S . \
             -DBUILD_DOCS=OFF \
-            -DBUILD_TESTS=OFF \
+            -DBUILD_TESTS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DSUNSHINE_ASSETS_DIR=assets \
             -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR="$DRIVER_PACKAGE_CMAKE_PATH" \
+            -DSUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON \
             -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
             -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/${GITHUB_REPOSITORY}" \
             -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/${GITHUB_REPOSITORY}/issues"
           ninja -C build
+
+      - name: Run targeted Windows tests
+        shell: msys2 {0}
+        run: |
+          build/tests/test_sunshine.exe \
+            --gtest_filter='VirtualHidProtocolTest.*:VirtualHidInputTest.*:InputTransportTest.*'
 
       - name: Package Windows
         shell: msys2 {0}
@@ -343,13 +375,72 @@ jobs:
           mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-lite.zip
 
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'lumen-vhidctl.exe' | wc -l)" -ge 1
-          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname '*.sys' | wc -l)" -ge 1
-          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname '*.cer' | wc -l)" -ge 1
+          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.inf' | wc -l)" -eq 1
+          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.cat' | wc -l)" -eq 1
+          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.dll' | wc -l)" -eq 1
+          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.cer' | wc -l)" -eq 1
           if 7z l ../artifacts/Sunshine-Windows-AMD64-lite.zip | grep -Eiq \
-              'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|\.sys$|\.cer$'; then
+              'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|lumenvirtualhid\.(inf|cat|dll|cer)'; then
             echo 'The lite ZIP unexpectedly contains Virtual HID installation files.'
             exit 1
           fi
+
+      - name: Validate generated MSI tables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msiPath = Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi'
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.GetType().InvokeMember(
+            'OpenDatabase', 'InvokeMethod', $null, $installer, @($msiPath.Path, 0)
+          )
+          function Read-MsiRows([string]$query, [int]$columns) {
+            $view = $database.OpenView($query)
+            $view.Execute()
+            $rows = @()
+            while ($record = $view.Fetch()) {
+              $rows += ,@(1..$columns | ForEach-Object { $record.StringData($_) })
+            }
+            $view.Close()
+            return $rows
+          }
+          $actions = Read-MsiRows `
+            'SELECT `Action`,`Type`,`Source`,`Target` FROM `CustomAction`' 4
+          $sequence = Read-MsiRows `
+            'SELECT `Action`,`Condition`,`Sequence` FROM `InstallExecuteSequence`' 3
+          $services = Read-MsiRows `
+            'SELECT `ServiceInstall`,`Name`,`StartType`,`Component_` FROM `ServiceInstall`' 4
+          $requiredActions = @(
+            'CA_SunshineInstall', 'CA_SunshineInstallRollback', 'CA_SunshineInstallCommit',
+            'CA_SunshineUninstall', 'CA_SunshineUninstallRollback', 'CA_SunshineUninstallCommit'
+          )
+          $actionNames = @($actions | ForEach-Object { $_[0] })
+          $sequenceNames = @($sequence | ForEach-Object { $_[0] })
+          foreach ($action in $requiredActions) {
+            if ($actionNames -notcontains $action -or $sequenceNames -notcontains $action) {
+              throw "Generated MSI is missing custom action or sequence row: $action"
+            }
+          }
+          if ($services.Count -ne 1 -or $services[0][1] -ne 'SunshineService') {
+            throw 'Generated MSI does not contain the declarative SunshineService row.'
+          }
+          if ($sequenceNames -notcontains 'RemoveExistingProducts') {
+            throw 'Generated MSI is missing RemoveExistingProducts.'
+          }
+          $installSetterAction = @($actions | Where-Object { $_[0] -eq 'SetSunshineInstallData' })
+          if ($installSetterAction.Count -ne 1 -or
+              $installSetterAction[0][3] -notmatch 'PreviousProductCode.+LUMEN_PREVIOUS_PRODUCT_CODE') {
+            throw 'Generated MSI does not pass the optional exact legacy ProductCode to the install action.'
+          }
+          $installSetterRows = @($sequence | Where-Object { $_[0] -eq 'SetSunshineInstallData' })
+          if ($installSetterRows.Count -ne 1) {
+            throw 'Generated MSI must set CA_SunshineInstall CustomActionData exactly once.'
+          }
+          $removeExistingProducts = @($sequence | Where-Object { $_[0] -eq 'RemoveExistingProducts' })
+          $installDeferred = @($sequence | Where-Object { $_[0] -eq 'CA_SunshineInstall' })
+          if ([int]$removeExistingProducts[0][2] -ge [int]$installDeferred[0][2]) {
+            throw 'RemoveExistingProducts must finish before the current Virtual HID install action.'
+          }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

@@ -364,22 +364,32 @@ brew uninstall sunshine
 > Installer logs can be found in the following directory:
 > `%%TEMP%/Sunshine/logs/install/`
 
-The Windows installer includes the architecture-matched Lumen Virtual HID keyboard and mouse driver. Sunshine
-automatically prefers this driver for input when it runs through `SunshineService`. If the driver is missing,
-unavailable, or incompatible, Sunshine uses the Windows `SendInput` backend for that input session and records the
-reason in the log. There is no backend setting to configure. Install and repair operations update the driver before
-starting the service and roll back if required setup fails.
+The Windows 11 x64 installer offers the **Virtual Keyboard and Mouse** driver feature. It is selected by default but is
+optional. Sunshine uses `windows_input_backend = auto` by default, which prefers the driver when it is installed,
+compatible, and accessible to `SunshineService`; otherwise, Sunshine uses the Windows `SendInput` backend and records
+the reason in the log. Deselect the feature to install without a bundled driver.
 
 > [!IMPORTANT]
-> Lumen currently ships a test-signed Virtual HID driver. Disable Secure Boot before running the MSI. The installer
-> trusts the bundled Lumen development certificate, enables Windows test-signing mode, and requests a restart. A
-> one-shot `SYSTEM` startup task finishes the driver installation after that restart. Uninstall removes the trusted
-> certificate and disables test-signing mode when Lumen enabled it, which requires one final restart.
+> Each Lumen Windows installer carries an exact self-signed Virtual HID certificate valid for 100 years. Upgrades
+> replace only Lumen's recorded prior thumbprint after the MSI transaction commits. Certificate expiry is 100 years
+> after the artifact is built; an installed driver does not stop on a build-job schedule.
+> It is not Microsoft-certified or distributed through Windows Update. Windows driver-signing or Secure Boot policy can
+> still reject it; deselect Virtual HID and use `SendInput` on systems where installation is blocked.
 
 > [!NOTE]
-> Only the service account (`SYSTEM`) can submit Virtual HID input. Launching Sunshine directly uses `SendInput`, even
-> when it is run as Administrator. Unicode text also continues to use `SendInput` while Virtual HID handles normal
-> keyboard and mouse input.
+> Only the service account (`SYSTEM`) can probe the exact Virtual HID ABI or submit Virtual HID input. Launching
+> Sunshine directly uses `SendInput`, even when it is run as Administrator. Unicode text also continues to use
+> `SendInput` while Virtual HID handles normal keyboard and mouse input.
+
+To install without the bundled driver from the command line, set the MSI property to `0`:
+
+```bat
+msiexec /i Sunshine-Windows-AMD64-installer.msi LUMEN_INSTALL_VHID=0
+```
+
+Use `LUMEN_INSTALL_VHID=1` to explicitly select the feature during a silent install. Deselecting the feature removes an
+existing Lumen Virtual HID driver but does not change Sunshine's configuration. For a SendInput-only deployment, also
+set `windows_input_backend = sendinput` in Sunshine's configuration.
 
 In Virtual HID mode, Windows controls the repeat cadence for held keys. The `key_repeat_delay` and
 `key_repeat_frequency` settings apply when Sunshine uses the `SendInput` fallback.
@@ -397,8 +407,9 @@ overflow menu. Different versions of Windows may provide slightly different step
 > By using this package instead of the installer, performance will be reduced. This package is not
 > recommended for most users. No support will be provided!
 
-The lite package does not install the Lumen Virtual HID driver. It uses `SendInput` unless a compatible driver is
-already installed and Sunshine runs through `SunshineService`.
+The lite package does not install the Lumen Virtual HID driver. With the default `auto` setting, it can use an existing
+compatible driver only when Sunshine runs through `SunshineService`; set `windows_input_backend = sendinput` to force a
+SendInput-only setup.
 
 1. Download and extract based on your architecture:
 

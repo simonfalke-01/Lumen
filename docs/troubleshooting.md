@@ -291,34 +291,44 @@ launchctl load -w /Library/LaunchAgents/org.freedesktop.dbus-session.plist
 
 ### Virtual keyboard or mouse is unavailable
 
-Sunshine automatically uses the Lumen Virtual HID keyboard and mouse driver when a compatible driver is available to
-`SunshineService`. If discovery, access, protocol validation, or input submission fails, Sunshine records the failed
-stage and status and switches the complete keyboard and mouse input session to `SendInput`.
+With the default `windows_input_backend = auto`, Sunshine uses the Lumen Virtual HID keyboard and mouse driver when it
+is compatible and accessible to `SunshineService`. Set `windows_input_backend = sendinput` to skip the driver probe and
+always use SendInput.
 
 Check the log in the web UI's `Troubleshooting` tab or at `config/sunshine.log` in the Sunshine installation directory.
-Then check the installed driver from Command Prompt:
+Then inspect the Plug and Play topology from Command Prompt:
 
 ```bat
 cd /d "%ProgramFiles%\Sunshine"
-tools\lumen-vhidctl.exe status
+tools\lumen-vhidctl.exe status --json
 ```
 
-The command does not require elevation. `state=installed` confirms that the root device is started and its interface is
-available; `state=absent` means the driver needs repair.
+`status --json` does not require elevation. Its `state` is `installed`, `absent`, or `unhealthy`; it reports whether the
+root device and expected HID collections are present and started. It does not prove that the service can use the exact
+driver ABI.
 
-If the helper reports that the driver is missing, incompatible, or unusable, rerun the architecture-matched Sunshine
-installer and select repair. Repair installs or updates the driver before restarting the service. Installer and repair
-logs are stored in `%%TEMP%/Sunshine/logs/install/`; uninstall logs are stored in
-`%%TEMP%/Sunshine/logs/uninstall/`. The helper is not included in standalone/lite packages.
+The exact ABI check is separate:
 
-The current Lumen driver is test-signed. Secure Boot must be disabled, Windows test-signing mode must be active, and
-the machine must be restarted after the first MSI installation. The installer enables test-signing mode and registers
-a one-shot startup task named `Lumen Virtual HID Driver Install` to finish installation after restart. If the task is
-still present after reboot, inspect the install log and run the MSI repair action.
+```bat
+tools\lumen-vhidctl.exe probe --json
+```
+
+`probe --json` must run as `SYSTEM`; an Administrator command prompt is not sufficient. Its `state` is `compatible`,
+`absent`, `inaccessible`, or `incompatible`. Use the Sunshine service log as the normal record of this service-only
+probe.
+
+If the helper reports that the driver is missing, incompatible, or unusable, rerun the Windows 11 x64 Sunshine
+installer and select repair. Installer and repair logs are stored in `%%TEMP%/Sunshine/logs/install/`; uninstall logs
+are stored in `%%TEMP%/Sunshine/logs/uninstall/`. The helper is not included in standalone/lite packages.
+
+Lumen Windows installers use an exact self-signed driver certificate valid for 100 years and trust only its exact
+thumbprint. A committed upgrade removes only the exact previously recorded Lumen signer. Certificate expiry is 100
+years after the artifact is built. The package is not Microsoft-certified. Windows driver-signing or Secure Boot policy can still reject it; use the
+optional SendInput-only installation when that policy blocks Virtual HID.
 
 > [!NOTE]
 > A direct Sunshine launch cannot access the Virtual HID report interface, even when run as Administrator. Run the
-> installed `SunshineService` to use Virtual HID. Standalone/lite and development builds use `SendInput` when no
+> installed `SunshineService` to use Virtual HID. Standalone/lite builds use `SendInput` when no
 > compatible, accessible driver is installed.
 
 If the installed driver and application use incompatible protocol versions, keep both on the same Sunshine release or
@@ -326,15 +336,20 @@ run installer repair. Uninstalling Sunshine stops the service before removing th
 package. Use Windows **Installed apps** to repair or uninstall Sunshine; Windows may require a restart to finish
 removing an in-use driver.
 
-If a runtime failure cannot safely release the Virtual HID session, Sunshine stops keyboard and mouse injection for
-that input session instead of risking duplicate or stuck input. Disconnect the Moonlight client, restart
-`SunshineService`, and review the recorded failure before reconnecting.
+If initialization fails, or input submission fails before the driver accepts its first report, Sunshine uses SendInput.
+After the driver accepts any report, a later submission failure fails closed and stops keyboard and mouse injection
+instead of risking duplicate or stuck input. Disconnect Moonlight to trigger the input session's atomic
+reset-and-release operation. A successful reset recovers through SendInput without replaying held state; a failed reset
+keeps input fail closed. If disconnecting does not recover input, restart `SunshineService` and review the failure before
+reconnecting. Reboot Windows if the topology remains `unhealthy`, the installer reports that a reboot is required, or a
+service restart does not recover the driver; then rerun repair if `status --json` is still not `installed`.
 
 Look for one of these backend-selection messages in `sunshine.log`:
 
 ```text
 Windows keyboard and mouse backend: Lumen Virtual HID
 Windows keyboard and mouse backend: SendInput fallback (stage=..., status=...)
+Lumen Virtual HID failed closed (stage=..., status=...)
 ```
 
 `SendInput` remains subject to Windows User Interface Privilege Isolation (UIPI). It may not control an application at

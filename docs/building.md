@@ -203,37 +203,32 @@ For ARM64: To build frontend, you also need to install [Node.JS](https://nodejs.
 
 ##### Lumen Virtual HID driver
 
-The Windows application and Lumen Virtual HID driver use separate toolchains. Continue to build the application in
-MSYS2 UCRT64 for AMD64 or MSYS2 CLANGARM64 for ARM64. Build the KMDF/VHF driver with MSVC from Visual Studio and the
-Windows Driver Kit (WDK); do not build the driver with the MSYS2 application toolchain.
+The Windows application and Lumen Virtual HID driver use separate toolchains. The Virtual HID driver currently supports
+Windows 11 x64 only. Continue to build the AMD64 application in MSYS2 UCRT64, but build the UMDF driver with MSVC from
+Visual Studio and the Windows Driver Kit (WDK). Do not build the driver with the MSYS2 application toolchain.
 
 Install [Visual Studio 2022](https://visualstudio.microsoft.com/vs/) with the **Desktop development with C++** workload,
 a Windows 11 SDK, and the matching [Windows Driver Kit](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk).
-From a Visual Studio 2022 Developer Command Prompt in the repository root, build both driver platforms when producing
-packages:
+From a Visual Studio 2022 Developer Command Prompt in the repository root, build the x64 driver:
 
 ```bat
 msbuild src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj /m /t:Build /p:Configuration=Release /p:Platform=x64
-msbuild src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj /m /t:Build /p:Configuration=Release /p:Platform=ARM64
 ```
 
-| Application architecture | Application toolchain | Driver platform | Default driver package output |
-|:-------------------------|:----------------------|:----------------|:------------------------------|
-| AMD64                    | MSYS2 UCRT64          | x64             | `src/platform/windows/virtual_hid_driver/build/x64/Release/package` |
-| ARM64                    | MSYS2 CLANGARM64      | ARM64           | `src/platform/windows/virtual_hid_driver/build/ARM64/Release/package` |
+The default build output is
+`src/platform/windows/virtual_hid_driver/build/x64/Release/package`. The regular CMake build does not build or sign the
+driver. To include it in an installer, supply its package directory with
+`SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR`. Omitting that option produces a package without the Virtual HID driver;
+Sunshine remains usable with `windows_input_backend = sendinput`.
 
-Each package supplied to CMake contains `LumenVirtualHid.inf`, `LumenVirtualHid.cat`, `LumenVirtualHid.sys`, and the
-test-signing certificate `LumenVirtualHid.cer`. CI or local packaging may
-override the MSBuild output to `cmake-build-virtual-hid-driver-<arch>/package`. Supply the package directory to the
-application CMake configure step with `SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR`. The regular CMake build does not build
-or sign the driver.
-
-Use an isolated Windows VM with Secure Boot disabled for
-[test-signed driver development](https://learn.microsoft.com/windows-hardware/drivers/install/test-signing-a-driver-package).
-The Lumen MSI trusts its bundled development certificate and enables test-signing mode to make the driver installable.
-Secure Boot must be disabled, and a restart is required before Windows will load the driver. Signing the application
-executable or installer does not satisfy Windows driver-signing requirements. The lite package remains usable through
-the `SendInput` fallback.
+A Lumen Windows package contains the x64 `LumenVirtualHid.inf`, `LumenVirtualHid.cat`, `LumenVirtualHid.dll`, and
+an exact self-signed `.cer` file valid for 100 years when configured with
+`SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON`. Setup trusts only that certificate. A committed upgrade replaces only
+the recorded prior Lumen signer, and a committed uninstall removes only the recorded thumbprint. Certificate expiry is
+100 years after the artifact is built. This is intentionally not Microsoft certification or Windows Update distribution.
+Windows policy may still reject a self-signed driver on systems whose
+driver-signing or Secure Boot policy does not allow it; users can deselect Virtual HID and use `SendInput`. The Windows
+ARM64 application build has no Virtual HID driver package and uses `SendInput`.
 
 ### Clone
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:

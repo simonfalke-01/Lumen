@@ -1,26 +1,22 @@
 /**
  * @file src/platform/windows/virtual_hid_input.cpp
- * @brief Lumen Virtual HID application transport implementation.
+ * @brief Lean Lumen Virtual HID application transport implementation.
  */
 
-// Define the device-interface GUID in this translation unit.
-#include <initguid.h>
-
 // local includes
+#define INITGUID
+#include "virtual_hid_input.h"
+#undef INITGUID
+
 #include "keylayout.h"
 #include "src/config.h"
 #include "src/logging.h"
-#include "virtual_hid_input.h"
 
 // platform includes
 #include <SetupAPI.h>
 
 // standard includes
 #include <algorithm>
-#include <array>
-#include <cmath>
-#include <cstddef>
-#include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -33,57 +29,11 @@ namespace platf::win_input {
   namespace {
     using namespace std::literals;
 
-    /**
-     * @brief Populate a protocol message header.
-     * @param operation Protocol operation identifier.
-     * @param total_size Complete structure size.
-     * @param protocol_minor Negotiated protocol minor version.
-     * @return Populated message header.
-     */
-    LUMEN_VHID_MESSAGE_HEADER message_header(
-      std::uint16_t operation,
-      std::uint32_t total_size,
-      std::uint16_t protocol_minor = LUMEN_VHID_PROTOCOL_MINOR
-    ) {
-      return {
-        LUMEN_VHID_PROTOCOL_MAGIC,
-        LUMEN_VHID_PROTOCOL_MAJOR,
-        protocol_minor,
-        sizeof(LUMEN_VHID_MESSAGE_HEADER),
-        operation,
-        total_size,
-        0
-      };
-    }
-
-    /**
-     * @brief Convert a Win32 channel error to an ordering-safe completion class.
-     * @param status Native Win32 status.
-     * @return Classified channel result.
-     */
-    channel_result_t classify_channel_error(DWORD status) {
-      switch (status) {
-        case ERROR_DEVICE_NOT_CONNECTED:
-        case ERROR_NO_SUCH_DEVICE:
-        case ERROR_FILE_NOT_FOUND:
-        case ERROR_INVALID_HANDLE:
-        case ERROR_TIMEOUT:
-        case ERROR_SEM_TIMEOUT:
-        case ERROR_OPERATION_ABORTED:
-        case ERROR_IO_INCOMPLETE:
-          return {channel_completion_t::ambiguous, status};
-        default:
-          return {channel_completion_t::definite_reject, status};
-      }
-    }
-
-    /**
-     * @brief Production SetupAPI and `DeviceIoControl` channel.
-     */
+    /** @brief Production synchronous IOCTL channel. */
     class system_virtual_hid_channel_t final: public virtual_hid_channel_t {
     public:
       ~system_virtual_hid_channel_t() override {
-        cleanup();
+        close();
       }
 
       channel_result_t open() override {
@@ -98,286 +48,127 @@ namespace platf::win_input {
           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
         );
         if (devices == INVALID_HANDLE_VALUE) {
-          return classify_channel_error(GetLastError());
+          return {false, GetLastError()};
         }
 
-        SP_DEVICE_INTERFACE_DATA interface_data {};
-        interface_data.cbSize = sizeof(interface_data);
-        if (!SetupDiEnumDeviceInterfaces(
-              devices,
-              nullptr,
-              &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID,
-              0,
-              &interface_data
-            )) {
-          const auto status = GetLastError();
-          SetupDiDestroyDeviceInfoList(devices);
-          return classify_channel_error(status);
-        }
+        DWORD result_status = ERROR_FILE_NOT_FOUND;
+        for (DWORD index = 0;; ++index) {
+          SP_DEVICE_INTERFACE_DATA interface_data {};
+          interface_data.cbSize = sizeof(interface_data);
+          if (!SetupDiEnumDeviceInterfaces(
+                devices,
+                nullptr,
+                &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID,
+                index,
+                &interface_data
+              )) {
+            const auto status = GetLastError();
+            if (status != ERROR_NO_MORE_ITEMS) {
+              result_status = status;
+            }
+            break;
+          }
 
-        DWORD detail_size = 0;
-        SetupDiGetDeviceInterfaceDetailW(devices, &interface_data, nullptr, 0, &detail_size, nullptr);
-        if (detail_size < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) {
-          const auto status = GetLastError();
-          SetupDiDestroyDeviceInfoList(devices);
-          return classify_channel_error(status ? status : ERROR_INVALID_DATA);
-        }
+          DWORD detail_size = 0;
+          SetupDiGetDeviceInterfaceDetailW(devices, &interface_data, nullptr, 0, &detail_size, nullptr);
+          if (detail_size < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) {
+            continue;
+          }
+          std::vector<std::byte> detail_buffer(detail_size);
+          auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(detail_buffer.data());
+          detail->cbSize = sizeof(*detail);
+          if (!SetupDiGetDeviceInterfaceDetailW(
+                devices,
+                &interface_data,
+                detail,
+                detail_size,
+                nullptr,
+                nullptr
+              )) {
+            result_status = GetLastError();
+            continue;
+          }
 
-        std::vector<std::byte> detail_buffer(detail_size);
-        auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(detail_buffer.data());
-        detail->cbSize = sizeof(*detail);
-        if (!SetupDiGetDeviceInterfaceDetailW(
-              devices,
-              &interface_data,
-              detail,
-              detail_size,
-              nullptr,
-              nullptr
-            )) {
-          const auto status = GetLastError();
-          SetupDiDestroyDeviceInfoList(devices);
-          return classify_channel_error(status);
+          handle_ = CreateFileW(
+            detail->DevicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+          );
+          if (handle_ != INVALID_HANDLE_VALUE) {
+            break;
+          }
+          result_status = GetLastError();
         }
-
-        handle_ = CreateFileW(
-          detail->DevicePath,
-          GENERIC_READ | GENERIC_WRITE,
-          FILE_SHARE_READ | FILE_SHARE_WRITE,
-          nullptr,
-          OPEN_EXISTING,
-          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-          nullptr
-        );
-        const auto status = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
         SetupDiDestroyDeviceInfoList(devices);
-        return handle_ == INVALID_HANDLE_VALUE ? classify_channel_error(status) : channel_result_t {};
+        return handle_ == INVALID_HANDLE_VALUE ? channel_result_t {false, result_status} : channel_result_t {};
       }
 
-      channel_result_t get_capabilities(
-        const LUMEN_VHID_GET_CAPABILITIES_REQUEST &request,
-        LUMEN_VHID_GET_CAPABILITIES_RESPONSE &response
-      ) override {
-        return ioctl(IOCTL_LUMEN_VHID_GET_PROTOCOL_CAPABILITIES, request, response);
+      channel_result_t get_info(LUMEN_VHID_GET_INFO_RESPONSE &response) override {
+        return ioctl(IOCTL_LUMEN_VHID_GET_INFO, nullptr, 0, &response, sizeof(response));
       }
 
-      channel_result_t claim(
-        const LUMEN_VHID_CLAIM_SESSION_REQUEST &request,
-        LUMEN_VHID_CLAIM_SESSION_RESPONSE &response
-      ) override {
-        return ioctl(IOCTL_LUMEN_VHID_CLAIM_INPUT_SESSION, request, response);
+      channel_result_t claim() override {
+        return ioctl(IOCTL_LUMEN_VHID_CLAIM, nullptr, 0, nullptr, 0);
       }
 
-      channel_result_t submit(
-        const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request,
-        LUMEN_VHID_SUBMIT_REPORT_RESPONSE &response
-      ) override {
-        return ioctl(IOCTL_LUMEN_VHID_SUBMIT_INPUT_REPORT, request, response);
+      channel_result_t submit(const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request) override {
+        return ioctl(IOCTL_LUMEN_VHID_SUBMIT_REPORT, &request, sizeof(request), nullptr, 0);
       }
 
-      channel_result_t reset(
-        const LUMEN_VHID_SESSION_REQUEST &request,
-        LUMEN_VHID_SESSION_RESPONSE &response
-      ) override {
-        return ioctl(IOCTL_LUMEN_VHID_RESET_INPUT_SESSION, request, response);
+      channel_result_t reset_and_release() override {
+        return ioctl(IOCTL_LUMEN_VHID_RESET_AND_RELEASE, nullptr, 0, nullptr, 0);
       }
 
-      channel_result_t release(
-        const LUMEN_VHID_SESSION_REQUEST &request,
-        LUMEN_VHID_SESSION_RESPONSE &response
-      ) override {
-        return ioctl(IOCTL_LUMEN_VHID_RELEASE_INPUT_SESSION, request, response);
-      }
-
-      channel_result_t cleanup() override {
-        if (handle_ == INVALID_HANDLE_VALUE) {
-          return {};
+      void close() noexcept override {
+        if (handle_ != INVALID_HANDLE_VALUE) {
+          CloseHandle(std::exchange(handle_, INVALID_HANDLE_VALUE));
         }
-
-        const auto handle = std::exchange(handle_, INVALID_HANDLE_VALUE);
-        const auto close_result = close_device_handle(handle);
-        if (!close_result) {
-          if (pending_) {
-            static_cast<void>(pending_.release());
-          }
-          return close_result;
-        }
-
-        if (pending_) {
-          // CloseHandle cancels all I/O issued by this file object. Give the I/O
-          // manager a second bounded interval to retire the caller-owned buffers.
-          // If a broken driver does not complete, retain the allocation permanently
-          // rather than permit a late kernel write into freed user memory.
-          if (WaitForSingleObject(pending_->overlapped.hEvent, ioctl_cancel_timeout_ms) == WAIT_OBJECT_0) {
-            pending_.reset();
-          } else {
-            static_cast<void>(pending_.release());
-          }
-        }
-        return {};
       }
 
     private:
       /**
-       * @brief Heap-owned buffers retained until overlapped I/O is retired.
-       */
-      struct pending_io_t {
-        /**
-         * @brief Close the completion event.
-         */
-        ~pending_io_t() {
-          if (overlapped.hEvent) {
-            CloseHandle(overlapped.hEvent);
-          }
-        }
-
-        OVERLAPPED overlapped {};  ///< Overlapped request state.
-        std::array<std::byte, LUMEN_VHID_MAX_CONTROL_SIZE> input {};  ///< Stable request buffer.
-        std::array<std::byte, LUMEN_VHID_MAX_CONTROL_SIZE> output {};  ///< Stable response buffer.
-      };
-
-      /**
-       * @brief State owned by the bounded device-handle close worker.
-       */
-      struct close_context_t {
-        HANDLE device_handle {INVALID_HANDLE_VALUE};  ///< Device handle to close.
-        HANDLE completion_event {nullptr};  ///< Signals completion of `CloseHandle`.
-        DWORD status {ERROR_SUCCESS};  ///< Close status.
-      };
-
-      /**
-       * @brief Close a device handle outside the input serialization thread.
-       * @param opaque Pointer to a `close_context_t`.
-       * @return Thread exit status.
-       */
-      static DWORD WINAPI close_handle_worker(void *opaque) {
-        auto *context = static_cast<close_context_t *>(opaque);
-        if (!CloseHandle(context->device_handle)) {
-          context->status = GetLastError();
-        }
-        SetEvent(context->completion_event);
-        return 0;
-      }
-
-      /**
-       * @brief Close a driver handle without permitting cleanup to hang indefinitely.
-       * @param handle Driver handle.
-       * @return Channel result.
-       */
-      static channel_result_t close_device_handle(HANDLE handle) {
-        auto context = std::make_unique<close_context_t>();
-        context->device_handle = handle;
-        context->completion_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!context->completion_event) {
-          const auto setup_status = GetLastError();
-          if (CloseHandle(handle)) {
-            return {};
-          }
-          const auto close_status = GetLastError();
-          return {
-            channel_completion_t::ambiguous,
-            close_status ? close_status : setup_status
-          };
-        }
-
-        const auto worker = CreateThread(nullptr, 0, close_handle_worker, context.get(), 0, nullptr);
-        if (!worker) {
-          const auto setup_status = GetLastError();
-          CloseHandle(context->completion_event);
-          if (CloseHandle(handle)) {
-            return {};
-          }
-          const auto close_status = GetLastError();
-          return {
-            channel_completion_t::ambiguous,
-            close_status ? close_status : setup_status
-          };
-        }
-
-        const auto wait_result = WaitForSingleObject(context->completion_event, close_timeout_ms);
-        if (wait_result != WAIT_OBJECT_0 ||
-            WaitForSingleObject(worker, close_worker_settle_timeout_ms) != WAIT_OBJECT_0) {
-          CloseHandle(worker);
-          static_cast<void>(context.release());
-          return {
-            channel_completion_t::ambiguous,
-            static_cast<DWORD>(wait_result == WAIT_TIMEOUT ? ERROR_TIMEOUT : ERROR_OPERATION_ABORTED)
-          };
-        }
-
-        CloseHandle(worker);
-        CloseHandle(context->completion_event);
-        return context->status == ERROR_SUCCESS ? channel_result_t {} : classify_channel_error(context->status);
-      }
-
-      /**
-       * @brief Issue a fixed-size buffered protocol request.
-       * @tparam Request Request structure type.
-       * @tparam Response Response structure type.
+       * @brief Perform one exact synchronous DeviceIoControl operation.
        * @param code Control code.
-       * @param request Input structure.
-       * @param response Output structure.
+       * @param input Optional input buffer.
+       * @param input_size Input buffer size.
+       * @param output Optional output buffer.
+       * @param output_size Output buffer size.
        * @return Channel result.
        */
-      template<class Request, class Response>
-      channel_result_t ioctl(DWORD code, const Request &request, Response &response) {
+      channel_result_t ioctl(
+        DWORD code,
+        const void *input,
+        DWORD input_size,
+        void *output,
+        DWORD output_size
+      ) {
         if (handle_ == INVALID_HANDLE_VALUE) {
-          return {channel_completion_t::removed, ERROR_INVALID_HANDLE};
+          return {false, ERROR_INVALID_HANDLE};
         }
-        if (pending_) {
-          return {channel_completion_t::ambiguous, ERROR_TIMEOUT};
+        DWORD transferred = 0;
+        if (!DeviceIoControl(
+              handle_,
+              code,
+              const_cast<void *>(input),
+              input_size,
+              output,
+              output_size,
+              &transferred,
+              nullptr
+            )) {
+          return {false, GetLastError()};
         }
-
-        auto pending = std::make_unique<pending_io_t>();
-        pending->overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!pending->overlapped.hEvent) {
-          return classify_channel_error(GetLastError());
+        if (transferred != output_size) {
+          return {false, ERROR_INVALID_DATA};
         }
-        std::memcpy(pending->input.data(), &request, sizeof(request));
-
-        const auto started = DeviceIoControl(
-          handle_,
-          code,
-          pending->input.data(),
-          sizeof(request),
-          pending->output.data(),
-          sizeof(response),
-          nullptr,
-          &pending->overlapped
-        );
-        const auto start_status = started ? ERROR_SUCCESS : GetLastError();
-        if (!started && start_status != ERROR_IO_PENDING) {
-          return classify_channel_error(start_status);
-        }
-
-        const auto wait_result = WaitForSingleObject(pending->overlapped.hEvent, ioctl_timeout_ms);
-        if (wait_result != WAIT_OBJECT_0) {
-          const auto wait_status = wait_result == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
-          CancelIoEx(handle_, &pending->overlapped);
-          if (WaitForSingleObject(pending->overlapped.hEvent, ioctl_cancel_timeout_ms) != WAIT_OBJECT_0) {
-            pending_ = std::move(pending);
-          }
-          return {channel_completion_t::ambiguous, wait_status};
-        }
-
-        DWORD returned = 0;
-        if (!GetOverlappedResult(handle_, &pending->overlapped, &returned, FALSE)) {
-          return classify_channel_error(GetLastError());
-        }
-        if (returned != sizeof(response)) {
-          // The IOCTL completed successfully and may already have changed
-          // driver/VHF state. A truncated acknowledgement is ambiguous.
-          return {channel_completion_t::ambiguous, ERROR_INVALID_DATA};
-        }
-        std::memcpy(&response, pending->output.data(), sizeof(response));
         return {};
       }
 
-      static constexpr DWORD ioctl_timeout_ms = 500;  ///< Per-request completion deadline.
-      static constexpr DWORD ioctl_cancel_timeout_ms = 250;  ///< Cancellation drain deadline.
-      static constexpr DWORD close_timeout_ms = 500;  ///< Driver cleanup deadline.
-      static constexpr DWORD close_worker_settle_timeout_ms = 50;  ///< Worker retirement deadline.
-      HANDLE handle_ {INVALID_HANDLE_VALUE};  ///< Open driver interface handle.
-      std::unique_ptr<pending_io_t> pending_;  ///< Timed-out request retained for memory safety.
+      HANDLE handle_ {INVALID_HANDLE_VALUE};  ///< Secured driver interface handle.
     };
 
     /**
@@ -524,43 +315,43 @@ namespace platf::win_input {
       if (prefix == 0xE0) {
         switch (code) {
           case 0x1C:
-            return 0x58;  // Keypad Enter
+            return 0x58;
           case 0x1D:
-            return 0xE4;  // Right Control
+            return 0xE4;
           case 0x35:
-            return 0x54;  // Keypad Divide
+            return 0x54;
           case 0x37:
-            return 0x46;  // Print Screen
+            return 0x46;
           case 0x38:
-            return 0xE6;  // Right Alt
+            return 0xE6;
           case 0x47:
-            return 0x4A;  // Home
+            return 0x4A;
           case 0x48:
-            return 0x52;  // Up
+            return 0x52;
           case 0x49:
-            return 0x4B;  // Page Up
+            return 0x4B;
           case 0x4B:
-            return 0x50;  // Left
+            return 0x50;
           case 0x4D:
-            return 0x4F;  // Right
+            return 0x4F;
           case 0x4F:
-            return 0x4D;  // End
+            return 0x4D;
           case 0x50:
-            return 0x51;  // Down
+            return 0x51;
           case 0x51:
-            return 0x4E;  // Page Down
+            return 0x4E;
           case 0x52:
-            return 0x49;  // Insert
+            return 0x49;
           case 0x53:
-            return 0x4C;  // Delete
+            return 0x4C;
           case 0x5B:
-            return 0xE3;  // Left GUI
+            return 0xE3;
           case 0x5C:
-            return 0xE7;  // Right GUI
+            return 0xE7;
           case 0x5D:
-            return 0x65;  // Application
+            return 0x65;
           case 0x5F:
-            return 0x82;  // System Sleep
+            return 0x82;
           default:
             return std::nullopt;
         }
@@ -569,46 +360,62 @@ namespace platf::win_input {
         return std::nullopt;
       }
 
-      switch (code) {
-        case 0x47:
-          return 0x5F;  // Keypad 7
-        case 0x48:
-          return 0x60;  // Keypad 8
-        case 0x49:
-          return 0x61;  // Keypad 9
-        case 0x4A:
-          return 0x56;  // Keypad Subtract
-        case 0x4B:
-          return 0x5C;  // Keypad 4
-        case 0x4C:
-          return 0x5D;  // Keypad 5
-        case 0x4D:
-          return 0x5E;  // Keypad 6
-        case 0x4E:
-          return 0x57;  // Keypad Add
-        case 0x4F:
-          return 0x59;  // Keypad 1
-        case 0x50:
-          return 0x5A;  // Keypad 2
-        case 0x51:
-          return 0x5B;  // Keypad 3
-        case 0x52:
-          return 0x62;  // Keypad 0
-        case 0x53:
-          return 0x63;  // Keypad Decimal
-        default:
-          break;
-      }
-
       for (std::uint16_t key = 0; key < VK_TO_SCANCODE_MAP.size(); ++key) {
-        if (VK_TO_SCANCODE_MAP[key] != code) {
-          continue;
-        }
-        if (const auto usage = direct_key_usage(key)) {
-          return usage;
+        if (VK_TO_SCANCODE_MAP[key] == code) {
+          if (const auto usage = direct_key_usage(key)) {
+            return usage;
+          }
         }
       }
       return std::nullopt;
+    }
+
+    /**
+     * @brief Map common Windows media/browser keys to Consumer Control usages.
+     * @param key Windows virtual key.
+     * @return Consumer usage, or no value when unsupported.
+     */
+    std::optional<std::uint16_t> consumer_usage(std::uint16_t key) {
+      switch (key) {
+        case VK_BROWSER_BACK:
+          return 0x0224;
+        case VK_BROWSER_FORWARD:
+          return 0x0225;
+        case VK_BROWSER_REFRESH:
+          return 0x0227;
+        case VK_BROWSER_STOP:
+          return 0x0226;
+        case VK_BROWSER_SEARCH:
+          return 0x0221;
+        case VK_BROWSER_FAVORITES:
+          return 0x022A;
+        case VK_BROWSER_HOME:
+          return 0x0223;
+        case VK_VOLUME_MUTE:
+          return 0x00E2;
+        case VK_VOLUME_DOWN:
+          return 0x00EA;
+        case VK_VOLUME_UP:
+          return 0x00E9;
+        case VK_MEDIA_NEXT_TRACK:
+          return 0x00B5;
+        case VK_MEDIA_PREV_TRACK:
+          return 0x00B6;
+        case VK_MEDIA_STOP:
+          return 0x00B7;
+        case VK_MEDIA_PLAY_PAUSE:
+          return 0x00CD;
+        case VK_LAUNCH_MAIL:
+          return 0x018A;
+        case VK_LAUNCH_MEDIA_SELECT:
+          return 0x0183;
+        case VK_LAUNCH_APP1:
+          return 0x0194;
+        case VK_LAUNCH_APP2:
+          return 0x0192;
+        default:
+          return std::nullopt;
+      }
     }
 
     /**
@@ -628,22 +435,13 @@ namespace platf::win_input {
   ) {
     if (flags & SS_KBE_FLAG_NON_NORMALIZED) {
       if (!always_send_scancodes) {
-        // The legacy path intentionally submits a virtual-key event here. HID
-        // cannot reproduce that layout-dependent semantic safely, so request
-        // a fenced whole-transport fallback before applying the transition.
         return std::nullopt;
       }
       if (modcode == VK_LWIN || modcode == VK_RWIN || modcode == VK_PAUSE) {
         return direct_key_usage(modcode);
       }
-      // HID can express only physical keyboard usages. Resolve the requested
-      // virtual key through the active layout first so OEM keys retain the old
-      // SendInput virtual-key behavior on non-US hosts.
       const auto scan = MapVirtualKeyW(modcode, MAPVK_VK_TO_VSC_EX);
-      if (!scan) {
-        return std::nullopt;
-      }
-      return scan_code_usage(scan);
+      return scan ? scan_code_usage(scan) : std::nullopt;
     }
     return direct_key_usage(modcode);
   }
@@ -659,12 +457,12 @@ namespace platf::win_input {
 
   virtual_hid_transport_t::~virtual_hid_transport_t() {
     std::lock_guard lock(mutex_);
-    if (backend_.load() == backend_t::virtual_hid || backend_.load() == backend_t::quiescing) {
-      desired_keys_.clear();
-      desired_buttons_ = 0;
-      fence_and_release();
-    } else if (backend_.load() == backend_t::send_input) {
-      fallback_->neutralize();
+    if (backend_.load() == backend_t::virtual_hid || backend_.load() == backend_t::fail_closed) {
+      const auto reset = channel_->reset_and_release();
+      channel_->close();
+      if (reset) {
+        fallback_->neutralize();
+      }
     }
   }
 
@@ -681,113 +479,23 @@ namespace platf::win_input {
       return false;
     }
 
-    LUMEN_VHID_GET_CAPABILITIES_REQUEST capabilities_request {};
-    capabilities_request.header = message_header(
-      LUMEN_VHID_OPERATION_GET_PROTOCOL_CAPABILITIES,
-      sizeof(capabilities_request)
-    );
-    LUMEN_VHID_GET_CAPABILITIES_RESPONSE capabilities_response {};
-    result = channel_->get_capabilities(capabilities_request, capabilities_response);
-    if (!result ||
-        !lumen_vhid_validate_message_header(
-          &capabilities_response.header,
-          sizeof(capabilities_response),
-          LUMEN_VHID_OPERATION_GET_PROTOCOL_CAPABILITIES,
-          sizeof(capabilities_response)
-        ) ||
-        (capabilities_response.capabilities & LUMEN_VHID_CAP_REQUIRED) != LUMEN_VHID_CAP_REQUIRED ||
-        (capabilities_response.required_capabilities & ~LUMEN_VHID_CAP_KNOWN_MASK) != 0 ||
-        capabilities_response.max_control_size != LUMEN_VHID_MAX_CONTROL_SIZE ||
-        capabilities_response.max_report_payload != LUMEN_VHID_MAX_REPORT_PAYLOAD ||
-        capabilities_response.keyboard_report_size != sizeof(LUMEN_VHID_KEYBOARD_REPORT) ||
-        capabilities_response.relative_mouse_report_size != sizeof(LUMEN_VHID_RELATIVE_MOUSE_REPORT) ||
-        capabilities_response.absolute_mouse_report_size != sizeof(LUMEN_VHID_ABSOLUTE_MOUSE_REPORT)) {
-      set_failure("capability handshake", result ? ERROR_REVISION_MISMATCH : result.status);
-      channel_->cleanup();
+    LUMEN_VHID_GET_INFO_RESPONSE info {};
+    result = channel_->get_info(info);
+    if (!result || info.abi_version != LUMEN_VHID_ABI_VERSION || info.ready != 1) {
+      set_failure("driver info", result ? ERROR_REVISION_MISMATCH : result.status);
+      channel_->close();
       backend_.store(backend_t::send_input);
       return false;
     }
 
-    protocol_minor_ = std::min<std::uint16_t>(
-      LUMEN_VHID_PROTOCOL_MINOR,
-      capabilities_response.header.protocol_minor
-    );
-    std::uint16_t negotiated_minor = 0;
-    if (!lumen_vhid_negotiate_protocol(
-          capabilities_response.header.protocol_major,
-          protocol_minor_,
-          LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION,
-          LUMEN_VHID_CAP_REQUIRED,
-          capabilities_response.capabilities,
-          &negotiated_minor
-        )) {
-      set_failure("protocol negotiation", ERROR_REVISION_MISMATCH);
-      channel_->cleanup();
-      backend_.store(backend_t::send_input);
-      return false;
-    }
-    protocol_minor_ = negotiated_minor;
-
-    LUMEN_VHID_CLAIM_SESSION_REQUEST claim_request {};
-    claim_request.header = message_header(
-      LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION,
-      sizeof(claim_request),
-      protocol_minor_
-    );
-    claim_request.required_capabilities = LUMEN_VHID_CAP_REQUIRED;
-    claim_request.optional_capabilities = LUMEN_VHID_CAP_OPTIONAL_MASK;
-    LUMEN_VHID_CLAIM_SESSION_RESPONSE claim_response {};
-    result = channel_->claim(claim_request, claim_response);
-    if (!result ||
-        !lumen_vhid_validate_message_header(
-          &claim_response.header,
-          sizeof(claim_response),
-          LUMEN_VHID_OPERATION_CLAIM_INPUT_SESSION,
-          sizeof(claim_response)
-        ) ||
-        claim_response.session_token == 0 ||
-        (claim_response.granted_capabilities & LUMEN_VHID_CAP_REQUIRED) != LUMEN_VHID_CAP_REQUIRED) {
-      set_failure("exclusive session claim", result ? ERROR_INVALID_DATA : result.status);
-      const auto cleanup_result = channel_->cleanup();
-      const auto safe_without_fence =
-        result.completion == channel_completion_t::definite_reject ||
-        result.completion == channel_completion_t::removed;
-      backend_.store(safe_without_fence || cleanup_result ? backend_t::send_input : backend_t::fail_closed);
-      return false;
-    }
-
-    session_token_ = claim_response.session_token;
-    sequence_ = 0;
-    const auto neutral_keyboard = keyboard_report();
-    result = submit_report(
-      LUMEN_VHID_DEVICE_KIND_KEYBOARD,
-      LUMEN_VHID_REPORT_ID_KEYBOARD,
-      &neutral_keyboard,
-      sizeof(neutral_keyboard)
-    );
-    if (result) {
-      LUMEN_VHID_RELATIVE_MOUSE_REPORT neutral_mouse {};
-      neutral_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-      result = submit_report(
-        LUMEN_VHID_DEVICE_KIND_MOUSE,
-        LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE,
-        &neutral_mouse,
-        sizeof(neutral_mouse)
-      );
-    }
+    result = channel_->claim();
     if (!result) {
-      set_failure("neutral report", result.status);
-      if (result.completion == channel_completion_t::removed) {
-        channel_->cleanup();
-        backend_.store(backend_t::send_input);
-      } else {
-        backend_.store(fence_and_release() ? backend_t::send_input : backend_t::fail_closed);
-      }
+      set_failure("exclusive claim", result.status);
+      channel_->close();
+      backend_.store(backend_t::send_input);
       return false;
     }
 
-    acknowledged_keyboard_ = neutral_keyboard;
-    acknowledged_buttons_ = 0;
     backend_.store(backend_t::virtual_hid);
     return true;
   }
@@ -817,62 +525,56 @@ namespace platf::win_input {
   LUMEN_VHID_KEYBOARD_REPORT virtual_hid_transport_t::keyboard_report() const {
     LUMEN_VHID_KEYBOARD_REPORT report {};
     report.report_id = LUMEN_VHID_REPORT_ID_KEYBOARD;
-    for (const auto &[modcode, key] : desired_keys_) {
+    for (const auto &[modcode, usage] : held_keys_) {
       static_cast<void>(modcode);
-      if (key.usage >= 0xE0 && key.usage <= 0xE7) {
-        report.modifiers |= static_cast<std::uint8_t>(1U << (key.usage - 0xE0));
-      } else if (key.usage / 8 < LUMEN_VHID_NKRO_BITMAP_SIZE) {
-        report.key_bitmap[key.usage / 8] |= static_cast<std::uint8_t>(1U << (key.usage % 8));
+      if (usage >= 0xE0 && usage <= 0xE7) {
+        report.modifiers |= static_cast<std::uint8_t>(1U << (usage - 0xE0));
+      } else if (usage / 8 < LUMEN_VHID_NKRO_BITMAP_SIZE) {
+        report.key_bitmap[usage / 8] |= static_cast<std::uint8_t>(1U << (usage % 8));
       }
     }
     return report;
   }
 
-  channel_result_t virtual_hid_transport_t::submit_report(
-    std::uint16_t device_kind,
-    std::uint16_t report_id,
-    const void *report,
-    std::uint16_t report_size
+  LUMEN_VHID_CONSUMER_REPORT virtual_hid_transport_t::consumer_report() const {
+    LUMEN_VHID_CONSUMER_REPORT report {};
+    report.report_id = LUMEN_VHID_REPORT_ID_CONSUMER;
+    std::size_t index = 0;
+    for (const auto &[modcode, usage] : held_consumers_) {
+      static_cast<void>(modcode);
+      if (index == LUMEN_VHID_CONSUMER_USAGE_COUNT) {
+        break;
+      }
+      report.usages[index++] = usage;
+    }
+    return report;
+  }
+
+  result_t virtual_hid_transport_t::submit_report(
+    const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request,
+    const char *stage
   ) {
-    if (sequence_ == std::numeric_limits<std::uint64_t>::max() ||
-        report_size > LUMEN_VHID_MAX_REPORT_PAYLOAD ||
-        !lumen_vhid_validate_report_metadata(device_kind, report_id, report_size)) {
-      return {channel_completion_t::definite_reject, ERROR_INVALID_DATA};
+    const auto result = channel_->submit(request);
+    if (result) {
+      accepted_virtual_input_ = true;
+      return {};
     }
 
-    const auto next_sequence = sequence_ + 1;
-    LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
-    request.header = message_header(
-      LUMEN_VHID_OPERATION_SUBMIT_INPUT_REPORT,
-      sizeof(request),
-      protocol_minor_
-    );
-    request.session_token = session_token_;
-    request.sequence = next_sequence;
-    request.device_kind = device_kind;
-    request.report_id = report_id;
-    request.payload_size = report_size;
-    std::memcpy(request.payload, report, report_size);
+    set_failure(stage, result.status);
+    if (accepted_virtual_input_) {
+      backend_.store(backend_t::fail_closed);
+      BOOST_LOG(error)
+        << "Lumen Virtual HID failed closed (stage="sv << stage
+        << ", status="sv << result.status << ')';
+      return {completion_t::ambiguous, result.status};
+    }
 
-    LUMEN_VHID_SUBMIT_REPORT_RESPONSE response {};
-    auto result = channel_->submit(request, response);
-    if (!result) {
-      return result;
-    }
-    if (!lumen_vhid_validate_message_header(
-          &response.header,
-          sizeof(response),
-          LUMEN_VHID_OPERATION_SUBMIT_INPUT_REPORT,
-          sizeof(response)
-        ) ||
-        response.session_token != session_token_ || response.accepted_sequence != next_sequence) {
-      // DeviceIoControl succeeded, so the driver may already have submitted the
-      // report to VHF. A malformed acknowledgement is therefore ambiguous and
-      // its stateless delta must never be replayed through SendInput.
-      return {channel_completion_t::ambiguous, ERROR_INVALID_DATA};
-    }
-    sequence_ = next_sequence;
-    return {};
+    channel_->close();
+    backend_.store(backend_t::send_input);
+    BOOST_LOG(warning)
+      << "Windows keyboard and mouse backend: SendInput fallback before accepted Virtual HID input (stage="sv
+      << stage << ", status="sv << result.status << ')';
+    return {completion_t::rejected, result.status};
   }
 
   result_t virtual_hid_transport_t::move_mouse(std::int32_t delta_x, std::int32_t delta_y) {
@@ -898,25 +600,17 @@ namespace platf::win_input {
         std::numeric_limits<std::int16_t>::min(),
         std::numeric_limits<std::int16_t>::max()
       );
-      LUMEN_VHID_RELATIVE_MOUSE_REPORT report {};
-      report.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-      report.buttons = desired_buttons_;
-      report.x = static_cast<std::int16_t>(segment_x);
-      report.y = static_cast<std::int16_t>(segment_y);
-      const auto result = submit_report(
-        LUMEN_VHID_DEVICE_KIND_MOUSE,
-        LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE,
-        &report,
-        sizeof(report)
-      );
+      LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+      request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
+      request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
+      request.report.relative_mouse.buttons = held_buttons_;
+      request.report.relative_mouse.x = static_cast<std::int16_t>(segment_x);
+      request.report.relative_mouse.y = static_cast<std::int16_t>(segment_y);
+      const auto result = submit_report(request, "relative mouse report");
       if (!result) {
-        const auto replay_x = static_cast<std::int32_t>(remaining_x);
-        const auto replay_y = static_cast<std::int32_t>(remaining_y);
-        return failover(result, "relative mouse report", [this, replay_x, replay_y] {
-          return fallback_->move_mouse(replay_x, replay_y);
-        });
+        return backend_.load() == backend_t::send_input ? fallback_->move_mouse(delta_x, delta_y) : result;
       }
-      acknowledged_buttons_ = desired_buttons_;
+      acknowledged_buttons_ = held_buttons_;
       remaining_x -= segment_x;
       remaining_y -= segment_y;
       submit_zero = false;
@@ -930,46 +624,11 @@ namespace platf::win_input {
     std::int32_t source_width,
     std::int32_t source_height
   ) {
-    if (source_width <= 0 || source_height <= 0) {
-      return {completion_t::rejected, ERROR_INVALID_PARAMETER};
-    }
-
     std::lock_guard lock(mutex_);
-    if (backend_.load() == backend_t::send_input) {
-      return fallback_->absolute_mouse(x, y, source_width, source_height);
-    }
-    if (backend_.load() != backend_t::virtual_hid) {
+    if (backend_.load() == backend_t::fail_closed) {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
-
-    const auto scaled_x = std::clamp<long>(
-      std::lround(x * (65535.0f / static_cast<float>(source_width))),
-      0,
-      65535
-    );
-    const auto scaled_y = std::clamp<long>(
-      std::lround(y * (65535.0f / static_cast<float>(source_height))),
-      0,
-      65535
-    );
-    LUMEN_VHID_ABSOLUTE_MOUSE_REPORT report {};
-    report.report_id = LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE;
-    report.buttons = desired_buttons_;
-    report.x = static_cast<std::uint16_t>(scaled_x);
-    report.y = static_cast<std::uint16_t>(scaled_y);
-    const auto result = submit_report(
-      LUMEN_VHID_DEVICE_KIND_MOUSE,
-      LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE,
-      &report,
-      sizeof(report)
-    );
-    if (!result) {
-      return failover(result, "absolute mouse report", [this, x, y, source_width, source_height] {
-        return fallback_->absolute_mouse(x, y, source_width, source_height);
-      });
-    }
-    acknowledged_buttons_ = desired_buttons_;
-    return {};
+    return fallback_->absolute_mouse(x, y, source_width, source_height);
   }
 
   result_t virtual_hid_transport_t::mouse_button(int button, bool release) {
@@ -986,25 +645,25 @@ namespace platf::win_input {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
 
+    const auto previous = held_buttons_;
     if (release) {
-      desired_buttons_ &= static_cast<std::uint8_t>(~bit);
+      held_buttons_ &= static_cast<std::uint8_t>(~bit);
     } else {
-      desired_buttons_ |= bit;
+      held_buttons_ |= bit;
     }
-    LUMEN_VHID_RELATIVE_MOUSE_REPORT report {};
-    report.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-    report.buttons = desired_buttons_;
-    const auto result = submit_report(
-      LUMEN_VHID_DEVICE_KIND_MOUSE,
-      LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE,
-      &report,
-      sizeof(report)
-    );
-    if (!result) {
-      return failover(result, "mouse button report");
+    LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+    request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
+    request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
+    request.report.relative_mouse.buttons = held_buttons_;
+    const auto result = submit_report(request, "mouse button report");
+    if (!result && backend_.load() == backend_t::send_input) {
+      held_buttons_ = previous;
+      return fallback_->mouse_button(button, release);
     }
-    acknowledged_buttons_ = desired_buttons_;
-    return {};
+    if (result) {
+      acknowledged_buttons_ = held_buttons_;
+    }
+    return result;
   }
 
   result_t virtual_hid_transport_t::vertical_scroll(std::int32_t distance) {
@@ -1024,23 +683,16 @@ namespace platf::win_input {
         std::numeric_limits<std::int16_t>::min(),
         std::numeric_limits<std::int16_t>::max()
       );
-      LUMEN_VHID_RELATIVE_MOUSE_REPORT report {};
-      report.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-      report.buttons = desired_buttons_;
-      report.vertical_wheel = static_cast<std::int16_t>(segment);
-      const auto result = submit_report(
-        LUMEN_VHID_DEVICE_KIND_MOUSE,
-        LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE,
-        &report,
-        sizeof(report)
-      );
+      LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+      request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
+      request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
+      request.report.relative_mouse.buttons = held_buttons_;
+      request.report.relative_mouse.vertical_wheel = static_cast<std::int16_t>(segment);
+      const auto result = submit_report(request, "vertical wheel report");
       if (!result) {
-        const auto replay = static_cast<std::int32_t>(remaining);
-        return failover(result, "vertical wheel report", [this, replay] {
-          return fallback_->vertical_scroll(replay);
-        });
+        return backend_.load() == backend_t::send_input ? fallback_->vertical_scroll(distance) : result;
       }
-      acknowledged_buttons_ = desired_buttons_;
+      acknowledged_buttons_ = held_buttons_;
       remaining -= segment;
       submit_zero = false;
     } while (remaining != 0 || submit_zero);
@@ -1064,23 +716,16 @@ namespace platf::win_input {
         std::numeric_limits<std::int16_t>::min(),
         std::numeric_limits<std::int16_t>::max()
       );
-      LUMEN_VHID_RELATIVE_MOUSE_REPORT report {};
-      report.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-      report.buttons = desired_buttons_;
-      report.horizontal_wheel = static_cast<std::int16_t>(segment);
-      const auto result = submit_report(
-        LUMEN_VHID_DEVICE_KIND_MOUSE,
-        LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE,
-        &report,
-        sizeof(report)
-      );
+      LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+      request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
+      request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
+      request.report.relative_mouse.buttons = held_buttons_;
+      request.report.relative_mouse.horizontal_wheel = static_cast<std::int16_t>(segment);
+      const auto result = submit_report(request, "horizontal wheel report");
       if (!result) {
-        const auto replay = static_cast<std::int32_t>(remaining);
-        return failover(result, "horizontal wheel report", [this, replay] {
-          return fallback_->horizontal_scroll(replay);
-        });
+        return backend_.load() == backend_t::send_input ? fallback_->horizontal_scroll(distance) : result;
       }
-      acknowledged_buttons_ = desired_buttons_;
+      acknowledged_buttons_ = held_buttons_;
       remaining -= segment;
       submit_zero = false;
     } while (remaining != 0 || submit_zero);
@@ -1096,38 +741,114 @@ namespace platf::win_input {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
 
-    const auto usage = map_key_to_hid_usage(modcode, flags, config::input.always_send_scancodes);
-    if (!usage) {
-      return failover(
-        {channel_completion_t::definite_reject, ERROR_NOT_SUPPORTED},
-        "keyboard mapping",
-        [this, modcode, release, flags] {
-          return fallback_->keyboard(modcode, release, flags);
-        }
-      );
+    if (release && fallback_keys_.contains(modcode)) {
+      const auto result = fallback_->keyboard(modcode, true, flags);
+      if (result) {
+        fallback_keys_.erase(modcode);
+      }
+      return result;
     }
 
+    if (const auto usage = consumer_usage(modcode)) {
+      const auto previous = held_consumers_;
+      if (release) {
+        if (!held_consumers_.contains(modcode)) {
+          return {};
+        }
+        held_consumers_.erase(modcode);
+      } else if (!held_consumers_.contains(modcode) && held_consumers_.size() >= LUMEN_VHID_CONSUMER_USAGE_COUNT) {
+        const auto result = fallback_->keyboard(modcode, false, flags);
+        if (result) {
+          fallback_keys_.insert(modcode);
+        }
+        return result;
+      } else {
+        held_consumers_[modcode] = *usage;
+      }
+      LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+      request.report_kind = LUMEN_VHID_REPORT_KIND_CONSUMER;
+      request.report.consumer = consumer_report();
+      const auto result = submit_report(request, "consumer report");
+      if (!result && backend_.load() == backend_t::send_input) {
+        held_consumers_ = previous;
+        return fallback_->keyboard(modcode, release, flags);
+      }
+      return result;
+    }
+
+    const auto usage = map_key_to_hid_usage(modcode, flags, config::input.always_send_scancodes);
+    if (!usage) {
+      if (release) {
+        return {};
+      }
+      const auto result = fallback_->keyboard(modcode, false, flags);
+      if (result) {
+        fallback_keys_.insert(modcode);
+      }
+      return result;
+    }
+
+    const auto previous = held_keys_;
     if (release) {
-      desired_keys_.erase(modcode);
+      if (!held_keys_.contains(modcode)) {
+        return {};
+      }
+      held_keys_.erase(modcode);
     } else {
-      desired_keys_[modcode] = held_key_t {flags, *usage};
+      held_keys_[modcode] = *usage;
     }
-    const auto report = keyboard_report();
-    const auto result = submit_report(
-      LUMEN_VHID_DEVICE_KIND_KEYBOARD,
-      LUMEN_VHID_REPORT_ID_KEYBOARD,
-      &report,
-      sizeof(report)
-    );
-    if (!result) {
-      return failover(result, "keyboard report");
+    LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+    request.report_kind = LUMEN_VHID_REPORT_KIND_KEYBOARD;
+    request.report.keyboard = keyboard_report();
+    const auto result = submit_report(request, "keyboard report");
+    if (!result && backend_.load() == backend_t::send_input) {
+      held_keys_ = previous;
+      return fallback_->keyboard(modcode, release, flags);
     }
-    acknowledged_keyboard_ = report;
-    return {};
+    if (result) {
+      acknowledged_keyboard_ = request.report.keyboard;
+    }
+    return result;
   }
 
   result_t virtual_hid_transport_t::unicode(const char *utf8, int size) {
+    std::lock_guard lock(mutex_);
+    if (backend_.load() == backend_t::fail_closed) {
+      return {completion_t::ambiguous, ERROR_NOT_READY};
+    }
     return fallback_->unicode(utf8, size);
+  }
+
+  result_t virtual_hid_transport_t::reset_session() {
+    std::lock_guard lock(mutex_);
+    if (backend_.load() == backend_t::send_input) {
+      return fallback_->reset_session();
+    }
+    if (backend_.load() == backend_t::virtual_hid) {
+      return fallback_->neutralize();
+    }
+    if (backend_.load() != backend_t::fail_closed) {
+      return {completion_t::rejected, ERROR_NOT_READY};
+    }
+
+    held_keys_.clear();
+    held_consumers_.clear();
+    fallback_keys_.clear();
+    held_buttons_ = 0;
+    const auto result = channel_->reset_and_release();
+    if (!result) {
+      set_failure("reset and release", result.status);
+      backend_.store(backend_t::fail_closed);
+      return {completion_t::ambiguous, result.status};
+    }
+
+    channel_->close();
+    accepted_virtual_input_ = false;
+    acknowledged_keyboard_ = {};
+    acknowledged_keyboard_.report_id = LUMEN_VHID_REPORT_ID_KEYBOARD;
+    acknowledged_buttons_ = 0;
+    backend_.store(backend_t::send_input);
+    return fallback_->neutralize();
   }
 
   result_t virtual_hid_transport_t::neutralize() {
@@ -1135,164 +856,22 @@ namespace platf::win_input {
     if (backend_.load() == backend_t::send_input) {
       return fallback_->neutralize();
     }
-    if (backend_.load() != backend_t::virtual_hid) {
-      return {completion_t::ambiguous, ERROR_NOT_READY};
+    if (backend_.load() != backend_t::virtual_hid && backend_.load() != backend_t::fail_closed) {
+      return {completion_t::rejected, ERROR_NOT_READY};
     }
 
-    desired_keys_.clear();
-    desired_buttons_ = 0;
-    LUMEN_VHID_SESSION_REQUEST request {};
-    request.header = message_header(
-      LUMEN_VHID_OPERATION_RESET_INPUT_SESSION,
-      sizeof(request),
-      protocol_minor_
-    );
-    request.session_token = session_token_;
-    LUMEN_VHID_SESSION_RESPONSE response {};
-    const auto result = channel_->reset(request, response);
-    if (!result ||
-        !lumen_vhid_validate_message_header(
-          &response.header,
-          sizeof(response),
-          LUMEN_VHID_OPERATION_RESET_INPUT_SESSION,
-          sizeof(response)
-        ) ||
-        response.session_token == 0 || response.last_sequence != 0) {
-      return failover(result ? channel_result_t {channel_completion_t::definite_reject, ERROR_INVALID_DATA} : result, "session reset");
-    }
-
-    session_token_ = response.session_token;
-    sequence_ = 0;
-    acknowledged_keyboard_ = keyboard_report();
-    acknowledged_buttons_ = 0;
-    return {};
-  }
-
-  result_t virtual_hid_transport_t::failover(
-    channel_result_t failure,
-    const char *stage,
-    const std::function<result_t()> &definitely_rejected_delta
-  ) {
-    backend_.store(backend_t::quiescing);
-    set_failure(stage, failure.status);
-
-    bool fenced = false;
-    if (failure.completion == channel_completion_t::removed) {
-      channel_->cleanup();
-      fenced = true;
-    } else {
-      fenced = fence_and_release();
-    }
-    if (!fenced) {
-      backend_.store(backend_t::fail_closed);
-      BOOST_LOG(error)
-        << "Lumen Virtual HID transition failed closed (stage="sv << stage
-        << ", status="sv << failure.status << ')';
-      return {completion_t::ambiguous, failure.status};
-    }
-
-    backend_.store(backend_t::send_input);
-    BOOST_LOG(warning)
-      << "Lumen Virtual HID entered SendInput fallback after a fenced failure (stage="sv << stage
-      << ", status="sv << failure.status << ')';
-    auto result = replay_held_state();
+    held_keys_.clear();
+    held_consumers_.clear();
+    fallback_keys_.clear();
+    held_buttons_ = 0;
+    const auto result = channel_->reset_and_release();
+    channel_->close();
     if (!result) {
-      return result;
+      backend_.store(backend_t::fail_closed);
+      return {completion_t::ambiguous, result.status};
     }
-    if (failure.completion == channel_completion_t::definite_reject && definitely_rejected_delta) {
-      return definitely_rejected_delta();
-    }
-    return {};
-  }
-
-  result_t virtual_hid_transport_t::replay_held_state() {
-    for (const auto &[modcode, key] : desired_keys_) {
-      if (key.usage < 0xE0 || key.usage > 0xE7) {
-        continue;
-      }
-      const auto result = fallback_->keyboard(modcode, false, key.flags);
-      if (!result) {
-        return result;
-      }
-    }
-    for (const auto &[modcode, key] : desired_keys_) {
-      if (key.usage >= 0xE0 && key.usage <= 0xE7) {
-        continue;
-      }
-      const auto result = fallback_->keyboard(modcode, false, key.flags);
-      if (!result) {
-        return result;
-      }
-    }
-    for (int button = 1; button <= 5; ++button) {
-      if (!(desired_buttons_ & mouse_button_bit(button))) {
-        continue;
-      }
-      const auto result = fallback_->mouse_button(button, false);
-      if (!result) {
-        return result;
-      }
-    }
-    return {};
-  }
-
-  bool virtual_hid_transport_t::fence_and_release() {
-    bool explicit_fence = false;
-    LUMEN_VHID_SESSION_REQUEST reset_request {};
-    reset_request.header = message_header(
-      LUMEN_VHID_OPERATION_RESET_INPUT_SESSION,
-      sizeof(reset_request),
-      protocol_minor_
-    );
-    reset_request.session_token = session_token_;
-    LUMEN_VHID_SESSION_RESPONSE reset_response {};
-    const auto reset_result = channel_->reset(reset_request, reset_response);
-    if (reset_result.completion == channel_completion_t::removed) {
-      channel_->cleanup();
-      session_token_ = 0;
-      sequence_ = 0;
-      return true;
-    }
-    if (reset_result &&
-        lumen_vhid_validate_message_header(
-          &reset_response.header,
-          sizeof(reset_response),
-          LUMEN_VHID_OPERATION_RESET_INPUT_SESSION,
-          sizeof(reset_response)
-        ) &&
-        reset_response.session_token != 0 && reset_response.last_sequence == 0) {
-      session_token_ = reset_response.session_token;
-      sequence_ = 0;
-
-      LUMEN_VHID_SESSION_REQUEST release_request {};
-      release_request.header = message_header(
-        LUMEN_VHID_OPERATION_RELEASE_INPUT_SESSION,
-        sizeof(release_request),
-        protocol_minor_
-      );
-      release_request.session_token = session_token_;
-      LUMEN_VHID_SESSION_RESPONSE release_response {};
-      const auto release_result = channel_->release(release_request, release_response);
-      if (release_result.completion == channel_completion_t::removed) {
-        channel_->cleanup();
-        session_token_ = 0;
-        sequence_ = 0;
-        return true;
-      }
-      explicit_fence = release_result &&
-                       lumen_vhid_validate_message_header(
-                         &release_response.header,
-                         sizeof(release_response),
-                         LUMEN_VHID_OPERATION_RELEASE_INPUT_SESSION,
-                         sizeof(release_response)
-                       ) &&
-                       release_response.session_token == session_token_;
-    }
-
-    const auto cleanup_result = channel_->cleanup();
-    session_token_ = 0;
-    sequence_ = 0;
-    return explicit_fence || static_cast<bool>(cleanup_result);
+    backend_.store(backend_t::send_input);
+    return fallback_->neutralize();
   }
 
   void virtual_hid_transport_t::set_failure(const char *stage, DWORD status) {
@@ -1312,10 +891,6 @@ namespace platf::win_input {
     );
     if (transport->initialize()) {
       BOOST_LOG(info) << "Windows keyboard and mouse backend: Lumen Virtual HID"sv;
-    } else if (transport->backend() == backend_t::fail_closed) {
-      BOOST_LOG(error)
-        << "Windows keyboard and mouse backend failed closed during Virtual HID initialization (stage="sv
-        << transport->failure_stage() << ", status="sv << transport->failure_status() << ')';
     } else {
       BOOST_LOG(warning)
         << "Windows keyboard and mouse backend: SendInput fallback (stage="sv

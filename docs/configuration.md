@@ -489,6 +489,44 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### windows_input_backend
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Selects the Windows keyboard and mouse input backend. Automatic selects the Lumen Virtual HID driver when
+            its Windows 11 x64 package is installed, compatible, and accessible to the service. Otherwise, Sunshine
+            uses SendInput. If Virtual HID fails after accepting any input, Sunshine fails closed until the input
+            session's reset-and-release operation succeeds.
+            @caution{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            windows_input_backend = sendinput
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="2">Choices</td>
+        <td>auto</td>
+        <td>
+            Prefer Virtual HID, with SendInput fallback before the driver accepts input and fail-closed recovery after.
+        </td>
+    </tr>
+    <tr>
+        <td>sendinput</td>
+        <td>Always use SendInput without probing Virtual HID.</td>
+    </tr>
+</table>
+
 ### keyboard
 
 <table>
@@ -556,31 +594,6 @@ editing the `conf` file in a text editor. Use the examples as reference.
         <td>Example</td>
         <td colspan="2">@code{}
             key_repeat_frequency = 24.9
-            @endcode</td>
-    </tr>
-</table>
-
-### windows_input_backend
-
-<table>
-    <tr>
-        <td>Description</td>
-        <td colspan="2">
-            Selects the Windows keyboard and mouse input backend. Automatic prefers the Lumen Virtual HID driver and
-            falls back to SendInput when the driver is unavailable. SendInput always uses the legacy Windows input path.
-            @caution{Applies to Windows only.}
-        </td>
-    </tr>
-    <tr>
-        <td>Default</td>
-        <td colspan="2">@code{}
-            auto
-            @endcode</td>
-    </tr>
-    <tr>
-        <td>Example</td>
-        <td colspan="2">@code{}
-            windows_input_backend = sendinput
             @endcode</td>
     </tr>
 </table>

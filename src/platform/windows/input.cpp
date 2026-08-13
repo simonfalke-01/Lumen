@@ -609,6 +609,14 @@ namespace platf {
     }
   }
 
+  void reset_input_session(input_t &input) {
+    auto *raw = (input_raw_t *) input.get();
+    const auto result = raw->keyboard_mouse->reset_session();
+    if (!result) {
+      BOOST_LOG(error) << "Couldn't reset keyboard and mouse input session: "sv << result.status;
+    }
+  }
+
   bool uses_native_keyboard_repeat(input_t &input) {
     const auto *raw = (const input_raw_t *) input.get();
     return raw && raw->keyboard_mouse && raw->keyboard_mouse->backend() == win_input::backend_t::virtual_hid;

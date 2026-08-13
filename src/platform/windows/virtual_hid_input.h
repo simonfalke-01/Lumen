@@ -1,6 +1,6 @@
 /**
  * @file src/platform/windows/virtual_hid_input.h
- * @brief Preferred Windows Virtual HID keyboard and mouse transport.
+ * @brief Lean Windows Virtual HID keyboard and mouse transport.
  */
 #pragma once
 
@@ -11,116 +11,73 @@
 // standard includes
 #include <atomic>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace platf::win_input {
   /**
-   * @brief Completion classes returned by the Virtual HID control channel.
-   */
-  enum class channel_completion_t {
-    accepted,  ///< The request completed successfully.
-    definite_reject,  ///< The driver definitely rejected the request.
-    ambiguous,  ///< The request may have reached the driver.
-    removed  ///< Device removal is confirmed and acts as a quiescence fence.
-  };
-
-  /**
-   * @brief Result returned by one Virtual HID control-channel operation.
+   * @brief Result returned by one synchronous Virtual HID operation.
    */
   struct channel_result_t {
-    channel_completion_t completion {channel_completion_t::accepted};  ///< Completion classification.
+    bool accepted {true};  ///< Whether the driver accepted the operation.
     DWORD status {ERROR_SUCCESS};  ///< Native Windows status.
 
     /**
-     * @brief Test whether the channel operation was accepted.
+     * @brief Test whether the operation was accepted.
      * @return `true` when accepted.
      */
     explicit operator bool() const noexcept {
-      return completion == channel_completion_t::accepted;
+      return accepted;
     }
   };
 
   /**
-   * @brief Test seam for the versioned Virtual HID control channel.
-   *
-   * Implementations execute requests synchronously. Request and response structures
-   * use the shared fixed-width C ABI so fakes can inspect every submitted report.
+   * @brief Test seam for the four-operation Virtual HID control channel.
    */
   class virtual_hid_channel_t {
   public:
     virtual ~virtual_hid_channel_t() = default;
 
     /**
-     * @brief Discover and open the report-control device interface.
+     * @brief Discover and open the secured driver interface.
      * @return Channel result.
      */
     virtual channel_result_t open() = 0;
 
     /**
-     * @brief Exchange protocol capability structures.
-     * @param request Capability request.
-     * @param response Capability response populated by the channel.
+     * @brief Read exact ABI identity and readiness.
+     * @param response Driver information returned on success.
      * @return Channel result.
      */
-    virtual channel_result_t get_capabilities(
-      const LUMEN_VHID_GET_CAPABILITIES_REQUEST &request,
-      LUMEN_VHID_GET_CAPABILITIES_RESPONSE &response
-    ) = 0;
+    virtual channel_result_t get_info(LUMEN_VHID_GET_INFO_RESPONSE &response) = 0;
 
     /**
-     * @brief Claim the exclusive keyboard and mouse writer session.
-     * @param request Claim request.
-     * @param response Claim response populated by the channel.
+     * @brief Claim exclusive report submission on the open file.
      * @return Channel result.
      */
-    virtual channel_result_t claim(
-      const LUMEN_VHID_CLAIM_SESSION_REQUEST &request,
-      LUMEN_VHID_CLAIM_SESSION_RESPONSE &response
-    ) = 0;
+    virtual channel_result_t claim() = 0;
 
     /**
-     * @brief Submit one complete HID report snapshot.
-     * @param request Report request.
-     * @param response Submission response populated by the channel.
+     * @brief Submit one complete fixed report.
+     * @param request Tagged report request.
      * @return Channel result.
      */
-    virtual channel_result_t submit(
-      const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request,
-      LUMEN_VHID_SUBMIT_REPORT_RESPONSE &response
-    ) = 0;
+    virtual channel_result_t submit(const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request) = 0;
 
     /**
-     * @brief Synchronously reset and neutralize the claimed session.
-     * @param request Session request.
-     * @param response Reset response populated by the channel.
+     * @brief Synchronously tear down Virtual HID state and release ownership.
      * @return Channel result.
      */
-    virtual channel_result_t reset(
-      const LUMEN_VHID_SESSION_REQUEST &request,
-      LUMEN_VHID_SESSION_RESPONSE &response
-    ) = 0;
+    virtual channel_result_t reset_and_release() = 0;
 
     /**
-     * @brief Synchronously neutralize and release the claimed session.
-     * @param request Session request.
-     * @param response Release response populated by the channel.
-     * @return Channel result.
+     * @brief Close the secured driver interface.
      */
-    virtual channel_result_t release(
-      const LUMEN_VHID_SESSION_REQUEST &request,
-      LUMEN_VHID_SESSION_RESPONSE &response
-    ) = 0;
-
-    /**
-     * @brief Close the file and establish the driver cleanup fence.
-     * @return Channel result.
-     */
-    virtual channel_result_t cleanup() = 0;
+    virtual void close() noexcept = 0;
   };
 
   /**
@@ -137,14 +94,14 @@ namespace platf::win_input {
   );
 
   /**
-   * @brief Preferred Virtual HID transport with one-way fenced fallback.
+   * @brief Preferred Virtual HID transport with reset-gated failure recovery.
    */
   class virtual_hid_transport_t final: public transport_t {
   public:
     /**
-     * @brief Construct a transport from injectable channel and fallback objects.
+     * @brief Construct a transport from injectable channel and SendInput objects.
      * @param channel Virtual HID channel.
-     * @param fallback Win32 compatibility transport.
+     * @param fallback SendInput compatibility and auxiliary transport.
      */
     virtual_hid_transport_t(
       std::shared_ptr<virtual_hid_channel_t> channel,
@@ -152,12 +109,12 @@ namespace platf::win_input {
     );
 
     /**
-     * @brief Neutralize and release any claimed Virtual HID session.
+     * @brief Strongly reset an active Virtual HID session before destruction.
      */
     ~virtual_hid_transport_t() override;
 
     /**
-     * @brief Probe, validate, claim, and neutralize the Virtual HID backend.
+     * @brief Open, validate, and claim the Virtual HID interface.
      * @return `true` only when Virtual HID becomes active.
      */
     bool initialize();
@@ -175,14 +132,14 @@ namespace platf::win_input {
     [[nodiscard]] DWORD failure_status() const noexcept;
 
     /**
-     * @brief Return the last keyboard snapshot acknowledged by the driver.
-     * @return Last acknowledged keyboard report.
+     * @brief Return the last keyboard report accepted by the driver.
+     * @return Last accepted keyboard snapshot.
      */
     [[nodiscard]] LUMEN_VHID_KEYBOARD_REPORT acknowledged_keyboard_report() const;
 
     /**
-     * @brief Return the last mouse-button snapshot acknowledged by the driver.
-     * @return Last acknowledged five-button bitmap.
+     * @brief Return the last mouse-button snapshot accepted by the driver.
+     * @return Last accepted five-button bitmap.
      */
     [[nodiscard]] std::uint8_t acknowledged_mouse_buttons() const;
 
@@ -194,88 +151,55 @@ namespace platf::win_input {
     result_t horizontal_scroll(std::int32_t distance) override;
     result_t keyboard(std::uint16_t modcode, bool release, std::uint8_t flags) override;
     result_t unicode(const char *utf8, int size) override;
+    result_t reset_session() override;
     result_t neutralize() override;
 
   private:
     /**
-     * @brief Original key transition retained for held-state replay.
-     */
-    struct held_key_t {
-      std::uint8_t flags;  ///< Moonlight keyboard flags.
-      std::uint8_t usage;  ///< Keyboard-page HID usage.
-    };
-
-    /**
-     * @brief Build a complete NKRO report from desired key state.
+     * @brief Build a complete NKRO report from held keyboard state.
      * @return Keyboard report snapshot.
      */
     LUMEN_VHID_KEYBOARD_REPORT keyboard_report() const;
 
     /**
-     * @brief Submit one raw HID report with the next sequence value.
-     * @param device_kind Protocol device kind.
-     * @param report_id HID report identifier.
-     * @param report Report bytes.
-     * @param report_size Number of report bytes.
-     * @return Channel result.
+     * @brief Build a complete Consumer Control report from held consumer state.
+     * @return Consumer Control report snapshot.
      */
-    channel_result_t submit_report(
-      std::uint16_t device_kind,
-      std::uint16_t report_id,
-      const void *report,
-      std::uint16_t report_size
-    );
+    LUMEN_VHID_CONSUMER_REPORT consumer_report() const;
 
     /**
-     * @brief Fence the Virtual HID session and activate the fallback backend.
-     * @param failure Failed operation result.
-     * @param stage Diagnostic failure stage.
-     * @param definitely_rejected_delta Optional stateless fallback action.
-     * @return Result after transition and optional delivery.
+     * @brief Submit one report and enforce the accepted-input failure boundary.
+     * @param request Tagged report request.
+     * @param stage Diagnostic stage name.
+     * @return Transport result.
      */
-    result_t failover(
-      channel_result_t failure,
-      const char *stage,
-      const std::function<result_t()> &definitely_rejected_delta = {}
-    );
+    result_t submit_report(const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request, const char *stage);
 
     /**
-     * @brief Replay final desired held state through `SendInput` after fencing.
-     * @return Replay result.
-     */
-    result_t replay_held_state();
-
-    /**
-     * @brief Reset then release the active writer session.
-     * @return `true` when a recognized quiescence fence succeeds.
-     */
-    bool fence_and_release();
-
-    /**
-     * @brief Record a fallback or fail-closed reason.
+     * @brief Record a diagnostic failure.
      * @param stage Failure stage.
      * @param status Native status.
      */
     void set_failure(const char *stage, DWORD status);
 
-    std::shared_ptr<virtual_hid_channel_t> channel_;  ///< Versioned driver channel.
-    std::unique_ptr<send_input_transport_t> fallback_;  ///< Win32 fallback and Unicode route.
-    mutable std::mutex mutex_;  ///< Serializes input reports and transitions.
-    std::atomic<backend_t> backend_ {backend_t::probing};  ///< Current backend state.
-    std::uint16_t protocol_minor_ {LUMEN_VHID_PROTOCOL_MINOR};  ///< Negotiated protocol minor.
-    std::uint64_t session_token_ {0};  ///< Current session generation token.
-    std::uint64_t sequence_ {0};  ///< Last accepted report sequence.
-    std::unordered_map<std::uint16_t, held_key_t> desired_keys_;  ///< Desired held keys by virtual key.
-    LUMEN_VHID_KEYBOARD_REPORT acknowledged_keyboard_ {};  ///< Last acknowledged keyboard snapshot.
-    std::uint8_t desired_buttons_ {0};  ///< Desired held mouse-button bitmap.
-    std::uint8_t acknowledged_buttons_ {0};  ///< Last acknowledged button bitmap.
+    std::shared_ptr<virtual_hid_channel_t> channel_;  ///< Secured driver channel.
+    std::unique_ptr<send_input_transport_t> fallback_;  ///< SendInput auxiliary transport.
+    mutable std::mutex mutex_;  ///< Serializes reports, state, and recovery.
+    std::atomic<backend_t> backend_ {backend_t::probing};  ///< Current stateful backend.
+    bool accepted_virtual_input_ {false};  ///< Whether any Virtual HID report was accepted.
+    std::unordered_map<std::uint16_t, std::uint8_t> held_keys_;  ///< Held keyboard usages by virtual key.
+    std::unordered_map<std::uint16_t, std::uint16_t> held_consumers_;  ///< Held consumer usages by virtual key.
+    std::unordered_set<std::uint16_t> fallback_keys_;  ///< Held per-key SendInput transitions.
+    LUMEN_VHID_KEYBOARD_REPORT acknowledged_keyboard_ {};  ///< Last accepted keyboard snapshot.
+    std::uint8_t held_buttons_ {0};  ///< Desired mouse-button bitmap.
+    std::uint8_t acknowledged_buttons_ {0};  ///< Last accepted mouse-button bitmap.
     std::string failure_stage_;  ///< Most recent diagnostic stage.
     DWORD failure_status_ {ERROR_SUCCESS};  ///< Most recent native failure status.
   };
 
   /**
    * @brief Create and probe the production preferred Windows input transport.
-   * @return Virtual HID transport, already in Virtual HID or fallback state.
+   * @return Virtual HID transport in Virtual HID, SendInput, or fail-closed state.
    */
   std::unique_ptr<transport_t> make_preferred_input_transport();
 }  // namespace platf::win_input

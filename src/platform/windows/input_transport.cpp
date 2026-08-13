@@ -246,24 +246,22 @@ namespace platf::win_input {
       input.type = INPUT_KEYBOARD;
       input.ki.wScan = wide[index];
       input.ki.dwFlags = KEYEVENTF_UNICODE;
-      const auto result = submit(input);
+      auto result = submit(input);
       if (!result) {
         return result;
       }
-    }
-
-    for (int index = 0; index < chars; ++index) {
-      INPUT input {};
-      input.type = INPUT_KEYBOARD;
-      input.ki.wScan = wide[index];
-      input.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-      const auto result = submit(input);
+      input.ki.dwFlags |= KEYEVENTF_KEYUP;
+      result = submit(input);
       if (!result) {
         return result;
       }
     }
 
     return {};
+  }
+
+  result_t send_input_transport_t::reset_session() {
+    return neutralize();
   }
 
   result_t send_input_transport_t::neutralize() {

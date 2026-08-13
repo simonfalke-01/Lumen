@@ -36,12 +36,15 @@ install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
 
 # Lumen Virtual HID driver
 #
-# The kernel driver is built separately with MSBuild/WDK. The application build
+# The UMDF driver is built separately with MSBuild/WDK. The application build
 # receives the architecture-matched, validated package directory from CI (or a
 # local packager) and stages it without attempting to rebuild MSVC artifacts
 # from the MSYS2 toolchain.
 set(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR "" CACHE PATH
-        "Directory containing the architecture-matched Lumen Virtual HID INF, CAT, and SYS files")
+        "Directory containing the architecture-matched Lumen Virtual HID INF, CAT, and DLL files")
+option(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE
+        "Package the exact self-signed Virtual HID certificate"
+        OFF)
 
 if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
     if(NOT IS_DIRECTORY "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
@@ -50,29 +53,47 @@ if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
                 "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
     endif()
 
-    file(GLOB VIRTUAL_HID_DRIVER_INF
-            CONFIGURE_DEPENDS
-            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*.inf")
-    file(GLOB VIRTUAL_HID_DRIVER_CAT
-            CONFIGURE_DEPENDS
-            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*.cat")
-    file(GLOB VIRTUAL_HID_DRIVER_SYS
-            CONFIGURE_DEPENDS
-            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*.sys")
-    file(GLOB VIRTUAL_HID_DRIVER_CERT
-            CONFIGURE_DEPENDS
-            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*.cer")
+    set(VIRTUAL_HID_DRIVER_INF
+            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.inf")
+    set(VIRTUAL_HID_DRIVER_CAT
+            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.cat")
+    set(VIRTUAL_HID_DRIVER_DLL
+            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.dll")
+    set(VIRTUAL_HID_DRIVER_FILES
+            "${VIRTUAL_HID_DRIVER_INF}"
+            "${VIRTUAL_HID_DRIVER_CAT}"
+            "${VIRTUAL_HID_DRIVER_DLL}")
 
-    list(LENGTH VIRTUAL_HID_DRIVER_INF VIRTUAL_HID_DRIVER_INF_COUNT)
-    list(LENGTH VIRTUAL_HID_DRIVER_CAT VIRTUAL_HID_DRIVER_CAT_COUNT)
-    list(LENGTH VIRTUAL_HID_DRIVER_SYS VIRTUAL_HID_DRIVER_SYS_COUNT)
-    list(LENGTH VIRTUAL_HID_DRIVER_CERT VIRTUAL_HID_DRIVER_CERT_COUNT)
-    if(NOT VIRTUAL_HID_DRIVER_INF_COUNT EQUAL 1
-            OR NOT VIRTUAL_HID_DRIVER_CAT_COUNT EQUAL 1
-            OR NOT VIRTUAL_HID_DRIVER_SYS_COUNT EQUAL 1
-            OR NOT VIRTUAL_HID_DRIVER_CERT_COUNT EQUAL 1)
+    if(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE)
+        set(VIRTUAL_HID_DRIVER_CERT
+                "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.cer")
+        list(APPEND VIRTUAL_HID_DRIVER_FILES "${VIRTUAL_HID_DRIVER_CERT}")
+        set(VIRTUAL_HID_DRIVER_EXPECTED_FILE_COUNT 4)
+    else()
+        set(VIRTUAL_HID_DRIVER_EXPECTED_FILE_COUNT 3)
+    endif()
+
+    foreach(VIRTUAL_HID_DRIVER_FILE IN LISTS VIRTUAL_HID_DRIVER_FILES)
+        if(NOT EXISTS "${VIRTUAL_HID_DRIVER_FILE}")
+            message(FATAL_ERROR
+                    "The Lumen Virtual HID package is missing: ${VIRTUAL_HID_DRIVER_FILE}")
+        endif()
+    endforeach()
+
+    file(GLOB VIRTUAL_HID_DRIVER_PACKAGE_FILES
+            LIST_DIRECTORIES false
+            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*")
+    list(LENGTH VIRTUAL_HID_DRIVER_PACKAGE_FILES VIRTUAL_HID_DRIVER_PACKAGE_FILE_COUNT)
+    if(NOT VIRTUAL_HID_DRIVER_PACKAGE_FILE_COUNT EQUAL VIRTUAL_HID_DRIVER_EXPECTED_FILE_COUNT)
+        if(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE)
+            set(VIRTUAL_HID_DRIVER_PACKAGE_CONTENTS
+                    "LumenVirtualHid.inf, LumenVirtualHid.cat, LumenVirtualHid.dll, and LumenVirtualHid.cer")
+        else()
+            set(VIRTUAL_HID_DRIVER_PACKAGE_CONTENTS
+                    "LumenVirtualHid.inf, LumenVirtualHid.cat, and LumenVirtualHid.dll")
+        endif()
         message(FATAL_ERROR
-                "The Lumen Virtual HID package must contain exactly one INF, CAT, SYS, and CER file: "
+                "The Lumen Virtual HID package must contain exactly ${VIRTUAL_HID_DRIVER_PACKAGE_CONTENTS}: "
                 "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
     endif()
 
@@ -84,11 +105,7 @@ if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
     install(TARGETS lumen-vhidctl
             RUNTIME DESTINATION "tools"
             COMPONENT virtual_hid_driver)
-    install(FILES
-            ${VIRTUAL_HID_DRIVER_INF}
-            ${VIRTUAL_HID_DRIVER_CAT}
-            ${VIRTUAL_HID_DRIVER_SYS}
-            ${VIRTUAL_HID_DRIVER_CERT}
+    install(FILES ${VIRTUAL_HID_DRIVER_FILES}
             DESTINATION "drivers/virtual-hid"
             COMPONENT virtual_hid_driver)
 else()
@@ -166,9 +183,8 @@ set(CPACK_COMPONENT_ASSETS_REQUIRED true)
 # Lumen Virtual HID driver and management helper
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISPLAY_NAME "Virtual Keyboard and Mouse")
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
-        "Required Lumen Virtual HID keyboard and mouse driver and management tool.")
+        "Optional Lumen Virtual HID keyboard and mouse driver. Deselect to use the SendInput backend only.")
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_GROUP "Core")
-set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_REQUIRED true)
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DEPENDS application)
 
 # ZIP packages are intentionally non-privileged. Keep the driver package and

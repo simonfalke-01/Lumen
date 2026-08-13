@@ -1,15 +1,15 @@
 ﻿# Sunshine Setup Script
 # This script orchestrates the installation and uninstallation of Sunshine
-# Usage: sunshine-setup.ps1 -Action [install|uninstall|rollback|commit] [-Silent]
+# Usage: sunshine-setup.ps1 -Action <operation> -ProductCode <guid> -TransactionKind <install|uninstall>
 
 param(
     [Parameter(Mandatory=$false)]
     [ValidateSet(
             "install",
-            "install-driver",
             "uninstall",
             "rollback",
-            "commit"
+            "commit",
+            "recover-legacy"
     )]
     [string]$Action,
 
@@ -17,11 +17,26 @@ param(
     [switch]$Silent,
 
     [Parameter(Mandatory=$false)]
-    [switch]$Msi
+    [switch]$Msi,
+
+    [Parameter(Mandatory=$false)]
+    [string]$ProductCode,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("install", "uninstall")]
+    [string]$TransactionKind,
+
+    [Parameter(Mandatory=$false)]
+    [string]$PreviousProductCode,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("0", "1")]
+    [string]$InstallVirtualHid
 )
 
 # Constants
 $DocsUrl = "https://docs.lizardbyte.dev/projects/sunshine"
+$virtualHidCertificateSubject = "CN=Lumen Virtual HID Driver"
 
 # Set preference variables for output streams
 $InformationPreference = 'Continue'
@@ -255,6 +270,18 @@ if (-not $isAdmin) {
     if ($Msi) {
         $arguments += " -Msi"
     }
+    if ($ProductCode) {
+        $arguments += " -ProductCode `"$ProductCode`""
+    }
+    if ($TransactionKind) {
+        $arguments += " -TransactionKind $TransactionKind"
+    }
+    if ($PreviousProductCode) {
+        $arguments += " -PreviousProductCode `"$PreviousProductCode`""
+    }
+    if ($InstallVirtualHid) {
+        $arguments += " -InstallVirtualHid $InstallVirtualHid"
+    }
 
     try {
         # Relaunch the script with elevation
@@ -473,8 +500,8 @@ function Invoke-SetupScript {
 }
 
 # Invoke the required Virtual HID management helper and preserve its output in
-# the installer log. Exit code 3010 means cleanup completed but Windows needs a
-# reboot to finish releasing the driver package.
+# the installer log. Exit code 3010 means the Plug and Play operation succeeded
+# but Windows needs a reboot to finish it.
 function Invoke-VirtualHidCtl {
     param(
         [Parameter(Mandatory=$true)]
@@ -522,20 +549,25 @@ function Invoke-VirtualHidCtl {
         if ($process.ExitCode -eq 3010) {
             $script:RebootRequired = $true
             Write-LogMessage `
-                -Message "  Driver cleanup is scheduled and requires a reboot." `
+                -Message "  Windows requires a reboot to finish the driver operation." `
                 -Level "Warning"
             return $process.ExitCode
         }
 
-        $isExpectedNotInstalled = $AllowNotInstalled -and $process.ExitCode -eq 1
+        $isExpectedNotInstalled = $AllowNotInstalled -and $process.ExitCode -eq 2
+        $isExpectedUnhealthy = $AllowNotInstalled -and $process.ExitCode -eq 4
         if ($process.ExitCode -ne 0 -and -not $isExpectedNotInstalled) {
-            throw "$Description failed with exit code $($process.ExitCode)."
+            if (-not $isExpectedUnhealthy) {
+                throw "$Description failed with exit code $($process.ExitCode)."
+            }
         }
 
         if ($process.ExitCode -eq 0) {
             Write-LogMessage -Message "  ✓ Done" -Level "Success"
         } elseif ($isExpectedNotInstalled) {
             Write-LogMessage -Message "  Lumen Virtual HID driver is not installed." -Level "Information"
+        } elseif ($isExpectedUnhealthy) {
+            Write-LogMessage -Message "  Lumen Virtual HID driver is installed but unhealthy." -Level "Warning"
         }
         return $process.ExitCode
     } finally {
@@ -563,29 +595,13 @@ function Get-VirtualHidCertificatePath {
     }
 
     $certificateFiles = @(Get-ChildItem -Path $driverDirectory -Filter "*.cer" -File)
-    if ($certificateFiles.Count -ne 1) {
-        throw "Expected exactly one Virtual HID certificate in $driverDirectory; found $($certificateFiles.Count)."
+    if ($certificateFiles.Count -gt 1) {
+        throw "Expected at most one bundled Virtual HID certificate in $driverDirectory; found $($certificateFiles.Count)."
+    }
+    if ($certificateFiles.Count -eq 0) {
+        return $null
     }
     return $certificateFiles[0].FullName
-}
-
-$virtualHidInstallTaskName = "Lumen Virtual HID Driver Install"
-$virtualHidTestSigningKey = "HKLM:\SOFTWARE\Lumen\VirtualHid"
-
-function Test-SecureBootEnabled {
-    $secureBootState = Get-ItemProperty `
-        -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" `
-        -Name "UEFISecureBootEnabled" `
-        -ErrorAction SilentlyContinue
-    return $null -ne $secureBootState -and $secureBootState.UEFISecureBootEnabled -eq 1
-}
-
-function Test-TestSigningActive {
-    $systemStartOptions = Get-ItemPropertyValue `
-        -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control" `
-        -Name "SystemStartOptions" `
-        -ErrorAction SilentlyContinue
-    return [string]$systemStartOptions -match '(^|\s)TESTSIGNING($|\s)'
 }
 
 function Install-VirtualHidCertificate {
@@ -594,49 +610,123 @@ function Install-VirtualHidCertificate {
         [string]$CertificatePath
     )
 
-    $certUtilPath = Join-Path $env:SystemRoot "System32\certutil.exe"
-    if (-not (Test-Path $certUtilPath -PathType Leaf)) {
-        throw "Required certificate utility not found: $certUtilPath"
+    if ([string]::IsNullOrWhiteSpace($CertificatePath)) {
+        return $null
     }
 
+    $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $CertificatePath
+    )
+    if ($certificate.Subject -ne $virtualHidCertificateSubject) {
+        throw "Only the exact bundled Lumen Virtual HID certificate may be imported."
+    }
+    Write-LogMessage -Message "Trusting the exact bundled driver signer" -Level "Step"
     foreach ($storeName in @("Root", "TrustedPublisher")) {
-        Write-LogMessage `
-            -Message "Trusting the Lumen Virtual HID development certificate in $storeName" `
-            -Level "Step"
-        $output = & $certUtilPath -f -addstore $storeName $CertificatePath 2>&1
-        $exitCode = $LASTEXITCODE
-        $output | ForEach-Object {
-            if ($_ -and $_.ToString().Trim()) {
-                Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
-            }
-        }
-        if ($exitCode -ne 0) {
-            throw "Installing the Virtual HID certificate in $storeName failed with exit code $exitCode."
+        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+            $storeName,
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+        )
+        try {
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $store.Add($certificate)
+        } finally {
+            $store.Close()
         }
     }
+    return $certificate.Thumbprint
 }
 
-function Assert-VirtualHidPackageSignature {
+function Get-VirtualHidCertificate {
     param(
         [Parameter(Mandatory=$true)]
         [string]$CertificatePath
     )
 
-    $driverDirectory = Split-Path -Parent $CertificatePath
+    $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $CertificatePath
+    )
+    if ($certificate.Subject -ne $virtualHidCertificateSubject) {
+        throw "The bundled Virtual HID certificate has an unexpected identity."
+    }
+    return $certificate
+}
+
+function Get-BackedUpVirtualHidCertificate {
+    param(
+        [string]$DriverDirectory = $rollbackDriverDirectory
+    )
+
+    $catalogs = @(Get-ChildItem -LiteralPath $DriverDirectory -Filter "*.cat" -File -Recurse)
+    if ($catalogs.Count -ne 1) {
+        throw "The previous Virtual HID backup does not contain exactly one signed catalog."
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $catalogs[0].FullName
+    $certificate = $signature.SignerCertificate
+    if ($null -eq $certificate) {
+        throw "The previous Virtual HID catalog does not contain a signer certificate."
+    }
+    if ($certificate.Subject -notin @(
+            $virtualHidCertificateSubject,
+            "CN=Lumen Virtual HID Development Driver"
+        )) {
+        throw "The backed-up Virtual HID signer certificate has an unexpected identity."
+    }
+    return $certificate
+}
+
+function Install-BackedUpVirtualHidCertificate {
+    param(
+        [string]$DriverDirectory = $rollbackDriverDirectory
+    )
+
+    $certificate = Get-BackedUpVirtualHidCertificate -DriverDirectory $DriverDirectory
+    foreach ($storeName in @("Root", "TrustedPublisher")) {
+        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+            $storeName,
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+        )
+        try {
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $store.Add($certificate)
+        } finally {
+            $store.Close()
+        }
+    }
+    return $certificate.Thumbprint
+}
+
+function Assert-VirtualHidPackageSignature {
+    param(
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [string]$CertificatePath
+    )
+
+    $driverDirectory = Join-Path $RootDir "drivers\virtual-hid"
+    $driverDllFiles = @(Get-ChildItem -Path $driverDirectory -Filter "*.dll" -File)
+    if ($driverDllFiles.Count -ne 1) {
+        throw "Expected exactly one Virtual HID UMDF DLL in $driverDirectory; found $($driverDllFiles.Count)."
+    }
+
     $catalogFiles = @(Get-ChildItem -Path $driverDirectory -Filter "*.cat" -File)
     if ($catalogFiles.Count -ne 1) {
         throw "Expected exactly one Virtual HID catalog in $driverDirectory; found $($catalogFiles.Count)."
     }
 
-    $expectedCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-        $CertificatePath
-    )
     $signature = Get-AuthenticodeSignature -LiteralPath $catalogFiles[0].FullName
     if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
-        $null -eq $signature.SignerCertificate -or
-        $signature.SignerCertificate.Thumbprint -ne $expectedCertificate.Thumbprint) {
-        throw "The Virtual HID catalog is not validly signed by the bundled certificate."
+        $null -eq $signature.SignerCertificate) {
+        throw "The Virtual HID catalog does not have a valid trusted signature."
     }
+    if (-not [string]::IsNullOrWhiteSpace($CertificatePath)) {
+        $expectedCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $CertificatePath
+        )
+        if ($signature.SignerCertificate.Thumbprint -ne $expectedCertificate.Thumbprint) {
+            throw "The Virtual HID catalog signer does not match the bundled certificate."
+        }
+    }
+    return $signature.SignerCertificate.Thumbprint
 }
 
 function Remove-VirtualHidCertificate {
@@ -644,6 +734,9 @@ function Remove-VirtualHidCertificate {
         [string]$Thumbprint
     )
 
+    if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
+        return
+    }
     foreach ($storeName in @("Root", "TrustedPublisher")) {
         $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
             $storeName,
@@ -652,12 +745,11 @@ function Remove-VirtualHidCertificate {
         try {
             $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
             foreach ($certificate in @($store.Certificates)) {
-                $matchesLumenCertificate = `
-                    $certificate.Subject -eq "CN=Lumen Virtual HID Development Driver"
-                $matchesRequestedCertificate = `
-                    [string]::IsNullOrWhiteSpace($Thumbprint) -or `
-                    $certificate.Thumbprint -eq $Thumbprint
-                if ($matchesLumenCertificate -and $matchesRequestedCertificate) {
+                if ($certificate.Subject -in @(
+                        $virtualHidCertificateSubject,
+                        "CN=Lumen Virtual HID Development Driver"
+                    ) -and
+                    $certificate.Thumbprint -eq $Thumbprint) {
                     $store.Remove($certificate)
                 }
             }
@@ -667,111 +759,106 @@ function Remove-VirtualHidCertificate {
     }
 }
 
-function Remove-VirtualHidInstallTask {
-    Unregister-ScheduledTask `
-        -TaskName $virtualHidInstallTaskName `
-        -Confirm:$false `
-        -ErrorAction SilentlyContinue
+function Get-InstalledVirtualHidSignerThumbprint {
+    if (-not (Test-Path -LiteralPath $installerRegistryPath)) {
+        return $null
+    }
+    return [string](Get-ItemProperty `
+        -LiteralPath $installerRegistryPath `
+        -Name "SignerThumbprint" `
+        -ErrorAction SilentlyContinue).SignerThumbprint
 }
 
-function Register-VirtualHidInstallTask {
-    $powerShellPath = Join-Path `
-        $env:SystemRoot `
-        "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $setupScriptPath = Join-Path $RootDir "scripts\sunshine-setup.ps1"
-    $taskAction = New-ScheduledTaskAction `
-        -Execute $powerShellPath `
-        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$setupScriptPath`" -Action install-driver -Silent"
-    $taskTrigger = New-ScheduledTaskTrigger -AtStartup
-    $taskPrincipal = New-ScheduledTaskPrincipal `
-        -UserId "SYSTEM" `
-        -LogonType ServiceAccount `
-        -RunLevel Highest
-    $taskSettings = New-ScheduledTaskSettingsSet `
-        -StartWhenAvailable `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+function Set-InstalledVirtualHidSignerThumbprint {
+    param(
+        [AllowNull()]
+        [string]$Thumbprint
+    )
 
-    Register-ScheduledTask `
-        -TaskName $virtualHidInstallTaskName `
-        -Action $taskAction `
-        -Trigger $taskTrigger `
-        -Principal $taskPrincipal `
-        -Settings $taskSettings `
-        -Description "Finishes installing the test-signed Lumen Virtual HID driver after restart." `
-        -Force | Out-Null
-}
-
-function Enable-VirtualHidTestSigning {
-    if (Test-SecureBootEnabled) {
-        throw "Secure Boot is enabled. Disable Secure Boot in UEFI firmware, then run the Lumen installer again so Windows can load the test-signed Virtual HID driver."
-    }
-
-    $bcdEditPath = Join-Path $env:SystemRoot "System32\bcdedit.exe"
-    if (-not (Test-Path $bcdEditPath -PathType Leaf)) {
-        throw "Required boot configuration utility not found: $bcdEditPath"
-    }
-
-    Write-LogMessage -Message "Enabling Windows test-signing mode" -Level "Step"
-    $output = & $bcdEditPath /set testsigning on 2>&1
-    $exitCode = $LASTEXITCODE
-    $output | ForEach-Object {
-        if ($_ -and $_.ToString().Trim()) {
-            Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
+    if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
+        if (Test-Path -LiteralPath $installerRegistryPath) {
+            Remove-ItemProperty `
+                -LiteralPath $installerRegistryPath `
+                -Name "SignerThumbprint" `
+                -ErrorAction SilentlyContinue
         }
-    }
-    if ($exitCode -ne 0) {
-        throw "Enabling Windows test-signing mode failed with exit code $exitCode."
-    }
-
-    New-Item -Path $virtualHidTestSigningKey -Force | Out-Null
-    New-ItemProperty `
-        -Path $virtualHidTestSigningKey `
-        -Name "TestSigningEnabledByLumen" `
-        -PropertyType DWord `
-        -Value 1 `
-        -Force | Out-Null
-
-    Register-VirtualHidInstallTask
-    $script:RebootRequired = $true
-    Write-LogMessage `
-        -Message "Restart Windows to activate test-signing mode and finish installing the Virtual HID driver." `
-        -Level "Warning"
-}
-
-function Disable-VirtualHidTestSigningIfOwned {
-    $enabledByLumen = Get-ItemPropertyValue `
-        -LiteralPath $virtualHidTestSigningKey `
-        -Name "TestSigningEnabledByLumen" `
-        -ErrorAction SilentlyContinue
-    if ($enabledByLumen -ne 1) {
         return
     }
-
-    $bcdEditPath = Join-Path $env:SystemRoot "System32\bcdedit.exe"
-    if (-not (Test-Path $bcdEditPath -PathType Leaf)) {
-        throw "Required boot configuration utility not found: $bcdEditPath"
-    }
-
-    Write-LogMessage -Message "Disabling Lumen-owned Windows test-signing mode" -Level "Step"
-    $output = & $bcdEditPath /set testsigning off 2>&1
-    $exitCode = $LASTEXITCODE
-    $output | ForEach-Object {
-        if ($_ -and $_.ToString().Trim()) {
-            Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
-        }
-    }
-    if ($exitCode -ne 0) {
-        throw "Disabling Windows test-signing mode failed with exit code $exitCode."
-    }
-
-    Remove-Item -LiteralPath $virtualHidTestSigningKey -Recurse -Force -ErrorAction SilentlyContinue
-    $script:RebootRequired = $true
+    New-Item -Path $installerRegistryPath -Force | Out-Null
+    Set-ItemProperty `
+        -LiteralPath $installerRegistryPath `
+        -Name "SignerThumbprint" `
+        -Type String `
+        -Value $Thumbprint `
+        -ErrorAction Stop
 }
 
 $programDataDirectory = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::CommonApplicationData
 )
-$rollbackDirectory = Join-Path $programDataDirectory "LumenVirtualHidInstaller"
+$legacyProductCode = "{D14220B3-D6E3-40B9-A781-5965FC320AD8}"
+$legacyRollbackDirectory = Join-Path $programDataDirectory "LumenVirtualHidInstaller"
+$legacyRollbackStatePath = Join-Path $legacyRollbackDirectory "virtual-hid-rollback.json"
+$legacyRollbackDriverDirectory = Join-Path $legacyRollbackDirectory "virtual-hid-driver"
+$installerRegistryPath = "HKLM:\SOFTWARE\LizardByte\Lumen\VirtualHid"
+
+function ConvertTo-CanonicalProductCode {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Value
+    )
+
+    $parsed = [Guid]::Empty
+    if (-not [Guid]::TryParseExact($Value, "B", [ref]$parsed)) {
+        throw "ProductCode must be an uppercase-braced GUID: $Value"
+    }
+    $canonical = $parsed.ToString("B").ToUpperInvariant()
+    if ($Value -cne $canonical) {
+        throw "ProductCode is not canonical: $Value"
+    }
+    return $canonical
+}
+
+$legacyMsiRollback = $Msi -and $Action -eq "rollback" -and
+    [string]::IsNullOrWhiteSpace($ProductCode) -and
+    [string]::IsNullOrWhiteSpace($TransactionKind)
+if ($Action -eq "recover-legacy" -or $legacyMsiRollback) {
+    # The exact 0.0.7 MSI did not pass scoped transaction arguments. Keep this
+    # one bridge so its rollback action still works if the new script is on disk.
+    $ProductCode = $legacyProductCode
+    $TransactionKind = "uninstall"
+} elseif ($Msi -or $ProductCode -or $Action -in @("rollback", "commit")) {
+    if ([string]::IsNullOrWhiteSpace($ProductCode)) {
+        throw "ProductCode is required for this installer action."
+    }
+    if ([string]::IsNullOrWhiteSpace($TransactionKind)) {
+        throw "TransactionKind is required for this installer action."
+    }
+    $ProductCode = ConvertTo-CanonicalProductCode -Value $ProductCode
+} else {
+    $ProductCode = "{00000000-0000-0000-0000-000000000000}"
+    if ([string]::IsNullOrWhiteSpace($TransactionKind)) {
+        $TransactionKind = if ($Action -eq "uninstall") { "uninstall" } else { "install" }
+    }
+}
+if ($Action -in @("install", "uninstall") -and $TransactionKind -ne $Action) {
+    throw "TransactionKind '$TransactionKind' does not match action '$Action'."
+}
+if (-not [string]::IsNullOrWhiteSpace($PreviousProductCode)) {
+    $PreviousProductCode = ConvertTo-CanonicalProductCode -Value $PreviousProductCode
+    if ($PreviousProductCode -cne $legacyProductCode) {
+        throw "Only the exact 0.0.7 ProductCode is supported as a legacy upgrade source."
+    }
+}
+$virtualHidSelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualHid)) {
+    $true
+} else {
+    $InstallVirtualHid -eq "1"
+}
+
+$rollbackRootDirectory = Join-Path $programDataDirectory "LumenVirtualHidInstallerV2"
+$rollbackProductDirectory = Join-Path $rollbackRootDirectory $ProductCode
+$rollbackDirectory = Join-Path $rollbackProductDirectory $TransactionKind.ToLowerInvariant()
 $rollbackStatePath = Join-Path $rollbackDirectory "virtual-hid-rollback.json"
 $rollbackDriverDirectory = Join-Path $rollbackDirectory "virtual-hid-driver"
 $script:RebootRequired = $false
@@ -797,15 +884,19 @@ function New-InstallRollbackDirectoryAcl {
 }
 
 function Assert-InstallRollbackDirectorySecure {
-    $directory = Get-Item -LiteralPath $rollbackDirectory -Force -ErrorAction Stop
+    param(
+        [string]$Path = $rollbackDirectory
+    )
+
+    $directory = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if (-not $directory.PSIsContainer -or
         ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-        throw "Installer rollback path is not a physical directory: $rollbackDirectory"
+        throw "Installer rollback path is not a physical directory: $Path"
     }
 
-    $acl = Get-Acl -LiteralPath $rollbackDirectory -ErrorAction Stop
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
     if (-not $acl.AreAccessRulesProtected) {
-        throw "Installer rollback directory inherits access rules: $rollbackDirectory"
+        throw "Installer rollback directory inherits access rules: $Path"
     }
 
     $expectedSids = @("S-1-5-18", "S-1-5-32-544")
@@ -840,21 +931,21 @@ function Assert-InstallRollbackDirectorySecure {
 }
 
 function Initialize-InstallRollbackDirectory {
-    if (Test-Path -LiteralPath $rollbackDirectory) {
-        Assert-InstallRollbackDirectorySecure
-        return
-    } else {
-        try {
-            [System.IO.Directory]::CreateDirectory(
-                $rollbackDirectory,
-                (New-InstallRollbackDirectoryAcl)
-            ) | Out-Null
-        } catch [System.Management.Automation.MethodException] {
-            throw "Atomic protected rollback-directory creation is unavailable on this Windows runtime."
+    $protectedAcl = New-InstallRollbackDirectoryAcl
+    foreach ($directoryPath in @(
+        $rollbackRootDirectory,
+        $rollbackProductDirectory,
+        $rollbackDirectory
+    )) {
+        if (-not (Test-Path -LiteralPath $directoryPath)) {
+            try {
+                [System.IO.Directory]::CreateDirectory($directoryPath, $protectedAcl) | Out-Null
+            } catch [System.Management.Automation.MethodException] {
+                throw "Atomic protected rollback-directory creation is unavailable on this Windows runtime."
+            }
         }
+        Assert-InstallRollbackDirectorySecure -Path $directoryPath
     }
-
-    Assert-InstallRollbackDirectorySecure
 }
 
 function Assert-NoPendingRollbackTransaction {
@@ -864,36 +955,103 @@ function Assert-NoPendingRollbackTransaction {
     }
 }
 
-function Remove-InstallRollbackArtifacts {
-    if (Test-Path -LiteralPath $rollbackDriverDirectory) {
-        try {
-            $backupItem = Get-Item -LiteralPath $rollbackDriverDirectory -Force -ErrorAction Stop
-            if ($backupItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-                Remove-Item -LiteralPath $rollbackDriverDirectory -Force -ErrorAction Stop
-            } else {
-                Remove-Item -LiteralPath $rollbackDriverDirectory -Recurse -Force -ErrorAction Stop
-            }
-        } catch {
-            Write-LogMessage `
-                -Message "Could not remove the Virtual HID driver backup: $($_.Exception.Message)" `
-                -Level "Warning"
+function Get-ServiceSnapshot {
+    param(
+        [string]$Name = "SunshineService"
+    )
+
+    $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        return @{
+            Present = $false
+            Running = $false
+            StartMode = $null
+            DelayedAutoStart = $null
         }
     }
-    if (Test-Path -LiteralPath $rollbackStatePath) {
-        try {
-            Remove-Item -LiteralPath $rollbackStatePath -Force -ErrorAction Stop
-        } catch {
-            Write-LogMessage `
-                -Message "Could not remove the installer rollback state: $($_.Exception.Message)" `
-                -Level "Warning"
+    $serviceConfiguration = Get-CimInstance `
+        -ClassName Win32_Service `
+        -Filter "Name='$Name'" `
+        -ErrorAction Stop
+    $delayedAutoStart = $false
+    if ($serviceConfiguration.StartMode -eq "Auto") {
+        $serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+        $delayedAutoStart = (Get-ItemProperty `
+            -LiteralPath $serviceKey `
+            -Name DelayedAutoStart `
+            -ErrorAction SilentlyContinue).DelayedAutoStart -eq 1
+    }
+    return @{
+        Present = $true
+        Running = $service.Status -eq "Running"
+        StartMode = [string]$serviceConfiguration.StartMode
+        DelayedAutoStart = $delayedAutoStart
+    }
+}
+
+function Restore-ServiceSnapshot {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$StartMode,
+        [bool]$DelayedAutoStart,
+        [bool]$Running
+    )
+
+    $startArgument = switch ($StartMode) {
+        "Auto" { if ($DelayedAutoStart) { "delayed-auto" } else { "auto" } }
+        "Manual" { "demand" }
+        "Disabled" { "disabled" }
+        default { throw "Unsupported saved service start mode: $StartMode" }
+    }
+    $scPath = Join-Path $env:SystemRoot "System32\sc.exe"
+    $output = & $scPath config SunshineService start= $startArgument 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Restoring the Sunshine service start mode failed: $($output -join ' ')"
+    }
+    $service = Get-Service -Name "SunshineService" -ErrorAction Stop
+    if ($Running) {
+        if ($StartMode -eq "Disabled") {
+            throw "Saved service state is internally inconsistent: disabled and running."
         }
+        if ($service.Status -ne "Running") {
+            Start-Service -Name "SunshineService" -ErrorAction Stop
+        }
+        $service.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+    } else {
+        if ($service.Status -ne "Stopped") {
+            Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
+        }
+        $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+    }
+}
+
+function Remove-InstallRollbackArtifacts {
+    if (-not (Test-Path -LiteralPath $rollbackDirectory)) {
+        return
+    }
+    Assert-InstallRollbackDirectorySecure
+    $leaf = Get-Item -LiteralPath $rollbackDirectory -Force -ErrorAction Stop
+    if ($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to commit a reparse-point transaction leaf: $rollbackDirectory"
+    }
+    Remove-Item -LiteralPath $rollbackDirectory -Recurse -Force -ErrorAction Stop
+
+    foreach ($parent in @($rollbackProductDirectory, $rollbackRootDirectory)) {
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            continue
+        }
+        Assert-InstallRollbackDirectorySecure -Path $parent
+        if (@(Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop).Count -ne 0) {
+            break
+        }
+        Remove-Item -LiteralPath $parent -Force -ErrorAction Stop
     }
 }
 
 function Get-InstalledVirtualHidInfName {
     $devices = @(
-        Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object {
-            $_.InstanceId -like "ROOT\LumenVirtualHid\*"
+        Get-PnpDevice -ErrorAction Stop | Where-Object {
+            $_.InstanceId -match '^ROOT\\LumenVirtualHid\\[^\\]+$'
         }
     )
     if ($devices.Count -ne 1) {
@@ -967,18 +1125,44 @@ function Save-RollbackState {
         [bool]$ServiceWasPresent,
         [bool]$ServiceWasRunning,
         [AllowNull()]
-        [string]$BackedUpDriverInfPath
+        [string]$ServiceStartMode,
+        [AllowNull()]
+        [bool]$ServiceDelayedAutoStart,
+        [AllowNull()]
+        [string]$BackedUpDriverInfPath,
+        [AllowNull()]
+        [string]$DriverSignerThumbprint,
+        [AllowNull()]
+        [string]$PreviousDriverSignerThumbprint,
+        [bool]$DriverRollbackComplete = $false,
+        [bool]$ServiceRollbackComplete = $false
     )
 
-    @{
-        TransactionKind = $TransactionKind
+    $state = @{
+        Schema = 2
+        OwnerProductCode = $ProductCode
+        TransactionKind = $TransactionKind.ToLowerInvariant()
         DriverWasPresent = $DriverWasPresent
         ServiceWasPresent = $ServiceWasPresent
         ServiceWasRunning = $ServiceWasRunning
+        ServiceStartMode = $ServiceStartMode
+        ServiceDelayedAutoStart = $ServiceDelayedAutoStart
         BackedUpDriverInfPath = $BackedUpDriverInfPath
-    } | ConvertTo-Json | Set-Content `
-        -LiteralPath $rollbackStatePath `
+        DriverSignerThumbprint = $DriverSignerThumbprint
+        PreviousDriverSignerThumbprint = $PreviousDriverSignerThumbprint
+        Committed = $false
+        DriverRollbackComplete = $DriverRollbackComplete
+        ServiceRollbackComplete = $ServiceRollbackComplete
+    }
+    $temporaryStatePath = Join-Path $rollbackDirectory "virtual-hid-rollback.pending"
+    $state | ConvertTo-Json | Set-Content `
+        -LiteralPath $temporaryStatePath `
         -Encoding UTF8 `
+        -ErrorAction Stop
+    Move-Item `
+        -LiteralPath $temporaryStatePath `
+        -Destination $rollbackStatePath `
+        -Force `
         -ErrorAction Stop
 }
 
@@ -989,7 +1173,18 @@ function Start-PersistedRollbackTransaction {
         [string]$TransactionKind,
         [bool]$DriverWasPresent,
         [bool]$ServiceWasPresent,
-        [bool]$ServiceWasRunning
+        [bool]$ServiceWasRunning,
+        [AllowNull()]
+        [string]$ServiceStartMode,
+        [AllowNull()]
+        [bool]$ServiceDelayedAutoStart,
+        [AllowNull()]
+        [string]$DriverSignerThumbprint,
+        [AllowNull()]
+        [string]$PreviousDriverSignerThumbprint,
+        [AllowNull()]
+        [string]$DriverBackupSourceDirectory,
+        [bool]$ServiceRollbackComplete = $false
     )
 
     Initialize-InstallRollbackDirectory
@@ -998,19 +1193,55 @@ function Start-PersistedRollbackTransaction {
     try {
         $backedUpDriverInfPath = $null
         if ($DriverWasPresent) {
-            $installedDriverInfName = Get-InstalledVirtualHidInfName
-            $backedUpDriverInfPath = Export-VirtualHidDriverBackup `
-                -PublishedInfName $installedDriverInfName
+            if ([string]::IsNullOrWhiteSpace($DriverBackupSourceDirectory)) {
+                $installedDriverInfName = Get-InstalledVirtualHidInfName
+                $backedUpDriverInfPath = Export-VirtualHidDriverBackup `
+                    -PublishedInfName $installedDriverInfName
+            } else {
+                $source = Get-Item -LiteralPath $DriverBackupSourceDirectory -Force -ErrorAction Stop
+                if (-not $source.PSIsContainer -or
+                    ($source.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                    throw "The supplied rollback driver backup is not a physical directory."
+                }
+                foreach ($item in @(Get-ChildItem -LiteralPath $source.FullName -Force -Recurse)) {
+                    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                        throw "The supplied rollback driver backup contains a reparse point."
+                    }
+                }
+                Copy-Item `
+                    -LiteralPath $source.FullName `
+                    -Destination $rollbackDriverDirectory `
+                    -Recurse `
+                    -ErrorAction Stop
+                $copiedInfFiles = @(
+                    Get-ChildItem -LiteralPath $rollbackDriverDirectory -Filter "*.inf" -File -Recurse | `
+                        Where-Object {
+                            Select-String `
+                                -LiteralPath $_.FullName `
+                                -Pattern "ROOT\LumenVirtualHid" `
+                                -SimpleMatch `
+                                -Quiet
+                        }
+                )
+                if ($copiedInfFiles.Count -ne 1) {
+                    throw "The supplied rollback backup does not contain exactly one Lumen Virtual HID INF."
+                }
+                $backedUpDriverInfPath = $copiedInfFiles[0].FullName
+            }
         }
         Save-RollbackState `
             -TransactionKind $TransactionKind `
             -DriverWasPresent $DriverWasPresent `
             -ServiceWasPresent $ServiceWasPresent `
             -ServiceWasRunning $ServiceWasRunning `
-            -BackedUpDriverInfPath $backedUpDriverInfPath
+            -ServiceStartMode $ServiceStartMode `
+            -ServiceDelayedAutoStart $ServiceDelayedAutoStart `
+            -BackedUpDriverInfPath $backedUpDriverInfPath `
+            -DriverSignerThumbprint $DriverSignerThumbprint `
+            -PreviousDriverSignerThumbprint $PreviousDriverSignerThumbprint `
+            -ServiceRollbackComplete $ServiceRollbackComplete
     } catch {
-        Remove-InstallRollbackArtifacts
-        throw
+        throw "Could not create rollback state; partial protected artifacts were preserved: $($_.Exception.Message)"
     }
 }
 
@@ -1035,7 +1266,58 @@ function Resolve-BackedUpDriverInfPath {
     if (-not (Test-Path -LiteralPath $resolvedBackupInfPath -PathType Leaf)) {
         throw "The previous Lumen Virtual HID driver backup is missing: $BackedUpDriverInfPath"
     }
+    foreach ($item in @(Get-ChildItem -LiteralPath $rollbackDriverDirectory -Force -Recurse)) {
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "The previous Lumen Virtual HID driver backup contains a reparse point: $($item.FullName)"
+        }
+    }
+    $backupItem = Get-Item -LiteralPath $resolvedBackupInfPath -Force -ErrorAction Stop
+    if ($backupItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "The previous Lumen Virtual HID driver backup is a reparse point."
+    }
+    if (-not (Select-String `
+        -LiteralPath $resolvedBackupInfPath `
+        -Pattern "ROOT\LumenVirtualHid" `
+        -SimpleMatch `
+        -Quiet)) {
+        throw "The previous driver backup does not belong to the exact Lumen Virtual HID root."
+    }
     return $resolvedBackupInfPath
+}
+
+function Save-ParsedRollbackState {
+    param(
+        [Parameter(Mandatory=$true)]
+        [psobject]$State
+    )
+    $temporaryStatePath = Join-Path $rollbackDirectory "virtual-hid-rollback.pending"
+    $State | ConvertTo-Json | Set-Content `
+        -LiteralPath $temporaryStatePath `
+        -Encoding UTF8 `
+        -ErrorAction Stop
+    Move-Item `
+        -LiteralPath $temporaryStatePath `
+        -Destination $rollbackStatePath `
+        -Force `
+        -ErrorAction Stop
+}
+
+function Read-RollbackState {
+    $state = Get-Content -LiteralPath $rollbackStatePath -Raw -ErrorAction Stop | `
+        ConvertFrom-Json -ErrorAction Stop
+    if ([int]$state.Schema -ne 2) {
+        throw "Rollback state has an unsupported schema."
+    }
+    if ([string]$state.OwnerProductCode -cne $ProductCode) {
+        throw "Rollback state is owned by a different ProductCode."
+    }
+    if ([string]$state.TransactionKind -cne $TransactionKind.ToLowerInvariant()) {
+        throw "Rollback state belongs to a different transaction kind."
+    }
+    if ([string]$state.TransactionKind -notin @("install", "uninstall")) {
+        throw "Rollback state has an invalid transaction kind."
+    }
+    return $state
 }
 
 function Invoke-PersistedRollback {
@@ -1054,22 +1336,30 @@ function Invoke-PersistedRollback {
     }
 
     try {
-        $rollbackState = Get-Content -LiteralPath $rollbackStatePath -Raw -ErrorAction Stop | `
-            ConvertFrom-Json -ErrorAction Stop
+        $rollbackState = Read-RollbackState
         $transactionKind = [string]$rollbackState.TransactionKind
-        if ($transactionKind -notin @("Install", "Uninstall")) {
-            throw "Rollback state has an invalid transaction kind: $transactionKind"
-        }
         $driverWasPresent = [bool]$rollbackState.DriverWasPresent
         $serviceWasPresent = [bool]$rollbackState.ServiceWasPresent
         $serviceWasRunning = [bool]$rollbackState.ServiceWasRunning
+        $serviceStartMode = [string]$rollbackState.ServiceStartMode
+        $serviceDelayedAutoStart = [bool]$rollbackState.ServiceDelayedAutoStart
         $backedUpDriverInfPath = [string]$rollbackState.BackedUpDriverInfPath
+        $driverSignerThumbprint = [string]$rollbackState.DriverSignerThumbprint
+        $previousDriverSignerThumbprint = [string]$rollbackState.PreviousDriverSignerThumbprint
+        $driverRollbackComplete = [bool]$rollbackState.DriverRollbackComplete
+        $serviceRollbackComplete = [bool]$rollbackState.ServiceRollbackComplete
     } catch {
         throw "Could not read rollback state; protected rollback artifacts were preserved: $($_.Exception.Message)"
     }
 
+    if ([bool]$rollbackState.Committed) {
+        Remove-InstallRollbackArtifacts
+        Write-LogMessage -Message "Removed artifacts from an already committed transaction." -Level "Information"
+        return $false
+    }
+
     $rollbackErrors = [System.Collections.Generic.List[string]]::new()
-    $driverNeedsRollback = $driverWasPresent -or $transactionKind -eq "Install"
+    $driverNeedsRollback = $driverWasPresent -or $transactionKind -eq "install"
     if ($driverNeedsRollback) {
         $currentService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
         if ($null -ne $currentService -and $currentService.Status -ne "Stopped") {
@@ -1084,27 +1374,37 @@ function Invoke-PersistedRollback {
         }
     }
 
-    if ($driverWasPresent) {
+    if (-not $driverRollbackComplete -and $driverWasPresent) {
         try {
             $resolvedBackupInfPath = Resolve-BackedUpDriverInfPath `
                 -BackedUpDriverInfPath $backedUpDriverInfPath
+            if (-not [string]::IsNullOrWhiteSpace($previousDriverSignerThumbprint)) {
+                $restoredSignerThumbprint = Install-BackedUpVirtualHidCertificate
+                if ($restoredSignerThumbprint -ne $previousDriverSignerThumbprint) {
+                    throw "The rollback driver signer does not match the saved exact thumbprint."
+                }
+            }
             Invoke-VirtualHidCtl `
                 -Arguments @("install-or-update", "`"$resolvedBackupInfPath`"") `
                 -Description "Restoring the previous Lumen Virtual HID driver during rollback" | Out-Null
+            $rollbackState.DriverRollbackComplete = $true
+            Save-ParsedRollbackState -State $rollbackState
         } catch {
             $rollbackErrors.Add($_.Exception.Message) | Out-Null
         }
-    } elseif ($transactionKind -eq "Install") {
+    } elseif (-not $driverRollbackComplete -and $transactionKind -eq "install") {
         try {
             Invoke-VirtualHidCtl `
                 -Arguments @("uninstall") `
                 -Description "Removing newly installed Lumen Virtual HID driver during rollback" | Out-Null
+            $rollbackState.DriverRollbackComplete = $true
+            Save-ParsedRollbackState -State $rollbackState
         } catch {
             $rollbackErrors.Add($_.Exception.Message) | Out-Null
         }
     }
 
-    if ($serviceWasPresent) {
+    if (-not $serviceRollbackComplete -and $serviceWasPresent) {
         $installServiceScript = Join-Path $RootDir "scripts\install-service.bat"
         try {
             if (-not (Test-Path -LiteralPath $installServiceScript -PathType Leaf)) {
@@ -1122,21 +1422,26 @@ function Invoke-PersistedRollback {
             if ($null -eq $restoredService) {
                 throw "The Sunshine service is still absent after rollback."
             }
-            if ($serviceWasRunning) {
-                if ($restoredService.Status -ne "Running") {
+            if ([string]::IsNullOrWhiteSpace($serviceStartMode)) {
+                if ($serviceWasRunning -and $restoredService.Status -ne "Running") {
                     Start-Service -Name "SunshineService" -ErrorAction Stop
-                }
-                $restoredService.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
-            } else {
-                if ($restoredService.Status -ne "Stopped") {
+                    $restoredService.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+                } elseif (-not $serviceWasRunning -and $restoredService.Status -ne "Stopped") {
                     Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
+                    $restoredService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
                 }
-                $restoredService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+            } else {
+                Restore-ServiceSnapshot `
+                    -StartMode $serviceStartMode `
+                    -DelayedAutoStart $serviceDelayedAutoStart `
+                    -Running $serviceWasRunning
             }
+            $rollbackState.ServiceRollbackComplete = $true
+            Save-ParsedRollbackState -State $rollbackState
         } catch {
             $rollbackErrors.Add($_.Exception.Message) | Out-Null
         }
-    } elseif ($transactionKind -eq "Install") {
+    } elseif (-not $serviceRollbackComplete -and $transactionKind -eq "install") {
         try {
             $uninstallServiceScript = Join-Path $RootDir "scripts\uninstall-service.bat"
             if (-not (Test-Path -LiteralPath $uninstallServiceScript -PathType Leaf)) {
@@ -1152,6 +1457,8 @@ function Invoke-PersistedRollback {
             if ($null -ne (Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue)) {
                 throw "The newly installed Sunshine service is still present after rollback."
             }
+            $rollbackState.ServiceRollbackComplete = $true
+            Save-ParsedRollbackState -State $rollbackState
         } catch {
             $rollbackErrors.Add($_.Exception.Message) | Out-Null
         }
@@ -1164,42 +1471,155 @@ function Invoke-PersistedRollback {
         throw "Rollback failed; protected rollback artifacts were preserved for retry."
     }
 
+    if ($transactionKind -eq "install" -and
+        -not [string]::IsNullOrWhiteSpace($driverSignerThumbprint) -and
+        $driverSignerThumbprint -ne $previousDriverSignerThumbprint) {
+        Remove-VirtualHidCertificate -Thumbprint $driverSignerThumbprint
+    }
     Remove-InstallRollbackArtifacts
     return $true
+}
+
+function Invoke-PersistedCommit {
+    if (-not (Test-Path -LiteralPath $rollbackDirectory -PathType Container)) {
+        Write-LogMessage -Message "No exact transaction leaf required commit cleanup." -Level "Information"
+        return $false
+    }
+
+    Assert-InstallRollbackDirectorySecure
+    if (-not (Test-Path -LiteralPath $rollbackStatePath -PathType Leaf)) {
+        throw "The transaction leaf is missing its rollback state."
+    }
+
+    $commitState = Read-RollbackState
+    if (-not [bool]$commitState.Committed) {
+        # Persist this transition first: once MSI invokes a commit action, this
+        # transaction must never be interpreted as rollback work on a retry.
+        $commitState.Committed = $true
+        Save-ParsedRollbackState -State $commitState
+    }
+
+    $committedSignerThumbprint = [string]$commitState.DriverSignerThumbprint
+    $previousSignerThumbprint = [string]$commitState.PreviousDriverSignerThumbprint
+    if ($commitState.TransactionKind -eq "install") {
+        Set-InstalledVirtualHidSignerThumbprint -Thumbprint $committedSignerThumbprint
+        if (-not [string]::IsNullOrWhiteSpace($previousSignerThumbprint) -and
+            $previousSignerThumbprint -ne $committedSignerThumbprint) {
+            Remove-VirtualHidCertificate -Thumbprint $previousSignerThumbprint
+        }
+    } elseif ($commitState.TransactionKind -eq "uninstall") {
+        Set-InstalledVirtualHidSignerThumbprint -Thumbprint $null
+        if (-not [string]::IsNullOrWhiteSpace($previousSignerThumbprint)) {
+            Remove-VirtualHidCertificate -Thumbprint $previousSignerThumbprint
+        }
+    }
+
+    Remove-InstallRollbackArtifacts
+    Write-LogMessage -Message "Installer transaction committed." -Level "Success"
+    return $true
+}
+
+function Invoke-ExactCurrentRecovery {
+    if ((Test-Path -LiteralPath $rollbackStatePath) -or
+        (Test-Path -LiteralPath $rollbackDriverDirectory)) {
+        Assert-InstallRollbackDirectorySecure
+        if (-not (Test-Path -LiteralPath $rollbackStatePath -PathType Leaf)) {
+            throw "The exact current installer transaction is incomplete and was preserved."
+        }
+        $pendingState = Read-RollbackState
+        if ([bool]$pendingState.Committed) {
+            Write-LogMessage -Message "Finishing committed installer cleanup" -Level "Warning"
+            Invoke-PersistedCommit | Out-Null
+        } else {
+            Write-LogMessage `
+                -Message "Recovering the exact current installer transaction before retry" `
+                -Level "Warning"
+            Invoke-PersistedRollback | Out-Null
+        }
+    }
+}
+
+function Invoke-LegacyRecovery {
+    if ($ProductCode -cne $legacyProductCode) {
+        throw "Legacy recovery is available only for the exact 0.0.7 ProductCode."
+    }
+    if (-not (Test-Path -LiteralPath $legacyRollbackDirectory -PathType Container)) {
+        Write-LogMessage -Message "No stale 0.0.7 installer transaction was found." -Level "Information"
+        return $false
+    }
+    Assert-InstallRollbackDirectorySecure -Path $legacyRollbackDirectory
+    if (-not (Test-Path -LiteralPath $legacyRollbackStatePath -PathType Leaf)) {
+        throw "Legacy rollback artifacts are incomplete and were preserved."
+    }
+    $legacyState = Get-Content -LiteralPath $legacyRollbackStatePath -Raw -ErrorAction Stop | `
+        ConvertFrom-Json -ErrorAction Stop
+    if ([string]$legacyState.TransactionKind -notin @("Install", "Uninstall")) {
+        throw "Legacy rollback state has an invalid transaction kind."
+    }
+
+    $savedDirectory = $rollbackDirectory
+    $savedStatePath = $rollbackStatePath
+    $savedDriverDirectory = $rollbackDriverDirectory
+    try {
+        $script:rollbackDirectory = $legacyRollbackDirectory
+        $script:rollbackStatePath = $legacyRollbackStatePath
+        $script:rollbackDriverDirectory = $legacyRollbackDriverDirectory
+        $legacyErrors = [System.Collections.Generic.List[string]]::new()
+        if ([bool]$legacyState.DriverWasPresent) {
+            try {
+                $legacyInf = Resolve-BackedUpDriverInfPath -BackedUpDriverInfPath ([string]$legacyState.BackedUpDriverInfPath)
+                Install-BackedUpVirtualHidCertificate | Out-Null
+                Invoke-VirtualHidCtl `
+                    -Arguments @("install-or-update", "`"$legacyInf`"") `
+                    -Description "Recovering the exact 0.0.7 Virtual HID driver" | Out-Null
+            } catch {
+                $legacyErrors.Add($_.Exception.Message) | Out-Null
+            }
+        } elseif ([string]$legacyState.TransactionKind -eq "Install") {
+            try {
+                Invoke-VirtualHidCtl `
+                    -Arguments @("uninstall") `
+                    -Description "Removing the exact 0.0.7 Virtual HID install" | Out-Null
+            } catch {
+                $legacyErrors.Add($_.Exception.Message) | Out-Null
+            }
+        }
+        if ([bool]$legacyState.ServiceWasPresent) {
+            try {
+                Invoke-SetupScript `
+                    -ScriptPath (Join-Path $RootDir "scripts\install-service.bat") `
+                    -Description "Recovering the 0.0.7 service" `
+                    -Emoji "⚡"
+                $service = Get-Service -Name "SunshineService" -ErrorAction Stop
+                if ([bool]$legacyState.ServiceWasRunning) {
+                    if ($service.Status -ne "Running") { Start-Service -Name "SunshineService" -ErrorAction Stop }
+                    $service.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+                } else {
+                    if ($service.Status -ne "Stopped") { Stop-Service -Name "SunshineService" -Force -ErrorAction Stop }
+                    $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+                }
+            } catch {
+                $legacyErrors.Add($_.Exception.Message) | Out-Null
+            }
+        }
+        if ($legacyErrors.Count -ne 0) {
+            throw "Legacy recovery failed; exact 0.0.7 artifacts were preserved: $($legacyErrors -join '; ')"
+        }
+        Remove-Item -LiteralPath $legacyRollbackDirectory -Recurse -Force -ErrorAction Stop
+        return $true
+    } finally {
+        $script:rollbackDirectory = $savedDirectory
+        $script:rollbackStatePath = $savedStatePath
+        $script:rollbackDriverDirectory = $savedDriverDirectory
+    }
 }
 
 # Main script logic
 Write-Information ""
 
 try {
-if ($Action -eq "install-driver") {
-    $driverInfPath = Get-VirtualHidInfPath
-    $driverCertificatePath = Get-VirtualHidCertificatePath
-    Install-VirtualHidCertificate -CertificatePath $driverCertificatePath
-    Assert-VirtualHidPackageSignature -CertificatePath $driverCertificatePath
-
-    if (-not (Test-TestSigningActive)) {
-        throw "Windows test-signing mode is not active after restart; the Virtual HID driver cannot be loaded."
-    }
-
-    Invoke-VirtualHidCtl `
-        -Arguments @("install-or-update", "`"$driverInfPath`"") `
-        -Description "Finishing Lumen Virtual HID driver installation" | Out-Null
-    Remove-VirtualHidInstallTask
-
-    $installedService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
-    if ($null -ne $installedService) {
-        if ($installedService.Status -ne "Stopped") {
-            Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
-            $installedService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
-        }
-        Start-Service -Name "SunshineService" -ErrorAction Stop
-        $installedService.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
-    }
-    Write-FramedText `
-        -Message "✓ Lumen Virtual HID driver installation completed successfully!" `
-        -Level "Success"
-} elseif ($Action -eq "install") {
+if ($Action -eq "install") {
+    Invoke-ExactCurrentRecovery
     Write-FramedText `
         -Message "🔅 Sunshine Installation Script" `
         -Level "Information" `
@@ -1323,50 +1743,126 @@ if ($Action -eq "install-driver") {
         -Activity "Installing Sunshine" `
         -Status "Installing Lumen Virtual HID driver" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    $driverInfPath = Get-VirtualHidInfPath
-    $driverCertificatePath = Get-VirtualHidCertificatePath
-    Install-VirtualHidCertificate -CertificatePath $driverCertificatePath
-    Assert-VirtualHidPackageSignature -CertificatePath $driverCertificatePath
+    $driverInfPath = $null
+    $driverSignerThumbprint = $null
+    $driverCertificatePath = $null
+    $previousDriverSignerThumbprint = Get-InstalledVirtualHidSignerThumbprint
+    $legacyUpgradeCertificate = $null
+    $legacyUpgradeState = $null
+    if (-not [string]::IsNullOrWhiteSpace($PreviousProductCode)) {
+        Assert-InstallRollbackDirectorySecure -Path $legacyRollbackDirectory
+        if (-not (Test-Path -LiteralPath $legacyRollbackStatePath -PathType Leaf)) {
+            throw "The exact 0.0.7 upgrade rollback state is incomplete and was preserved."
+        }
+        $legacyUpgradeState = Get-Content -LiteralPath $legacyRollbackStatePath -Raw -ErrorAction Stop | `
+            ConvertFrom-Json -ErrorAction Stop
+        if ([string]$legacyUpgradeState.TransactionKind -ne "Uninstall") {
+            throw "The exact 0.0.7 upgrade rollback state is not an uninstall transaction."
+        }
+        if ([bool]$legacyUpgradeState.DriverWasPresent) {
+            $legacyUpgradeCertificate = Get-BackedUpVirtualHidCertificate `
+                -DriverDirectory $legacyRollbackDriverDirectory
+            $previousDriverSignerThumbprint = $legacyUpgradeCertificate.Thumbprint
+        }
+    }
     $driverStatus = Invoke-VirtualHidCtl `
         -Arguments @("status") `
         -Description "Checking Lumen Virtual HID driver status" `
         -AllowNotInstalled
-    $existingService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
-    $serviceWasPresent = $null -ne $existingService
-    $serviceWasRunning = $serviceWasPresent -and $existingService.Status -eq "Running"
+    if ($virtualHidSelected) {
+        $driverInfPath = Get-VirtualHidInfPath
+        $driverCertificatePath = Get-VirtualHidCertificatePath
+        if ([string]::IsNullOrWhiteSpace($driverCertificatePath)) {
+            $driverSignerThumbprint = Assert-VirtualHidPackageSignature
+        } else {
+            $driverSignerThumbprint = (Get-VirtualHidCertificate `
+                -CertificatePath $driverCertificatePath).Thumbprint
+        }
+    } else {
+        Write-LogMessage -Message "Lumen Virtual HID feature is not selected." -Level "Information"
+    }
+    $serviceSnapshot = if ($Msi) {
+        @{ Present = $false; Running = $false; StartMode = $null; DelayedAutoStart = $null }
+    } else {
+        Get-ServiceSnapshot
+    }
+    $existingService = if ($Msi) { $null } else { Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue }
+    $serviceWasPresent = $serviceSnapshot.Present
+    $serviceWasRunning = $serviceSnapshot.Running
+    $driverWasPresent = $driverStatus -in @(0, 4)
+    $driverBackupSourceDirectory = $null
+    $serviceRollbackComplete = [bool]$Msi
+    if ($null -ne $legacyUpgradeState) {
+        $driverWasPresent = [bool]$legacyUpgradeState.DriverWasPresent
+        if ($driverWasPresent) {
+            $driverBackupSourceDirectory = $legacyRollbackDriverDirectory
+        }
+        $serviceWasPresent = [bool]$legacyUpgradeState.ServiceWasPresent
+        $serviceWasRunning = [bool]$legacyUpgradeState.ServiceWasRunning
+        $serviceSnapshot.StartMode = [string]$legacyUpgradeState.ServiceStartMode
+        $serviceSnapshot.DelayedAutoStart = [bool]$legacyUpgradeState.ServiceDelayedAutoStart
+        $serviceRollbackComplete = $false
+    }
     Start-PersistedRollbackTransaction `
-        -TransactionKind "Install" `
-        -DriverWasPresent ($driverStatus -eq 0) `
+        -TransactionKind "install" `
+        -DriverWasPresent $driverWasPresent `
         -ServiceWasPresent $serviceWasPresent `
-        -ServiceWasRunning $serviceWasRunning
-    if ($serviceWasRunning) {
+        -ServiceWasRunning $serviceWasRunning `
+        -ServiceStartMode $serviceSnapshot.StartMode `
+        -ServiceDelayedAutoStart $serviceSnapshot.DelayedAutoStart `
+        -DriverSignerThumbprint $driverSignerThumbprint `
+        -PreviousDriverSignerThumbprint $previousDriverSignerThumbprint `
+        -DriverBackupSourceDirectory $driverBackupSourceDirectory `
+        -ServiceRollbackComplete $serviceRollbackComplete
+    if ($null -ne $legacyUpgradeCertificate) {
+        $trustedLegacyThumbprint = Install-BackedUpVirtualHidCertificate `
+            -DriverDirectory $legacyRollbackDriverDirectory
+        if ($trustedLegacyThumbprint -ne $previousDriverSignerThumbprint) {
+            throw "The trusted 0.0.7 signer does not match the saved rollback signer."
+        }
+    }
+    if ($virtualHidSelected -and -not [string]::IsNullOrWhiteSpace($driverCertificatePath)) {
+        $importedThumbprint = Install-VirtualHidCertificate `
+            -CertificatePath $driverCertificatePath
+        if ($importedThumbprint -ne $driverSignerThumbprint) {
+            throw "The imported Virtual HID signer does not match the bundled certificate."
+        }
+        Assert-VirtualHidPackageSignature -CertificatePath $driverCertificatePath | Out-Null
+    }
+    if (-not $Msi -and $serviceWasRunning) {
         Write-LogMessage `
             -Message "Stopping the Sunshine service before updating the Virtual HID driver" `
             -Level "Step"
         Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
         $existingService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
     }
-    if (Test-TestSigningActive) {
+    if ($virtualHidSelected) {
         Invoke-VirtualHidCtl `
             -Arguments @("install-or-update", "`"$driverInfPath`"") `
             -Description "Installing or updating the Lumen Virtual HID driver" | Out-Null
-        Remove-VirtualHidInstallTask
-    } else {
-        Enable-VirtualHidTestSigning
+    } elseif ($driverStatus -in @(0, 4)) {
+        Invoke-VirtualHidCtl `
+            -Arguments @("uninstall") `
+            -Description "Removing the deselected Lumen Virtual HID driver" | Out-Null
     }
     Write-Information ""
 
-    # 5. Install service
+    # 5. Install service. MSI owns this through ServiceInstall/ServiceControl;
+    # the scripts remain the NSIS path only.
     $currentStep++
     Write-Progress `
         -Activity "Installing Sunshine" `
         -Status "Installing service" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    $installServiceScript = Join-Path $RootDir "scripts\install-service.bat"
-    Invoke-SetupScript `
-        -ScriptPath $installServiceScript `
-        -Description "Installing Windows Service" `
-        -Emoji "⚡"
+    if (-not $Msi) {
+        $installServiceScript = Join-Path $RootDir "scripts\install-service.bat"
+        Invoke-SetupScript `
+            -ScriptPath $installServiceScript `
+            -Description "Installing Windows Service" `
+            -Emoji "⚡"
+    } else {
+        Write-LogMessage -Message "Windows Installer owns the Sunshine service." -Level "Information"
+    }
     Write-Information ""
 
     # 6. Configure autostart
@@ -1375,20 +1871,24 @@ if ($Action -eq "install-driver") {
         -Activity "Installing Sunshine" `
         -Status "Configuring autostart" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    $autostartScript = Join-Path $RootDir "scripts\autostart-service.bat"
-    Invoke-SetupScript `
-        -ScriptPath $autostartScript `
-        -Description "Configuring autostart" `
-        -Emoji "🚀"
+    if (-not $Msi) {
+        $autostartScript = Join-Path $RootDir "scripts\autostart-service.bat"
+        Invoke-SetupScript `
+            -ScriptPath $autostartScript `
+            -Description "Configuring autostart" `
+            -Emoji "🚀"
+    } else {
+        Write-LogMessage -Message "Windows Installer owns the Sunshine service start mode." -Level "Information"
+    }
     Write-Information ""
 
     Write-Progress -Activity "Installing Sunshine" -Completed
     if (-not $Msi) {
-        Remove-InstallRollbackArtifacts
+        Invoke-PersistedCommit | Out-Null
     }
     if ($script:RebootRequired) {
         Write-FramedText `
-            -Message "✓ Lumen installed. Restart Windows to activate the Virtual HID driver." `
+            -Message "✓ Lumen installed. Restart Windows to finish the Virtual HID driver operation." `
             -Level "Warning"
     } else {
         Write-FramedText -Message "✓ Sunshine installation completed successfully!" -Level "Success"
@@ -1411,6 +1911,7 @@ if ($Action -eq "install-driver") {
     }
 
 } elseif ($Action -eq "uninstall") {
+    Invoke-ExactCurrentRecovery
     Write-FramedText `
         -Message "🗑️  Sunshine Uninstallation Script" `
         -Level "Information" `
@@ -1420,25 +1921,32 @@ if ($Action -eq "install-driver") {
     $totalSteps = 5
     $currentStep = 0
 
-    Remove-VirtualHidInstallTask
-
-    $driverStatus = Invoke-VirtualHidCtl `
-        -Arguments @("status") `
-        -Description "Checking Lumen Virtual HID driver status before uninstall" `
-        -AllowNotInstalled
-    $uninstallDriverWasPresent = $driverStatus -eq 0
+    $driverStatus = 2
+    if ($virtualHidSelected) {
+        $driverStatus = Invoke-VirtualHidCtl `
+            -Arguments @("status") `
+            -Description "Checking Lumen Virtual HID driver status before uninstall" `
+            -AllowNotInstalled
+    }
+    $uninstallDriverWasPresent = $virtualHidSelected -and $driverStatus -in @(0, 4)
+    $serviceSnapshot = Get-ServiceSnapshot
     $existingService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
     $legacyService = Get-Service -Name "sunshinesvc" -ErrorAction SilentlyContinue
-    $uninstallServiceWasPresent = $null -ne $existingService -or $null -ne $legacyService
-    $uninstallServiceWasRunning = `
+    $uninstallServiceWasPresent = -not $Msi -and ($serviceSnapshot.Present -or $null -ne $legacyService)
+    $uninstallServiceWasRunning = -not $Msi -and (`
         ($null -ne $existingService -and $existingService.Status -eq "Running") -or `
-        ($null -ne $legacyService -and $legacyService.Status -eq "Running")
+        ($null -ne $legacyService -and $legacyService.Status -eq "Running"))
 
     Start-PersistedRollbackTransaction `
-        -TransactionKind "Uninstall" `
+        -TransactionKind "uninstall" `
         -DriverWasPresent $uninstallDriverWasPresent `
         -ServiceWasPresent $uninstallServiceWasPresent `
-        -ServiceWasRunning $uninstallServiceWasRunning
+        -ServiceWasRunning $uninstallServiceWasRunning `
+        -ServiceStartMode $serviceSnapshot.StartMode `
+        -ServiceDelayedAutoStart $serviceSnapshot.DelayedAutoStart `
+        -DriverSignerThumbprint $null `
+        -PreviousDriverSignerThumbprint (Get-InstalledVirtualHidSignerThumbprint) `
+        -ServiceRollbackComplete ([bool]$Msi)
 
     # 1. Stop and remove the service before touching the driver.
     $currentStep++
@@ -1447,7 +1955,9 @@ if ($Action -eq "install-driver") {
         -Status "Uninstalling service" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $uninstallServiceScript = Join-Path $RootDir "scripts\uninstall-service.bat"
-    if ($uninstallServiceWasPresent) {
+    if ($Msi) {
+        Write-LogMessage -Message "Windows Installer owns Sunshine service removal." -Level "Information"
+    } elseif ($uninstallServiceWasPresent) {
         Invoke-SetupScript `
             -ScriptPath $uninstallServiceScript `
             -Description "Removing Windows Service" `
@@ -1464,11 +1974,13 @@ if ($Action -eq "install-driver") {
         -Activity "Uninstalling Sunshine" `
         -Status "Removing Lumen Virtual HID driver" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    Invoke-VirtualHidCtl `
-        -Arguments @("uninstall") `
-        -Description "Removing the Lumen Virtual HID device and driver package" | Out-Null
-    Remove-VirtualHidCertificate
-    Disable-VirtualHidTestSigningIfOwned
+    if ($virtualHidSelected) {
+        Invoke-VirtualHidCtl `
+            -Arguments @("uninstall") `
+            -Description "Removing the Lumen Virtual HID device and driver package" | Out-Null
+    } else {
+        Write-LogMessage -Message "Lumen Virtual HID feature was not owned by this product." -Level "Information"
+    }
     Write-Information ""
 
     # 3. Delete firewall rules
@@ -1515,17 +2027,24 @@ if ($Action -eq "install-driver") {
         -Message "✓ Sunshine uninstallation completed successfully!" `
         -Level "Success"
     if (-not $Msi) {
-        Remove-InstallRollbackArtifacts
+        Invoke-PersistedCommit | Out-Null
     }
 } elseif ($Action -eq "rollback") {
-    $rollbackApplied = Invoke-PersistedRollback
+    $rollbackApplied = if ($legacyMsiRollback) {
+        Invoke-LegacyRecovery
+    } else {
+        Invoke-PersistedRollback
+    }
     if ($rollbackApplied) {
         Write-LogMessage -Message "Rollback completed." -Level "Success"
     }
 } elseif ($Action -eq "commit") {
-    Assert-InstallRollbackDirectorySecure
-    Remove-InstallRollbackArtifacts
-    Write-LogMessage -Message "Installer transaction committed." -Level "Success"
+    Invoke-PersistedCommit | Out-Null
+} elseif ($Action -eq "recover-legacy") {
+    $legacyRecoveryApplied = Invoke-LegacyRecovery
+    if ($legacyRecoveryApplied) {
+        Write-LogMessage -Message "Exact 0.0.7 recovery completed." -Level "Success"
+    }
 }
 
 } catch {
@@ -1537,22 +2056,6 @@ if ($Action -eq "install-driver") {
             $rollbackApplied = Invoke-PersistedRollback
             if ($rollbackApplied) {
                 Write-LogMessage -Message "Failed setup changes were rolled back." -Level "Success"
-            }
-            if ($Action -eq "install") {
-                Remove-VirtualHidInstallTask
-                try {
-                    $bundledCertificatePath = Get-VirtualHidCertificatePath
-                    $bundledCertificate = `
-                        [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-                            $bundledCertificatePath
-                        )
-                    Remove-VirtualHidCertificate -Thumbprint $bundledCertificate.Thumbprint
-                } catch {
-                    Write-LogMessage `
-                        -Message "Could not remove the bundled Virtual HID certificate: $($_.Exception.Message)" `
-                        -Level "Warning"
-                }
-                Disable-VirtualHidTestSigningIfOwned
             }
         } catch {
             Write-LogMessage -Message $_.Exception.Message -Level "Error"

@@ -1,56 +1,51 @@
 /**
  * @file Driver.h
- * @brief KMDF/VHF driver declarations and per-device session state.
+ * @brief UMDF 2.15 VHF source-driver declarations and device state.
  */
 
 #ifndef LUMEN_VIRTUAL_HID_DRIVER_H
 #define LUMEN_VIRTUAL_HID_DRIVER_H
 
-#include <ntddk.h>
-#include <wdf.h>
-#include <vhf.h>
+#define WIN32_NO_STATUS
+#include <windows.h>
+#undef WIN32_NO_STATUS
 
+#include <ntstatus.h>
+#include <wdf.h>
+
+/* VHF requires the NT and WDF declarations above. */
 #include "../virtual_hid_protocol.h"
 
-/** Per-open state used to reject cleanup races and make release idempotent. */
+#include <vhf.h>
+
+/** Per-open marker used to ensure requests originate from framework-owned files. */
 typedef struct LUMEN_VHID_FILE_CONTEXT {
-  volatile LONG closing;  /**< Nonzero once cleanup begins. */
-  uint64_t last_released_token;  /**< Token accepted by an idempotent release retry. */
-  uint64_t last_released_sequence;  /**< Final sequence returned by a release retry. */
+  BOOLEAN closing;  ///< True after file cleanup begins.
 } LUMEN_VHID_FILE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LUMEN_VHID_FILE_CONTEXT, LumenVhidGetFileContext);
 
-/** Per-device persistent VHF and exclusive-session state. */
+/** Per-device VHF transport and exact open-file ownership state. */
 typedef struct LUMEN_VHID_DEVICE_CONTEXT {
-  WDFWAITLOCK session_lock;  /**< Serializes VHF calls, sessions, and cleanup. */
-  VHFHANDLE vhf_handle;  /**< Persistent VHF source handle while hardware is prepared. */
-  WDFFILEOBJECT owner_file;  /**< Open file that exclusively owns both collections. */
-  uint64_t next_session_token;  /**< Monotonically increasing token source. */
-  uint64_t session_token;  /**< Current owner generation token. */
-  uint64_t retired_session_token;  /**< Last token accepted for reset retry. */
-  uint64_t last_sequence;  /**< Last exact sequence accepted by VHF. */
-  BOOLEAN session_exhausted;  /**< True after accepting terminal UINT64_MAX. */
-  BOOLEAN stopping;  /**< Blocks control work during PnP teardown/startup. */
-  volatile LONG rejection_logged;  /**< One-shot guard for bounded rejection logging. */
-  uint8_t mouse_buttons;  /**< Last complete five-button state. */
-  uint16_t absolute_x;  /**< Last absolute X retained for neutralization. */
-  uint16_t absolute_y;  /**< Last absolute Y retained for neutralization. */
+  WDFDEVICE device;  ///< Owning UMDF device.
+  WDFIOTARGET local_target;  ///< Open local target that supplies VHF's UMDF handle.
+  VHFHANDLE vhf_handle;  ///< Started virtual HID device, or NULL when unavailable.
+  WDFWAITLOCK state_lock;  ///< Serializes ownership, report submission, and VHF reset.
+  WDFFILEOBJECT owner_file;  ///< Exact framework file that currently owns submission.
+  BOOLEAN ready;  ///< True only while vhf_handle has started successfully.
 } LUMEN_VHID_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LUMEN_VHID_DEVICE_CONTEXT, LumenVhidGetDeviceContext);
 
-/** Initialize the KMDF driver object. */
+/** Initialize the UMDF 2 driver object. */
 DRIVER_INITIALIZE DriverEntry;
-/** Create one secured root-enumerated function device and its control queue. */
+/** Create the VHF source device, control interface, and default I/O queue. */
 EVT_WDF_DRIVER_DEVICE_ADD LumenVhidEvtDeviceAdd;
-/** Create and start the persistent VHF child topology. */
-EVT_WDF_DEVICE_PREPARE_HARDWARE LumenVhidEvtDevicePrepareHardware;
-/** Neutralize input, release ownership, and synchronously delete VHF. */
-EVT_WDF_DEVICE_RELEASE_HARDWARE LumenVhidEvtDeviceReleaseHardware;
-/** Validate and execute one fixed METHOD_BUFFERED protocol request. */
+/** Dispatch the four exact METHOD_BUFFERED control operations. */
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL LumenVhidEvtIoDeviceControl;
-/** Drain the file's synchronous work, neutralize, and release its claim. */
+/** Reset VHF and release ownership held by a closing file. */
 EVT_WDF_FILE_CLEANUP LumenVhidEvtFileCleanup;
+/** Synchronously delete VHF when its UMDF parent device is destroyed. */
+EVT_WDF_OBJECT_CONTEXT_CLEANUP LumenVhidEvtDeviceCleanup;
 
 #endif /* LUMEN_VIRTUAL_HID_DRIVER_H */
