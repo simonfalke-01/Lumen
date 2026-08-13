@@ -368,7 +368,7 @@ jobs:
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
           export PATH="$PATH:$NODEJS_PATH"
           DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$DRIVER_PACKAGE_DIR")
-          SCCACHE_CMAKE_PATH=$(cygpath -m "$(command -v sccache)")
+          SCCACHE_CMAKE_PATH=$(cygpath -m "$SCCACHE_PATH")
 
           cmake \
             -B build \
