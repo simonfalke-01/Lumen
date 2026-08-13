@@ -477,13 +477,42 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $source = Join-Path $env:SystemRoot 'Temp\Sunshine\logs'
-          if (Test-Path -LiteralPath $source -PathType Container) {
-            Copy-Item `
-              -LiteralPath $source `
-              -Destination 'artifacts/installer-script-logs' `
-              -Recurse `
-              -Force
+          $destination = 'artifacts/installer-diagnostics'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+          $logRoots = @(
+            (Join-Path $env:TEMP 'Sunshine\logs'),
+            (Join-Path $env:SystemRoot 'Temp\Sunshine\logs')
+          ) | Select-Object -Unique
+          foreach ($source in $logRoots) {
+            if (Test-Path -LiteralPath $source -PathType Container) {
+              $name = Split-Path (Split-Path $source -Parent) -Leaf
+              Copy-Item `
+                -LiteralPath $source `
+                -Destination (Join-Path $destination "sunshine-$name") `
+                -Recurse `
+                -Force `
+                -ErrorAction Continue
+            }
+          }
+
+          $setupApiLog = Join-Path $env:SystemRoot 'INF\setupapi.dev.log'
+          if (Test-Path -LiteralPath $setupApiLog -PathType Leaf) {
+            Copy-Item $setupApiLog (Join-Path $destination 'setupapi.dev.log') -Force
+          }
+
+          & pnputil.exe /enum-devices /instanceid 'ROOT\LumenVirtualHid*' /drivers 2>&1 |
+            Out-File (Join-Path $destination 'lumen-vhid-pnp.log') -Encoding utf8
+          try {
+            Get-WinEvent -FilterHashtable @{
+              LogName = 'System'
+              StartTime = (Get-Date).AddMinutes(-30)
+            } -ErrorAction Stop | Where-Object {
+              $_.ProviderName -match 'Kernel-PnP|DriverFrameworks|UserModeDriver'
+            } | Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message |
+              Out-File (Join-Path $destination 'lumen-vhid-events.log') -Encoding utf8
+          } catch {
+            $_ | Out-File (Join-Path $destination 'lumen-vhid-events.log') -Encoding utf8
           }
 
       - name: Upload MSI validation logs
