@@ -53,21 +53,6 @@
     </StandardDirectory>
 
     <Property Id="LUMEN_INSTALL_VHID" Value="1" Secure="yes"/>
-    <Property Id="LUMEN_PREVIOUS_PRODUCT_CODE" Secure="yes"/>
-    <!-- Only the immutable 0.0.7 transaction format needs the legacy bridge. -->
-    <Property Id="LUMEN_LEGACY_007_INSTALLED" Secure="yes">
-      <RegistrySearch Id="FindLumenLegacy007"
-                      Root="HKLM"
-                      Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{D14220B3-D6E3-40B9-A781-5965FC320AD8}"
-                      Name="DisplayVersion"
-                      Type="raw"
-                      Bitness="always64"/>
-    </Property>
-    <SetProperty Id="LUMEN_PREVIOUS_PRODUCT_CODE"
-                 Action="ResolveLumenLegacy007"
-                 Value="{D14220B3-D6E3-40B9-A781-5965FC320AD8}"
-                 After="AppSearch" Sequence="execute"
-                 Condition="LUMEN_LEGACY_007_INSTALLED = &quot;0.0.7&quot;"/>
 
     <!-- Normalize the public silent-install property to the actual feature
          action/current state before building deferred CustomActionData. -->
@@ -103,29 +88,29 @@
          retain NSIS-independent path, firewall, migration, and optional-driver work. -->
     <CustomAction Id="CA_SunshineInstallRollback"
                   Directory="SystemFolder"
-                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi [CustomActionData]"
+                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi -MsiData &quot;[CustomActionData]&quot;"
                   Execute="rollback" Return="ignore" Impersonate="no" HideTarget="yes"/>
     <CustomAction Id="CA_SunshineInstall"
                   Directory="SystemFolder"
-                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install -Silent -Msi [CustomActionData]"
+                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install -Silent -Msi -MsiData &quot;[CustomActionData]&quot;"
                   Execute="deferred" Return="check" Impersonate="no" HideTarget="yes"/>
     <CustomAction Id="CA_SunshineInstallCommit"
                   Directory="SystemFolder"
-                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action commit -Silent -Msi [CustomActionData]"
-                  Execute="commit" Return="ignore" Impersonate="no" HideTarget="yes"/>
+                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -MsiData &quot;[CustomActionData]&quot;"
+                  Execute="commit" Return="check" Impersonate="no" HideTarget="yes"/>
 
     <CustomAction Id="CA_SunshineUninstallRollback"
                   Directory="SystemFolder"
-                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi [CustomActionData]"
+                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi -MsiData &quot;[CustomActionData]&quot;"
                   Execute="rollback" Return="ignore" Impersonate="no" HideTarget="yes"/>
     <CustomAction Id="CA_SunshineUninstall"
                   Directory="SystemFolder"
-                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall -Silent -Msi [CustomActionData]"
+                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall -Silent -Msi -MsiData &quot;[CustomActionData]&quot;"
                   Execute="deferred" Return="check" Impersonate="no" HideTarget="yes"/>
     <CustomAction Id="CA_SunshineUninstallCommit"
                   Directory="SystemFolder"
-                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action commit -Silent -Msi [CustomActionData]"
-                  Execute="commit" Return="ignore" Impersonate="no" HideTarget="yes"/>
+                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -MsiData &quot;[CustomActionData]&quot;"
+                  Execute="commit" Return="check" Impersonate="no" HideTarget="yes"/>
 
     <InstallExecuteSequence>
       <!-- Each setter has the deferred action's Id so Windows Installer copies
@@ -160,32 +145,32 @@
 
     <SetProperty Id="CA_SunshineInstallRollback"
                  Action="SetSunshineInstallRollbackData"
-                 Value="-ProductCode &amp;quot;[ProductCode]&amp;quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="1|[ProductCode]|install|[LUMEN_INSTALL_VHID]"
                  After="InstallFiles" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_SunshineInstall"
                  Action="SetSunshineInstallData"
-                 Value="-ProductCode &amp;quot;[ProductCode]&amp;quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID] -PreviousProductCode &amp;quot;[LUMEN_PREVIOUS_PRODUCT_CODE]&amp;quot;"
+                 Value="1|[ProductCode]|install|[LUMEN_INSTALL_VHID]"
                  After="SetSunshineInstallRollbackData" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_SunshineInstallCommit"
                  Action="SetSunshineInstallCommitData"
-                 Value="-ProductCode &amp;quot;[ProductCode]&amp;quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="1|[ProductCode]|install|[LUMEN_INSTALL_VHID]"
                  After="SetSunshineInstallData" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_SunshineUninstallRollback"
                  Action="SetSunshineUninstallRollbackData"
-                 Value="-ProductCode &amp;quot;[ProductCode]&amp;quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="1|[ProductCode]|uninstall|[LUMEN_INSTALL_VHID]"
                  After="InstallInitialize" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_SunshineUninstall"
                  Action="SetSunshineUninstallData"
-                 Value="-ProductCode &amp;quot;[ProductCode]&amp;quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="1|[ProductCode]|uninstall|[LUMEN_INSTALL_VHID]"
                  After="SetSunshineUninstallRollbackData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_SunshineUninstallCommit"
                  Action="SetSunshineUninstallCommitData"
-                 Value="-ProductCode &amp;quot;[ProductCode]&amp;quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="1|[ProductCode]|uninstall|[LUMEN_INSTALL_VHID]"
                  After="SetSunshineUninstallData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
   </Fragment>

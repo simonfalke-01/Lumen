@@ -22,7 +22,7 @@
         <?endif?>
 
         <MajorUpgrade
-            Schedule="afterInstallInitialize"
+            Schedule="afterInstallExecute"
             AllowDowngrades="yes"/>
 
         <WixVariable Id="WixUILicenseRtf" Value="$(var.CPACK_WIX_LICENSE_RTF)"/>

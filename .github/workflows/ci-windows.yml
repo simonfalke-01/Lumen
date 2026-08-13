@@ -21,6 +21,7 @@ jobs:
       run:
         shell: msys2 {0}
     permissions:
+      actions: read
       contents: read
     steps:
       - name: Checkout
@@ -418,6 +419,10 @@ jobs:
             'SELECT `Action`,`Condition`,`Sequence` FROM `InstallExecuteSequence`' 3
           $services = Read-MsiRows `
             'SELECT `ServiceInstall`,`Name`,`StartType`,`Component_` FROM `ServiceInstall`' 4
+          $features = Read-MsiRows `
+            'SELECT `Feature`,`Level` FROM `Feature`' 2
+          $properties = Read-MsiRows `
+            'SELECT `Property`,`Value` FROM `Property`' 2
           $requiredActions = @(
             'CA_SunshineInstall', 'CA_SunshineInstallRollback', 'CA_SunshineInstallCommit',
             'CA_SunshineUninstall', 'CA_SunshineUninstallRollback', 'CA_SunshineUninstallCommit'
@@ -435,10 +440,30 @@ jobs:
           if ($sequenceNames -notcontains 'RemoveExistingProducts') {
             throw 'Generated MSI is missing RemoveExistingProducts.'
           }
-          $installSetterAction = @($actions | Where-Object { $_[0] -eq 'SetSunshineInstallData' })
-          if ($installSetterAction.Count -ne 1 -or
-              $installSetterAction[0][3] -notmatch 'PreviousProductCode.+LUMEN_PREVIOUS_PRODUCT_CODE') {
-            throw 'Generated MSI does not pass the optional exact legacy ProductCode to the install action.'
+          $setterNames = @(
+            'SetSunshineInstallRollbackData', 'SetSunshineInstallData', 'SetSunshineInstallCommitData',
+            'SetSunshineUninstallRollbackData', 'SetSunshineUninstallData', 'SetSunshineUninstallCommitData'
+          )
+          foreach ($setterName in $setterNames) {
+            $setter = @($actions | Where-Object { $_[0] -eq $setterName })
+            if ($setter.Count -ne 1 -or $setter[0][3] -notmatch '^1\|\[ProductCode\]\|(install|uninstall)\|[01]$') {
+              throw "Generated MSI has invalid structured CustomActionData: $setterName"
+            }
+            if ($setter[0][3] -match '&(?:amp;)?quot;|\[CustomActionData\]') {
+              throw "Generated MSI contains escaped or nested CustomActionData text: $setterName"
+            }
+          }
+          $deferredActions = @($actions | Where-Object { $_[0] -in $requiredActions })
+          foreach ($deferredAction in $deferredActions) {
+            if ($deferredAction[3] -notmatch '-MsiData "\[CustomActionData\]"') {
+              throw "Deferred MSI action does not pass the structured transaction data: $($deferredAction[0])"
+            }
+          }
+          foreach ($commitAction in @('CA_SunshineInstallCommit', 'CA_SunshineUninstallCommit')) {
+            $commit = @($actions | Where-Object { $_[0] -eq $commitAction })
+            if ($commit.Count -ne 1 -or ([int]$commit[0][1] -band 0x40) -ne 0) {
+              throw "MSI commit cleanup must fail the transaction when cleanup fails: $commitAction"
+            }
           }
           $installSetterRows = @($sequence | Where-Object { $_[0] -eq 'SetSunshineInstallData' })
           if ($installSetterRows.Count -ne 1) {
@@ -446,8 +471,154 @@ jobs:
           }
           $removeExistingProducts = @($sequence | Where-Object { $_[0] -eq 'RemoveExistingProducts' })
           $installDeferred = @($sequence | Where-Object { $_[0] -eq 'CA_SunshineInstall' })
-          if ([int]$removeExistingProducts[0][2] -ge [int]$installDeferred[0][2]) {
-            throw 'RemoveExistingProducts must finish before the current Virtual HID install action.'
+          if ([int]$removeExistingProducts[0][2] -le [int]$installDeferred[0][2]) {
+            throw 'The new product must finish its install action before removing the old product.'
+          }
+          $vhidFeature = @($features | Where-Object { $_[0] -eq 'CM_C_virtual_hid_driver' })
+          if ($vhidFeature.Count -ne 1) {
+            throw 'Generated MSI is missing the Virtual HID feature.'
+          }
+          $productCode = @($properties | Where-Object { $_[0] -eq 'ProductCode' })
+          if ($productCode.Count -ne 1 -or
+              $productCode[0][1] -notmatch '^\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}$') {
+            throw 'Generated MSI has an invalid ProductCode.'
+          }
+          "MSI_PRODUCT_CODE=$($productCode[0][1])" >> $env:GITHUB_ENV
+
+      - name: Smoke test MSI install without Virtual HID
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msiPath = (Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi').Path
+          $installLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-install-no-vhid.log'
+          $uninstallLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-uninstall-no-vhid.log'
+          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=0',
+            '/L*V', "`"$installLog`""
+          )
+          if ($install.ExitCode -notin @(0, 3010)) {
+            Get-Content $installLog
+            throw "MSI install without Virtual HID failed with exit code $($install.ExitCode)."
+          }
+          $service = Get-Service SunshineService -ErrorAction Stop
+          if ($service.Status -ne 'Running') {
+            throw 'SunshineService is not running after MSI installation.'
+          }
+          if (Test-Path 'C:\Program Files\Sunshine\drivers\virtual-hid') {
+            throw 'Virtual HID files were installed despite LUMEN_INSTALL_VHID=0.'
+          }
+          $uninstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/x', $env:MSI_PRODUCT_CODE, '/qn', '/norestart', '/L*V', "`"$uninstallLog`""
+          )
+          if ($uninstall.ExitCode -notin @(0, 3010)) {
+            Get-Content $uninstallLog
+            throw "MSI uninstall without Virtual HID failed with exit code $($uninstall.ExitCode)."
+          }
+
+      - name: Smoke test MSI install with Virtual HID
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msiPath = (Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi').Path
+          $installLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-install-vhid.log'
+          $uninstallLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-uninstall-vhid.log'
+          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=1',
+            '/L*V', "`"$installLog`""
+          )
+          if ($install.ExitCode -notin @(0, 3010)) {
+            Get-Content $installLog
+            throw "MSI install with Virtual HID failed with exit code $($install.ExitCode)."
+          }
+          $helper = 'C:\Program Files\Sunshine\tools\lumen-vhidctl.exe'
+          & $helper status --json
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content $installLog
+            throw "Virtual HID status failed with exit code $LASTEXITCODE."
+          }
+          $uninstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/x', $env:MSI_PRODUCT_CODE, '/qn', '/norestart', '/L*V', "`"$uninstallLog`""
+          )
+          if ($uninstall.ExitCode -notin @(0, 3010)) {
+            Get-Content $uninstallLog
+            throw "MSI uninstall with Virtual HID failed with exit code $($uninstall.ExitCode)."
+          }
+          if (Test-Path $helper) {
+            throw 'Virtual HID helper remains after MSI uninstall.'
+          }
+
+      - name: Smoke test MSI upgrade from 0.0.9
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $oldArtifactId = 9136389283
+          $oldArtifactZip = Join-Path $env:RUNNER_TEMP 'lumen-0.0.9.zip'
+          $oldArtifactDir = Join-Path $env:RUNNER_TEMP 'lumen-0.0.9'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          Invoke-WebRequest `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$oldArtifactId/zip" `
+            -Headers $headers `
+            -OutFile $oldArtifactZip
+          Expand-Archive -LiteralPath $oldArtifactZip -DestinationPath $oldArtifactDir
+          $oldMsi = (Get-ChildItem $oldArtifactDir -Filter '*.msi' -File -Recurse | Select-Object -First 1).FullName
+          if (-not $oldMsi) {
+            throw 'The 0.0.9 regression artifact does not contain an MSI.'
+          }
+          $newMsi = (Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi').Path
+          $oldLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-install-0.0.9.log'
+          $upgradeLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-upgrade.log'
+          $uninstallLog = Join-Path $env:RUNNER_TEMP 'lumen-msi-upgrade-uninstall.log'
+
+          $oldInstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', "`"$oldMsi`"", '/qn', '/norestart', '/L*V', "`"$oldLog`""
+          )
+          if ($oldInstall.ExitCode -notin @(0, 3010)) {
+            Get-Content $oldLog
+            throw "Installing the 0.0.9 MSI fixture failed with exit code $($oldInstall.ExitCode)."
+          }
+          $sentinel = 'C:\Program Files\Sunshine\config\upgrade-ci-sentinel.txt'
+          Set-Content -LiteralPath $sentinel -Value 'preserve-me' -NoNewline
+
+          $upgrade = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', "`"$newMsi`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=1',
+            '/L*V', "`"$upgradeLog`""
+          )
+          if ($upgrade.ExitCode -notin @(0, 3010)) {
+            Get-Content $upgradeLog
+            throw "MSI upgrade from 0.0.9 failed with exit code $($upgrade.ExitCode)."
+          }
+          if ((Get-Content -LiteralPath $sentinel -Raw) -ne 'preserve-me') {
+            throw 'MSI upgrade did not preserve the existing configuration sentinel.'
+          }
+          $service = Get-Service SunshineService -ErrorAction Stop
+          if ($service.Status -ne 'Running') {
+            throw 'SunshineService is not running after MSI upgrade.'
+          }
+          $helper = 'C:\Program Files\Sunshine\tools\lumen-vhidctl.exe'
+          & $helper status --json
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content $upgradeLog
+            throw "Virtual HID status after MSI upgrade failed with exit code $LASTEXITCODE."
+          }
+          $oldProduct = Get-ItemProperty `
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{77391323-4F4F-4189-9ABA-151A7F048675}' `
+            -ErrorAction SilentlyContinue
+          if ($null -ne $oldProduct) {
+            throw 'The 0.0.9 product is still registered after the major upgrade.'
+          }
+
+          $uninstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/x', $env:MSI_PRODUCT_CODE, '/qn', '/norestart', '/L*V', "`"$uninstallLog`""
+          )
+          if ($uninstall.ExitCode -notin @(0, 3010)) {
+            Get-Content $uninstallLog
+            throw "Uninstall after MSI upgrade failed with exit code $($uninstall.ExitCode)."
           }
 
       - name: Upload Windows artifacts

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cwchar>
 #include <hidsdi.h>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <setupapi.h>
@@ -243,6 +244,24 @@ namespace {
     return message;
   }
 
+  /** Format a SetupAPI error when the system message table has no entry. */
+  std::wstring setupapi_message(DWORD error) {
+    struct known_setupapi_error {
+      DWORD code;
+      const wchar_t *message;
+    };
+    static constexpr known_setupapi_error known_errors[] = {
+      {0xE0000219u, L"The installation failed because a function driver was not specified for this device instance."},
+      {0xE0000231u, L"A device cannot be removed because one of its descendants vetoed the removal."},
+    };
+    for (const auto &known : known_errors) {
+      if (known.code == error) {
+        return known.message;
+      }
+    }
+    return win32_message(error);
+  }
+
   /** Translate privilege errors while preserving the operation-specific fallback. */
   exit_code error_code(exit_code fallback, DWORD error) {
     if (error == ERROR_ACCESS_DENIED || error == ERROR_PRIVILEGE_NOT_HELD) {
@@ -261,7 +280,10 @@ namespace {
     std::wcerr << L"result=error code=" << static_cast<int>(code)
                << L" operation=" << operation;
     if (error != ERROR_SUCCESS) {
-      std::wcerr << L" win32=" << error << L" message=\"" << win32_message(error) << L'\"';
+      std::wcerr << L" win32=" << error
+                 << L" hex=\"0x" << std::uppercase << std::hex << std::setw(8) << std::setfill(L'0') << error
+                 << std::dec << std::nouppercase << std::setfill(L' ')
+                 << L"\" message=\"" << setupapi_message(error) << L'\"';
     }
     std::wcerr << L'\n';
     return static_cast<int>(code);

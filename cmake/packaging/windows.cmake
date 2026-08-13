@@ -36,12 +36,12 @@ install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
 
 # Lumen Virtual HID driver
 #
-# The UMDF driver is built separately with MSBuild/WDK. The application build
+# The Virtual HID driver is built separately with MSBuild/WDK. The application build
 # receives the architecture-matched, validated package directory from CI (or a
 # local packager) and stages it without attempting to rebuild MSVC artifacts
 # from the MSYS2 toolchain.
 set(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR "" CACHE PATH
-        "Directory containing the architecture-matched Lumen Virtual HID INF, CAT, and DLL files")
+        "Directory containing the architecture-matched Lumen Virtual HID INF, CAT, and driver binary")
 option(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE
         "Package the exact self-signed Virtual HID certificate"
         OFF)
@@ -123,10 +123,6 @@ install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/service/"
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/migration/"
         DESTINATION "scripts"
         COMPONENT assets)
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/path/"
-        DESTINATION "scripts"
-        COMPONENT assets)
-
 # Configurable options for the service
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/autostart/"
         DESTINATION "scripts"

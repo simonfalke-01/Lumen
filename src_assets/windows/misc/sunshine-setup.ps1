@@ -8,8 +8,7 @@ param(
             "install",
             "uninstall",
             "rollback",
-            "commit",
-            "recover-legacy"
+            "commit"
     )]
     [string]$Action,
 
@@ -27,11 +26,11 @@ param(
     [string]$TransactionKind,
 
     [Parameter(Mandatory=$false)]
-    [string]$PreviousProductCode,
+    [ValidateSet("0", "1")]
+    [string]$InstallVirtualHid,
 
     [Parameter(Mandatory=$false)]
-    [ValidateSet("0", "1")]
-    [string]$InstallVirtualHid
+    [string]$MsiData
 )
 
 # Constants
@@ -276,11 +275,11 @@ if (-not $isAdmin) {
     if ($TransactionKind) {
         $arguments += " -TransactionKind $TransactionKind"
     }
-    if ($PreviousProductCode) {
-        $arguments += " -PreviousProductCode `"$PreviousProductCode`""
-    }
     if ($InstallVirtualHid) {
         $arguments += " -InstallVirtualHid $InstallVirtualHid"
+    }
+    if ($MsiData) {
+        $arguments += " -MsiData `"$MsiData`""
     }
 
     try {
@@ -314,6 +313,21 @@ if (-not (Test-Path $logDir)) {
 
 # Store LogPath in script scope for logging functions
 $script:LogPath = $LogPath
+
+# Products released before scoped MSI transaction data invoked the installed
+# script as `-Action uninstall -Msi` during RemoveExistingProducts. When a new
+# product has already installed into the shared directory, that legacy action
+# must not remove resources now owned by the new product.
+$legacyMajorUpgradeUninstall = $Msi -and $Action -eq "uninstall" -and
+    [string]::IsNullOrWhiteSpace($MsiData) -and
+    [string]::IsNullOrWhiteSpace($ProductCode) -and
+    [string]::IsNullOrWhiteSpace($TransactionKind)
+if ($legacyMajorUpgradeUninstall) {
+    Write-LogMessage `
+        -Message "Skipping the unscoped legacy uninstall action during major upgrade." `
+        -Level "Information"
+    exit 0
+}
 
 # Function to execute a batch script if it exists
 function Invoke-ScriptIfExist {
@@ -575,6 +589,72 @@ function Invoke-VirtualHidCtl {
     }
 }
 
+# Update the machine PATH without routing the value through cmd.exe. The batch
+# implementation corrupts values containing cmd metacharacters and reports the
+# wrong exit status when no registry write is required.
+function Update-SystemPath {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("add", "remove")]
+        [string]$Operation
+    )
+
+    $managedPaths = @($RootDir, (Join-Path $RootDir "tools"))
+    $normalizePath = {
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            return $null
+        }
+        $expanded = [System.Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+        return [System.IO.Path]::GetFullPath($expanded).TrimEnd('\')
+    }
+    $normalizedManagedPaths = @($managedPaths | ForEach-Object { & $normalizePath $_ })
+    $pathTarget = [System.EnvironmentVariableTarget]::Machine
+    $currentPath = [System.Environment]::GetEnvironmentVariable("Path", $pathTarget)
+    $entries = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @($currentPath -split ";")) {
+        $trimmed = $entry.Trim()
+        $normalizedEntry = & $normalizePath $trimmed
+        if (-not [string]::IsNullOrWhiteSpace($trimmed) -and
+            -not ($normalizedManagedPaths | Where-Object { $_ -ieq $normalizedEntry })) {
+            $entries.Add($trimmed)
+        }
+    }
+    if ($Operation -eq "add") {
+        foreach ($managedPath in $managedPaths) {
+            $entries.Add($managedPath)
+        }
+    }
+    $newPath = $entries -join ";"
+    if ($newPath -cne $currentPath) {
+        [System.Environment]::SetEnvironmentVariable("Path", $newPath, $pathTarget)
+        Add-Type -Namespace Lumen -Name NativeEnvironment -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern System.IntPtr SendMessageTimeout(
+    System.IntPtr hWnd,
+    uint Msg,
+    System.IntPtr wParam,
+    string lParam,
+    uint fuFlags,
+    uint uTimeout,
+    out System.IntPtr lpdwResult);
+'@ -ErrorAction SilentlyContinue
+        $result = [IntPtr]::Zero
+        [void][Lumen.NativeEnvironment]::SendMessageTimeout(
+            [IntPtr]0xffff,
+            0x001a,
+            [IntPtr]::Zero,
+            "Environment",
+            0x0002,
+            5000,
+            [ref]$result
+        )
+        Write-LogMessage -Message "  ✓ Done" -Level "Success"
+    } else {
+        Write-LogMessage -Message "  No PATH changes were required." -Level "Information"
+    }
+}
+
 function Get-VirtualHidInfPath {
     $driverDirectory = Join-Path $RootDir "drivers\virtual-hid"
     if (-not (Test-Path $driverDirectory -PathType Container)) {
@@ -796,11 +876,28 @@ function Set-InstalledVirtualHidSignerThumbprint {
 $programDataDirectory = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::CommonApplicationData
 )
-$legacyProductCode = "{D14220B3-D6E3-40B9-A781-5965FC320AD8}"
-$legacyRollbackDirectory = Join-Path $programDataDirectory "LumenVirtualHidInstaller"
-$legacyRollbackStatePath = Join-Path $legacyRollbackDirectory "virtual-hid-rollback.json"
-$legacyRollbackDriverDirectory = Join-Path $legacyRollbackDirectory "virtual-hid-driver"
 $installerRegistryPath = "HKLM:\SOFTWARE\LizardByte\Lumen\VirtualHid"
+
+function Set-MsiTransactionArguments {
+    if (-not $Msi) {
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($MsiData)) {
+        throw "MsiData is required for Windows Installer actions."
+    }
+    $parts = $MsiData.Split([char]'|')
+    if ($parts.Count -ne 4 -or
+        $parts[0] -ne "1" -or
+        $parts[2] -notin @("install", "uninstall") -or
+        $parts[3] -notin @("0", "1")) {
+        throw "MsiData has an unsupported format."
+    }
+    $script:ProductCode = $parts[1]
+    $script:TransactionKind = $parts[2]
+    $script:InstallVirtualHid = $parts[3]
+}
+
+Set-MsiTransactionArguments
 
 function ConvertTo-CanonicalProductCode {
     param(
@@ -819,15 +916,7 @@ function ConvertTo-CanonicalProductCode {
     return $canonical
 }
 
-$legacyMsiRollback = $Msi -and $Action -eq "rollback" -and
-    [string]::IsNullOrWhiteSpace($ProductCode) -and
-    [string]::IsNullOrWhiteSpace($TransactionKind)
-if ($Action -eq "recover-legacy" -or $legacyMsiRollback) {
-    # The exact 0.0.7 MSI did not pass scoped transaction arguments. Keep this
-    # one bridge so its rollback action still works if the new script is on disk.
-    $ProductCode = $legacyProductCode
-    $TransactionKind = "uninstall"
-} elseif ($Msi -or $ProductCode -or $Action -in @("rollback", "commit")) {
+if ($Msi -or $ProductCode -or $Action -in @("rollback", "commit")) {
     if ([string]::IsNullOrWhiteSpace($ProductCode)) {
         throw "ProductCode is required for this installer action."
     }
@@ -843,12 +932,6 @@ if ($Action -eq "recover-legacy" -or $legacyMsiRollback) {
 }
 if ($Action -in @("install", "uninstall") -and $TransactionKind -ne $Action) {
     throw "TransactionKind '$TransactionKind' does not match action '$Action'."
-}
-if (-not [string]::IsNullOrWhiteSpace($PreviousProductCode)) {
-    $PreviousProductCode = ConvertTo-CanonicalProductCode -Value $PreviousProductCode
-    if ($PreviousProductCode -cne $legacyProductCode) {
-        throw "Only the exact 0.0.7 ProductCode is supported as a legacy upgrade source."
-    }
 }
 $virtualHidSelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualHid)) {
     $true
@@ -993,12 +1076,12 @@ function Restore-ServiceSnapshot {
     param(
         [Parameter(Mandatory=$true)]
         [string]$StartMode,
-        [bool]$DelayedAutoStart,
+        [Nullable[bool]]$DelayedAutoStart,
         [bool]$Running
     )
 
     $startArgument = switch ($StartMode) {
-        "Auto" { if ($DelayedAutoStart) { "delayed-auto" } else { "auto" } }
+        "Auto" { if ($DelayedAutoStart -eq $true) { "delayed-auto" } else { "auto" } }
         "Manual" { "demand" }
         "Disabled" { "disabled" }
         default { throw "Unsupported saved service start mode: $StartMode" }
@@ -1127,7 +1210,7 @@ function Save-RollbackState {
         [AllowNull()]
         [string]$ServiceStartMode,
         [AllowNull()]
-        [bool]$ServiceDelayedAutoStart,
+        [Nullable[bool]]$ServiceDelayedAutoStart,
         [AllowNull()]
         [string]$BackedUpDriverInfPath,
         [AllowNull()]
@@ -1177,13 +1260,12 @@ function Start-PersistedRollbackTransaction {
         [AllowNull()]
         [string]$ServiceStartMode,
         [AllowNull()]
-        [bool]$ServiceDelayedAutoStart,
+        [Nullable[bool]]$ServiceDelayedAutoStart,
         [AllowNull()]
         [string]$DriverSignerThumbprint,
         [AllowNull()]
         [string]$PreviousDriverSignerThumbprint,
-        [AllowNull()]
-        [string]$DriverBackupSourceDirectory,
+        [bool]$DriverRollbackComplete = $false,
         [bool]$ServiceRollbackComplete = $false
     )
 
@@ -1193,40 +1275,13 @@ function Start-PersistedRollbackTransaction {
     try {
         $backedUpDriverInfPath = $null
         if ($DriverWasPresent) {
-            if ([string]::IsNullOrWhiteSpace($DriverBackupSourceDirectory)) {
-                $installedDriverInfName = Get-InstalledVirtualHidInfName
-                $backedUpDriverInfPath = Export-VirtualHidDriverBackup `
-                    -PublishedInfName $installedDriverInfName
-            } else {
-                $source = Get-Item -LiteralPath $DriverBackupSourceDirectory -Force -ErrorAction Stop
-                if (-not $source.PSIsContainer -or
-                    ($source.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-                    throw "The supplied rollback driver backup is not a physical directory."
-                }
-                foreach ($item in @(Get-ChildItem -LiteralPath $source.FullName -Force -Recurse)) {
-                    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-                        throw "The supplied rollback driver backup contains a reparse point."
-                    }
-                }
-                Copy-Item `
-                    -LiteralPath $source.FullName `
-                    -Destination $rollbackDriverDirectory `
-                    -Recurse `
-                    -ErrorAction Stop
-                $copiedInfFiles = @(
-                    Get-ChildItem -LiteralPath $rollbackDriverDirectory -Filter "*.inf" -File -Recurse | `
-                        Where-Object {
-                            Select-String `
-                                -LiteralPath $_.FullName `
-                                -Pattern "ROOT\LumenVirtualHid" `
-                                -SimpleMatch `
-                                -Quiet
-                        }
-                )
-                if ($copiedInfFiles.Count -ne 1) {
-                    throw "The supplied rollback backup does not contain exactly one Lumen Virtual HID INF."
-                }
-                $backedUpDriverInfPath = $copiedInfFiles[0].FullName
+            $installedDriverInfName = Get-InstalledVirtualHidInfName
+            $backedUpDriverInfPath = Export-VirtualHidDriverBackup `
+                -PublishedInfName $installedDriverInfName
+            if ([string]::IsNullOrWhiteSpace($PreviousDriverSignerThumbprint)) {
+                $PreviousDriverSignerThumbprint = (
+                    Get-BackedUpVirtualHidCertificate
+                ).Thumbprint
             }
         }
         Save-RollbackState `
@@ -1239,6 +1294,7 @@ function Start-PersistedRollbackTransaction {
             -BackedUpDriverInfPath $backedUpDriverInfPath `
             -DriverSignerThumbprint $DriverSignerThumbprint `
             -PreviousDriverSignerThumbprint $PreviousDriverSignerThumbprint `
+            -DriverRollbackComplete $DriverRollbackComplete `
             -ServiceRollbackComplete $ServiceRollbackComplete
     } catch {
         throw "Could not create rollback state; partial protected artifacts were preserved: $($_.Exception.Message)"
@@ -1342,7 +1398,11 @@ function Invoke-PersistedRollback {
         $serviceWasPresent = [bool]$rollbackState.ServiceWasPresent
         $serviceWasRunning = [bool]$rollbackState.ServiceWasRunning
         $serviceStartMode = [string]$rollbackState.ServiceStartMode
-        $serviceDelayedAutoStart = [bool]$rollbackState.ServiceDelayedAutoStart
+        $serviceDelayedAutoStart = if ($null -eq $rollbackState.ServiceDelayedAutoStart) {
+            $null
+        } else {
+            [Nullable[bool]]([bool]$rollbackState.ServiceDelayedAutoStart)
+        }
         $backedUpDriverInfPath = [string]$rollbackState.BackedUpDriverInfPath
         $driverSignerThumbprint = [string]$rollbackState.DriverSignerThumbprint
         $previousDriverSignerThumbprint = [string]$rollbackState.PreviousDriverSignerThumbprint
@@ -1359,7 +1419,9 @@ function Invoke-PersistedRollback {
     }
 
     $rollbackErrors = [System.Collections.Generic.List[string]]::new()
-    $driverNeedsRollback = $driverWasPresent -or $transactionKind -eq "install"
+    $driverNeedsRollback = -not $driverRollbackComplete -and (
+        $driverWasPresent -or $transactionKind -eq "install"
+    )
     if ($driverNeedsRollback) {
         $currentService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
         if ($null -ne $currentService -and $currentService.Status -ne "Stopped") {
@@ -1539,81 +1601,6 @@ function Invoke-ExactCurrentRecovery {
     }
 }
 
-function Invoke-LegacyRecovery {
-    if ($ProductCode -cne $legacyProductCode) {
-        throw "Legacy recovery is available only for the exact 0.0.7 ProductCode."
-    }
-    if (-not (Test-Path -LiteralPath $legacyRollbackDirectory -PathType Container)) {
-        Write-LogMessage -Message "No stale 0.0.7 installer transaction was found." -Level "Information"
-        return $false
-    }
-    Assert-InstallRollbackDirectorySecure -Path $legacyRollbackDirectory
-    if (-not (Test-Path -LiteralPath $legacyRollbackStatePath -PathType Leaf)) {
-        throw "Legacy rollback artifacts are incomplete and were preserved."
-    }
-    $legacyState = Get-Content -LiteralPath $legacyRollbackStatePath -Raw -ErrorAction Stop | `
-        ConvertFrom-Json -ErrorAction Stop
-    if ([string]$legacyState.TransactionKind -notin @("Install", "Uninstall")) {
-        throw "Legacy rollback state has an invalid transaction kind."
-    }
-
-    $savedDirectory = $rollbackDirectory
-    $savedStatePath = $rollbackStatePath
-    $savedDriverDirectory = $rollbackDriverDirectory
-    try {
-        $script:rollbackDirectory = $legacyRollbackDirectory
-        $script:rollbackStatePath = $legacyRollbackStatePath
-        $script:rollbackDriverDirectory = $legacyRollbackDriverDirectory
-        $legacyErrors = [System.Collections.Generic.List[string]]::new()
-        if ([bool]$legacyState.DriverWasPresent) {
-            try {
-                $legacyInf = Resolve-BackedUpDriverInfPath -BackedUpDriverInfPath ([string]$legacyState.BackedUpDriverInfPath)
-                Install-BackedUpVirtualHidCertificate | Out-Null
-                Invoke-VirtualHidCtl `
-                    -Arguments @("install-or-update", "`"$legacyInf`"") `
-                    -Description "Recovering the exact 0.0.7 Virtual HID driver" | Out-Null
-            } catch {
-                $legacyErrors.Add($_.Exception.Message) | Out-Null
-            }
-        } elseif ([string]$legacyState.TransactionKind -eq "Install") {
-            try {
-                Invoke-VirtualHidCtl `
-                    -Arguments @("uninstall") `
-                    -Description "Removing the exact 0.0.7 Virtual HID install" | Out-Null
-            } catch {
-                $legacyErrors.Add($_.Exception.Message) | Out-Null
-            }
-        }
-        if ([bool]$legacyState.ServiceWasPresent) {
-            try {
-                Invoke-SetupScript `
-                    -ScriptPath (Join-Path $RootDir "scripts\install-service.bat") `
-                    -Description "Recovering the 0.0.7 service" `
-                    -Emoji "⚡"
-                $service = Get-Service -Name "SunshineService" -ErrorAction Stop
-                if ([bool]$legacyState.ServiceWasRunning) {
-                    if ($service.Status -ne "Running") { Start-Service -Name "SunshineService" -ErrorAction Stop }
-                    $service.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
-                } else {
-                    if ($service.Status -ne "Stopped") { Stop-Service -Name "SunshineService" -Force -ErrorAction Stop }
-                    $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
-                }
-            } catch {
-                $legacyErrors.Add($_.Exception.Message) | Out-Null
-            }
-        }
-        if ($legacyErrors.Count -ne 0) {
-            throw "Legacy recovery failed; exact 0.0.7 artifacts were preserved: $($legacyErrors -join '; ')"
-        }
-        Remove-Item -LiteralPath $legacyRollbackDirectory -Recurse -Force -ErrorAction Stop
-        return $true
-    } finally {
-        $script:rollbackDirectory = $savedDirectory
-        $script:rollbackStatePath = $savedStatePath
-        $script:rollbackDriverDirectory = $savedDriverDirectory
-    }
-}
-
 # Main script logic
 Write-Information ""
 
@@ -1702,12 +1689,8 @@ if ($Action -eq "install") {
         -Activity "Installing Sunshine" `
         -Status "Updating system PATH" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    $updatePathScript = Join-Path $RootDir "scripts\update-path.bat"
-    Invoke-ScriptIfExist `
-        -ScriptPath $updatePathScript `
-        -Arguments "add" `
-        -Description "Adding Sunshine directories to PATH" `
-        -Emoji "📁"
+    Write-LogMessage -Message "📁 Adding Sunshine directories to PATH" -Level "Step"
+    Update-SystemPath -Operation "add"
     Write-Information ""
 
     # 2. Migrate configuration
@@ -1747,29 +1730,12 @@ if ($Action -eq "install") {
     $driverSignerThumbprint = $null
     $driverCertificatePath = $null
     $previousDriverSignerThumbprint = Get-InstalledVirtualHidSignerThumbprint
-    $legacyUpgradeCertificate = $null
-    $legacyUpgradeState = $null
-    if (-not [string]::IsNullOrWhiteSpace($PreviousProductCode)) {
-        Assert-InstallRollbackDirectorySecure -Path $legacyRollbackDirectory
-        if (-not (Test-Path -LiteralPath $legacyRollbackStatePath -PathType Leaf)) {
-            throw "The exact 0.0.7 upgrade rollback state is incomplete and was preserved."
-        }
-        $legacyUpgradeState = Get-Content -LiteralPath $legacyRollbackStatePath -Raw -ErrorAction Stop | `
-            ConvertFrom-Json -ErrorAction Stop
-        if ([string]$legacyUpgradeState.TransactionKind -ne "Uninstall") {
-            throw "The exact 0.0.7 upgrade rollback state is not an uninstall transaction."
-        }
-        if ([bool]$legacyUpgradeState.DriverWasPresent) {
-            $legacyUpgradeCertificate = Get-BackedUpVirtualHidCertificate `
-                -DriverDirectory $legacyRollbackDriverDirectory
-            $previousDriverSignerThumbprint = $legacyUpgradeCertificate.Thumbprint
-        }
-    }
-    $driverStatus = Invoke-VirtualHidCtl `
-        -Arguments @("status") `
-        -Description "Checking Lumen Virtual HID driver status" `
-        -AllowNotInstalled
+    $driverStatus = 2
     if ($virtualHidSelected) {
+        $driverStatus = Invoke-VirtualHidCtl `
+            -Arguments @("status") `
+            -Description "Checking Lumen Virtual HID driver status" `
+            -AllowNotInstalled
         $driverInfPath = Get-VirtualHidInfPath
         $driverCertificatePath = Get-VirtualHidCertificatePath
         if ([string]::IsNullOrWhiteSpace($driverCertificatePath)) {
@@ -1790,19 +1756,7 @@ if ($Action -eq "install") {
     $serviceWasPresent = $serviceSnapshot.Present
     $serviceWasRunning = $serviceSnapshot.Running
     $driverWasPresent = $driverStatus -in @(0, 4)
-    $driverBackupSourceDirectory = $null
     $serviceRollbackComplete = [bool]$Msi
-    if ($null -ne $legacyUpgradeState) {
-        $driverWasPresent = [bool]$legacyUpgradeState.DriverWasPresent
-        if ($driverWasPresent) {
-            $driverBackupSourceDirectory = $legacyRollbackDriverDirectory
-        }
-        $serviceWasPresent = [bool]$legacyUpgradeState.ServiceWasPresent
-        $serviceWasRunning = [bool]$legacyUpgradeState.ServiceWasRunning
-        $serviceSnapshot.StartMode = [string]$legacyUpgradeState.ServiceStartMode
-        $serviceSnapshot.DelayedAutoStart = [bool]$legacyUpgradeState.ServiceDelayedAutoStart
-        $serviceRollbackComplete = $false
-    }
     Start-PersistedRollbackTransaction `
         -TransactionKind "install" `
         -DriverWasPresent $driverWasPresent `
@@ -1812,15 +1766,8 @@ if ($Action -eq "install") {
         -ServiceDelayedAutoStart $serviceSnapshot.DelayedAutoStart `
         -DriverSignerThumbprint $driverSignerThumbprint `
         -PreviousDriverSignerThumbprint $previousDriverSignerThumbprint `
-        -DriverBackupSourceDirectory $driverBackupSourceDirectory `
+        -DriverRollbackComplete (-not $virtualHidSelected) `
         -ServiceRollbackComplete $serviceRollbackComplete
-    if ($null -ne $legacyUpgradeCertificate) {
-        $trustedLegacyThumbprint = Install-BackedUpVirtualHidCertificate `
-            -DriverDirectory $legacyRollbackDriverDirectory
-        if ($trustedLegacyThumbprint -ne $previousDriverSignerThumbprint) {
-            throw "The trusted 0.0.7 signer does not match the saved rollback signer."
-        }
-    }
     if ($virtualHidSelected -and -not [string]::IsNullOrWhiteSpace($driverCertificatePath)) {
         $importedThumbprint = Install-VirtualHidCertificate `
             -CertificatePath $driverCertificatePath
@@ -1840,10 +1787,9 @@ if ($Action -eq "install") {
         Invoke-VirtualHidCtl `
             -Arguments @("install-or-update", "`"$driverInfPath`"") `
             -Description "Installing or updating the Lumen Virtual HID driver" | Out-Null
-    } elseif ($driverStatus -in @(0, 4)) {
         Invoke-VirtualHidCtl `
-            -Arguments @("uninstall") `
-            -Description "Removing the deselected Lumen Virtual HID driver" | Out-Null
+            -Arguments @("probe", "--json") `
+            -Description "Verifying the Lumen Virtual HID control protocol" | Out-Null
     }
     Write-Information ""
 
@@ -1946,6 +1892,7 @@ if ($Action -eq "install") {
         -ServiceDelayedAutoStart $serviceSnapshot.DelayedAutoStart `
         -DriverSignerThumbprint $null `
         -PreviousDriverSignerThumbprint (Get-InstalledVirtualHidSignerThumbprint) `
+        -DriverRollbackComplete (-not $virtualHidSelected) `
         -ServiceRollbackComplete ([bool]$Msi)
 
     # 1. Stop and remove the service before touching the driver.
@@ -2014,12 +1961,8 @@ if ($Action -eq "install") {
         -Activity "Uninstalling Sunshine" `
         -Status "Cleaning up system PATH" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    $updatePathScript = Join-Path $RootDir "scripts\update-path.bat"
-    Invoke-ScriptIfExist `
-        -ScriptPath $updatePathScript `
-        -Arguments "remove" `
-        -Description "Removing from PATH" `
-        -Emoji "📁"
+    Write-LogMessage -Message "📁 Removing Sunshine directories from PATH" -Level "Step"
+    Update-SystemPath -Operation "remove"
     Write-Information ""
 
     Write-Progress -Activity "Uninstalling Sunshine" -Completed
@@ -2030,21 +1973,12 @@ if ($Action -eq "install") {
         Invoke-PersistedCommit | Out-Null
     }
 } elseif ($Action -eq "rollback") {
-    $rollbackApplied = if ($legacyMsiRollback) {
-        Invoke-LegacyRecovery
-    } else {
-        Invoke-PersistedRollback
-    }
+    $rollbackApplied = Invoke-PersistedRollback
     if ($rollbackApplied) {
         Write-LogMessage -Message "Rollback completed." -Level "Success"
     }
 } elseif ($Action -eq "commit") {
     Invoke-PersistedCommit | Out-Null
-} elseif ($Action -eq "recover-legacy") {
-    $legacyRecoveryApplied = Invoke-LegacyRecovery
-    if ($legacyRecoveryApplied) {
-        Write-LogMessage -Message "Exact 0.0.7 recovery completed." -Level "Success"
-    }
 }
 
 } catch {
