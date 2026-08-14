@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <cstdint>
 #include <functional>
 
 // local includes
@@ -13,6 +14,53 @@
 
 namespace input {
   struct input_t;
+
+  /**
+   * @brief Internal input helpers exposed for focused unit testing.
+   */
+  namespace detail {
+    /**
+     * @brief Add two signed 16-bit values without overflowing.
+     *
+     * @param lhs Left-hand operand.
+     * @param rhs Right-hand operand.
+     * @param result Receives the sum when it is representable as a signed 16-bit value.
+     * @return True when the addition succeeds; false when the sum would overflow.
+     */
+    bool checked_add_int16(std::int16_t lhs, std::int16_t rhs, std::int16_t &result);
+
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Exercise relative mouse packet batching through the production batch implementation.
+     *
+     * @param dest_x Destination packet horizontal delta, updated when batching succeeds.
+     * @param dest_y Destination packet vertical delta, updated when batching succeeds.
+     * @param src_x Source packet horizontal delta.
+     * @param src_y Source packet vertical delta.
+     * @return True when the packets are batched; false when batching terminates.
+     */
+    bool batch_relative_mouse_for_test(std::int16_t &dest_x, std::int16_t &dest_y, std::int16_t src_x, std::int16_t src_y);
+
+    /**
+     * @brief Exercise vertical scroll packet batching through the production batch implementation.
+     *
+     * @param dest_primary Destination packet primary scroll amount, updated when batching succeeds.
+     * @param dest_secondary Destination packet duplicate scroll amount, updated when batching succeeds.
+     * @param src Source packet scroll amount.
+     * @return True when the packets are batched; false when batching terminates.
+     */
+    bool batch_vertical_scroll_for_test(std::int16_t &dest_primary, std::int16_t &dest_secondary, std::int16_t src);
+
+    /**
+     * @brief Exercise horizontal scroll packet batching through the production batch implementation.
+     *
+     * @param dest Destination packet scroll amount, updated when batching succeeds.
+     * @param src Source packet scroll amount.
+     * @return True when the packets are batched; false when batching terminates.
+     */
+    bool batch_horizontal_scroll_for_test(std::int16_t &dest, std::int16_t src);
+#endif
+  }  // namespace detail
 
   /**
    * @brief Write a debug log representation of the input packet.

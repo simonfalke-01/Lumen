@@ -27,12 +27,12 @@ LumenVirtualHid.dll = 1
 [LumenVirtualHid.Install.NT]
 CopyFiles = LumenVirtualHid.CopyFiles
 Include = WUDFRD.inf
-Needs = WUDFRD_LowerFilter.NT
+Needs = WUDFRD.NT
 
 [LumenVirtualHid.Install.NT.HW]
 AddReg = LumenVirtualHid.Device.AddReg
 Include = WUDFRD.inf
-Needs = WUDFRD_LowerFilter.NT.HW
+Needs = WUDFRD.NT.HW
 
 [LumenVirtualHid.Device.AddReg]
 HKR,,"LowerFilters",0x00010000,"vhf"
@@ -41,21 +41,18 @@ HKR,,Security,,"D:P(A;;GA;;;SY)"
 
 [LumenVirtualHid.Install.NT.Services]
 Include = WUDFRD.inf
-Needs = WUDFRD_LowerFilter.NT.Services
-
-[LumenVirtualHid.Install.NT.Filters]
-Include = WUDFRD.inf
-Needs = WUDFRD_LowerFilter.NT.Filters
+Needs = WUDFRD.NT.Services
 
 [LumenVirtualHid.Install.NT.Wdf]
 UmdfService = "LumenVirtualHid", LumenVirtualHid.Wdf
 UmdfServiceOrder = LumenVirtualHid
 UmdfKernelModeClientPolicy = AllowKernelModeClients
-UmdfFileObjectPolicy = RejectNullAndUnknownFileObjects
-UmdfDeviceGroupId = LumenVirtualHid
+UmdfFileObjectPolicy = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction = Copy
+UmdfFsContextUsePolicy = CanUseFsContext2
 
 [LumenVirtualHid.Wdf]
-UmdfLibraryVersion = 2.15
+UmdfLibraryVersion = 2.15.0
 ServiceBinary = "%13%\LumenVirtualHid.dll"
 
 [LumenVirtualHid.CopyFiles]

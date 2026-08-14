@@ -14,6 +14,7 @@ extern "C" {
 #include <chrono>
 #include <cmath>
 #include <future>
+#include <limits>
 #include <list>
 #include <mutex>
 #include <thread>
@@ -40,6 +41,16 @@ constexpr int WHEEL_DELTA = 120;  ///< Standard Windows wheel delta used to norm
 using namespace std::literals;
 
 namespace input {
+
+  bool detail::checked_add_int16(std::int16_t lhs, std::int16_t rhs, std::int16_t &result) {
+    const auto sum = static_cast<std::int32_t>(lhs) + static_cast<std::int32_t>(rhs);
+    if (sum < std::numeric_limits<std::int16_t>::min() || sum > std::numeric_limits<std::int16_t>::max()) {
+      return false;
+    }
+
+    result = static_cast<std::int16_t>(sum);
+    return true;
+  }
 
   constexpr auto MAX_GAMEPADS = std::min((std::size_t) platf::MAX_GAMEPADS, sizeof(std::int16_t) * 8);  ///< Maximum gamepads representable by the active gamepad mask.
 /**
@@ -1464,20 +1475,20 @@ namespace input {
    * @return The status of the batching operation.
    */
   batch_result_e batch(PNV_REL_MOUSE_MOVE_PACKET dest, PNV_REL_MOUSE_MOVE_PACKET src) {
-    short deltaX;
-    short deltaY;
+    std::int16_t delta_x;
+    std::int16_t delta_y;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), &deltaX)) {
+    if (!detail::checked_add_int16(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), delta_x)) {
       return batch_result_e::terminate_batch;
     }
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), &deltaY)) {
+    if (!detail::checked_add_int16(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), delta_y)) {
       return batch_result_e::terminate_batch;
     }
 
     // Take the sum of deltas
-    dest->deltaX = util::endian::big(deltaX);
-    dest->deltaY = util::endian::big(deltaY);
+    dest->deltaX = util::endian::big(delta_x);
+    dest->deltaY = util::endian::big(delta_y);
     return batch_result_e::batched;
   }
 
@@ -1505,16 +1516,16 @@ namespace input {
    * @return The status of the batching operation.
    */
   batch_result_e batch(PNV_SCROLL_PACKET dest, PNV_SCROLL_PACKET src) {
-    short scrollAmt;
+    std::int16_t scroll_amount;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), &scrollAmt)) {
+    if (!detail::checked_add_int16(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), scroll_amount)) {
       return batch_result_e::terminate_batch;
     }
 
     // Take the sum of delta
-    dest->scrollAmt1 = util::endian::big(scrollAmt);
-    dest->scrollAmt2 = util::endian::big(scrollAmt);
+    dest->scrollAmt1 = util::endian::big(scroll_amount);
+    dest->scrollAmt2 = util::endian::big(scroll_amount);
     return batch_result_e::batched;
   }
 
@@ -1525,15 +1536,15 @@ namespace input {
    * @return The status of the batching operation.
    */
   batch_result_e batch(PSS_HSCROLL_PACKET dest, PSS_HSCROLL_PACKET src) {
-    short scrollAmt;
+    std::int16_t scroll_amount;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), &scrollAmt)) {
+    if (!detail::checked_add_int16(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), scroll_amount)) {
       return batch_result_e::terminate_batch;
     }
 
     // Take the sum of delta
-    dest->scrollAmount = util::endian::big(scrollAmt);
+    dest->scrollAmount = util::endian::big(scroll_amount);
     return batch_result_e::batched;
   }
 
@@ -1727,6 +1738,47 @@ namespace input {
         return batch_result_e::terminate_batch;
     }
   }
+
+#ifdef SUNSHINE_TESTS
+  bool detail::batch_relative_mouse_for_test(std::int16_t &dest_x, std::int16_t &dest_y, std::int16_t src_x, std::int16_t src_y) {
+    NV_REL_MOUSE_MOVE_PACKET dest {};
+    NV_REL_MOUSE_MOVE_PACKET src {};
+    dest.deltaX = util::endian::big(dest_x);
+    dest.deltaY = util::endian::big(dest_y);
+    src.deltaX = util::endian::big(src_x);
+    src.deltaY = util::endian::big(src_y);
+
+    const auto result = batch(&dest, &src);
+    dest_x = util::endian::big(dest.deltaX);
+    dest_y = util::endian::big(dest.deltaY);
+    return result == batch_result_e::batched;
+  }
+
+  bool detail::batch_vertical_scroll_for_test(std::int16_t &dest_primary, std::int16_t &dest_secondary, std::int16_t src_amount) {
+    NV_SCROLL_PACKET dest {};
+    NV_SCROLL_PACKET src {};
+    dest.scrollAmt1 = util::endian::big(dest_primary);
+    dest.scrollAmt2 = util::endian::big(dest_secondary);
+    src.scrollAmt1 = util::endian::big(src_amount);
+    src.scrollAmt2 = util::endian::big(src_amount);
+
+    const auto result = batch(&dest, &src);
+    dest_primary = util::endian::big(dest.scrollAmt1);
+    dest_secondary = util::endian::big(dest.scrollAmt2);
+    return result == batch_result_e::batched;
+  }
+
+  bool detail::batch_horizontal_scroll_for_test(std::int16_t &dest_amount, std::int16_t src_amount) {
+    SS_HSCROLL_PACKET dest {};
+    SS_HSCROLL_PACKET src {};
+    dest.scrollAmount = util::endian::big(dest_amount);
+    src.scrollAmount = util::endian::big(src_amount);
+
+    const auto result = batch(&dest, &src);
+    dest_amount = util::endian::big(dest.scrollAmount);
+    return result == batch_result_e::batched;
+  }
+#endif
 
   /**
    * @brief Called on a thread pool thread to process an input message.

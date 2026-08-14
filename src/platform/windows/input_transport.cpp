@@ -153,8 +153,8 @@ namespace platf::win_input {
     INPUT input {};
     input.type = INPUT_MOUSE;
     input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-    input.mi.dx = std::lround(x * (65535.0f / static_cast<float>(source_width)));
-    input.mi.dy = std::lround(y * (65535.0f / static_cast<float>(source_height)));
+    input.mi.dx = std::lround(static_cast<double>(x) * (65535.0 / static_cast<double>(source_width)));
+    input.mi.dy = std::lround(static_cast<double>(y) * (65535.0 / static_cast<double>(source_height)));
     return submit(input);
   }
 

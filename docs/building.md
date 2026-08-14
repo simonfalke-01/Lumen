@@ -204,7 +204,7 @@ For ARM64: To build frontend, you also need to install [Node.JS](https://nodejs.
 ##### Lumen Virtual HID driver
 
 The Windows application and Lumen Virtual HID driver use separate toolchains. The Virtual HID driver currently supports
-Windows 11 x64 only. Continue to build the AMD64 application in MSYS2 UCRT64, but build the UMDF driver with MSVC from
+Windows 11 x64 only. Continue to build the AMD64 application in MSYS2 UCRT64, but build the VHF driver with MSVC from
 Visual Studio and the Windows Driver Kit (WDK). Do not build the driver with the MSYS2 application toolchain.
 
 Install [Visual Studio 2022](https://visualstudio.microsoft.com/vs/) with the **Desktop development with C++** workload,

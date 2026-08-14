@@ -8,20 +8,46 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Existing successful run ID; skips build/bootstrap and only validates its MSI
+        required: false
+        type: string
+      validation_scenario:
+        description: MSI scenario to run; select one for fast test-only validation
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - install-no-vhid
+          - install-vhid
+          - upgrade
 
 env:
   PYTHON_VERSION: '3.14'
   WDK_VERSION: '10.0.26100.0'
 
+concurrency:
+  group: >-
+    windows-${{ github.workflow }}-${{ github.ref }}-${{
+      github.event.inputs.artifact_run_id || 'build' }}
+  cancel-in-progress: true
+
 jobs:
   build_windows:
     name: Windows-AMD64
+    if: github.event_name != 'workflow_dispatch' || inputs.artifact_run_id == ''
     runs-on: windows-2022
     defaults:
       run:
         shell: msys2 {0}
     permissions:
+      actions: read
       contents: read
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -41,6 +67,25 @@ jobs:
             $errors | ForEach-Object { Write-Error $_.Message }
             throw 'The Windows installer script contains syntax errors.'
           }
+
+      - name: Cache CMake dependency tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build/_deps
+          key: >-
+            windows-cmake-deps-v1-${{ runner.os }}-${{
+            hashFiles('package-lock.cmake', 'cmake/dependencies/**/*.cmake') }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: >-
+            windows-nuget-wix-v1-${{
+            hashFiles('cmake/packaging/windows_wix.cmake') }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba  # v0.0.11
 
       - name: Install Windows Driver Kit
         shell: pwsh
@@ -143,6 +188,11 @@ jobs:
           $driverPackageDir = Join-Path $driverBuildDir 'package'
           New-Item -ItemType Directory -Path $driverBinDir, $driverObjDir -Force | Out-Null
 
+          $sccacheWrapperDir = Join-Path $env:RUNNER_TEMP 'sccache-msbuild'
+          New-Item -ItemType Directory -Path $sccacheWrapperDir -Force | Out-Null
+          $sccache = (Get-Command sccache -ErrorAction Stop).Source
+          Copy-Item $sccache (Join-Path $sccacheWrapperDir 'cl.exe') -Force
+
           & $msbuild `
             $driverProject `
             /m `
@@ -154,6 +204,10 @@ jobs:
             /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
             /p:OutDir="$driverBinDir\" `
             /p:IntDir="$driverObjDir\" `
+            /p:CLToolExe="$sccacheWrapperDir\cl.exe" `
+            /p:TrackFileAccess=false `
+            /p:UseMultiToolTask=true `
+            /p:DebugInformationFormat=OldStyle `
             /p:SkipPackageVerification=true `
             /p:SignMode=Off `
             /p:RunCodeAnalysis=true `
@@ -277,7 +331,8 @@ jobs:
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2.32.0
         with:
           msystem: ucrt64
-          update: true
+          cache: true
+          update: false
           install: >-
             git
             mingw-w64-ucrt-x86_64-boost
@@ -304,6 +359,8 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: 'lts/*'
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Export NodeJS path
         shell: pwsh
@@ -321,6 +378,7 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
           enable-cache: true
+          cache-dependency-glob: uv.lock
 
       - name: Setup Python build tools
         shell: msys2 {0}
@@ -339,6 +397,7 @@ jobs:
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
           export PATH="$PATH:$NODEJS_PATH"
           DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$DRIVER_PACKAGE_DIR")
+          SCCACHE_CMAKE_PATH=$(cygpath -m "$SCCACHE_PATH")
 
           cmake \
             -B build \
@@ -347,6 +406,8 @@ jobs:
             -DBUILD_DOCS=OFF \
             -DBUILD_TESTS=ON \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER="$SCCACHE_CMAKE_PATH" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="$SCCACHE_CMAKE_PATH" \
             -DSUNSHINE_ASSETS_DIR=assets \
             -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR="$DRIVER_PACKAGE_CMAKE_PATH" \
             -DSUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON \
@@ -359,7 +420,7 @@ jobs:
         shell: msys2 {0}
         run: |
           build/tests/test_sunshine.exe \
-            --gtest_filter='VirtualHidProtocolTest.*:VirtualHidInputTest.*:InputTransportTest.*'
+            --gtest_filter='VirtualHidProtocolTest.*:VirtualHidKeyMappingTest.*:*virtual_hid_input_test.*:*virtual_hid_mouse_button_test.*:*send_input_transport_test.*:*send_input_mouse_button_test.*:InputBatchingTest.*'
 
       - name: Package Windows
         shell: msys2 {0}
@@ -392,67 +453,341 @@ jobs:
             exit 1
           fi
 
-      - name: Validate generated MSI tables
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $msiPath = Resolve-Path 'artifacts/Sunshine-Windows-AMD64-installer.msi'
-          $installer = New-Object -ComObject WindowsInstaller.Installer
-          $database = $installer.GetType().InvokeMember(
-            'OpenDatabase', 'InvokeMethod', $null, $installer, @($msiPath.Path, 0)
-          )
-          function Read-MsiRows([string]$query, [int]$columns) {
-            $view = $database.OpenView($query)
-            [void]$view.Execute()
-            $rows = [Collections.Generic.List[object[]]]::new()
-            while ($record = $view.Fetch()) {
-              $row = [object[]]@(1..$columns | ForEach-Object { $record.StringData($_) })
-              $rows.Add($row)
-            }
-            [void]$view.Close()
-            return ,$rows.ToArray()
-          }
-          $actions = Read-MsiRows `
-            'SELECT `Action`,`Type`,`Source`,`Target` FROM `CustomAction`' 4
-          $sequence = Read-MsiRows `
-            'SELECT `Action`,`Condition`,`Sequence` FROM `InstallExecuteSequence`' 3
-          $services = Read-MsiRows `
-            'SELECT `ServiceInstall`,`Name`,`StartType`,`Component_` FROM `ServiceInstall`' 4
-          $requiredActions = @(
-            'CA_SunshineInstall', 'CA_SunshineInstallRollback', 'CA_SunshineInstallCommit',
-            'CA_SunshineUninstall', 'CA_SunshineUninstallRollback', 'CA_SunshineUninstallCommit'
-          )
-          $actionNames = @($actions | ForEach-Object { $_[0] })
-          $sequenceNames = @($sequence | ForEach-Object { $_[0] })
-          foreach ($action in $requiredActions) {
-            if ($actionNames -notcontains $action -or $sequenceNames -notcontains $action) {
-              throw "Generated MSI is missing custom action or sequence row: $action"
-            }
-          }
-          if ($services.Count -ne 1 -or $services[0][1] -ne 'SunshineService') {
-            throw 'Generated MSI does not contain the declarative SunshineService row.'
-          }
-          if ($sequenceNames -notcontains 'RemoveExistingProducts') {
-            throw 'Generated MSI is missing RemoveExistingProducts.'
-          }
-          $installSetterAction = @($actions | Where-Object { $_[0] -eq 'SetSunshineInstallData' })
-          if ($installSetterAction.Count -ne 1 -or
-              $installSetterAction[0][3] -notmatch 'PreviousProductCode.+LUMEN_PREVIOUS_PRODUCT_CODE') {
-            throw 'Generated MSI does not pass the optional exact legacy ProductCode to the install action.'
-          }
-          $installSetterRows = @($sequence | Where-Object { $_[0] -eq 'SetSunshineInstallData' })
-          if ($installSetterRows.Count -ne 1) {
-            throw 'Generated MSI must set CA_SunshineInstall CustomActionData exactly once.'
-          }
-          $removeExistingProducts = @($sequence | Where-Object { $_[0] -eq 'RemoveExistingProducts' })
-          $installDeferred = @($sequence | Where-Object { $_[0] -eq 'CA_SunshineInstall' })
-          if ([int]$removeExistingProducts[0][2] -ge [int]$installDeferred[0][2]) {
-            throw 'RemoveExistingProducts must finish before the current Virtual HID install action.'
-          }
-
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: build-Windows-AMD64
           path: artifacts/
           if-no-files-found: error
+
+  publish_reused_windows_artifacts:
+    name: Re-publish reused Windows artifacts
+    if: github.event_name == 'workflow_dispatch' && inputs.artifact_run_id != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Download reused Windows artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
+        with:
+          name: build-Windows-AMD64
+          path: artifacts
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.artifact_run_id }}
+
+      - name: Attach reused Windows artifacts to this run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: build-Windows-AMD64
+          path: artifacts/
+          if-no-files-found: error
+          # MSI and ZIP payloads are already compressed; recompression only wastes time.
+          compression-level: 0
+
+  validate_msi:
+    name: >-
+      Windows MSI (${{ matrix.scenario }},
+      ${{ matrix.scenario == 'install-no-vhid' && 'Windows Server 2022' || 'Windows Server 2025' }})
+    needs: build_windows
+    if: >-
+      always() &&
+      (inputs.artifact_run_id != '' || needs.build_windows.result == 'success')
+    runs-on: ${{ matrix.scenario == 'install-no-vhid' && 'windows-2022' || 'windows-2025' }}
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The hosted x64 labels used here map to Windows Server, not Windows 11 client.
+        scenario: >-
+          ${{ fromJSON(
+            (inputs.validation_scenario == '' || inputs.validation_scenario == 'all') &&
+            '["install-no-vhid","install-vhid","upgrade"]' ||
+            format('["{0}"]', inputs.validation_scenario)
+          ) }}
+    steps:
+      - name: Checkout validation scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
+        with:
+          name: build-Windows-AMD64
+          path: artifacts
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+
+      - name: Capture Windows MSI host details
+        shell: pwsh
+        env:
+          MSI_SCENARIO: ${{ matrix.scenario }}
+          RUNNER_LABEL: ${{ matrix.scenario == 'install-no-vhid' && 'windows-2022' || 'windows-2025' }}
+          RUNNER_HOST_NAME: >-
+            ${{ matrix.scenario == 'install-no-vhid' && 'Windows Server 2022' || 'Windows Server 2025' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $destination = 'artifacts/installer-diagnostics'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+          $capturedAt = Get-Date
+          $capturedAt.ToUniversalTime().ToString('o') |
+            Set-Content (Join-Path $destination 'scenario-start.txt') -Encoding utf8
+
+          $operatingSystem = Get-CimInstance Win32_OperatingSystem
+          $currentVersion = Get-ItemProperty `
+            'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          $componentPaths = @(
+            @{
+              Name = 'WUDFHost.exe'
+              Candidates = @(
+                (Join-Path $env:SystemRoot 'System32\WUDFHost.exe')
+              )
+            },
+            @{
+              Name = 'WUDFx02000.dll'
+              Candidates = @(
+                (Join-Path $env:SystemRoot 'System32\drivers\UMDF\WUDFx02000.dll'),
+                (Join-Path $env:SystemRoot 'System32\WUDFx02000.dll')
+              )
+            },
+            @{
+              Name = 'VhfUm.dll'
+              Candidates = @(
+                (Join-Path $env:SystemRoot 'System32\drivers\UMDF\VhfUm.dll'),
+                (Join-Path $env:SystemRoot 'System32\VhfUm.dll')
+              )
+            }
+          )
+          $components = foreach ($component in $componentPaths) {
+            $path = $component.Candidates |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+              Select-Object -First 1
+            if ($path) {
+              $file = Get-Item -LiteralPath $path
+              [pscustomobject]@{
+                name = $component.Name
+                path = $file.FullName
+                fileVersion = $file.VersionInfo.FileVersion
+                productVersion = $file.VersionInfo.ProductVersion
+              }
+            } else {
+              [pscustomobject]@{
+                name = $component.Name
+                path = $null
+                fileVersion = $null
+                productVersion = $null
+              }
+            }
+          }
+
+          [pscustomobject]@{
+            capturedAtUtc = $capturedAt.ToUniversalTime().ToString('o')
+            scenario = $env:MSI_SCENARIO
+            runnerLabel = $env:RUNNER_LABEL
+            runnerHostName = $env:RUNNER_HOST_NAME
+            runnerImageOs = $env:ImageOS
+            runnerImageVersion = $env:ImageVersion
+            edition = $operatingSystem.Caption
+            version = $operatingSystem.Version
+            buildNumber = $operatingSystem.BuildNumber
+            displayVersion = $currentVersion.DisplayVersion
+            updateBuildRevision = $currentVersion.UBR
+            architecture = $operatingSystem.OSArchitecture
+            components = @($components)
+          } | ConvertTo-Json -Depth 4 |
+            Set-Content (Join-Path $destination 'windows-host.json') -Encoding utf8
+
+          & systeminfo.exe /FO LIST |
+            Out-File (Join-Path $destination 'systeminfo.txt') -Encoding utf8
+
+      - name: Enable isolated WUDFHost crash dumps
+        if: matrix.scenario != 'install-no-vhid'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumpDirectory = Join-Path $env:RUNNER_TEMP 'lumen-wudfhost-dumps'
+          New-Item -ItemType Directory -Path $dumpDirectory -Force | Out-Null
+
+          $werKey = `
+            'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\WUDFHost.exe'
+          New-Item -Path $werKey -Force | Out-Null
+          New-ItemProperty `
+            -Path $werKey `
+            -Name DumpFolder `
+            -Value $dumpDirectory `
+            -PropertyType ExpandString `
+            -Force | Out-Null
+          New-ItemProperty `
+            -Path $werKey `
+            -Name DumpCount `
+            -Value 5 `
+            -PropertyType DWord `
+            -Force | Out-Null
+          New-ItemProperty `
+            -Path $werKey `
+            -Name DumpType `
+            -Value 1 `
+            -PropertyType DWord `
+            -Force | Out-Null
+          "UMDF_WER_DUMP_DIR=$dumpDirectory" >> $env:GITHUB_ENV
+
+      - name: Validate generated MSI tables
+        shell: pwsh
+        run: ./.github/scripts/validate-windows-msi.ps1
+
+      - name: Run ${{ matrix.scenario }} MSI scenario
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/test-windows-msi.ps1 -Scenario '${{ matrix.scenario }}'
+
+      - name: Collect MSI and UMDF diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $destination = 'artifacts/installer-diagnostics'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+          $logRoots = @(
+            (Join-Path $env:TEMP 'Sunshine\logs'),
+            (Join-Path $env:SystemRoot 'Temp\Sunshine\logs')
+          ) | Select-Object -Unique
+          foreach ($source in $logRoots) {
+            if (Test-Path -LiteralPath $source -PathType Container) {
+              $name = Split-Path (Split-Path $source -Parent) -Leaf
+              Copy-Item `
+                -LiteralPath $source `
+                -Destination (Join-Path $destination "sunshine-$name") `
+                -Recurse `
+                -Force `
+                -ErrorAction Continue
+            }
+          }
+
+          $setupApiLog = Join-Path $env:SystemRoot 'INF\setupapi.dev.log'
+          if (Test-Path -LiteralPath $setupApiLog -PathType Leaf) {
+            Copy-Item $setupApiLog (Join-Path $destination 'setupapi.dev.log') -Force
+          }
+
+          & pnputil.exe /enum-devices /instanceid 'ROOT\LumenVirtualHid*' /drivers 2>&1 |
+            Out-File (Join-Path $destination 'lumen-vhid-pnp.log') -Encoding utf8
+          try {
+            Get-WinEvent -FilterHashtable @{
+              LogName = 'System'
+              StartTime = (Get-Date).AddMinutes(-30)
+            } -ErrorAction Stop | Where-Object {
+              $_.ProviderName -match 'Kernel-PnP|DriverFrameworks|UserModeDriver'
+            } | Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message |
+              Out-File (Join-Path $destination 'lumen-vhid-events.log') -Encoding utf8
+          } catch {
+            $_ | Out-File (Join-Path $destination 'lumen-vhid-events.log') -Encoding utf8
+          }
+
+          $scenarioStartPath = Join-Path $destination 'scenario-start.txt'
+          $scenarioStart = if (Test-Path -LiteralPath $scenarioStartPath -PathType Leaf) {
+            [DateTimeOffset]::Parse((Get-Content -LiteralPath $scenarioStartPath -Raw))
+          } else {
+            [DateTimeOffset]::UtcNow.AddHours(-1)
+          }
+          $earliestDumpTime = $scenarioStart.UtcDateTime.AddMinutes(-1)
+          $dumpDestination = Join-Path $destination 'crash-dumps'
+          $dumpManifest = [System.Collections.Generic.List[string]]::new()
+          $dumpCount = 0
+
+          function Copy-UmdfDump {
+            param(
+              [Parameter(Mandatory = $true)]
+              [System.IO.FileInfo]$File,
+              [Parameter(Mandatory = $true)]
+              [string]$Source
+            )
+
+            if ($File.LastWriteTimeUtc -lt $earliestDumpTime) {
+              return
+            }
+            New-Item -ItemType Directory -Path $dumpDestination -Force | Out-Null
+            $timestamp = $File.LastWriteTimeUtc.ToString('yyyyMMddTHHmmssfffZ')
+            $fileName = '{0}-{1}-{2}' -f $Source, $timestamp, $File.Name
+            $destinationPath = Join-Path $dumpDestination $fileName
+            Copy-Item -LiteralPath $File.FullName -Destination $destinationPath -Force
+            $hash = (Get-FileHash -LiteralPath $destinationPath -Algorithm SHA256).Hash
+            $dumpManifest.Add(
+              "source=$Source path=$($File.FullName) file=$fileName bytes=$($File.Length) sha256=$hash"
+            )
+            $script:dumpCount++
+          }
+
+          $wdfRoot = Join-Path $env:ProgramData 'Microsoft\WDF'
+          if (Test-Path -LiteralPath $wdfRoot -PathType Container) {
+            Get-ChildItem -LiteralPath $wdfRoot -File -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like 'WudfHost*.mdmp' } |
+              ForEach-Object { Copy-UmdfDump -File $_ -Source 'wdf' }
+          }
+
+          if ($env:UMDF_WER_DUMP_DIR -and
+              (Test-Path -LiteralPath $env:UMDF_WER_DUMP_DIR -PathType Container)) {
+            Get-ChildItem `
+              -LiteralPath $env:UMDF_WER_DUMP_DIR `
+              -File `
+              -Force `
+              -ErrorAction SilentlyContinue | Where-Object {
+                $_.Extension -in @('.dmp', '.mdmp', '.hdmp')
+              } | ForEach-Object { Copy-UmdfDump -File $_ -Source 'wer-localdump' }
+          }
+
+          $werRoots = @(
+            (Join-Path $env:ProgramData 'Microsoft\Windows\WER\ReportArchive'),
+            (Join-Path $env:ProgramData 'Microsoft\Windows\WER\ReportQueue')
+          )
+          foreach ($werRoot in $werRoots) {
+            if (Test-Path -LiteralPath $werRoot -PathType Container) {
+              Get-ChildItem `
+                -LiteralPath $werRoot `
+                -File `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue | Where-Object {
+                  $_.FullName -match '(?i)WUDFHost' -and
+                  $_.Extension -in @('.dmp', '.mdmp', '.hdmp')
+                } | ForEach-Object { Copy-UmdfDump -File $_ -Source 'wer-report' }
+            }
+          }
+
+          if ($dumpCount -gt 0) {
+            $dumpManifest |
+              Set-Content (Join-Path $destination 'umdf-dump-manifest.txt') -Encoding utf8
+            'UMDF_DUMPS_FOUND=true' >> $env:GITHUB_ENV
+          } else {
+            'UMDF_DUMPS_FOUND=false' >> $env:GITHUB_ENV
+          }
+
+      - name: Upload MSI validation logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-msi-${{ matrix.scenario }}-logs
+          path: |
+            artifacts/**/*.log
+            artifacts/installer-diagnostics/*.json
+            artifacts/installer-diagnostics/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Minidumps can contain process memory. Never expose them from a public repository.
+      - name: Upload short-lived private UMDF crash dumps
+        if: >-
+          always() &&
+          env.UMDF_DUMPS_FOUND == 'true' &&
+          github.event.repository.private
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-msi-${{ matrix.scenario }}-umdf-crash-dumps
+          path: artifacts/installer-diagnostics/crash-dumps/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0

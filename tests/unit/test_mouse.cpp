@@ -4,7 +4,95 @@
  */
 #include "../tests_common.h"
 
+#include <cstdint>
+#include <limits>
 #include <src/input.h>
+
+TEST(InputBatchingTest, CheckedAddInt16AcceptsRepresentableSums) {
+  std::int16_t result = 0;
+
+  EXPECT_TRUE(input::detail::checked_add_int16(120, 40, result));
+  EXPECT_EQ(result, 160);
+
+  EXPECT_TRUE(input::detail::checked_add_int16(-120, -40, result));
+  EXPECT_EQ(result, -160);
+
+  EXPECT_TRUE(input::detail::checked_add_int16(std::numeric_limits<std::int16_t>::max(), 0, result));
+  EXPECT_EQ(result, std::numeric_limits<std::int16_t>::max());
+
+  EXPECT_TRUE(input::detail::checked_add_int16(std::numeric_limits<std::int16_t>::min(), 0, result));
+  EXPECT_EQ(result, std::numeric_limits<std::int16_t>::min());
+}
+
+TEST(InputBatchingTest, CheckedAddInt16RejectsOverflow) {
+  constexpr std::int16_t sentinel = 42;
+  std::int16_t result = sentinel;
+
+  EXPECT_FALSE(input::detail::checked_add_int16(std::numeric_limits<std::int16_t>::max(), 1, result));
+  EXPECT_EQ(result, sentinel);
+
+  EXPECT_FALSE(input::detail::checked_add_int16(std::numeric_limits<std::int16_t>::min(), -1, result));
+  EXPECT_EQ(result, sentinel);
+}
+
+TEST(InputBatchingTest, RelativeMouseBatchesRepresentableSums) {
+  std::int16_t dest_x = 100;
+  std::int16_t dest_y = -100;
+
+  EXPECT_TRUE(input::detail::batch_relative_mouse_for_test(dest_x, dest_y, 20, -20));
+  EXPECT_EQ(dest_x, 120);
+  EXPECT_EQ(dest_y, -120);
+}
+
+TEST(InputBatchingTest, RelativeMouseRejectsOverflowWithoutMutation) {
+  std::int16_t dest_x = std::numeric_limits<std::int16_t>::max();
+  std::int16_t dest_y = std::numeric_limits<std::int16_t>::min();
+
+  EXPECT_FALSE(input::detail::batch_relative_mouse_for_test(dest_x, dest_y, 1, -1));
+  EXPECT_EQ(dest_x, std::numeric_limits<std::int16_t>::max());
+  EXPECT_EQ(dest_y, std::numeric_limits<std::int16_t>::min());
+}
+
+TEST(InputBatchingTest, RelativeMouseRejectsVerticalOverflowWithoutPartialMutation) {
+  std::int16_t dest_x = 100;
+  std::int16_t dest_y = std::numeric_limits<std::int16_t>::min();
+
+  EXPECT_FALSE(input::detail::batch_relative_mouse_for_test(dest_x, dest_y, 20, -1));
+  EXPECT_EQ(dest_x, 100);
+  EXPECT_EQ(dest_y, std::numeric_limits<std::int16_t>::min());
+}
+
+TEST(InputBatchingTest, VerticalScrollBatchesRepresentableSums) {
+  std::int16_t dest_primary = 120;
+  std::int16_t dest_secondary = 120;
+
+  EXPECT_TRUE(input::detail::batch_vertical_scroll_for_test(dest_primary, dest_secondary, -40));
+  EXPECT_EQ(dest_primary, 80);
+  EXPECT_EQ(dest_secondary, 80);
+}
+
+TEST(InputBatchingTest, VerticalScrollRejectsOverflowWithoutMutation) {
+  std::int16_t dest_primary = std::numeric_limits<std::int16_t>::max();
+  std::int16_t dest_secondary = std::numeric_limits<std::int16_t>::max();
+
+  EXPECT_FALSE(input::detail::batch_vertical_scroll_for_test(dest_primary, dest_secondary, 1));
+  EXPECT_EQ(dest_primary, std::numeric_limits<std::int16_t>::max());
+  EXPECT_EQ(dest_secondary, std::numeric_limits<std::int16_t>::max());
+}
+
+TEST(InputBatchingTest, HorizontalScrollBatchesRepresentableSums) {
+  std::int16_t dest = -80;
+
+  EXPECT_TRUE(input::detail::batch_horizontal_scroll_for_test(dest, -40));
+  EXPECT_EQ(dest, -120);
+}
+
+TEST(InputBatchingTest, HorizontalScrollRejectsOverflowWithoutMutation) {
+  std::int16_t dest = std::numeric_limits<std::int16_t>::min();
+
+  EXPECT_FALSE(input::detail::batch_horizontal_scroll_for_test(dest, -1));
+  EXPECT_EQ(dest, std::numeric_limits<std::int16_t>::min());
+}
 
 struct MouseHIDTest: PlatformTestSuite, testing::WithParamInterface<util::point_t> {
   void SetUp() override {

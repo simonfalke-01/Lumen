@@ -419,12 +419,26 @@ namespace platf::win_input {
     }
 
     /**
-     * @brief Return the bitmap bit for a valid mouse button.
-     * @param button Moonlight button number.
-     * @return Button bit, or zero when invalid.
+     * @brief Map a Moonlight mouse button constant to its HID report bit.
+     *
+     * @param button Moonlight mouse button constant.
+     * @return HID button bit, or zero when invalid.
      */
     constexpr std::uint8_t mouse_button_bit(int button) noexcept {
-      return button >= 1 && button <= 5 ? static_cast<std::uint8_t>(1U << (button - 1)) : 0;
+      switch (button) {
+        case BUTTON_LEFT:
+          return 0x01;
+        case BUTTON_MIDDLE:
+          return 0x04;
+        case BUTTON_RIGHT:
+          return 0x02;
+        case BUTTON_X1:
+          return 0x08;
+        case BUTTON_X2:
+          return 0x10;
+        default:
+          return 0;
+      }
     }
   }  // namespace
 

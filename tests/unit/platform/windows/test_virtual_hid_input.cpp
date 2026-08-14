@@ -126,6 +126,17 @@ namespace {
   private:
     bool saved_always_send_scancodes_ {false};  ///< Restored mapping setting.
   };
+
+  /** @brief Expected HID bitmap bit for one Moonlight mouse button. */
+  struct virtual_hid_mouse_button_case_t {
+    int button;  ///< Moonlight mouse button constant.
+    std::uint8_t hid_bit;  ///< Expected HID mouse button bit.
+  };
+
+  /** @brief Parameterized fixture covering Virtual HID mouse button mappings. */
+  class virtual_hid_mouse_button_test:
+      public virtual_hid_input_test,
+      public testing::WithParamInterface<virtual_hid_mouse_button_case_t> {};
 }  // namespace
 
 TEST_F(virtual_hid_input_test, InitializesThroughExactLeanOperations) {
@@ -256,6 +267,67 @@ TEST_F(virtual_hid_input_test, BuildsSegmentedRelativeMouseAndWheelReports) {
   EXPECT_EQ(channel->submissions[1].report.relative_mouse.y, -7232);
   EXPECT_EQ(channel->submissions[2].report.relative_mouse.horizontal_wheel, 32767);
   EXPECT_EQ(channel->submissions[3].report.relative_mouse.horizontal_wheel, 7233);
+}
+
+TEST_P(virtual_hid_mouse_button_test, MapsPressAndReleaseToHidBitmap) {
+  initialize();
+  const auto &test_case = GetParam();
+
+  ASSERT_TRUE(transport->mouse_button(test_case.button, false));
+  EXPECT_EQ(transport->acknowledged_mouse_buttons(), test_case.hid_bit);
+  ASSERT_TRUE(transport->mouse_button(test_case.button, true));
+
+  ASSERT_EQ(channel->submissions.size(), 2);
+  EXPECT_EQ(channel->submissions[0].report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
+  EXPECT_EQ(channel->submissions[0].report.relative_mouse.report_id, LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE);
+  EXPECT_EQ(channel->submissions[0].report.relative_mouse.buttons, test_case.hid_bit);
+  EXPECT_EQ(channel->submissions[1].report.relative_mouse.buttons, 0);
+  EXPECT_EQ(transport->acknowledged_mouse_buttons(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  AllButtons,
+  virtual_hid_mouse_button_test,
+  testing::Values(
+    virtual_hid_mouse_button_case_t {BUTTON_LEFT, 0x01},
+    virtual_hid_mouse_button_case_t {BUTTON_MIDDLE, 0x04},
+    virtual_hid_mouse_button_case_t {BUTTON_RIGHT, 0x02},
+    virtual_hid_mouse_button_case_t {BUTTON_X1, 0x08},
+    virtual_hid_mouse_button_case_t {BUTTON_X2, 0x10}
+  )
+);
+
+TEST_F(virtual_hid_input_test, PreservesHeldButtonsAcrossTransitionsAndMovement) {
+  initialize();
+
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_MIDDLE, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_RIGHT, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_X1, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_X2, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_RIGHT, true));
+  ASSERT_TRUE(transport->move_mouse(1, -1));
+
+  ASSERT_EQ(channel->submissions.size(), 7);
+  EXPECT_EQ(channel->submissions[4].report.relative_mouse.buttons, 0x1F);
+  EXPECT_EQ(channel->submissions[5].report.relative_mouse.buttons, 0x1D);
+  EXPECT_EQ(channel->submissions[6].report.relative_mouse.buttons, 0x1D);
+  EXPECT_EQ(transport->acknowledged_mouse_buttons(), 0x1D);
+}
+
+TEST_F(virtual_hid_input_test, RejectsUnknownMouseButtons) {
+  initialize();
+
+  const auto below_range = transport->mouse_button(0, false);
+  const auto above_range = transport->mouse_button(BUTTON_X2 + 1, false);
+
+  EXPECT_FALSE(below_range);
+  EXPECT_EQ(below_range.completion, platf::win_input::completion_t::rejected);
+  EXPECT_EQ(below_range.status, ERROR_INVALID_PARAMETER);
+  EXPECT_FALSE(above_range);
+  EXPECT_EQ(above_range.completion, platf::win_input::completion_t::rejected);
+  EXPECT_EQ(above_range.status, ERROR_INVALID_PARAMETER);
+  EXPECT_TRUE(channel->submissions.empty());
 }
 
 TEST_F(virtual_hid_input_test, FallsBackWhenFirstVirtualReportIsRejected) {
