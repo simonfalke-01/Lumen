@@ -10,9 +10,19 @@ on:
   workflow_dispatch:
     inputs:
       artifact_run_id:
-        description: Existing Windows Build run ID to validate without rebuilding
+        description: Existing successful run ID; skips build/bootstrap and only validates its MSI
         required: false
         type: string
+      validation_scenario:
+        description: MSI scenario to run; select one for fast test-only validation
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - install-no-vhid
+          - install-vhid
+          - upgrade
 
 env:
   PYTHON_VERSION: '3.14'
@@ -57,6 +67,22 @@ jobs:
             $errors | ForEach-Object { Write-Error $_.Message }
             throw 'The Windows installer script contains syntax errors.'
           }
+
+      - name: Cache CMake dependency tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build/_deps
+          key: >-
+            windows-cmake-deps-v1-${{ runner.os }}-${{
+            hashFiles('package-lock.cmake', 'cmake/dependencies/**/*.cmake') }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: >-
+            windows-nuget-wix-v1-${{
+            hashFiles('cmake/packaging/windows_wix.cmake') }}
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba  # v0.0.11
@@ -305,7 +331,8 @@ jobs:
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2.32.0
         with:
           msystem: ucrt64
-          update: true
+          cache: true
+          update: false
           install: >-
             git
             mingw-w64-ucrt-x86_64-boost
@@ -333,6 +360,7 @@ jobs:
         with:
           node-version: 'lts/*'
           cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Export NodeJS path
         shell: pwsh
@@ -350,6 +378,7 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
         with:
           enable-cache: true
+          cache-dependency-glob: uv.lock
 
       - name: Setup Python build tools
         shell: msys2 {0}
@@ -432,29 +461,27 @@ jobs:
           if-no-files-found: error
 
   validate_msi:
-    name: Windows MSI (${{ matrix.scenario }}, ${{ matrix.host_name }})
+    name: >-
+      Windows MSI (${{ matrix.scenario }},
+      ${{ matrix.scenario == 'install-no-vhid' && 'Windows Server 2022' || 'Windows Server 2025' }})
     needs: build_windows
     if: >-
       always() &&
       (inputs.artifact_run_id != '' || needs.build_windows.result == 'success')
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.scenario == 'install-no-vhid' && 'windows-2022' || 'windows-2025' }}
     permissions:
       actions: read
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # The hosted x64 labels used here map to Windows Server, not Windows 11 client.
-          - scenario: install-no-vhid
-            runner: windows-2022
-            host_name: Windows Server 2022
-          - scenario: install-vhid
-            runner: windows-2025
-            host_name: Windows Server 2025
-          - scenario: upgrade
-            runner: windows-2025
-            host_name: Windows Server 2025
+        # The hosted x64 labels used here map to Windows Server, not Windows 11 client.
+        scenario: >-
+          ${{ fromJSON(
+            (inputs.validation_scenario == '' || inputs.validation_scenario == 'all') &&
+            '["install-no-vhid","install-vhid","upgrade"]' ||
+            format('["{0}"]', inputs.validation_scenario)
+          ) }}
     steps:
       - name: Checkout validation scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -474,8 +501,9 @@ jobs:
         shell: pwsh
         env:
           MSI_SCENARIO: ${{ matrix.scenario }}
-          RUNNER_LABEL: ${{ matrix.runner }}
-          RUNNER_HOST_NAME: ${{ matrix.host_name }}
+          RUNNER_LABEL: ${{ matrix.scenario == 'install-no-vhid' && 'windows-2022' || 'windows-2025' }}
+          RUNNER_HOST_NAME: >-
+            ${{ matrix.scenario == 'install-no-vhid' && 'Windows Server 2022' || 'Windows Server 2025' }}
         run: |
           $ErrorActionPreference = 'Stop'
           $destination = 'artifacts/installer-diagnostics'
