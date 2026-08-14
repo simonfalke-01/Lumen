@@ -89,6 +89,34 @@ static NTSTATUS LumenVhidCreateAndStart(LUMEN_VHID_DEVICE_CONTEXT *context) {
 }
 
 /**
+ * Stop VHF and delete the local target created during PrepareHardware.
+ *
+ * The caller must run at PASSIVE_LEVEL and hold state_lock whenever the lock
+ * exists and file or control callbacks can still run. The function is
+ * idempotent so device cleanup can defensively call it after the normal
+ * ReleaseHardware path.
+ *
+ * @param context Device state to return to its unprepared state.
+ */
+static VOID LumenVhidStopAndCloseTarget(LUMEN_VHID_DEVICE_CONTEXT *context) {
+  if (context == NULL) {
+    return;
+  }
+
+  context->ready = FALSE;
+  context->owner_file = NULL;
+  if (context->vhf_handle != NULL) {
+    VhfDelete(context->vhf_handle, TRUE);
+    context->vhf_handle = NULL;
+  }
+  if (context->local_target != NULL) {
+    WdfIoTargetClose(context->local_target);
+    WdfObjectDelete(context->local_target);
+    context->local_target = NULL;
+  }
+}
+
+/**
  * Submit one complete input report through VHF.
  *
  * @param context Device state with a started VHF handle.
@@ -369,13 +397,66 @@ VOID LumenVhidEvtFileCleanup(WDFFILEOBJECT file_object) {
 
 VOID LumenVhidEvtDeviceCleanup(WDFOBJECT device_object) {
   LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device_object);
+  NTSTATUS status;
 
-  if (context->vhf_handle != NULL) {
-    context->ready = FALSE;
-    VhfDelete(context->vhf_handle, TRUE);
-    context->vhf_handle = NULL;
+  if (context->state_lock != NULL) {
+    status = WdfWaitLockAcquire(context->state_lock, NULL);
+    if (NT_SUCCESS(status)) {
+      LumenVhidStopAndCloseTarget(context);
+      WdfWaitLockRelease(context->state_lock);
+      return;
+    }
   }
-  context->owner_file = NULL;
+  LumenVhidStopAndCloseTarget(context);
+}
+
+NTSTATUS LumenVhidEvtDevicePrepareHardware(WDFDEVICE device, WDFCMRESLIST resources_raw, WDFCMRESLIST resources_translated) {
+  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
+  WDF_OBJECT_ATTRIBUTES target_attributes;
+  WDF_IO_TARGET_OPEN_PARAMS open_params;
+  NTSTATUS status;
+
+  UNREFERENCED_PARAMETER(resources_raw);
+  UNREFERENCED_PARAMETER(resources_translated);
+
+  if (context->local_target != NULL || context->vhf_handle != NULL) {
+    return STATUS_INVALID_DEVICE_STATE;
+  }
+
+  WDF_OBJECT_ATTRIBUTES_INIT(&target_attributes);
+  target_attributes.ParentObject = device;
+  status = WdfIoTargetCreate(device, &target_attributes, &context->local_target);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+
+  WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_FILE(&open_params, NULL);
+  status = WdfIoTargetOpen(context->local_target, &open_params);
+  if (!NT_SUCCESS(status)) {
+    LumenVhidStopAndCloseTarget(context);
+    return status;
+  }
+
+  status = LumenVhidCreateAndStart(context);
+  if (!NT_SUCCESS(status)) {
+    LumenVhidStopAndCloseTarget(context);
+  }
+  return status;
+}
+
+NTSTATUS LumenVhidEvtDeviceReleaseHardware(WDFDEVICE device, WDFCMRESLIST resources_translated) {
+  LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device);
+  NTSTATUS status;
+
+  UNREFERENCED_PARAMETER(resources_translated);
+
+  status = WdfWaitLockAcquire(context->state_lock, NULL);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
+  LumenVhidStopAndCloseTarget(context);
+  WdfWaitLockRelease(context->state_lock);
+  return STATUS_SUCCESS;
 }
 
 NTSTATUS LumenVhidEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
@@ -383,8 +464,8 @@ NTSTATUS LumenVhidEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
   WDF_OBJECT_ATTRIBUTES file_attributes;
   WDF_OBJECT_ATTRIBUTES device_attributes;
   WDF_OBJECT_ATTRIBUTES child_attributes;
+  WDF_PNPPOWER_EVENT_CALLBACKS pnp_callbacks;
   WDF_IO_QUEUE_CONFIG queue_config;
-  WDF_IO_TARGET_OPEN_PARAMS open_params;
   WDFDEVICE device;
   LUMEN_VHID_DEVICE_CONTEXT *context;
   NTSTATUS status;
@@ -395,6 +476,11 @@ NTSTATUS LumenVhidEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
   WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&file_attributes, LUMEN_VHID_FILE_CONTEXT);
   file_attributes.ExecutionLevel = WdfExecutionLevelPassive;
   WdfDeviceInitSetFileObjectConfig(device_init, &file_config, &file_attributes);
+
+  WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp_callbacks);
+  pnp_callbacks.EvtDevicePrepareHardware = LumenVhidEvtDevicePrepareHardware;
+  pnp_callbacks.EvtDeviceReleaseHardware = LumenVhidEvtDeviceReleaseHardware;
+  WdfDeviceInitSetPnpPowerEventCallbacks(device_init, &pnp_callbacks);
 
   WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&device_attributes, LUMEN_VHID_DEVICE_CONTEXT);
   device_attributes.ExecutionLevel = WdfExecutionLevelPassive;
@@ -410,20 +496,6 @@ NTSTATUS LumenVhidEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
   WDF_OBJECT_ATTRIBUTES_INIT(&child_attributes);
   child_attributes.ParentObject = device;
   status = WdfWaitLockCreate(&child_attributes, &context->state_lock);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  status = WdfIoTargetCreate(device, &child_attributes, &context->local_target);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-  WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_FILE(&open_params, NULL);
-  status = WdfIoTargetOpen(context->local_target, &open_params);
-  if (!NT_SUCCESS(status)) {
-    return status;
-  }
-
-  status = LumenVhidCreateAndStart(context);
   if (!NT_SUCCESS(status)) {
     return status;
   }

@@ -432,7 +432,7 @@ jobs:
           if-no-files-found: error
 
   validate_msi:
-    name: Windows MSI (${{ matrix.scenario }})
+    name: Windows MSI (${{ matrix.scenario }}, ${{ matrix.host_name }})
     needs: build_windows
     if: >-
       always() &&
@@ -445,12 +445,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The hosted x64 labels used here map to Windows Server, not Windows 11 client.
           - scenario: install-no-vhid
             runner: windows-2022
+            host_name: Windows Server 2022
           - scenario: install-vhid
             runner: windows-2025
+            host_name: Windows Server 2025
           - scenario: upgrade
             runner: windows-2025
+            host_name: Windows Server 2025
     steps:
       - name: Checkout validation scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -466,6 +470,119 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.artifact_run_id || github.run_id }}
 
+      - name: Capture Windows MSI host details
+        shell: pwsh
+        env:
+          MSI_SCENARIO: ${{ matrix.scenario }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+          RUNNER_HOST_NAME: ${{ matrix.host_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $destination = 'artifacts/installer-diagnostics'
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+          $capturedAt = Get-Date
+          $capturedAt.ToUniversalTime().ToString('o') |
+            Set-Content (Join-Path $destination 'scenario-start.txt') -Encoding utf8
+
+          $operatingSystem = Get-CimInstance Win32_OperatingSystem
+          $currentVersion = Get-ItemProperty `
+            'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          $componentPaths = @(
+            @{
+              Name = 'WUDFHost.exe'
+              Candidates = @(
+                (Join-Path $env:SystemRoot 'System32\WUDFHost.exe')
+              )
+            },
+            @{
+              Name = 'WUDFx02000.dll'
+              Candidates = @(
+                (Join-Path $env:SystemRoot 'System32\drivers\UMDF\WUDFx02000.dll'),
+                (Join-Path $env:SystemRoot 'System32\WUDFx02000.dll')
+              )
+            },
+            @{
+              Name = 'VhfUm.dll'
+              Candidates = @(
+                (Join-Path $env:SystemRoot 'System32\drivers\UMDF\VhfUm.dll'),
+                (Join-Path $env:SystemRoot 'System32\VhfUm.dll')
+              )
+            }
+          )
+          $components = foreach ($component in $componentPaths) {
+            $path = $component.Candidates |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+              Select-Object -First 1
+            if ($path) {
+              $file = Get-Item -LiteralPath $path
+              [pscustomobject]@{
+                name = $component.Name
+                path = $file.FullName
+                fileVersion = $file.VersionInfo.FileVersion
+                productVersion = $file.VersionInfo.ProductVersion
+              }
+            } else {
+              [pscustomobject]@{
+                name = $component.Name
+                path = $null
+                fileVersion = $null
+                productVersion = $null
+              }
+            }
+          }
+
+          [pscustomobject]@{
+            capturedAtUtc = $capturedAt.ToUniversalTime().ToString('o')
+            scenario = $env:MSI_SCENARIO
+            runnerLabel = $env:RUNNER_LABEL
+            runnerHostName = $env:RUNNER_HOST_NAME
+            runnerImageOs = $env:ImageOS
+            runnerImageVersion = $env:ImageVersion
+            edition = $operatingSystem.Caption
+            version = $operatingSystem.Version
+            buildNumber = $operatingSystem.BuildNumber
+            displayVersion = $currentVersion.DisplayVersion
+            updateBuildRevision = $currentVersion.UBR
+            architecture = $operatingSystem.OSArchitecture
+            components = @($components)
+          } | ConvertTo-Json -Depth 4 |
+            Set-Content (Join-Path $destination 'windows-host.json') -Encoding utf8
+
+          & systeminfo.exe /FO LIST |
+            Out-File (Join-Path $destination 'systeminfo.txt') -Encoding utf8
+
+      - name: Enable isolated WUDFHost crash dumps
+        if: matrix.scenario != 'install-no-vhid'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumpDirectory = Join-Path $env:RUNNER_TEMP 'lumen-wudfhost-dumps'
+          New-Item -ItemType Directory -Path $dumpDirectory -Force | Out-Null
+
+          $werKey = `
+            'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\WUDFHost.exe'
+          New-Item -Path $werKey -Force | Out-Null
+          New-ItemProperty `
+            -Path $werKey `
+            -Name DumpFolder `
+            -Value $dumpDirectory `
+            -PropertyType ExpandString `
+            -Force | Out-Null
+          New-ItemProperty `
+            -Path $werKey `
+            -Name DumpCount `
+            -Value 5 `
+            -PropertyType DWord `
+            -Force | Out-Null
+          New-ItemProperty `
+            -Path $werKey `
+            -Name DumpType `
+            -Value 1 `
+            -PropertyType DWord `
+            -Force | Out-Null
+          "UMDF_WER_DUMP_DIR=$dumpDirectory" >> $env:GITHUB_ENV
+
       - name: Validate generated MSI tables
         shell: pwsh
         run: ./.github/scripts/validate-windows-msi.ps1
@@ -476,7 +593,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: ./.github/scripts/test-windows-msi.ps1 -Scenario '${{ matrix.scenario }}'
 
-      - name: Collect installer script logs
+      - name: Collect MSI and UMDF diagnostics
         if: always()
         shell: pwsh
         run: |
@@ -518,11 +635,106 @@ jobs:
             $_ | Out-File (Join-Path $destination 'lumen-vhid-events.log') -Encoding utf8
           }
 
+          $scenarioStartPath = Join-Path $destination 'scenario-start.txt'
+          $scenarioStart = if (Test-Path -LiteralPath $scenarioStartPath -PathType Leaf) {
+            [DateTimeOffset]::Parse((Get-Content -LiteralPath $scenarioStartPath -Raw))
+          } else {
+            [DateTimeOffset]::UtcNow.AddHours(-1)
+          }
+          $earliestDumpTime = $scenarioStart.UtcDateTime.AddMinutes(-1)
+          $dumpDestination = Join-Path $destination 'crash-dumps'
+          $dumpManifest = [System.Collections.Generic.List[string]]::new()
+          $dumpCount = 0
+
+          function Copy-UmdfDump {
+            param(
+              [Parameter(Mandatory = $true)]
+              [System.IO.FileInfo]$File,
+              [Parameter(Mandatory = $true)]
+              [string]$Source
+            )
+
+            if ($File.LastWriteTimeUtc -lt $earliestDumpTime) {
+              return
+            }
+            New-Item -ItemType Directory -Path $dumpDestination -Force | Out-Null
+            $timestamp = $File.LastWriteTimeUtc.ToString('yyyyMMddTHHmmssfffZ')
+            $fileName = '{0}-{1}-{2}' -f $Source, $timestamp, $File.Name
+            $destinationPath = Join-Path $dumpDestination $fileName
+            Copy-Item -LiteralPath $File.FullName -Destination $destinationPath -Force
+            $hash = (Get-FileHash -LiteralPath $destinationPath -Algorithm SHA256).Hash
+            $dumpManifest.Add(
+              "source=$Source path=$($File.FullName) file=$fileName bytes=$($File.Length) sha256=$hash"
+            )
+            $script:dumpCount++
+          }
+
+          $wdfRoot = Join-Path $env:ProgramData 'Microsoft\WDF'
+          if (Test-Path -LiteralPath $wdfRoot -PathType Container) {
+            Get-ChildItem -LiteralPath $wdfRoot -File -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like 'WudfHost*.mdmp' } |
+              ForEach-Object { Copy-UmdfDump -File $_ -Source 'wdf' }
+          }
+
+          if ($env:UMDF_WER_DUMP_DIR -and
+              (Test-Path -LiteralPath $env:UMDF_WER_DUMP_DIR -PathType Container)) {
+            Get-ChildItem `
+              -LiteralPath $env:UMDF_WER_DUMP_DIR `
+              -File `
+              -Force `
+              -ErrorAction SilentlyContinue | Where-Object {
+                $_.Extension -in @('.dmp', '.mdmp', '.hdmp')
+              } | ForEach-Object { Copy-UmdfDump -File $_ -Source 'wer-localdump' }
+          }
+
+          $werRoots = @(
+            (Join-Path $env:ProgramData 'Microsoft\Windows\WER\ReportArchive'),
+            (Join-Path $env:ProgramData 'Microsoft\Windows\WER\ReportQueue')
+          )
+          foreach ($werRoot in $werRoots) {
+            if (Test-Path -LiteralPath $werRoot -PathType Container) {
+              Get-ChildItem `
+                -LiteralPath $werRoot `
+                -File `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue | Where-Object {
+                  $_.FullName -match '(?i)WUDFHost' -and
+                  $_.Extension -in @('.dmp', '.mdmp', '.hdmp')
+                } | ForEach-Object { Copy-UmdfDump -File $_ -Source 'wer-report' }
+            }
+          }
+
+          if ($dumpCount -gt 0) {
+            $dumpManifest |
+              Set-Content (Join-Path $destination 'umdf-dump-manifest.txt') -Encoding utf8
+            'UMDF_DUMPS_FOUND=true' >> $env:GITHUB_ENV
+          } else {
+            'UMDF_DUMPS_FOUND=false' >> $env:GITHUB_ENV
+          }
+
       - name: Upload MSI validation logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: windows-msi-${{ matrix.scenario }}-logs
-          path: artifacts/**/*.log
+          path: |
+            artifacts/**/*.log
+            artifacts/installer-diagnostics/*.json
+            artifacts/installer-diagnostics/*.txt
           if-no-files-found: warn
           retention-days: 14
+
+      # Minidumps can contain process memory. Never expose them from a public repository.
+      - name: Upload short-lived private UMDF crash dumps
+        if: >-
+          always() &&
+          env.UMDF_DUMPS_FOUND == 'true' &&
+          github.event.repository.private
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-msi-${{ matrix.scenario }}-umdf-crash-dumps
+          path: artifacts/installer-diagnostics/crash-dumps/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0

@@ -28,7 +28,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LUMEN_VHID_FILE_CONTEXT, LumenVhidGetFileCont
 /** Per-device VHF transport and exact open-file ownership state. */
 typedef struct LUMEN_VHID_DEVICE_CONTEXT {
   WDFDEVICE device;  ///< Owning UMDF device.
-  WDFIOTARGET local_target;  ///< Open local target that supplies VHF's UMDF handle.
+  WDFIOTARGET local_target;  ///< PrepareHardware-owned local target supplying VHF's UMDF handle.
   VHFHANDLE vhf_handle;  ///< Started virtual HID device, or NULL when unavailable.
   WDFWAITLOCK state_lock;  ///< Serializes ownership, report submission, and VHF reset.
   WDFFILEOBJECT owner_file;  ///< Exact framework file that currently owns submission.
@@ -39,8 +39,12 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LUMEN_VHID_DEVICE_CONTEXT, LumenVhidGetDevice
 
 /** Initialize the UMDF 2 driver object. */
 DRIVER_INITIALIZE DriverEntry;
-/** Create the VHF source device, control interface, and default I/O queue. */
+/** Create the source device, register PnP callbacks, interface, and I/O queue. */
 EVT_WDF_DRIVER_DEVICE_ADD LumenVhidEvtDeviceAdd;
+/** Open the local target and start VHF after the PnP stack is prepared. */
+EVT_WDF_DEVICE_PREPARE_HARDWARE LumenVhidEvtDevicePrepareHardware;
+/** Stop VHF and close the local target before hardware resources are released. */
+EVT_WDF_DEVICE_RELEASE_HARDWARE LumenVhidEvtDeviceReleaseHardware;
 /** Dispatch the four exact METHOD_BUFFERED control operations. */
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL LumenVhidEvtIoDeviceControl;
 /** Reset VHF and release ownership held by a closing file. */

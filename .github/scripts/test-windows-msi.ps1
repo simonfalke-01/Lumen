@@ -96,6 +96,20 @@ Set-Content -LiteralPath '$escapedExit' -Value `$probeExitCode -NoNewline
     }
 }
 
+function Restart-VirtualHidDevice {
+    $devices = @(Get-CimInstance Win32_PnPEntity | Where-Object {
+        @($_.HardwareID) -contains 'ROOT\LumenVirtualHid'
+    })
+    if ($devices.Count -ne 1) {
+        throw "Expected one Lumen Virtual HID root before restart; found $($devices.Count)."
+    }
+
+    & pnputil.exe /restart-device $devices[0].PNPDeviceID
+    if ($LASTEXITCODE -ne 0) {
+        throw "Virtual HID device restart failed with exit code $LASTEXITCODE."
+    }
+}
+
 switch ($Scenario) {
     'install-no-vhid' {
         [void](Invoke-Msi `
@@ -116,6 +130,8 @@ switch ($Scenario) {
             -Arguments @('/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=1') `
             -LogName 'lumen-msi-install-vhid.log' `
             -FailureMessage 'MSI install with Virtual HID failed.')
+        Assert-VirtualHidHealthy -FailureLog 'lumen-msi-install-vhid.log'
+        Restart-VirtualHidDevice
         Assert-VirtualHidHealthy -FailureLog 'lumen-msi-install-vhid.log'
         [void](Invoke-Msi `
             -Arguments @('/x', $productCode, '/qn', '/norestart') `

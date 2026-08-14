@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <devpkey.h>
 #include <hidsdi.h>
 #include <iomanip>
 #include <iostream>
@@ -144,6 +145,16 @@ namespace {
     DWORD error = ERROR_SUCCESS;
   };
 
+  /** ConfigMgr diagnostic captured from the first unhealthy device node. */
+  struct pnp_diagnostic {
+    ULONG status = 0;  ///< Device-node status flags from CM_Get_DevNode_Status.
+    ULONG problem = 0;  ///< Configuration Manager problem code.
+    DWORD problem_status = 0;  ///< NTSTATUS value associated with the problem.
+    CONFIGRET error = CR_SUCCESS;  ///< Last ConfigMgr traversal error.
+    bool status_available = false;  ///< Whether status and problem contain valid values.
+    bool problem_status_available = false;  ///< Whether problem_status contains a valid value.
+  };
+
   /** Started HID collections published by the Lumen transport. */
   struct collection_inventory {
     unsigned keyboard_count = 0;
@@ -250,6 +261,7 @@ namespace {
       DWORD code;
       const wchar_t *message;
     };
+
     static constexpr known_setupapi_error known_errors[] = {
       {0xE0000219u, L"The installation failed because a function driver was not specified for this device instance."},
       {0xE0000231u, L"A device cannot be removed because one of its descendants vetoed the removal."},
@@ -275,8 +287,21 @@ namespace {
     return exit_code::mutation_failed;
   }
 
-  /** Emit a stable machine-readable diagnostic and return its exit code. */
-  int fail(exit_code code, std::wstring_view operation, DWORD error) {
+  /**
+   * @brief Emit a stable machine-readable diagnostic and return its exit code.
+   *
+   * @param code Stable process exit code.
+   * @param operation Operation that failed.
+   * @param error Win32 or SetupAPI error associated with the failure.
+   * @param pnp Optional diagnostic for an unhealthy PnP device node.
+   * @return Numeric process exit code.
+   */
+  int fail(
+    exit_code code,
+    std::wstring_view operation,
+    DWORD error,
+    const pnp_diagnostic *pnp = nullptr
+  ) {
     std::wcerr << L"result=error code=" << static_cast<int>(code)
                << L" operation=" << operation;
     if (error != ERROR_SUCCESS) {
@@ -284,6 +309,19 @@ namespace {
                  << L" hex=\"0x" << std::uppercase << std::hex << std::setw(8) << std::setfill(L'0') << error
                  << std::dec << std::nouppercase << std::setfill(L' ')
                  << L"\" message=\"" << setupapi_message(error) << L'\"';
+    }
+    if (pnp != nullptr && pnp->status_available) {
+      std::wcerr << L" cm_status=" << pnp->status
+                 << L" cm_problem=" << pnp->problem;
+      if (pnp->problem_status_available) {
+        std::wcerr << L" problem_status=" << pnp->problem_status
+                   << L" problem_status_hex=\"0x" << std::uppercase << std::hex << std::setw(8)
+                   << std::setfill(L'0') << pnp->problem_status
+                   << std::dec << std::nouppercase << std::setfill(L' ') << L'\"';
+      }
+    }
+    if (pnp != nullptr && pnp->error != CR_SUCCESS) {
+      std::wcerr << L" cm_error=" << pnp->error;
     }
     std::wcerr << L'\n';
     return static_cast<int>(code);
@@ -348,37 +386,95 @@ namespace {
     return result;
   }
 
-  /** Verify that every descendant of the Lumen root node started without a PnP problem. */
-  bool descendants_started(DEVINST parent, ULONG &problem, CONFIGRET &error) {
-    DEVINST child = 0;
-    error = CM_Get_Child(&child, parent, 0);
-    if (error == CR_NO_SUCH_DEVNODE) {
-      error = CR_SUCCESS;
+  /**
+   * @brief Query the kernel problem status associated with one unhealthy device node.
+   *
+   * @param device Device node to query.
+   * @param diagnostic Diagnostic updated when the property is available and well-typed.
+   */
+  void query_problem_status(DEVINST device, pnp_diagnostic &diagnostic) {
+    DEVPROPTYPE property_type = DEVPROP_TYPE_EMPTY;
+    ULONG size = sizeof(diagnostic.problem_status);
+    diagnostic.problem_status_available =
+      CM_Get_DevNode_PropertyW(
+        device,
+        &DEVPKEY_Device_ProblemStatus,
+        &property_type,
+        reinterpret_cast<PBYTE>(&diagnostic.problem_status),
+        &size,
+        0
+      ) == CR_SUCCESS &&
+      property_type == DEVPROP_TYPE_NTSTATUS && size == sizeof(diagnostic.problem_status);
+  }
+
+  /**
+   * @brief Verify that one device node started without a PnP problem.
+   *
+   * @param device Device node to inspect.
+   * @param diagnostic Diagnostic populated when the node is unhealthy.
+   * @return true if the node is started and has no PnP problem.
+   */
+  bool device_started(DEVINST device, pnp_diagnostic &diagnostic) {
+    ULONG status = 0;
+    ULONG problem = 0;
+    diagnostic.error = CM_Get_DevNode_Status(&status, &problem, device, 0);
+    if (diagnostic.error != CR_SUCCESS) {
+      return false;
+    }
+    if ((status & DN_STARTED) != 0 && (status & DN_HAS_PROBLEM) == 0) {
       return true;
     }
-    if (error != CR_SUCCESS) {
+    diagnostic.status = status;
+    diagnostic.problem = problem;
+    diagnostic.status_available = true;
+    query_problem_status(device, diagnostic);
+    return false;
+  }
+
+  /**
+   * @brief Verify that every descendant of the Lumen root node started without a PnP problem.
+   *
+   * @param parent Parent whose descendants should be inspected.
+   * @param diagnostic Diagnostic populated from the first unhealthy descendant.
+   * @return true if every descendant is started and has no PnP problem.
+   */
+  bool descendants_started(DEVINST parent, pnp_diagnostic &diagnostic) {
+    DEVINST child = 0;
+    diagnostic.error = CM_Get_Child(&child, parent, 0);
+    if (diagnostic.error == CR_NO_SUCH_DEVNODE) {
+      diagnostic.error = CR_SUCCESS;
+      return true;
+    }
+    if (diagnostic.error != CR_SUCCESS) {
       return false;
     }
 
     for (;;) {
-      ULONG child_status = 0;
-      problem = 0;
-      error = CM_Get_DevNode_Status(&child_status, &problem, child, 0);
-      if (error != CR_SUCCESS || (child_status & DN_STARTED) == 0 ||
-          (child_status & DN_HAS_PROBLEM) != 0 || !descendants_started(child, problem, error)) {
+      if (!device_started(child, diagnostic) || !descendants_started(child, diagnostic)) {
         return false;
       }
       DEVINST sibling = 0;
-      error = CM_Get_Sibling(&sibling, child, 0);
-      if (error == CR_NO_SUCH_DEVNODE) {
-        error = CR_SUCCESS;
+      diagnostic.error = CM_Get_Sibling(&sibling, child, 0);
+      if (diagnostic.error == CR_NO_SUCH_DEVNODE) {
+        diagnostic.error = CR_SUCCESS;
         return true;
       }
-      if (error != CR_SUCCESS) {
+      if (diagnostic.error != CR_SUCCESS) {
         return false;
       }
       child = sibling;
     }
+  }
+
+  /**
+   * @brief Verify that the Lumen root and all of its descendants started successfully.
+   *
+   * @param root Root device node to inspect.
+   * @param diagnostic Diagnostic populated from the first unhealthy device node.
+   * @return true if the complete device tree started without a PnP problem.
+   */
+  bool device_tree_started(DEVINST root, pnp_diagnostic &diagnostic) {
+    return device_started(root, diagnostic) && descendants_started(root, diagnostic);
   }
 
   /** Read the top-level HID capabilities for a Lumen collection. */
@@ -816,8 +912,13 @@ namespace {
     for (const SP_DEVINFO_DATA &device : devices.devices) {
       if (CM_Get_DevNode_Status(&device_status, &problem, device.DevInst, 0) == CR_SUCCESS &&
           (device_status & DN_STARTED) != 0) {
+        pnp_diagnostic diagnostic;
         started = true;
-        children_started = descendants_started(device.DevInst, problem, child_error);
+        children_started = descendants_started(device.DevInst, diagnostic);
+        if (!children_started) {
+          problem = diagnostic.problem;
+          child_error = diagnostic.error;
+        }
         break;
       }
     }
@@ -970,13 +1071,16 @@ namespace {
     }
 
     if (!reboot) {
+      pnp_diagnostic last_pnp_diagnostic;
       for (int attempt = 0; attempt < kInterfaceWaitAttempts; ++attempt) {
         auto installed_devices = enumerate_devices(DIGCF_ALLCLASSES | DIGCF_PRESENT);
-        ULONG child_problem = 0;
-        CONFIGRET child_error = CR_SUCCESS;
+        pnp_diagnostic diagnostic;
         const bool children_started = installed_devices.error == ERROR_SUCCESS &&
                                       installed_devices.devices.size() == 1 &&
-                                      descendants_started(installed_devices.devices[0].DevInst, child_problem, child_error);
+                                      device_tree_started(installed_devices.devices[0].DevInst, diagnostic);
+        if (diagnostic.status_available || diagnostic.error != CR_SUCCESS) {
+          last_pnp_diagnostic = diagnostic;
+        }
         if (*generation == package_generation::legacy_007 && children_started) {
           std::wcout << L"result=success action=install-or-update hardware_id=\""
                      << LUMEN_VHID_ROOT_HARDWARE_ID_W << L"\" package=legacy-0.0.7\n";
@@ -1002,7 +1106,7 @@ namespace {
         }
         Sleep(100);
       }
-      return fail(exit_code::mutation_failed, L"verify-interface", ERROR_NOT_READY);
+      return fail(exit_code::mutation_failed, L"verify-interface", ERROR_NOT_READY, &last_pnp_diagnostic);
     }
 
     std::wcout << L"result=reboot-required action=install-or-update hardware_id=\""
