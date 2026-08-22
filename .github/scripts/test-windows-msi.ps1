@@ -188,15 +188,49 @@ switch ($Scenario) {
             -LogName 'lumen-msi-install-vmic.log' `
             -FailureMessage 'MSI install with Virtual Microphone failed.')
         $helper = 'C:\Program Files\Lumen\tools\lumen-vmicctl.exe'
-        & $helper status --json
-        if ($LASTEXITCODE -ne 0) {
+        $statusOutput = @(& $helper status --json)
+        $statusExitCode = $LASTEXITCODE
+        $statusText = ($statusOutput -join [Environment]::NewLine).Trim()
+        Write-Host $statusText
+        try {
+            $status = $statusText | ConvertFrom-Json -ErrorAction Stop
+        } catch {
             Get-Content (Join-Path $artifactDirectory 'lumen-msi-install-vmic.log')
-            throw "Virtual Microphone status failed with exit code $LASTEXITCODE."
+            throw "Virtual Microphone status did not return valid JSON: $($_.Exception.Message)"
         }
-        & $helper probe --json
-        if ($LASTEXITCODE -ne 0) {
+        if ($statusExitCode -ne 3 -or
+            $status.state -ne 'unhealthy' -or
+            [int]$status.rootDevices -ne 1 -or
+            [int]$status.activeCaptureEndpoints -lt 1 -or
+            [int]$status.captureEndpoints -ne 1 -or
+            $status.control -ne 'inaccessible') {
             Get-Content (Join-Path $artifactDirectory 'lumen-msi-install-vmic.log')
-            throw "Virtual Microphone protocol probe failed with exit code $LASTEXITCODE."
+            throw (
+                'Virtual Microphone runneradmin status contract mismatch: ' +
+                "exit=$statusExitCode state='$($status.state)' " +
+                "rootDevices=$($status.rootDevices) " +
+                "activeCaptureEndpoints=$($status.activeCaptureEndpoints) " +
+                "captureEndpoints=$($status.captureEndpoints) " +
+                "control='$($status.control)'."
+            )
+        }
+
+        $probeOutput = @(& $helper probe --json)
+        $probeExitCode = $LASTEXITCODE
+        $probeText = ($probeOutput -join [Environment]::NewLine).Trim()
+        Write-Host $probeText
+        try {
+            $probe = $probeText | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            Get-Content (Join-Path $artifactDirectory 'lumen-msi-install-vmic.log')
+            throw "Virtual Microphone probe did not return valid JSON: $($_.Exception.Message)"
+        }
+        if ($probeExitCode -ne 3 -or $probe.state -ne 'inaccessible') {
+            Get-Content (Join-Path $artifactDirectory 'lumen-msi-install-vmic.log')
+            throw (
+                'Virtual Microphone runneradmin probe contract mismatch: ' +
+                "exit=$probeExitCode state='$($probe.state)'."
+            )
         }
         [void](Invoke-Msi `
             -Arguments @('/x', $productCode, '/qn', '/norestart') `
