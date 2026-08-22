@@ -1315,10 +1315,10 @@ ByteDisplacement - # of bytes to process.
     {
         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
 
-        ASSERT((runWrite % sizeof(int16_t)) == 0u);
+        ASSERT((runWrite % sizeof(lumen_vmic_int16_t)) == 0u);
         LumenVirtualMicrophoneControlReadFrames(
-            reinterpret_cast<int16_t*>(m_pDmaBuffer + bufferOffset),
-            runWrite / sizeof(int16_t));
+            reinterpret_cast<lumen_vmic_int16_t*>(m_pDmaBuffer + bufferOffset),
+            runWrite / sizeof(lumen_vmic_int16_t));
 
         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
         ByteDisplacement -= runWrite;

@@ -5,8 +5,17 @@
 
 #include "LumenPcmRing.h"
 
-#include <limits.h>
-#include <string.h>
+#if defined(LUMEN_VMIC_KERNEL)
+  #define LUMEN_PCM_UINT64_MAX MAXUINT64
+  #define LumenPcmCopy(destination, source, bytes) RtlCopyMemory((destination), (source), (bytes))
+  #define LumenPcmZero(destination, bytes) RtlZeroMemory((destination), (bytes))
+#else
+  #include <stdint.h>
+  #include <string.h>
+  #define LUMEN_PCM_UINT64_MAX UINT64_MAX
+  #define LumenPcmCopy(destination, source, bytes) memcpy((destination), (source), (bytes))
+  #define LumenPcmZero(destination, bytes) memset((destination), 0, (bytes))
+#endif
 
 /**
  * Saturating addition for lifetime counters.
@@ -15,33 +24,37 @@
  * @param increment Value to add.
  * @return Saturated sum.
  */
-static uint64_t LumenPcmSaturatingAdd(uint64_t current, size_t increment) {
-  const uint64_t converted = (uint64_t) increment;
+static lumen_pcm_uint64_t LumenPcmSaturatingAdd(lumen_pcm_uint64_t current, lumen_pcm_size_t increment) {
+  const lumen_pcm_uint64_t converted = (lumen_pcm_uint64_t) increment;
 
-  if (converted > UINT64_MAX - current) {
-    return UINT64_MAX;
+  if (converted > LUMEN_PCM_UINT64_MAX - current) {
+    return LUMEN_PCM_UINT64_MAX;
   }
   return current + converted;
 }
 
-int LumenPcmRingInitialize(LUMEN_PCM_RING *ring, int16_t *storage, size_t capacity_frames) {
+int LumenPcmRingInitialize(LUMEN_PCM_RING *ring, lumen_pcm_int16_t *storage, lumen_pcm_size_t capacity_frames) {
   if (ring == NULL || storage == NULL || capacity_frames == 0u) {
     return 0;
   }
 
-  memset(ring, 0, sizeof(*ring));
+  LumenPcmZero(ring, sizeof(*ring));
   ring->storage = storage;
   ring->capacity_frames = capacity_frames;
   return 1;
 }
 
-size_t LumenPcmRingSubmit(LUMEN_PCM_RING *ring, const int16_t *frames, size_t frame_count) {
-  size_t input_offset = 0u;
-  size_t retained_frames = frame_count;
-  size_t free_frames;
-  size_t dropped_frames = 0u;
-  size_t write_index;
-  size_t first_copy;
+lumen_pcm_size_t LumenPcmRingSubmit(
+  LUMEN_PCM_RING *ring,
+  const lumen_pcm_int16_t *frames,
+  lumen_pcm_size_t frame_count
+) {
+  lumen_pcm_size_t input_offset = 0u;
+  lumen_pcm_size_t retained_frames = frame_count;
+  lumen_pcm_size_t free_frames;
+  lumen_pcm_size_t dropped_frames = 0u;
+  lumen_pcm_size_t write_index;
+  lumen_pcm_size_t first_copy;
 
   if (ring == NULL || ring->storage == NULL || ring->capacity_frames == 0u || frames == NULL || frame_count == 0u) {
     return 0u;
@@ -55,7 +68,7 @@ size_t LumenPcmRingSubmit(LUMEN_PCM_RING *ring, const int16_t *frames, size_t fr
 
   free_frames = ring->capacity_frames - ring->queued_frames;
   if (retained_frames > free_frames) {
-    const size_t queued_to_drop = retained_frames - free_frames;
+    const lumen_pcm_size_t queued_to_drop = retained_frames - free_frames;
     ring->read_index = (ring->read_index + queued_to_drop) % ring->capacity_frames;
     ring->queued_frames -= queued_to_drop;
     dropped_frames += queued_to_drop;
@@ -67,9 +80,13 @@ size_t LumenPcmRingSubmit(LUMEN_PCM_RING *ring, const int16_t *frames, size_t fr
     first_copy = ring->capacity_frames - write_index;
   }
 
-  memcpy(&ring->storage[write_index], &frames[input_offset], first_copy * sizeof(frames[0]));
+  LumenPcmCopy(&ring->storage[write_index], &frames[input_offset], first_copy * sizeof(frames[0]));
   if (first_copy < retained_frames) {
-    memcpy(ring->storage, &frames[input_offset + first_copy], (retained_frames - first_copy) * sizeof(frames[0]));
+    LumenPcmCopy(
+      ring->storage,
+      &frames[input_offset + first_copy],
+      (retained_frames - first_copy) * sizeof(frames[0])
+    );
   }
 
   ring->queued_frames += retained_frames;
@@ -78,9 +95,13 @@ size_t LumenPcmRingSubmit(LUMEN_PCM_RING *ring, const int16_t *frames, size_t fr
   return retained_frames;
 }
 
-size_t LumenPcmRingRead(LUMEN_PCM_RING *ring, int16_t *output, size_t frame_count) {
-  size_t available_frames;
-  size_t first_copy;
+lumen_pcm_size_t LumenPcmRingRead(
+  LUMEN_PCM_RING *ring,
+  lumen_pcm_int16_t *output,
+  lumen_pcm_size_t frame_count
+) {
+  lumen_pcm_size_t available_frames;
+  lumen_pcm_size_t first_copy;
 
   if (ring == NULL || ring->storage == NULL || ring->capacity_frames == 0u || output == NULL || frame_count == 0u) {
     return 0u;
@@ -95,12 +116,12 @@ size_t LumenPcmRingRead(LUMEN_PCM_RING *ring, int16_t *output, size_t frame_coun
     first_copy = ring->capacity_frames - ring->read_index;
   }
 
-  memcpy(output, &ring->storage[ring->read_index], first_copy * sizeof(output[0]));
+  LumenPcmCopy(output, &ring->storage[ring->read_index], first_copy * sizeof(output[0]));
   if (first_copy < available_frames) {
-    memcpy(&output[first_copy], ring->storage, (available_frames - first_copy) * sizeof(output[0]));
+    LumenPcmCopy(&output[first_copy], ring->storage, (available_frames - first_copy) * sizeof(output[0]));
   }
   if (available_frames < frame_count) {
-    memset(&output[available_frames], 0, (frame_count - available_frames) * sizeof(output[0]));
+    LumenPcmZero(&output[available_frames], (frame_count - available_frames) * sizeof(output[0]));
   }
 
   ring->read_index = (ring->read_index + available_frames) % ring->capacity_frames;

@@ -15,8 +15,24 @@
 #ifndef LUMEN_PLATFORM_WINDOWS_VIRTUAL_MICROPHONE_PROTOCOL_H
 #define LUMEN_PLATFORM_WINDOWS_VIRTUAL_MICROPHONE_PROTOCOL_H
 
-#include <stddef.h>
-#include <stdint.h>
+#if defined(LUMEN_VMIC_KERNEL)
+  #include <ntddk.h>
+typedef UINT8 lumen_vmic_uint8_t;
+typedef UINT16 lumen_vmic_uint16_t;
+typedef UINT32 lumen_vmic_uint32_t;
+typedef UINT64 lumen_vmic_uint64_t;
+typedef INT16 lumen_vmic_int16_t;
+  #define LUMEN_VMIC_OFFSETOF(type, member) FIELD_OFFSET(type, member)
+#else
+  #include <stddef.h>
+  #include <stdint.h>
+typedef uint8_t lumen_vmic_uint8_t;
+typedef uint16_t lumen_vmic_uint16_t;
+typedef uint32_t lumen_vmic_uint32_t;
+typedef uint64_t lumen_vmic_uint64_t;
+typedef int16_t lumen_vmic_int16_t;
+  #define LUMEN_VMIC_OFFSETOF(type, member) offsetof(type, member)
+#endif
 
 #ifndef CTL_CODE
   #define CTL_CODE(DeviceType, Function, Method, Access) \
@@ -79,49 +95,49 @@ extern "C" {
 
   /** Exact response returned by IOCTL_LUMEN_VMIC_QUERY_ABI. */
   typedef struct LUMEN_VMIC_QUERY_ABI_RESPONSE {
-    uint32_t abi_version;  ///< LUMEN_VMIC_ABI_VERSION.
-    uint32_t sample_rate_hz;  ///< LUMEN_VMIC_SAMPLE_RATE_HZ.
-    uint16_t channel_count;  ///< LUMEN_VMIC_CHANNEL_COUNT.
-    uint16_t bits_per_sample;  ///< LUMEN_VMIC_BITS_PER_SAMPLE.
-    uint32_t max_write_frames;  ///< LUMEN_VMIC_MAX_WRITE_FRAMES.
+    lumen_vmic_uint32_t abi_version;  ///< LUMEN_VMIC_ABI_VERSION.
+    lumen_vmic_uint32_t sample_rate_hz;  ///< LUMEN_VMIC_SAMPLE_RATE_HZ.
+    lumen_vmic_uint16_t channel_count;  ///< LUMEN_VMIC_CHANNEL_COUNT.
+    lumen_vmic_uint16_t bits_per_sample;  ///< LUMEN_VMIC_BITS_PER_SAMPLE.
+    lumen_vmic_uint32_t max_write_frames;  ///< LUMEN_VMIC_MAX_WRITE_FRAMES.
   } LUMEN_VMIC_QUERY_ABI_RESPONSE;
 
   /** Exact input accepted by IOCTL_LUMEN_VMIC_OPEN_STREAM. */
   typedef struct LUMEN_VMIC_OPEN_STREAM_REQUEST {
-    uint64_t requested_generation;  ///< Non-secret generation selected by the host.
-    uint32_t sample_rate_hz;  ///< Must be LUMEN_VMIC_SAMPLE_RATE_HZ.
-    uint16_t channel_count;  ///< Must be LUMEN_VMIC_CHANNEL_COUNT.
-    uint16_t bits_per_sample;  ///< Must be LUMEN_VMIC_BITS_PER_SAMPLE.
+    lumen_vmic_uint64_t requested_generation;  ///< Non-secret generation selected by the host.
+    lumen_vmic_uint32_t sample_rate_hz;  ///< Must be LUMEN_VMIC_SAMPLE_RATE_HZ.
+    lumen_vmic_uint16_t channel_count;  ///< Must be LUMEN_VMIC_CHANNEL_COUNT.
+    lumen_vmic_uint16_t bits_per_sample;  ///< Must be LUMEN_VMIC_BITS_PER_SAMPLE.
   } LUMEN_VMIC_OPEN_STREAM_REQUEST;
 
   /** Exact fixed-size input accepted by IOCTL_LUMEN_VMIC_WRITE_PCM. */
   typedef struct LUMEN_VMIC_WRITE_PCM_REQUEST {
-    uint64_t generation;  ///< Active stream generation.
-    uint32_t frame_count;  ///< Valid mono samples in the trailing array.
-    int16_t samples[LUMEN_VMIC_MAX_WRITE_FRAMES];  ///< Signed little-endian mono PCM.
+    lumen_vmic_uint64_t generation;  ///< Active stream generation.
+    lumen_vmic_uint32_t frame_count;  ///< Valid mono samples in the trailing array.
+    lumen_vmic_int16_t samples[LUMEN_VMIC_MAX_WRITE_FRAMES];  ///< Signed little-endian mono PCM.
   } LUMEN_VMIC_WRITE_PCM_REQUEST;
 
   /** Exact input accepted by IOCTL_LUMEN_VMIC_RESET. */
   typedef struct LUMEN_VMIC_RESET_REQUEST {
-    uint64_t generation;  ///< Active stream generation being reset.
+    lumen_vmic_uint64_t generation;  ///< Active stream generation being reset.
   } LUMEN_VMIC_RESET_REQUEST;
 
   /** Exact response returned by IOCTL_LUMEN_VMIC_QUERY_STATS. */
   typedef struct LUMEN_VMIC_QUERY_STATS_RESPONSE {
-    uint64_t generation;  ///< Active generation, or zero when no stream is open.
-    uint64_t accepted_frames;  ///< PCM frames admitted to the bounded FIFO.
-    uint64_t stale_writes;  ///< Writes rejected for a generation mismatch.
-    uint64_t overflow_drops;  ///< Oldest frames discarded to preserve live latency.
-    uint64_t underflow_samples;  ///< Silence samples emitted while the FIFO was empty.
-    uint64_t resets;  ///< Completed FIFO and generation resets.
-    uint32_t current_fill_frames;  ///< Frames currently buffered for capture.
-    uint32_t capacity_frames;  ///< Maximum bounded FIFO capacity in frames.
+    lumen_vmic_uint64_t generation;  ///< Active generation, or zero when no stream is open.
+    lumen_vmic_uint64_t accepted_frames;  ///< PCM frames admitted to the bounded FIFO.
+    lumen_vmic_uint64_t stale_writes;  ///< Writes rejected for a generation mismatch.
+    lumen_vmic_uint64_t overflow_drops;  ///< Oldest frames discarded to preserve live latency.
+    lumen_vmic_uint64_t underflow_samples;  ///< Silence samples emitted while the FIFO was empty.
+    lumen_vmic_uint64_t resets;  ///< Completed FIFO and generation resets.
+    lumen_vmic_uint32_t current_fill_frames;  ///< Frames currently buffered for capture.
+    lumen_vmic_uint32_t capacity_frames;  ///< Maximum bounded FIFO capacity in frames.
   } LUMEN_VMIC_QUERY_STATS_RESPONSE;
 
 #pragma pack(pop)
 
 /** Byte count preceding samples in the fixed-size write request. */
-#define LUMEN_VMIC_WRITE_PCM_HEADER_SIZE offsetof(LUMEN_VMIC_WRITE_PCM_REQUEST, samples)
+#define LUMEN_VMIC_WRITE_PCM_HEADER_SIZE LUMEN_VMIC_OFFSETOF(LUMEN_VMIC_WRITE_PCM_REQUEST, samples)
 /** Maximum byte count accepted by IOCTL_LUMEN_VMIC_WRITE_PCM. */
 #define LUMEN_VMIC_MAX_WRITE_PCM_REQUEST_SIZE sizeof(LUMEN_VMIC_WRITE_PCM_REQUEST)
 
@@ -129,14 +145,14 @@ extern "C" {
   typedef char lumen_vmic_static_assert_##name[(expression) ? 1 : -1]
 
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_QUERY_ABI_RESPONSE) == 16, query_abi_response_size);
-  LUMEN_VMIC_STATIC_ASSERT(offsetof(LUMEN_VMIC_QUERY_ABI_RESPONSE, max_write_frames) == 12, max_write_frames_offset);
+  LUMEN_VMIC_STATIC_ASSERT(LUMEN_VMIC_OFFSETOF(LUMEN_VMIC_QUERY_ABI_RESPONSE, max_write_frames) == 12, max_write_frames_offset);
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_OPEN_STREAM_REQUEST) == 16, open_stream_request_size);
-  LUMEN_VMIC_STATIC_ASSERT(offsetof(LUMEN_VMIC_OPEN_STREAM_REQUEST, sample_rate_hz) == 8, open_stream_format_offset);
+  LUMEN_VMIC_STATIC_ASSERT(LUMEN_VMIC_OFFSETOF(LUMEN_VMIC_OPEN_STREAM_REQUEST, sample_rate_hz) == 8, open_stream_format_offset);
   LUMEN_VMIC_STATIC_ASSERT(LUMEN_VMIC_WRITE_PCM_HEADER_SIZE == 12, write_pcm_header_size);
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_WRITE_PCM_REQUEST) == 1932, write_pcm_request_size);
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_RESET_REQUEST) == 8, reset_request_size);
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_QUERY_STATS_RESPONSE) == 56, query_stats_response_size);
-  LUMEN_VMIC_STATIC_ASSERT(offsetof(LUMEN_VMIC_QUERY_STATS_RESPONSE, current_fill_frames) == 48, current_fill_offset);
+  LUMEN_VMIC_STATIC_ASSERT(LUMEN_VMIC_OFFSETOF(LUMEN_VMIC_QUERY_STATS_RESPONSE, current_fill_frames) == 48, current_fill_offset);
   LUMEN_VMIC_STATIC_ASSERT((IOCTL_LUMEN_VMIC_QUERY_ABI & 3u) == METHOD_BUFFERED, query_abi_ioctl_buffered);
   LUMEN_VMIC_STATIC_ASSERT((IOCTL_LUMEN_VMIC_OPEN_STREAM & 3u) == METHOD_BUFFERED, open_stream_ioctl_buffered);
   LUMEN_VMIC_STATIC_ASSERT((IOCTL_LUMEN_VMIC_WRITE_PCM & 3u) == METHOD_BUFFERED, write_pcm_ioctl_buffered);
@@ -144,6 +160,7 @@ extern "C" {
   LUMEN_VMIC_STATIC_ASSERT((IOCTL_LUMEN_VMIC_QUERY_STATS & 3u) == METHOD_BUFFERED, query_stats_ioctl_buffered);
 
 #undef LUMEN_VMIC_STATIC_ASSERT
+#undef LUMEN_VMIC_OFFSETOF
 
 #if defined(__cplusplus)
 } /* extern "C" */

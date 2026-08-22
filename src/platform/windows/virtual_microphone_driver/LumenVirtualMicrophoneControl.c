@@ -18,9 +18,9 @@
 typedef struct LUMEN_VMIC_DEVICE_EXTENSION {
   KSPIN_LOCK lock;  ///< Serializes ownership, generation, FIFO, and counters.
   PFILE_OBJECT owner_file;  ///< Exact file object holding the writer lease.
-  uint64_t generation;  ///< Active caller-selected generation, or zero.
-  uint64_t stale_writes;  ///< Saturating count of stale WRITE_PCM attempts.
-  int16_t *fifo_storage;  ///< Nonpaged backing storage for the PCM FIFO.
+  lumen_vmic_uint64_t generation;  ///< Active caller-selected generation, or zero.
+  lumen_vmic_uint64_t stale_writes;  ///< Saturating count of stale WRITE_PCM attempts.
+  lumen_pcm_int16_t *fifo_storage;  ///< Nonpaged backing storage for the PCM FIFO.
   LUMEN_PCM_RING fifo;  ///< Bounded, newest-data-wins PCM FIFO.
 } LUMEN_VMIC_DEVICE_EXTENSION;
 
@@ -78,7 +78,7 @@ static NTSTATUS LumenVirtualMicrophoneComplete(PIRP irp, NTSTATUS status, ULONG_
 static NTSTATUS LumenVirtualMicrophoneValidateOwner(
   const LUMEN_VMIC_DEVICE_EXTENSION *extension,
   PFILE_OBJECT file_object,
-  uint64_t generation
+  lumen_vmic_uint64_t generation
 ) {
   if (extension->owner_file == NULL || extension->owner_file != file_object || generation == 0u ||
       generation != extension->generation) {
@@ -259,8 +259,8 @@ static NTSTATUS LumenVirtualMicrophoneQueryStats(
   response.overflow_drops = extension->fifo.counters.dropped_frames;
   response.underflow_samples = extension->fifo.counters.silence_frames;
   response.resets = extension->fifo.counters.reset_count;
-  response.current_fill_frames = (uint32_t) extension->fifo.queued_frames;
-  response.capacity_frames = (uint32_t) extension->fifo.capacity_frames;
+  response.current_fill_frames = (lumen_vmic_uint32_t) extension->fifo.queued_frames;
+  response.capacity_frames = (lumen_vmic_uint32_t) extension->fifo.capacity_frames;
   RtlCopyMemory(buffer, &response, sizeof(response));
   *information = sizeof(response);
   return STATUS_SUCCESS;
@@ -331,10 +331,13 @@ NTSTATUS LumenVirtualMicrophoneControlUnsupported(PDEVICE_OBJECT device_object, 
   return LumenVirtualMicrophoneComplete(irp, STATUS_INVALID_DEVICE_REQUEST, 0u);
 }
 
-size_t LumenVirtualMicrophoneControlReadFrames(int16_t *output, size_t frame_count) {
+lumen_pcm_size_t LumenVirtualMicrophoneControlReadFrames(
+  lumen_vmic_int16_t *output,
+  lumen_pcm_size_t frame_count
+) {
   LUMEN_VMIC_DEVICE_EXTENSION *extension;
   KIRQL old_irql;
-  size_t copied_frames;
+  lumen_pcm_size_t copied_frames;
 
   if (g_lumen_vmic_control_device == NULL || output == NULL || frame_count == 0u) {
     return 0u;
@@ -349,7 +352,7 @@ size_t LumenVirtualMicrophoneControlReadFrames(int16_t *output, size_t frame_cou
 NTSTATUS LumenVirtualMicrophoneControlInitialize(PDRIVER_OBJECT driver_object) {
   PDEVICE_OBJECT device_object = NULL;
   LUMEN_VMIC_DEVICE_EXTENSION *extension;
-  const SIZE_T storage_bytes = (SIZE_T) LUMEN_VMIC_FIFO_CAPACITY_FRAMES * sizeof(int16_t);
+  const SIZE_T storage_bytes = (SIZE_T) LUMEN_VMIC_FIFO_CAPACITY_FRAMES * sizeof(lumen_vmic_int16_t);
   NTSTATUS status;
 
   if (driver_object == NULL || g_lumen_vmic_control_device != NULL) {
@@ -373,7 +376,11 @@ NTSTATUS LumenVirtualMicrophoneControlInitialize(PDRIVER_OBJECT driver_object) {
   extension = (LUMEN_VMIC_DEVICE_EXTENSION *) device_object->DeviceExtension;
   RtlZeroMemory(extension, sizeof(*extension));
   KeInitializeSpinLock(&extension->lock);
-  extension->fifo_storage = (int16_t *) ExAllocatePool2(POOL_FLAG_NON_PAGED, storage_bytes, LUMEN_VMIC_POOL_TAG);
+  extension->fifo_storage = (lumen_pcm_int16_t *) ExAllocatePool2(
+    POOL_FLAG_NON_PAGED,
+    storage_bytes,
+    LUMEN_VMIC_POOL_TAG
+  );
   if (extension->fifo_storage == NULL) {
     IoDeleteDevice(device_object);
     return STATUS_INSUFFICIENT_RESOURCES;
