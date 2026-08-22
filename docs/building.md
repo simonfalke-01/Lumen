@@ -227,6 +227,23 @@ certificate. A committed upgrade replaces only the recorded prior Lumen signer, 
 only the recorded thumbprint. Users can deselect Virtual HID and use `SendInput`. The Windows ARM64 application build
 has no Virtual HID driver package and uses `SendInput`.
 
+##### Lumen Virtual Microphone driver
+
+Client microphone passthrough uses a separate Windows 11 x64 WaveRT driver. Build it from a Visual Studio 2022
+Developer Command Prompt with the matching WDK:
+
+```bat
+msbuild src\platform\windows\virtual_microphone_driver\LumenVirtualMicrophone.vcxproj /m /t:Build /p:Configuration=Release /p:Platform=x64
+```
+
+The driver project stages `LumenVirtualMicrophone.inf`, `LumenVirtualMicrophone.sys`, and
+`LumenVirtualMicrophone.cat`. Pass that directory to CMake with
+`-DSUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR=<package-directory>`. The packager rejects extra files, missing
+files, a non-AMD64 target, or an INF without the exact `ROOT\LumenVirtualMicrophone` identity. The MSI exposes the
+package as the optional, default-off **Client Microphone Passthrough** feature. Lite ZIP packages exclude both the
+driver and `lumen-vmicctl.exe`. Automated tagged builds omit this optional driver until the production driver pipeline
+is enabled; normal Windows CI still builds and validates the driver and its MSI feature.
+
 ### Clone
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:
 

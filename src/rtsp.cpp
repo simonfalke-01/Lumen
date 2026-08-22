@@ -40,6 +40,48 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace rtsp_stream {
+  bool validate_client_microphone_announce(
+    const std::unordered_map<std::string_view, std::string_view> &attributes
+  ) {
+    static constexpr std::array required {
+      std::pair {"x-lumen-mic.enabled"sv, "1"sv},
+      std::pair {"x-lumen-mic.version"sv, "1"sv},
+      std::pair {"x-lumen-mic.codec"sv, "opus"sv},
+      std::pair {"x-lumen-mic.sampleRate"sv, "48000"sv},
+      std::pair {"x-lumen-mic.channels"sv, "1"sv},
+      std::pair {"x-lumen-mic.packetDurationMs"sv, "20"sv},
+      std::pair {"x-lumen-mic.fec"sv, "opus-inband"sv},
+    };
+
+    const auto microphone_attribute_count = std::ranges::count_if(attributes, [](const auto &entry) {
+      return entry.first.starts_with("x-lumen-mic."sv);
+    });
+    return microphone_attribute_count == required.size() &&
+           std::ranges::all_of(required, [&](const auto &entry) {
+             const auto found = attributes.find(entry.first);
+             return found != attributes.end() && found->second == entry.second;
+           });
+  }
+
+  bool is_client_microphone_setup_target(std::string_view target) {
+    constexpr auto media_target = "streamid=lumen-mic/1/0"sv;
+    const auto position = target.rfind(media_target);
+    return position != std::string_view::npos &&
+           position + media_target.size() == target.size() &&
+           (position == 0 || target[position - 1] == '/');
+  }
+
+  std::string encode_client_microphone_hex(const std::array<std::uint8_t, 16> &bytes) {
+    static constexpr std::string_view digits = "0123456789abcdef";
+    std::string encoded;
+    encoded.reserve(bytes.size() * 2);
+    for (const auto byte : bytes) {
+      encoded.push_back(digits[byte >> 4U]);
+      encoded.push_back(digits[byte & 0x0FU]);
+    }
+    return encoded;
+  }
+
   /**
    * @brief Release msg resources.
    *
@@ -924,6 +966,10 @@ namespace rtsp_stream {
     // Tell the client about our supported features
     ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
 
+    if (config::audio.client_microphone && stream::client_microphone_available()) {
+      ss << CLIENT_MICROPHONE_DESCRIBE_ATTRIBUTES;
+    }
+
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
     uint32_t encryption_flags_requested = SS_ENC_CONTROL_V2;
@@ -1002,6 +1048,57 @@ namespace rtsp_stream {
    * @param req Parsed RTSP request being handled.
    */
   void cmd_setup(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+    std::string_view target {req->message.request.target};
+    if (is_client_microphone_setup_target(target)) {
+      if (!config::audio.client_microphone || !stream::client_microphone_available()) {
+        cmd_not_found(sock, session, std::move(req));
+        return;
+      }
+      if (session.client_microphone_setup) {
+        respond(sock, session, nullptr, 409, "Conflict", req->sequenceNumber, {});
+        return;
+      }
+
+      std::array<std::uint8_t, 16> session_id {};
+      std::array<std::uint8_t, 16> salt {};
+      if (RAND_bytes(session_id.data(), static_cast<int>(session_id.size())) != 1 ||
+          RAND_bytes(salt.data(), static_cast<int>(salt.size())) != 1) {
+        respond(sock, session, nullptr, 500, "Internal Server Error", req->sequenceNumber, {});
+        return;
+      }
+
+      session.client_microphone_session_id = session_id;
+      session.client_microphone_salt = salt;
+      session.client_microphone_setup = true;
+
+      const auto session_hex = encode_client_microphone_hex(session.client_microphone_session_id);
+      const auto salt_hex = encode_client_microphone_hex(session.client_microphone_salt);
+      const auto port_value = std::format(
+        "unicast;server_port={}",
+        static_cast<int>(net::map_port(stream::MICROPHONE_STREAM_PORT))
+      );
+      const auto seqn_str = std::to_string(req->sequenceNumber);
+
+      OPTION_ITEM options[5] {};
+      options[0].option = const_cast<char *>("CSeq");
+      options[0].content = const_cast<char *>(seqn_str.c_str());
+      options[0].next = &options[1];
+      options[1].option = const_cast<char *>("Session");
+      options[1].content = const_cast<char *>("DEADBEEFCAFE;timeout = 90");
+      options[1].next = &options[2];
+      options[2].option = const_cast<char *>("Transport");
+      options[2].content = const_cast<char *>(port_value.c_str());
+      options[2].next = &options[3];
+      options[3].option = const_cast<char *>("X-Lumen-Mic-Session");
+      options[3].content = const_cast<char *>(session_hex.c_str());
+      options[3].next = &options[4];
+      options[4].option = const_cast<char *>("X-Lumen-Mic-Salt");
+      options[4].content = const_cast<char *>(salt_hex.c_str());
+
+      respond(sock, session, options, 200, "OK", req->sequenceNumber, {});
+      return;
+    }
+
     OPTION_ITEM options[4] {};
 
     auto &seqn = options[0];
@@ -1014,7 +1111,6 @@ namespace rtsp_stream {
     auto seqn_str = std::to_string(req->sequenceNumber);
     seqn.content = const_cast<char *>(seqn_str.c_str());
 
-    std::string_view target {req->message.request.target};
     auto begin = std::find(std::begin(target), std::end(target), '=') + 1;
     auto end = std::find(begin, std::end(target), '/');
     std::string_view type {begin, (size_t) std::distance(begin, end)};
@@ -1247,6 +1343,16 @@ namespace rtsp_stream {
       config.audio.flags[audio::config_t::CONTINUOUS_AUDIO] = true;
     }
 
+    const auto mentions_client_microphone = std::ranges::any_of(args, [](const auto &attribute) {
+      return attribute.first.starts_with("x-lumen-mic."sv);
+    });
+    config.client_microphone = session.client_microphone_setup;
+    if ((mentions_client_microphone && !config.client_microphone) ||
+        (config.client_microphone && !validate_client_microphone_announce(args))) {
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+
     // If the client sent a configured bitrate, we will choose the actual bitrate ourselves
     // by using FEC percentage and audio quality settings. If the calculated bitrate ends up
     // too low, we'll allow it to exceed the limits rather than reducing the encoding bitrate
@@ -1296,16 +1402,29 @@ namespace rtsp_stream {
       return;
     }
 
+    if (config.client_microphone && !stream::session::claim_client_microphone(session.id)) {
+      respond(sock, session, &option, 409, "Conflict", req->sequenceNumber, {});
+      return;
+    }
+
+    auto microphone_claim_guard = util::fail_guard([&]() {
+      if (config.client_microphone) {
+        stream::session::release_client_microphone(session.id);
+      }
+    });
+
     auto stream_session = stream::session::alloc(config, session);
     server->insert(stream_session);
 
-    if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
+    if (stream::session::start(stream_session, sock.remote_endpoint().address().to_string())) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
       server->remove(stream_session);
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;
     }
+
+    microphone_claim_guard.disable();
 
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }

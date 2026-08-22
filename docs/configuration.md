@@ -928,6 +928,32 @@ The key retains its upstream name for compatibility with existing configuration 
     </tr>
 </table>
 
+### client_microphone
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Accepts an authenticated microphone stream from a compatible client and exposes it through the
+            Lumen Virtual Microphone capture endpoint.
+            @note{This option is only supported on Windows and is advertised to clients only when the virtual
+            microphone backend is available.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            client_microphone = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### adapter_name
 
 <table>

@@ -55,3 +55,14 @@ target_link_libraries(lumen-vhidctl
         setupapi
         shell32)
 target_compile_options(lumen-vhidctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+# Dedicated Windows device lifecycle helper for the optional capture-only
+# virtual microphone. It dynamically resolves NewDev mutations so the binary
+# remains compatible with the Windows versions supported by Lumen.
+add_executable(lumen-vmicctl lumen-vmicctl.cpp)
+target_link_libraries(lumen-vmicctl
+        cfgmgr32
+        ole32
+        setupapi
+        shell32)
+target_compile_options(lumen-vmicctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})

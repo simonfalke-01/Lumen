@@ -1,0 +1,113 @@
+; Lumen root-enumerated capture-only WaveRT virtual microphone.
+
+[Version]
+Signature = "$WINDOWS NT$"
+Class = MEDIA
+ClassGuid = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider = %LumenProvider%
+DriverVer = 08/23/2026,0.1.0.0
+CatalogFile = LumenVirtualMicrophone.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+LumenVirtualMicrophone.CopyFiles = 13
+
+[SourceDisksNames]
+1 = %InstallationMedia%,,,
+
+[SourceDisksFiles]
+LumenVirtualMicrophone.sys = 1
+
+[Manufacturer]
+%LumenProvider% = LumenVirtualMicrophone.Models, NTamd64.10.0...22000
+
+[LumenVirtualMicrophone.Models.NTamd64.10.0...22000]
+%LumenVirtualMicrophone.DeviceDesc% = LumenVirtualMicrophone.Install, ROOT\LumenVirtualMicrophone
+
+[LumenVirtualMicrophone.CopyFiles]
+LumenVirtualMicrophone.sys
+
+[LumenVirtualMicrophone.Install.NT]
+Include = ks.inf,wdmaudio.inf
+Needs = KS.Registration,WDMAUDIO.Registration
+CopyFiles = LumenVirtualMicrophone.CopyFiles
+AddReg = LumenVirtualMicrophone.AudioRegistration
+
+[LumenVirtualMicrophone.AudioRegistration]
+HKR,,AssociatedFilters,,"wdmaud"
+HKR,,Driver,,LumenVirtualMicrophone.sys
+HKR,Drivers,SubClasses,,"wave,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%LumenVirtualMicrophone.DeviceDesc%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%LumenVirtualMicrophone.DeviceDesc%
+HKR,%MEDIA_CATEGORIES%\%LumenVirtualMicrophone.CustomNameGuid%,Name,,%LumenVirtualMicrophone.CustomName%
+
+[LumenVirtualMicrophone.Install.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,%KSNAME_WaveLumenVirtualMicrophone%,LumenVirtualMicrophone.Wave
+AddInterface = %KSCATEGORY_REALTIME%,%KSNAME_WaveLumenVirtualMicrophone%,LumenVirtualMicrophone.Wave
+AddInterface = %KSCATEGORY_CAPTURE%,%KSNAME_WaveLumenVirtualMicrophone%,LumenVirtualMicrophone.Wave
+AddInterface = %KSCATEGORY_AUDIO%,%KSNAME_TopologyLumenVirtualMicrophone%,LumenVirtualMicrophone.Topology
+AddInterface = %KSCATEGORY_TOPOLOGY%,%KSNAME_TopologyLumenVirtualMicrophone%,LumenVirtualMicrophone.Topology
+
+[LumenVirtualMicrophone.Wave]
+AddReg = LumenVirtualMicrophone.Wave.AddReg
+
+[LumenVirtualMicrophone.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%LumenVirtualMicrophone.WaveName%
+
+[LumenVirtualMicrophone.Topology]
+AddReg = LumenVirtualMicrophone.Topology.AddReg
+
+[LumenVirtualMicrophone.Topology.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%LumenVirtualMicrophone.TopologyName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[LumenVirtualMicrophone.Install.NT.Services]
+AddService = LumenVirtualMicrophone,0x00000002,LumenVirtualMicrophone.Service
+
+[LumenVirtualMicrophone.Service]
+DisplayName = %LumenVirtualMicrophone.ServiceDesc%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %13%\LumenVirtualMicrophone.sys
+
+[LumenVirtualMicrophone.Install.NT.HW]
+AddReg = LumenVirtualMicrophone.Hardware
+
+[LumenVirtualMicrophone.Hardware]
+HKR,,DeviceType,0x00010001,0x0000001D
+; The audio device uses the Microsoft sample ACL so Windows audio services can
+; open WaveRT pins. The separate PCM control device is LocalSystem-only.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
+
+[LumenVirtualMicrophone.Install.NT.Wdf]
+KmdfService = LumenVirtualMicrophone,LumenVirtualMicrophone.Wdf
+
+[LumenVirtualMicrophone.Wdf]
+KmdfLibraryVersion = 1.31
+
+[Strings]
+LumenProvider = "simonfalke"
+InstallationMedia = "Lumen Virtual Microphone installation media"
+LumenVirtualMicrophone.DeviceDesc = "Lumen Virtual Microphone"
+LumenVirtualMicrophone.ServiceDesc = "Lumen Virtual Microphone WaveRT driver"
+LumenVirtualMicrophone.WaveName = "Lumen Virtual Microphone Wave"
+LumenVirtualMicrophone.TopologyName = "Lumen Virtual Microphone Topology"
+KSNAME_WaveLumenVirtualMicrophone = "WaveLumenVirtualMicrophone"
+KSNAME_TopologyLumenVirtualMicrophone = "TopologyLumenVirtualMicrophone"
+Proxy.CLSID = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_CAPTURE = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+KSNODETYPE_ANY = "{00000000-0000-0000-0000-000000000000}"
+PKEY_AudioEndpoint_Association = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+MEDIA_CATEGORIES = "MediaCategories"
+LumenVirtualMicrophone.CustomNameGuid = "{109DB539-1977-4C12-88A2-F22BDAC5AB13}"
+LumenVirtualMicrophone.CustomName = "Lumen Virtual Microphone"

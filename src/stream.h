@@ -5,6 +5,10 @@
 #pragma once
 
 // standard includes
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <string>
 #include <utility>
 
 // lib includes
@@ -19,8 +23,106 @@ namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;  ///< GameStream base-port offset used for the video UDP stream.
   constexpr auto CONTROL_PORT = 10;  ///< GameStream base-port offset used for the control channel.
   constexpr auto AUDIO_STREAM_PORT = 11;  ///< GameStream base-port offset used for the audio UDP stream.
+  constexpr auto MICROPHONE_STREAM_PORT = 12;  ///< Lumen base-port offset used for authenticated client microphone UDP input.
 
   struct session_t;
+
+  /**
+   * @brief Test whether the platform client-microphone backend is usable.
+   *
+   * @return `true` when a microphone sink can be opened and its ABI validated.
+   */
+  [[nodiscard]] bool client_microphone_available();
+
+  /**
+   * @brief Convert the complete binary microphone session identifier into a route key.
+   *
+   * @param session_id Exact 16-byte identifier returned by RTSP SETUP.
+   * @return Binary-safe key preserving every byte, including zeroes.
+   */
+  [[nodiscard]] std::string client_microphone_route_key(const std::array<std::uint8_t, 16> &session_id);
+
+  /**
+   * @brief Bounded 128-datagram replay window for authenticated microphone input.
+   *
+   * Call `may_accept()` before authentication as a cheap rejection and call
+   * `commit()` only after the packet's authentication tag succeeds.
+   */
+  class microphone_replay_window_t {
+  public:
+    /**
+     * @brief Check whether a sequence is neither duplicate nor too old.
+     *
+     * @param sequence Monotonic microphone datagram sequence.
+     * @return `true` when authentication should be attempted.
+     */
+    [[nodiscard]] bool may_accept(std::uint64_t sequence) const;
+
+    /**
+     * @brief Check whether a sequence would advance the authenticated high-water mark.
+     * @param sequence Monotonic microphone datagram sequence.
+     * @return `true` before the first commit or when `sequence` is newer than every committed packet.
+     */
+    [[nodiscard]] bool would_advance(std::uint64_t sequence) const;
+
+    /**
+     * @brief Mark an authenticated sequence as received.
+     *
+     * @param sequence Authenticated sequence previously accepted by `may_accept()`.
+     */
+    void commit(std::uint64_t sequence);
+
+    /**
+     * @brief Clear all replay history for a newly negotiated RTSP generation.
+     */
+    void reset();
+
+  private:
+    std::array<std::uint64_t, 2> bitmap_ {};  ///< Bits for the highest sequence and 127 predecessors.
+    std::uint64_t highest_ {};  ///< Highest authenticated sequence observed.
+    bool initialized_ {};  ///< Whether `highest_` and `bitmap_` contain committed state.
+  };
+
+  /**
+   * @brief Source-endpoint policy applied after microphone packet authentication.
+   */
+  class microphone_endpoint_tracker_t {
+  public:
+    /**
+     * @brief Accept an authenticated endpoint or perform an authenticated NAT rebind.
+     *
+     * The first accepted packet must be HELLO. Once claimed, any authenticated
+     * replay-new packet may update the endpoint to support NAT port changes.
+     *
+     * @param endpoint Source endpoint of the authenticated datagram.
+     * @param hello Whether the datagram is a HELLO packet.
+     * @return `true` when the packet may proceed to state handling.
+     */
+    [[nodiscard]] bool accept_authenticated(const boost::asio::ip::udp::endpoint &endpoint, bool hello);
+
+    /**
+     * @brief Determine whether an authenticated HELLO already claimed an endpoint.
+     *
+     * @return `true` after the first accepted HELLO.
+     */
+    [[nodiscard]] bool claimed() const;
+
+    /**
+     * @brief Return the currently authenticated source endpoint.
+     *
+     * @return Claimed endpoint, or a default endpoint before HELLO.
+     */
+    [[nodiscard]] const boost::asio::ip::udp::endpoint &endpoint() const;
+
+    /**
+     * @brief Forget the claimed endpoint at session teardown.
+     */
+    void reset();
+
+  private:
+    boost::asio::ip::udp::endpoint endpoint_;  ///< Last authenticated source endpoint.
+    bool claimed_ {};  ///< Whether HELLO established the endpoint.
+  };
 
   /**
    * @brief Stream configuration shared by capture and network senders.
@@ -37,6 +139,8 @@ namespace stream {
     int videoQosType;  ///< Video QoS type.
 
     uint32_t encryptionFlagsEnabled;  ///< Bitmask of GameStream encryption features enabled for the session.
+
+    bool client_microphone;  ///< Whether this session negotiated authenticated client microphone input.
 
     std::optional<int> gcmap;  ///< Optional game-controller mapping override from the launch request.
   };
@@ -67,7 +171,7 @@ namespace stream {
      * @param addr_string Addr string.
      * @return Start status.
      */
-    int start(session_t &session, const std::string &addr_string);
+    int start(const std::shared_ptr<session_t> &session, const std::string &addr_string);
     /**
      * @brief Stop a streaming session and prevent more packets from being queued.
      *
@@ -94,5 +198,20 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+
+    /**
+     * @brief Claim the single global client-microphone owner slot.
+     *
+     * @param launch_session_id Launch session attempting to enable microphone input.
+     * @return `true` when the slot was free or already owned by the same launch session.
+     */
+    [[nodiscard]] bool claim_client_microphone(std::uint32_t launch_session_id);
+
+    /**
+     * @brief Release the client-microphone owner slot when held by a launch session.
+     *
+     * @param launch_session_id Launch session whose ownership is ending.
+     */
+    void release_client_microphone(std::uint32_t launch_session_id);
   }  // namespace session
 }  // namespace stream

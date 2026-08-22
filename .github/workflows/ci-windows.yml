@@ -53,6 +53,7 @@ on:
           - release
           - install-no-vhid
           - install-vhid
+          - install-vmic
           - upgrade
           - legacy-import
 
@@ -469,6 +470,184 @@ jobs:
 
           "DRIVER_PACKAGE_DIR=$driverPackageDir" >> $env:GITHUB_ENV
 
+      - name: Build Virtual Microphone driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $buildDirectory = Join-Path $env:GITHUB_WORKSPACE 'cmake-build-virtual-microphone-driver'
+          $sourceRoot = Join-Path $buildDirectory 'source\windows'
+          $sourceDirectory = Join-Path $sourceRoot 'virtual_microphone_driver'
+          $binaryDirectory = Join-Path $buildDirectory 'bin'
+          $objectDirectory = Join-Path $buildDirectory 'obj'
+          $packageDirectory = Join-Path $buildDirectory 'package'
+          $artifactDirectory = Join-Path $buildDirectory 'artifact'
+          Remove-Item $buildDirectory -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item `
+            -ItemType Directory `
+            -Path $sourceRoot, $binaryDirectory, $objectDirectory, $packageDirectory, $artifactDirectory `
+            -Force | Out-Null
+          Copy-Item `
+            (Join-Path $env:GITHUB_WORKSPACE 'src\platform\windows\virtual_microphone_protocol.h') `
+            -Destination $sourceRoot
+          Copy-Item `
+            (Join-Path $env:GITHUB_WORKSPACE 'src\platform\windows\virtual_microphone_driver') `
+            -Destination $sourceRoot `
+            -Recurse
+
+          $versionCore = $env:LUMEN_BUILD_VERSION.Split('-', 2)[0].Split('+', 2)[0]
+          $versionParts = $versionCore.Split('.')
+          if ($versionParts.Count -ne 3) {
+            throw "Invalid Lumen version core for Virtual Microphone: $versionCore"
+          }
+          $driverRevision = [int64]$env:GITHUB_RUN_NUMBER % 65535
+          $driverVersion = "$($versionParts[0]).$($versionParts[1]).$($versionParts[2]).$driverRevision"
+          $driverDate = (Get-Date).ToUniversalTime().ToString('MM/dd/yyyy')
+          $sourceInf = Join-Path $sourceDirectory 'LumenVirtualMicrophone.inf'
+          $infContents = Get-Content -LiteralPath $sourceInf -Raw
+          $infContents = $infContents -replace `
+            '(?m)^DriverVer\s*=.*$', `
+            "DriverVer = $driverDate,$driverVersion"
+          Set-Content -LiteralPath $sourceInf -Value $infContents -Encoding ascii
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere `
+            -latest `
+            -products '*' `
+            -requires Microsoft.Component.MSBuild `
+            -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) {
+            throw 'MSBuild was not found.'
+          }
+
+          $project = Join-Path $sourceDirectory 'LumenVirtualMicrophone.vcxproj'
+          & $msbuild `
+            $project `
+            /m `
+            /restore `
+            /t:Build `
+            /warnaserror `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
+            /p:OutDir="$binaryDirectory\" `
+            /p:IntDir="$objectDirectory\" `
+            /p:EnableInf2Cat=false `
+            /p:SkipPackageVerification=true `
+            /p:SignMode=Off `
+            /p:RunCodeAnalysis=true `
+            /p:EnableCppCodeAnalysis=true
+          if ($LASTEXITCODE -ne 0) {
+            throw "Virtual Microphone driver build failed with exit code $LASTEXITCODE."
+          }
+
+          $driverBinaries = @(Get-ChildItem $binaryDirectory -Recurse -File -Filter 'LumenVirtualMicrophone.sys')
+          if ($driverBinaries.Count -ne 1) {
+            throw "Expected exactly one Virtual Microphone SYS; found $($driverBinaries.Count)."
+          }
+          Copy-Item $sourceInf, $driverBinaries[0].FullName -Destination $packageDirectory
+
+          $packagedInf = Join-Path $packageDirectory 'LumenVirtualMicrophone.inf'
+          $packagedInfContents = Get-Content -LiteralPath $packagedInf -Raw
+          $packagedInfContents = $packagedInfContents -replace `
+            '(?m)^DriverVer\s*=.*$', `
+            "DriverVer = $driverDate,$driverVersion"
+          Set-Content -LiteralPath $packagedInf -Value $packagedInfContents -Encoding ascii
+
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $infVerif = Get-ChildItem (Join-Path $kitsRoot 'tools') `
+            -Recurse -File -Filter InfVerif.exe |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          $inf2Cat = Get-ChildItem (Join-Path $kitsRoot 'bin') `
+            -Recurse -File -Filter Inf2Cat.exe |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          $signTool = Get-ChildItem (Join-Path $kitsRoot 'bin') `
+            -Recurse -File -Filter signtool.exe | Where-Object {
+              $_.FullName -match '\\x64\\signtool\.exe$'
+            } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $infVerif -or -not $inf2Cat -or -not $signTool) {
+            throw 'Required WDK package verification tools were not found.'
+          }
+
+          $certificate = New-SelfSignedCertificate `
+            -Subject 'CN=Lumen Virtual Microphone Driver' `
+            -FriendlyName 'Lumen Virtual Microphone Driver' `
+            -Type CodeSigningCert `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -KeyAlgorithm RSA `
+            -KeyLength 3072 `
+            -HashAlgorithm SHA256 `
+            -KeyExportPolicy Exportable `
+            -NotAfter (Get-Date).AddYears(100)
+          $certificatePath = Join-Path $artifactDirectory 'LumenVirtualMicrophone.cer'
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'LumenVirtualMicrophone.pfx'
+          $pfxPasswordText = [Guid]::NewGuid().ToString('N')
+          $pfxPassword = ConvertTo-SecureString $pfxPasswordText -AsPlainText -Force
+          Export-Certificate -Cert $certificate -FilePath $certificatePath -Force | Out-Null
+          Export-PfxCertificate `
+            -Cert $certificate `
+            -FilePath $pfxPath `
+            -Password $pfxPassword `
+            -Force | Out-Null
+
+          $driverBinary = Get-Item (Join-Path $packageDirectory 'LumenVirtualMicrophone.sys')
+          & $signTool.FullName sign /f $pfxPath /p $pfxPasswordText /fd SHA256 /v $driverBinary.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signing the Virtual Microphone SYS failed with exit code $LASTEXITCODE."
+          }
+          & $infVerif.FullName /v /w $packagedInf
+          if ($LASTEXITCODE -ne 0) {
+            throw "Virtual Microphone InfVerif failed with exit code $LASTEXITCODE."
+          }
+          & $inf2Cat.FullName "/driver:$packageDirectory" /os:10_X64 /verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "Virtual Microphone Inf2Cat failed with exit code $LASTEXITCODE."
+          }
+          $catalogs = @(Get-ChildItem $packageDirectory -File -Filter '*.cat')
+          if ($catalogs.Count -ne 1) {
+            throw 'Inf2Cat did not generate exactly one Virtual Microphone catalog.'
+          }
+          & $signTool.FullName sign /f $pfxPath /p $pfxPasswordText /fd SHA256 /v $catalogs[0].FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signing the Virtual Microphone catalog failed with exit code $LASTEXITCODE."
+          }
+          Import-Certificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+          Import-Certificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+          & $signTool.FullName verify /pa /v $driverBinary.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Verifying the Virtual Microphone SYS signature failed.'
+          }
+          & $signTool.FullName verify /pa /v /c $catalogs[0].FullName $packagedInf
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The Virtual Microphone catalog does not cover the INF.'
+          }
+          & $signTool.FullName verify /pa /v /c $catalogs[0].FullName $driverBinary.FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The Virtual Microphone catalog does not cover the SYS.'
+          }
+          Remove-Item $pfxPath -Force
+
+          Copy-Item $packageDirectory -Destination (Join-Path $artifactDirectory 'package') -Recurse
+          "VMIC_DRIVER_PACKAGE_DIR=$packageDirectory" >> $env:GITHUB_ENV
+          "VMIC_DRIVER_CERTIFICATE_PATH=$certificatePath" >> $env:GITHUB_ENV
+          "VMIC_DRIVER_ARTIFACT_DIR=$artifactDirectory" >> $env:GITHUB_ENV
+
+      - name: Upload Virtual Microphone driver artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: Lumen-Virtual-Microphone-AMD64
+          path: ${{ env.VMIC_DRIVER_ARTIFACT_DIR }}
+          if-no-files-found: error
+          compression-level: 0
+
       - name: Setup MSYS2 dependencies
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2.32.0
         with:
@@ -564,7 +743,15 @@ jobs:
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
           export PATH="$PATH:$NODEJS_PATH"
           DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$DRIVER_PACKAGE_DIR")
+          VMIC_DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$VMIC_DRIVER_PACKAGE_DIR")
           SCCACHE_CMAKE_PATH=$(cygpath -m "$SCCACHE_PATH")
+
+          VMIC_PACKAGE_ARGS=()
+          if [[ -z "$TAG" ]]; then
+            VMIC_PACKAGE_ARGS+=(
+              -DSUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR="$VMIC_DRIVER_PACKAGE_CMAKE_PATH"
+            )
+          fi
 
           cmake \
             -B cmake-build-windows \
@@ -578,6 +765,7 @@ jobs:
             -DSUNSHINE_ASSETS_DIR=assets \
             -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR="$DRIVER_PACKAGE_CMAKE_PATH" \
             -DSUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON \
+            "${VMIC_PACKAGE_ARGS[@]}" \
             -DSUNSHINE_PUBLISHER_NAME="simonfalke" \
             -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/${GITHUB_REPOSITORY}" \
             -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/${GITHUB_REPOSITORY}/issues"
@@ -587,7 +775,7 @@ jobs:
         shell: msys2 {0}
         run: |
           cmake-build-windows/tests/test_sunshine.exe \
-            --gtest_filter='VirtualHidProtocolTest.*:VirtualHidKeyMappingTest.*:*virtual_hid_input_test.*:*virtual_hid_mouse_button_test.*:*send_input_transport_test.*:*send_input_mouse_button_test.*:InputBatchingTest.*'
+            --gtest_filter='VirtualHidProtocolTest.*:VirtualHidKeyMappingTest.*:*virtual_hid_input_test.*:*virtual_hid_mouse_button_test.*:*send_input_transport_test.*:*send_input_mouse_button_test.*:InputBatchingTest.*:VirtualMicrophone*.*:ClientMicrophone*.*:client_microphone_test.*'
 
       - name: Run complete Windows release test suite
         if: inputs.release_tag != ''
@@ -635,8 +823,13 @@ jobs:
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.dll' | wc -l)" -eq 1
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.cer' | wc -l)" -eq 1
           if 7z l "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-lite.zip" | grep -Eiq \
-              'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|lumenvirtualhid\.(inf|cat|dll|cer)'; then
+            'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|lumenvirtualhid\.(inf|cat|dll|cer)'; then
             echo 'The lite ZIP unexpectedly contains Virtual HID installation files.'
+            exit 1
+          fi
+          if 7z l "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-lite.zip" | grep -Eiq \
+              'lumen-vmicctl\.exe|drivers[/\\]virtual-microphone|lumenvirtualmicrophone\.(inf|cat|sys)'; then
+            echo 'The lite ZIP unexpectedly contains Virtual Microphone installation files.'
             exit 1
           fi
 
@@ -693,7 +886,7 @@ jobs:
             inputs.validation_scenario == 'release' &&
             '["install-no-vhid","upgrade","legacy-import"]' ||
             (inputs.validation_scenario == '' || inputs.validation_scenario == 'all') &&
-            '["install-no-vhid","install-vhid","upgrade","legacy-import"]' ||
+            '["install-no-vhid","install-vhid","install-vmic","upgrade","legacy-import"]' ||
             format('["{0}"]', inputs.validation_scenario)
           ) }}
     steps:
@@ -712,6 +905,36 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.artifact_run_id || github.run_id }}
+
+      - name: Download Virtual Microphone driver trust artifact
+        if: matrix.scenario == 'install-vmic'
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
+        with:
+          name: Lumen-Virtual-Microphone-AMD64
+          path: artifacts/vmic-driver
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+
+      - name: Trust Virtual Microphone test certificate
+        if: matrix.scenario == 'install-vmic'
+        shell: pwsh
+        run: |
+          $certificate = Get-ChildItem artifacts/vmic-driver -Recurse -File -Filter 'LumenVirtualMicrophone.cer'
+          if (@($certificate).Count -ne 1) {
+            throw "Expected exactly one Virtual Microphone test certificate; found $(@($certificate).Count)."
+          }
+          Import-Certificate -FilePath $certificate.FullName -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+          Import-Certificate -FilePath $certificate.FullName -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+
+      - name: Enable Windows audio services for Virtual Microphone
+        if: matrix.scenario == 'install-vmic'
+        shell: pwsh
+        run: |
+          Set-Service AudioEndpointBuilder -StartupType Automatic
+          Start-Service AudioEndpointBuilder
+          Set-Service Audiosrv -StartupType Automatic
+          Start-Service Audiosrv
 
       - name: Capture Windows MSI host details
         shell: pwsh
@@ -829,6 +1052,8 @@ jobs:
 
       - name: Validate generated MSI tables
         shell: pwsh
+        env:
+          EXPECT_VMIC_FEATURE: ${{ inputs.release_tag == '' && 'true' || 'false' }}
         run: ./.github/scripts/validate-windows-msi.ps1
 
       - name: Run ${{ matrix.scenario }} MSI scenario

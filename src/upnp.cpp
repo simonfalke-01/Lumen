@@ -74,6 +74,7 @@ namespace upnp {
       auto rtsp = std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT));
       auto video = std::to_string(net::map_port(stream::VIDEO_STREAM_PORT));
       auto audio = std::to_string(net::map_port(stream::AUDIO_STREAM_PORT));
+      auto microphone = std::to_string(net::map_port(stream::MICROPHONE_STREAM_PORT));
       auto control = std::to_string(net::map_port(stream::CONTROL_PORT));
       auto gs_http = std::to_string(net::map_port(nvhttp::PORT_HTTP));
       auto gs_https = std::to_string(net::map_port(nvhttp::PORT_HTTPS));
@@ -87,6 +88,10 @@ namespace upnp {
         {{gs_http, gs_http, "TCP"s}, "Lumen - Client HTTP"s},
         {{gs_https, gs_https, "TCP"s}, "Lumen - Client HTTPS"s},
       });
+
+      if (config::audio.client_microphone && stream::client_microphone_available()) {
+        mappings.emplace_back(mapping_t {{microphone, microphone, "UDP"s}, "Lumen - Microphone"s});
+      }
 
       // Only map port for the Web Manager if it is configured to accept connection from WAN
       if (net::from_enum_string(config::nvhttp.origin_web_ui_allowed) > net::LAN) {

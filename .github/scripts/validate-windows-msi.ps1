@@ -36,6 +36,8 @@ $features = Read-MsiRows `
     'SELECT `Feature`,`Level` FROM `Feature`' 2
 $properties = Read-MsiRows `
     'SELECT `Property`,`Value` FROM `Property`' 2
+$files = Read-MsiRows `
+    'SELECT `File`,`FileName`,`Component_` FROM `File`' 3
 
 $requiredActions = @(
     'CA_LumenInstall',
@@ -84,7 +86,8 @@ foreach ($setterName in $setterNames) {
         $command -notmatch ' -Msi ' -or
         $command -notmatch ' -ProductCode "\[ProductCode\]" ' -or
         $command -notmatch ' -TransactionKind (install|uninstall) ' -or
-        $command -notmatch ' -InstallVirtualHid \[LUMEN_INSTALL_VHID\]$') {
+        $command -notmatch ' -InstallVirtualHid \[LUMEN_INSTALL_VHID\] ' -or
+        $command -notmatch ' -InstallVirtualMicrophone \[LUMEN_INSTALL_VMIC\]$') {
         throw "Generated MSI has an invalid deferred command: $setterName"
     }
     if ($command -match '&(?:amp;)?quot;|\[CustomActionData\]|-MsiData') {
@@ -124,6 +127,32 @@ if ($vhidFeature.Count -ne 1) {
 $vhidDefault = @($properties | Where-Object { $_[0] -eq 'LUMEN_INSTALL_VHID' })
 if ($vhidDefault.Count -ne 1 -or $vhidDefault[0][1] -ne '0') {
     throw 'The Virtual HID feature must remain explicit opt-in.'
+}
+$vmicFeature = @($features | Where-Object { $_[0] -eq 'CM_C_virtual_microphone_driver' })
+$vmicDefault = @($properties | Where-Object { $_[0] -eq 'LUMEN_INSTALL_VMIC' })
+if ($vmicDefault.Count -ne 1 -or $vmicDefault[0][1] -ne '0') {
+    throw 'The Virtual Microphone feature must remain explicit opt-in.'
+}
+$vmicFiles = @($files | Where-Object {
+    $_[1] -match '(?i)LumenVirtualMicrophone\.(inf|sys|cat)|lumen-vmicctl\.exe'
+})
+$expectVmicFeature = $env:EXPECT_VMIC_FEATURE -eq 'true'
+if ($expectVmicFeature) {
+    if ($vmicFeature.Count -ne 1) {
+        throw 'Generated development MSI is missing the Virtual Microphone feature.'
+    }
+    foreach ($requiredVmicFile in @(
+        'LumenVirtualMicrophone.inf',
+        'LumenVirtualMicrophone.sys',
+        'LumenVirtualMicrophone.cat',
+        'lumen-vmicctl.exe'
+    )) {
+        if (-not ($vmicFiles | Where-Object { $_[1] -match "(?i)$([regex]::Escape($requiredVmicFile))" })) {
+            throw "Generated development MSI is missing $requiredVmicFile."
+        }
+    }
+} elseif ($vmicFeature.Count -ne 0 -or $vmicFiles.Count -ne 0) {
+    throw 'Generated tagged MSI unexpectedly contains Virtual Microphone files or features.'
 }
 $productCode = @($properties | Where-Object { $_[0] -eq 'ProductCode' })
 if ($productCode.Count -ne 1 -or

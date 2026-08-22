@@ -3,8 +3,12 @@
  * @brief Definitions for cryptography functions.
  */
 // lib includes
+#include <openssl/kdf.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+
+// standard includes
+#include <limits>
 
 // local includes
 #include "crypto.h"
@@ -18,6 +22,132 @@ namespace crypto {
    * @brief OpenSSL X.509 subject/issuer name pointer with automatic release.
    */
   using x509_name_t = util::safe_ptr<X509_NAME, &X509_NAME_free>;
+
+  std::optional<aes_t> hkdf_sha256(
+    std::span<const std::uint8_t> input_key_material,
+    std::span<const std::uint8_t> salt,
+    std::string_view info,
+    std::size_t output_size
+  ) {
+    if (input_key_material.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        salt.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        info.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      return std::nullopt;
+    }
+
+    pkey_ctx_t context {EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr)};
+    if (!context || EVP_PKEY_derive_init(context.get()) <= 0 ||
+        EVP_PKEY_CTX_set_hkdf_mode(context.get(), EVP_PKEY_HKDEF_MODE_EXTRACT_AND_EXPAND) <= 0 ||
+        EVP_PKEY_CTX_set_hkdf_md(context.get(), EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_salt(context.get(), salt.data(), static_cast<int>(salt.size())) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_key(context.get(), input_key_material.data(), static_cast<int>(input_key_material.size())) <= 0 ||
+        EVP_PKEY_CTX_add1_hkdf_info(context.get(), reinterpret_cast<const std::uint8_t *>(info.data()), static_cast<int>(info.size())) <= 0) {
+      return std::nullopt;
+    }
+
+    aes_t output(output_size);
+    auto derived_size = output.size();
+    if (EVP_PKEY_derive(context.get(), output.data(), &derived_size) <= 0 || derived_size != output.size()) {
+      return std::nullopt;
+    }
+
+    return output;
+  }
+
+  aes_256_gcm_t::aes_256_gcm_t(key_t key):
+      key_(std::move(key)) {
+  }
+
+  bool aes_256_gcm_t::encrypt(
+    std::span<const std::uint8_t> plaintext,
+    std::span<const std::uint8_t> additional_data,
+    const nonce_t &nonce,
+    aes_t &ciphertext,
+    tag_t &tag
+  ) const {
+    if (plaintext.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        additional_data.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+
+    cipher_ctx_t context {EVP_CIPHER_CTX_new()};
+    if (!context || EVP_EncryptInit_ex(context.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce.size()), nullptr) != 1 ||
+        EVP_EncryptInit_ex(context.get(), nullptr, nullptr, key_.data(), nonce.data()) != 1) {
+      return false;
+    }
+
+    int output_size = 0;
+    if (!additional_data.empty() &&
+        EVP_EncryptUpdate(context.get(), nullptr, &output_size, additional_data.data(), static_cast<int>(additional_data.size())) != 1) {
+      return false;
+    }
+
+    ciphertext.resize(plaintext.size() + EVP_MAX_BLOCK_LENGTH);
+    int ciphertext_size = 0;
+    if (!plaintext.empty() &&
+        EVP_EncryptUpdate(context.get(), ciphertext.data(), &ciphertext_size, plaintext.data(), static_cast<int>(plaintext.size())) != 1) {
+      ciphertext.clear();
+      return false;
+    }
+
+    int final_size = 0;
+    if (EVP_EncryptFinal_ex(context.get(), ciphertext.data() + ciphertext_size, &final_size) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_GET_TAG, static_cast<int>(tag.size()), tag.data()) != 1) {
+      ciphertext.clear();
+      return false;
+    }
+
+    ciphertext.resize(static_cast<std::size_t>(ciphertext_size + final_size));
+    return true;
+  }
+
+  bool aes_256_gcm_t::decrypt(
+    std::span<const std::uint8_t> ciphertext,
+    std::span<const std::uint8_t> additional_data,
+    const nonce_t &nonce,
+    const tag_t &tag,
+    aes_t &plaintext
+  ) const {
+    if (ciphertext.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        additional_data.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+
+    cipher_ctx_t context {EVP_CIPHER_CTX_new()};
+    if (!context || EVP_DecryptInit_ex(context.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce.size()), nullptr) != 1 ||
+        EVP_DecryptInit_ex(context.get(), nullptr, nullptr, key_.data(), nonce.data()) != 1) {
+      return false;
+    }
+
+    int output_size = 0;
+    if (!additional_data.empty() &&
+        EVP_DecryptUpdate(context.get(), nullptr, &output_size, additional_data.data(), static_cast<int>(additional_data.size())) != 1) {
+      return false;
+    }
+
+    aes_t candidate(ciphertext.size() + EVP_MAX_BLOCK_LENGTH);
+    int plaintext_size = 0;
+    if (!ciphertext.empty() &&
+        EVP_DecryptUpdate(context.get(), candidate.data(), &plaintext_size, ciphertext.data(), static_cast<int>(ciphertext.size())) != 1) {
+      return false;
+    }
+
+    auto mutable_tag = tag;
+    if (EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_SET_TAG, static_cast<int>(mutable_tag.size()), mutable_tag.data()) != 1) {
+      return false;
+    }
+
+    int final_size = 0;
+    if (EVP_DecryptFinal_ex(context.get(), candidate.data() + plaintext_size, &final_size) != 1) {
+      return false;
+    }
+
+    candidate.resize(static_cast<std::size_t>(plaintext_size + final_size));
+    plaintext = std::move(candidate);
+    return true;
+  }
 
   cert_chain_t::cert_chain_t():
       _certs {},

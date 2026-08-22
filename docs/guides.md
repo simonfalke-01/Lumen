@@ -3,6 +3,11 @@
 @admonition{Community | Share Lumen guides and tips in
 [GitHub Discussions](https://github.com/simonfalke-01/Lumen/discussions).}
 
+## Umbra client integration
+
+Umbra implementers can use the normative [client microphone protocol](protocols/umbra-microphone-v1.md) for
+authenticated client-to-host microphone passthrough.
+
 <div class="section_buttons">
 
 | Previous                                |                                        Next |

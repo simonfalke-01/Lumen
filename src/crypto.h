@@ -6,6 +6,8 @@
 
 // standard includes
 #include <array>
+#include <optional>
+#include <span>
 
 // lib includes
 #include <openssl/evp.h>
@@ -41,6 +43,87 @@ namespace crypto {
    * @brief Byte buffer containing AES key material.
    */
   using aes_t = std::vector<std::uint8_t>;
+
+  /**
+   * @brief Derive arbitrary key material with RFC 5869 HKDF-SHA-256.
+   *
+   * @param input_key_material Secret input keying material.
+   * @param salt Non-secret salt that separates derivation domains.
+   * @param info Application-specific context string.
+   * @param output_size Number of bytes to derive.
+   * @return Derived bytes, or `std::nullopt` when OpenSSL rejects the operation.
+   */
+  [[nodiscard]] std::optional<aes_t> hkdf_sha256(
+    std::span<const std::uint8_t> input_key_material,
+    std::span<const std::uint8_t> salt,
+    std::string_view info,
+    std::size_t output_size
+  );
+
+  /**
+   * @brief One-shot AES-256-GCM helper with explicit additional authenticated data.
+   *
+   * This helper is intentionally independent from the AES-128 GameStream cipher
+   * state. Each operation creates a fresh OpenSSL context, making the object safe
+   * to use for independently sequenced microphone datagrams.
+   */
+  class aes_256_gcm_t {
+  public:
+    static constexpr std::size_t key_size = 32;  ///< Required AES-256 key length.
+    static constexpr std::size_t nonce_size = 12;  ///< Required GCM nonce length.
+    static constexpr std::size_t tag_size = 16;  ///< Full GCM authentication tag length.
+
+    using key_t = std::array<std::uint8_t, key_size>;  ///< Fixed AES-256 key bytes.
+    using nonce_t = std::array<std::uint8_t, nonce_size>;  ///< Fixed GCM nonce bytes.
+    using tag_t = std::array<std::uint8_t, tag_size>;  ///< Fixed GCM authentication tag bytes.
+
+    /**
+     * @brief Construct a one-shot AES-256-GCM helper.
+     *
+     * @param key Exact 32-byte AES key.
+     */
+    explicit aes_256_gcm_t(key_t key);
+
+    /**
+     * @brief Encrypt plaintext and authenticate both it and the supplied AAD.
+     *
+     * @param plaintext Bytes to encrypt.
+     * @param additional_data Bytes authenticated without encryption.
+     * @param nonce Unique 12-byte nonce for this key.
+     * @param ciphertext Receives ciphertext with the same length as `plaintext`.
+     * @param tag Receives the 16-byte authentication tag.
+     * @return `true` only when the complete operation succeeds.
+     */
+    [[nodiscard]] bool encrypt(
+      std::span<const std::uint8_t> plaintext,
+      std::span<const std::uint8_t> additional_data,
+      const nonce_t &nonce,
+      aes_t &ciphertext,
+      tag_t &tag
+    ) const;
+
+    /**
+     * @brief Authenticate and decrypt one AES-256-GCM message.
+     *
+     * @param ciphertext Bytes to decrypt.
+     * @param additional_data Bytes that must match the sender's authenticated data.
+     * @param nonce Unique 12-byte nonce for this key.
+     * @param tag Authentication tag supplied by the sender.
+     * @param plaintext Receives plaintext only after successful authentication.
+     * @return `true` only when authentication and decryption both succeed.
+     */
+    [[nodiscard]] bool decrypt(
+      std::span<const std::uint8_t> ciphertext,
+      std::span<const std::uint8_t> additional_data,
+      const nonce_t &nonce,
+      const tag_t &tag,
+      aes_t &plaintext
+    ) const;
+
+  private:
+    key_t key_;  ///< Immutable AES-256 key owned by this helper.
+  };
+
   /**
    * @brief Owning pointer for an OpenSSL X.509 certificate.
    */

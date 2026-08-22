@@ -27,7 +27,11 @@ param(
 
     [Parameter(Mandatory=$false)]
     [ValidateSet("0", "1")]
-    [string]$InstallVirtualHid
+    [string]$InstallVirtualHid,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("0", "1")]
+    [string]$InstallVirtualMicrophone
 )
 
 # Constants
@@ -274,6 +278,9 @@ if (-not $isAdmin) {
     }
     if ($InstallVirtualHid) {
         $arguments += " -InstallVirtualHid $InstallVirtualHid"
+    }
+    if ($InstallVirtualMicrophone) {
+        $arguments += " -InstallVirtualMicrophone $InstallVirtualMicrophone"
     }
     try {
         # Relaunch the script with elevation
@@ -644,6 +651,78 @@ function Invoke-VirtualHidCtl {
     }
 }
 
+# Invoke the dedicated virtual microphone lifecycle helper. The same stable
+# exit-code contract as lumen-vhidctl is used by MSI and standalone installs.
+function Invoke-VirtualMicrophoneCtl {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Description,
+
+        [switch]$AllowNotInstalled
+    )
+
+    $virtualMicrophoneCtlPath = Join-Path $RootDir "tools\lumen-vmicctl.exe"
+    if (-not (Test-Path $virtualMicrophoneCtlPath -PathType Leaf)) {
+        throw "Required Virtual Microphone helper not found: $virtualMicrophoneCtlPath"
+    }
+
+    Write-LogMessage -Message "🎙️  $Description" -Level "Step"
+    Write-LogMessage `
+        -Message "Executing: $virtualMicrophoneCtlPath $($Arguments -join ' ')" `
+        -Level "Information"
+
+    $stdoutFile = [System.IO.Path]::GetTempFileName()
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $process = Start-Process `
+            -FilePath $virtualMicrophoneCtlPath `
+            -ArgumentList $Arguments `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError $stderrFile
+
+        foreach ($outputFile in @($stdoutFile, $stderrFile)) {
+            if (Test-Path $outputFile) {
+                Get-Content $outputFile -ErrorAction SilentlyContinue | ForEach-Object {
+                    if ($_.Trim()) {
+                        Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
+                    }
+                }
+            }
+        }
+
+        if ($process.ExitCode -eq 3010) {
+            $script:RebootRequired = $true
+            Write-LogMessage `
+                -Message "  Windows requires a reboot to finish the driver operation." `
+                -Level "Warning"
+            return $process.ExitCode
+        }
+
+        $isExpectedAbsent = $AllowNotInstalled -and $process.ExitCode -eq 2
+        $isExpectedUnhealthy = $AllowNotInstalled -and $process.ExitCode -in @(3, 4)
+        if ($process.ExitCode -ne 0 -and -not $isExpectedAbsent -and -not $isExpectedUnhealthy) {
+            throw "$Description failed with exit code $($process.ExitCode)."
+        }
+
+        if ($process.ExitCode -eq 0) {
+            Write-LogMessage -Message "  ✓ Done" -Level "Success"
+        } elseif ($isExpectedAbsent) {
+            Write-LogMessage -Message "  Lumen Virtual Microphone driver is not installed." -Level "Information"
+        } else {
+            Write-LogMessage -Message "  Lumen Virtual Microphone driver is installed but not ready." -Level "Warning"
+        }
+        return $process.ExitCode
+    } finally {
+        Remove-Item $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Update the machine PATH without routing the value through cmd.exe. The batch
 # implementation corrupts values containing cmd metacharacters and reports the
 # wrong exit status when no registry write is required.
@@ -719,6 +798,26 @@ function Get-VirtualHidInfPath {
     $infFiles = @(Get-ChildItem -Path $driverDirectory -Filter "*.inf" -File)
     if ($infFiles.Count -ne 1) {
         throw "Expected exactly one Virtual HID INF in $driverDirectory; found $($infFiles.Count)."
+    }
+    return $infFiles[0].FullName
+}
+
+function Get-VirtualMicrophoneInfPath {
+    $driverDirectory = Join-Path $RootDir "drivers\virtual-microphone"
+    if (-not (Test-Path $driverDirectory -PathType Container)) {
+        throw "Required Virtual Microphone driver directory not found: $driverDirectory"
+    }
+
+    $infFiles = @(Get-ChildItem -Path $driverDirectory -Filter "*.inf" -File)
+    if ($infFiles.Count -ne 1) {
+        throw "Expected exactly one Virtual Microphone INF in $driverDirectory; found $($infFiles.Count)."
+    }
+    if (-not (Select-String `
+        -LiteralPath $infFiles[0].FullName `
+        -Pattern "ROOT\LumenVirtualMicrophone" `
+        -SimpleMatch `
+        -Quiet)) {
+        throw "The bundled Virtual Microphone INF has an unexpected hardware identity."
     }
     return $infFiles[0].FullName
 }
@@ -989,6 +1088,11 @@ $virtualHidSelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualHid)) {
 } else {
     $InstallVirtualHid -eq "1"
 }
+$virtualMicrophoneSelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualMicrophone)) {
+    $false
+} else {
+    $InstallVirtualMicrophone -eq "1"
+}
 
 $rollbackRootDirectory = Join-Path $programDataDirectory "LumenVirtualHidInstallerV2"
 $rollbackProductDirectory = Join-Path $rollbackRootDirectory $ProductCode
@@ -996,6 +1100,19 @@ $rollbackDirectory = Join-Path $rollbackProductDirectory $TransactionKind.ToLowe
 $rollbackStatePath = Join-Path $rollbackDirectory "virtual-hid-rollback.json"
 $rollbackDriverDirectory = Join-Path $rollbackDirectory "virtual-hid-driver"
 $rollbackScriptPath = Join-Path $rollbackDirectory "lumen-setup.ps1"
+$virtualMicrophoneRollbackRootDirectory = Join-Path $programDataDirectory "LumenVirtualMicrophoneInstallerV1"
+$virtualMicrophoneRollbackProductDirectory = Join-Path `
+    $virtualMicrophoneRollbackRootDirectory `
+    $ProductCode
+$virtualMicrophoneRollbackDirectory = Join-Path `
+    $virtualMicrophoneRollbackProductDirectory `
+    $TransactionKind.ToLowerInvariant()
+$virtualMicrophoneRollbackStatePath = Join-Path `
+    $virtualMicrophoneRollbackDirectory `
+    "virtual-microphone-rollback.json"
+$virtualMicrophoneRollbackDriverDirectory = Join-Path `
+    $virtualMicrophoneRollbackDirectory `
+    "virtual-microphone-driver"
 $script:RebootRequired = $false
 
 function New-InstallRollbackDirectoryAcl {
@@ -1662,12 +1779,368 @@ function Invoke-ExactCurrentRecovery {
     }
 }
 
+function Initialize-VirtualMicrophoneRollbackDirectory {
+    $protectedAcl = New-InstallRollbackDirectoryAcl
+    foreach ($directoryPath in @(
+        $virtualMicrophoneRollbackRootDirectory,
+        $virtualMicrophoneRollbackProductDirectory,
+        $virtualMicrophoneRollbackDirectory
+    )) {
+        if (-not (Test-Path -LiteralPath $directoryPath)) {
+            try {
+                [System.IO.Directory]::CreateDirectory($directoryPath, $protectedAcl) | Out-Null
+            } catch [System.Management.Automation.MethodException] {
+                throw "Atomic protected Virtual Microphone rollback-directory creation is unavailable."
+            }
+        }
+        Assert-InstallRollbackDirectorySecure -Path $directoryPath
+    }
+}
+
+function Remove-VirtualMicrophoneRollbackArtifacts {
+    if (-not (Test-Path -LiteralPath $virtualMicrophoneRollbackDirectory)) {
+        return
+    }
+    Assert-InstallRollbackDirectorySecure -Path $virtualMicrophoneRollbackDirectory
+    $leaf = Get-Item -LiteralPath $virtualMicrophoneRollbackDirectory -Force -ErrorAction Stop
+    if ($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to remove a reparse-point Virtual Microphone transaction leaf."
+    }
+    Remove-Item `
+        -LiteralPath $virtualMicrophoneRollbackDirectory `
+        -Recurse `
+        -Force `
+        -ErrorAction Stop
+
+    foreach ($parent in @(
+        $virtualMicrophoneRollbackProductDirectory,
+        $virtualMicrophoneRollbackRootDirectory
+    )) {
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            continue
+        }
+        Assert-InstallRollbackDirectorySecure -Path $parent
+        if (@(Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop).Count -ne 0) {
+            break
+        }
+        Remove-Item -LiteralPath $parent -Force -ErrorAction Stop
+    }
+}
+
+function Get-InstalledVirtualMicrophoneInfName {
+    $devices = @(
+        Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+            @($_.HardwareID) -contains "ROOT\LumenVirtualMicrophone"
+        }
+    )
+    if ($devices.Count -ne 1) {
+        throw "Expected exactly one active Lumen Virtual Microphone device; found $($devices.Count)."
+    }
+
+    $driverInfProperty = Get-PnpDeviceProperty `
+        -InstanceId $devices[0].PNPDeviceID `
+        -KeyName "DEVPKEY_Device_DriverInfPath" `
+        -ErrorAction Stop
+    $driverInfName = [string]$driverInfProperty.Data
+    if ($driverInfName -notmatch '^oem\d+\.inf$') {
+        throw "Active Lumen Virtual Microphone reported an invalid driver INF path: $driverInfName"
+    }
+    return $driverInfName
+}
+
+function Export-VirtualMicrophoneDriverBackup {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$PublishedInfName
+    )
+
+    if (Test-Path -LiteralPath $virtualMicrophoneRollbackDriverDirectory) {
+        Remove-Item `
+            -LiteralPath $virtualMicrophoneRollbackDriverDirectory `
+            -Recurse `
+            -Force `
+            -ErrorAction Stop
+    }
+    New-Item `
+        -ItemType Directory `
+        -Path $virtualMicrophoneRollbackDriverDirectory `
+        -Force | Out-Null
+
+    $pnpUtilPath = Join-Path $env:SystemRoot "System32\pnputil.exe"
+    if (-not (Test-Path $pnpUtilPath -PathType Leaf)) {
+        throw "Required driver package utility not found: $pnpUtilPath"
+    }
+    Write-LogMessage -Message "Backing up the active Lumen Virtual Microphone driver" -Level "Step"
+    $output = & $pnpUtilPath `
+        /export-driver `
+        $PublishedInfName `
+        $virtualMicrophoneRollbackDriverDirectory 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object {
+        if ($_ -and $_.ToString().Trim()) {
+            Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
+        }
+    }
+    if ($exitCode -ne 0) {
+        throw "Backing up the active Lumen Virtual Microphone driver failed with exit code $exitCode."
+    }
+
+    $exportedInfFiles = @(
+        Get-ChildItem `
+            -Path $virtualMicrophoneRollbackDriverDirectory `
+            -Filter "*.inf" `
+            -File `
+            -Recurse | Where-Object {
+                Select-String `
+                    -Path $_.FullName `
+                    -Pattern "ROOT\LumenVirtualMicrophone" `
+                    -SimpleMatch `
+                    -Quiet
+            }
+    )
+    if ($exportedInfFiles.Count -ne 1) {
+        throw "Expected exactly one exported Lumen Virtual Microphone INF; found $($exportedInfFiles.Count)."
+    }
+    return $exportedInfFiles[0].FullName
+}
+
+function Save-VirtualMicrophoneRollbackState {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("Install", "Uninstall")]
+        [string]$TransactionKind,
+        [bool]$DriverWasPresent,
+        [AllowNull()]
+        [string]$BackedUpDriverInfPath,
+        [bool]$DriverRollbackComplete = $false,
+        [bool]$Committed = $false
+    )
+
+    $state = @{
+        Schema = 1
+        OwnerProductCode = $ProductCode
+        TransactionKind = $TransactionKind.ToLowerInvariant()
+        DriverWasPresent = $DriverWasPresent
+        BackedUpDriverInfPath = $BackedUpDriverInfPath
+        DriverRollbackComplete = $DriverRollbackComplete
+        Committed = $Committed
+    }
+    $temporaryStatePath = Join-Path `
+        $virtualMicrophoneRollbackDirectory `
+        "virtual-microphone-rollback.pending"
+    $state | ConvertTo-Json | Set-Content `
+        -LiteralPath $temporaryStatePath `
+        -Encoding UTF8 `
+        -ErrorAction Stop
+    Move-Item `
+        -LiteralPath $temporaryStatePath `
+        -Destination $virtualMicrophoneRollbackStatePath `
+        -Force `
+        -ErrorAction Stop
+}
+
+function Start-PersistedVirtualMicrophoneTransaction {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("Install", "Uninstall")]
+        [string]$TransactionKind,
+        [bool]$DriverWasPresent,
+        [bool]$DriverRollbackComplete = $false
+    )
+
+    Initialize-VirtualMicrophoneRollbackDirectory
+    if ((Test-Path -LiteralPath $virtualMicrophoneRollbackStatePath) -or
+        (Test-Path -LiteralPath $virtualMicrophoneRollbackDriverDirectory)) {
+        throw "A pending Virtual Microphone rollback transaction must be resolved before continuing."
+    }
+
+    $backedUpDriverInfPath = $null
+    if ($DriverWasPresent) {
+        $installedDriverInfName = Get-InstalledVirtualMicrophoneInfName
+        $backedUpDriverInfPath = Export-VirtualMicrophoneDriverBackup `
+            -PublishedInfName $installedDriverInfName
+    }
+    Save-VirtualMicrophoneRollbackState `
+        -TransactionKind $TransactionKind `
+        -DriverWasPresent $DriverWasPresent `
+        -BackedUpDriverInfPath $backedUpDriverInfPath `
+        -DriverRollbackComplete $DriverRollbackComplete
+}
+
+function Read-VirtualMicrophoneRollbackState {
+    $state = Get-Content `
+        -LiteralPath $virtualMicrophoneRollbackStatePath `
+        -Raw `
+        -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ([int]$state.Schema -ne 1) {
+        throw "Virtual Microphone rollback state has an unsupported schema."
+    }
+    if ([string]$state.OwnerProductCode -cne $ProductCode) {
+        throw "Virtual Microphone rollback state is owned by a different ProductCode."
+    }
+    if ([string]$state.TransactionKind -cne $TransactionKind.ToLowerInvariant()) {
+        throw "Virtual Microphone rollback state belongs to a different transaction kind."
+    }
+    return $state
+}
+
+function Save-ParsedVirtualMicrophoneRollbackState {
+    param(
+        [Parameter(Mandatory=$true)]
+        [psobject]$State
+    )
+    $temporaryStatePath = Join-Path `
+        $virtualMicrophoneRollbackDirectory `
+        "virtual-microphone-rollback.pending"
+    $State | ConvertTo-Json | Set-Content `
+        -LiteralPath $temporaryStatePath `
+        -Encoding UTF8 `
+        -ErrorAction Stop
+    Move-Item `
+        -LiteralPath $temporaryStatePath `
+        -Destination $virtualMicrophoneRollbackStatePath `
+        -Force `
+        -ErrorAction Stop
+}
+
+function Resolve-BackedUpVirtualMicrophoneInfPath {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$BackedUpDriverInfPath
+    )
+    $backupRoot = [System.IO.Path]::GetFullPath(
+        $virtualMicrophoneRollbackDriverDirectory
+    ) + [System.IO.Path]::DirectorySeparatorChar
+    $resolvedInf = [System.IO.Path]::GetFullPath($BackedUpDriverInfPath)
+    if (-not $resolvedInf.StartsWith(
+        $backupRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "The Virtual Microphone backup INF is outside the rollback directory."
+    }
+    if (-not (Test-Path -LiteralPath $resolvedInf -PathType Leaf)) {
+        throw "The previous Virtual Microphone driver backup is missing."
+    }
+    foreach ($item in @(
+        Get-ChildItem `
+            -LiteralPath $virtualMicrophoneRollbackDriverDirectory `
+            -Force `
+            -Recurse
+    )) {
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "The Virtual Microphone driver backup contains a reparse point."
+        }
+    }
+    if (-not (Select-String `
+        -LiteralPath $resolvedInf `
+        -Pattern "ROOT\LumenVirtualMicrophone" `
+        -SimpleMatch `
+        -Quiet)) {
+        throw "The previous driver backup does not belong to the exact Virtual Microphone root."
+    }
+    return $resolvedInf
+}
+
+function Invoke-PersistedVirtualMicrophoneRollback {
+    if (-not (Test-Path -LiteralPath $virtualMicrophoneRollbackDirectory -PathType Container)) {
+        return $false
+    }
+    Assert-InstallRollbackDirectorySecure -Path $virtualMicrophoneRollbackDirectory
+    if (-not (Test-Path -LiteralPath $virtualMicrophoneRollbackStatePath -PathType Leaf)) {
+        throw "The Virtual Microphone transaction leaf is missing rollback state."
+    }
+
+    $state = Read-VirtualMicrophoneRollbackState
+    if ([bool]$state.Committed) {
+        Remove-VirtualMicrophoneRollbackArtifacts
+        return $false
+    }
+    if (-not [bool]$state.DriverRollbackComplete) {
+        $service = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
+        if ($null -ne $service -and $service.Status -ne "Stopped") {
+            Stop-Service -Name "LumenService" -Force -ErrorAction Stop
+            $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+        }
+
+        if ([bool]$state.DriverWasPresent) {
+            $backupInf = Resolve-BackedUpVirtualMicrophoneInfPath `
+                -BackedUpDriverInfPath ([string]$state.BackedUpDriverInfPath)
+            Invoke-VirtualMicrophoneCtl `
+                -Arguments @("install-or-update", "`"$backupInf`"") `
+                -Description "Restoring the previous Lumen Virtual Microphone driver" | Out-Null
+        } elseif ([string]$state.TransactionKind -eq "install") {
+            Invoke-VirtualMicrophoneCtl `
+                -Arguments @("uninstall") `
+                -Description "Removing the newly installed Lumen Virtual Microphone driver" | Out-Null
+        }
+        $state.DriverRollbackComplete = $true
+        Save-ParsedVirtualMicrophoneRollbackState -State $state
+    }
+    Remove-VirtualMicrophoneRollbackArtifacts
+    return $true
+}
+
+function Invoke-PersistedVirtualMicrophoneCommit {
+    if (-not (Test-Path -LiteralPath $virtualMicrophoneRollbackDirectory -PathType Container)) {
+        return $false
+    }
+    Assert-InstallRollbackDirectorySecure -Path $virtualMicrophoneRollbackDirectory
+    $state = Read-VirtualMicrophoneRollbackState
+    if (-not [bool]$state.Committed) {
+        $state.Committed = $true
+        Save-ParsedVirtualMicrophoneRollbackState -State $state
+    }
+    Remove-VirtualMicrophoneRollbackArtifacts
+    return $true
+}
+
+function Invoke-ExactCurrentVirtualMicrophoneRecovery {
+    if ((Test-Path -LiteralPath $virtualMicrophoneRollbackStatePath) -or
+        (Test-Path -LiteralPath $virtualMicrophoneRollbackDriverDirectory)) {
+        Assert-InstallRollbackDirectorySecure -Path $virtualMicrophoneRollbackDirectory
+        if (-not (Test-Path -LiteralPath $virtualMicrophoneRollbackStatePath -PathType Leaf)) {
+            throw "The exact current Virtual Microphone transaction is incomplete and was preserved."
+        }
+        $state = Read-VirtualMicrophoneRollbackState
+        if ([bool]$state.Committed) {
+            Invoke-PersistedVirtualMicrophoneCommit | Out-Null
+        } else {
+            Invoke-PersistedVirtualMicrophoneRollback | Out-Null
+        }
+    }
+}
+
+function Invoke-AllPersistedRollbacks {
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $applied = $false
+    try {
+        $applied = (Invoke-PersistedVirtualMicrophoneRollback) -or $applied
+    } catch {
+        $errors.Add($_.Exception.Message) | Out-Null
+    }
+    try {
+        $applied = (Invoke-PersistedRollback) -or $applied
+    } catch {
+        $errors.Add($_.Exception.Message) | Out-Null
+    }
+    if ($errors.Count -ne 0) {
+        throw ($errors -join " ")
+    }
+    return $applied
+}
+
+function Invoke-AllPersistedCommits {
+    Invoke-PersistedVirtualMicrophoneCommit | Out-Null
+    Invoke-PersistedCommit | Out-Null
+}
+
 # Main script logic
 Write-Information ""
 
 try {
 if ($Action -eq "install") {
     Invoke-ExactCurrentRecovery
+    Invoke-ExactCurrentVirtualMicrophoneRecovery
     $legacySunshineProducts = @(Get-LegacySunshineProducts)
     if ($legacySunshineProducts.Count -ne 0) {
         Write-LogMessage `
@@ -1787,12 +2260,12 @@ if ($Action -eq "install") {
         -Emoji "🛡️"
     Write-Information ""
 
-    # 4. Install or update the Lumen Virtual HID driver. This must complete
+    # 4. Install or update selected Lumen device drivers. This must complete
     # before the service is installed or started.
     $currentStep++
     Write-Progress `
         -Activity "Installing Lumen" `
-        -Status "Installing Lumen Virtual HID driver" `
+        -Status "Installing selected Lumen device drivers" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $driverInfPath = $null
     $driverSignerThumbprint = $null
@@ -1815,6 +2288,19 @@ if ($Action -eq "install") {
     } else {
         Write-LogMessage -Message "Lumen Virtual HID feature is not selected." -Level "Information"
     }
+    $virtualMicrophoneInfPath = $null
+    $virtualMicrophoneStatus = 2
+    if ($virtualMicrophoneSelected) {
+        $virtualMicrophoneStatus = Invoke-VirtualMicrophoneCtl `
+            -Arguments @("status") `
+            -Description "Checking Lumen Virtual Microphone driver status" `
+            -AllowNotInstalled
+        $virtualMicrophoneInfPath = Get-VirtualMicrophoneInfPath
+    } else {
+        Write-LogMessage `
+            -Message "Lumen Virtual Microphone feature is not selected." `
+            -Level "Information"
+    }
     $serviceSnapshot = if ($Msi) {
         @{ Present = $false; Running = $false; StartMode = $null; DelayedAutoStart = $null }
     } else {
@@ -1824,6 +2310,7 @@ if ($Action -eq "install") {
     $serviceWasPresent = $serviceSnapshot.Present
     $serviceWasRunning = $serviceSnapshot.Running
     $driverWasPresent = $driverStatus -in @(0, 4)
+    $virtualMicrophoneWasPresent = $virtualMicrophoneStatus -in @(0, 3, 4)
     $serviceRollbackComplete = [bool]$Msi
     Start-PersistedRollbackTransaction `
         -TransactionKind "install" `
@@ -1836,6 +2323,10 @@ if ($Action -eq "install") {
         -PreviousDriverSignerThumbprint $previousDriverSignerThumbprint `
         -DriverRollbackComplete (-not $virtualHidSelected) `
         -ServiceRollbackComplete $serviceRollbackComplete
+    Start-PersistedVirtualMicrophoneTransaction `
+        -TransactionKind "install" `
+        -DriverWasPresent $virtualMicrophoneWasPresent `
+        -DriverRollbackComplete (-not $virtualMicrophoneSelected)
     if ($virtualHidSelected -and -not [string]::IsNullOrWhiteSpace($driverCertificatePath)) {
         $importedThumbprint = Install-VirtualHidCertificate `
             -CertificatePath $driverCertificatePath
@@ -1846,7 +2337,7 @@ if ($Action -eq "install") {
     }
     if (-not $Msi -and $serviceWasRunning) {
         Write-LogMessage `
-            -Message "Stopping the Lumen service before updating the Virtual HID driver" `
+            -Message "Stopping the Lumen service before updating device drivers" `
             -Level "Step"
         Stop-Service -Name "LumenService" -Force -ErrorAction Stop
         $existingService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
@@ -1858,6 +2349,14 @@ if ($Action -eq "install") {
         Invoke-VirtualHidCtl `
             -Arguments @("probe", "--json") `
             -Description "Verifying the Lumen Virtual HID control protocol" | Out-Null
+    }
+    if ($virtualMicrophoneSelected) {
+        Invoke-VirtualMicrophoneCtl `
+            -Arguments @("install-or-update", "`"$virtualMicrophoneInfPath`"") `
+            -Description "Installing or updating the Lumen Virtual Microphone driver" | Out-Null
+        Invoke-VirtualMicrophoneCtl `
+            -Arguments @("probe", "--json") `
+            -Description "Verifying the Lumen Virtual Microphone control ABI" | Out-Null
     }
     Write-Information ""
 
@@ -1898,11 +2397,11 @@ if ($Action -eq "install") {
 
     Write-Progress -Activity "Installing Lumen" -Completed
     if (-not $Msi) {
-        Invoke-PersistedCommit | Out-Null
+        Invoke-AllPersistedCommits
     }
     if ($script:RebootRequired) {
         Write-FramedText `
-            -Message "✓ Lumen installed. Restart Windows to finish the Virtual HID driver operation." `
+            -Message "✓ Lumen installed. Restart Windows to finish the driver operation." `
             -Level "Warning"
     } else {
         Write-FramedText -Message "✓ Lumen installation completed successfully!" -Level "Success"
@@ -1926,6 +2425,7 @@ if ($Action -eq "install") {
 
 } elseif ($Action -eq "uninstall") {
     Invoke-ExactCurrentRecovery
+    Invoke-ExactCurrentVirtualMicrophoneRecovery
     Write-FramedText `
         -Message "🗑️  Lumen Uninstallation Script" `
         -Level "Information" `
@@ -1943,6 +2443,15 @@ if ($Action -eq "install") {
             -AllowNotInstalled
     }
     $uninstallDriverWasPresent = $virtualHidSelected -and $driverStatus -in @(0, 4)
+    $virtualMicrophoneStatus = 2
+    if ($virtualMicrophoneSelected) {
+        $virtualMicrophoneStatus = Invoke-VirtualMicrophoneCtl `
+            -Arguments @("status") `
+            -Description "Checking Lumen Virtual Microphone driver status before uninstall" `
+            -AllowNotInstalled
+    }
+    $uninstallVirtualMicrophoneWasPresent = `
+        $virtualMicrophoneSelected -and $virtualMicrophoneStatus -in @(0, 3, 4)
     $serviceSnapshot = Get-ServiceSnapshot
     $existingService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
     $uninstallServiceWasPresent = -not $Msi -and $serviceSnapshot.Present
@@ -1960,6 +2469,10 @@ if ($Action -eq "install") {
         -PreviousDriverSignerThumbprint (Get-InstalledVirtualHidSignerThumbprint) `
         -DriverRollbackComplete (-not $virtualHidSelected) `
         -ServiceRollbackComplete ([bool]$Msi)
+    Start-PersistedVirtualMicrophoneTransaction `
+        -TransactionKind "uninstall" `
+        -DriverWasPresent $uninstallVirtualMicrophoneWasPresent `
+        -DriverRollbackComplete (-not $virtualMicrophoneSelected)
 
     # 1. Stop and remove the service before touching the driver.
     $currentStep++
@@ -1985,8 +2498,17 @@ if ($Action -eq "install") {
     $currentStep++
     Write-Progress `
         -Activity "Uninstalling Lumen" `
-        -Status "Removing Lumen Virtual HID driver" `
+        -Status "Removing selected Lumen device drivers" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
+    if ($virtualMicrophoneSelected) {
+        Invoke-VirtualMicrophoneCtl `
+            -Arguments @("uninstall") `
+            -Description "Removing the Lumen Virtual Microphone device and driver package" | Out-Null
+    } else {
+        Write-LogMessage `
+            -Message "Lumen Virtual Microphone feature was not owned by this product." `
+            -Level "Information"
+    }
     if ($virtualHidSelected) {
         Invoke-VirtualHidCtl `
             -Arguments @("uninstall") `
@@ -2036,15 +2558,15 @@ if ($Action -eq "install") {
         -Message "✓ Lumen uninstallation completed successfully!" `
         -Level "Success"
     if (-not $Msi) {
-        Invoke-PersistedCommit | Out-Null
+        Invoke-AllPersistedCommits
     }
 } elseif ($Action -eq "rollback") {
-    $rollbackApplied = Invoke-PersistedRollback
+    $rollbackApplied = Invoke-AllPersistedRollbacks
     if ($rollbackApplied) {
         Write-LogMessage -Message "Rollback completed." -Level "Success"
     }
 } elseif ($Action -eq "commit") {
-    Invoke-PersistedCommit | Out-Null
+    Invoke-AllPersistedCommits
 }
 
 } catch {
@@ -2053,7 +2575,7 @@ if ($Action -eq "install") {
     Write-LogMessage -Message $setupErrorMessage -Level "Error"
     if ($Action -in @("install", "uninstall")) {
         try {
-            $rollbackApplied = Invoke-PersistedRollback
+            $rollbackApplied = Invoke-AllPersistedRollbacks
             if ($rollbackApplied) {
                 Write-LogMessage -Message "Failed setup changes were rolled back." -Level "Success"
             }
@@ -2070,7 +2592,7 @@ if ($Action -eq "install") {
 Write-Information ""
 if ($script:RebootRequired) {
     Write-LogMessage `
-        -Message "Windows must be restarted to finish the Virtual HID driver operation." `
+        -Message "Windows must be restarted to finish the driver operation." `
         -Level "Warning"
     # Windows Installer treats every nonzero executable custom-action result as
     # failure. The driver APIs have already scheduled their reboot work, so MSI

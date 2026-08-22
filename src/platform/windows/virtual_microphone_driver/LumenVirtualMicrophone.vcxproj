@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{DC995AE0-BDE8-4BD5-9C53-ED5DE8ACB7E2}</ProjectGuid>
+    <RootNamespace>LumenVirtualMicrophone</RootNamespace>
+    <ProjectName>LumenVirtualMicrophone</ProjectName>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
+    <KMDF_VERSION_MINOR>31</KMDF_VERSION_MINOR>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <DriverType>KMDF</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <DriverType>KMDF</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)build\$(Platform)\$(Configuration)\package\</OutDir>
+    <IntDir>$(ProjectDir)build\$(Platform)\$(Configuration)\obj\</IntDir>
+    <TargetName>LumenVirtualMicrophone</TargetName>
+    <EnableInf2Cat>true</EnableInf2Cat>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_WIN32;_UNICODE;UNICODE;PC_IMPLEMENTATION;DEBUG_LEVEL=DEBUGLVL_TERSE;_USE_WAVERT_;_NEW_DELETE_OPERATORS_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(DDK_INC_PATH);$(ProjectDir)wavert\Inc;$(ProjectDir)wavert\Main;$(ProjectDir)wavert\Filters;$(ProjectDir)wavert\Utilities;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <SDLCheck>true</SDLCheck>
+      <SpectreMitigation>Spectre</SpectreMitigation>
+      <ExceptionHandling>false</ExceptionHandling>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>portcls.lib;stdunk.lib;libcntpr.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+      <SignMode>Off</SignMode>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="LumenPcmRing.c">
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+    </ClCompile>
+    <ClCompile Include="LumenVirtualMicrophoneControl.c">
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+    </ClCompile>
+    <ClCompile Include="wavert\Filters\micarraytopo.cpp" />
+    <ClCompile Include="wavert\Main\adapter.cpp" />
+    <ClCompile Include="wavert\Main\basetopo.cpp" />
+    <ClCompile Include="wavert\Main\common.cpp" />
+    <ClCompile Include="wavert\Main\mintopo.cpp" />
+    <ClCompile Include="wavert\Main\minwavert.cpp" />
+    <ClCompile Include="wavert\Main\minwavertstream.cpp" />
+    <ClCompile Include="wavert\Main\NewDelete.cpp" />
+    <ClCompile Include="wavert\Utilities\hw.cpp" />
+    <ClCompile Include="wavert\Utilities\kshelper.cpp" />
+    <ClCompile Include="wavert\Utilities\savedata.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="LumenPcmRing.h" />
+    <ClInclude Include="LumenVirtualMicrophoneControl.h" />
+    <ClInclude Include="..\virtual_microphone_protocol.h" />
+    <ClInclude Include="wavert\Filters\micarray1toptable.h" />
+    <ClInclude Include="wavert\Filters\micarraytopo.h" />
+    <ClInclude Include="wavert\Filters\micarraywavtable.h" />
+    <ClInclude Include="wavert\Filters\minipairs.h" />
+    <ClInclude Include="wavert\Inc\basetopo.h" />
+    <ClInclude Include="wavert\Inc\common.h" />
+    <ClInclude Include="wavert\Inc\definitions.h" />
+    <ClInclude Include="wavert\Inc\endpoints.h" />
+    <ClInclude Include="wavert\Inc\kshelper.h" />
+    <ClInclude Include="wavert\Inc\mintopo.h" />
+    <ClInclude Include="wavert\Inc\NewDelete.h" />
+    <ClInclude Include="wavert\Main\minwavert.h" />
+    <ClInclude Include="wavert\Main\minwavertstream.h" />
+    <ClInclude Include="wavert\Utilities\hw.h" />
+    <ClInclude Include="wavert\Utilities\savedata.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="LumenVirtualMicrophone.inf" />
+    <FilesToPackage Include="$(TargetPath)" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

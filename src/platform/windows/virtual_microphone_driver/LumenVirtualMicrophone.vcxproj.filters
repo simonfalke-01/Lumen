@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{D25B638C-FA30-418B-882C-A3727E26F390}</UniqueIdentifier>
+      <Extensions>c;cpp</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{C83AD9BC-4358-4B97-A8D0-1B87DD4051BF}</UniqueIdentifier>
+      <Extensions>h</Extensions>
+    </Filter>
+    <Filter Include="Driver Files">
+      <UniqueIdentifier>{E67CF96E-A8B5-4722-914A-1485736E2140}</UniqueIdentifier>
+      <Extensions>inf</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="LumenPcmRing.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LumenVirtualMicrophoneControl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="wavert\Filters\micarraytopo.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Main\adapter.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Main\basetopo.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Main\common.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Main\mintopo.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Main\minwavert.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Main\minwavertstream.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Main\NewDelete.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Utilities\hw.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Utilities\kshelper.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="wavert\Utilities\savedata.cpp"><Filter>Source Files</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="LumenPcmRing.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="LumenVirtualMicrophoneControl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\virtual_microphone_protocol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="LumenVirtualMicrophone.inf">
+      <Filter>Driver Files</Filter>
+    </Inf>
+  </ItemGroup>
+</Project>
