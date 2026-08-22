@@ -57,7 +57,7 @@
       <WarningLevel>Level3</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
       <PreprocessorDefinitions>_WIN32;_UNICODE;UNICODE;PC_IMPLEMENTATION;DEBUG_LEVEL=DEBUGLVL_TERSE;_USE_WAVERT_;_NEW_DELETE_OPERATORS_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(DDK_INC_PATH);$(ProjectDir)wavert\Inc;$(ProjectDir)wavert\Main;$(ProjectDir)wavert\Filters;$(ProjectDir)wavert\Utilities;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(DDK_INC_PATH)crt;$(DDK_INC_PATH);$(ProjectDir)wavert\Inc;$(ProjectDir)wavert\Main;$(ProjectDir)wavert\Filters;$(ProjectDir)wavert\Utilities;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <SDLCheck>true</SDLCheck>
       <SpectreMitigation>Spectre</SpectreMitigation>
       <ExceptionHandling>false</ExceptionHandling>
