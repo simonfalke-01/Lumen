@@ -47,7 +47,7 @@ static const GUID g_lumen_vmic_control_class = {
  * @param extension Device state protected by extension->lock.
  */
 static void LumenVirtualMicrophoneCountStaleWrite(LUMEN_VMIC_DEVICE_EXTENSION *extension) {
-  if (extension->stale_writes != UINT64_MAX) {
+  if (extension->stale_writes != (lumen_vmic_uint64_t) -1) {
     ++extension->stale_writes;
   }
 }
