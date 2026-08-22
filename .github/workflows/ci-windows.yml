@@ -69,6 +69,7 @@ jobs:
       contents: read
     outputs:
       build_version: ${{ steps.version.outputs.build_version }}
+      source_commit: ${{ steps.version.outputs.source_commit }}
     steps:
       - name: Checkout requested source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -114,6 +115,7 @@ jobs:
           fi
 
           echo "build_version=$build_version" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build_windows:
     name: Windows-AMD64
@@ -534,13 +536,23 @@ jobs:
             exit 1
           fi
 
+      - name: Restore immutable release sources
+        if: inputs.release_tag != ''
+        shell: msys2 {0}
+        run: |
+          git status --short
+          git submodule foreach --recursive 'git reset --hard HEAD'
+          git reset --hard HEAD
+          git diff --quiet --exit-code
+          git diff --cached --quiet --exit-code
+
       - name: Build Windows
         shell: msys2 {0}
         env:
           BRANCH: ${{ github.ref_name }}
           BUILD_VERSION: ${{ needs.validate_version.outputs.build_version }}
           CLONE_URL: ${{ github.server_url }}/${{ github.repository }}
-          COMMIT: ${{ github.sha }}
+          COMMIT: ${{ needs.validate_version.outputs.source_commit }}
           TAG: ${{ inputs.release_tag }}
         run: |
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
