@@ -194,7 +194,6 @@ jobs:
             "$RELEASE_TAG"
             release-assets/*
             --draft
-            --verify-tag
             --title "Lumen $RELEASE_VERSION"
             --notes-file release-notes.md
           )
