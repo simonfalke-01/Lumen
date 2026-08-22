@@ -71,6 +71,7 @@ jobs:
     with:
       release_tag: ${{ inputs.release_tag || github.ref_name }}
       source_ref: ${{ needs.validate.outputs.release_commit }}
+      validation_scenario: release
     permissions:
       actions: read
       contents: read

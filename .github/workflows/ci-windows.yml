@@ -19,6 +19,11 @@ on:
         required: false
         default: ''
         type: string
+      validation_scenario:
+        description: MSI validation set to run
+        required: false
+        default: all
+        type: string
   workflow_dispatch:
     inputs:
       release_tag:
@@ -45,6 +50,7 @@ on:
         type: choice
         options:
           - all
+          - release
           - install-no-vhid
           - install-vhid
           - upgrade
@@ -684,6 +690,8 @@ jobs:
         # The hosted x64 labels used here map to Windows Server, not Windows 11 client.
         scenario: >-
           ${{ fromJSON(
+            inputs.validation_scenario == 'release' &&
+            '["install-no-vhid","upgrade","legacy-import"]' ||
             (inputs.validation_scenario == '' || inputs.validation_scenario == 'all') &&
             '["install-no-vhid","install-vhid","upgrade","legacy-import"]' ||
             format('["{0}"]', inputs.validation_scenario)

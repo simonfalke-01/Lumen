@@ -24,15 +24,17 @@ The release tag must exactly equal `v` followed by the contents of `version.txt`
    `version.txt`, and create a new tag instead of moving the old one.
 
 4. The `Release` workflow validates that the tag exactly matches `version.txt`, builds that tag through the reusable
-   Windows workflow, runs the installer validation scenarios, and downloads the versioned Lumen artifacts.
+   Windows workflow, reruns the non-driver installer validation scenarios, and downloads the versioned Lumen artifacts.
+   The optional Virtual HID install/uninstall scenario remains a required check in the normal Windows CI before the tag
+   is created; it is not repeated during release publication because hosted driver installation is nondeterministic.
 5. Approve the deployment in the protected GitHub `release` environment when the validation evidence is complete.
 6. After approval, the workflow revalidates the remote tag target, generates `SHA256SUMS` and `update-manifest.json`, records GitHub artifact
    provenance attestations, and publishes the GitHub Release with generated notes.
 
 The update manifest is release metadata for current and future clients. Each binary entry includes its file name,
 size, SHA-256 digest, and immutable tag download URL. The repository enforces GitHub immutable releases, and the
-workflow refuses to publish if that protection is disabled. Consumers should still verify the digest after
-downloading; release publication also records GitHub provenance for the uploaded bytes.
+workflow verifies that the published release is immutable. Consumers should still verify the digest after downloading;
+release publication also records GitHub provenance for the uploaded bytes.
 
 The current application implements release discovery and a trusted repository-scoped download link. It does not
 download, verify, or execute installers automatically. Prerelease installations follow newer prereleases by default;

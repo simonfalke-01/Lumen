@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$msiTimeoutMilliseconds = 15 * 60 * 1000
 $artifactDirectory = (Resolve-Path 'artifacts').Path
 $msiCandidates = @(Get-ChildItem 'artifacts/Lumen-*-Windows-AMD64-installer.msi' -File)
 if ($msiCandidates.Count -ne 1) {
@@ -28,7 +29,15 @@ function Invoke-Msi {
 
     $logPath = Join-Path $artifactDirectory $LogName
     $msiArguments = $Arguments + @('/L*V', "`"$logPath`"")
-    $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList $msiArguments
+    $process = Start-Process msiexec.exe -PassThru -ArgumentList $msiArguments
+    if (-not $process.WaitForExit($msiTimeoutMilliseconds)) {
+        & taskkill.exe /PID $process.Id /T /F | Out-Null
+        $process.WaitForExit()
+        if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+            Get-Content $logPath
+        }
+        throw "$FailureMessage Timed out after 15 minutes."
+    }
     if ($process.ExitCode -notin @(0, 3010)) {
         Get-Content $logPath
         throw "$FailureMessage Exit code: $($process.ExitCode)."
