@@ -241,6 +241,8 @@ namespace platf::win_input {
         case VK_OEM_7:
           return 0x34;
         case VK_OEM_3:
+          // Set 1 calls this physical key 0x29, but 0x29 on the HID
+          // Keyboard/Keypad page is Escape. Grave/Tilde is HID usage 0x35.
           return 0x35;
         case VK_OEM_COMMA:
           return 0x36;
@@ -295,124 +297,7 @@ namespace platf::win_input {
         case VK_APPS:
           return 0x65;
         case VK_SEPARATOR:
-          return 0x85;
-        case VK_SLEEP:
-          return 0x82;
-        default:
-          return std::nullopt;
-      }
-    }
-
-    /**
-     * @brief Convert an active-layout Set 1 scan code to a HID keyboard usage.
-     * @param scan_code Scan code returned by `MAPVK_VK_TO_VSC_EX`.
-     * @return HID usage, or no value when the physical key is unsupported.
-     */
-    std::optional<std::uint8_t> scan_code_usage(UINT scan_code) {
-      const auto code = static_cast<std::uint8_t>(scan_code & 0xFFU);
-      const auto prefix = static_cast<std::uint8_t>((scan_code >> 8U) & 0xFFU);
-
-      if (prefix == 0xE0) {
-        switch (code) {
-          case 0x1C:
-            return 0x58;
-          case 0x1D:
-            return 0xE4;
-          case 0x35:
-            return 0x54;
-          case 0x37:
-            return 0x46;
-          case 0x38:
-            return 0xE6;
-          case 0x47:
-            return 0x4A;
-          case 0x48:
-            return 0x52;
-          case 0x49:
-            return 0x4B;
-          case 0x4B:
-            return 0x50;
-          case 0x4D:
-            return 0x4F;
-          case 0x4F:
-            return 0x4D;
-          case 0x50:
-            return 0x51;
-          case 0x51:
-            return 0x4E;
-          case 0x52:
-            return 0x49;
-          case 0x53:
-            return 0x4C;
-          case 0x5B:
-            return 0xE3;
-          case 0x5C:
-            return 0xE7;
-          case 0x5D:
-            return 0x65;
-          case 0x5F:
-            return 0x82;
-          default:
-            return std::nullopt;
-        }
-      }
-      if (prefix != 0) {
-        return std::nullopt;
-      }
-
-      for (std::uint16_t key = 0; key < VK_TO_SCANCODE_MAP.size(); ++key) {
-        if (VK_TO_SCANCODE_MAP[key] == code) {
-          if (const auto usage = direct_key_usage(key)) {
-            return usage;
-          }
-        }
-      }
-      return std::nullopt;
-    }
-
-    /**
-     * @brief Map common Windows media/browser keys to Consumer Control usages.
-     * @param key Windows virtual key.
-     * @return Consumer usage, or no value when unsupported.
-     */
-    std::optional<std::uint16_t> consumer_usage(std::uint16_t key) {
-      switch (key) {
-        case VK_BROWSER_BACK:
-          return 0x0224;
-        case VK_BROWSER_FORWARD:
-          return 0x0225;
-        case VK_BROWSER_REFRESH:
-          return 0x0227;
-        case VK_BROWSER_STOP:
-          return 0x0226;
-        case VK_BROWSER_SEARCH:
-          return 0x0221;
-        case VK_BROWSER_FAVORITES:
-          return 0x022A;
-        case VK_BROWSER_HOME:
-          return 0x0223;
-        case VK_VOLUME_MUTE:
-          return 0x00E2;
-        case VK_VOLUME_DOWN:
-          return 0x00EA;
-        case VK_VOLUME_UP:
-          return 0x00E9;
-        case VK_MEDIA_NEXT_TRACK:
-          return 0x00B5;
-        case VK_MEDIA_PREV_TRACK:
-          return 0x00B6;
-        case VK_MEDIA_STOP:
-          return 0x00B7;
-        case VK_MEDIA_PLAY_PAUSE:
-          return 0x00CD;
-        case VK_LAUNCH_MAIL:
-          return 0x018A;
-        case VK_LAUNCH_MEDIA_SELECT:
-          return 0x0183;
-        case VK_LAUNCH_APP1:
-          return 0x0194;
-        case VK_LAUNCH_APP2:
-          return 0x0192;
+          return 0x9F;
         default:
           return std::nullopt;
       }
@@ -440,7 +325,165 @@ namespace platf::win_input {
           return 0;
       }
     }
+
+    /**
+     * @brief Build the stable identity of one keyboard transition stream.
+     * @param modcode Windows virtual-key code.
+     * @param flags Moonlight keyboard packet flags.
+     * @return Key identity preserving both the code and mapping mode.
+     */
+    constexpr std::uint32_t key_transition_id(std::uint16_t modcode, std::uint8_t flags) noexcept {
+      return static_cast<std::uint32_t>(modcode) | (static_cast<std::uint32_t>(flags) << 16U);
+    }
   }  // namespace
+
+  std::optional<std::uint8_t> map_scan_code_to_hid_usage(UINT scan_code) {
+    if (scan_code > 0xFFFFU) {
+      return std::nullopt;
+    }
+    const auto code = static_cast<std::uint8_t>(scan_code & 0xFFU);
+    const auto prefix = static_cast<std::uint8_t>((scan_code >> 8U) & 0xFFU);
+
+    if (prefix == 0xE0) {
+      switch (code) {
+        case 0x1C:
+          return 0x58;
+        case 0x1D:
+          return 0xE4;
+        case 0x35:
+          return 0x54;
+        case 0x37:
+          return 0x46;
+        case 0x38:
+          return 0xE6;
+        case 0x47:
+          return 0x4A;
+        case 0x48:
+          return 0x52;
+        case 0x49:
+          return 0x4B;
+        case 0x4B:
+          return 0x50;
+        case 0x4D:
+          return 0x4F;
+        case 0x4F:
+          return 0x4D;
+        case 0x50:
+          return 0x51;
+        case 0x51:
+          return 0x4E;
+        case 0x52:
+          return 0x49;
+        case 0x53:
+          return 0x4C;
+        case 0x5B:
+          return 0xE3;
+        case 0x5C:
+          return 0xE7;
+        case 0x5D:
+          return 0x65;
+        default:
+          return std::nullopt;
+      }
+    }
+    if (prefix != 0 || code == 0) {
+      return std::nullopt;
+    }
+
+    // Set 1 reuses these codes for E0-prefixed navigation keys and their
+    // unprefixed keypad counterparts. Resolve the physical keypad keys before
+    // consulting the legacy VK-to-scan-code table, which cannot store prefixes.
+    switch (code) {
+      case 0x29:
+        return 0x35;
+      case 0x35:
+        return 0x38;
+      case 0x47:
+        return 0x5F;
+      case 0x48:
+        return 0x60;
+      case 0x49:
+        return 0x61;
+      case 0x4A:
+        return 0x56;
+      case 0x4B:
+        return 0x5C;
+      case 0x4C:
+        return 0x5D;
+      case 0x4D:
+        return 0x5E;
+      case 0x4E:
+        return 0x57;
+      case 0x4F:
+        return 0x59;
+      case 0x50:
+        return 0x5A;
+      case 0x51:
+        return 0x5B;
+      case 0x52:
+        return 0x62;
+      case 0x53:
+        return 0x63;
+      case 0x5B:
+      case 0x5C:
+      case 0x5D:
+        return std::nullopt;
+      default:
+        break;
+    }
+
+    for (std::uint16_t key = 0; key < VK_TO_SCANCODE_MAP.size(); ++key) {
+      if (VK_TO_SCANCODE_MAP[key] == code) {
+        if (const auto usage = direct_key_usage(key)) {
+          return usage;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::uint16_t> map_key_to_consumer_usage(std::uint16_t modcode) {
+    switch (modcode) {
+      case VK_BROWSER_BACK:
+        return 0x0224;
+      case VK_BROWSER_FORWARD:
+        return 0x0225;
+      case VK_BROWSER_REFRESH:
+        return 0x0227;
+      case VK_BROWSER_STOP:
+        return 0x0226;
+      case VK_BROWSER_SEARCH:
+        return 0x0221;
+      case VK_BROWSER_FAVORITES:
+        return 0x022A;
+      case VK_BROWSER_HOME:
+        return 0x0223;
+      case VK_VOLUME_MUTE:
+        return 0x00E2;
+      case VK_VOLUME_DOWN:
+        return 0x00EA;
+      case VK_VOLUME_UP:
+        return 0x00E9;
+      case VK_MEDIA_NEXT_TRACK:
+        return 0x00B5;
+      case VK_MEDIA_PREV_TRACK:
+        return 0x00B6;
+      case VK_MEDIA_STOP:
+        return 0x00B7;
+      case VK_MEDIA_PLAY_PAUSE:
+        return 0x00CD;
+      case VK_LAUNCH_MAIL:
+        return 0x018A;
+      case VK_LAUNCH_MEDIA_SELECT:
+        return 0x0183;
+      case VK_LAUNCH_APP1:
+        return 0x0194;
+      case VK_LAUNCH_APP2:
+        return 0x0192;
+      default:
+        return std::nullopt;
+    }
+  }
 
   std::optional<std::uint8_t> map_key_to_hid_usage(
     std::uint16_t modcode,
@@ -455,7 +498,7 @@ namespace platf::win_input {
         return direct_key_usage(modcode);
       }
       const auto scan = MapVirtualKeyW(modcode, MAPVK_VK_TO_VSC_EX);
-      return scan ? scan_code_usage(scan) : std::nullopt;
+      return scan ? map_scan_code_to_hid_usage(scan) : std::nullopt;
     }
     return direct_key_usage(modcode);
   }
@@ -539,8 +582,8 @@ namespace platf::win_input {
   LUMEN_VHID_KEYBOARD_REPORT virtual_hid_transport_t::keyboard_report() const {
     LUMEN_VHID_KEYBOARD_REPORT report {};
     report.report_id = LUMEN_VHID_REPORT_ID_KEYBOARD;
-    for (const auto &[modcode, usage] : held_keys_) {
-      static_cast<void>(modcode);
+    for (const auto &[transition_id, usage] : held_keys_) {
+      static_cast<void>(transition_id);
       if (usage >= 0xE0 && usage <= 0xE7) {
         report.modifiers |= static_cast<std::uint8_t>(1U << (usage - 0xE0));
       } else if (usage / 8 < LUMEN_VHID_NKRO_BITMAP_SIZE) {
@@ -554,8 +597,8 @@ namespace platf::win_input {
     LUMEN_VHID_CONSUMER_REPORT report {};
     report.report_id = LUMEN_VHID_REPORT_ID_CONSUMER;
     std::size_t index = 0;
-    for (const auto &[modcode, usage] : held_consumers_) {
-      static_cast<void>(modcode);
+    for (const auto &[transition_id, usage] : held_consumers_) {
+      static_cast<void>(transition_id);
       if (index == LUMEN_VHID_CONSUMER_USAGE_COUNT) {
         break;
       }
@@ -755,29 +798,30 @@ namespace platf::win_input {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
 
-    if (release && fallback_keys_.contains(modcode)) {
+    const auto transition_id = key_transition_id(modcode, flags);
+    if (release && fallback_keys_.contains(transition_id)) {
       const auto result = fallback_->keyboard(modcode, true, flags);
       if (result) {
-        fallback_keys_.erase(modcode);
+        fallback_keys_.erase(transition_id);
       }
       return result;
     }
 
-    if (const auto usage = consumer_usage(modcode)) {
+    if (const auto usage = map_key_to_consumer_usage(modcode)) {
       const auto previous = held_consumers_;
       if (release) {
-        if (!held_consumers_.contains(modcode)) {
+        if (!held_consumers_.contains(transition_id)) {
           return {};
         }
-        held_consumers_.erase(modcode);
-      } else if (!held_consumers_.contains(modcode) && held_consumers_.size() >= LUMEN_VHID_CONSUMER_USAGE_COUNT) {
+        held_consumers_.erase(transition_id);
+      } else if (!held_consumers_.contains(transition_id) && held_consumers_.size() >= LUMEN_VHID_CONSUMER_USAGE_COUNT) {
         const auto result = fallback_->keyboard(modcode, false, flags);
         if (result) {
-          fallback_keys_.insert(modcode);
+          fallback_keys_.insert(transition_id);
         }
         return result;
       } else {
-        held_consumers_[modcode] = *usage;
+        held_consumers_[transition_id] = *usage;
       }
       LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
       request.report_kind = LUMEN_VHID_REPORT_KIND_CONSUMER;
@@ -790,27 +834,25 @@ namespace platf::win_input {
       return result;
     }
 
-    const auto usage = map_key_to_hid_usage(modcode, flags, config::input.always_send_scancodes);
-    if (!usage) {
-      if (release) {
-        return {};
-      }
-      const auto result = fallback_->keyboard(modcode, false, flags);
-      if (result) {
-        fallback_keys_.insert(modcode);
-      }
-      return result;
-    }
-
     const auto previous = held_keys_;
     if (release) {
-      if (!held_keys_.contains(modcode)) {
+      if (!held_keys_.contains(transition_id)) {
         return {};
       }
-      held_keys_.erase(modcode);
+      held_keys_.erase(transition_id);
     } else {
-      held_keys_[modcode] = *usage;
+      const auto usage = map_key_to_hid_usage(modcode, flags, config::input.always_send_scancodes);
+      if (usage) {
+        held_keys_[transition_id] = *usage;
+      } else {
+        const auto result = fallback_->keyboard(modcode, false, flags);
+        if (result) {
+          fallback_keys_.insert(transition_id);
+        }
+        return result;
+      }
     }
+
     LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
     request.report_kind = LUMEN_VHID_REPORT_KIND_KEYBOARD;
     request.report.keyboard = keyboard_report();

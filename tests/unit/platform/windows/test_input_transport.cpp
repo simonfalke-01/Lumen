@@ -281,6 +281,17 @@ TEST_F(send_input_transport_test, BuildsExtendedKeyboardReleaseInput) {
   EXPECT_EQ(input.ki.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP);
 }
 
+TEST_F(send_input_transport_test, BuildsExtendedSystemSleepInput) {
+  const auto result = transport->keyboard(VK_SLEEP, false, 0);
+
+  ASSERT_TRUE(result);
+  ASSERT_EQ(api->submitted.size(), 1);
+  const auto &input = api->submitted.front();
+  EXPECT_EQ(input.ki.wVk, 0);
+  EXPECT_EQ(input.ki.wScan, 0x5F);
+  EXPECT_EQ(input.ki.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
+}
+
 TEST_F(send_input_transport_test, KeepsPauseAsVirtualKeyWhenAlwaysScancodesEnabled) {
   config::input.always_send_scancodes = true;
 

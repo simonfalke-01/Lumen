@@ -94,6 +94,24 @@ namespace platf::win_input {
   );
 
   /**
+   * @brief Convert a Set 1 scan code into a keyboard-page HID usage.
+   *
+   * The high byte may contain the `0xE0` prefix returned by
+   * `MAPVK_VK_TO_VSC_EX`.
+   *
+   * @param scan_code Set 1 scan code, optionally prefixed by `0xE0`.
+   * @return HID usage, or no value when the physical key is unsupported.
+   */
+  [[nodiscard]] std::optional<std::uint8_t> map_scan_code_to_hid_usage(UINT scan_code);
+
+  /**
+   * @brief Convert a Windows virtual key into a Consumer-page HID usage.
+   * @param modcode Windows virtual-key code.
+   * @return Consumer usage, or no value when the key is unsupported.
+   */
+  [[nodiscard]] std::optional<std::uint16_t> map_key_to_consumer_usage(std::uint16_t modcode);
+
+  /**
    * @brief Preferred Virtual HID transport with reset-gated failure recovery.
    */
   class virtual_hid_transport_t final: public transport_t {
@@ -187,9 +205,9 @@ namespace platf::win_input {
     mutable std::mutex mutex_;  ///< Serializes reports, state, and recovery.
     std::atomic<backend_t> backend_ {backend_t::probing};  ///< Current stateful backend.
     bool accepted_virtual_input_ {false};  ///< Whether any Virtual HID report was accepted.
-    std::unordered_map<std::uint16_t, std::uint8_t> held_keys_;  ///< Held keyboard usages by virtual key.
-    std::unordered_map<std::uint16_t, std::uint16_t> held_consumers_;  ///< Held consumer usages by virtual key.
-    std::unordered_set<std::uint16_t> fallback_keys_;  ///< Held per-key SendInput transitions.
+    std::unordered_map<std::uint32_t, std::uint8_t> held_keys_;  ///< Held keyboard usages by key and packet flags.
+    std::unordered_map<std::uint32_t, std::uint16_t> held_consumers_;  ///< Held consumer usages by key and packet flags.
+    std::unordered_set<std::uint32_t> fallback_keys_;  ///< Held SendInput transitions by key and packet flags.
     LUMEN_VHID_KEYBOARD_REPORT acknowledged_keyboard_ {};  ///< Last accepted keyboard snapshot.
     std::uint8_t held_buttons_ {0};  ///< Desired mouse-button bitmap.
     std::uint8_t acknowledged_buttons_ {0};  ///< Last accepted mouse-button bitmap.

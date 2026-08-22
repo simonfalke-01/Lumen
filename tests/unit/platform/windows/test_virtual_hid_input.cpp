@@ -11,9 +11,11 @@
 
   // standard includes
   #include <algorithm>
+  #include <array>
   #include <cstdint>
   #include <deque>
   #include <memory>
+  #include <optional>
   #include <utility>
   #include <vector>
 
@@ -137,6 +139,272 @@ namespace {
   class virtual_hid_mouse_button_test:
       public virtual_hid_input_test,
       public testing::WithParamInterface<virtual_hid_mouse_button_case_t> {};
+
+  /** Complete expected Windows virtual-key to keyboard-page usage map. */
+  using expected_keyboard_map_t = std::array<std::optional<std::uint8_t>, 256>;
+
+  /** Complete expected Windows virtual-key to Consumer-page usage map. */
+  using expected_consumer_map_t = std::array<std::optional<std::uint16_t>, 256>;
+
+  /**
+   * @brief Build the independently specified canonical keyboard-page map.
+   * @return Expected usage for every eight-bit Windows virtual key.
+   */
+  expected_keyboard_map_t expected_keyboard_map() {
+    expected_keyboard_map_t expected {};
+    for (std::uint16_t key = 'A'; key <= 'Z'; ++key) {
+      expected[key] = static_cast<std::uint8_t>(0x04 + key - 'A');
+    }
+    for (std::uint16_t key = '1'; key <= '9'; ++key) {
+      expected[key] = static_cast<std::uint8_t>(0x1E + key - '1');
+    }
+    expected['0'] = 0x27;
+    for (std::uint16_t key = VK_F1; key <= VK_F12; ++key) {
+      expected[key] = static_cast<std::uint8_t>(0x3A + key - VK_F1);
+    }
+    for (std::uint16_t key = VK_F13; key <= VK_F24; ++key) {
+      expected[key] = static_cast<std::uint8_t>(0x68 + key - VK_F13);
+    }
+    for (std::uint16_t key = VK_NUMPAD1; key <= VK_NUMPAD9; ++key) {
+      expected[key] = static_cast<std::uint8_t>(0x59 + key - VK_NUMPAD1);
+    }
+
+    const auto fixed = std::to_array<std::pair<std::uint16_t, std::uint8_t>>({
+      {VK_SHIFT, 0xE1},
+      {VK_LSHIFT, 0xE1},
+      {VK_RSHIFT, 0xE5},
+      {VK_CONTROL, 0xE0},
+      {VK_LCONTROL, 0xE0},
+      {VK_RCONTROL, 0xE4},
+      {VK_MENU, 0xE2},
+      {VK_LMENU, 0xE2},
+      {VK_RMENU, 0xE6},
+      {VK_LWIN, 0xE3},
+      {VK_RWIN, 0xE7},
+      {VK_RETURN, 0x28},
+      {VK_ESCAPE, 0x29},
+      {VK_BACK, 0x2A},
+      {VK_TAB, 0x2B},
+      {VK_SPACE, 0x2C},
+      {VK_OEM_MINUS, 0x2D},
+      {VK_OEM_PLUS, 0x2E},
+      {VK_OEM_4, 0x2F},
+      {VK_OEM_6, 0x30},
+      {VK_OEM_5, 0x31},
+      {VK_OEM_1, 0x33},
+      {VK_OEM_7, 0x34},
+      {VK_OEM_3, 0x35},
+      {VK_OEM_COMMA, 0x36},
+      {VK_OEM_PERIOD, 0x37},
+      {VK_OEM_2, 0x38},
+      {VK_CAPITAL, 0x39},
+      {VK_SNAPSHOT, 0x46},
+      {VK_SCROLL, 0x47},
+      {VK_PAUSE, 0x48},
+      {VK_INSERT, 0x49},
+      {VK_HOME, 0x4A},
+      {VK_PRIOR, 0x4B},
+      {VK_DELETE, 0x4C},
+      {VK_END, 0x4D},
+      {VK_NEXT, 0x4E},
+      {VK_RIGHT, 0x4F},
+      {VK_LEFT, 0x50},
+      {VK_DOWN, 0x51},
+      {VK_UP, 0x52},
+      {VK_NUMLOCK, 0x53},
+      {VK_DIVIDE, 0x54},
+      {VK_MULTIPLY, 0x55},
+      {VK_SUBTRACT, 0x56},
+      {VK_ADD, 0x57},
+      {VK_NUMPAD0, 0x62},
+      {VK_DECIMAL, 0x63},
+      {VK_OEM_102, 0x64},
+      {VK_APPS, 0x65},
+      {VK_SEPARATOR, 0x9F},
+    });
+    for (const auto &[key, usage] : fixed) {
+      expected[key] = usage;
+    }
+    return expected;
+  }
+
+  /**
+   * @brief Build the independently specified canonical Consumer-page map.
+   * @return Expected usage for every eight-bit Windows virtual key.
+   */
+  expected_consumer_map_t expected_consumer_map() {
+    expected_consumer_map_t expected {};
+    const auto fixed = std::to_array<std::pair<std::uint16_t, std::uint16_t>>({
+      {VK_BROWSER_BACK, 0x0224},
+      {VK_BROWSER_FORWARD, 0x0225},
+      {VK_BROWSER_REFRESH, 0x0227},
+      {VK_BROWSER_STOP, 0x0226},
+      {VK_BROWSER_SEARCH, 0x0221},
+      {VK_BROWSER_FAVORITES, 0x022A},
+      {VK_BROWSER_HOME, 0x0223},
+      {VK_VOLUME_MUTE, 0x00E2},
+      {VK_VOLUME_DOWN, 0x00EA},
+      {VK_VOLUME_UP, 0x00E9},
+      {VK_MEDIA_NEXT_TRACK, 0x00B5},
+      {VK_MEDIA_PREV_TRACK, 0x00B6},
+      {VK_MEDIA_STOP, 0x00B7},
+      {VK_MEDIA_PLAY_PAUSE, 0x00CD},
+      {VK_LAUNCH_MAIL, 0x018A},
+      {VK_LAUNCH_MEDIA_SELECT, 0x0183},
+      {VK_LAUNCH_APP1, 0x0194},
+      {VK_LAUNCH_APP2, 0x0192},
+    });
+    for (const auto &[key, usage] : fixed) {
+      expected[key] = usage;
+    }
+    return expected;
+  }
+
+  /**
+   * @brief Store one expected Set 1 scan-code mapping.
+   * @param expected Normal and `0xE0`-prefixed scan-code maps.
+   * @param scan_code Set 1 scan code, optionally prefixed by `0xE0`.
+   * @param usage Expected keyboard-page usage.
+   */
+  void set_expected_scan_usage(
+    std::array<expected_keyboard_map_t, 2> &expected,
+    UINT scan_code,
+    std::uint8_t usage
+  ) {
+    const auto prefix_index = (scan_code & 0xFF00U) == 0xE000U ? 1U : 0U;
+    expected[prefix_index][scan_code & 0xFFU] = usage;
+  }
+
+  /**
+   * @brief Build the canonical Set 1 scan-code to keyboard-page usage map.
+   * @return Expected maps for unprefixed and `0xE0`-prefixed scan codes.
+   */
+  std::array<expected_keyboard_map_t, 2> expected_scan_code_map() {
+    std::array<expected_keyboard_map_t, 2> expected {};
+    const auto fixed = std::to_array<std::pair<UINT, std::uint8_t>>({
+      {0x01, 0x29},
+      {0x02, 0x1E},
+      {0x03, 0x1F},
+      {0x04, 0x20},
+      {0x05, 0x21},
+      {0x06, 0x22},
+      {0x07, 0x23},
+      {0x08, 0x24},
+      {0x09, 0x25},
+      {0x0A, 0x26},
+      {0x0B, 0x27},
+      {0x0C, 0x2D},
+      {0x0D, 0x2E},
+      {0x0E, 0x2A},
+      {0x0F, 0x2B},
+      {0x10, 0x14},
+      {0x11, 0x1A},
+      {0x12, 0x08},
+      {0x13, 0x15},
+      {0x14, 0x17},
+      {0x15, 0x1C},
+      {0x16, 0x18},
+      {0x17, 0x0C},
+      {0x18, 0x12},
+      {0x19, 0x13},
+      {0x1A, 0x2F},
+      {0x1B, 0x30},
+      {0x1C, 0x28},
+      {0x1D, 0xE0},
+      {0x1E, 0x04},
+      {0x1F, 0x16},
+      {0x20, 0x07},
+      {0x21, 0x09},
+      {0x22, 0x0A},
+      {0x23, 0x0B},
+      {0x24, 0x0D},
+      {0x25, 0x0E},
+      {0x26, 0x0F},
+      {0x27, 0x33},
+      {0x28, 0x34},
+      {0x29, 0x35},
+      {0x2A, 0xE1},
+      {0x2B, 0x31},
+      {0x2C, 0x1D},
+      {0x2D, 0x1B},
+      {0x2E, 0x06},
+      {0x2F, 0x19},
+      {0x30, 0x05},
+      {0x31, 0x11},
+      {0x32, 0x10},
+      {0x33, 0x36},
+      {0x34, 0x37},
+      {0x35, 0x38},
+      {0x36, 0xE5},
+      {0x37, 0x55},
+      {0x38, 0xE2},
+      {0x39, 0x2C},
+      {0x3A, 0x39},
+      {0x3B, 0x3A},
+      {0x3C, 0x3B},
+      {0x3D, 0x3C},
+      {0x3E, 0x3D},
+      {0x3F, 0x3E},
+      {0x40, 0x3F},
+      {0x41, 0x40},
+      {0x42, 0x41},
+      {0x43, 0x42},
+      {0x44, 0x43},
+      {0x45, 0x53},
+      {0x46, 0x47},
+      {0x47, 0x5F},
+      {0x48, 0x60},
+      {0x49, 0x61},
+      {0x4A, 0x56},
+      {0x4B, 0x5C},
+      {0x4C, 0x5D},
+      {0x4D, 0x5E},
+      {0x4E, 0x57},
+      {0x4F, 0x59},
+      {0x50, 0x5A},
+      {0x51, 0x5B},
+      {0x52, 0x62},
+      {0x53, 0x63},
+      {0x54, 0x46},
+      {0x56, 0x64},
+      {0x57, 0x44},
+      {0x58, 0x45},
+      {0x64, 0x68},
+      {0x65, 0x69},
+      {0x66, 0x6A},
+      {0x67, 0x6B},
+      {0x68, 0x6C},
+      {0x69, 0x6D},
+      {0x6A, 0x6E},
+      {0x6B, 0x6F},
+      {0x6C, 0x70},
+      {0x6D, 0x71},
+      {0x6E, 0x72},
+      {0x76, 0x73},
+      {0xE01C, 0x58},
+      {0xE01D, 0xE4},
+      {0xE035, 0x54},
+      {0xE037, 0x46},
+      {0xE038, 0xE6},
+      {0xE047, 0x4A},
+      {0xE048, 0x52},
+      {0xE049, 0x4B},
+      {0xE04B, 0x50},
+      {0xE04D, 0x4F},
+      {0xE04F, 0x4D},
+      {0xE050, 0x51},
+      {0xE051, 0x4E},
+      {0xE052, 0x49},
+      {0xE053, 0x4C},
+      {0xE05B, 0xE3},
+      {0xE05C, 0xE7},
+      {0xE05D, 0x65},
+    });
+    for (const auto &[scan_code, usage] : fixed) {
+      set_expected_scan_usage(expected, scan_code, usage);
+    }
+    return expected;
+  }
 }  // namespace
 
 TEST_F(virtual_hid_input_test, InitializesThroughExactLeanOperations) {
@@ -199,6 +467,41 @@ TEST_F(virtual_hid_input_test, BuildsCompleteNkroKeyboardSnapshots) {
   EXPECT_EQ(release.modifiers, 1U << 4);
 }
 
+TEST_F(virtual_hid_input_test, ReleasesStoredUsageAfterScancodeSettingChanges) {
+  initialize();
+  config::input.always_send_scancodes = true;
+  ASSERT_TRUE(transport->keyboard('A', false, SS_KBE_FLAG_NON_NORMALIZED));
+
+  config::input.always_send_scancodes = false;
+  ASSERT_TRUE(transport->keyboard('A', true, SS_KBE_FLAG_NON_NORMALIZED));
+
+  ASSERT_EQ(channel->submissions.size(), 2);
+  const auto &release = channel->submissions.back().report.keyboard;
+  EXPECT_EQ(release.modifiers, 0);
+  EXPECT_TRUE(std::ranges::all_of(release.key_bitmap, [](std::uint8_t byte) {
+    return byte == 0;
+  }));
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, TracksNormalizedAndNonNormalizedKeysIndependently) {
+  initialize();
+  config::input.always_send_scancodes = true;
+
+  ASSERT_TRUE(transport->keyboard('A', false, 0));
+  ASSERT_TRUE(transport->keyboard('A', false, SS_KBE_FLAG_NON_NORMALIZED));
+  ASSERT_TRUE(transport->keyboard('A', true, 0));
+  ASSERT_TRUE(transport->keyboard('A', true, SS_KBE_FLAG_NON_NORMALIZED));
+
+  ASSERT_EQ(channel->submissions.size(), 4);
+  EXPECT_TRUE(std::ranges::any_of(channel->submissions[2].report.keyboard.key_bitmap, [](std::uint8_t byte) {
+    return byte != 0;
+  }));
+  EXPECT_TRUE(std::ranges::all_of(channel->submissions[3].report.keyboard.key_bitmap, [](std::uint8_t byte) {
+    return byte == 0;
+  }));
+}
+
 TEST_F(virtual_hid_input_test, MapsCommonMediaKeyThroughConsumerControl) {
   initialize();
 
@@ -225,6 +528,19 @@ TEST_F(virtual_hid_input_test, UsesPerKeySendInputForUnsupportedKeyWhileHealthy)
   EXPECT_EQ(fallback_api->submitted[0].ki.wVk, VK_PACKET);
 }
 
+TEST_F(virtual_hid_input_test, RoutesSystemSleepThroughSendInputInsteadOfKeyboardPage) {
+  initialize();
+
+  const auto result = transport->keyboard(VK_SLEEP, false, 0);
+
+  ASSERT_TRUE(result);
+  EXPECT_TRUE(channel->submissions.empty());
+  ASSERT_EQ(fallback_api->submitted.size(), 1);
+  EXPECT_EQ(fallback_api->submitted[0].ki.wVk, 0);
+  EXPECT_EQ(fallback_api->submitted[0].ki.wScan, 0x5F);
+  EXPECT_EQ(fallback_api->submitted[0].ki.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
+}
+
 TEST_F(virtual_hid_input_test, RoutesMatchingUnsupportedReleaseThroughSendInput) {
   initialize();
 
@@ -237,6 +553,19 @@ TEST_F(virtual_hid_input_test, RoutesMatchingUnsupportedReleaseThroughSendInput)
   EXPECT_TRUE(channel->submissions.empty());
   ASSERT_EQ(fallback_api->submitted.size(), 2);
   EXPECT_EQ(fallback_api->submitted[1].ki.dwFlags, KEYEVENTF_KEYUP);
+}
+
+TEST_F(virtual_hid_input_test, TracksFallbackKeysIndependentlyByPacketFlags) {
+  initialize();
+
+  ASSERT_TRUE(transport->keyboard(VK_PACKET, false, 0));
+  ASSERT_TRUE(transport->keyboard(VK_PACKET, false, SS_KBE_FLAG_NON_NORMALIZED));
+  ASSERT_TRUE(transport->keyboard(VK_PACKET, true, 0));
+  ASSERT_TRUE(transport->keyboard(VK_PACKET, true, SS_KBE_FLAG_NON_NORMALIZED));
+
+  ASSERT_EQ(fallback_api->submitted.size(), 4);
+  EXPECT_EQ(fallback_api->submitted[2].ki.dwFlags, KEYEVENTF_KEYUP);
+  EXPECT_EQ(fallback_api->submitted[3].ki.dwFlags, KEYEVENTF_KEYUP);
 }
 
 TEST_F(virtual_hid_input_test, RoutesAbsoluteMouseAndUnicodeThroughSendInputWhileHealthy) {
@@ -392,10 +721,65 @@ TEST_F(virtual_hid_input_test, ResetFailureKeepsTransportFailClosed) {
   EXPECT_EQ(transport->failure_stage(), "reset and release");
 }
 
-TEST(VirtualHidKeyMappingTest, MapsAndRejectsExpectedKeys) {
-  EXPECT_EQ(platf::win_input::map_key_to_hid_usage('A', 0, false), 0x04);
-  EXPECT_EQ(platf::win_input::map_key_to_hid_usage(VK_RCONTROL, 0, false), 0xE4);
-  EXPECT_FALSE(platf::win_input::map_key_to_hid_usage(VK_PACKET, 0, false));
+TEST_F(virtual_hid_input_test, PacksGraveAndEscapeIntoDistinctBitmapBits) {
+  initialize();
+
+  ASSERT_TRUE(transport->keyboard(VK_OEM_3, false, 0));
+  ASSERT_EQ(channel->submissions.size(), 1);
+  const auto &grave = channel->submissions.back().report.keyboard;
+  EXPECT_EQ(grave.key_bitmap[0x35 / 8], 1U << (0x35 % 8));
+  EXPECT_EQ(grave.key_bitmap[0x29 / 8], 0);
+
+  ASSERT_TRUE(transport->keyboard(VK_OEM_3, true, 0));
+  ASSERT_TRUE(transport->keyboard(VK_ESCAPE, false, 0));
+  ASSERT_EQ(channel->submissions.size(), 3);
+  const auto &escape = channel->submissions.back().report.keyboard;
+  EXPECT_EQ(escape.key_bitmap[0x29 / 8], 1U << (0x29 % 8));
+  EXPECT_EQ(escape.key_bitmap[0x35 / 8], 0);
+}
+
+TEST(VirtualHidKeyMappingTest, MapsEveryVirtualKeyToCanonicalKeyboardUsage) {
+  const auto expected = expected_keyboard_map();
+
+  for (std::uint16_t key = 0; key < expected.size(); ++key) {
+    SCOPED_TRACE(testing::Message() << "virtual key 0x" << std::hex << key);
+    EXPECT_EQ(platf::win_input::map_key_to_hid_usage(key, 0, false), expected[key]);
+  }
+
+  EXPECT_EQ(expected[VK_OEM_3], 0x35);
+  EXPECT_EQ(expected[VK_ESCAPE], 0x29);
+  EXPECT_FALSE(expected[VK_SLEEP]);
+}
+
+TEST(VirtualHidKeyMappingTest, MapsEveryVirtualKeyToCanonicalConsumerUsage) {
+  const auto expected = expected_consumer_map();
+
+  for (std::uint16_t key = 0; key < expected.size(); ++key) {
+    SCOPED_TRACE(testing::Message() << "virtual key 0x" << std::hex << key);
+    EXPECT_EQ(platf::win_input::map_key_to_consumer_usage(key), expected[key]);
+  }
+}
+
+TEST(VirtualHidKeyMappingTest, MapsEverySet1ScanCodeToCanonicalKeyboardUsage) {
+  const auto expected = expected_scan_code_map();
+
+  for (UINT code = 0; code <= 0xFFU; ++code) {
+    SCOPED_TRACE(testing::Message() << "Set 1 scan code 0x" << std::hex << code);
+    EXPECT_EQ(platf::win_input::map_scan_code_to_hid_usage(code), expected[0][code]);
+    EXPECT_EQ(platf::win_input::map_scan_code_to_hid_usage(0xE000U | code), expected[1][code]);
+    EXPECT_FALSE(platf::win_input::map_scan_code_to_hid_usage(0xE100U | code));
+  }
+
+  EXPECT_EQ(platf::win_input::map_scan_code_to_hid_usage(0x29), 0x35);
+  EXPECT_EQ(platf::win_input::map_scan_code_to_hid_usage(0x01), 0x29);
+  EXPECT_EQ(platf::win_input::map_scan_code_to_hid_usage(0x35), 0x38);
+  EXPECT_EQ(platf::win_input::map_scan_code_to_hid_usage(0xE035), 0x54);
+  EXPECT_EQ(platf::win_input::map_scan_code_to_hid_usage(0x52), 0x62);
+  EXPECT_EQ(platf::win_input::map_scan_code_to_hid_usage(0xE052), 0x49);
+  EXPECT_FALSE(platf::win_input::map_scan_code_to_hid_usage(0x01E029));
+}
+
+TEST(VirtualHidKeyMappingTest, RejectsNonNormalizedKeysUnlessScancodeMappingIsEnabled) {
   EXPECT_FALSE(platf::win_input::map_key_to_hid_usage('A', SS_KBE_FLAG_NON_NORMALIZED, false));
 }
 

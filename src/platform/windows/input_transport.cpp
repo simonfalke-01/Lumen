@@ -89,6 +89,7 @@ namespace platf::win_input {
         case VK_RIGHT:
         case VK_DIVIDE:
         case VK_APPS:
+        case VK_SLEEP:
           keyboard.dwFlags |= KEYEVENTF_EXTENDEDKEY;
           break;
         default:
