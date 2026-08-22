@@ -595,19 +595,101 @@ TEST_F(virtual_hid_input_test, BuildsSegmentedRelativeMouseReports) {
   EXPECT_EQ(channel->submissions[1].report.relative_mouse.y, -7232);
 }
 
-TEST_F(virtual_hid_input_test, RoutesWheelThroughSendInputWhileVirtualHidHealthy) {
+TEST_F(virtual_hid_input_test, ConvertsWindowsWheelUnitsToVirtualHidDetents) {
   initialize();
 
   ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA));
-  ASSERT_TRUE(transport->horizontal_scroll(-37));
+  ASSERT_TRUE(transport->horizontal_scroll(-2 * WHEEL_DELTA));
 
-  EXPECT_TRUE(channel->submissions.empty());
+  ASSERT_EQ(channel->submissions.size(), 2);
+  EXPECT_EQ(channel->submissions[0].report.relative_mouse.vertical_wheel, 1);
+  EXPECT_EQ(channel->submissions[1].report.relative_mouse.horizontal_wheel, -2);
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
-  ASSERT_EQ(fallback_api->submitted.size(), 2);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, AccumulatesFractionalVirtualHidWheelDetents) {
+  initialize();
+
+  ASSERT_TRUE(transport->vertical_scroll(40));
+  ASSERT_TRUE(transport->vertical_scroll(79));
+  ASSERT_TRUE(transport->horizontal_scroll(-30));
+  EXPECT_TRUE(channel->submissions.empty());
+
+  ASSERT_TRUE(transport->vertical_scroll(1));
+  ASSERT_TRUE(transport->horizontal_scroll(-90));
+  ASSERT_EQ(channel->submissions.size(), 2);
+  EXPECT_EQ(channel->submissions[0].report.relative_mouse.vertical_wheel, 1);
+  EXPECT_EQ(channel->submissions[1].report.relative_mouse.horizontal_wheel, -1);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, SegmentsLargeVirtualHidWheelDetents) {
+  initialize();
+
+  ASSERT_TRUE(transport->horizontal_scroll(40000 * WHEEL_DELTA));
+
+  ASSERT_EQ(channel->submissions.size(), 2);
+  EXPECT_EQ(channel->submissions[0].report.relative_mouse.horizontal_wheel, 32767);
+  EXPECT_EQ(channel->submissions[1].report.relative_mouse.horizontal_wheel, 7233);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, SegmentsLargeNegativeVirtualHidWheelDetents) {
+  initialize();
+
+  ASSERT_TRUE(transport->vertical_scroll(-40000 * WHEEL_DELTA));
+
+  ASSERT_EQ(channel->submissions.size(), 2);
+  EXPECT_EQ(channel->submissions[0].report.relative_mouse.vertical_wheel, -32768);
+  EXPECT_EQ(channel->submissions[1].report.relative_mouse.vertical_wheel, -7232);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, ResetSessionClearsFractionalVirtualHidWheelDetents) {
+  initialize();
+
+  ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA / 2));
+  ASSERT_TRUE(transport->horizontal_scroll(WHEEL_DELTA / 2));
+  ASSERT_TRUE(transport->reset_session());
+  ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA / 2));
+  ASSERT_TRUE(transport->horizontal_scroll(WHEEL_DELTA / 2));
+  EXPECT_TRUE(channel->submissions.empty());
+
+  ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA / 2));
+  ASSERT_TRUE(transport->horizontal_scroll(WHEEL_DELTA / 2));
+  ASSERT_EQ(channel->submissions.size(), 2);
+  EXPECT_EQ(channel->submissions[0].report.relative_mouse.vertical_wheel, 1);
+  EXPECT_EQ(channel->submissions[1].report.relative_mouse.horizontal_wheel, 1);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, ReplaysAccumulatedWheelUnitsOnlyAfterVirtualHidFallback) {
+  initialize();
+  channel->submit_results.push_back({false, ERROR_ACCESS_DENIED});
+
+  ASSERT_TRUE(transport->vertical_scroll(40));
+  const auto result = transport->vertical_scroll(80);
+
+  ASSERT_TRUE(result);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::send_input);
+  ASSERT_EQ(channel->submissions.size(), 1);
+  ASSERT_EQ(fallback_api->submitted.size(), 1);
   EXPECT_EQ(fallback_api->submitted[0].mi.dwFlags, MOUSEEVENTF_WHEEL);
   EXPECT_EQ(fallback_api->submitted[0].mi.mouseData, static_cast<DWORD>(WHEEL_DELTA));
-  EXPECT_EQ(fallback_api->submitted[1].mi.dwFlags, MOUSEEVENTF_HWHEEL);
-  EXPECT_EQ(fallback_api->submitted[1].mi.mouseData, static_cast<DWORD>(-37));
+}
+
+TEST_F(virtual_hid_input_test, DoesNotReplayWheelAfterAcceptedVirtualHidInputFails) {
+  initialize();
+
+  ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA));
+  channel->submit_results.push_back({false, ERROR_WRITE_FAULT});
+  const auto result = transport->vertical_scroll(WHEEL_DELTA);
+
+  EXPECT_FALSE(result);
+  EXPECT_EQ(result.completion, platf::win_input::completion_t::ambiguous);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::fail_closed);
+  EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
 TEST_P(virtual_hid_mouse_button_test, MapsPressAndReleaseToHidBitmap) {

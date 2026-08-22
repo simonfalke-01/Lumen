@@ -634,6 +634,54 @@ namespace platf::win_input {
     return {completion_t::rejected, result.status};
   }
 
+  result_t virtual_hid_transport_t::submit_wheel_detents(
+    std::int64_t detents,
+    bool horizontal,
+    const char *stage
+  ) {
+    while (detents != 0) {
+      const auto segment = std::clamp<std::int64_t>(
+        detents,
+        std::numeric_limits<std::int16_t>::min(),
+        std::numeric_limits<std::int16_t>::max()
+      );
+      LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+      request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
+      request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
+      request.report.relative_mouse.buttons = held_buttons_;
+      if (horizontal) {
+        request.report.relative_mouse.horizontal_wheel = static_cast<std::int16_t>(segment);
+      } else {
+        request.report.relative_mouse.vertical_wheel = static_cast<std::int16_t>(segment);
+      }
+      const auto result = submit_report(request, stage);
+      if (!result) {
+        return result;
+      }
+      acknowledged_buttons_ = held_buttons_;
+      detents -= segment;
+    }
+    return {};
+  }
+
+  result_t virtual_hid_transport_t::submit_fallback_wheel_units(std::int64_t units, bool horizontal) {
+    while (units != 0) {
+      const auto segment = std::clamp<std::int64_t>(
+        units,
+        std::numeric_limits<std::int32_t>::min(),
+        std::numeric_limits<std::int32_t>::max()
+      );
+      const auto result = horizontal ?
+                            fallback_->horizontal_scroll(static_cast<std::int32_t>(segment)) :
+                            fallback_->vertical_scroll(static_cast<std::int32_t>(segment));
+      if (!result) {
+        return result;
+      }
+      units -= segment;
+    }
+    return {};
+  }
+
   result_t virtual_hid_transport_t::move_mouse(std::int32_t delta_x, std::int32_t delta_y) {
     std::lock_guard lock(mutex_);
     if (backend_.load() == backend_t::send_input) {
@@ -725,21 +773,40 @@ namespace platf::win_input {
 
   result_t virtual_hid_transport_t::vertical_scroll(std::int32_t distance) {
     std::lock_guard lock(mutex_);
-    if (backend_.load() == backend_t::fail_closed) {
+    if (backend_.load() == backend_t::send_input) {
+      return fallback_->vertical_scroll(distance);
+    }
+    if (backend_.load() != backend_t::virtual_hid) {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
-    // SendInput preserves Moonlight's 120-unit detents and fractional deltas;
-    // the HID wheel field represents whole detents instead.
-    return fallback_->vertical_scroll(distance);
+
+    const auto accumulated = static_cast<std::int64_t>(vertical_wheel_remainder_) + distance;
+    vertical_wheel_remainder_ = static_cast<std::int32_t>(accumulated % WHEEL_DELTA);
+    const auto result = submit_wheel_detents(accumulated / WHEEL_DELTA, false, "vertical wheel report");
+    if (!result && backend_.load() == backend_t::send_input) {
+      vertical_wheel_remainder_ = 0;
+      return submit_fallback_wheel_units(accumulated, false);
+    }
+    return result;
   }
 
   result_t virtual_hid_transport_t::horizontal_scroll(std::int32_t distance) {
     std::lock_guard lock(mutex_);
-    if (backend_.load() == backend_t::fail_closed) {
+    if (backend_.load() == backend_t::send_input) {
+      return fallback_->horizontal_scroll(distance);
+    }
+    if (backend_.load() != backend_t::virtual_hid) {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
-    // AC Pan has the same whole-detent HID semantics as the vertical wheel.
-    return fallback_->horizontal_scroll(distance);
+
+    const auto accumulated = static_cast<std::int64_t>(horizontal_wheel_remainder_) + distance;
+    horizontal_wheel_remainder_ = static_cast<std::int32_t>(accumulated % WHEEL_DELTA);
+    const auto result = submit_wheel_detents(accumulated / WHEEL_DELTA, true, "horizontal wheel report");
+    if (!result && backend_.load() == backend_t::send_input) {
+      horizontal_wheel_remainder_ = 0;
+      return submit_fallback_wheel_units(accumulated, true);
+    }
+    return result;
   }
 
   result_t virtual_hid_transport_t::keyboard(std::uint16_t modcode, bool release, std::uint8_t flags) {
@@ -830,6 +897,8 @@ namespace platf::win_input {
 
   result_t virtual_hid_transport_t::reset_session() {
     std::lock_guard lock(mutex_);
+    vertical_wheel_remainder_ = 0;
+    horizontal_wheel_remainder_ = 0;
     if (backend_.load() == backend_t::send_input) {
       return fallback_->reset_session();
     }
@@ -862,6 +931,8 @@ namespace platf::win_input {
 
   result_t virtual_hid_transport_t::neutralize() {
     std::lock_guard lock(mutex_);
+    vertical_wheel_remainder_ = 0;
+    horizontal_wheel_remainder_ = 0;
     if (backend_.load() == backend_t::send_input) {
       return fallback_->neutralize();
     }

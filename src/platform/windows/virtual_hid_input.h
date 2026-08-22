@@ -194,6 +194,23 @@ namespace platf::win_input {
     result_t submit_report(const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request, const char *stage);
 
     /**
+     * @brief Submit whole Virtual HID wheel detents in signed 16-bit segments.
+     * @param detents Signed whole-detent distance.
+     * @param horizontal Use Consumer AC Pan instead of the vertical wheel.
+     * @param stage Diagnostic stage name.
+     * @return Transport result.
+     */
+    result_t submit_wheel_detents(std::int64_t detents, bool horizontal, const char *stage);
+
+    /**
+     * @brief Replay Windows wheel units after Virtual HID has switched to SendInput.
+     * @param units Signed Windows high-resolution wheel units.
+     * @param horizontal Use horizontal instead of vertical scrolling.
+     * @return Transport result.
+     */
+    result_t submit_fallback_wheel_units(std::int64_t units, bool horizontal);
+
+    /**
      * @brief Record a diagnostic failure.
      * @param stage Failure stage.
      * @param status Native status.
@@ -211,6 +228,8 @@ namespace platf::win_input {
     LUMEN_VHID_KEYBOARD_REPORT acknowledged_keyboard_ {};  ///< Last accepted keyboard snapshot.
     std::uint8_t held_buttons_ {0};  ///< Desired mouse-button bitmap.
     std::uint8_t acknowledged_buttons_ {0};  ///< Last accepted mouse-button bitmap.
+    std::int32_t vertical_wheel_remainder_ {0};  ///< Pending vertical Windows wheel units.
+    std::int32_t horizontal_wheel_remainder_ {0};  ///< Pending horizontal Windows wheel units.
     std::string failure_stage_;  ///< Most recent diagnostic stage.
     DWORD failure_status_ {ERROR_SUCCESS};  ///< Most recent native failure status.
   };

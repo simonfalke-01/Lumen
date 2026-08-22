@@ -513,8 +513,8 @@ The key retains its upstream name for compatibility with existing configuration 
             Selects the Windows keyboard and mouse input backend. Automatic selects the Lumen Virtual HID driver when
             its Windows 11 x64 package is installed, compatible, and accessible to the service. Otherwise, Lumen
             uses SendInput. If Virtual HID fails after accepting any input, Lumen fails closed until the input
-            session's reset-and-release operation succeeds. Unicode text, absolute mouse positioning, and wheel
-            scrolling always use the auxiliary SendInput path so Windows receives their native units.
+            session's reset-and-release operation succeeds. Unicode text and absolute mouse positioning use the
+            auxiliary SendInput path.
             @caution{Applies to Windows only.}
         </td>
     </tr>
