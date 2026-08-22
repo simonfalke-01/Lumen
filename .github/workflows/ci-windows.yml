@@ -524,6 +524,7 @@ jobs:
       - name: Test release and updater contracts
         shell: msys2 {0}
         run: |
+          export PATH="$(cygpath --unix "$NODEJS_PATH"):$PATH"
           npm test
           cmake -P tests/packaging/verify_lumen_packaging.cmake
           if cmake \
