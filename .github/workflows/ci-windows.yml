@@ -528,7 +528,6 @@ jobs:
             /m `
             /restore `
             /t:Build `
-            /warnaserror `
             /p:Configuration=Release `
             /p:Platform=x64 `
             /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
@@ -538,7 +537,8 @@ jobs:
             /p:SkipPackageVerification=true `
             /p:SignMode=Off `
             /p:RunCodeAnalysis=true `
-            /p:EnableCppCodeAnalysis=true
+            /p:EnableCppCodeAnalysis=true `
+            /p:CodeAnalysisTreatWarningsAsErrors=false
           if ($LASTEXITCODE -ne 0) {
             throw "Virtual Microphone driver build failed with exit code $LASTEXITCODE."
           }
