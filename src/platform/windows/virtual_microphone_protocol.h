@@ -137,7 +137,7 @@ extern "C" {
 #pragma pack(pop)
 
 /** Byte count preceding samples in the fixed-size write request. */
-#define LUMEN_VMIC_WRITE_PCM_HEADER_SIZE LUMEN_VMIC_OFFSETOF(LUMEN_VMIC_WRITE_PCM_REQUEST, samples)
+#define LUMEN_VMIC_WRITE_PCM_HEADER_SIZE 12u
 /** Maximum byte count accepted by IOCTL_LUMEN_VMIC_WRITE_PCM. */
 #define LUMEN_VMIC_MAX_WRITE_PCM_REQUEST_SIZE sizeof(LUMEN_VMIC_WRITE_PCM_REQUEST)
 
@@ -148,7 +148,10 @@ extern "C" {
   LUMEN_VMIC_STATIC_ASSERT(LUMEN_VMIC_OFFSETOF(LUMEN_VMIC_QUERY_ABI_RESPONSE, max_write_frames) == 12, max_write_frames_offset);
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_OPEN_STREAM_REQUEST) == 16, open_stream_request_size);
   LUMEN_VMIC_STATIC_ASSERT(LUMEN_VMIC_OFFSETOF(LUMEN_VMIC_OPEN_STREAM_REQUEST, sample_rate_hz) == 8, open_stream_format_offset);
-  LUMEN_VMIC_STATIC_ASSERT(LUMEN_VMIC_WRITE_PCM_HEADER_SIZE == 12, write_pcm_header_size);
+  LUMEN_VMIC_STATIC_ASSERT(
+    LUMEN_VMIC_OFFSETOF(LUMEN_VMIC_WRITE_PCM_REQUEST, samples) == LUMEN_VMIC_WRITE_PCM_HEADER_SIZE,
+    write_pcm_header_size
+  );
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_WRITE_PCM_REQUEST) == 1932, write_pcm_request_size);
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_RESET_REQUEST) == 8, reset_request_size);
   LUMEN_VMIC_STATIC_ASSERT(sizeof(LUMEN_VMIC_QUERY_STATS_RESPONSE) == 56, query_stats_response_size);
