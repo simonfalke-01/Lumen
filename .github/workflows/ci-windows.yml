@@ -341,6 +341,13 @@ jobs:
             -Destination $driverPackageDir
 
           $packagedInfPath = Join-Path $driverPackageDir 'LumenVirtualHid.inf'
+          # WDK StampInf rewrites DriverVer during MSBuild, so restamp the
+          # isolated package copy before InfVerif/Inf2Cat and signing.
+          $packagedInfContents = Get-Content -LiteralPath $packagedInfPath -Raw
+          $packagedInfContents = $packagedInfContents -replace `
+            '(?m)^DriverVer\s*=.*$', `
+            "DriverVer = $driverDate,$driverVersion"
+          Set-Content -LiteralPath $packagedInfPath -Value $packagedInfContents -Encoding ascii
           if ((Get-Content -LiteralPath $packagedInfPath -Raw) -notmatch `
               "(?m)^DriverVer\s*=\s*$([regex]::Escape($driverDate)),$([regex]::Escape($driverVersion))\s*$") {
             throw 'Failed to stamp the Virtual HID INF version.'
