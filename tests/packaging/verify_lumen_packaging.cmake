@@ -78,6 +78,14 @@ assert_file_contains(
     "Property Id=\"LUMEN_INSTALL_VHID\" Value=\"0\""
     "Virtual HID must remain explicit opt-in")
 assert_file_contains(
+    "cmake/packaging/wix_resources/patch.xml"
+    "Condition=\"NOT Installed AND LUMEN_INSTALL_VHID = 0\""
+    "Virtual HID opt-out must not suppress removal of an installed feature")
+assert_file_excludes(
+    "cmake/packaging/wix_resources/patch.xml"
+    "Condition=\"LUMEN_INSTALL_VHID = 0\""
+    "Virtual HID opt-out must only apply during a fresh install")
+assert_file_contains(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
     "Target=\"\\[INSTALL_ROOT\\]Lumen.exe\""
     "Installer shortcuts must launch Lumen.exe")

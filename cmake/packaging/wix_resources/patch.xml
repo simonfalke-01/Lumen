@@ -3,7 +3,7 @@
     <FeatureRef Id="RunLumenInstallScripts"/>
   </CPackWiXFragment>
   <CPackWiXFragment Id="CM_C_virtual_hid_driver">
-    <Level Value="0" Condition="LUMEN_INSTALL_VHID = 0"/>
+    <Level Value="0" Condition="NOT Installed AND LUMEN_INSTALL_VHID = 0"/>
     <Level Value="1" Condition="LUMEN_INSTALL_VHID = 1"/>
   </CPackWiXFragment>
   <CPackWiXFragment Id="CM_CP_application.tools.lumensvc.exe">
