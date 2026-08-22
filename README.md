@@ -468,6 +468,15 @@ the [documentation index](docs/guides.md).
     </tr>
 </table>
 
+## 🚀 Releases
+
+Lumen uses Semantic Versioning from [version.txt](version.txt). Maintainers publish a release by committing the new
+version, waiting for Windows CI, and pushing the matching annotated `vX.Y.Z[-prerelease]` tag. GitHub then builds,
+tests, packages, verifies, and publishes the immutable release after approval.
+
+See the [maintainer release guide](docs/maintainers/release.md) for the exact commands, prerelease policy, artifact
+verification, and signing limitations.
+
 ## ❓ Support
 
 Use [GitHub Discussions](https://github.com/simonfalke-01/Lumen/discussions) for help and the
