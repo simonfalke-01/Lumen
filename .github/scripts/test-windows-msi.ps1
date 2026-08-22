@@ -232,6 +232,7 @@ switch ($Scenario) {
                 "exit=$probeExitCode state='$($probe.state)'."
             )
         }
+        $global:LASTEXITCODE = 0
         [void](Invoke-Msi `
             -Arguments @('/x', $productCode, '/qn', '/norestart') `
             -LogName 'lumen-msi-uninstall-vmic.log' `
