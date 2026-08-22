@@ -7,11 +7,36 @@ on:
     branches:
       - master
   pull_request:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Exact SemVer release tag to build
+        required: false
+        default: ''
+        type: string
+      source_ref:
+        description: Exact Git ref to check out; required with release_tag
+        required: false
+        default: ''
+        type: string
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: Exact SemVer release tag to build
+        required: false
+        type: string
+      source_ref:
+        description: Exact Git ref to check out; required with release_tag
+        required: false
+        type: string
       artifact_run_id:
         description: Existing successful run ID; skips build/bootstrap and only validates its MSI
         required: false
+        type: string
+      artifact_name:
+        description: Artifact name in artifact_run_id (supports validation of older runs)
+        required: false
+        default: Lumen-Windows-AMD64
         type: string
       validation_scenario:
         description: MSI scenario to run; select one for fast test-only validation
@@ -23,6 +48,7 @@ on:
           - install-no-vhid
           - install-vhid
           - upgrade
+          - legacy-import
 
 env:
   PYTHON_VERSION: '3.14'
@@ -31,12 +57,67 @@ env:
 concurrency:
   group: >-
     windows-${{ github.workflow }}-${{ github.ref }}-${{
-      github.event.inputs.artifact_run_id || 'build' }}
+      inputs.artifact_run_id || inputs.release_tag || 'build' }}
   cancel-in-progress: true
 
 jobs:
+  validate_version:
+    name: Resolve build version
+    if: inputs.artifact_run_id == ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build_version: ${{ steps.version.outputs.build_version }}
+    steps:
+      - name: Checkout requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate and resolve version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+
+          version=$(tr -d '[:space:]' < version.txt)
+          if [[ -n "$RELEASE_TAG" ]]; then
+            cmake \
+              -DRELEASE_TAG="$RELEASE_TAG" \
+              -P .github/scripts/validate-release-version.cmake
+            expected_ref="refs/tags/$RELEASE_TAG"
+            expected_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+            if [[ "$SOURCE_REF" != "$expected_ref" && "$SOURCE_REF" != "$expected_commit" ]]; then
+              echo "source_ref must be $expected_ref or its immutable commit $expected_commit for release builds." >&2
+              exit 1
+            fi
+            if [[ "$(git rev-parse HEAD)" != "$expected_commit" ]]; then
+              echo "Checked-out commit does not match $RELEASE_TAG." >&2
+              exit 1
+            fi
+            if [[ "$(git cat-file -t "$RELEASE_TAG")" != 'tag' ]]; then
+              echo "$RELEASE_TAG must be an annotated tag." >&2
+              exit 1
+            fi
+            build_version=${RELEASE_TAG#v}
+          else
+            if [[ "$version" == *-* ]]; then
+              dev_version_prefix="${version}.dev"
+            else
+              dev_version_prefix="${version}-dev"
+            fi
+            build_version="${dev_version_prefix}.${GITHUB_RUN_NUMBER}+g${GITHUB_SHA::7}"
+          fi
+
+          echo "build_version=$build_version" >> "$GITHUB_OUTPUT"
+
   build_windows:
     name: Windows-AMD64
+    needs: validate_version
     if: github.event_name != 'workflow_dispatch' || inputs.artifact_run_id == ''
     runs-on: windows-2022
     defaults:
@@ -48,10 +129,12 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      LUMEN_BUILD_VERSION: ${{ needs.validate_version.outputs.build_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           submodules: recursive
 
       - name: Validate installer script
@@ -71,7 +154,7 @@ jobs:
       - name: Cache CMake dependency tree
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          path: build/_deps
+          path: cmake-build-windows/_deps
           key: >-
             windows-cmake-deps-v1-${{ runner.os }}-${{
             hashFiles('package-lock.cmake', 'cmake/dependencies/**/*.cmake') }}
@@ -167,9 +250,49 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $driverProject = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            'src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj'
+          $driverBuildDir = Join-Path $env:GITHUB_WORKSPACE 'cmake-build-virtual-hid-driver'
+          $driverSourceRoot = Join-Path $driverBuildDir 'source\windows'
+          $driverSourceDir = Join-Path $driverSourceRoot 'virtual_hid_driver'
+          $driverBinDir = Join-Path $driverBuildDir 'bin'
+          $driverObjDir = Join-Path $driverBuildDir 'obj'
+          $driverPackageDir = Join-Path $driverBuildDir 'package'
+          Remove-Item $driverBuildDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $driverSourceRoot, $driverBinDir, $driverObjDir -Force | Out-Null
+          Copy-Item `
+            (Join-Path $env:GITHUB_WORKSPACE 'src\platform\windows\virtual_hid_protocol.h') `
+            -Destination $driverSourceRoot
+          Copy-Item `
+            (Join-Path $env:GITHUB_WORKSPACE 'src\platform\windows\virtual_hid_driver') `
+            -Destination $driverSourceRoot `
+            -Recurse
+
+          $versionCore = $env:LUMEN_BUILD_VERSION.Split('-', 2)[0].Split('+', 2)[0]
+          $versionParts = $versionCore.Split('.')
+          if ($versionParts.Count -ne 3) {
+            throw "Invalid Lumen version core for Virtual HID: $versionCore"
+          }
+          $driverRevision = [int64]$env:GITHUB_RUN_NUMBER % 65535
+          $driverVersion = "$($versionParts[0]).$($versionParts[1]).$($versionParts[2]).$driverRevision"
+          $driverDate = (Get-Date).ToUniversalTime().ToString('MM/dd/yyyy')
+
+          $driverInfPath = Join-Path $driverSourceDir 'LumenVirtualHid.inf'
+          $driverInfContents = Get-Content -LiteralPath $driverInfPath -Raw
+          $driverInfContents = $driverInfContents -replace `
+            '(?m)^DriverVer\s*=.*$', `
+            "DriverVer = $driverDate,$driverVersion"
+          Set-Content -LiteralPath $driverInfPath -Value $driverInfContents -Encoding ascii
+
+          $driverResourcePath = Join-Path $driverSourceDir 'resource.h'
+          $driverResourceContents = Get-Content -LiteralPath $driverResourcePath -Raw
+          $driverResourceContents = $driverResourceContents -replace `
+            '(?m)^#define LUMEN_VHID_FILE_VERSION\s+.*$', `
+            "#define LUMEN_VHID_FILE_VERSION $($versionParts[0]), $($versionParts[1]), $($versionParts[2]), $driverRevision"
+          $driverResourceContents = $driverResourceContents -replace `
+            '(?m)^#define LUMEN_VHID_FILE_VERSION_STRING\s+.*$', `
+            "#define LUMEN_VHID_FILE_VERSION_STRING `"$driverVersion\0`""
+          Set-Content -LiteralPath $driverResourcePath -Value $driverResourceContents -Encoding ascii
+
+          $driverProject = Join-Path $driverSourceDir 'LumenVirtualHid.vcxproj'
           $vswhere = Join-Path `
             ${env:ProgramFiles(x86)} `
             'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -181,12 +304,6 @@ jobs:
           if (-not $msbuild) {
             throw 'MSBuild was not found.'
           }
-
-          $driverBuildDir = Join-Path $env:GITHUB_WORKSPACE 'build-virtual-hid-driver'
-          $driverBinDir = Join-Path $driverBuildDir 'bin'
-          $driverObjDir = Join-Path $driverBuildDir 'obj'
-          $driverPackageDir = Join-Path $driverBuildDir 'package'
-          New-Item -ItemType Directory -Path $driverBinDir, $driverObjDir -Force | Out-Null
 
           $sccacheWrapperDir = Join-Path $env:RUNNER_TEMP 'sccache-msbuild'
           New-Item -ItemType Directory -Path $sccacheWrapperDir -Force | Out-Null
@@ -222,6 +339,16 @@ jobs:
             (Join-Path $driverBinDir 'LumenVirtualHid.inf'), `
             (Join-Path $driverBinDir 'LumenVirtualHid.dll') `
             -Destination $driverPackageDir
+
+          $packagedInfPath = Join-Path $driverPackageDir 'LumenVirtualHid.inf'
+          if ((Get-Content -LiteralPath $packagedInfPath -Raw) -notmatch `
+              "(?m)^DriverVer\s*=\s*$([regex]::Escape($driverDate)),$([regex]::Escape($driverVersion))\s*$") {
+            throw 'Failed to stamp the Virtual HID INF version.'
+          }
+          $driverFileVersion = (Get-Item (Join-Path $driverPackageDir 'LumenVirtualHid.dll')).VersionInfo.FileVersion
+          if ($driverFileVersion -ne $driverVersion) {
+            throw "Virtual HID DLL version '$driverFileVersion' does not match '$driverVersion'."
+          }
 
           $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
           $infVerif = Get-ChildItem (Join-Path $kitsRoot 'tools') `
@@ -387,12 +514,26 @@ jobs:
           UV_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: uv sync --locked --no-python-downloads --no-install-project
 
+      - name: Test release and updater contracts
+        shell: msys2 {0}
+        run: |
+          npm test
+          cmake -P tests/packaging/verify_lumen_packaging.cmake
+          if cmake \
+              -DRELEASE_TAG=v0.0.0-invalid \
+              -P .github/scripts/validate-release-version.cmake; then
+            echo 'Invalid release tag unexpectedly passed validation.' >&2
+            exit 1
+          fi
+
       - name: Build Windows
         shell: msys2 {0}
         env:
           BRANCH: ${{ github.ref_name }}
-          BUILD_VERSION: 0.0.${{ github.run_number }}
+          BUILD_VERSION: ${{ needs.validate_version.outputs.build_version }}
+          CLONE_URL: ${{ github.server_url }}/${{ github.repository }}
           COMMIT: ${{ github.sha }}
+          TAG: ${{ inputs.release_tag }}
         run: |
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
           export PATH="$PATH:$NODEJS_PATH"
@@ -400,7 +541,7 @@ jobs:
           SCCACHE_CMAKE_PATH=$(cygpath -m "$SCCACHE_PATH")
 
           cmake \
-            -B build \
+            -B cmake-build-windows \
             -G Ninja \
             -S . \
             -DBUILD_DOCS=OFF \
@@ -411,16 +552,21 @@ jobs:
             -DSUNSHINE_ASSETS_DIR=assets \
             -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR="$DRIVER_PACKAGE_CMAKE_PATH" \
             -DSUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON \
-            -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
+            -DSUNSHINE_PUBLISHER_NAME="simonfalke" \
             -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/${GITHUB_REPOSITORY}" \
             -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/${GITHUB_REPOSITORY}/issues"
-          ninja -C build
+          ninja -C cmake-build-windows
 
       - name: Run targeted Windows tests
         shell: msys2 {0}
         run: |
-          build/tests/test_sunshine.exe \
+          cmake-build-windows/tests/test_sunshine.exe \
             --gtest_filter='VirtualHidProtocolTest.*:VirtualHidKeyMappingTest.*:*virtual_hid_input_test.*:*virtual_hid_mouse_button_test.*:*send_input_transport_test.*:*send_input_mouse_button_test.*:InputBatchingTest.*'
+
+      - name: Run complete Windows release test suite
+        if: inputs.release_tag != ''
+        shell: msys2 {0}
+        run: cmake-build-windows/tests/test_sunshine.exe
 
       - name: Package Windows
         shell: msys2 {0}
@@ -435,19 +581,27 @@ jobs:
           trap dump_wix_log ERR
 
           mkdir -p artifacts
-          cd build
+          cd cmake-build-windows
           cpack -G WIX
           cpack -G ZIP
 
-          mv ./cpack_artifacts/Sunshine.msi ../artifacts/Sunshine-Windows-AMD64-installer.msi
-          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-lite.zip
+          mapfile -t msi_files < <(find ./cpack_artifacts -maxdepth 1 -type f -name '*.msi')
+          mapfile -t zip_files < <(find ./cpack_artifacts -maxdepth 1 -type f -name '*.zip')
+          test "${#msi_files[@]}" -eq 1
+          test "${#zip_files[@]}" -eq 1
+          mv \
+            "${msi_files[0]}" \
+            "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-installer.msi"
+          mv \
+            "${zip_files[0]}" \
+            "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-lite.zip"
 
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'lumen-vhidctl.exe' | wc -l)" -ge 1
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.inf' | wc -l)" -eq 1
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.cat' | wc -l)" -eq 1
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.dll' | wc -l)" -eq 1
           test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.cer' | wc -l)" -eq 1
-          if 7z l ../artifacts/Sunshine-Windows-AMD64-lite.zip | grep -Eiq \
+          if 7z l "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-lite.zip" | grep -Eiq \
               'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|lumenvirtualhid\.(inf|cat|dll|cer)'; then
             echo 'The lite ZIP unexpectedly contains Virtual HID installation files.'
             exit 1
@@ -456,7 +610,7 @@ jobs:
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: build-Windows-AMD64
+          name: Lumen-Windows-AMD64
           path: artifacts/
           if-no-files-found: error
 
@@ -470,7 +624,7 @@ jobs:
       - name: Download reused Windows artifacts
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
         with:
-          name: build-Windows-AMD64
+          name: ${{ inputs.artifact_name }}
           path: artifacts
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -479,7 +633,7 @@ jobs:
       - name: Attach reused Windows artifacts to this run
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: build-Windows-AMD64
+          name: Lumen-Windows-AMD64
           path: artifacts/
           if-no-files-found: error
           # MSI and ZIP payloads are already compressed; recompression only wastes time.
@@ -504,7 +658,7 @@ jobs:
         scenario: >-
           ${{ fromJSON(
             (inputs.validation_scenario == '' || inputs.validation_scenario == 'all') &&
-            '["install-no-vhid","install-vhid","upgrade"]' ||
+            '["install-no-vhid","install-vhid","upgrade","legacy-import"]' ||
             format('["{0}"]', inputs.validation_scenario)
           ) }}
     steps:
@@ -516,7 +670,9 @@ jobs:
       - name: Download Windows artifacts
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
         with:
-          name: build-Windows-AMD64
+          name: >-
+            ${{ inputs.artifact_run_id != '' && inputs.artifact_name ||
+            'Lumen-Windows-AMD64' }}
           path: artifacts
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -654,15 +810,15 @@ jobs:
           New-Item -ItemType Directory -Path $destination -Force | Out-Null
 
           $logRoots = @(
-            (Join-Path $env:TEMP 'Sunshine\logs'),
-            (Join-Path $env:SystemRoot 'Temp\Sunshine\logs')
+            (Join-Path $env:TEMP 'Lumen\logs'),
+            (Join-Path $env:SystemRoot 'Temp\Lumen\logs')
           ) | Select-Object -Unique
           foreach ($source in $logRoots) {
             if (Test-Path -LiteralPath $source -PathType Container) {
               $name = Split-Path (Split-Path $source -Parent) -Leaf
               Copy-Item `
                 -LiteralPath $source `
-                -Destination (Join-Path $destination "sunshine-$name") `
+                -Destination (Join-Path $destination "lumen-$name") `
                 -Recurse `
                 -Force `
                 -ErrorAction Continue

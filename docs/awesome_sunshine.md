@@ -1,4 +1,4 @@
-# Awesome-Sunshine
+# Awesome Sunshine
 
 @htmlonly
 <script type="module" src="https://md-block.verou.me/md-block.js"></script>

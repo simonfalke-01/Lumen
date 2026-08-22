@@ -5,9 +5,9 @@ set -euo pipefail
 
 # Default value for arguments
 num_processors=$(sysctl -n hw.ncpu)
-publisher_name="LizardByte"
-publisher_website="https://app.lizardbyte.dev"
-publisher_issue_url="https://app.lizardbyte.dev/support"
+publisher_name="simonfalke"
+publisher_website="https://github.com/simonfalke-01/Lumen"
+publisher_issue_url="https://github.com/simonfalke-01/Lumen/issues"
 step="all"
 build_docs="OFF"
 build_tests="ON"
@@ -63,7 +63,7 @@ Options:
   --publisher-name         The name of the publisher (not developer) of the application.
   --publisher-website      The URL of the publisher's website.
   --publisher-issue-url    The URL of the publisher's support site or issue tracker.
-                           If you provide a modified version of Sunshine, we kindly request that you use your own url.
+                           If you provide a modified version of Lumen, use your own project URL.
   --step=STEP              Which step(s) to run: deps, cmake, build, dmg, or all (default: all)
   --debug                  Build in debug mode.
   --build-docs             Build docs.
@@ -117,13 +117,13 @@ function run_step_cmake() {
 
   # Publisher metadata
   if [[ -n "$publisher_name" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_NAME='${publisher_name}'")
+    cmake_args+=("-DSUNSHINE_PUBLISHER_NAME=${publisher_name}")
   fi
   if [[ -n "$publisher_website" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_WEBSITE='${publisher_website}'")
+    cmake_args+=("-DSUNSHINE_PUBLISHER_WEBSITE=${publisher_website}")
   fi
   if [[ -n "$publisher_issue_url" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_ISSUE_URL='${publisher_issue_url}'")
+    cmake_args+=("-DSUNSHINE_PUBLISHER_ISSUE_URL=${publisher_issue_url}")
   fi
 
   # Cmake stuff here
@@ -153,11 +153,11 @@ function run_step_dmg() {
   cpack -G DragNDrop --config "${build_dir}/CPackConfig.cmake" --verbose
 
   if [[ -n "${sign_app}" && -n "${notarize}" ]]; then
-    time xcrun notarytool submit "${build_dir}/cpack_artifacts/Sunshine.dmg" \
+    time xcrun notarytool submit "${build_dir}/cpack_artifacts/Lumen.dmg" \
       --keychain-profile "notarytool-password" \
       --wait \
       --timeout 15m
-    xcrun stapler staple -v "${build_dir}/cpack_artifacts/Sunshine.dmg"
+    xcrun stapler staple -v "${build_dir}/cpack_artifacts/Lumen.dmg"
   fi
   return 0
 }

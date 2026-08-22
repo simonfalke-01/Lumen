@@ -588,13 +588,14 @@ namespace platf {
   CATapDescription *tapDescription = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:excludeProcesses];
 
   // Set unique name and UUID for this instance
-  NSString *uniqueName = [NSString stringWithFormat:@"SunshineAVAudio-Tap-%p", (void *) self];
+  NSString *uniqueName = [NSString stringWithFormat:@"LumenAVAudio-Tap-%p", (void *) self];
   NSUUID *uniqueUUID = [[NSUUID alloc] init];
 
   tapDescription.name = uniqueName;
   tapDescription.UUID = uniqueUUID;
 
-  if (std::getenv("SUNSHINE_PUBLIC_AUDIO_TAP")) {
+  const bool publicAudioTap = std::getenv("LUMEN_PUBLIC_AUDIO_TAP") || std::getenv("SUNSHINE_PUBLIC_AUDIO_TAP");
+  if (publicAudioTap) {
     // Shows the tap in Audio MIDI Setup and HALLab where it's easier to inspect
     BOOST_LOG(debug) << "Setting tap as public (visible in Audio MIDI Setup and HALLab)"sv;
     [tapDescription setPrivate:NO];
@@ -632,6 +633,7 @@ namespace platf {
 
 - (OSStatus)createAggregateDeviceWithTapDescription:(CATapDescription *)tapDescription sampleRate:(UInt32)sampleRate frameSize:(UInt32)frameSize {
   using namespace std::literals;
+  const bool publicAudioTap = std::getenv("LUMEN_PUBLIC_AUDIO_TAP") || std::getenv("SUNSHINE_PUBLIC_AUDIO_TAP");
 
   // Get Tap UUID string properly
   NSString *tapUIDString = nil;
@@ -650,12 +652,12 @@ namespace platf {
   };
 
   NSDictionary *aggregateProperties = @{
-    @kAudioAggregateDeviceNameKey: [NSString stringWithFormat:@"SunshineAggregate-%p", (void *) self],
-    @kAudioAggregateDeviceUIDKey: [NSString stringWithFormat:@"com.lizardbyte.sunshine.aggregate-%p", (void *) self],
+    @kAudioAggregateDeviceNameKey: [NSString stringWithFormat:@"LumenAggregate-%p", (void *) self],
+    @kAudioAggregateDeviceUIDKey: [NSString stringWithFormat:@"io.github.simonfalke.lumen.aggregate-%p", (void *) self],
     @kAudioAggregateDeviceTapListKey: @[subTapDictionary],
     @kAudioAggregateDeviceTapAutoStartKey: @NO,
     // Shows the tap in Audio MIDI Setup and HALLab where it's easier to inspect when set
-    @kAudioAggregateDeviceIsPrivateKey: std::getenv("SUNSHINE_PUBLIC_AUDIO_TAP") ? @NO : @YES,
+    @kAudioAggregateDeviceIsPrivateKey: publicAudioTap ? @NO : @YES,
   };
 
   BOOST_LOG(debug) << "Creating aggregate device with tap UID: "sv << [tapUIDString UTF8String];

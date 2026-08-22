@@ -1,6 +1,5 @@
 # Contributing
-Read our contribution guide in our organization level
-[docs](https://docs.lizardbyte.dev/latest/developers/contributing.html).
+Review the repository's `AGENTS.md` instructions and this guide before contributing.
 
 ## Recommended Tools
 
@@ -32,44 +31,21 @@ Read our contribution guide in our organization level
 }
 
 ### Localization
-Sunshine and related LizardByte projects are being localized into various languages.
-The default language is `en` (English).
 
-![](https://app.lizardbyte.dev/dashboard/crowdin/LizardByte_graph.svg)
-
-@admonition{Community | We are looking for language coordinators to help approve translations.
-The goal is to have the bars above filled with green!
-If you are interested, please reach out to us on our Discord server.}
-
-#### CrowdIn
-The translations occur on [CrowdIn][crowdin-url].
-Anyone is free to contribute to the localization there.
-
-##### Translation Basics
-* The brand names *LizardByte* and *Sunshine* should never be translated.
-* Other brand names should never be translated. Examples include *AMD*, *Intel*, and *NVIDIA*.
-
-##### CrowdIn Integration
-How does it work?
-
-When a change is made to Sunshine source code, a workflow generates new translation templates
-that get pushed to CrowdIn automatically.
-
-When translations are updated on CrowdIn, a push gets made to the *l10n_master* branch and a PR is made against the
-*master* branch. Once the PR is merged, all updated translations are part of the project and will be included in the
-next release.
+The default language is `en` (English). In this fork, add or update only the `en` locale. Do not edit `en-US`, other
+English variants, or any translated locale. The Lumen brand name and other product names must not be translated.
 
 #### Extraction
 
 ##### Web UI
-Sunshine uses [Vue I18n](https://vue-i18n.intlify.dev) for localizing the UI.
+Lumen uses [Vue I18n](https://vue-i18n.intlify.dev) for localizing the UI.
 The following is a simple example of how to use it.
 
 * Add the string to the `./src_assets/common/assets/web/public/assets/locale/en.json` file, in English.
   ```json
   {
    "index": {
-     "welcome": "Hello, Sunshine!"
+     "welcome": "Hello, Lumen!"
    }
   }
   ```
@@ -79,10 +55,7 @@ The following is a simple example of how to use it.
   > to sort the keys.
 
   > [!IMPORTANT]
-  > Due to the integration with Crowdin, it is important to only add strings to the *en.json* file,
-  > and to not modify any other language files. After the PR is merged, the translations can take place
-  > on [CrowdIn][crowdin-url]. Once the translations are complete, a PR will be made
-  > to merge the translations into Sunshine.
+  > Only edit the `en.json` file. Do not modify any other language or English-variant locale.
 
 * Use the string in the Vue component.
   ```html
@@ -118,17 +91,15 @@ some situations. For example the system tray icon could be localized as it is us
 > The below is for information only. Contributors should never include manually updated template files, or
 > manually compiled language files in Pull Requests.
 
-Strings are automatically extracted from the code to the `locale/sunshine.po` template file. The generated file is
-used by CrowdIn to generate language specific template files. The file is generated using the
-`.github/workflows/localize.yml` workflow and is run on any push event into the `master` branch. Jobs are only run if
-any of the following paths are modified.
+Strings can be extracted to the localization template using the repository localization tooling. Generated template
+or compiled localization files must not be committed manually.
 
 ```yaml
 - 'src/**'
 ```
 
 When testing locally, it may be desirable to manually extract, initialize, update, and compile strings. Python and
-uv are required for this, along with the Python dependencies in the Sunshine `pyproject.toml`. From the repository
+uv are required for this, along with the Python dependencies in the Lumen `pyproject.toml`. From the repository
 root, install these with the following command.
 
 ```bash
@@ -148,10 +119,7 @@ Additionally, [xgettext](https://www.gnu.org/software/gettext) must be installed
   ```
 
 > [!IMPORTANT]
-> Due to the integration with CrowdIn, it is important to not include any extracted or compiled files in
-> Pull Requests. The files are automatically generated and updated by the workflow. Once the PR is merged, the
-> translations can take place on [CrowdIn][crowdin-url]. Once the translations are
-> complete, a PR will be made to merge the translations into Sunshine.
+> Do not include extracted or compiled localization files in changes unless the release workflow explicitly requires it.
 
 ### Testing
 
@@ -167,7 +135,7 @@ uv run --locked --no-sync lb-update-clang-format
 ```
 
 #### Unit Testing
-Sunshine uses [Google Test](https://github.com/google/googletest) for unit testing. Google Test is included in the
+Lumen uses [Google Test](https://github.com/google/googletest) for unit testing. Google Test is included in the
 repo as a submodule. The test sources are located in the `./tests` directory.
 
 The tests need to be compiled into an executable, and then run. The tests are built using the normal build process, but
@@ -199,8 +167,6 @@ more information.
 
 Even if your changes cannot be covered in the CI, we still encourage you to write the tests for them. This will allow
 maintainers to run the tests locally.
-
-[crowdin-url]: https://translate.lizardbyte.dev
 
 <div class="section_buttons">
 

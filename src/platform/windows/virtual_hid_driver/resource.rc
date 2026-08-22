@@ -20,11 +20,11 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "CompanyName", "LizardByte\0"
+      VALUE "CompanyName", "simonfalke\0"
       VALUE "FileDescription", "Lumen Virtual HID UMDF driver\0"
       VALUE "FileVersion", LUMEN_VHID_FILE_VERSION_STRING
       VALUE "InternalName", "LumenVirtualHid.dll\0"
-      VALUE "LegalCopyright", "Copyright (C) 2026 LizardByte\0"
+      VALUE "LegalCopyright", "Copyright (C) 2026 simonfalke\0"
       VALUE "OriginalFilename", "LumenVirtualHid.dll\0"
       VALUE "ProductName", "Lumen\0"
       VALUE "ProductVersion", LUMEN_VHID_FILE_VERSION_STRING

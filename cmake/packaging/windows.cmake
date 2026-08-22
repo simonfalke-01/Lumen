@@ -113,9 +113,11 @@ else()
             "Lumen Virtual HID driver package not supplied; installer generation will not include the driver")
 endif()
 
-# Mandatory scripts
+# Mandatory scripts. The source filename is retained as a build compatibility
+# alias, but new packages expose only the Lumen script name.
 install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sunshine-setup.ps1"
         DESTINATION "scripts"
+        RENAME "lumen-setup.ps1"
         COMPONENT assets)
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/service/"
         DESTINATION "scripts"
@@ -133,7 +135,7 @@ install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/firewall/"
         DESTINATION "scripts"
         COMPONENT firewall)
 
-# Sunshine assets
+# Lumen assets
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/"
         DESTINATION "${SUNSHINE_ASSETS_DIR}"
         COMPONENT assets)
@@ -158,7 +160,7 @@ set(CPACK_COMPONENT_GROUP_CORE_EXPANDED true)
 set(CPACK_COMPONENT_GROUP_THIRDPARTY_DISPLAY_NAME "Third Party")
 set(CPACK_COMPONENT_GROUP_THIRDPARTY_DESCRIPTION "Bundled third-party installers and optional components.")
 
-# sunshine binary
+# Lumen binary
 set(CPACK_COMPONENT_APPLICATION_DISPLAY_NAME "${CMAKE_PROJECT_NAME}")
 set(CPACK_COMPONENT_APPLICATION_DESCRIPTION "${CMAKE_PROJECT_NAME} main application and required components.")
 set(CPACK_COMPONENT_APPLICATION_GROUP "Core")
@@ -167,7 +169,7 @@ set(CPACK_COMPONENT_APPLICATION_DEPENDS assets)
 
 # service auto-start script
 set(CPACK_COMPONENT_AUTOSTART_DISPLAY_NAME "Launch on Startup")
-set(CPACK_COMPONENT_AUTOSTART_DESCRIPTION "If enabled, launches Sunshine automatically on system startup.")
+set(CPACK_COMPONENT_AUTOSTART_DESCRIPTION "If enabled, launches Lumen automatically on system startup.")
 set(CPACK_COMPONENT_AUTOSTART_GROUP "Core")
 
 # assets
@@ -178,17 +180,23 @@ set(CPACK_COMPONENT_ASSETS_REQUIRED true)
 
 # Lumen Virtual HID driver and management helper
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISPLAY_NAME "Virtual Keyboard and Mouse")
-set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
-        "Optional Lumen Virtual HID keyboard and mouse driver. Deselect to use the SendInput backend only.")
+if(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE)
+    set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
+            "Development only: installs the self-signed Lumen Virtual HID keyboard and mouse driver.")
+else()
+    set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
+            "Optional Lumen Virtual HID keyboard and mouse driver. Leave disabled to use SendInput only.")
+endif()
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_GROUP "Core")
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DEPENDS application)
+set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISABLED true)
 
 # ZIP packages are intentionally non-privileged. Keep the driver package and
 # its install/remove helper out of the lite archive so unpacked builds use the
 # SendInput fallback unless a matching driver is already installed.
 get_cmake_property(SUNSHINE_WINDOWS_PACKAGE_COMPONENTS COMPONENTS)
 set(SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG
-        "${CMAKE_CURRENT_BINARY_DIR}/SunshineWindowsCPackOptions.cmake")
+        "${CMAKE_CURRENT_BINARY_DIR}/LumenWindowsCPackOptions.cmake")
 string(CONCAT SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT
         "if(CPACK_GENERATOR STREQUAL \"ZIP\")\n"
         "  set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)\n"

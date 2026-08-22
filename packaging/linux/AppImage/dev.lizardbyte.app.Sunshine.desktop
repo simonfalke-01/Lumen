@@ -1,13 +1,13 @@
 [Desktop Entry]
 Categories=RemoteAccess;Network;
 Comment=@PROJECT_DESCRIPTION@
-Exec=sunshine
-Icon=sunshine
+Exec=lumen
+Icon=@SUNSHINE_DESKTOP_ICON@
 Keywords=gamestream;stream;moonlight;remote play;
 Name=@PROJECT_NAME@
 Terminal=true
 Type=Application
 Version=1.0
 X-AppImage-Arch=x86_64
-X-AppImage-Name=sunshine
+X-AppImage-Name=lumen
 X-AppImage-Version=@PROJECT_VERSION@

@@ -668,11 +668,11 @@ namespace portal {
       request_count++;
 
       if (out_token) {
-        *out_token = g_strdup_printf("Sunshine%u", request_count);
+        *out_token = g_strdup_printf("Lumen%u", request_count);
       }
       if (out_path) {
         g_autofree gchar *sender = get_sender_string(conn);
-        *out_path = g_strdup(std::format("{}{}{}{}", REQUEST_PREFIX, sender, "/Sunshine", request_count).c_str());
+        *out_path = g_strdup(std::format("{}{}{}{}", REQUEST_PREFIX, sender, "/Lumen", request_count).c_str());
       }
     }
 
@@ -682,12 +682,12 @@ namespace portal {
       session_count++;
 
       if (out_token) {
-        *out_token = g_strdup_printf("Sunshine%u", session_count);
+        *out_token = g_strdup_printf("Lumen%u", session_count);
       }
 
       if (out_path) {
         g_autofree gchar *sender = get_sender_string(conn);
-        *out_path = g_strdup(std::format("{}{}{}{}", SESSION_PREFIX, sender, "/Sunshine", session_count).c_str());
+        *out_path = g_strdup(std::format("{}{}{}{}", SESSION_PREFIX, sender, "/Lumen", session_count).c_str());
       }
     }
 

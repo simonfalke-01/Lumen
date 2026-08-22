@@ -1,20 +1,19 @@
 #!/bin/sh
 
-# FreeBSD pre-deinstall script for Sunshine
+# FreeBSD pre-deinstall script for Lumen
 # This script cleans up configuration added during installation
 
-echo "Cleaning up Sunshine configuration..."
+echo "Cleaning up Lumen configuration..."
 
 # Remove devfs rules
 DEVFS_RULESET_FILE="/etc/devfs.rules"
-RULESET_NUM=47989
+RULESET_NUM=48371
 
 # Remove rules from /etc/devfs.rules
 if [ -f "$DEVFS_RULESET_FILE" ]; then
-  if grep -q "\[sunshine=$RULESET_NUM\]" "$DEVFS_RULESET_FILE"; then
+  if grep -q "\[lumen=$RULESET_NUM\]" "$DEVFS_RULESET_FILE"; then
     echo "Removing devfs rules from $DEVFS_RULESET_FILE..."
-    # Remove the [sunshine=47989] section and its rules (match the section header and the next line)
-    sed -i.bak '/^\[sunshine='"$RULESET_NUM"'\]$/,/^add path.*uinput/d' "$DEVFS_RULESET_FILE"
+    sed -i.bak '/^\[lumen='"$RULESET_NUM"'\]$/,/^add path.*uinput/d' "$DEVFS_RULESET_FILE"
     echo "Devfs rules removed from file."
   fi
 fi

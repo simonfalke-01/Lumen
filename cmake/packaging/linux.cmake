@@ -12,16 +12,16 @@ file(CREATE_LINK "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/assets/shaders"
         "${CMAKE_BINARY_DIR}/assets/shaders" COPY_ON_ERROR SYMBOLIC)
 
 if(${SUNSHINE_BUILD_APPIMAGE} OR ${SUNSHINE_BUILD_FLATPAK})
-    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-sunshine.rules"
+    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
             DESTINATION "${SUNSHINE_ASSETS_DIR}/udev/rules.d")
-    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-sunshine.conf"
+    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
             DESTINATION "${SUNSHINE_ASSETS_DIR}/modules-load.d")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
             DESTINATION "${SUNSHINE_ASSETS_DIR}/systemd/user")
 elseif(${SUNSHINE_BUILD_HOMEBREW})
-    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-sunshine.rules"
+    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/udev/rules.d")
-    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-sunshine.conf"
+    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/modules-load.d")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
             DESTINATION ".")
@@ -30,13 +30,13 @@ else()
     find_package(Udev)
 
     if(UDEV_FOUND)
-        install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-sunshine.rules"
+        install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
                 DESTINATION "${UDEV_RULES_INSTALL_DIR}")
     endif()
     if(SYSTEMD_FOUND)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
                 DESTINATION "${SYSTEMD_USER_UNIT_INSTALL_DIR}")
-        install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-sunshine.conf"
+        install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
                 DESTINATION "${SYSTEMD_MODULES_LOAD_DIR}")
     endif()
 endif()

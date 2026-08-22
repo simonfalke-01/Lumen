@@ -89,7 +89,7 @@ namespace nvprefs {
    */
   struct nvprefs_options {
     bool opengl_vulkan_on_dxgi = true;  ///< Whether NVIDIA OpenGL/Vulkan-on-DXGI should be enabled.
-    bool sunshine_high_power_mode = true;  ///< Whether NVIDIA high-power mode should be enabled for Sunshine.
+    bool sunshine_high_power_mode = true;  ///< Whether NVIDIA high-power mode should be enabled for Lumen.
   };
 
   /**

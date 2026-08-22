@@ -15,35 +15,35 @@ endif()
 SET(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
         "${CPACK_NSIS_EXTRA_INSTALL_COMMANDS}
         ${NSIS_LOGSET_COMMAND}
-        IfSilent sunshine_install_silent sunshine_install_interactive
-        sunshine_install_interactive:
+        IfSilent lumen_install_silent lumen_install_interactive
+        lumen_install_interactive:
         nsExec::ExecToLog \
           'powershell -ExecutionPolicy Bypass \
-          -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action install'
-        Goto sunshine_install_check
-        sunshine_install_silent:
+          -File \\\"$INSTDIR\\\\scripts\\\\lumen-setup.ps1\\\" -Action install'
+        Goto lumen_install_check
+        lumen_install_silent:
         nsExec::ExecToLog \
           'powershell -ExecutionPolicy Bypass \
-          -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action install -Silent'
-        sunshine_install_check:
+          -File \\\"$INSTDIR\\\\scripts\\\\lumen-setup.ps1\\\" -Action install -Silent'
+        lumen_install_check:
         Pop $0
-        StrCmp $0 '0' sunshine_install_done
-        StrCmp $0 '3010' sunshine_install_reboot
+        StrCmp $0 '0' lumen_install_done
+        StrCmp $0 '3010' lumen_install_reboot
         StrCpy $1 $0
         nsExec::ExecToLog \
           'powershell -ExecutionPolicy Bypass \
-          -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action rollback -Silent'
+          -File \\\"$INSTDIR\\\\scripts\\\\lumen-setup.ps1\\\" -Action rollback -Silent'
         Pop $2
-        StrCmp $2 '0' sunshine_install_rollback_done
-        StrCmp $2 '3010' sunshine_install_rollback_reboot
-        Abort 'Sunshine setup failed with exit code $1, and rollback failed with exit code $2. Protected recovery state was preserved.'
-        sunshine_install_rollback_reboot:
+        StrCmp $2 '0' lumen_install_rollback_done
+        StrCmp $2 '3010' lumen_install_rollback_reboot
+        Abort 'Lumen setup failed with exit code $1, and rollback failed with exit code $2. Protected recovery state was preserved.'
+        lumen_install_rollback_reboot:
         SetRebootFlag true
-        sunshine_install_rollback_done:
-        Abort 'Sunshine setup failed with exit code $1. Installation changes were rolled back.'
-        sunshine_install_reboot:
+        lumen_install_rollback_done:
+        Abort 'Lumen setup failed with exit code $1. Installation changes were rolled back.'
+        lumen_install_reboot:
         SetRebootFlag true
-        sunshine_install_done:
+        lumen_install_done:
         ")
 
 # Extra uninstall commands
@@ -53,14 +53,14 @@ set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS
         ${NSIS_LOGSET_COMMAND}
         nsExec::ExecToLog \
           'powershell -ExecutionPolicy Bypass \
-          -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action uninstall'
+          -File \\\"$INSTDIR\\\\scripts\\\\lumen-setup.ps1\\\" -Action uninstall'
         Pop $0
-        StrCmp $0 '0' sunshine_uninstall_done
-        StrCmp $0 '3010' sunshine_uninstall_reboot
-        Abort 'Sunshine cleanup failed with exit code $0. See the setup log for recovery details.'
-        sunshine_uninstall_reboot:
+        StrCmp $0 '0' lumen_uninstall_done
+        StrCmp $0 '3010' lumen_uninstall_reboot
+        Abort 'Lumen cleanup failed with exit code $0. See the setup log for recovery details.'
+        lumen_uninstall_reboot:
         SetRebootFlag true
-        sunshine_uninstall_done:
+        lumen_uninstall_done:
         MessageBox MB_YESNO|MB_ICONQUESTION \
           'Do you want to remove $INSTDIR (this includes the configuration, cover images, and settings)?' \
           /SD IDNO IDNO no_delete
@@ -87,12 +87,12 @@ set(CPACK_NSIS_DELETE_ICONS_EXTRA
 # Checking for previous installed versions
 set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL "ON")
 
-set(CPACK_NSIS_HELP_LINK "https://docs.lizardbyte.dev/projects/sunshine/latest/md_docs_2getting__started.html")
-set(CPACK_NSIS_URL_INFO_ABOUT "${CMAKE_PROJECT_HOMEPAGE_URL}")
-set(CPACK_NSIS_CONTACT "${CMAKE_PROJECT_HOMEPAGE_URL}/support")
+set(CPACK_NSIS_HELP_LINK "https://github.com/simonfalke-01/Lumen")
+set(CPACK_NSIS_URL_INFO_ABOUT "https://github.com/simonfalke-01/Lumen")
+set(CPACK_NSIS_CONTACT "https://github.com/simonfalke-01/Lumen/issues")
 
 set(CPACK_NSIS_MENU_LINKS
-        "https://docs.lizardbyte.dev/projects/sunshine" "Sunshine documentation"
-        "https://app.lizardbyte.dev" "LizardByte Web Site"
-        "https://app.lizardbyte.dev/support" "LizardByte Support")
+        "https://github.com/simonfalke-01/Lumen" "Lumen on GitHub"
+        "https://github.com/simonfalke-01/Lumen/releases" "Lumen releases"
+        "https://github.com/simonfalke-01/Lumen/issues" "Lumen support")
 set(CPACK_NSIS_MANIFEST_DPI_AWARE true)

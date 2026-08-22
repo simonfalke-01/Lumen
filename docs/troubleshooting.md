@@ -7,15 +7,15 @@ If you forgot your credentials to the web UI, try this.
 
 @tabs{
   @tab{General | ```bash
-    sunshine --creds {new-username} {new-password}
+    lumen --creds {new-username} {new-password}
     ```
   }
   @tab{AppImage | ```bash
-    ./sunshine.AppImage --creds {new-username} {new-password}
+    ./lumen.AppImage --creds {new-username} {new-password}
     ```
   }
   @tab{Flatpak | ```bash
-    flatpak run --command=sunshine dev.lizardbyte.app.Sunshine --creds {new-username} {new-password}
+    flatpak run --command=lumen io.github.simonfalke.Lumen --creds {new-username} {new-password}
     ```
   }
 }
@@ -25,7 +25,7 @@ If you forgot your credentials to the web UI, try this.
 > Do not include the curly braces.
 
 ### Unusual Mouse Behavior
-If you experience unusual mouse behavior, try attaching a physical mouse to the Sunshine host.
+If you experience unusual mouse behavior, try attaching a physical mouse to the Lumen host.
 
 ### Web UI Access
 Can't access the web UI?
@@ -37,7 +37,7 @@ One trick might be to change Steam settings and check or uncheck the configurati
 controllers and leave only support for Generic controllers.
 
 Also, if you have many controllers already directly connected to the host, it might help to disable them so that the
-Sunshine-provided controller (connected to the guest) is the "first" one. In Linux this can be achieved on USB
+Lumen-provided controller (connected to the guest) is the "first" one. In Linux this can be achieved on USB
 devices by finding the device in `/sys/bus/usb/devices/` and writing `0` to the `authorized` file.
 
 ### Network performance test
@@ -48,7 +48,7 @@ consistency (low latency with low variance, minimal or no packet loss).
 
 The network can be tested using the multi-platform tool [iPerf3](https://iperf.fr).
 
-On the Sunshine host `iperf3` is started in server mode:
+On the Lumen host `iperf3` is started in server mode:
 
 ```bash
 iperf3 -s
@@ -73,9 +73,9 @@ If you are testing a remote connection (over the internet), you will need to
 forward the port 5201 (TCP and UDP) from your host.
 
 ### Packet loss (Buffer overrun)
-If the host PC (running Sunshine) has a much faster connection to the network
+If the host PC (running Lumen) has a much faster connection to the network
 than the slowest segment of the network path to the client device (running
-Moonlight), massive packet loss can occur: Sunshine emits its stream in bursts
+Moonlight), massive packet loss can occur: Lumen emits its stream in bursts
 every 16 ms (for 60 fps), but those bursts can't be passed on fast enough to the
 client and must be buffered by one of the network devices inbetween. If the
 bitrate is high enough, these buffers will overflow and data will be discarded.
@@ -87,7 +87,7 @@ client having only a 100 Mbps interface.
 As a workaround the transmission speed of the host NIC can be reduced: 1 Gbps
 instead of 2.5 or 100 Mbps instead of 1 Gbps. A technically more advanced
 solution would be to configure traffic shaping rules at the OS level, so that
-only Sunshine's traffic is slowed down.
+only Lumen's traffic is slowed down.
 
 Such a solution on Linux could look like that:
 
@@ -102,7 +102,7 @@ sudo tc qdisc add dev <NIC> root handle 1: htb default 1
 sudo tc class add dev <NIC> parent 1: classid 1:1 htb \
     rate 10000mbit ceil 10000mbit burst 32k
 
-# 4) Create class 1:10 for Sunshine game stream at 1 Gbit/s
+# 4) Create class 1:10 for Lumen game stream at 1 Gbit/s
 sudo tc class add dev <NIC> parent 1: classid 1:10 htb \
     rate 1000mbit ceil 1000mbit burst 32k
 
@@ -112,10 +112,10 @@ sudo tc filter add dev <NIC> protocol ip parent 1: prio 1 \
     match ip sport 47998 0xffff flowid 1:10
 ```
 
-In that way only the Sunshine traffic is limited by 1 Gbit. This is not persistent on reboots.
+In that way only the Lumen traffic is limited by 1 Gbit. This is not persistent on reboots.
 If you use a different port for the game stream, you need to adjust the last command.
 
-Sunshine versions > 0.23.1 include improved networking code that should
+Lumen versions > 0.23.1 include improved networking code that should
 alleviate or even solve this issue (without reducing the NIC speed).
 
 ### Packet loss (MTU)
@@ -130,11 +130,11 @@ resort suggestion.
 
 ### Hardware Encoders throttle/drop FPS during high GPU load
 Capture methods (`wlgrab`) or encoders (`nvenc`, `vaapi`) that utilize EGL contexts may exhibit FPS drops
-in conjunction with a Sunshine installation that runs in a sandboxed or reduced permissions state
+in conjunction with a Lumen installation that runs in a sandboxed or reduced permissions state
 (Flatpak, AppImage, or when using Portal capture) due to the lack of active CAP_SYS_NICE process permissions
 needed to set up high priority EGL contexts.
 
-To check if you are affected by this issue, look out for this message in your Sunshine log:
+To check if you are affected by this issue, look out for this message in your Lumen log:
 ```
 Warning: EGL: context priority set to HIGH but CAP_SYS_NICE capability is missing
 ```
@@ -142,7 +142,7 @@ Warning: EGL: context priority set to HIGH but CAP_SYS_NICE capability is missin
 > [!IMPORTANT]
 > Switching to Vulkan encoding should resolve the issue for the majority of configurations, but refer to this
 > table for recommended configurations (especially if Vulkan encoding is not supported on your system):
-> | Desktop Environment | Vulkan Supported? | Recommended Sunshine Install Type | Recommended Capture & Encoder Configuration       |
+> | Desktop Environment | Vulkan Supported? | Recommended Lumen Install Type | Recommended Capture & Encoder Configuration       |
 > |:--------------------|-------------------|-----------------------------------|--------------------------------------------------:|
 > | KDE Plasma          | Yes               | Any                               | `portal` or `kwin` capture with `vulkan` encoding |
 > | KDE Plasma          | No                | Non-Sandboxed                     | `kwin` capture with `vaapi`/`nvenc` encoding      |
@@ -156,12 +156,12 @@ Due to legal concerns, Mesa has disabled hardware decoding and encoding by defau
 Error: Could not open codec [h264_vaapi]: Function not implemented
 ```
 
-If you see the above error in the Sunshine logs, compiling *Mesa* manually may be required. See the official Mesa3D
+If you see the above error in the Lumen logs, compiling *Mesa* manually may be required. See the official Mesa3D
 [Compiling and Installing](https://docs.mesa3d.org/install.html) documentation for instructions.
 
 > [!IMPORTANT]
 > You must re-enable the disabled encoders. You can do so by passing the following argument to the build
-> system. You may also want to enable decoders, however, that is not required for Sunshine and is not covered here.
+> system. You may also want to enable decoders, however, that is not required for Lumen and is not covered here.
 > ```bash
 > -Dvideo-codecs=h264enc,h265enc
 > ```
@@ -173,16 +173,16 @@ If you see the above error in the Sunshine logs, compiling *Mesa* manually may b
 ### Portal token issues
 Portal capture requires you to manually approve Remote Desktop permissions via an on-screen prompt on the host.
 This creates a portal token which is used to automaticaly reauthorize on subsequent reconnects, but under certain
-circumstances (a Sunshine crash, switching to another desktop environment, or if a monitor hotplug event occurs)
+circumstances (a Lumen crash, switching to another desktop environment, or if a monitor hotplug event occurs)
 the portal token may become lost or invalid, necessitating manual re-approval of capture permissions.
 
 Users of the KDE Plasma desktop can bypass this issue either by switching to `kwin` capture or setting the following
-configuration to enable permanent capture autorization for Sunshine via Portal capture:
+configuration to enable permanent capture autorization for Lumen via Portal capture:
 ```
-flatpak permission-set kde-authorized remote-desktop dev.lizardbyte.app.Sunshine yes
+flatpak permission-set kde-authorized remote-desktop io.github.simonfalke.Lumen yes
 ```
 > [!NOTE]
-> Although this configuration is plumbed through Flatpak, it will work with any supported Sunshine installation type.
+> Although this configuration is plumbed through Flatpak, it will work with any supported Lumen installation type.
 
 ### Input not working
 After installation, the `udev` rules need to be reloaded. Our post-install script tries to do this for you
@@ -197,20 +197,20 @@ sudo usermod -aG input $USER
 #### Multiseat
 
 If you run multiple concurrent Wayland sessions on separate logind seats (e.g. `seat0`, `seat1`),
-your compositor may ignore injected input unless Sunshine's virtual devices are assigned to the correct seat.
+your compositor may ignore injected input unless Lumen's virtual devices are assigned to the correct seat.
 
-Sunshine determines its target seat from `XDG_SEAT`, which is typically set automatically by your display manager.
-If needed, you can override it manually in your systemd service file or shell environment before starting Sunshine.
+Lumen determines its target seat from `XDG_SEAT`, which is typically set automatically by your display manager.
+If needed, you can override it manually in your systemd service file or shell environment before starting Lumen.
 
-When the seat is not `seat0`, Sunshine appends the seat name to its virtual device names, for example:
+When the seat is not `seat0`, Lumen appends the seat name to its virtual device names, for example:
 
 - Keyboard passthrough (seat1)
-- Sunshine PS5 (virtual) pad (seat1)
+- Lumen PS5 (virtual) pad (seat1)
 
-Sunshine creates two mouse devices: a relative one and an absolute one.
+Lumen creates two mouse devices: a relative one and an absolute one.
 
-To assign Sunshine's virtual devices to the correct seat, create this udev rules file
-(/etc/udev/rules.d/72-sunshine-virtual-seat.rules):
+To assign Lumen's virtual devices to the correct seat, create this udev rules file
+(/etc/udev/rules.d/72-lumen-virtual-seat.rules):
 ```udev
 SUBSYSTEM=="input", KERNEL=="input*", ATTR{name}=="*(seat1)*", TAG+="seat", ENV{ID_SEAT}="seat1"
 ```
@@ -223,7 +223,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger -s input
 
 ### KMS Streaming fails
 KMS screencasting requires elevated privileges which are not allowed for Flatpak or AppImage packages.
-This means that you must install Sunshine using the native package format of your distribution, if available.
+This means that you must install Lumen using the native package format of your distribution, if available.
 KMS capture will soon be phased out in favour of XDG Portal Capture (which works with all package types).
 
 ### KMS Streaming; some windows flicker/disappear on KDE Plasma 6.5+
@@ -263,7 +263,7 @@ by running them with a special
 ```bash
 export AMD_DEBUG=lowlatencyenc
 ```
-Sunshine sets this variable automatically, no manual
+Lumen sets this variable automatically, no manual
 configuration is needed.
 
 To check whether low-latency mode is being used, one can watch the VCLK and DCLK
@@ -291,15 +291,15 @@ launchctl load -w /Library/LaunchAgents/org.freedesktop.dbus-session.plist
 
 ### Virtual keyboard or mouse is unavailable
 
-With the default `windows_input_backend = auto`, Sunshine uses the Lumen Virtual HID keyboard and mouse driver when it
-is compatible and accessible to `SunshineService`. Set `windows_input_backend = sendinput` to skip the driver probe and
+With the default `windows_input_backend = auto`, Lumen uses the Lumen Virtual HID keyboard and mouse driver when it
+is compatible and accessible to `LumenService`. Set `windows_input_backend = sendinput` to skip the driver probe and
 always use SendInput.
 
-Check the log in the web UI's `Troubleshooting` tab or at `config/sunshine.log` in the Sunshine installation directory.
+Check the log in the web UI's `Troubleshooting` tab or at `config/lumen.log` in the Lumen installation directory.
 Then inspect the Plug and Play topology from Command Prompt:
 
 ```bat
-cd /d "%ProgramFiles%\Sunshine"
+cd /d "%ProgramFiles%\Lumen"
 tools\lumen-vhidctl.exe status --json
 ```
 
@@ -314,12 +314,12 @@ tools\lumen-vhidctl.exe probe --json
 ```
 
 `probe --json` must run as `SYSTEM`; an Administrator command prompt is not sufficient. Its `state` is `compatible`,
-`absent`, `inaccessible`, or `incompatible`. Use the Sunshine service log as the normal record of this service-only
+`absent`, `inaccessible`, or `incompatible`. Use the Lumen service log as the normal record of this service-only
 probe.
 
-If the helper reports that the driver is missing, incompatible, or unusable, rerun the Windows 11 x64 Sunshine
-installer and select repair. Installer and repair logs are stored in `%%TEMP%/Sunshine/logs/install/`; uninstall logs
-are stored in `%%TEMP%/Sunshine/logs/uninstall/`. The helper is not included in standalone/lite packages.
+If the helper reports that the driver is missing, incompatible, or unusable, rerun the Windows 11 x64 Lumen
+installer and select repair. Installer and repair logs are stored in `%%TEMP%/Lumen/logs/install/`; uninstall logs
+are stored in `%%TEMP%/Lumen/logs/uninstall/`. The helper is not included in standalone/lite packages.
 
 Lumen Windows installers use an exact self-signed driver certificate valid for 100 years and trust only its exact
 thumbprint. A committed upgrade removes only the exact previously recorded Lumen signer. Certificate expiry is 100
@@ -327,24 +327,25 @@ years after the artifact is built. The package is not Microsoft-certified. Windo
 optional SendInput-only installation when that policy blocks Virtual HID.
 
 > [!NOTE]
-> A direct Sunshine launch cannot access the Virtual HID report interface, even when run as Administrator. Run the
-> installed `SunshineService` to use Virtual HID. Standalone/lite builds use `SendInput` when no
+> A direct Lumen launch cannot access the Virtual HID report interface, even when run as Administrator. Run the
+> installed `LumenService` to use Virtual HID. `SunshineService` belongs to the upstream product and is never used as
+> a Lumen fallback. Standalone/lite builds use `SendInput` when no
 > compatible, accessible driver is installed.
 
-If the installed driver and application use incompatible protocol versions, keep both on the same Sunshine release or
-run installer repair. Uninstalling Sunshine stops the service before removing the Virtual HID device and driver
-package. Use Windows **Installed apps** to repair or uninstall Sunshine; Windows may require a restart to finish
+If the installed driver and application use incompatible protocol versions, keep both on the same Lumen release or
+run installer repair. Uninstalling Lumen stops the service before removing the Virtual HID device and driver
+package. Use Windows **Installed apps** to repair or uninstall Lumen; Windows may require a restart to finish
 removing an in-use driver.
 
-If initialization fails, or input submission fails before the driver accepts its first report, Sunshine uses SendInput.
+If initialization fails, or input submission fails before the driver accepts its first report, Lumen uses SendInput.
 After the driver accepts any report, a later submission failure fails closed and stops keyboard and mouse injection
 instead of risking duplicate or stuck input. Disconnect Moonlight to trigger the input session's atomic
 reset-and-release operation. A successful reset recovers through SendInput without replaying held state; a failed reset
-keeps input fail closed. If disconnecting does not recover input, restart `SunshineService` and review the failure before
+keeps input fail closed. If disconnecting does not recover input, restart `LumenService` and review the failure before
 reconnecting. Reboot Windows if the topology remains `unhealthy`, the installer reports that a reboot is required, or a
 service restart does not recover the driver; then rerun repair if `status --json` is still not `installed`.
 
-Look for one of these backend-selection messages in `sunshine.log`:
+Look for one of these backend-selection messages in `lumen.log`:
 
 ```text
 Windows keyboard and mouse backend: Lumen Virtual HID
@@ -364,7 +365,7 @@ Alternatively, you can manually install it from
 After installation, it is recommended to restart your computer.
 
 ### Permission denied
-Since Sunshine runs as a service on Windows, it may not have the same level of access that your regular user account
+Since Lumen runs as a service on Windows, it may not have the same level of access that your regular user account
 has. You may get permission denied errors when attempting to launch a game or application from a non-system drive.
 
 You will need to modify the security permissions on your disk. Ensure that user/principal SYSTEM has full

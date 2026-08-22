@@ -70,14 +70,19 @@
           {{ $t('index.installed_version_not_stable') }}
         </div>
 
-        <div v-else-if="(!preReleaseBuildAvailable || !notifyPreReleases) && !stableBuildAvailable && !buildVersionIsDirty">
+        <div class="alert alert-warning my-3" v-if="updateCheckFailed && !loading">
+          <alert-circle :size="18" class="icon"></alert-circle>
+          Unable to check for updates.
+        </div>
+
+        <div v-else-if="githubVersion && (!preReleaseBuildAvailable || !wantsPreReleases) && !stableBuildAvailable && !buildVersionIsDirty">
           <div class="alert alert-success my-3">
             <check-circle :size="18" class="icon"></check-circle>
             {{ $t('index.version_latest') }}
           </div>
         </div>
 
-        <div v-if="notifyPreReleases && preReleaseBuildAvailable">
+        <div v-if="wantsPreReleases && preReleaseBuildAvailable">
           <div class="alert alert-warning my-3">
             <!-- header row -->
             <div class="d-flex align-items-center justify-content-between gap-3 flex-wrap mb-3">
@@ -86,14 +91,14 @@
                 <span>{{ $t('index.new_pre_release') }}</span>
                 <h5 class="mb-0">{{ preReleaseVersion.release.name }}</h5>
               </div>
-              <a class="btn btn-success flex-shrink-0" :href="preReleaseVersion.release.html_url" target="_blank">
+              <a class="btn btn-success flex-shrink-0" :href="preReleaseVersion.downloadUrl(platform)" target="_blank" rel="noopener noreferrer">
                 <download :size="18" class="icon"></download>
                 {{ $t('index.download') }}
               </a>
             </div>
 
             <!-- body row (full width) -->
-            <div class="markdown-body release-notes" v-html="convertMarkdownToHtml(preReleaseVersion.release.body)"></div>
+            <div class="markdown-body release-notes" v-html="formatReleaseNotesAsHtml(preReleaseVersion.release.body)"></div>
           </div>
         </div>
 
@@ -106,14 +111,14 @@
                 <span>{{ $t('index.new_stable') }}</span>
                 <h5 class="mb-0">{{ githubVersion.release.name }}</h5>
               </div>
-              <a class="btn btn-success flex-shrink-0" :href="githubVersion.release.html_url" target="_blank">
+              <a class="btn btn-success flex-shrink-0" :href="githubVersion.downloadUrl(platform)" target="_blank" rel="noopener noreferrer">
                 <download :size="18" class="icon"></download>
                 {{ $t('index.download') }}
               </a>
             </div>
 
             <!-- body row (full width) -->
-            <div class="markdown-body release-notes" v-html="convertMarkdownToHtml(githubVersion.release.body)"></div>
+            <div class="markdown-body release-notes" v-html="formatReleaseNotesAsHtml(githubVersion.release.body)"></div>
           </div>
         </div>
       </div>
@@ -128,11 +133,14 @@
 
 <script type="module">
   import { createApp } from 'vue'
-  import { marked } from 'marked'
   import { initApp } from './init'
   import Navbar from './Navbar.vue'
   import ResourceCard from './ResourceCard.vue'
-  import SunshineVersion from './sunshine_version'
+  import LumenVersion, {
+    fetchLumenReleases,
+    formatReleaseNotesAsHtml,
+    selectLatestReleases
+  } from './sunshine_version'
   import {
     AlertCircle,
     AlertTriangle,
@@ -143,15 +151,6 @@
     CheckCircle,
     Download
   } from '@lucide/vue'
-
-  // Configure marked to allow HTML
-  marked.setOptions({
-    breaks: true,
-    gfm: true,
-    headerIds: true,
-    mangle: false,
-    sanitize: false
-  });
 
   console.log("Hello, Sunshine!")
   let app = createApp({
@@ -173,6 +172,7 @@
         githubVersion: null,
         notifyPreReleases: false,
         preReleaseVersion: null,
+        updateCheckFailed: false,
         loading: true,
         logs: null,
         platform: "",
@@ -181,42 +181,62 @@
       }
     },
     async created() {
-      try {
-        let config = await fetch("./api/config").then((r) => r.json());
-        this.notifyPreReleases = config.notify_pre_releases;
-        this.platform = config.platform;
-        this.controllerEnabled = config.controller !== "disabled";
-        this.version = new SunshineVersion(null, config.version);
-        console.log("Version: ", this.version.version)
-        this.githubVersion = new SunshineVersion(await fetch("https://api.github.com/repos/LizardByte/Sunshine/releases/latest").then((r) => r.json()), null);
-        console.log("GitHub Version: ", this.githubVersion.version)
-        this.preReleaseVersion = new SunshineVersion((await fetch("https://api.github.com/repos/LizardByte/Sunshine/releases").then((r) => r.json())).find(release => release.prerelease), null);
-        console.log("Pre-Release Version: ", this.preReleaseVersion.version)
+      const configRequest = fetch("./api/config")
+        .then((r) => r.json())
+        .then(async (config) => {
+          this.notifyPreReleases = config.notify_pre_releases;
+          this.platform = config.platform;
+          this.controllerEnabled = config.controller !== "disabled";
+          this.version = new LumenVersion(null, config.version);
+          console.log("Version: ", this.version.version)
 
-        // Fetch ViGEmBus status only on Windows when controller is enabled
-        if (this.platform === 'windows' && this.controllerEnabled) {
-          try {
-            this.vigembus = await fetch("./api/vigembus/status").then((r) => r.json());
-          } catch (e) {
-            console.error("Failed to fetch ViGEmBus status:", e);
+          // Fetch ViGEmBus status only on Windows when controller is enabled
+          if (this.platform === 'windows' && this.controllerEnabled) {
+            try {
+              this.vigembus = await fetch("./api/vigembus/status").then((r) => r.json());
+            } catch (e) {
+              console.error("Failed to fetch ViGEmBus status:", e);
+            }
           }
-        }
-      } catch (e) {
-        console.error(e);
-      }
-      try {
-        this.logs = (await fetch("./api/logs").then(r => r.text()))
-      } catch (e) {
-        console.error(e);
-      }
+        })
+        .catch((e) => console.error("Failed to load configuration:", e));
+
+      const releasesRequest = fetchLumenReleases()
+        .then((releaseList) => {
+          this.updateCheckFailed = false;
+          const releases = selectLatestReleases(releaseList);
+          this.githubVersion = releases.stable
+            ? new LumenVersion(releases.stable, null)
+            : null;
+          this.preReleaseVersion = releases.prerelease
+            ? new LumenVersion(releases.prerelease, null)
+            : null;
+        })
+        .catch((e) => {
+          this.updateCheckFailed = true;
+          console.error("Failed to fetch Lumen releases:", e);
+        });
+
+      const logsRequest = fetch("./api/logs")
+        .then((r) => r.text())
+        .then((logs) => {
+          this.logs = logs;
+        })
+        .catch((e) => console.error("Failed to load logs:", e));
+
+      await Promise.allSettled([
+        configRequest,
+        releasesRequest,
+        logsRequest,
+      ]);
       this.loading = false;
     },
     computed: {
       installedVersionNotStable() {
-        if (!this.githubVersion || !this.version) {
-          return false;
-        }
-        return this.version.isGreater(this.githubVersion);
+        return Boolean(this.version?.parsedVersion?.prerelease.length);
+      },
+      wantsPreReleases() {
+        return this.notifyPreReleases || this.installedVersionNotStable;
       },
       stableBuildAvailable() {
         if (!this.githubVersion || !this.version) {
@@ -225,14 +245,14 @@
         return this.githubVersion.isGreater(this.version);
       },
       preReleaseBuildAvailable() {
-        if (!this.preReleaseVersion || !this.githubVersion || !this.version) {
+        if (!this.preReleaseVersion || !this.version) {
           return false;
         }
-        return this.preReleaseVersion.isGreater(this.version) && this.preReleaseVersion.isGreater(this.githubVersion);
+        return this.preReleaseVersion.isGreater(this.version) &&
+          (!this.githubVersion || this.preReleaseVersion.isGreater(this.githubVersion));
       },
       buildVersionIsDirty() {
-        return this.version.version?.split(".").length === 5 &&
-          this.version.version.indexOf("dirty") !== -1
+        return this.version?.version?.includes("dirty") ?? false;
       },
       /** Parse the text errors, calculating the text, the timestamp and the level */
       fancyLogs() {
@@ -247,10 +267,7 @@
       }
     },
     methods: {
-      convertMarkdownToHtml(markdown) {
-        if (!markdown) return '';
-        return marked.parse(markdown);
-      }
+      formatReleaseNotesAsHtml,
     }
   });
 

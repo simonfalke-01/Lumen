@@ -1,112 +1,127 @@
-# Set build variables if env variables are defined
-# These are used in configured files such as manifests for different packages
+# Set build variables used in configured package and update metadata.
 if(DEFINED ENV{BRANCH})
-    set(GITHUB_BRANCH $ENV{BRANCH})
-endif()
-if(DEFINED ENV{BUILD_VERSION})  # cmake-lint: disable=W0106
-    set(BUILD_VERSION $ENV{BUILD_VERSION})
+    set(GITHUB_BRANCH "$ENV{BRANCH}")
 endif()
 if(DEFINED ENV{CLONE_URL})
-    set(GITHUB_CLONE_URL $ENV{CLONE_URL})
+    set(GITHUB_CLONE_URL "$ENV{CLONE_URL}")
 endif()
 if(DEFINED ENV{COMMIT})
-    set(GITHUB_COMMIT $ENV{COMMIT})
-endif()
-if(DEFINED ENV{TAG})
-    set(GITHUB_TAG $ENV{TAG})
+    set(GITHUB_COMMIT "$ENV{COMMIT}")
 endif()
 
-# Check if env vars are defined before attempting to access them, variables will be defined even if blank
-if((DEFINED ENV{BRANCH}) AND (DEFINED ENV{BUILD_VERSION}))  # cmake-lint: disable=W0106
-    if((DEFINED ENV{BRANCH}) AND (NOT $ENV{BUILD_VERSION} STREQUAL ""))
-        # If BRANCH is defined and BUILD_VERSION is not empty, then we are building from CI
-        # If BRANCH is master we are building a push/release build
-        MESSAGE("Got from CI '$ENV{BRANCH}' branch and version '$ENV{BUILD_VERSION}'")
-        set(PROJECT_VERSION $ENV{BUILD_VERSION})
-        string(REGEX REPLACE "^v" "" PROJECT_VERSION ${PROJECT_VERSION})  # remove the v prefix if it exists
-        set(CMAKE_PROJECT_VERSION ${PROJECT_VERSION})  # cpack will use this to set the binary versions
-    endif()
+set(LUMEN_RELEASE_TAG "v${LUMEN_VERSION}")
+if(LUMEN_VERSION MATCHES "-")
+    set(LUMEN_DEV_VERSION_PREFIX "${LUMEN_VERSION}.dev")
 else()
-    # Generate Sunshine Version based of the git tag
-    # https://github.com/nocnokneo/cmake-git-versioning-example/blob/master/LICENSE
-    find_package(Git)
-    if(GIT_EXECUTABLE)
-        MESSAGE("${CMAKE_SOURCE_DIR}")
-        get_filename_component(SRC_DIR "${CMAKE_SOURCE_DIR}" DIRECTORY)
-        #Get current Branch
+    set(LUMEN_DEV_VERSION_PREFIX "${LUMEN_VERSION}-dev")
+endif()
+string(REPLACE "." "\\." LUMEN_DEV_VERSION_PREFIX_REGEX "${LUMEN_DEV_VERSION_PREFIX}")
+
+set(LUMEN_REQUESTED_VERSION "")
+if(DEFINED ENV{BUILD_VERSION} AND NOT "$ENV{BUILD_VERSION}" STREQUAL "")  # cmake-lint: disable=W0106
+    set(LUMEN_REQUESTED_VERSION "$ENV{BUILD_VERSION}")
+    string(REGEX REPLACE "^v" "" LUMEN_REQUESTED_VERSION "${LUMEN_REQUESTED_VERSION}")
+endif()
+
+set(LUMEN_REQUESTED_TAG "")
+if(DEFINED ENV{TAG} AND NOT "$ENV{TAG}" STREQUAL "")
+    set(LUMEN_REQUESTED_TAG "$ENV{TAG}")
+endif()
+
+find_package(Git QUIET)
+if(GIT_EXECUTABLE)
+    if(NOT GITHUB_BRANCH)
         execute_process(
                 COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
-                OUTPUT_VARIABLE GIT_DESCRIBE_BRANCH
-                RESULT_VARIABLE GIT_DESCRIBE_ERROR_CODE
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                OUTPUT_VARIABLE GITHUB_BRANCH
                 OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
         )
-        # Gather current commit
+    endif()
+    if(NOT GITHUB_COMMIT)
         execute_process(
-                COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
-                OUTPUT_VARIABLE GIT_DESCRIBE_VERSION
-                RESULT_VARIABLE GIT_DESCRIBE_ERROR_CODE
+                COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                OUTPUT_VARIABLE GITHUB_COMMIT
                 OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
         )
-        # Check if Dirty
+    endif()
+endif()
+
+if(LUMEN_REQUESTED_TAG)
+    if(NOT LUMEN_REQUESTED_TAG STREQUAL LUMEN_RELEASE_TAG)
+        message(FATAL_ERROR
+            "Release tag '${LUMEN_REQUESTED_TAG}' must exactly match version.txt as '${LUMEN_RELEASE_TAG}'.")
+    endif()
+    if(LUMEN_REQUESTED_VERSION AND NOT LUMEN_REQUESTED_VERSION STREQUAL LUMEN_VERSION)
+        message(FATAL_ERROR
+            "BUILD_VERSION '${LUMEN_REQUESTED_VERSION}' does not match release tag '${LUMEN_REQUESTED_TAG}'.")
+    endif()
+    if(GIT_EXECUTABLE)
         execute_process(
                 COMMAND ${GIT_EXECUTABLE} diff --quiet --exit-code
-                RESULT_VARIABLE GIT_IS_DIRTY
-                OUTPUT_STRIP_TRAILING_WHITESPACE
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                RESULT_VARIABLE LUMEN_RELEASE_WORKTREE_DIRTY
+                ERROR_QUIET
         )
-        if(NOT GIT_DESCRIBE_ERROR_CODE)
-            MESSAGE("Sunshine Branch: ${GIT_DESCRIBE_BRANCH}")
-            if(NOT GIT_DESCRIBE_BRANCH STREQUAL "master")
-                set(PROJECT_VERSION ${PROJECT_VERSION}-${GIT_DESCRIBE_VERSION})
-                MESSAGE("Sunshine Version: ${GIT_DESCRIBE_VERSION}")
-            endif()
-            if(GIT_IS_DIRTY)
-                set(PROJECT_VERSION ${PROJECT_VERSION}-dirty)
-                MESSAGE("Git tree is dirty!")
-            endif()
-        else()
-            MESSAGE(ERROR ": Got git error while fetching tags: ${GIT_DESCRIBE_ERROR_CODE}")
+        execute_process(
+                COMMAND ${GIT_EXECUTABLE} diff --cached --quiet --exit-code
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                RESULT_VARIABLE LUMEN_RELEASE_INDEX_DIRTY
+                ERROR_QUIET
+        )
+        if(LUMEN_RELEASE_WORKTREE_DIRTY OR LUMEN_RELEASE_INDEX_DIRTY)
+            message(FATAL_ERROR "Release identity requires a clean Git working tree.")
         endif()
-    else()
-        MESSAGE(WARNING ": Git not found, cannot find git version")
     endif()
+    set(PROJECT_VERSION "${LUMEN_VERSION}")
+    set(GITHUB_TAG "${LUMEN_REQUESTED_TAG}")
+elseif(LUMEN_REQUESTED_VERSION)
+    if(LUMEN_REQUESTED_VERSION STREQUAL LUMEN_VERSION)
+        message(FATAL_ERROR "Release-like BUILD_VERSION values require a matching TAG.")
+    endif()
+    if(NOT LUMEN_REQUESTED_VERSION MATCHES
+       "^${LUMEN_DEV_VERSION_PREFIX_REGEX}\\.(0|[1-9][0-9]*)(\\+g[0-9a-f]+)?$")
+        message(FATAL_ERROR
+            "Untagged BUILD_VERSION '${LUMEN_REQUESTED_VERSION}' must use ${LUMEN_DEV_VERSION_PREFIX}.N[+gCOMMIT].")
+    endif()
+    set(PROJECT_VERSION "${LUMEN_REQUESTED_VERSION}")
+else()
+    set(LUMEN_SHORT_COMMIT "unknown")
+    set(LUMEN_DIRTY_SUFFIX "")
+    if(GIT_EXECUTABLE)
+        execute_process(
+                COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                OUTPUT_VARIABLE LUMEN_SHORT_COMMIT
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+        )
+        execute_process(
+                COMMAND ${GIT_EXECUTABLE} status --porcelain
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                OUTPUT_VARIABLE LUMEN_GIT_STATUS
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+        )
+        if(LUMEN_GIT_STATUS)
+            set(LUMEN_DIRTY_SUFFIX ".dirty")
+        endif()
+    endif()
+    set(PROJECT_VERSION "${LUMEN_DEV_VERSION_PREFIX}.0+g${LUMEN_SHORT_COMMIT}${LUMEN_DIRTY_SUFFIX}")
 endif()
 
-# set date variables
-set(PROJECT_YEAR "1990")
-set(PROJECT_MONTH "01")
-set(PROJECT_DAY "01")
+set(BUILD_VERSION "${PROJECT_VERSION}")
+message(STATUS "Lumen branch: ${GITHUB_BRANCH}")
+message(STATUS "Lumen version: ${PROJECT_VERSION}")
 
-# Extract year, month, and day (do this AFTER version parsing)
-# Note: Cmake doesn't support "{}" regex syntax
-if(PROJECT_VERSION MATCHES "^([0-9][0-9][0-9][0-9])\\.([0-9][0-9][0-9][0-9]?)\\.([0-9]+)$")
-    message("Extracting year and month/day from PROJECT_VERSION: ${PROJECT_VERSION}")
-    # First capture group is the year
-    set(PROJECT_YEAR "${CMAKE_MATCH_1}")
-
-    # Second capture group contains month and day
-    set(MONTH_DAY "${CMAKE_MATCH_2}")
-
-    # Extract month (first 1-2 digits) and day (last 2 digits)
-    string(LENGTH "${MONTH_DAY}" MONTH_DAY_LENGTH)
-    if(MONTH_DAY_LENGTH EQUAL 3)
-        # Format: MDD (e.g., 703 = month 7, day 03)
-        string(SUBSTRING "${MONTH_DAY}" 0 1 PROJECT_MONTH)
-        string(SUBSTRING "${MONTH_DAY}" 1 2 PROJECT_DAY)
-    elseif(MONTH_DAY_LENGTH EQUAL 4)
-        # Format: MMDD (e.g., 1203 = month 12, day 03)
-        string(SUBSTRING "${MONTH_DAY}" 0 2 PROJECT_MONTH)
-        string(SUBSTRING "${MONTH_DAY}" 2 2 PROJECT_DAY)
-    endif()
-
-    # Ensure month is two digits
-    if(PROJECT_MONTH LESS 10 AND NOT PROJECT_MONTH MATCHES "^0")
-        set(PROJECT_MONTH "0${PROJECT_MONTH}")
-    endif()
-    # Ensure day is two digits
-    if(PROJECT_DAY LESS 10 AND NOT PROJECT_DAY MATCHES "^0")
-        set(PROJECT_DAY "0${PROJECT_DAY}")
-    endif()
-endif()
+# Package metadata uses the build date in UTC. CMake honors SOURCE_DATE_EPOCH
+# here, so reproducible release builds can pin this to the tagged commit time.
+string(TIMESTAMP PROJECT_YEAR "%Y" UTC)
+string(TIMESTAMP PROJECT_MONTH "%m" UTC)
+string(TIMESTAMP PROJECT_DAY "%d" UTC)
 
 # Parse PROJECT_VERSION to extract major, minor, and patch components
 if(PROJECT_VERSION MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+)")
@@ -120,12 +135,10 @@ if(PROJECT_VERSION MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+)")
     set(CMAKE_PROJECT_VERSION_PATCH "${CMAKE_MATCH_3}")
 endif()
 
-# Split PROJECT_VERSION_PATCH for RC file (Windows VERSIONINFO requires values <= 65535)
-# PROJECT_VERSION_PATCH can be 0-245959, so we split it into two parts:
-# - Last 2 digits for RC_VERSION_REVISION
-# - Leading digits for RC_VERSION_BUILD (0 if original is <= 99)
-math(EXPR RC_VERSION_BUILD "${PROJECT_VERSION_PATCH} / 100")
-math(EXPR RC_VERSION_REVISION "${PROJECT_VERSION_PATCH} % 100")
+# Windows VERSIONINFO uses major, minor, patch, revision. The SemVer patch is
+# already constrained to 65535, so preserve it exactly and reserve revision.
+set(RC_VERSION_BUILD "${PROJECT_VERSION_PATCH}")
+set(RC_VERSION_REVISION "0")
 
 message("PROJECT_FQDN: ${PROJECT_FQDN}")
 message("PROJECT_NAME: ${PROJECT_NAME}")
@@ -144,6 +157,7 @@ message("PROJECT_MONTH: ${PROJECT_MONTH}")
 message("PROJECT_DAY: ${PROJECT_DAY}")
 
 list(APPEND SUNSHINE_DEFINITIONS PROJECT_FQDN="${PROJECT_FQDN}")
+list(APPEND SUNSHINE_DEFINITIONS PROJECT_LEGACY_FQDN="${PROJECT_LEGACY_FQDN}")
 list(APPEND SUNSHINE_DEFINITIONS PROJECT_NAME="${PROJECT_NAME}")
 list(APPEND SUNSHINE_DEFINITIONS PROJECT_VERSION="${PROJECT_VERSION}")
 list(APPEND SUNSHINE_DEFINITIONS PROJECT_VERSION_MAJOR="${PROJECT_VERSION_MAJOR}")

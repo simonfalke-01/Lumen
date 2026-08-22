@@ -1,0 +1,244 @@
+---
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      release_commit: ${{ steps.release.outputs.release_commit }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Validate release policy
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          cmake \
+            -DRELEASE_TAG="$RELEASE_TAG" \
+            -P .github/scripts/validate-release-version.cmake
+
+          version=${RELEASE_TAG#v}
+          release_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          else
+            echo 'Stable releases are disabled until the workflow performs and verifies production app, MSI, and VHID signing.' >&2
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "$RELEASE_TAG")" != 'tag' ]]; then
+            echo "$RELEASE_TAG must be an annotated tag." >&2
+            exit 1
+          fi
+          if [[ "$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '.enabled')" != 'true' ]]; then
+            echo 'GitHub immutable releases must be enabled before publication.' >&2
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "release_commit=$release_commit"
+          } >> "$GITHUB_OUTPUT"
+
+  build_windows:
+    name: Build and validate Windows release
+    needs: validate
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+      source_ref: ${{ needs.validate.outputs.release_commit }}
+    permissions:
+      actions: read
+      contents: read
+
+  publish:
+    name: Attest and publish release
+    needs:
+      - validate
+      - build_windows
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      IS_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.release_commit }}
+    steps:
+      - name: Download Windows release artifacts
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
+        with:
+          name: Lumen-Windows-AMD64
+          path: release-assets
+
+      - name: Generate checksums and update manifest
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t binaries < <(
+            find release-assets -maxdepth 1 -type f \
+              \( -name '*.msi' -o -name '*.zip' \) -print | sort
+          )
+          if [[ ${#binaries[@]} -eq 0 ]]; then
+            echo 'No release binaries were downloaded.' >&2
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            sha256sum -- *.msi *.zip
+          ) > release-assets/SHA256SUMS
+
+          assets='[]'
+          for path in "${binaries[@]}"; do
+            name=$(basename "$path")
+            bytes=$(stat --format='%s' "$path")
+            sha256=$(sha256sum "$path" | cut -d ' ' -f 1)
+            url="https://github.com/${RELEASE_REPOSITORY}/releases/download/${RELEASE_TAG}/${name}"
+            assets=$(jq \
+              --arg name "$name" \
+              --argjson bytes "$bytes" \
+              --arg sha256 "$sha256" \
+              --arg url "$url" \
+              '. + [{name: $name, bytes: $bytes, sha256: $sha256, url: $url}]' \
+              <<< "$assets")
+          done
+
+          if [[ "$IS_PRERELEASE" == 'true' ]]; then
+            signing_status='self-signed-per-run'
+            security_warning='The application and MSI are unsigned. The optional Virtual HID driver uses a per-run self-signed certificate.'
+          fi
+
+          jq -n \
+            --arg product 'Lumen' \
+            --arg repository "$RELEASE_REPOSITORY" \
+            --arg version "$RELEASE_VERSION" \
+            --arg tag "$RELEASE_TAG" \
+            --arg channel "$([[ "$IS_PRERELEASE" == 'true' ]] && echo prerelease || echo stable)" \
+            --arg published_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --arg release_url "https://github.com/${RELEASE_REPOSITORY}/releases/tag/${RELEASE_TAG}" \
+            --arg signing_status "$signing_status" \
+            --arg security_warning "$security_warning" \
+            --argjson assets "$assets" \
+            '{
+              schema_version: 1,
+              product: $product,
+              repository: $repository,
+              version: $version,
+              tag: $tag,
+              channel: $channel,
+              published_at: $published_at,
+              release_url: $release_url,
+              security: {
+                application: "unsigned",
+                msi: "unsigned",
+                vhid_certificate: $signing_status,
+                warning: $security_warning
+              },
+              assets: $assets
+            }' > release-assets/update-manifest.json
+
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f  # v3.2.0
+        with:
+          subject-path: release-assets/*
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          generated_notes=$(gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" \
+            --jq '.body')
+
+          if [[ "$IS_PRERELEASE" == 'true' ]]; then
+            cat > release-notes.md <<'EOF'
+          > [!WARNING]
+          > This prerelease application and MSI are not code-signed. The optional Virtual HID driver uses a per-run self-signed certificate. Review the certificate warning before enabling it.
+
+          EOF
+          fi
+          printf '%s\n' "$generated_notes" >> release-notes.md
+
+          if [[ "$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '.enabled')" != 'true' ]]; then
+            echo 'GitHub immutable releases were disabled after validation.' >&2
+            exit 1
+          fi
+          ref_json=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")
+          ref_type=$(jq -r '.object.type' <<< "$ref_json")
+          ref_sha=$(jq -r '.object.sha' <<< "$ref_json")
+          if [[ "$ref_type" != 'tag' ]]; then
+            echo "$RELEASE_TAG is no longer an annotated tag." >&2
+            exit 1
+          fi
+          tag_json=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${ref_sha}")
+          tag_target_type=$(jq -r '.object.type' <<< "$tag_json")
+          tag_target_sha=$(jq -r '.object.sha' <<< "$tag_json")
+          if [[ "$tag_target_type" != 'commit' || "$tag_target_sha" != "$RELEASE_COMMIT" ]]; then
+            echo "$RELEASE_TAG moved after validation; refusing to publish stale artifacts." >&2
+            exit 1
+          fi
+
+          release_args=(
+            "$RELEASE_TAG"
+            release-assets/*
+            --draft
+            --verify-tag
+            --title "Lumen $RELEASE_VERSION"
+            --notes-file release-notes.md
+          )
+          if [[ "$IS_PRERELEASE" == 'true' ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "${release_args[@]}"
+
+          expected_assets=$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')
+          uploaded_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')
+          if [[ "$uploaded_assets" != "$expected_assets" ]]; then
+            echo "Draft release contains $uploaded_assets assets; expected $expected_assets." >&2
+            exit 1
+          fi
+
+          if [[ "$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '.enabled')" != 'true' ]]; then
+            echo 'GitHub immutable releases were disabled before publication.' >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false
+          if [[ "$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.immutable')" != 'true' ]]; then
+            echo 'Published GitHub release is not immutable.' >&2
+            exit 1
+          fi

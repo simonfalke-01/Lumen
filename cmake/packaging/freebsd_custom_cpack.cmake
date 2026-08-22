@@ -122,7 +122,7 @@ if(NOT _pack_result EQUAL 0)
 endif()
 
 # Find the generated package file (pkg create generates its own name based on manifest)
-file(GLOB _new_pkg_files "${_pkg_dir}/Sunshine-*.pkg")
+file(GLOB _new_pkg_files "${_pkg_dir}/Lumen-*.pkg")
 if(NOT _new_pkg_files)
     message(FATAL_ERROR "FreeBSD post-build: pkg-static create succeeded but no package file was generated")
 endif()

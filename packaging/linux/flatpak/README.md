@@ -1,22 +1,14 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/LizardByte/Sunshine/master/sunshine.png" />
-  <h1 align="center">Sunshine</h1>
+  <img src="../../../sunshine.png" alt="Inherited project icon" />
+  <h1 align="center">Lumen</h1>
   <h4 align="center">Self-hosted game stream host for Moonlight.</h4>
-</div>
-
-<div align="center">
-  <a href="https://flathub.org/apps/dev.lizardbyte.app.Sunshine"><img src="https://img.shields.io/flathub/downloads/dev.lizardbyte.app.Sunshine?style=for-the-badge&logo=flathub" alt="Flathub installs"></a>
-  <a href="https://flathub.org/apps/dev.lizardbyte.app.Sunshine"><img src="https://img.shields.io/flathub/v/dev.lizardbyte.app.Sunshine?style=for-the-badge&logo=flathub" alt="Flathub Version"></a>
 </div>
 
 ## ℹ️ About
 
-Sunshine is a self-hosted game stream host for Moonlight.
+Lumen is a self-hosted game stream host for Moonlight, based on Sunshine.
 
-LizardByte has the full documentation hosted on [Read the Docs](https://docs.lizardbyte.dev/projects/sunshine)
+This manifest builds the Lumen application ID `io.github.simonfalke.Lumen` from source. The fork does not currently
+publish a Flathub package; see the repository's [build documentation](../../../docs/building.md) for local use.
 
-* [Stable](https://docs.lizardbyte.dev/projects/sunshine/latest/)
-* [Beta](https://docs.lizardbyte.dev/projects/sunshine/master/)
-
-This repo is synced from the upstream [Sunshine](https://github.com/LizardByte/Sunshine) repo.
-Please report issues and contribute to the upstream repo.
+Report Lumen-specific issues at <https://github.com/simonfalke-01/Lumen/issues>.

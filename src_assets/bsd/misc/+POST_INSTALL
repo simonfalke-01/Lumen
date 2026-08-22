@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# FreeBSD post-install script for Sunshine
+# FreeBSD post-install script for Lumen
 # This script sets up the necessary permissions for virtual input devices
 
 echo "Configuring permissions for virtual input devices..."
@@ -8,8 +8,7 @@ echo "Configuring permissions for virtual input devices..."
 # Create the 'input' group if it doesn't exist
 if ! pw groupshow input >/dev/null 2>&1; then
   echo "Creating 'input' group..."
-  pw groupadd input
-  if [ $? -eq 0 ]; then
+  if pw groupadd input; then
     echo "Successfully created 'input' group."
   else
     echo "Warning: Failed to create 'input' group. You may need to create it manually."
@@ -31,13 +30,13 @@ fi
 # Create devfs rules for persistent permissions
 echo "Creating devfs rules for persistent permissions..."
 DEVFS_RULESET_FILE="/etc/devfs.rules"
-RULESET_NUM=47989
+RULESET_NUM=48371
 
 # Check if our rules already exist
-if ! grep -q "\[sunshine=$RULESET_NUM\]" "$DEVFS_RULESET_FILE" 2>/dev/null; then
+if ! grep -q "\[lumen=$RULESET_NUM\]" "$DEVFS_RULESET_FILE" 2>/dev/null; then
   cat >> "$DEVFS_RULESET_FILE" << EOF
 
-[sunshine=$RULESET_NUM]
+[lumen=$RULESET_NUM]
 add path 'uinput' mode 0660 group input
 EOF
   echo "Devfs rules added to $DEVFS_RULESET_FILE"

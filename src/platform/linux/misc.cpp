@@ -224,7 +224,7 @@ namespace platf {
     return fd;
 #else
   #ifndef __FreeBSD__
-    BOOST_LOG(info) << "Sunshine compiled without DRM support. Cannot control Linux DRM master state for "sv << path.string();
+    BOOST_LOG(info) << "Lumen was compiled without DRM support. Cannot control Linux DRM master state for "sv << path.string();
   #endif
     return open(path.c_str(), flags | O_CLOEXEC);
 #endif
@@ -267,54 +267,45 @@ namespace platf {
       // May be set if running under a systemd service with the ConfigurationDirectory= option set.
       if (std::string dir; lizardbyte::common::get_env("CONFIGURATION_DIRECTORY", dir) && !dir.empty()) {
         found = true;
-        config_path = fs::path(dir) / "sunshine"sv;
+        config_path = fs::path(dir) / "lumen"sv;
       }
       // Otherwise, follow the XDG base directory specification:
       // https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
       if (std::string dir; !found && lizardbyte::common::get_env("XDG_CONFIG_HOME", dir) && !dir.empty()) {
         found = true;
-        config_path = fs::path(dir) / "sunshine"sv;
+        config_path = fs::path(dir) / "lumen"sv;
       }
       // As a last resort, use the home directory
       if (!found) {
-        migrate_config = false;
-        config_path = homedir / ".config" / "sunshine";
+        config_path = homedir / ".config" / "lumen";
       }
 
-      // migrate from the old config location if necessary
-      if (std::string migrate_envvar; migrate_config && found && lizardbyte::common::get_env("SUNSHINE_MIGRATE_CONFIG", migrate_envvar) && migrate_envvar == "1") {
+      // LUMEN_MIGRATE_CONFIG is the primary control; SUNSHINE_MIGRATE_CONFIG remains a compatibility alias.
+      std::string migrate_envvar;
+      if (lizardbyte::common::get_env("LUMEN_MIGRATE_CONFIG", migrate_envvar) ||
+          lizardbyte::common::get_env("SUNSHINE_MIGRATE_CONFIG", migrate_envvar)) {
+        migrate_config = migrate_envvar == "1";
+      }
+
+      // Copy the legacy Sunshine configuration when Lumen has no configuration yet.
+      if (migrate_config) {
         std::error_code ec;
-        fs::path old_config_path = homedir / ".config" / "sunshine";
+        fs::path old_config_path;
+        if (found) {
+          old_config_path = config_path.parent_path() / "sunshine";
+        } else {
+          old_config_path = homedir / ".config" / "sunshine";
+        }
         if (old_config_path != config_path && fs::exists(old_config_path, ec)) {
           if (!fs::exists(config_path, ec)) {
-            std::cout << "Migrating config from "sv << old_config_path << " to "sv << config_path << std::endl;
-            if (!ec) {
-              // Create the new directory tree if it doesn't already exist
-              fs::create_directories(config_path, ec);
-            }
-            if (!ec) {
-              // Copy the old directory into the new location
-              // NB: We use a copy instead of a move so that cross-volume migrations work
-              fs::copy(old_config_path, config_path, fs::copy_options::recursive | fs::copy_options::copy_symlinks, ec);
-            }
-            if (!ec) {
-              // If the copy was successful, delete the original directory
-              fs::remove_all(old_config_path, ec);
-              if (ec) {
-                std::cerr << "Failed to clean up old config directory: " << ec.message() << std::endl;
-
-                // This is not fatal. Next time we start, we'll warn the user to delete the old one.
-                ec.clear();
-              }
-            }
-            if (ec) {
-              std::cerr << "Migration failed: " << ec.message() << std::endl;
-              config_path = old_config_path;
+            std::cout << "Copying legacy Sunshine config from "sv << old_config_path << " to "sv << config_path << std::endl;
+            std::string migration_error;
+            if (!config::copy_legacy_config_directory(old_config_path.string(), config_path.string(), migration_error)) {
+              std::cerr << "Legacy config copy failed: " << migration_error << std::endl;
             }
           } else {
             // We cannot use Boost logging because it hasn't been initialized yet!
-            std::cerr << "Config exists in both "sv << old_config_path << " and "sv << config_path << ". Using "sv << config_path << " for config" << std::endl;
-            std::cerr << "It is recommended to remove "sv << old_config_path << std::endl;
+            std::cerr << "Config exists in both "sv << old_config_path << " and "sv << config_path << ". Using "sv << config_path << " for Lumen config" << std::endl;
           }
         }
       }
@@ -1096,7 +1087,7 @@ namespace platf {
       return boost::asio::ip::host_name();
     } catch (boost::system::system_error &err) {
       BOOST_LOG(error) << "Failed to get hostname: "sv << err.what();
-      return "Sunshine"s;
+      return "Lumen"s;
     }
   }
 

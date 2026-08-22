@@ -57,13 +57,13 @@ endif()
 
 # Set WiX-specific variables
 set(CPACK_WIX_ROOT "${WIX_TOOL_PATH}")
-set(CPACK_WIX_UPGRADE_GUID "512A3D1B-BE16-401B-A0D1-59BBA3942FB8")
+set(CPACK_WIX_UPGRADE_GUID "89721553-C582-4D70-8BBF-1E6C5431C8D5")
 
 # Installer metadata
-set(CPACK_WIX_HELP_LINK "https://docs.lizardbyte.dev/projects/sunshine/latest/md_docs_2getting__started.html")
+set(CPACK_WIX_HELP_LINK "https://github.com/simonfalke-01/Lumen")
 set(CPACK_WIX_PRODUCT_ICON "${SUNSHINE_ICON_PATH}")
 set(CPACK_WIX_PRODUCT_URL "${CMAKE_PROJECT_HOMEPAGE_URL}")
-set(CPACK_WIX_PROGRAM_MENU_FOLDER "LizardByte")
+set(CPACK_WIX_PROGRAM_MENU_FOLDER "Lumen")
 # Force package files to replace existing files when switching between release
 # and PR builds, regardless of their embedded file versions.
 # https://learn.microsoft.com/en-us/windows/win32/msi/reinstallmode
@@ -86,7 +86,7 @@ set(CPACK_WIX_EXTRA_SOURCES
 set(CPACK_WIX_PATCH_FILE
         "${WIX_BUILD_PARENT_DIRECTORY}/patch.xml"
 )
-# CPack's default WiX template blocks downgrades. Sunshine users commonly switch
+# CPack's default WiX template blocks downgrades. Lumen users commonly switch
 # between release and PR builds, so allow any build to replace the installed one.
 # https://docs.firegiant.com/wix/schema/wxs/majorupgrade/#allowdowngrades
 set(CPACK_WIX_TEMPLATE

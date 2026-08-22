@@ -1,6 +1,6 @@
 /**
  * @file tools/sunshinesvc.cpp
- * @brief Handles launching Sunshine.exe into user sessions as SYSTEM
+ * @brief Handles launching Lumen.exe into user sessions as SYSTEM.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <format>
@@ -21,7 +21,21 @@ SERVICE_STATUS service_status;
 HANDLE stop_event;
 HANDLE session_change_event;
 
-constexpr auto SERVICE_NAME = "SunshineService";
+constexpr auto SERVICE_NAME = "LumenService";  ///< Stable Windows service name for Lumen.
+constexpr auto LUMEN_EXECUTABLE = L"Lumen.exe";  ///< Executable name published by current packages.
+
+/**
+ * @brief Resolve the Lumen host executable without crossing product identity.
+ *
+ * @return The relative executable name, or `nullptr` when the package is broken.
+ */
+const wchar_t *ResolveHostExecutable() {
+  if (GetFileAttributesW(LUMEN_EXECUTABLE) != INVALID_FILE_ATTRIBUTES) {
+    return LUMEN_EXECUTABLE;
+  }
+  OutputDebugStringW(L"LumenService: Lumen.exe is missing from the installation root.\n");
+  return nullptr;
+}
 
 DWORD WINAPI HandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext) {
   switch (dwControl) {
@@ -29,7 +43,7 @@ DWORD WINAPI HandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, L
       return NO_ERROR;
 
     case SERVICE_CONTROL_SESSIONCHANGE:
-      // If a new session connects to the console, restart Sunshine
+      // If a new session connects to the console, restart Lumen
       // to allow it to spawn inside the new console session.
       if (dwEventType == WTS_CONSOLE_CONNECT) {
         SetEvent(session_change_event);
@@ -62,12 +76,12 @@ HANDLE CreateJobObjectForChildProcess() {
 
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limit_info = {};
 
-  // Kill Sunshine.exe when the final job object handle is closed (which will happen if we terminate unexpectedly).
-  // This ensures we don't leave an orphaned Sunshine.exe running with an inherited handle to our log file.
+  // Kill Lumen.exe when the final job object handle is closed (which will happen if we terminate unexpectedly).
+  // This ensures we don't leave an orphaned Lumen.exe running with an inherited handle to our log file.
   job_limit_info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
-  // Allow Sunshine.exe to use CREATE_BREAKAWAY_FROM_JOB when spawning processes to ensure they can to live beyond
-  // the lifetime of SunshineSvc.exe. This avoids unexpected user data loss if we crash or are killed.
+  // Allow Lumen.exe to use CREATE_BREAKAWAY_FROM_JOB when spawning processes to ensure they can live beyond
+  // the lifetime of the service wrapper. This avoids unexpected user data loss if we crash or are killed.
   job_limit_info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;
 
   if (!SetInformationJobObject(job_handle, JobObjectExtendedLimitInformation, &job_limit_info, sizeof(job_limit_info))) {
@@ -122,9 +136,9 @@ HANDLE DuplicateTokenForSession(DWORD console_session_id) {
 HANDLE OpenLogFileHandle() {
   WCHAR log_file_name[MAX_PATH];
 
-  // Create sunshine.log in the Temp folder (usually %SYSTEMROOT%\Temp)
+  // Create lumen.log in the Temp folder (usually %SYSTEMROOT%\Temp)
   GetTempPathW(_countof(log_file_name), log_file_name);
-  wcscat_s(log_file_name, L"sunshine.log");
+  wcscat_s(log_file_name, L"lumen.log");
 
   // Preserve previous service output before opening the current log.
   logging::rotate_log_file(log_file_name);
@@ -132,7 +146,7 @@ HANDLE OpenLogFileHandle() {
   // The file handle must be inheritable for our child process to use it
   SECURITY_ATTRIBUTES security_attributes = {sizeof(security_attributes), nullptr, TRUE};
 
-  // Create the current sunshine.log
+  // Create the current lumen.log
   return CreateFileW(log_file_name, GENERIC_WRITE, FILE_SHARE_READ, &security_attributes, CREATE_ALWAYS, 0, nullptr);
 }
 
@@ -151,7 +165,7 @@ bool RunTerminationHelper(HANDLE console_token, DWORD pid) {
   startup_info.lpDesktop = (LPWSTR) L"winsta0\\default";
 
   // Execute ourselves as a detached process in the user session with the --terminate argument.
-  // This will allow us to attach to Sunshine's console and send it a Ctrl-C event.
+  // This will allow us to attach to Lumen's console and send it a Ctrl-C event.
   PROCESS_INFORMATION process_info;
   if (!CreateProcessAsUserW(console_token, module_path, (LPWSTR) command.c_str(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS, nullptr, nullptr, &startup_info, &process_info)) {
     return false;
@@ -238,7 +252,7 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     return;
   }
 
-  // Only allow Sunshine.exe to inherit the log file handle, not all inheritable handles
+  // Only allow Lumen.exe to inherit the log file handle, not all inheritable handles
   UpdateProcThreadAttribute(startup_info.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &log_file_handle, sizeof(log_file_handle), nullptr, nullptr);
 
   // Tell SCM we're running (and stoppable now)
@@ -246,7 +260,7 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   service_status.dwCurrentState = SERVICE_RUNNING;
   SetServiceStatus(service_status_handle, &service_status);
 
-  // Loop every 3 seconds until the stop event is set or Sunshine.exe is running
+  // Loop every 3 seconds until the stop event is set or Lumen.exe is running
   while (WaitForSingleObject(stop_event, 3000) != WAIT_OBJECT_0) {
     auto console_session_id = WTSGetActiveConsoleSessionId();
     if (console_session_id == 0xFFFFFFFF) {
@@ -266,30 +280,39 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
       continue;
     }
 
-    // Start Sunshine.exe inside our job object
+    // Start Lumen.exe inside our job object
     UpdateProcThreadAttribute(startup_info.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handle, sizeof(job_handle), nullptr, nullptr);
 
-    PROCESS_INFORMATION process_info;
-    if (!CreateProcessAsUserW(console_token, L"Sunshine.exe", nullptr, nullptr, nullptr, TRUE, CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, (LPSTARTUPINFOW) &startup_info, &process_info)) {
+    const auto host_executable = ResolveHostExecutable();
+    PROCESS_INFORMATION process_info {};
+    if (!host_executable || !CreateProcessAsUserW(console_token, host_executable, nullptr, nullptr, nullptr, TRUE, CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, (LPSTARTUPINFOW) &startup_info, &process_info)) {
+      const DWORD launch_error = host_executable ? GetLastError() : ERROR_FILE_NOT_FOUND;
+      const std::string message = std::format("LumenService failed to launch Lumen.exe (error {}).\r\n", launch_error);
+      DWORD written = 0;
+      WriteFile(log_file_handle, message.data(), static_cast<DWORD>(message.size()), &written, nullptr);
+      service_status.dwWin32ExitCode = launch_error;
+      service_status.dwCurrentState = SERVICE_STOPPED;
+      SetServiceStatus(service_status_handle, &service_status);
       CloseHandle(console_token);
       CloseHandle(job_handle);
-      continue;
+      SetEvent(stop_event);
+      break;
     }
 
     bool still_running;
     do {
-      // Wait for the stop event to be set, Sunshine.exe to terminate, or the console session to change
+      // Wait for the stop event to be set, Lumen.exe to terminate, or the console session to change
       const HANDLE wait_objects[] = {stop_event, process_info.hProcess, session_change_event};
       switch (WaitForMultipleObjects(_countof(wait_objects), wait_objects, FALSE, INFINITE)) {
         case WAIT_OBJECT_0 + 2:
           if (WTSGetActiveConsoleSessionId() == console_session_id) {
-            // The active console session didn't actually change. Let Sunshine keep running.
+            // The active console session didn't actually change. Let Lumen keep running.
             still_running = true;
             continue;
           }
-          // Fall-through to terminate Sunshine.exe and start it again.
+          // Fall-through to terminate Lumen.exe and start it again.
         case WAIT_OBJECT_0:
-          // The service is shutting down, so try to gracefully terminate Sunshine.exe.
+          // The service is shutting down, so try to gracefully terminate Lumen.exe.
           // If it doesn't terminate in 20 seconds, we will forcefully terminate it.
           if (!RunTerminationHelper(console_token, process_info.dwProcessId) || WaitForSingleObject(process_info.hProcess, 20000) != WAIT_OBJECT_0) {
             // If it won't terminate gracefully, kill it now
@@ -300,11 +323,11 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
 
         case WAIT_OBJECT_0 + 1:
           {
-            // Sunshine terminated itself.
+            // Lumen terminated itself.
 
             DWORD exit_code;
             if (GetExitCodeProcess(process_info.hProcess, &exit_code) && exit_code == ERROR_SHUTDOWN_IN_PROGRESS) {
-              // Sunshine is asking for us to shut down, so gracefully stop ourselves.
+              // Lumen is asking for us to shut down, so gracefully stop ourselves.
               SetEvent(stop_event);
             }
             still_running = false;
@@ -326,7 +349,7 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
 
 // This will run in a child process in the user session
 int DoGracefulTermination(DWORD pid) {
-  // Attach to Sunshine's console
+  // Attach to Lumen's console
   if (!AttachConsole(pid)) {
     return GetLastError();
   }
@@ -334,7 +357,7 @@ int DoGracefulTermination(DWORD pid) {
   // Disable our own Ctrl-C handling
   SetConsoleCtrlHandler(nullptr, TRUE);
 
-  // Send a Ctrl-C event to Sunshine
+  // Send a Ctrl-C event to Lumen
   if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)) {
     return GetLastError();
   }
@@ -348,13 +371,13 @@ int main(int argc, char *argv[]) {
     {nullptr, nullptr}
   };
 
-  // Check if this is a reinvocation of ourselves to send Ctrl-C to Sunshine.exe
+  // Check if this is a reinvocation of ourselves to send Ctrl-C to Lumen.exe
   if (argc == 3 && strcmp(argv[1], "--terminate") == 0) {
     return DoGracefulTermination(atol(argv[2]));
   }
 
   // By default, services have their current directory set to %SYSTEMROOT%\System32.
-  // We want to use the directory where Sunshine.exe is located instead of system32.
+  // We want to use the directory where Lumen.exe is located instead of system32.
   // This requires stripping off 2 path components: the file name and the last folder
   WCHAR module_path[MAX_PATH];
   GetModuleFileNameW(nullptr, module_path, _countof(module_path));

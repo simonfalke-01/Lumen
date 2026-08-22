@@ -1256,7 +1256,7 @@ namespace platf {
    */
   platform_caps::caps_t get_capabilities();
 
-  constexpr auto SERVICE_NAME = "Sunshine";  ///< mDNS service instance name advertised for GameStream discovery.
+  constexpr auto SERVICE_NAME = "Lumen";  ///< mDNS service instance name advertised for GameStream discovery.
   constexpr auto SERVICE_TYPE = "_nvstream._tcp";  ///< mDNS service type advertised for GameStream discovery.
 
   namespace publish {

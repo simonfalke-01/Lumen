@@ -1,6 +1,6 @@
 /**
  * @file src/config.h
- * @brief Declarations for the configuration of Sunshine.
+ * @brief Declarations for the configuration of Lumen.
  */
 #pragma once
 
@@ -257,9 +257,9 @@ namespace config {
     std::string pkey;  ///< Private key PEM string or path.
     std::string cert;  ///< Certificate PEM string or path.
 
-    std::string sunshine_name;  ///< Host name advertised to Moonlight clients.
+    std::string sunshine_name;  ///< Host name advertised to Moonlight clients; retained for source compatibility.
 
-    std::string file_state;  ///< Path to the persisted Sunshine state file.
+    std::string file_state;  ///< Path to the persisted Lumen state file.
 
     std::string external_ip;  ///< External address advertised to clients when configured.
   };
@@ -340,10 +340,10 @@ namespace config {
   };
 
   /**
-   * @brief Top-level Sunshine configuration and credential state.
+   * @brief Top-level Lumen configuration and credential state.
    */
   struct sunshine_t {
-    std::string locale;  ///< Locale selected for Sunshine UI and log messages.
+    std::string locale;  ///< Locale selected for Lumen UI and log messages.
     int min_log_level;  ///< Minimum severity level written to the configured log sink.
     std::bitset<flag::FLAG_SIZE> flags;  ///< Runtime flags parsed from command-line options.
     std::string credentials_file;  ///< Path to the stored pairing credentials file.
@@ -352,7 +352,7 @@ namespace config {
     std::string password;  ///< Password hash or secret for the local Web UI account.
     std::string salt;  ///< Salt used when hashing the Web UI password.
 
-    std::string config_file;  ///< Path to the active Sunshine configuration file.
+    std::string config_file;  ///< Path to the active Lumen configuration file.
 
     /**
      * @brief Command-line options parsed before configuration loading.
@@ -363,9 +363,9 @@ namespace config {
       char **argv;  ///< Command-line argument vector.
     } cmd;  ///< Command line used to launch the application.
 
-    std::uint16_t port;  ///< TCP port used by Sunshine services.
+    std::uint16_t port;  ///< TCP port used by Lumen services.
     std::string address_family;  ///< Address family requested for listening sockets.
-    std::string bind_address;  ///< Local address Sunshine should bind to.
+    std::string bind_address;  ///< Local address Lumen should bind to.
 
     std::string log_file;  ///< Path to the configured log file.
     bool notify_pre_releases;  ///< Notify users about pre-release updates.
@@ -393,10 +393,36 @@ namespace config {
    */
   int parse(int argc, char *argv[]);
   /**
-   * @brief Parse Sunshine configuration text into key-value entries.
+   * @brief Parse Lumen configuration text into key-value entries.
    *
    * @param file_content Raw configuration file contents to parse.
    * @return Parsed configuration key-value entries.
    */
   std::unordered_map<std::string, std::string> parse_config(const std::string_view &file_content);
+
+  /**
+   * @brief Select or copy a legacy Sunshine configuration for Lumen startup.
+   *
+   * @param config_file Path to the canonical configuration file; never
+   * redirected into the legacy Sunshine directory.
+   * @param custom_config_file Whether the user supplied the path explicitly.
+   */
+  void migrate_legacy_config_file(std::string &config_file, bool custom_config_file);
+
+  /**
+   * @brief Safely copy a legacy configuration tree into a new Lumen directory.
+   *
+   * The copy refuses symlinks, reserves a private staging directory, and
+   * atomically publishes the completed tree without modifying the source.
+   *
+   * @param legacy_directory Legacy Sunshine directory to read.
+   * @param lumen_directory Canonical Lumen directory to create.
+   * @param error_message Receives a diagnostic when the copy is rejected.
+   * @return `true` only when the complete tree is published.
+   */
+  bool copy_legacy_config_directory(
+    const std::string &legacy_directory,
+    const std::string &lumen_directory,
+    std::string &error_message
+  );
 }  // namespace config

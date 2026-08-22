@@ -292,7 +292,7 @@ namespace pipewire {
         struct pw_properties *props = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "Screen", nullptr);
 
         BOOST_LOG(debug) << "[pipewire] Create PW stream"sv;
-        stream_data.stream = pw_stream_new(core, "Sunshine Video Capture", props);
+        stream_data.stream = pw_stream_new(core, "Lumen Video Capture", props);
         pw_stream_add_listener(stream_data.stream, &stream_data.stream_listener, &stream_events, &stream_data);
 
         std::array<uint8_t, SPA_POD_BUFFER_SIZE> buffer;

@@ -10,8 +10,8 @@
 
 namespace {
 
-  const auto sunshine_application_profile_name = L"SunshineStream";
-  const auto sunshine_application_path = L"sunshine.exe";
+  const auto lumen_application_profile_name = L"LumenStream";
+  const auto lumen_application_path = L"Lumen.exe";
 
   void nvapi_error_message(NvAPI_Status status) {
     NvAPI_ShortString message = {};
@@ -222,7 +222,7 @@ namespace nvprefs {
     NvAPI_Status status;
 
     NvAPI_UnicodeString profile_name = {};
-    fill_nvapi_string(profile_name, sunshine_application_profile_name);
+    fill_nvapi_string(profile_name, lumen_application_profile_name);
 
     NvDRSProfileHandle profile_handle = nullptr;
     status = NvAPI_DRS_FindProfileByName(session_handle, profile_name, &profile_handle);
@@ -231,7 +231,7 @@ namespace nvprefs {
       // Create application profile if missing
       NVDRS_PROFILE profile = {};
       profile.version = NVDRS_PROFILE_VER1;
-      fill_nvapi_string(profile.profileName, sunshine_application_profile_name);
+      fill_nvapi_string(profile.profileName, lumen_application_profile_name);
       status = NvAPI_DRS_CreateProfile(session_handle, &profile, &profile_handle);
       if (status != NVAPI_OK) {
         nvapi_error_message(status);
@@ -241,19 +241,19 @@ namespace nvprefs {
       modified = true;
     }
 
-    NvAPI_UnicodeString sunshine_path = {};
-    fill_nvapi_string(sunshine_path, sunshine_application_path);
+    NvAPI_UnicodeString lumen_path = {};
+    fill_nvapi_string(lumen_path, lumen_application_path);
 
     NVDRS_APPLICATION application = {};
     application.version = NVDRS_APPLICATION_VER_V1;
-    status = NvAPI_DRS_GetApplicationInfo(session_handle, profile_handle, sunshine_path, &application);
+    status = NvAPI_DRS_GetApplicationInfo(session_handle, profile_handle, lumen_path, &application);
 
     if (status != NVAPI_OK) {
       // Add application to application profile if missing
       application.version = NVDRS_APPLICATION_VER_V1;
       application.isPredefined = 0;
-      fill_nvapi_string(application.appName, sunshine_application_path);
-      fill_nvapi_string(application.userFriendlyName, sunshine_application_path);
+      fill_nvapi_string(application.appName, lumen_application_path);
+      fill_nvapi_string(application.userFriendlyName, lumen_application_path);
       fill_nvapi_string(application.launcher, L"");
 
       status = NvAPI_DRS_CreateApplication(session_handle, profile_handle, &application);
@@ -271,7 +271,7 @@ namespace nvprefs {
 
     if (!get_nvprefs_options().sunshine_high_power_mode) {
       if (status == NVAPI_OK && setting.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION) {
-        // User requested to not use high power mode for sunshine.exe,
+        // User requested to not use high power mode for Lumen.exe,
         // remove the setting from application profile if it's been set previously
 
         status = NvAPI_DRS_DeleteProfileSetting(session_handle, profile_handle, PREFERRED_PSTATE_ID);
@@ -282,7 +282,7 @@ namespace nvprefs {
         }
         modified = true;
 
-        info_message(std::wstring(L"Removed PREFERRED_PSTATE for ") + sunshine_application_path);
+        info_message(std::wstring(L"Removed PREFERRED_PSTATE for ") + lumen_application_path);
       }
     } else if (status != NVAPI_OK || setting.settingLocation != NVDRS_CURRENT_PROFILE_LOCATION || setting.u32CurrentValue != PREFERRED_PSTATE_PREFER_MAX) {
       // Set power setting if needed
@@ -301,7 +301,7 @@ namespace nvprefs {
       }
       modified = true;
 
-      info_message(std::wstring(L"Changed PREFERRED_PSTATE to PREFERRED_PSTATE_PREFER_MAX for ") + sunshine_application_path);
+      info_message(std::wstring(L"Changed PREFERRED_PSTATE to PREFERRED_PSTATE_PREFER_MAX for ") + lumen_application_path);
     }
 
     return true;

@@ -71,22 +71,19 @@ namespace {
   #endif
 
   /**
-   * @brief Verify the persistent menu exposed by Sunshine.
+   * @brief Verify the persistent menu exposed by Lumen.
    */
   void verify_menu() {
     const auto &tray_data = system_tray::tray_data_for_testing();
     ASSERT_NE(tray_data.menu, nullptr);
 
-    EXPECT_STREQ(tray_data.menu[0].text, "Open Sunshine");
+    EXPECT_STREQ(tray_data.menu[0].text, "Open Lumen");
     EXPECT_NE(tray_data.menu[0].cb, nullptr);
     EXPECT_STREQ(tray_data.menu[1].text, "-");
     EXPECT_EQ(tray_data.menu[1].cb, nullptr);
-    EXPECT_STREQ(tray_data.menu[2].text, "Donate");
-    ASSERT_NE(tray_data.menu[2].submenu, nullptr);
-    EXPECT_STREQ(tray_data.menu[2].submenu[0].text, "GitHub Sponsors");
-    EXPECT_STREQ(tray_data.menu[2].submenu[1].text, "Patreon");
-    EXPECT_STREQ(tray_data.menu[2].submenu[2].text, "PayPal");
-    EXPECT_EQ(tray_data.menu[2].submenu[3].text, nullptr);
+    EXPECT_STREQ(tray_data.menu[2].text, "Lumen on GitHub");
+    EXPECT_NE(tray_data.menu[2].cb, nullptr);
+    EXPECT_EQ(tray_data.menu[2].submenu, nullptr);
     EXPECT_STREQ(tray_data.menu[3].text, "-");
 
   #ifdef _WIN32

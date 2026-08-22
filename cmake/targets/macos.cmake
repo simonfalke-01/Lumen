@@ -10,8 +10,8 @@ else()
             MACOSX_BUNDLE_GUI_IDENTIFIER "${PROJECT_FQDN}"
             MACOSX_BUNDLE_INFO_PLIST "${APPLE_PLIST_FILE}"
             MACOSX_BUNDLE_ICON_FILE "sunshine.icns"
-            MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-            MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}")
+            MACOSX_BUNDLE_SHORT_VERSION_STRING "${LUMEN_VERSION_CORE}"
+            MACOSX_BUNDLE_BUNDLE_VERSION "${LUMEN_VERSION_CORE}")
 
     # Populate bundle resources in the build tree for local runs.
     set(_bundle_resources_dir "$<TARGET_FILE_DIR:sunshine>/../Resources")
@@ -19,6 +19,9 @@ else()
             COMMENT "Copying bundle resources to build tree"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${_bundle_resources_dir}"
             COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_BINARY_DIR}/assets" "${_bundle_resources_dir}/assets"
+            COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                    "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/assets"
+                    "${_bundle_resources_dir}/assets"
             VERBATIM)
 endif()
 

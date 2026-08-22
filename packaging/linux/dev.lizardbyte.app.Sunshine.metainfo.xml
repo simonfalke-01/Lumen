@@ -16,41 +16,32 @@
   </supports>
 
   <url type="homepage">@PROJECT_HOMEPAGE_URL@</url>
-  <url type="bugtracker">https://github.com/LizardByte/Sunshine/issues</url>
-  <url type="faq">https://docs.lizardbyte.dev/projects/sunshine/latest/md_docs_2troubleshooting.html</url>
-  <url type="help">https://docs.lizardbyte.dev/projects/sunshine</url>
-  <url type="donation">https://app.lizardbyte.dev/#Donate</url>
-  <url type="translate">https://translate.lizardbyte.dev</url>
-  <url type="contact">https://app.lizardbyte.dev/support</url>
+  <url type="bugtracker">https://github.com/simonfalke-01/Lumen/issues</url>
+  <url type="help">https://github.com/simonfalke-01/Lumen</url>
+  <url type="contact">https://github.com/simonfalke-01/Lumen/issues</url>
 
   <description>
     <p>@PROJECT_LONG_DESCRIPTION@</p>
 
-    <p>NOTE: Sunshine requires additional installation steps on Flatpak.</p>
+    <p>NOTE: Lumen requires additional installation steps on Flatpak.</p>
     <p>
       <code>flatpak run --command=additional-install.sh @PROJECT_FQDN@</code>
     </p>
-    <p>NOTE: Sunshine uses a self-signed certificate. The web browser will report it as not secure, but it is safe.</p>
+    <p>NOTE: Lumen uses a self-signed certificate for its local web interface.</p>
   </description>
 
   <releases>
     <release version="@PROJECT_VERSION@" date="@PROJECT_YEAR@-@PROJECT_MONTH@-@PROJECT_DAY@">
-      <url>https://github.com/LizardByte/Sunshine/releases/tag/v@PROJECT_VERSION@</url>
+      <url>https://github.com/simonfalke-01/Lumen/releases/tag/v@PROJECT_VERSION@</url>
       <description>
         <p>See the changelog on GitHub</p>
       </description>
     </release>
   </releases>
 
-  <developer id="dev.lizardbyte">
-    <name>LizardByte</name>
+  <developer id="io.github.simonfalke">
+    <name>simonfalke</name>
   </developer>
-  <screenshots>
-    <screenshot type="default">
-      <image>https://app.lizardbyte.dev/Sunshine/assets/img/screenshots/01-sunshine-welcome-page.png</image>
-      <caption>Sunshine welcome page</caption>
-    </screenshot>
-  </screenshots>
   <content_rating type="oars-1.0">
     <content_attribute id="language-profanity">moderate</content_attribute>
     <content_attribute id="language-humor">mild</content_attribute>

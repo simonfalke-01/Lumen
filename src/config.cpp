@@ -1,9 +1,10 @@
 /**
  * @file src/config.cpp
- * @brief Definitions for the configuration of Sunshine.
+ * @brief Definitions for the configuration of Lumen.
  */
 // standard includes
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -46,7 +47,7 @@
 namespace fs = std::filesystem;
 using namespace std::literals;
 
-constexpr auto CA_DIR = "credentials";  ///< Subdirectory under app data that stores Sunshine credentials.
+constexpr auto CA_DIR = "credentials";  ///< Subdirectory under app data that stores Lumen credentials.
 const std::string PRIVATE_KEY_FILE = std::string(CA_DIR) + "/cakey.pem";  ///< Relative path to the persisted private key PEM file.
 const std::string CERTIFICATE_FILE = std::string(CA_DIR) + "/cacert.pem";  ///< Relative path to the persisted certificate PEM file.
 const std::string APPS_JSON_PATH = platf::appdata().string() + "/apps.json";  ///< Default path to the applications JSON file.
@@ -863,7 +864,7 @@ namespace config {
   };
 
   /**
-   * @brief Default top-level Sunshine configuration values used before file and CLI overrides.
+   * @brief Default top-level Lumen configuration values used before file and CLI overrides.
    */
   sunshine_t sunshine {
     "en",  // locale
@@ -873,12 +874,12 @@ namespace config {
     {},  // Username
     {},  // Password
     {},  // Password Salt
-    platf::appdata().string() + "/sunshine.conf",  // config file
+    platf::appdata().string() + "/lumen.conf",  // config file
     {},  // cmd args
     47989,  // Base port number
     "ipv4",  // Address family
     {},  // Bind address
-    platf::appdata().string() + "/sunshine.log",  // log file
+    platf::appdata().string() + "/lumen.log",  // log file
     false,  // notify_pre_releases
     true,  // system_tray
     {},  // prep commands
@@ -1009,7 +1010,7 @@ namespace config {
   }
 
   /**
-   * @brief Parse Sunshine configuration text into key-value entries.
+   * @brief Parse Lumen configuration text into key-value entries.
    */
   std::unordered_map<std::string, std::string> parse_config(const std::string_view &file_content) {
     std::unordered_map<std::string, std::string> vars;
@@ -1691,6 +1692,8 @@ namespace config {
 
     path_f(vars, "pkey", nvhttp.pkey);
     path_f(vars, "cert", nvhttp.cert);
+    // Retain the established config key so existing configurations continue
+    // to work without a schema or Web UI migration.
     string_f(vars, "sunshine_name", nvhttp.sunshine_name);
     path_f(vars, "log_path", config::sunshine.log_file);
     path_f(vars, "file_state", nvhttp.file_state);
@@ -1731,7 +1734,7 @@ namespace config {
       }
     }
     if (csrf_invalid_config) {
-      BOOST_LOG(warning) << "Please refer to: https://docs.lizardbyte.dev/projects/sunshine/latest/md_docs_2configuration.html#csrf_allowed_origins"sv;
+      BOOST_LOG(warning) << "Please refer to: https://github.com/simonfalke-01/Lumen/blob/master/docs/configuration.md#csrf_allowed_origins"sv;
     }
 
     int to = -1;
@@ -1896,11 +1899,103 @@ namespace config {
     }
   }
 
+  void migrate_legacy_config_file(std::string &config_file, bool custom_config_file) {
+    if (custom_config_file || fs::exists(config_file) || fs::path {config_file}.filename() != "lumen.conf"sv) {
+      return;
+    }
+
+    const auto legacy_config_file = fs::path {config_file}.parent_path() / "sunshine.conf";
+    std::error_code ec;
+    if (!fs::exists(legacy_config_file, ec)) {
+      return;
+    }
+
+    if (fs::path {config_file}.parent_path().filename() == "sunshine"sv) {
+      // Never write canonical Lumen state into an upstream-owned directory.
+      return;
+    }
+
+    fs::copy_file(legacy_config_file, config_file, fs::copy_options::none, ec);
+    if (ec) {
+      std::cerr << "Failed to copy legacy Sunshine config to " << config_file << ": " << ec.message() << std::endl;
+    } else {
+      std::cout << "Copied legacy Sunshine config to " << config_file << std::endl;
+    }
+  }
+
+  bool copy_legacy_config_directory(
+    const std::string &legacy_directory,
+    const std::string &lumen_directory,
+    std::string &error_message
+  ) {
+    const fs::path source {legacy_directory};
+    const fs::path destination {lumen_directory};
+    std::error_code ec;
+    if (!fs::is_directory(source, ec) || ec) {
+      error_message = ec ? ec.message() : "legacy source is not a directory";
+      return false;
+    }
+    if (fs::exists(destination, ec) || ec) {
+      error_message = ec ? ec.message() : "canonical destination already exists";
+      return false;
+    }
+
+    const auto source_status = fs::symlink_status(source, ec);
+    if (ec || fs::is_symlink(source_status)) {
+      error_message = ec ? ec.message() : "legacy source is a symlink";
+      return false;
+    }
+    for (fs::recursive_directory_iterator iterator {source, ec}, end; iterator != end && !ec; iterator.increment(ec)) {
+      const auto status = iterator->symlink_status(ec);
+      if (ec || fs::is_symlink(status)) {
+        error_message = ec ? ec.message() : "legacy source contains a symlink";
+        return false;
+      }
+    }
+    if (ec) {
+      error_message = ec.message();
+      return false;
+    }
+
+    fs::create_directories(destination.parent_path(), ec);
+    if (ec) {
+      error_message = ec.message();
+      return false;
+    }
+    auto staging = destination;
+    staging += ".migration-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (!fs::create_directory(staging, ec) || ec) {
+      error_message = ec ? ec.message() : "migration staging path already exists";
+      return false;
+    }
+
+    for (fs::directory_iterator iterator {source, ec}, end; iterator != end && !ec; iterator.increment(ec)) {
+      fs::copy(
+        iterator->path(),
+        staging / iterator->path().filename(),
+        fs::copy_options::recursive | fs::copy_options::skip_symlinks,
+        ec
+      );
+    }
+    if (!ec) {
+      fs::rename(staging, destination, ec);
+    }
+    if (ec) {
+      error_message = ec.message();
+      std::error_code cleanup_ec;
+      fs::remove_all(staging, cleanup_ec);
+      return false;
+    }
+    error_message.clear();
+    return true;
+  }
+
   /**
    * @brief Parse serialized text into the corresponding runtime representation.
    */
   int parse(int argc, char *argv[]) {
     std::unordered_map<std::string, std::string> cmd_vars;
+    bool custom_config_file = false;
 #ifdef _WIN32
     bool shortcut_launch = false;
     bool service_admin_launch = false;
@@ -1938,6 +2033,7 @@ namespace config {
         auto pos = std::find(line, line_end, '=');
         if (pos == line_end) {
           sunshine.config_file = line;
+          custom_config_file = true;
         } else {
           TUPLE_EL(var, 1, parse_option(line, line_end));
           if (!var) {
@@ -1961,6 +2057,10 @@ namespace config {
     try {
       // Create appdata folder if it does not exist
       file_handler::make_directory(platf::appdata().string());
+
+      // A copied legacy directory contains sunshine.conf. Seed the new canonical
+      // filename from it without modifying or deleting the legacy file.
+      migrate_legacy_config_file(sunshine.config_file, custom_config_file);
 
       // Create empty config file if it does not exist
       if (!fs::exists(sunshine.config_file)) {
@@ -1991,7 +2091,7 @@ namespace config {
     // so that service instance will do the work instead.
 
     if (!config_loaded && !shortcut_launch) {
-      BOOST_LOG(fatal) << "To relaunch Sunshine successfully, use the shortcut in the Start Menu. Do not run Sunshine.exe manually."sv;
+      BOOST_LOG(fatal) << "To relaunch Lumen successfully, use the shortcut in the Start Menu. Do not run the executable manually."sv;
       std::this_thread::sleep_for(10s);
 #else
     if (!config_loaded) {

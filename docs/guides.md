@@ -1,15 +1,13 @@
 # Guides
 
-@admonition{Community | A collection of guides written by the community is available on our
-[blog](https://app.lizardbyte.dev/blog).
-Feel free to contribute your own tips and trips by making a PR to
-[LizardByte.github.io](https://github.com/LizardByte/LizardByte.github.io).}
+@admonition{Community | Share Lumen guides and tips in
+[GitHub Discussions](https://github.com/simonfalke-01/Lumen/discussions).}
 
 <div class="section_buttons">
 
 | Previous                                |                                        Next |
 |:----------------------------------------|--------------------------------------------:|
-| [Awesome-Sunshine](awesome_sunshine.md) | [Performance Tuning](performance_tuning.md) |
+| [Awesome Sunshine](awesome_sunshine.md) | [Performance Tuning](performance_tuning.md) |
 
 </div>
 

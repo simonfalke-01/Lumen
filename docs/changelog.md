@@ -1,12 +1,6 @@
 # Changelog
 
-@htmlonly
-<script type="module" src="https://md-block.verou.me/md-block.js"></script>
-<md-block
-  hmin="2"
-  src="https://raw.githubusercontent.com/LizardByte/Sunshine/changelog/CHANGELOG.md">
-</md-block>
-@endhtmlonly
+Release notes are published with each [Lumen release](https://github.com/simonfalke-01/Lumen/releases).
 
 <div class="section_buttons">
 

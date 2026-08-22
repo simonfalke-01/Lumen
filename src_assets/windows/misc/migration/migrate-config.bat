@@ -1,6 +1,7 @@
 @echo off
 
-rem Get sunshine root directory
+rem Get Lumen root directory. sunshine.conf is accepted only as a legacy
+rem compatibility input and is moved to the canonical lumen.conf name.
 for %%I in ("%~dp0\..") do set "OLD_DIR=%%~fI"
 
 rem Create the config directory if it didn't already exist
@@ -15,12 +16,26 @@ if exist "%OLD_DIR%\apps.json" (
         icacls "%NEW_DIR%\apps.json" /reset
     )
 )
-if exist "%OLD_DIR%\sunshine.conf" (
-    if not exist "%NEW_DIR%\sunshine.conf" (
-        move "%OLD_DIR%\sunshine.conf" "%NEW_DIR%\sunshine.conf"
-        icacls "%NEW_DIR%\sunshine.conf" /reset
+if exist "%OLD_DIR%\lumen.conf" (
+    if not exist "%NEW_DIR%\lumen.conf" (
+        move "%OLD_DIR%\lumen.conf" "%NEW_DIR%\lumen.conf"
+        icacls "%NEW_DIR%\lumen.conf" /reset
     )
 )
+if exist "%OLD_DIR%\sunshine.conf" (
+    if not exist "%NEW_DIR%\lumen.conf" (
+        move "%OLD_DIR%\sunshine.conf" "%NEW_DIR%\lumen.conf"
+        icacls "%NEW_DIR%\lumen.conf" /reset
+    )
+)
+if exist "%NEW_DIR%\sunshine.conf" (
+    if not exist "%NEW_DIR%\lumen.conf" (
+        move "%NEW_DIR%\sunshine.conf" "%NEW_DIR%\lumen.conf"
+        icacls "%NEW_DIR%\lumen.conf" /reset
+    )
+)
+rem sunshine_state.json remains a compatibility filename so existing pairing
+rem identity is preserved during migration.
 if exist "%OLD_DIR%\sunshine_state.json" (
     if not exist "%NEW_DIR%\sunshine_state.json" (
         move "%OLD_DIR%\sunshine_state.json" "%NEW_DIR%\sunshine_state.json"

@@ -565,7 +565,10 @@
   import Navbar from './Navbar.vue'
   import Checkbox from './Checkbox.vue'
   import { apiFetch } from './fetch_utils'
-  import SunshineVersion from './sunshine_version'
+  import LumenVersion, {
+    fetchLumenReleases,
+    selectLatestRelease
+  } from './sunshine_version'
   import { Modal } from 'bootstrap/dist/js/bootstrap'
   import {
     ArrowDown,
@@ -717,12 +720,15 @@
         .then(r => r.json())
         .then(r => {
           this.platform = r.platform;
-          this.version = new SunshineVersion(null, r.version);
-        });
+          this.version = new LumenVersion(null, r.version);
+        })
+        .catch((e) => console.error("Failed to load configuration:", e));
 
-      fetch("https://api.github.com/repos/LizardByte/Sunshine/releases/latest")
-        .then((r) => r.json())
-        .then((r) => this.githubVersion = new SunshineVersion(r, null))
+      fetchLumenReleases()
+        .then((releases) => selectLatestRelease(releases))
+        .then((release) => {
+          this.githubVersion = release ? new LumenVersion(release, null) : null;
+        })
         .catch((e) => console.error(e));
     },
     methods: {

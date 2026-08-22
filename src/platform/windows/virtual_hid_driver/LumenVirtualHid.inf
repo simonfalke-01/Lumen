@@ -5,7 +5,7 @@ Signature = "$WINDOWS NT$"
 Class = SoftwareComponent
 ClassGuid = {5c4c3332-344d-483c-8739-259e934c9cc8}
 Provider = %LumenProvider%
-DriverVer = 08/12/2026,1.0.0.0
+DriverVer = 08/22/2026,0.1.0.0
 CatalogFile = LumenVirtualHid.cat
 PnpLockdown = 1
 
@@ -59,6 +59,6 @@ ServiceBinary = "%13%\LumenVirtualHid.dll"
 LumenVirtualHid.dll
 
 [Strings]
-LumenProvider = "LizardByte"
+LumenProvider = "simonfalke"
 InstallationMedia = "Lumen Virtual HID installation media"
 LumenVirtualHid.DeviceDesc = "Lumen Virtual HID Input Source"

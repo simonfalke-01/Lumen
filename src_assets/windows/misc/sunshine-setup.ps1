@@ -1,6 +1,6 @@
-﻿# Sunshine Setup Script
-# This script orchestrates the installation and uninstallation of Sunshine
-# Usage: sunshine-setup.ps1 -Action <operation> -ProductCode <guid> -TransactionKind <install|uninstall>
+﻿# Lumen Setup Script
+# This script orchestrates the installation and uninstallation of Lumen.
+# The source filename is retained only for build compatibility; packages install it as lumen-setup.ps1.
 
 param(
     [Parameter(Mandatory=$false)]
@@ -31,7 +31,7 @@ param(
 )
 
 # Constants
-$DocsUrl = "https://docs.lizardbyte.dev/projects/sunshine"
+$DocsUrl = "https://github.com/simonfalke-01/Lumen"
 $virtualHidCertificateSubject = "CN=Lumen Virtual HID Driver"
 
 # Set preference variables for output streams
@@ -221,11 +221,11 @@ function Write-LogFile {
 # If Action is not provided, prompt the user
 if (-not $Action) {
     Write-Information ""
-    Write-FramedText -Message "🔅 Sunshine Setup Script" -Level "Information" -Color "Cyan"
+    Write-FramedText -Message "🔅 Lumen Setup Script" -Level "Information" -Color "Cyan"
     Write-Information ""
     Write-LogMessage -Message "Please select an action:" -Level "Information" -Color "Yellow"
-    Write-LogMessage -Message "  1. Install Sunshine" -Level "Information" -Color "Green"
-    Write-LogMessage -Message "  2. Uninstall Sunshine" -Level "Information" -Color "Red"
+    Write-LogMessage -Message "  1. Install Lumen" -Level "Information" -Color "Green"
+    Write-LogMessage -Message "  2. Uninstall Lumen" -Level "Information" -Color "Red"
     Write-Information ""
 
     $validChoice = $false
@@ -296,7 +296,7 @@ $RootDir = Split-Path -Parent $ScriptDir
 
 # Set up transcript logging
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logDir = Join-Path $env:TEMP "Sunshine\logs\$Action"
+$logDir = Join-Path $env:TEMP "Lumen\logs\$Action"
 $LogPath = Join-Path $logDir "${timestamp}.log"
 
 # Ensure the log directory exists
@@ -319,6 +319,68 @@ if ($legacyMajorUpgradeUninstall) {
         -Message "Skipping the unscoped legacy uninstall action during major upgrade." `
         -Level "Information"
     exit 0
+}
+
+# Detect separately installed Sunshine products without mutating them. Lumen
+# has its own UpgradeCode and service identity, so official Sunshine remains
+# under the user's control even when legacy configuration is available to copy.
+function Get-LegacySunshineProducts {
+    $products = [System.Collections.Generic.List[object]]::new()
+    foreach ($registryRoot in @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )) {
+        if (-not (Test-Path -LiteralPath $registryRoot)) {
+            continue
+        }
+        foreach ($productKey in @(Get-ChildItem -LiteralPath $registryRoot -ErrorAction SilentlyContinue)) {
+            $product = Get-ItemProperty -LiteralPath $productKey.PSPath -ErrorAction SilentlyContinue
+            if ($null -ne $product -and $product.DisplayName -like "Sunshine*") {
+                $products.Add($product)
+            }
+        }
+    }
+    return $products.ToArray()
+}
+
+function Copy-LegacySunshineConfigIfNeeded {
+    param(
+        [object[]]$Products
+    )
+
+    $destination = Join-Path $RootDir "config"
+    if ((Test-Path -LiteralPath $destination -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $destination -Force).Count -ne 0) {
+        return
+    }
+
+    foreach ($product in $Products) {
+        if ([string]::IsNullOrWhiteSpace($product.InstallLocation)) {
+            continue
+        }
+        $legacyConfig = Join-Path ([string]$product.InstallLocation) "config"
+        if (-not (Test-Path -LiteralPath $legacyConfig -PathType Container)) {
+            continue
+        }
+        $legacyItems = @(Get-ChildItem -LiteralPath $legacyConfig -Force -Recurse)
+        if ($legacyItems | Where-Object {
+                $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint
+            }) {
+            Write-LogMessage `
+                -Message "Skipped legacy Sunshine config containing a reparse point: $legacyConfig" `
+                -Level "Warning"
+            continue
+        }
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+        Get-ChildItem -LiteralPath $legacyConfig -Force | Copy-Item `
+            -Destination $destination `
+            -Recurse `
+            -ErrorAction Stop
+        Write-LogMessage `
+            -Message "Copied legacy Sunshine configuration from $legacyConfig; the source was not modified." `
+            -Level "Information"
+        return
+    }
 }
 
 # Function to execute a batch script if it exists
@@ -407,8 +469,9 @@ function Invoke-ScriptIfExist {
     }
 }
 
-# Function to execute sunshine.exe with arguments if it exists
-function Invoke-SunshineIfExist {
+# Execute only the current Lumen binary. Legacy Sunshine state may be copied,
+# but executable identity never crosses product boundaries.
+function Invoke-LumenIfExist {
     param(
         [string]$Arguments,
         [string]$Description = "",
@@ -419,10 +482,10 @@ function Invoke-SunshineIfExist {
         Write-LogMessage -Message "$Emoji $Description" -Level "Step"
     }
 
-    $SunshinePath = Join-Path $RootDir "sunshine.exe"
+    $HostPath = Join-Path $RootDir "Lumen.exe"
 
-    if (Test-Path $SunshinePath) {
-        Write-LogMessage -Message "Executing: $SunshinePath $Arguments" -Level "Information"
+    if (Test-Path $HostPath -PathType Leaf) {
+        Write-LogMessage -Message "Executing: $HostPath $Arguments" -Level "Information"
 
         # Capture output to suppress it from console but log it
         $stdoutFile = [System.IO.Path]::GetTempFileName()
@@ -430,7 +493,7 @@ function Invoke-SunshineIfExist {
 
         try {
             $process = Start-Process `
-                -FilePath $SunshinePath `
+                -FilePath $HostPath `
                 -ArgumentList $Arguments `
                 -Wait `
                 -PassThru `
@@ -463,7 +526,7 @@ function Invoke-SunshineIfExist {
             }
 
             if ($process.ExitCode -ne 0) {
-                Write-LogMessage -Message "  ⚠ Sunshine exited with code $($process.ExitCode)" -Level "Warning"
+                Write-LogMessage -Message "  ⚠ Lumen exited with code $($process.ExitCode)" -Level "Warning"
                 return $process.ExitCode
             } else {
                 Write-LogMessage -Message "  ✓ Done" -Level "Success"
@@ -832,13 +895,18 @@ function Remove-VirtualHidCertificate {
 }
 
 function Get-InstalledVirtualHidSignerThumbprint {
-    if (-not (Test-Path -LiteralPath $installerRegistryPath)) {
-        return $null
+    foreach ($registryPath in @($installerRegistryPath) + $legacyInstallerRegistryPaths) {
+        if (Test-Path -LiteralPath $registryPath) {
+            $thumbprint = [string](Get-ItemProperty `
+                -LiteralPath $registryPath `
+                -Name "SignerThumbprint" `
+                -ErrorAction SilentlyContinue).SignerThumbprint
+            if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
+                return $thumbprint
+            }
+        }
     }
-    return [string](Get-ItemProperty `
-        -LiteralPath $installerRegistryPath `
-        -Name "SignerThumbprint" `
-        -ErrorAction SilentlyContinue).SignerThumbprint
+    return $null
 }
 
 function Set-InstalledVirtualHidSignerThumbprint {
@@ -848,9 +916,9 @@ function Set-InstalledVirtualHidSignerThumbprint {
     )
 
     if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
-        if (Test-Path -LiteralPath $installerRegistryPath) {
+        foreach ($registryPath in @($installerRegistryPath) + $legacyInstallerRegistryPaths) {
             Remove-ItemProperty `
-                -LiteralPath $installerRegistryPath `
+                -LiteralPath $registryPath `
                 -Name "SignerThumbprint" `
                 -ErrorAction SilentlyContinue
         }
@@ -863,12 +931,24 @@ function Set-InstalledVirtualHidSignerThumbprint {
         -Type String `
         -Value $Thumbprint `
         -ErrorAction Stop
+    foreach ($registryPath in $legacyInstallerRegistryPaths) {
+        if (Test-Path -LiteralPath $registryPath) {
+            Remove-ItemProperty `
+                -LiteralPath $registryPath `
+                -Name "SignerThumbprint" `
+                -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 $programDataDirectory = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::CommonApplicationData
 )
-$installerRegistryPath = "HKLM:\SOFTWARE\LizardByte\Lumen\VirtualHid"
+$installerRegistryPath = "HKLM:\SOFTWARE\simonfalke\Lumen\VirtualHid"
+$legacyInstallerRegistryPaths = @(
+    "HKLM:\SOFTWARE\simonfalke-01\Lumen\VirtualHid",
+    "HKLM:\SOFTWARE\LizardByte\Lumen\VirtualHid"
+)
 
 function ConvertTo-CanonicalProductCode {
     param(
@@ -915,7 +995,7 @@ $rollbackProductDirectory = Join-Path $rollbackRootDirectory $ProductCode
 $rollbackDirectory = Join-Path $rollbackProductDirectory $TransactionKind.ToLowerInvariant()
 $rollbackStatePath = Join-Path $rollbackDirectory "virtual-hid-rollback.json"
 $rollbackDriverDirectory = Join-Path $rollbackDirectory "virtual-hid-driver"
-$rollbackScriptPath = Join-Path $rollbackDirectory "sunshine-setup.ps1"
+$rollbackScriptPath = Join-Path $rollbackDirectory "lumen-setup.ps1"
 $script:RebootRequired = $false
 
 function New-InstallRollbackDirectoryAcl {
@@ -1013,7 +1093,7 @@ function Assert-NoPendingRollbackTransaction {
 
 function Get-ServiceSnapshot {
     param(
-        [string]$Name = "SunshineService"
+        [string]$Name = "LumenService"
     )
 
     $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
@@ -1060,22 +1140,22 @@ function Restore-ServiceSnapshot {
         default { throw "Unsupported saved service start mode: $StartMode" }
     }
     $scPath = Join-Path $env:SystemRoot "System32\sc.exe"
-    $output = & $scPath config SunshineService start= $startArgument 2>&1
+    $output = & $scPath config LumenService start= $startArgument 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw "Restoring the Sunshine service start mode failed: $($output -join ' ')"
+        throw "Restoring the Lumen service start mode failed: $($output -join ' ')"
     }
-    $service = Get-Service -Name "SunshineService" -ErrorAction Stop
+    $service = Get-Service -Name "LumenService" -ErrorAction Stop
     if ($Running) {
         if ($StartMode -eq "Disabled") {
             throw "Saved service state is internally inconsistent: disabled and running."
         }
         if ($service.Status -ne "Running") {
-            Start-Service -Name "SunshineService" -ErrorAction Stop
+            Start-Service -Name "LumenService" -ErrorAction Stop
         }
         $service.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
     } else {
         if ($service.Status -ne "Stopped") {
-            Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
+            Stop-Service -Name "LumenService" -Force -ErrorAction Stop
         }
         $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
     }
@@ -1357,7 +1437,7 @@ function Read-RollbackState {
 }
 
 function Invoke-PersistedRollback {
-    Write-LogMessage -Message "Rolling back Sunshine service and Virtual HID changes" -Level "Step"
+    Write-LogMessage -Message "Rolling back Lumen service and Virtual HID changes" -Level "Step"
 
     if (-not (Test-Path -LiteralPath $rollbackDirectory -PathType Container)) {
         Write-LogMessage -Message "No pending installer transaction was found." -Level "Information"
@@ -1403,14 +1483,14 @@ function Invoke-PersistedRollback {
         $driverWasPresent -or $transactionKind -eq "install"
     )
     if ($driverNeedsRollback) {
-        $currentService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
+        $currentService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
         if ($null -ne $currentService -and $currentService.Status -ne "Stopped") {
             try {
-                Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
+                Stop-Service -Name "LumenService" -Force -ErrorAction Stop
                 $currentService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
             } catch {
                 $rollbackErrors.Add(
-                    "Could not stop the Sunshine service before driver rollback: $($_.Exception.Message)"
+                    "Could not stop the Lumen service before driver rollback: $($_.Exception.Message)"
                 ) | Out-Null
             }
         }
@@ -1460,16 +1540,16 @@ function Invoke-PersistedRollback {
                 throw "Service restore reported exit code $serviceExitCode."
             }
 
-            $restoredService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
+            $restoredService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
             if ($null -eq $restoredService) {
-                throw "The Sunshine service is still absent after rollback."
+                throw "The Lumen service is still absent after rollback."
             }
             if ([string]::IsNullOrWhiteSpace($serviceStartMode)) {
                 if ($serviceWasRunning -and $restoredService.Status -ne "Running") {
-                    Start-Service -Name "SunshineService" -ErrorAction Stop
+                    Start-Service -Name "LumenService" -ErrorAction Stop
                     $restoredService.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
                 } elseif (-not $serviceWasRunning -and $restoredService.Status -ne "Stopped") {
-                    Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
+                    Stop-Service -Name "LumenService" -Force -ErrorAction Stop
                     $restoredService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
                 }
             } else {
@@ -1496,8 +1576,8 @@ function Invoke-PersistedRollback {
             if ($serviceExitCode -ne 0) {
                 throw "Service rollback reported exit code $serviceExitCode."
             }
-            if ($null -ne (Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue)) {
-                throw "The newly installed Sunshine service is still present after rollback."
+            if ($null -ne (Get-Service -Name "LumenService" -ErrorAction SilentlyContinue)) {
+                throw "The newly installed Lumen service is still present after rollback."
             }
             $rollbackState.ServiceRollbackComplete = $true
             Save-ParsedRollbackState -State $rollbackState
@@ -1588,8 +1668,15 @@ Write-Information ""
 try {
 if ($Action -eq "install") {
     Invoke-ExactCurrentRecovery
+    $legacySunshineProducts = @(Get-LegacySunshineProducts)
+    if ($legacySunshineProducts.Count -ne 0) {
+        Write-LogMessage `
+            -Message "Detected a separate Sunshine installation. Lumen will not replace or uninstall it." `
+            -Level "Warning"
+        Copy-LegacySunshineConfigIfNeeded -Products $legacySunshineProducts
+    }
     Write-FramedText `
-        -Message "🔅 Sunshine Installation Script" `
+        -Message "🔅 Lumen Installation Script" `
         -Level "Information" `
         -Color "Yellow"
     Write-Information ""
@@ -1600,7 +1687,7 @@ if ($Action -eq "install") {
     # Reset permissions on the install directory
     $currentStep++
     Write-Progress `
-        -Activity "Installing Sunshine" `
+        -Activity "Installing Lumen" `
         -Status "Resetting permissions on installation directory" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     Write-LogMessage -Message "🔐 Resetting permissions on installation directory" -Level "Step"
@@ -1667,17 +1754,17 @@ if ($Action -eq "install") {
     # 1. Update PATH (add)
     $currentStep++
     Write-Progress `
-        -Activity "Installing Sunshine" `
+        -Activity "Installing Lumen" `
         -Status "Updating system PATH" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    Write-LogMessage -Message "📁 Adding Sunshine directories to PATH" -Level "Step"
+    Write-LogMessage -Message "📁 Adding Lumen directories to PATH" -Level "Step"
     Update-SystemPath -Operation "add"
     Write-Information ""
 
     # 2. Migrate configuration
     $currentStep++
     Write-Progress `
-        -Activity "Installing Sunshine" `
+        -Activity "Installing Lumen" `
         -Status "Migrating configuration" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $migrateConfigScript = Join-Path $RootDir "scripts\migrate-config.bat"
@@ -1690,7 +1777,7 @@ if ($Action -eq "install") {
     # 3. Add firewall rules
     $currentStep++
     Write-Progress `
-        -Activity "Installing Sunshine" `
+        -Activity "Installing Lumen" `
         -Status "Configuring firewall" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $addFirewallScript = Join-Path $RootDir "scripts\add-firewall-rule.bat"
@@ -1704,7 +1791,7 @@ if ($Action -eq "install") {
     # before the service is installed or started.
     $currentStep++
     Write-Progress `
-        -Activity "Installing Sunshine" `
+        -Activity "Installing Lumen" `
         -Status "Installing Lumen Virtual HID driver" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $driverInfPath = $null
@@ -1733,7 +1820,7 @@ if ($Action -eq "install") {
     } else {
         Get-ServiceSnapshot
     }
-    $existingService = if ($Msi) { $null } else { Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue }
+    $existingService = if ($Msi) { $null } else { Get-Service -Name "LumenService" -ErrorAction SilentlyContinue }
     $serviceWasPresent = $serviceSnapshot.Present
     $serviceWasRunning = $serviceSnapshot.Running
     $driverWasPresent = $driverStatus -in @(0, 4)
@@ -1759,9 +1846,9 @@ if ($Action -eq "install") {
     }
     if (-not $Msi -and $serviceWasRunning) {
         Write-LogMessage `
-            -Message "Stopping the Sunshine service before updating the Virtual HID driver" `
+            -Message "Stopping the Lumen service before updating the Virtual HID driver" `
             -Level "Step"
-        Stop-Service -Name "SunshineService" -Force -ErrorAction Stop
+        Stop-Service -Name "LumenService" -Force -ErrorAction Stop
         $existingService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
     }
     if ($virtualHidSelected) {
@@ -1778,7 +1865,7 @@ if ($Action -eq "install") {
     # the scripts remain the NSIS path only.
     $currentStep++
     Write-Progress `
-        -Activity "Installing Sunshine" `
+        -Activity "Installing Lumen" `
         -Status "Installing service" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     if (-not $Msi) {
@@ -1788,14 +1875,14 @@ if ($Action -eq "install") {
             -Description "Installing Windows Service" `
             -Emoji "⚡"
     } else {
-        Write-LogMessage -Message "Windows Installer owns the Sunshine service." -Level "Information"
+        Write-LogMessage -Message "Windows Installer owns the Lumen service." -Level "Information"
     }
     Write-Information ""
 
     # 6. Configure autostart
     $currentStep++
     Write-Progress `
-        -Activity "Installing Sunshine" `
+        -Activity "Installing Lumen" `
         -Status "Configuring autostart" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     if (-not $Msi) {
@@ -1805,11 +1892,11 @@ if ($Action -eq "install") {
             -Description "Configuring autostart" `
             -Emoji "🚀"
     } else {
-        Write-LogMessage -Message "Windows Installer owns the Sunshine service start mode." -Level "Information"
+        Write-LogMessage -Message "Windows Installer owns the Lumen service start mode." -Level "Information"
     }
     Write-Information ""
 
-    Write-Progress -Activity "Installing Sunshine" -Completed
+    Write-Progress -Activity "Installing Lumen" -Completed
     if (-not $Msi) {
         Invoke-PersistedCommit | Out-Null
     }
@@ -1818,7 +1905,7 @@ if ($Action -eq "install") {
             -Message "✓ Lumen installed. Restart Windows to finish the Virtual HID driver operation." `
             -Level "Warning"
     } else {
-        Write-FramedText -Message "✓ Sunshine installation completed successfully!" -Level "Success"
+        Write-FramedText -Message "✓ Lumen installation completed successfully!" -Level "Success"
     }
 
     # Open documentation in browser (only if not running silently)
@@ -1840,7 +1927,7 @@ if ($Action -eq "install") {
 } elseif ($Action -eq "uninstall") {
     Invoke-ExactCurrentRecovery
     Write-FramedText `
-        -Message "🗑️  Sunshine Uninstallation Script" `
+        -Message "🗑️  Lumen Uninstallation Script" `
         -Level "Information" `
         -Color "Yellow"
     Write-Information ""
@@ -1857,12 +1944,10 @@ if ($Action -eq "install") {
     }
     $uninstallDriverWasPresent = $virtualHidSelected -and $driverStatus -in @(0, 4)
     $serviceSnapshot = Get-ServiceSnapshot
-    $existingService = Get-Service -Name "SunshineService" -ErrorAction SilentlyContinue
-    $legacyService = Get-Service -Name "sunshinesvc" -ErrorAction SilentlyContinue
-    $uninstallServiceWasPresent = -not $Msi -and ($serviceSnapshot.Present -or $null -ne $legacyService)
-    $uninstallServiceWasRunning = -not $Msi -and (`
-        ($null -ne $existingService -and $existingService.Status -eq "Running") -or `
-        ($null -ne $legacyService -and $legacyService.Status -eq "Running"))
+    $existingService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
+    $uninstallServiceWasPresent = -not $Msi -and $serviceSnapshot.Present
+    $uninstallServiceWasRunning = -not $Msi -and `
+        $null -ne $existingService -and $existingService.Status -eq "Running"
 
     Start-PersistedRollbackTransaction `
         -TransactionKind "uninstall" `
@@ -1879,12 +1964,12 @@ if ($Action -eq "install") {
     # 1. Stop and remove the service before touching the driver.
     $currentStep++
     Write-Progress `
-        -Activity "Uninstalling Sunshine" `
+        -Activity "Uninstalling Lumen" `
         -Status "Uninstalling service" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $uninstallServiceScript = Join-Path $RootDir "scripts\uninstall-service.bat"
     if ($Msi) {
-        Write-LogMessage -Message "Windows Installer owns Sunshine service removal." -Level "Information"
+        Write-LogMessage -Message "Windows Installer owns Lumen service removal." -Level "Information"
     } elseif ($uninstallServiceWasPresent) {
         Invoke-SetupScript `
             -ScriptPath $uninstallServiceScript `
@@ -1899,7 +1984,7 @@ if ($Action -eq "install") {
     # is idempotent and reports reboot-required cleanup as exit code 3010.
     $currentStep++
     Write-Progress `
-        -Activity "Uninstalling Sunshine" `
+        -Activity "Uninstalling Lumen" `
         -Status "Removing Lumen Virtual HID driver" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     if ($virtualHidSelected) {
@@ -1914,7 +1999,7 @@ if ($Action -eq "install") {
     # 3. Delete firewall rules
     $currentStep++
     Write-Progress `
-        -Activity "Uninstalling Sunshine" `
+        -Activity "Uninstalling Lumen" `
         -Status "Removing firewall rules" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $deleteFirewallScript = Join-Path $RootDir "scripts\delete-firewall-rule.bat"
@@ -1927,10 +2012,10 @@ if ($Action -eq "install") {
     # 4. Restore NVIDIA preferences
     $currentStep++
     Write-Progress `
-        -Activity "Uninstalling Sunshine" `
+        -Activity "Uninstalling Lumen" `
         -Status "Restoring NVIDIA settings" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    Invoke-SunshineIfExist `
+    Invoke-LumenIfExist `
         -Arguments "--restore-nvprefs-undo" `
         -Description "Restoring NVIDIA preferences" `
         -Emoji "🎮"
@@ -1939,16 +2024,16 @@ if ($Action -eq "install") {
     # 5. Update PATH (remove)
     $currentStep++
     Write-Progress `
-        -Activity "Uninstalling Sunshine" `
+        -Activity "Uninstalling Lumen" `
         -Status "Cleaning up system PATH" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
-    Write-LogMessage -Message "📁 Removing Sunshine directories from PATH" -Level "Step"
+    Write-LogMessage -Message "📁 Removing Lumen directories from PATH" -Level "Step"
     Update-SystemPath -Operation "remove"
     Write-Information ""
 
-    Write-Progress -Activity "Uninstalling Sunshine" -Completed
+    Write-Progress -Activity "Uninstalling Lumen" -Completed
     Write-FramedText `
-        -Message "✓ Sunshine uninstallation completed successfully!" `
+        -Message "✓ Lumen uninstallation completed successfully!" `
         -Level "Success"
     if (-not $Msi) {
         Invoke-PersistedCommit | Out-Null
@@ -1963,7 +2048,7 @@ if ($Action -eq "install") {
 }
 
 } catch {
-    Write-Progress -Activity "Sunshine Setup" -Completed
+    Write-Progress -Activity "Lumen Setup" -Completed
     $setupErrorMessage = $_.Exception.Message
     Write-LogMessage -Message $setupErrorMessage -Level "Error"
     if ($Action -in @("install", "uninstall")) {
@@ -1977,7 +2062,7 @@ if ($Action -eq "install") {
         }
     }
     Write-LogMessage `
-        -Message "Sunshine setup failed. See $LogPath for details." `
+        -Message "Lumen setup failed. See $LogPath for details." `
         -Level "Error"
     exit 1
 }

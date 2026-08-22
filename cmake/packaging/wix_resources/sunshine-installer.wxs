@@ -4,55 +4,55 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="ApplicationShortcutRoot" Guid="*">
         <Shortcut Id="ApplicationStartMenuShortcutRoot"
-                  Name="Sunshine"
-                  Description="Sunshine Game Stream Host"
-                  Target="[INSTALL_ROOT]sunshine.exe"
+                  Name="Lumen"
+                  Description="Lumen Game Stream Host"
+                  Target="[INSTALL_ROOT]Lumen.exe"
                   Arguments="--shortcut"
                   WorkingDirectory="INSTALL_ROOT"/>
-        <RegistryValue Root="HKCU" Key="Software\LizardByte\Sunshine" Name="installed_root" Type="integer" Value="1" KeyPath="yes"/>
+        <RegistryValue Root="HKCU" Key="Software\simonfalke\Lumen" Name="installed_root" Type="integer" Value="1" KeyPath="yes"/>
       </Component>
-      <Directory Id="ProgramMenuSubfolder" Name="LizardByte">
-        <Directory Id="ProgramMenuSunshineFolder" Name="Sunshine">
+      <Directory Id="ProgramMenuSubfolder" Name="Lumen">
+        <Directory Id="ProgramMenuLumenFolder" Name="Lumen">
           <Component Id="ApplicationShortcut" Guid="*">
             <Shortcut Id="ApplicationStartMenuShortcut"
-                      Name="Sunshine"
-                      Description="Sunshine Game Stream Host"
-                      Target="[INSTALL_ROOT]sunshine.exe"
+                      Name="Lumen"
+                      Description="Lumen Game Stream Host"
+                      Target="[INSTALL_ROOT]Lumen.exe"
                       Arguments="--shortcut"
                       WorkingDirectory="INSTALL_ROOT"/>
-            <RemoveFolder Id="CleanUpShortCut" Directory="ProgramMenuSunshineFolder" On="uninstall"/>
+            <RemoveFolder Id="CleanUpShortCut" Directory="ProgramMenuLumenFolder" On="uninstall"/>
             <RemoveFolder Id="CleanUpShortCutParent" Directory="ProgramMenuSubfolder" On="uninstall"/>
-            <RegistryValue Root="HKCU" Key="Software\LizardByte\Sunshine" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
+            <RegistryValue Root="HKCU" Key="Software\simonfalke\Lumen" Name="installed" Type="integer" Value="1" KeyPath="yes"/>
           </Component>
           <Component Id="DocumentationShortcut" Guid="*">
             <util:InternetShortcut Id="DocumentationLink"
-                                   Name="Sunshine Documentation"
-                                   Target="https://docs.lizardbyte.dev/projects/sunshine"
+                                   Name="Lumen on GitHub"
+                                   Target="https://github.com/simonfalke-01/Lumen"
                                    Type="url"/>
-            <RemoveFolder Id="CleanUpDocsShortCut" Directory="ProgramMenuSunshineFolder" On="uninstall"/>
-            <RegistryValue Root="HKCU" Key="Software\LizardByte\Sunshine" Name="docs_shortcut" Type="integer" Value="1" KeyPath="yes"/>
+            <RemoveFolder Id="CleanUpDocsShortCut" Directory="ProgramMenuLumenFolder" On="uninstall"/>
+            <RegistryValue Root="HKCU" Key="Software\simonfalke\Lumen" Name="docs_shortcut" Type="integer" Value="1" KeyPath="yes"/>
           </Component>
           <Component Id="WebsiteShortcut" Guid="*">
             <util:InternetShortcut Id="WebsiteLink"
-                                   Name="LizardByte Web Site"
-                                   Target="https://app.lizardbyte.dev"
+                                   Name="Lumen Releases"
+                                   Target="https://github.com/simonfalke-01/Lumen/releases"
                                    Type="url"/>
-            <RemoveFolder Id="CleanUpWebsiteShortCut" Directory="ProgramMenuSunshineFolder" On="uninstall"/>
-            <RegistryValue Root="HKCU" Key="Software\LizardByte\Sunshine" Name="website_shortcut" Type="integer" Value="1" KeyPath="yes"/>
+            <RemoveFolder Id="CleanUpWebsiteShortCut" Directory="ProgramMenuLumenFolder" On="uninstall"/>
+            <RegistryValue Root="HKCU" Key="Software\simonfalke\Lumen" Name="website_shortcut" Type="integer" Value="1" KeyPath="yes"/>
           </Component>
           <Component Id="SupportShortcut" Guid="*">
             <util:InternetShortcut Id="SupportLink"
-                                   Name="LizardByte Support"
-                                   Target="https://app.lizardbyte.dev/support"
+                                   Name="Lumen Support"
+                                   Target="https://github.com/simonfalke-01/Lumen/issues"
                                    Type="url"/>
-            <RemoveFolder Id="CleanUpSupportShortCut" Directory="ProgramMenuSunshineFolder" On="uninstall"/>
-            <RegistryValue Root="HKCU" Key="Software\LizardByte\Sunshine" Name="support_shortcut" Type="integer" Value="1" KeyPath="yes"/>
+            <RemoveFolder Id="CleanUpSupportShortCut" Directory="ProgramMenuLumenFolder" On="uninstall"/>
+            <RegistryValue Root="HKCU" Key="Software\simonfalke\Lumen" Name="support_shortcut" Type="integer" Value="1" KeyPath="yes"/>
           </Component>
         </Directory>
       </Directory>
     </StandardDirectory>
 
-    <Property Id="LUMEN_INSTALL_VHID" Value="1" Secure="yes"/>
+    <Property Id="LUMEN_INSTALL_VHID" Value="0" Secure="yes"/>
 
     <!-- Normalize the public silent-install property to the actual feature
          action/current state before building deferred CustomActionData. -->
@@ -75,41 +75,41 @@
 
     <!-- Service installation/removal remains in MSI service tables. These two
          actions select the declaratively installed service's start mode. -->
-    <CustomAction Id="CA_SunshineServiceAutoStart"
+    <CustomAction Id="CA_LumenServiceAutoStart"
                   Directory="System64Folder"
-                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config SunshineService start= auto"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config LumenService start= auto"
                   Execute="deferred" Return="check" Impersonate="no"/>
-    <CustomAction Id="CA_SunshineServiceDemandStart"
+    <CustomAction Id="CA_LumenServiceDemandStart"
                   Directory="System64Folder"
-                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config SunshineService start= demand"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config LumenService start= demand"
                   Execute="deferred" Return="check" Impersonate="no"/>
 
     <!-- MSI service ownership is declarative above. WixQuietExec is used here
          because deferred EXE custom actions cannot expand CustomActionData in
          their command line. Each matching SetProperty below supplies the full,
          already-formatted command to the deferred action. -->
-    <CustomAction Id="CA_SunshineInstallRollback"
+    <CustomAction Id="CA_LumenInstallRollback"
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec64"
                   Execute="rollback" Return="ignore" Impersonate="no"/>
-    <CustomAction Id="CA_SunshineInstall"
+    <CustomAction Id="CA_LumenInstall"
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec64"
                   Execute="deferred" Return="check" Impersonate="no"/>
-    <CustomAction Id="CA_SunshineInstallCommit"
+    <CustomAction Id="CA_LumenInstallCommit"
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec64"
                   Execute="commit" Return="check" Impersonate="no"/>
 
-    <CustomAction Id="CA_SunshineUninstallRollback"
+    <CustomAction Id="CA_LumenUninstallRollback"
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec64"
                   Execute="rollback" Return="ignore" Impersonate="no"/>
-    <CustomAction Id="CA_SunshineUninstall"
+    <CustomAction Id="CA_LumenUninstall"
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec64"
                   Execute="deferred" Return="check" Impersonate="no"/>
-    <CustomAction Id="CA_SunshineUninstallCommit"
+    <CustomAction Id="CA_LumenUninstallCommit"
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   DllEntry="WixQuietExec64"
                   Execute="commit" Return="check" Impersonate="no"/>
@@ -117,27 +117,27 @@
     <InstallExecuteSequence>
       <!-- Each setter has the deferred action's Id so WixQuietExec receives the
            full formatted command through that action's CustomActionData. -->
-      <Custom Action="CA_SunshineInstallRollback" After="SetSunshineInstallCommitData"
+      <Custom Action="CA_LumenInstallRollback" After="SetLumenInstallCommitData"
               Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
-      <Custom Action="CA_SunshineInstall" After="CA_SunshineInstallRollback"
+      <Custom Action="CA_LumenInstall" After="CA_LumenInstallRollback"
               Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
-      <Custom Action="CA_SunshineInstallCommit" After="CA_SunshineInstall"
+      <Custom Action="CA_LumenInstallCommit" After="CA_LumenInstall"
               Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
 
-      <Custom Action="CA_SunshineServiceAutoStart" After="InstallServices"
+      <Custom Action="CA_LumenServiceAutoStart" After="InstallServices"
               Condition="NOT (REMOVE=&quot;ALL&quot;) AND &amp;CM_C_autostart = 3"/>
-      <Custom Action="CA_SunshineServiceDemandStart" After="InstallServices"
+      <Custom Action="CA_LumenServiceDemandStart" After="InstallServices"
               Condition="NOT (REMOVE=&quot;ALL&quot;) AND &amp;CM_C_autostart &lt;&gt; 3"/>
 
-      <Custom Action="CA_SunshineUninstallRollback" After="SetSunshineUninstallCommitData"
+      <Custom Action="CA_LumenUninstallRollback" After="SetLumenUninstallCommitData"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
-      <Custom Action="CA_SunshineUninstall" After="CA_SunshineUninstallRollback"
+      <Custom Action="CA_LumenUninstall" After="CA_LumenUninstallRollback"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
-      <Custom Action="CA_SunshineUninstallCommit" After="CA_SunshineUninstall"
+      <Custom Action="CA_LumenUninstallCommit" After="CA_LumenUninstall"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     </InstallExecuteSequence>
 
-    <Feature Id="RunSunshineInstallScripts" Title="Run Sunshine Installation Scripts" Level="1" Display="hidden">
+    <Feature Id="RunLumenInstallScripts" Title="Run Lumen Installation Scripts" Level="1" Display="hidden">
       <ComponentRef Id="ApplicationShortcutRoot"/>
       <ComponentRef Id="ApplicationShortcut"/>
       <ComponentRef Id="DocumentationShortcut"/>
@@ -145,35 +145,35 @@
       <ComponentRef Id="SupportShortcut"/>
     </Feature>
 
-    <SetProperty Id="CA_SunshineInstallRollback"
-                 Action="SetSunshineInstallRollbackData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+    <SetProperty Id="CA_LumenInstallRollback"
+                 Action="SetLumenInstallRollbackData"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="InstallFiles" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
-    <SetProperty Id="CA_SunshineInstall"
-                 Action="SetSunshineInstallData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action install -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
-                 After="SetSunshineInstallRollbackData" Sequence="execute"
+    <SetProperty Id="CA_LumenInstall"
+                 Action="SetLumenInstallData"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action install -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 After="SetLumenInstallRollbackData" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
-    <SetProperty Id="CA_SunshineInstallCommit"
-                 Action="SetSunshineInstallCommitData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
-                 After="SetSunshineInstallData" Sequence="execute"
+    <SetProperty Id="CA_LumenInstallCommit"
+                 Action="SetLumenInstallCommitData"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 After="SetLumenInstallData" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
-    <SetProperty Id="CA_SunshineUninstallRollback"
-                 Action="SetSunshineUninstallRollbackData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+    <SetProperty Id="CA_LumenUninstallRollback"
+                 Action="SetLumenUninstallRollbackData"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
                  After="InstallInitialize" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
-    <SetProperty Id="CA_SunshineUninstall"
-                 Action="SetSunshineUninstallData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\sunshine-setup.ps1&quot; -Action uninstall -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
-                 After="SetSunshineUninstallRollbackData" Sequence="execute"
+    <SetProperty Id="CA_LumenUninstall"
+                 Action="SetLumenUninstallData"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action uninstall -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 After="SetLumenUninstallRollbackData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
-    <SetProperty Id="CA_SunshineUninstallCommit"
-                 Action="SetSunshineUninstallCommitData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\sunshine-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
-                 After="SetSunshineUninstallData" Sequence="execute"
+    <SetProperty Id="CA_LumenUninstallCommit"
+                 Action="SetLumenUninstallCommitData"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\lumen-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 After="SetLumenUninstallData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
   </Fragment>
 </Wix>

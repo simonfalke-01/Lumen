@@ -1,6 +1,6 @@
 require "language/node"
 
-class Sunshine < Formula
+class Lumen < Formula
   include Language::Python::Virtualenv
 
   CUDA_VERSION = "13.1".freeze
@@ -12,7 +12,7 @@ class Sunshine < Formula
   GCC_FORMULA = "gcc@#{GCC_VERSION}".freeze
   LLVM_PROFILE_FILE_ENV = "LLVM_PROFILE_FILE".freeze
   TEST_BINARY = "test_sunshine".freeze
-  IS_UPSTREAM_REPO = ENV.fetch("GITHUB_REPOSITORY", "") == "LizardByte/Sunshine"
+  IS_LUMEN_REPO = ENV.fetch("GITHUB_REPOSITORY", "") == "simonfalke-01/Lumen"
 
   desc "@PROJECT_DESCRIPTION@"
   homepage "@PROJECT_HOMEPAGE_URL@"
@@ -25,22 +25,13 @@ class Sunshine < Formula
   # https://docs.brew.sh/Brew-Livecheck#githublatest-strategy-block
   livecheck do
     url :stable
-    regex(/^v?(\d+\.\d+\.\d+)$/i)
+    regex(/^v?(\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\.\d+)?)$/i)
     strategy :github_latest do |json, regex|
       match = json["tag_name"]&.match(regex)
       next if match.blank?
 
       match[1]
     end
-  end
-
-  bottle do
-    root_url "https://ghcr.io/v2/lizardbyte/homebrew"
-    sha256 arm64_tahoe:   "0000000000000000000000000000000000000000000000000000000000000000"
-    sha256 arm64_sequoia: "0000000000000000000000000000000000000000000000000000000000000000"
-    sha256 arm64_sonoma:  "0000000000000000000000000000000000000000000000000000000000000000"
-    sha256 arm64_linux:   "0000000000000000000000000000000000000000000000000000000000000000"
-    sha256 x86_64_linux:  "0000000000000000000000000000000000000000000000000000000000000000"
   end
 
   option "with-docs", "Enable docs build"
@@ -115,7 +106,8 @@ class Sunshine < Formula
     end
   end
 
-  conflicts_with "sunshine-beta", because: "sunshine and sunshine-beta cannot be installed at the same time"
+  conflicts_with "sunshine",
+                 because: "Lumen can import Sunshine configuration, but both hosts cannot bind the same streaming ports"
 
   fails_with :clang do
     build 1400
@@ -165,20 +157,20 @@ class Sunshine < Formula
       -DGLAD_SKIP_PIP_INSTALL=ON
       -DHOMEBREW_ALLOW_FETCHCONTENT=ON
       -DOPENSSL_ROOT_DIR=#{formula_opt_prefix("openssl")}
-      -DSUNSHINE_ASSETS_DIR=sunshine/assets
+      -DSUNSHINE_ASSETS_DIR=lumen/assets
       -DSUNSHINE_BUILD_HOMEBREW=ON
-      -DSUNSHINE_PUBLISHER_NAME='LizardByte'
-      -DSUNSHINE_PUBLISHER_WEBSITE='https://app.lizardbyte.dev'
-      -DSUNSHINE_PUBLISHER_ISSUE_URL='https://app.lizardbyte.dev/support'
+      -DSUNSHINE_PUBLISHER_NAME=simonfalke
+      -DSUNSHINE_PUBLISHER_WEBSITE=https://github.com/simonfalke-01/Lumen
+      -DSUNSHINE_PUBLISHER_ISSUE_URL=https://github.com/simonfalke-01/Lumen/issues
     ]
-    args << "-DSUNSHINE_EXECUTABLE_PATH=#{opt_bin}/sunshine" if OS.linux?
+    args << "-DSUNSHINE_EXECUTABLE_PATH=#{opt_bin}/lumen" if OS.linux?
     # Point cmake at the venv Python that has jinja2 installed (set up in setup_build_environment)
     args << "-DPython_EXECUTABLE=#{@glad_python}" if @glad_python
     args
   end
 
   def add_test_args(args)
-    if IS_UPSTREAM_REPO
+    if IS_LUMEN_REPO
       args << "-DBUILD_TESTS=ON"
       args << "-DSUNSHINE_LLVM_COVERAGE=ON" if OS.mac?
       ohai "Building tests: enabled"
@@ -214,7 +206,7 @@ class Sunshine < Formula
     unless formula_any_version_installed?("icu4c")
       odie <<~EOS
         icu4c must be installed to link against static Boost libraries,
-        either install icu4c or use brew install sunshine --with-static-boost instead
+        either install icu4c or use brew install lumen --with-static-boost instead
       EOS
     end
     ENV.append "CXXFLAGS", "-I#{formula_opt_include("icu4c")}"
@@ -275,7 +267,7 @@ class Sunshine < Formula
 
   def with_llvm_profile_file(artifact_dir)
     original_profile_file = ENV.fetch(LLVM_PROFILE_FILE_ENV, nil)
-    ENV[LLVM_PROFILE_FILE_ENV] = "#{artifact_dir}/sunshine-%p.profraw"
+    ENV[LLVM_PROFILE_FILE_ENV] = "#{artifact_dir}/lumen-%p.profraw"
     yield
   ensure
     if original_profile_file
@@ -393,7 +385,7 @@ class Sunshine < Formula
 
   def collect_test_artifacts
     artifact_dir = release_homebrew_testpath
-    return unless IS_UPSTREAM_REPO
+    return unless IS_LUMEN_REPO
     return unless artifact_dir
 
     run_test_suite artifact_dir
@@ -419,10 +411,10 @@ class Sunshine < Formula
   end
 
   def install_platform_specific_files
-    bin.install "build/tests/#{TEST_BINARY}" if IS_UPSTREAM_REPO
+    bin.install "build/tests/#{TEST_BINARY}" if IS_LUMEN_REPO
 
     # codesign the binary on intel macs
-    system "codesign", "-s", "-", "--force", "--deep", bin/"sunshine" if OS.mac? && Hardware::CPU.intel?
+    system "codesign", "-s", "-", "--force", "--deep", bin/"lumen" if OS.mac? && Hardware::CPU.intel?
 
     bin.install "src_assets/linux/misc/postinst" if OS.linux?
   end
@@ -435,7 +427,7 @@ class Sunshine < Formula
   end
 
   service do
-    run [opt_bin/"sunshine", "~/.config/sunshine/sunshine.conf"] if OS.mac?
+    run [opt_bin/"lumen", "~/.config/lumen/lumen.conf"] if OS.mac?
     name linux: "app-@PROJECT_FQDN@" if OS.linux?
   end
 
@@ -459,15 +451,15 @@ class Sunshine < Formula
       Thanks for installing @PROJECT_NAME@!
 
       To get started, review the documentation at:
-        https://docs.lizardbyte.dev/projects/sunshine
+        https://github.com/simonfalke-01/Lumen
     EOS
   end
 
   test do
     # test that the binary runs at all
-    system bin/"sunshine", "--version"
+    system bin/"lumen", "--version"
 
-    if IS_UPSTREAM_REPO
+    if IS_LUMEN_REPO
       artifact_dir = release_homebrew_testpath
       if artifact_dir
         assert_path_exists artifact_dir/"tests/test_results.xml"

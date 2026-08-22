@@ -713,7 +713,7 @@ namespace {
     std::vector<BYTE> bytes;
     if (!read_file(path, bytes, error) ||
         !contains_inf_token(bytes, LUMEN_VHID_ROOT_HARDWARE_ID_A) ||
-        !contains_inf_token(bytes, "LumenProvider = \"LizardByte\"") ||
+        !contains_inf_token(bytes, "LumenProvider = \"simonfalke\"") ||
         !contains_inf_token(bytes, "UmdfService = \"LumenVirtualHid\"")) {
       return std::nullopt;
     }

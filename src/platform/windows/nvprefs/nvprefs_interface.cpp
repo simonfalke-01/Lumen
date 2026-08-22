@@ -12,7 +12,9 @@
 
 namespace {
 
-  const auto sunshine_program_data_folder = "Sunshine";
+  // Keep the legacy folder so an upgrade can restore global driver settings
+  // recorded by an interrupted Sunshine or Lumen process.
+  const auto legacy_program_data_folder = "Sunshine";
   const auto nvprefs_undo_file_name = "nvprefs_undo.json";
 
 }  // namespace
@@ -53,7 +55,7 @@ namespace nvprefs {
       }
 
       // Prepare undo file path variables
-      pimpl->undo_folder_path = std::filesystem::path(program_data_env) / sunshine_program_data_folder;
+      pimpl->undo_folder_path = std::filesystem::path(program_data_env) / legacy_program_data_folder;
       pimpl->undo_file_path = pimpl->undo_folder_path / nvprefs_undo_file_name;
 
       // Dynamically load nvapi library and load driver settings
@@ -108,7 +110,7 @@ namespace nvprefs {
       return false;
     }
 
-    // Modify and save sunshine.exe application profile settings, if needed
+    // Modify and save Lumen.exe application profile settings, if needed
     bool modified = false;
     if (!pimpl->driver_settings.check_and_modify_application_profile(modified)) {
       error_message("Failed to modify application profile settings");
@@ -145,7 +147,7 @@ namespace nvprefs {
     auto make_undo_and_commit = [&]() -> bool {
       // Create and lock undo file if it hasn't been done yet
       if (!pimpl->undo_file) {
-        // Prepare Sunshine folder in ProgramData if it doesn't exist
+        // Prepare the compatibility folder in ProgramData if it doesn't exist
         if (!CreateDirectoryW(pimpl->undo_folder_path.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
           error_message("Couldn't create undo folder");
           return false;

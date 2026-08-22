@@ -15,12 +15,12 @@
 %endif
 %endif
 
-Name: Sunshine
+Name: Lumen
 Version: %{build_version}
 Release: 1%{?dist}
 Summary: Self-hosted game stream host for Moonlight.
 License: GPLv3-only
-URL: https://github.com/LizardByte/Sunshine
+URL: https://github.com/simonfalke-01/Lumen
 Source0: tarball.tar.gz
 
 # Common BuildRequires
@@ -206,11 +206,11 @@ Self-hosted game stream host for Moonlight.
 
 %prep
 # extract tarball to current directory
-mkdir -p %{_builddir}/Sunshine
-tar -xzf %{SOURCE0} -C %{_builddir}/Sunshine
+mkdir -p %{_builddir}/Lumen
+tar -xzf %{SOURCE0} -C %{_builddir}/Lumen
 
 # list directory
-ls -a %{_builddir}/Sunshine
+ls -a %{_builddir}/Lumen
 
 %build
 # exit on error
@@ -223,29 +223,29 @@ cuda_supported_architectures=("x86_64" "aarch64")
 
 # prepare CMAKE args
 cmake_args=(
-  "-B=%{_builddir}/Sunshine/build"
+  "-B=%{_builddir}/Lumen/build"
   "-G=Unix Makefiles"
   "-S=."
   "-DBUILD_DOCS=OFF"
   "-DBUILD_WERROR=ON"
   "-DCMAKE_BUILD_TYPE=Release"
   "-DCMAKE_INSTALL_PREFIX=%{_prefix}"
-  "-DSUNSHINE_ASSETS_DIR=%{_datadir}/sunshine"
-  "-DSUNSHINE_EXECUTABLE_PATH=%{_bindir}/sunshine"
+  "-DSUNSHINE_ASSETS_DIR=%{_datadir}/lumen"
+  "-DSUNSHINE_EXECUTABLE_PATH=%{_bindir}/lumen"
   "-DSUNSHINE_ENABLE_DRM=ON"
   "-DSUNSHINE_ENABLE_KWIN=ON"
   "-DSUNSHINE_ENABLE_PORTAL=ON"
   "-DSUNSHINE_ENABLE_WAYLAND=ON"
   "-DSUNSHINE_ENABLE_X11=ON"
-  "-DSUNSHINE_PUBLISHER_NAME=LizardByte"
-  "-DSUNSHINE_PUBLISHER_WEBSITE=https://app.lizardbyte.dev"
-  "-DSUNSHINE_PUBLISHER_ISSUE_URL=https://app.lizardbyte.dev/support"
+  "-DSUNSHINE_PUBLISHER_NAME=simonfalke"
+  "-DSUNSHINE_PUBLISHER_WEBSITE=https://github.com/simonfalke-01/Lumen"
+  "-DSUNSHINE_PUBLISHER_ISSUE_URL=https://github.com/simonfalke-01/Lumen/issues"
 )
 
 %if 0%{?fedora}
 # uv installs Python and glad's Python dependencies into .venv before CMake runs.
 cmake_args+=("-DGLAD_SKIP_PIP_INSTALL=ON")
-cmake_args+=("-DPython_EXECUTABLE=%{_builddir}/Sunshine/.venv/bin/python")
+cmake_args+=("-DPython_EXECUTABLE=%{_builddir}/Lumen/.venv/bin/python")
 %endif
 
 %if 0%{?suse_version}
@@ -311,7 +311,7 @@ function install_cuda() {
       --backup \
       --directory="%{cuda_dir}" \
       --verbose \
-      < "%{_builddir}/Sunshine/packaging/linux/patches/${architecture}/${patch_file}"
+      < "%{_builddir}/Lumen/packaging/linux/patches/${architecture}/${patch_file}"
   fi
 }
 
@@ -368,7 +368,7 @@ cmake_args+=("-DSUNSHINE_ENABLE_VULKAN=OFF")
 %endif
 
 # cmake
-cd %{_builddir}/Sunshine
+cd %{_builddir}/Lumen
 %if 0%{?fedora}
 uv python install %{sunshine_python_version}
 uv sync \
@@ -380,7 +380,7 @@ uv sync \
 echo "cmake args:"
 echo "${cmake_args[@]}"
 cmake "${cmake_args[@]}"
-make -j$(nproc) -C "%{_builddir}/Sunshine/build"
+make -j$(nproc) -C "%{_builddir}/Lumen/build"
 
 %check
 # validate the metainfo file
@@ -389,7 +389,7 @@ appstream-util validate %{buildroot}%{_metainfodir}/*.metainfo.xml
 desktop-file-validate %{buildroot}%{_datadir}/applications/*.desktop
 
 # run tests
-cd %{_builddir}/Sunshine/build
+cd %{_builddir}/Lumen/build
 xvfb-run ./tests/test_sunshine
 
 %install
@@ -408,7 +408,7 @@ echo "Node.js version: $(node --version)"
 echo "npm version: $(npm --version)"
 %endif
 
-cd %{_builddir}/Sunshine/build
+cd %{_builddir}/Lumen/build
 %make_install
 
 %post
@@ -439,7 +439,7 @@ fi
 
 %files
 # Executables
-%caps(cap_sys_admin,cap_sys_nice+p) %{_bindir}/sunshine
+%caps(cap_sys_admin,cap_sys_nice+p) %{_bindir}/lumen
 
 # Systemd unit files for user services
 %{_userunitdir}/*.service
@@ -454,12 +454,12 @@ fi
 %{_datadir}/applications/*.desktop
 
 # Icons
-%{_datadir}/icons/hicolor/scalable/apps/*.Sunshine.svg
+%{_datadir}/icons/hicolor/scalable/apps/*.Lumen.svg
 
 # Metainfo
 %{_datadir}/metainfo/*.metainfo.xml
 
 # Assets
-%{_datadir}/sunshine/**
+%{_datadir}/lumen/**
 
 %changelog

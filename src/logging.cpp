@@ -136,7 +136,7 @@ namespace logging {
         android_priority = ANDROID_LOG_UNKNOWN;
         break;
     }
-    __android_log_print(android_priority, "Sunshine", "%s", message.c_str());
+    __android_log_print(android_priority, "Lumen", "%s", message.c_str());
   }
 
   // custom sink backend for android
@@ -270,7 +270,7 @@ namespace logging {
       << std::endl
       << "    --help                    | print help"sv << std::endl
       << "    --creds username password | set user credentials for the Web manager"sv << std::endl
-      << "    --version                 | print the version of sunshine"sv << std::endl
+      << "    --version                 | print the version of Lumen"sv << std::endl
       << std::endl
       << "    flags"sv << std::endl
       << "        -0 | Read PIN from stdin"sv << std::endl

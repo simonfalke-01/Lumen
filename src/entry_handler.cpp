@@ -122,12 +122,12 @@ bool is_gamestream_enabled() {
 
 namespace service_ctrl {
   /**
-   * @brief Owns Windows service-manager handles for the Sunshine service.
+   * @brief Owns Windows service-manager handles for the Lumen service.
    */
   class service_controller {
   public:
     /**
-     * @brief Open the Windows service manager and Sunshine service handle.
+     * @brief Open the Windows service manager and Lumen service handle.
      *
      * @param service_desired_access SERVICE_* desired access flags.
      */
@@ -139,7 +139,7 @@ namespace service_ctrl {
         return;
       }
 
-      service_handle = OpenServiceA(scm_handle, "SunshineService", service_desired_access);
+      service_handle = OpenServiceA(scm_handle, "LumenService", service_desired_access);
       if (!service_handle) {
         auto winerr = GetLastError();
         BOOST_LOG(error) << "OpenService() failed: "sv << winerr;
@@ -158,7 +158,7 @@ namespace service_ctrl {
     }
 
     /**
-     * @brief Asynchronously starts the Sunshine service.
+     * @brief Asynchronously starts the Lumen service.
      *
      * @return True when the Windows service API call succeeds.
      */
@@ -217,7 +217,7 @@ namespace service_ctrl {
   bool start_service() {
     service_controller sc {SERVICE_QUERY_STATUS | SERVICE_START};
 
-    std::cout << "Starting Sunshine..."sv;
+    std::cout << "Starting Lumen..."sv;
 
     // This operation is asynchronous, so we must wait for it to complete
     if (!sc.start_service()) {

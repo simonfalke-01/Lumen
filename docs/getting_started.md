@@ -1,15 +1,15 @@
 # Getting Started
 
-The recommended method for running Sunshine is to use the [binaries](#binaries) included in the
-[latest release][latest-release], unless otherwise specified.
+On Windows AMD64, the recommended method for running Lumen is to use the installer included in the
+[latest release][latest-release]. Other platforms currently require a source build or independently maintained package.
 
-[Pre-releases](https://github.com/LizardByte/Sunshine/releases) are also available. These should be considered beta,
+[Pre-releases](https://github.com/simonfalke-01/Lumen/releases) are also available. These should be considered beta,
 and release artifacts may be missing when merging changes on a faster cadence.
 
 ## Binaries
 
-Binaries of Sunshine are created for each release. They are available for FreeBSD, Linux, macOS, and Windows.
-Binaries can be found in the [latest release][latest-release].
+This fork currently publishes Windows AMD64 MSI and ZIP artifacts. Versioned assets are available on the
+[release page][latest-release].
 
 > [!NOTE]
 > Some third party packages also exist.
@@ -18,335 +18,18 @@ Binaries can be found in the [latest release][latest-release].
 
 ## Install
 
-### Docker
-
-> [!WARNING]
-> The Docker images are not recommended for most users.
-
-Docker images are available on [Dockerhub.io](https://hub.docker.com/repository/docker/lizardbyte/sunshine)
-and [ghcr.io](https://github.com/orgs/LizardByte/packages?repo_name=sunshine).
-
-See [Docker](../DOCKER_README.md) for more information.
-
-### FreeBSD
-
-#### Install
-1. Download the appropriate package for your architecture
-
-   | Architecture  | Package                                                                                                                                |
-   |---------------|----------------------------------------------------------------------------------------------------------------------------------------|
-   | amd64/x86_64  | [Sunshine-FreeBSD-14.4-amd64.pkg](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-FreeBSD-14.3-amd64.pkg)     |
-   | arm64/aarch64 | [Sunshine-FreeBSD-14.4-aarch64.pkg](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-FreeBSD-14.3-aarch64.pkg) |
-
-2. Open terminal and run the following command.
-   ```sh
-   sudo pkg install ./Sunshine-FreeBSD-14.4-{arch}.pkg
-   ```
-
-#### Uninstall
-```sh
-sudo pkg delete Sunshine
-```
-
-### Linux
-
-**CUDA Compatibility**
-
-CUDA is used for NVFBC capture.
-
-> [!NOTE]
-> See [CUDA GPUS](https://developer.nvidia.com/cuda-gpus) to cross-reference Compute Capability to your GPU.
-> The table below applies to packages provided by LizardByte. If you use an official LizardByte package, then you do not
-> need to install CUDA.
-
-<table>
-    <caption>CUDA Compatibility</caption>
-    <tr>
-        <th>CUDA Version</th>
-        <th>Min Driver</th>
-        <th>CUDA Compute Capabilities</th>
-        <th>Package</th>
-    </tr>
-    <tr>
-        <td rowspan="8">13.1.1</td>
-        <td rowspan="8">590.48.01</td>
-        <td rowspan="8">50;52;60;61;62;70;72;75;80;86;87;89;90;100;101;103;120;121</td>
-        <td>sunshine.AppImage</td>
-    </tr>
-    <tr>
-        <td>sunshine-ubuntu-22.04-{arch}.deb</td>
-    </tr>
-    <tr>
-        <td>sunshine-ubuntu-24.04-{arch}.deb</td>
-    </tr>
-    <tr>
-        <td>sunshine-debian-trixie-{arch}.deb</td>
-    </tr>
-    <tr>
-        <td>sunshine_{arch}.flatpak</td>
-    </tr>
-    <tr>
-        <td>Sunshine (copr - Fedora)</td>
-    </tr>
-    <tr>
-        <td>Sunshine (copr - OpenSUSE)</td>
-    </tr>
-    <tr>
-        <td>sunshine.pkg.tar.zst</td>
-    </tr>
-</table>
-
-#### AppImage
-
-> [!CAUTION]
-> Use distro-specific packages instead of the AppImage if they are available.
-> AppImage does not support KMS capture.
-
-> [!NOTE]
-> The AppImage is built on Ubuntu 22.04, which requires `glibc 2.35` or newer and `libstdc++ 3.4.11` or newer.
-
-##### Install
-1. Download [sunshine.AppImage](https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine.AppImage)
-   into your home directory.
-   ```bash
-   cd ~
-   wget https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine.AppImage
-   ```
-2. Open terminal and run the following command.
-   ```bash
-   ./sunshine.AppImage --install
-   ```
-
-##### Run
-```bash
-./sunshine.AppImage --install && ./sunshine.AppImage
-```
-
-##### Uninstall
-```bash
-./sunshine.AppImage --remove
-```
-
-#### ArchLinux
-
-> [!CAUTION]
-> Use AUR packages at your own risk.
-
-##### Install Prebuilt Packages
-Follow the instructions at LizardByte's [pacman-repo](https://github.com/LizardByte/pacman-repo) to add
-the repository. Then run the following command.
-```bash
-pacman -S sunshine
-```
-
-##### Install PKGBUILD Archive
-Open terminal and run the following command.
-```bash
-wget https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine.pkg.tar.gz
-tar -xvf sunshine.pkg.tar.gz
-cd sunshine
-
-# install optional dependencies
-pacman -S cuda  # Nvidia GPU encoding support
-pacman -S libva-mesa-driver  # AMD GPU encoding support
-
-makepkg -si
-```
-
-##### Uninstall
-```bash
-pacman -R sunshine
-```
-
-#### Debian/Ubuntu
-
-##### Install
-Download `sunshine-{distro}-{distro-version}-{arch}.deb` and run the following command.
-```bash
-sudo dpkg -i ./sunshine-{distro}-{distro-version}-{arch}.deb
-```
-
-> [!NOTE]
-> The `{distro-version}` is the version of the distro we built the package on. The `{arch}` is the
-> architecture of your operating system.
-
-> [!TIP]
-> You can double-click the deb file to see details about the package and begin installation.
-
-##### Uninstall
-```bash
-sudo apt remove sunshine
-```
-
-#### Fedora/OpenSUSE
-
-> [!TIP]
-> The package name is case-sensitive.
-
-##### Install (GitHub releases)
-Download `Sunshine-{version}.{distro+version}.{arch}.rpm` and run the following command.
-```bash
-sudo dnf install ./Sunshine-{version}.{distro}.{arch}.rpm
-```
-
-> [!NOTE]
-> The `{distro+version}` is the distro and distro version of the distro we built the package on. The `{arch}` is the
-> architecture of your operating system.
-
-> [!TIP]
-> You can double-click the rpm file to see details about the package and begin installation.
-
-##### Uninstall
-```bash
-sudo dnf remove sunshine
-```
-
-##### Install (Copr)
-
-> [!IMPORTANT]
-> Stable builds are only available if the Sunshine release was made after the Fedora version release.
-> Because of this, it is often recommended to use the beta copr; however, you do not need to regularly update.
-> This could lead to annoyances in rare cases where there may be a breaking change.
-
-1. Enable copr repository.
-   ```bash
-   sudo dnf copr enable lizardbyte/stable
-   ```
-
-   or
-   ```bash
-   sudo dnf copr enable lizardbyte/beta
-   ```
-
-2. Install the package.
-   ```bash
-   sudo dnf install Sunshine
-   ```
-
-##### Uninstall
-```bash
-sudo dnf remove Sunshine
-```
-
-#### Flatpak
-
-> [!CAUTION]
-> Use distro-specific packages instead of the Flatpak if they are available.
-> Flatpak does not support KMS capture.
-
-Using this package requires that you have [Flatpak](https://flatpak.org/setup) installed.
-
-##### Download (local option)
-1. Download `sunshine_{arch}.flatpak` and run the following command.
-
-   > [!NOTE]
-   > Replace `{arch}` with your system architecture.
-
-##### Install (system level)
-**Flathub**
-```bash
-flatpak install --system flathub dev.lizardbyte.app.Sunshine
-```
-
-**Local**
-```bash
-flatpak install --system ./sunshine_{arch}.flatpak
-```
-
-##### Install (user level)
-**Flathub**
-```bash
-flatpak install --user flathub dev.lizardbyte.app.Sunshine
-```
-
-**Local**
-```bash
-flatpak install --user ./sunshine_{arch}.flatpak
-```
-
-##### Additional installation (required)
-```bash
-flatpak run --command=additional-install.sh dev.lizardbyte.app.Sunshine
-```
-
-##### Run with NVFBC capture (X11 Only) or XDG Portal (Wayland Only)
-```bash
-flatpak run dev.lizardbyte.app.Sunshine
-```
-
-##### Uninstall
-```bash
-flatpak run --command=remove-additional-install.sh dev.lizardbyte.app.Sunshine
-flatpak uninstall --delete-data dev.lizardbyte.app.Sunshine
-```
-
-#### Homebrew
-
-> [!IMPORTANT]
-> The Homebrew package is experimental on Linux.
-
-This package requires that you have [Homebrew](https://docs.brew.sh/Installation) installed.
-
-##### Install
-```bash
-brew update
-brew upgrade
-brew tap LizardByte/homebrew
-brew install sunshine
-```
-
-##### Uninstall
-```bash
-brew uninstall sunshine
-```
-
-> [!TIP]
-> For beta you can replace `sunshine` with `sunshine-beta` in the above commands.
-
-### macOS
-
-> [!IMPORTANT]
-> Sunshine on macOS is experimental. Gamepads do not work.
-
-#### DMG
-
-##### Install
-
-1. Download and install based on your architecture:
-
-   | Architecture          | Package                                                                                                                |
-   |-----------------------|------------------------------------------------------------------------------------------------------------------------|
-   | arm64 (Apple Silicon) | [Sunshine-macOS-arm64.dmg](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-macOS-arm64.dmg)   |
-   | x86_64 (Intel)        | [Sunshine-macOS-x86_64.dmg](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-macOS-x86_64.dmg) |
-
-2. Open the downloaded `.dmg` file.
-3. Drag `Sunshine.app` into the `Applications` folder.
-4. Eject the disk image.
-
-##### Uninstall
-1. Quit Sunshine if it is running.
-2. Open `Finder`, navigate to `Applications`, and drag `Sunshine.app` to the Trash.
-
-#### Homebrew
-This package requires that you have [Homebrew](https://docs.brew.sh/Installation) installed.
-
-##### Install
-```bash
-brew update
-brew upgrade
-brew tap LizardByte/homebrew
-brew install sunshine
-```
-
-##### Uninstall
-```bash
-brew uninstall sunshine
-```
-
-> [!TIP]
-> For beta you can replace `sunshine` with `sunshine-beta` in the above commands.
+### Other platforms
+
+Lumen currently publishes no fork-owned FreeBSD, Linux, macOS, Docker, Flatpak, Homebrew, or community-repository
+artifacts. Build those platforms from source using [Building](building.md), or use community packaging with the
+understanding that it is independently maintained and may still use the upstream Sunshine identity.
 
 ### Windows
+
+> [!WARNING]
+> Lumen has its own installer and service identity and will not replace an official Sunshine installation. When
+> Sunshine is detected, the installer can copy its configuration without deleting the source, but the two hosts cannot
+> run at the same time because they use the same GameStream ports. Stop or uninstall Sunshine before starting Lumen.
 
 #### Installer (recommended)
 
@@ -356,17 +39,17 @@ brew uninstall sunshine
 
 1. Download and install based on your architecture:
 
-   | Architecture          | Installer                                                                                                                                    |
-   |-----------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
-   | AMD64/x64 (Intel/AMD) | [Sunshine-Windows-AMD64-installer.msi](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.msi) |
+   | Architecture          | Installer pattern                                      |
+   |-----------------------|--------------------------------------------------------|
+   | AMD64/x64 (Intel/AMD) | `Lumen-<version>-Windows-AMD64-installer.msi`          |
 
 > [!TIP]
 > Installer logs can be found in the following directory:
-> `%%TEMP%/Sunshine/logs/install/`
+> `%%TEMP%/Lumen/logs/install/`
 
-The Windows 11 x64 installer offers the **Virtual Keyboard and Mouse** driver feature. It is selected by default but is
-optional. Sunshine uses `windows_input_backend = auto` by default, which prefers the driver when it is installed,
-compatible, and accessible to `SunshineService`; otherwise, Sunshine uses the Windows `SendInput` backend and records
+The Windows 11 x64 installer offers the optional **Virtual Keyboard and Mouse** driver feature. It is not selected by
+default while prerelease builds use a self-signed driver certificate. Lumen uses `windows_input_backend = auto` by default, which prefers the driver when it is installed,
+compatible, and accessible to `LumenService`; otherwise, Lumen uses the Windows `SendInput` backend and records
 the reason in the log. Deselect the feature to install without a bundled driver.
 
 > [!IMPORTANT]
@@ -378,27 +61,27 @@ the reason in the log. Deselect the feature to install without a bundled driver.
 
 > [!NOTE]
 > Only the service account (`SYSTEM`) can probe the exact Virtual HID ABI or submit Virtual HID input. Launching
-> Sunshine directly uses `SendInput`, even when it is run as Administrator. Unicode text also continues to use
+> Lumen directly uses `SendInput`, even when it is run as Administrator. Unicode text also continues to use
 > `SendInput` while Virtual HID handles normal keyboard and mouse input.
 
 To install without the bundled driver from the command line, set the MSI property to `0`:
 
 ```bat
-msiexec /i Sunshine-Windows-AMD64-installer.msi LUMEN_INSTALL_VHID=0
+msiexec /i Lumen-<version>-Windows-AMD64-installer.msi LUMEN_INSTALL_VHID=0
 ```
 
 Use `LUMEN_INSTALL_VHID=1` to explicitly select the feature during a silent install. Deselecting the feature removes an
-existing Lumen Virtual HID driver but does not change Sunshine's configuration. For a SendInput-only deployment, also
-set `windows_input_backend = sendinput` in Sunshine's configuration.
+existing Lumen Virtual HID driver but does not change Lumen's configuration. For a SendInput-only deployment, also
+set `windows_input_backend = sendinput` in Lumen's configuration.
 
 In Virtual HID mode, Windows controls the repeat cadence for held keys. The `key_repeat_delay` and
-`key_repeat_frequency` settings apply when Sunshine uses the `SendInput` fallback.
+`key_repeat_frequency` settings apply when Lumen uses the `SendInput` fallback.
 
 > [!CAUTION]
 > You should carefully select or unselect the options you want to install. Do not blindly install or
 > enable features.
 
-To uninstall, find Sunshine in the list <a href="ms-settings:installed-apps">here</a> and select "Uninstall" from the
+To uninstall, find Lumen in the list <a href="ms-settings:installed-apps">here</a> and select "Uninstall" from the
 overflow menu. Different versions of Windows may provide slightly different steps for uninstall.
 
 #### Standalone (lite version)
@@ -408,14 +91,14 @@ overflow menu. Different versions of Windows may provide slightly different step
 > recommended for most users. No support will be provided!
 
 The lite package does not install the Lumen Virtual HID driver. With the default `auto` setting, it can use an existing
-compatible driver only when Sunshine runs through `SunshineService`; set `windows_input_backend = sendinput` to force a
+compatible driver only when Lumen runs through `LumenService`; set `windows_input_backend = sendinput` to force a
 SendInput-only setup.
 
 1. Download and extract based on your architecture:
 
-   | Architecture          | Installer                                                                                                                          |
-   |-----------------------|------------------------------------------------------------------------------------------------------------------------------------|
-   | AMD64/x64 (Intel/AMD) | `Sunshine-Windows-AMD64-lite.zip` |
+   | Architecture          | Archive pattern                              |
+   |-----------------------|----------------------------------------------|
+   | AMD64/x64 (Intel/AMD) | `Lumen-<version>-Windows-AMD64-lite.zip`     |
 
 2. Open command prompt as administrator
 3. Firewall rules
@@ -450,6 +133,8 @@ SendInput-only setup.
 ## Initial Setup
 After installation, some initial setup is required.
 
+The FreeBSD, Linux, and macOS notes below apply only to source builds or independently maintained packages.
+
 ### FreeBSD
 
 #### Virtual Input Devices
@@ -472,22 +157,22 @@ After adding yourself to the group, log out and log back in for the changes to t
 
 **Start once**
 ```bash
-systemctl --user start app-dev.lizardbyte.app.Sunshine
+systemctl --user start app-io.github.simonfalke.Lumen
 ```
 
 **Start on boot**
 ```bash
-systemctl --user --now enable app-dev.lizardbyte.app.Sunshine
+systemctl --user --now enable app-io.github.simonfalke.Lumen
 ```
 
 > [!NOTE]
-> The service has been renamed to "app-dev.lizardbyte.app.Sunshine" in order to increase compatibility with
-> XDG Desktop Portal, but it is also aliased to "sunshine.service" for convenience.
+> The service is named `app-io.github.simonfalke.Lumen` for XDG Desktop Portal compatibility and is also aliased
+> to `lumen.service` for convenience.
 
 ### macOS
-The first time you start Sunshine, you will be asked to grant access to screen recording and your microphone.
+The first time you start Lumen, you will be asked to grant access to screen recording and your microphone.
 
-Sunshine supports native system audio capture on macOS 14.0 (Sonoma) and newer via Apple’s Audio Tap API.
+Lumen supports native system audio capture on macOS 14.0 (Sonoma) and newer via Apple’s Audio Tap API.
 To use it, simply leave the **Audio Sink** setting blank.
 
 If you prefer to manage your own loopback device, you can still use
@@ -503,7 +188,7 @@ and enter its device name in the [audio_sink](configuration.md#audio_sink) field
 
 ### Windows
 In order for virtual gamepads to work, you must install ViGEmBus. You can do this from the troubleshooting tab
-in the web UI, as long as you are running Sunshine as a service or as an administrator. After installation, it is
+in the web UI, as long as you are running Lumen as a service or as an administrator. After installation, it is
 recommended to restart your computer.
 
 ![ViGEmBus Installation](images/vigembus-installer.png)
@@ -511,20 +196,20 @@ recommended to restart your computer.
 ## Usage
 
 ### Basic usage
-If Sunshine is not installed/running as a service, then start Sunshine with the following command, unless a start
+If Lumen is not installed/running as a service, then start Lumen with the following command, unless a start
 command is listed in the specified package [install](#install) instructions above.
 
 > [!NOTE]
-> A service is a process that runs in the background. This is the default when installing Sunshine from the
-> Windows installer. Running multiple instances of Sunshine is not advised.
+> A service is a process that runs in the background. This is the default when installing Lumen from the
+> Windows installer. Running multiple instances of Lumen is not advised.
 
 ```bash
-sunshine
+lumen
 ```
 
 ### Specify config file
 ```bash
-sunshine <directory of conf file>/sunshine.conf
+lumen <directory of conf file>/lumen.conf
 ```
 
 > [!NOTE]
@@ -532,30 +217,29 @@ sunshine <directory of conf file>/sunshine.conf
 > If no config file is entered, the default location will be used.
 > The configuration file specified will be created if it doesn't exist.
 
-### Start Sunshine over SSH (Linux/X11)
+### Start Lumen over SSH (Linux/X11)
 Assuming you are already logged into the host, you can use this command
 
 ```bash
-ssh <user>@<ip_address> 'export DISPLAY=:0; sunshine'
+ssh <user>@<ip_address> 'export DISPLAY=:0; lumen'
 ```
 
 If you are logged into the host with only a tty (teletypewriter), you can use `startx` to start the X server prior to
-executing Sunshine. You nay need to add `sleep` between `startx` and `sunshine` to allow more time for the display to
+executing Lumen. You nay need to add `sleep` between `startx` and `lumen` to allow more time for the display to
 be ready.
 
 ```bash
-ssh <user>@<ip_address> 'startx &; export DISPLAY=:0; sunshine'
+ssh <user>@<ip_address> 'startx &; export DISPLAY=:0; lumen'
 ```
 
 > [!TIP]
 > You could also use the `~/.bash_profile` or `~/.bashrc` files to set up the `DISPLAY` variable.
 
-@seealso{See [Remote SSH Headless Setup](https://app.lizardbyte.dev/2023-09-14-remote-ssh-headless-sunshine-setup)
-on how to set up a headless streaming server without autologin and dummy plugs (X11 + NVidia GPUs)}
+See the project [Discussions](https://github.com/simonfalke-01/Lumen/discussions) for community headless-host setups.
 
 ### Configuration
 
-Sunshine is configured via the web ui, which is available on [https://localhost:47990](https://localhost:47990)
+Lumen is configured via the web ui, which is available on [https://localhost:47990](https://localhost:47990)
 by default. You may replace *localhost* with your internal ip address.
 
 > [!NOTE]
@@ -571,7 +255,7 @@ by default. You may replace *localhost* with your internal ip address.
    ![Applications](images/applications.png)
 3. Adjust any configuration settings as needed. You can search for options in the search bar.
    ![Configuration](images/configuration-search.png)
-4. Find Moonlight clients and other tools for Sunshine in the `Featured Apps` tab.
+4. Find Moonlight clients and other tools for Lumen in the `Featured Apps` tab.
    ![Featured Apps](images/featured-apps.png)
 5. In Moonlight, you may need to add the PC manually.
 6. When Moonlight requests for you insert the pin:
@@ -591,13 +275,7 @@ To get a list of available arguments, run the following command.
 
 @tabs{
    @tab{ General | ```bash
-      sunshine --help
-      ```}
-   @tab{ AppImage | ```bash
-      ./sunshine.AppImage --help
-      ```}
-   @tab{ Flatpak | ```bash
-      flatpak run --command=sunshine dev.lizardbyte.app.Sunshine --help
+      lumen --help
       ```}
 }
 
@@ -613,11 +291,11 @@ All shortcuts start with `Ctrl+Alt+Shift`, just like Moonlight.
 * You can use Environment variables in place of values
 * `$(HOME)` will be replaced by the value of `$HOME`
 * `$$` will be replaced by `$`, e.g. `$$(HOME)` will be become `$(HOME)`
-* `env` - Adds or overwrites Environment variables for the commands/applications run by Sunshine.
+* `env` - Adds or overwrites Environment variables for the commands/applications run by Lumen.
   This can only be changed by modifying the `apps.json` file directly.
 
 ### Considerations
-* On Windows, Sunshine uses the Desktop Duplication API which only supports capturing from the GPU used for display.
+* On Windows, Lumen uses the Desktop Duplication API which only supports capturing from the GPU used for display.
   If you want to capture and encode on the eGPU, connect a display or HDMI dummy display dongle to it and run the games
   on that display.
 * When an application is started, if there is an application already running, it will be terminated.
@@ -634,9 +312,9 @@ All shortcuts start with `Ctrl+Alt+Shift`, just like Moonlight.
 * For the Linux flatpak you must prepend commands with `flatpak-spawn --host`.
 * If inputs (mouse, keyboard, gamepads...) aren't working after connecting:
 
-  * On FreeBSD/Linux, add the user running sunshine to the `input` group.
+  * On FreeBSD/Linux, add the user running lumen to the `input` group.
 
-* The FreeBSD version of Sunshine is missing some features that are present on Linux.
+* The FreeBSD version of Lumen is missing some features that are present on Linux.
   The following are known limitations.
 
   * Only X11 and Wayland capture are supported
@@ -699,4 +377,4 @@ Tutorials and Guides are community generated. Want to contribute? Reach out to u
   [TOC]
 </details>
 
-[latest-release]: https://github.com/LizardByte/Sunshine/releases/latest
+[latest-release]: https://github.com/simonfalke-01/Lumen/releases/latest

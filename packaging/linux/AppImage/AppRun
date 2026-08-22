@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# custom AppRun for Sunshine AppImage
+# custom AppRun for Lumen AppImage
 
 # path of the extracted AppRun
 HERE="$(dirname "$(readlink -f "${0}")")"
-SUNSHINE_PATH=/usr/bin/sunshine
-SUNSHINE_BIN_HERE=$HERE/usr/bin/sunshine
-SUNSHINE_SHARE_HERE=$HERE/usr/share/sunshine
+LUMEN_PATH=/usr/bin/lumen
+LUMEN_BIN_HERE=$HERE/usr/bin/lumen
+LUMEN_SHARE_HERE=$HERE/usr/share/lumen
 
 # Set APPDIR when running directly from the AppDir:
 if [ -z "$APPDIR" ]; then
@@ -18,81 +18,77 @@ cd "$HERE" || exit 1
 function help() {
 echo "
  ------------------------------
-   Sunshine AppImage package.
+   Lumen AppImage package.
  ------------------------------
 
- sunshine.AppImage options
+ Lumen.AppImage options
  ------------------------
 
  Usage:  $ARGV0  --help, -h
  ------            # This message
 
          $ARGV0  --install, -i
-                   # Install input rules sunshine.service files. Restart required.
+                   # Install input rules and Lumen service files. Restart required.
 
          $ARGV0  --remove, -r
-                   # Remove input rules sunshine.service files.
+                   # Remove input rules and Lumen service files.
 
          $ARGV0  --appimage-help
                    # Show available AppImage options
 
- sunshine options
+ Lumen options
  ----------------
 "
-# print sunshine binary help, replacing the sunshine command in usage statement
-"$SUNSHINE_BIN_HERE" --help | sed -e "s#$SUNSHINE_BIN_HERE#$ARGV0#g"
+# print Lumen binary help, replacing the binary path in the usage statement
+"$LUMEN_BIN_HERE" --help | sed -e "s#$LUMEN_BIN_HERE#$ARGV0#g"
 }
 
 function install() {
   # user input rules
   # shellcheck disable=SC2002
-  cat "$SUNSHINE_SHARE_HERE/udev/rules.d/60-sunshine.rules" | sudo tee /etc/udev/rules.d/60-sunshine.rules
-  cat "$SUNSHINE_SHARE_HERE/modules-load.d/60-sunshine.conf" | sudo tee /etc/modules-load.d/60-sunshine.conf
+  cat "$LUMEN_SHARE_HERE/udev/rules.d/60-lumen.rules" | sudo tee /etc/udev/rules.d/60-lumen.rules
+  cat "$LUMEN_SHARE_HERE/modules-load.d/60-lumen.conf" | sudo tee /etc/modules-load.d/60-lumen.conf
   sudo modprobe uhid
   sudo udevadm control --reload-rules
   sudo udevadm trigger --property-match=DEVNAME=/dev/uinput
   sudo udevadm trigger --property-match=DEVNAME=/dev/uhid
 
-  # sunshine service
+  # Lumen service
   mkdir -p ~/.config/systemd/user
-  cp -r "$SUNSHINE_SHARE_HERE/systemd/user/" ~/.config/systemd/
+  cp -r "$LUMEN_SHARE_HERE/systemd/user/" ~/.config/systemd/
   # patch service executable path
-  sed -i -e "s#$SUNSHINE_PATH#$(readlink -f $ARGV0)#g" ~/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service
+  sed -i -e "s#$LUMEN_PATH#$(readlink -f "$ARGV0")#g" ~/.config/systemd/user/app-io.github.simonfalke.Lumen.service
 
   # setcap
-  sudo setcap cap_sys_admin,cap_sys_nice+p "$(readlink -f "$SUNSHINE_BIN_HERE")"
+  sudo setcap cap_sys_admin,cap_sys_nice+p "$(readlink -f "$LUMEN_BIN_HERE")"
 }
 
 function remove() {
   # remove input rules
-  sudo rm -f /etc/udev/rules.d/60-sunshine.rules
+  sudo rm -f /etc/udev/rules.d/60-lumen.rules
 
   # remove uhid module loading config
-  sudo rm -f /etc/modules-load.d/60-sunshine.conf
+  sudo rm -f /etc/modules-load.d/60-lumen.conf
 
   # remove service
-  sudo rm -f ~/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service
+  sudo rm -f ~/.config/systemd/user/app-io.github.simonfalke.Lumen.service
 }
 
 # process arguments
-if [ "x$1" == "xhelp" ] || [ "x$1" == "x--help" ] || [ "x$1" == "x-h" ] ; then
+case "${1:-}" in
+  help|--help|-h)
     help
     exit $?
-fi
-
-if [ "x$1" == "xinstall" ] || [ "x$1" == "x--install" ] || [ "x$1" == "x-i" ] ; then
+    ;;
+  install|--install|-i)
     install
     exit $?
-fi
-
-if [ "x$1" == "xremove" ] || [ "x$1" == "x--remove" ] || [ "x$1" == "x-r" ] ; then
+    ;;
+  remove|--remove|-r)
     remove
     exit $?
-fi
+    ;;
+esac
 
-# create config directory if it doesn't exist
-# https://github.com/LizardByte/Sunshine/issues/324
-mkdir -p ~/.config/sunshine
-
-# run sunshine
-"$SUNSHINE_BIN_HERE" $@
+# Lumen owns its staged, symlink-safe legacy configuration import.
+"$LUMEN_BIN_HERE" "$@"

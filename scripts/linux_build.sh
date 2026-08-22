@@ -19,9 +19,9 @@ cuda_system_package=0
 cuda_system_package_name=""
 force_cuda_runfile=0
 num_processors=$(nproc)
-publisher_name="Third Party Publisher"
-publisher_website=""
-publisher_issue_url="https://app.lizardbyte.dev/support"
+publisher_name="simonfalke"
+publisher_website="https://github.com/simonfalke-01/Lumen"
+publisher_issue_url="https://github.com/simonfalke-01/Lumen/issues"
 skip_cleanup=0
 skip_cuda=0
 skip_libva=0
@@ -187,7 +187,7 @@ Options:
   --publisher-name         The name of the publisher (not developer) of the application.
   --publisher-website      The URL of the publisher's website.
   --publisher-issue-url    The URL of the publisher's support site or issue tracker.
-                           If you provide a modified version of Sunshine, we kindly request that you use your own url.
+                           If you provide a modified version of Lumen, use your own project URL.
   --skip-cleanup           Do not restore the original gcc alternatives, or the math-vector.h file.
   --skip-cuda              Skip CUDA installation.
   --skip-libva             Skip libva installation. This will automatically be enabled if passing --appimage-build.
@@ -695,8 +695,8 @@ function run_step_cmake() {
     "-DBUILD_WERROR=ON"
     "-DCMAKE_BUILD_TYPE=Release"
     "-DCMAKE_INSTALL_PREFIX=/usr"
-    "-DSUNSHINE_ASSETS_DIR=share/sunshine"
-    "-DSUNSHINE_EXECUTABLE_PATH=/usr/bin/sunshine"
+    "-DSUNSHINE_ASSETS_DIR=share/lumen"
+    "-DSUNSHINE_EXECUTABLE_PATH=/usr/bin/lumen"
     "-DSUNSHINE_ENABLE_DRM=ON"
     "-DSUNSHINE_ENABLE_KWIN=ON"
     "-DSUNSHINE_ENABLE_PORTAL=ON"
@@ -710,13 +710,13 @@ function run_step_cmake() {
 
   # Publisher metadata
   if [[ -n "$publisher_name" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_NAME='${publisher_name}'")
+    cmake_args+=("-DSUNSHINE_PUBLISHER_NAME=${publisher_name}")
   fi
   if [[ -n "$publisher_website" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_WEBSITE='${publisher_website}'")
+    cmake_args+=("-DSUNSHINE_PUBLISHER_WEBSITE=${publisher_website}")
   fi
   if [[ -n "$publisher_issue_url" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_ISSUE_URL='${publisher_issue_url}'")
+    cmake_args+=("-DSUNSHINE_PUBLISHER_ISSUE_URL=${publisher_issue_url}")
   fi
 
   # Handle doxygen docs flag
@@ -747,11 +747,11 @@ function run_step_validation() {
   echo "Running step: Validation"
 
   # Run appstream validation, etc.
-  appstreamcli validate "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
-  appstream-util validate "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
-  desktop-file-validate "build/dev.lizardbyte.app.Sunshine.desktop"
+  appstreamcli validate "build/io.github.simonfalke.Lumen.metainfo.xml"
+  appstream-util validate "build/io.github.simonfalke.Lumen.metainfo.xml"
+  desktop-file-validate "build/io.github.simonfalke.Lumen.desktop"
   if [[ "$appimage_build" == 0 ]]; then
-    desktop-file-validate "build/dev.lizardbyte.app.Sunshine.terminal.desktop"
+    desktop-file-validate "build/io.github.simonfalke.Lumen.terminal.desktop"
   fi
   return 0
 }
