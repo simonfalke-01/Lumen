@@ -133,7 +133,7 @@ assert_file_contains_literal(
 assert_file_contains_literal(
     "tools/lumen-vmicctl.cpp"
     [=[PKEY_Device_FriendlyName]=]
-    "The helper must validate the active capture endpoint")
+    "The helper must retain the endpoint display name for diagnostics")
 assert_file_contains_literal(
     "tools/lumen-vmicctl.cpp"
     [=[constexpr int kReadyWaitAttempts = 300;]=]
@@ -141,23 +141,15 @@ assert_file_contains_literal(
 assert_file_contains_literal(
     "tools/lumen-vmicctl.cpp"
     [=[PKEY_DeviceInterface_FriendlyName]=]
-    "The helper must retain adapter names for endpoint diagnostics")
+    "The helper must read the INF-owned audio-adapter identity")
 assert_file_contains_literal(
     "tools/lumen-vmicctl.cpp"
-    [=[PKEY_Device_InstanceId]=]
-    "The helper must read the immutable Core Audio endpoint instance ID")
-assert_file_contains_literal(
-    "tools/lumen-vmicctl.cpp"
-    [=[CM_Locate_DevNodeW(]=]
-    "The helper must resolve the endpoint instance ID to a PnP node")
-assert_file_contains_literal(
-    "tools/lumen-vmicctl.cpp"
-    [=[CM_Get_Parent(&parent, current, 0)]=]
-    "The helper must verify immutable endpoint ancestry")
+    [=[_wcsicmp(adapter_name.pwszVal, kAdapterFriendlyName) == 0]=]
+    "The helper must match the exact INF-owned adapter name")
 assert_file_excludes(
     "tools/lumen-vmicctl.cpp"
-    "endpoint_name_matches"
-    "Mutable endpoint names must not establish VMIC ownership")
+    "PKEY_Device_InstanceId"
+    "The helper must not require the absent MMDevice instance-ID property")
 foreach(virtual_microphone_readiness_field IN ITEMS
         "roots_ready="
         "tree_ready="
@@ -165,8 +157,7 @@ foreach(virtual_microphone_readiness_field IN ITEMS
         "control_ready="
         "endpoint_property_hresult="
         "endpoint_names="
-        "adapter_names="
-        "endpoint_instance_ids=")
+        "adapter_names=")
     assert_file_contains_literal(
         "tools/lumen-vmicctl.cpp"
         "${virtual_microphone_readiness_field}"
