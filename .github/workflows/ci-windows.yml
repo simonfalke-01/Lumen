@@ -543,11 +543,11 @@ jobs:
             throw "Virtual Microphone driver build failed with exit code $LASTEXITCODE."
           }
 
-          $driverBinaries = @(Get-ChildItem $binaryDirectory -Recurse -File -Filter 'LumenVirtualMicrophone.sys')
-          if ($driverBinaries.Count -ne 1) {
-            throw "Expected exactly one Virtual Microphone SYS; found $($driverBinaries.Count)."
+          $driverBinaryPath = Join-Path $binaryDirectory 'LumenVirtualMicrophone.sys'
+          if (-not (Test-Path -LiteralPath $driverBinaryPath -PathType Leaf)) {
+            throw "Virtual Microphone SYS was not produced at $driverBinaryPath."
           }
-          Copy-Item $sourceInf, $driverBinaries[0].FullName -Destination $packageDirectory
+          Copy-Item $sourceInf, $driverBinaryPath -Destination $packageDirectory
 
           $packagedInf = Join-Path $packageDirectory 'LumenVirtualMicrophone.inf'
           $packagedInfContents = Get-Content -LiteralPath $packagedInf -Raw
