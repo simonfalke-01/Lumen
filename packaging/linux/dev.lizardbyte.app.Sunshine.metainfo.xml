@@ -27,7 +27,6 @@
     <p>
       <code>flatpak run --command=additional-install.sh @PROJECT_FQDN@</code>
     </p>
-    <p>NOTE: Lumen uses a self-signed certificate for its local web interface.</p>
   </description>
 
   <releases>

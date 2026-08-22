@@ -135,11 +135,6 @@ jobs:
               <<< "$assets")
           done
 
-          if [[ "$IS_PRERELEASE" == 'true' ]]; then
-            signing_status='self-signed-per-run'
-            security_warning='The application and MSI are unsigned. The optional Virtual HID driver uses a per-run self-signed certificate.'
-          fi
-
           jq -n \
             --arg product 'Lumen' \
             --arg repository "$RELEASE_REPOSITORY" \
@@ -148,8 +143,6 @@ jobs:
             --arg channel "$([[ "$IS_PRERELEASE" == 'true' ]] && echo prerelease || echo stable)" \
             --arg published_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             --arg release_url "https://github.com/${RELEASE_REPOSITORY}/releases/tag/${RELEASE_TAG}" \
-            --arg signing_status "$signing_status" \
-            --arg security_warning "$security_warning" \
             --argjson assets "$assets" \
             '{
               schema_version: 1,
@@ -160,12 +153,6 @@ jobs:
               channel: $channel,
               published_at: $published_at,
               release_url: $release_url,
-              security: {
-                application: "unsigned",
-                msi: "unsigned",
-                vhid_certificate: $signing_status,
-                warning: $security_warning
-              },
               assets: $assets
             }' > release-assets/update-manifest.json
 
@@ -186,13 +173,6 @@ jobs:
             -f tag_name="$RELEASE_TAG" \
             --jq '.body')
 
-          if [[ "$IS_PRERELEASE" == 'true' ]]; then
-            cat > release-notes.md <<'EOF'
-          > [!WARNING]
-          > This prerelease application and MSI are not code-signed. The optional Virtual HID driver uses a per-run self-signed certificate. Review the certificate warning before enabling it.
-
-          EOF
-          fi
           printf '%s\n' "$generated_notes" >> release-notes.md
 
           ref_json=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")

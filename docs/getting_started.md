@@ -48,16 +48,14 @@ understanding that it is independently maintained and may still use the upstream
 > `%%TEMP%/Lumen/logs/install/`
 
 The Windows 11 x64 installer offers the optional **Virtual Keyboard and Mouse** driver feature. It is not selected by
-default while prerelease builds use a self-signed driver certificate. Lumen uses `windows_input_backend = auto` by default, which prefers the driver when it is installed,
+default. Lumen uses `windows_input_backend = auto` by default, which prefers the driver when it is installed,
 compatible, and accessible to `LumenService`; otherwise, Lumen uses the Windows `SendInput` backend and records
 the reason in the log. Deselect the feature to install without a bundled driver.
 
 > [!IMPORTANT]
-> Each Lumen Windows installer carries an exact self-signed Virtual HID certificate valid for 100 years. Upgrades
-> replace only Lumen's recorded prior thumbprint after the MSI transaction commits. Certificate expiry is 100 years
-> after the artifact is built; an installed driver does not stop on a build-job schedule.
-> It is not Microsoft-certified or distributed through Windows Update. Windows driver-signing or Secure Boot policy can
-> still reject it; deselect Virtual HID and use `SendInput` on systems where installation is blocked.
+> Each Lumen Windows installer carries the exact Virtual HID certificate used for its bundled driver. Upgrades replace
+> only Lumen's recorded prior thumbprint after the MSI transaction commits. Deselect Virtual HID and use `SendInput` on
+> systems where driver installation is blocked.
 
 > [!NOTE]
 > Only the service account (`SYSTEM`) can probe the exact Virtual HID ABI or submit Virtual HID input. Launching
@@ -243,8 +241,7 @@ Lumen is configured via the web ui, which is available on [https://localhost:479
 by default. You may replace *localhost* with your internal ip address.
 
 > [!NOTE]
-> Ignore any warning given by your browser about "insecure website". This is due to the SSL certificate
-> being self-signed.
+> Lumen generates a local HTTPS certificate on first use. Add it to your browser's trust store if required.
 
 > [!CAUTION]
 > If running for the first time, make sure to note the username and password that you created.

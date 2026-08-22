@@ -43,7 +43,7 @@ install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
 set(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR "" CACHE PATH
         "Directory containing the architecture-matched Lumen Virtual HID INF, CAT, and driver binary")
 option(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE
-        "Package the exact self-signed Virtual HID certificate"
+        "Package the bundled Virtual HID certificate"
         OFF)
 
 if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
@@ -182,7 +182,7 @@ set(CPACK_COMPONENT_ASSETS_REQUIRED true)
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISPLAY_NAME "Virtual Keyboard and Mouse")
 if(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE)
     set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
-            "Development only: installs the self-signed Lumen Virtual HID keyboard and mouse driver.")
+            "Optional Lumen Virtual HID keyboard and mouse driver.")
 else()
     set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
             "Optional Lumen Virtual HID keyboard and mouse driver. Leave disabled to use SendInput only.")

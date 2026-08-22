@@ -141,7 +141,7 @@ namespace crypto {
   bool verify256(const x509_t &x509, const std::string_view &data, const std::string_view &signature);
 
   /**
-   * @brief Generate a self-signed certificate and private key for Sunshine pairing.
+   * @brief Generate a certificate and private key for Sunshine pairing.
    *
    * @param cn Common name to place in the generated certificate.
    * @param key_bits Size in bits of the generated RSA key.

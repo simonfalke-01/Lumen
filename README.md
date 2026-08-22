@@ -10,7 +10,7 @@
 
 <div align="center">
   <a href="https://github.com/simonfalke-01/Lumen"><img src="https://img.shields.io/github/stars/simonfalke-01/Lumen.svg?logo=github&style=for-the-badge" alt="GitHub stars"></a>
-  <a href="https://github.com/simonfalke-01/Lumen/releases/latest"><img src="https://img.shields.io/github/v/release/simonfalke-01/Lumen?style=for-the-badge&logo=github" alt="GitHub release"></a>
+  <a href="https://github.com/simonfalke-01/Lumen/releases"><img src="https://img.shields.io/github/v/release/simonfalke-01/Lumen?include_prereleases&sort=semver&style=for-the-badge&logo=github" alt="GitHub release"></a>
 </div>
 
 ## ℹ️ About

@@ -40,15 +40,10 @@ The current application implements release discovery and a trusted repository-sc
 download, verify, or execute installers automatically. Prerelease installations follow newer prereleases by default;
 stable installations only consider prereleases when the existing opt-in setting is enabled.
 
-## Signing and stable-release gate
+## Stable-release gate
 
-Prerelease applications and MSI packages are currently unsigned. They may bundle a per-run self-signed Virtual HID
-driver certificate; the release notes and update manifest call this out explicitly, and Virtual HID installation
-remains opt-in.
-
-Stable `vX.Y.Z` publication is hard-disabled. Enabling stable releases requires implementation steps that sign and
-verify the application, MSI, catalog, and Virtual HID driver inside the release workflow. An operator variable is not
-accepted as proof of signing. Until those steps exist and are reviewed, publish only prerelease versions.
+Stable `vX.Y.Z` publication is hard-disabled until the production release requirements are implemented and reviewed.
+Until then, publish only prerelease versions.
 
 ## Verify downloaded artifacts
 

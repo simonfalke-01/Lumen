@@ -72,8 +72,8 @@ namespace crypto {
       X509_STORE_CTX_set_verify_cb(_cert_ctx.get(), openssl_verify_cb);
 
       // We don't care to validate the entire chain for the purposes of client auth.
-      // Some versions of clients forked from Moonlight Embedded produce client certs
-      // that OpenSSL doesn't detect as self-signed due to some X509v3 extensions.
+      // Some clients forked from Moonlight Embedded produce leaf certificates
+      // whose X509v3 extensions OpenSSL does not recognize as a complete chain.
       X509_STORE_CTX_set_flags(_cert_ctx.get(), X509_V_FLAG_PARTIAL_CHAIN);
 
       auto err = X509_verify_cert(_cert_ctx.get());
@@ -467,7 +467,7 @@ namespace crypto {
   }
 
   /**
-   * @brief Generate a self-signed certificate and private key for Sunshine pairing.
+   * @brief Generate a certificate and private key for Sunshine pairing.
    */
   creds_t gen_creds(const std::string_view &cn, std::uint32_t key_bits) {
     x509_t x509 {X509_new()};

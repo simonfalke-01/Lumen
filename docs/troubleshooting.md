@@ -321,10 +321,9 @@ If the helper reports that the driver is missing, incompatible, or unusable, rer
 installer and select repair. Installer and repair logs are stored in `%%TEMP%/Lumen/logs/install/`; uninstall logs
 are stored in `%%TEMP%/Lumen/logs/uninstall/`. The helper is not included in standalone/lite packages.
 
-Lumen Windows installers use an exact self-signed driver certificate valid for 100 years and trust only its exact
-thumbprint. A committed upgrade removes only the exact previously recorded Lumen signer. Certificate expiry is 100
-years after the artifact is built. The package is not Microsoft-certified. Windows driver-signing or Secure Boot policy can still reject it; use the
-optional SendInput-only installation when that policy blocks Virtual HID.
+Lumen Windows installers trust only the exact bundled driver certificate thumbprint. A committed upgrade removes only
+the exact previously recorded Lumen signer. Use the optional SendInput-only installation when system policy blocks
+Virtual HID.
 
 > [!NOTE]
 > A direct Lumen launch cannot access the Virtual HID report interface, even when run as Administrator. Run the

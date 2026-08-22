@@ -222,13 +222,10 @@ driver. To include it in an installer, supply its package directory with
 Lumen remains usable with `windows_input_backend = sendinput`.
 
 A Lumen Windows package contains the x64 `LumenVirtualHid.inf`, `LumenVirtualHid.cat`, `LumenVirtualHid.dll`, and
-an exact self-signed `.cer` file valid for 100 years when configured with
-`SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON`. Setup trusts only that certificate. A committed upgrade replaces only
-the recorded prior Lumen signer, and a committed uninstall removes only the recorded thumbprint. Certificate expiry is
-100 years after the artifact is built. This is intentionally not Microsoft certification or Windows Update distribution.
-Windows policy may still reject a self-signed driver on systems whose
-driver-signing or Secure Boot policy does not allow it; users can deselect Virtual HID and use `SendInput`. The Windows
-ARM64 application build has no Virtual HID driver package and uses `SendInput`.
+a bundled `.cer` file when configured with `SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON`. Setup trusts only that
+certificate. A committed upgrade replaces only the recorded prior Lumen signer, and a committed uninstall removes
+only the recorded thumbprint. Users can deselect Virtual HID and use `SendInput`. The Windows ARM64 application build
+has no Virtual HID driver package and uses `SendInput`.
 
 ### Clone
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:
