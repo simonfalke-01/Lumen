@@ -118,8 +118,8 @@ extern "C" {
     uint8_t buttons;  ///< Complete buttons 1-5 snapshot; high bits must be zero.
     int16_t x;  ///< Relative horizontal delta.
     int16_t y;  ///< Relative vertical delta.
-    int16_t vertical_wheel;  ///< Relative vertical wheel delta.
-    int16_t horizontal_wheel;  ///< Relative Consumer AC Pan delta.
+    int16_t vertical_wheel;  ///< Relative vertical HID wheel detents.
+    int16_t horizontal_wheel;  ///< Relative Consumer AC Pan HID detents.
   } LUMEN_VHID_RELATIVE_MOUSE_REPORT;
 
   /** Complete Consumer Control input report, including its report ID. */

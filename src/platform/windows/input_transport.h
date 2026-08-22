@@ -91,14 +91,14 @@ namespace platf::win_input {
 
     /**
      * @brief Inject vertical wheel movement.
-     * @param distance Wheel delta.
+     * @param distance Windows high-resolution wheel delta; 120 units represent one detent.
      * @return Operation result.
      */
     virtual result_t vertical_scroll(std::int32_t distance) = 0;
 
     /**
      * @brief Inject horizontal wheel movement.
-     * @param distance Wheel delta.
+     * @param distance Windows high-resolution wheel delta; 120 units represent one detent.
      * @return Operation result.
      */
     virtual result_t horizontal_scroll(std::int32_t distance) = 0;

@@ -583,19 +583,31 @@ TEST_F(virtual_hid_input_test, RoutesAbsoluteMouseAndUnicodeThroughSendInputWhil
   EXPECT_EQ(fallback_api->submitted[2].ki.dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
 }
 
-TEST_F(virtual_hid_input_test, BuildsSegmentedRelativeMouseAndWheelReports) {
+TEST_F(virtual_hid_input_test, BuildsSegmentedRelativeMouseReports) {
   initialize();
 
   ASSERT_TRUE(transport->move_mouse(40000, -40000));
-  ASSERT_TRUE(transport->horizontal_scroll(40000));
 
-  ASSERT_EQ(channel->submissions.size(), 4);
+  ASSERT_EQ(channel->submissions.size(), 2);
   EXPECT_EQ(channel->submissions[0].report.relative_mouse.x, 32767);
   EXPECT_EQ(channel->submissions[0].report.relative_mouse.y, -32768);
   EXPECT_EQ(channel->submissions[1].report.relative_mouse.x, 7233);
   EXPECT_EQ(channel->submissions[1].report.relative_mouse.y, -7232);
-  EXPECT_EQ(channel->submissions[2].report.relative_mouse.horizontal_wheel, 32767);
-  EXPECT_EQ(channel->submissions[3].report.relative_mouse.horizontal_wheel, 7233);
+}
+
+TEST_F(virtual_hid_input_test, RoutesWheelThroughSendInputWhileVirtualHidHealthy) {
+  initialize();
+
+  ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA));
+  ASSERT_TRUE(transport->horizontal_scroll(-37));
+
+  EXPECT_TRUE(channel->submissions.empty());
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
+  ASSERT_EQ(fallback_api->submitted.size(), 2);
+  EXPECT_EQ(fallback_api->submitted[0].mi.dwFlags, MOUSEEVENTF_WHEEL);
+  EXPECT_EQ(fallback_api->submitted[0].mi.mouseData, static_cast<DWORD>(WHEEL_DELTA));
+  EXPECT_EQ(fallback_api->submitted[1].mi.dwFlags, MOUSEEVENTF_HWHEEL);
+  EXPECT_EQ(fallback_api->submitted[1].mi.mouseData, static_cast<DWORD>(-37));
 }
 
 TEST_P(virtual_hid_mouse_button_test, MapsPressAndReleaseToHidBitmap) {
@@ -684,6 +696,8 @@ TEST_F(virtual_hid_input_test, FailsClosedAfterAnyAcceptedVirtualReport) {
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::fail_closed);
   EXPECT_TRUE(fallback_api->submitted.empty());
   EXPECT_FALSE(transport->absolute_mouse(1, 1, 100, 100));
+  EXPECT_FALSE(transport->vertical_scroll(WHEEL_DELTA));
+  EXPECT_FALSE(transport->horizontal_scroll(WHEEL_DELTA));
   EXPECT_FALSE(transport->unicode("a", 1));
   EXPECT_FALSE(transport->keyboard(VK_PACKET, false, 0));
   EXPECT_TRUE(fallback_api->submitted.empty());

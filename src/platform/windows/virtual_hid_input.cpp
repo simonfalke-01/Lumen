@@ -725,68 +725,21 @@ namespace platf::win_input {
 
   result_t virtual_hid_transport_t::vertical_scroll(std::int32_t distance) {
     std::lock_guard lock(mutex_);
-    if (backend_.load() == backend_t::send_input) {
-      return fallback_->vertical_scroll(distance);
-    }
-    if (backend_.load() != backend_t::virtual_hid) {
+    if (backend_.load() == backend_t::fail_closed) {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
-
-    std::int64_t remaining = distance;
-    bool submit_zero = remaining == 0;
-    do {
-      const auto segment = std::clamp<std::int64_t>(
-        remaining,
-        std::numeric_limits<std::int16_t>::min(),
-        std::numeric_limits<std::int16_t>::max()
-      );
-      LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
-      request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
-      request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-      request.report.relative_mouse.buttons = held_buttons_;
-      request.report.relative_mouse.vertical_wheel = static_cast<std::int16_t>(segment);
-      const auto result = submit_report(request, "vertical wheel report");
-      if (!result) {
-        return backend_.load() == backend_t::send_input ? fallback_->vertical_scroll(distance) : result;
-      }
-      acknowledged_buttons_ = held_buttons_;
-      remaining -= segment;
-      submit_zero = false;
-    } while (remaining != 0 || submit_zero);
-    return {};
+    // SendInput preserves Moonlight's 120-unit detents and fractional deltas;
+    // the HID wheel field represents whole detents instead.
+    return fallback_->vertical_scroll(distance);
   }
 
   result_t virtual_hid_transport_t::horizontal_scroll(std::int32_t distance) {
     std::lock_guard lock(mutex_);
-    if (backend_.load() == backend_t::send_input) {
-      return fallback_->horizontal_scroll(distance);
-    }
-    if (backend_.load() != backend_t::virtual_hid) {
+    if (backend_.load() == backend_t::fail_closed) {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
-
-    std::int64_t remaining = distance;
-    bool submit_zero = remaining == 0;
-    do {
-      const auto segment = std::clamp<std::int64_t>(
-        remaining,
-        std::numeric_limits<std::int16_t>::min(),
-        std::numeric_limits<std::int16_t>::max()
-      );
-      LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
-      request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
-      request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-      request.report.relative_mouse.buttons = held_buttons_;
-      request.report.relative_mouse.horizontal_wheel = static_cast<std::int16_t>(segment);
-      const auto result = submit_report(request, "horizontal wheel report");
-      if (!result) {
-        return backend_.load() == backend_t::send_input ? fallback_->horizontal_scroll(distance) : result;
-      }
-      acknowledged_buttons_ = held_buttons_;
-      remaining -= segment;
-      submit_zero = false;
-    } while (remaining != 0 || submit_zero);
-    return {};
+    // AC Pan has the same whole-detent HID semantics as the vertical wheel.
+    return fallback_->horizontal_scroll(distance);
   }
 
   result_t virtual_hid_transport_t::keyboard(std::uint16_t modcode, bool release, std::uint8_t flags) {
