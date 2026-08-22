@@ -86,6 +86,7 @@ TEST(LumenBrandingTest, KeepsExistingCanonicalConfig) {
   std::string canonical_contents;
   std::getline(canonical_stream, canonical_contents);
   EXPECT_EQ(canonical_contents, "port = 49000");
+  canonical_stream.close();
   std::filesystem::remove_all(test_directory);
 }
 

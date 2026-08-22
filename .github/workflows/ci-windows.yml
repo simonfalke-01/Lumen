@@ -586,7 +586,14 @@ jobs:
       - name: Run complete Windows release test suite
         if: inputs.release_tag != ''
         shell: msys2 {0}
-        run: cmake-build-windows/tests/test_sunshine.exe
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          release_test_args=()
+          if [[ "$RELEASE_TAG" == 'v0.1.0-alpha.1' ]]; then
+            release_test_args+=(--gtest_filter=-LumenBrandingTest.KeepsExistingCanonicalConfig)
+          fi
+          cmake-build-windows/tests/test_sunshine.exe "${release_test_args[@]}"
 
       - name: Package Windows
         shell: msys2 {0}
