@@ -5,7 +5,11 @@
 #pragma once
 
 // standard includes
+#include <array>
 #include <atomic>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 
 // local includes
 #include "crypto.h"
@@ -13,6 +17,43 @@
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
+
+  /**
+   * @brief Exact SDP attributes advertising Lumen client-microphone version one.
+   */
+  inline constexpr std::string_view CLIENT_MICROPHONE_DESCRIBE_ATTRIBUTES =
+    "a=x-lumen-mic.version:1\r\n"
+    "a=x-lumen-mic.codec:opus\r\n"
+    "a=x-lumen-mic.sampleRate:48000\r\n"
+    "a=x-lumen-mic.channels:1\r\n"
+    "a=x-lumen-mic.packetDurationMs:20\r\n"
+    "a=x-lumen-mic.crypto:aes-256-gcm\r\n"
+    "a=x-lumen-mic.fec:opus-inband\r\n";
+
+  /**
+   * @brief Validate the complete Umbra microphone ANNOUNCE extension.
+   *
+   * @param attributes Parsed SDP attribute name/value pairs.
+   * @return `true` only when every required version-one value is present and exact.
+   */
+  [[nodiscard]] bool validate_client_microphone_announce(
+    const std::unordered_map<std::string_view, std::string_view> &attributes
+  );
+
+  /**
+   * @brief Determine whether an RTSP target requests the version-one Lumen microphone stream.
+   *
+   * @param target Complete RTSP SETUP request target.
+   * @return `true` only for the `streamid=lumen-mic/1/0` media target.
+   */
+  [[nodiscard]] bool is_client_microphone_setup_target(std::string_view target);
+
+  /**
+   * @brief Encode a microphone session identifier or salt as forward lowercase hexadecimal.
+   * @param bytes Exact 16-byte RTSP microphone credential.
+   * @return Thirty-two lowercase hexadecimal characters in input byte order.
+   */
+  [[nodiscard]] std::string encode_client_microphone_hex(const std::array<std::uint8_t, 16> &bytes);
 
   /**
    * @brief RTSP launch session state shared with stream setup.
@@ -38,6 +79,10 @@ namespace rtsp_stream {
     bool continuous_audio;  ///< Whether audio packets continue during silence.
     bool enable_hdr;  ///< Whether HDR streaming is requested.
     bool enable_sops;  ///< Whether sequence output protection is requested.
+
+    bool client_microphone_setup {};  ///< Whether the client completed version-one microphone SETUP.
+    std::array<std::uint8_t, 16> client_microphone_session_id {};  ///< Public microphone UDP routing identifier.
+    std::array<std::uint8_t, 16> client_microphone_salt {};  ///< Independent HKDF salt for microphone key derivation.
 
     std::optional<crypto::cipher::gcm_t> rtsp_cipher;  ///< AES-GCM cipher used once encrypted RTSP is negotiated.
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.

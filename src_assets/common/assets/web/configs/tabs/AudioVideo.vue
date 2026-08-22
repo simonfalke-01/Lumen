@@ -64,6 +64,14 @@ const config = ref(props.config)
                   v-model="config.install_steam_audio_drivers"
                   default="true"
         ></Checkbox>
+
+        <!-- Client Microphone -->
+        <Checkbox class="mb-3"
+                  id="client_microphone"
+                  locale-prefix="config"
+                  v-model="config.client_microphone"
+                  default="false"
+        ></Checkbox>
       </template>
     </PlatformLayout>
 

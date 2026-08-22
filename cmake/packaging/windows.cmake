@@ -113,6 +113,84 @@ else()
             "Lumen Virtual HID driver package not supplied; installer generation will not include the driver")
 endif()
 
+# Lumen Virtual Microphone driver
+#
+# The WaveRT driver is built separately with MSBuild/WDK. Only an exact x64
+# INF/SYS/CAT package may be supplied to the MSYS2 application packager.
+set(SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR "" CACHE PATH
+        "Directory containing the architecture-matched Lumen Virtual Microphone INF, SYS, and CAT")
+
+if(SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR)
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
+        message(FATAL_ERROR
+                "The current Lumen Virtual Microphone package supports AMD64 packaging only")
+    endif()
+    if(NOT IS_DIRECTORY "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
+        message(FATAL_ERROR
+                "SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR does not exist: "
+                "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
+    endif()
+
+    set(VIRTUAL_MICROPHONE_DRIVER_INF
+            "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.inf")
+    set(VIRTUAL_MICROPHONE_DRIVER_SYS
+            "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.sys")
+    set(VIRTUAL_MICROPHONE_DRIVER_CAT
+            "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.cat")
+    set(VIRTUAL_MICROPHONE_DRIVER_FILES
+            "${VIRTUAL_MICROPHONE_DRIVER_INF}"
+            "${VIRTUAL_MICROPHONE_DRIVER_SYS}"
+            "${VIRTUAL_MICROPHONE_DRIVER_CAT}")
+
+    foreach(VIRTUAL_MICROPHONE_DRIVER_FILE IN LISTS VIRTUAL_MICROPHONE_DRIVER_FILES)
+        if(NOT EXISTS "${VIRTUAL_MICROPHONE_DRIVER_FILE}")
+            message(FATAL_ERROR
+                    "The Lumen Virtual Microphone package is missing: ${VIRTUAL_MICROPHONE_DRIVER_FILE}")
+        endif()
+    endforeach()
+
+    file(GLOB VIRTUAL_MICROPHONE_DRIVER_PACKAGE_FILES
+            LIST_DIRECTORIES false
+            "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/*")
+    list(LENGTH VIRTUAL_MICROPHONE_DRIVER_PACKAGE_FILES VIRTUAL_MICROPHONE_DRIVER_PACKAGE_FILE_COUNT)
+    if(NOT VIRTUAL_MICROPHONE_DRIVER_PACKAGE_FILE_COUNT EQUAL 3)
+        message(FATAL_ERROR
+                "The Lumen Virtual Microphone package must contain exactly "
+                "LumenVirtualMicrophone.inf, LumenVirtualMicrophone.sys, and "
+                "LumenVirtualMicrophone.cat: ${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
+    endif()
+
+    file(READ "${VIRTUAL_MICROPHONE_DRIVER_INF}" VIRTUAL_MICROPHONE_DRIVER_INF_CONTENTS)
+    foreach(VIRTUAL_MICROPHONE_INF_IDENTITY IN ITEMS
+            "ROOT\\LumenVirtualMicrophone"
+            "NTamd64"
+            "LumenVirtualMicrophone.sys")
+        string(FIND
+                "${VIRTUAL_MICROPHONE_DRIVER_INF_CONTENTS}"
+                "${VIRTUAL_MICROPHONE_INF_IDENTITY}"
+                VIRTUAL_MICROPHONE_INF_IDENTITY_OFFSET)
+        if(VIRTUAL_MICROPHONE_INF_IDENTITY_OFFSET EQUAL -1)
+            message(FATAL_ERROR
+                    "The Lumen Virtual Microphone INF does not match this package: "
+                    "missing ${VIRTUAL_MICROPHONE_INF_IDENTITY}")
+        endif()
+    endforeach()
+
+    if(NOT TARGET lumen-vmicctl)
+        message(FATAL_ERROR
+                "The lumen-vmicctl target is required when packaging the Lumen Virtual Microphone driver")
+    endif()
+    install(TARGETS lumen-vmicctl
+            RUNTIME DESTINATION "tools"
+            COMPONENT virtual_microphone_driver)
+    install(FILES ${VIRTUAL_MICROPHONE_DRIVER_FILES}
+            DESTINATION "drivers/virtual-microphone"
+            COMPONENT virtual_microphone_driver)
+else()
+    message(STATUS
+            "Lumen Virtual Microphone driver package not supplied; installer generation will not include the driver")
+endif()
+
 # Mandatory scripts. The source filename is retained as a build compatibility
 # alias, but new packages expose only the Lumen script name.
 install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sunshine-setup.ps1"
@@ -191,6 +269,14 @@ set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_GROUP "Core")
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DEPENDS application)
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISABLED true)
 
+# Lumen Virtual Microphone driver and lifecycle helper
+set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_DISPLAY_NAME "Client Microphone Passthrough")
+set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_DESCRIPTION
+        "Optional Lumen virtual capture endpoint for client microphone passthrough.")
+set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_GROUP "Core")
+set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_DEPENDS application)
+set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_DISABLED true)
+
 # ZIP packages are intentionally non-privileged. Keep the driver package and
 # its install/remove helper out of the lite archive so unpacked builds use the
 # SendInput fallback unless a matching driver is already installed.
@@ -203,6 +289,7 @@ string(CONCAT SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT
         "  set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)\n"
         "  set(CPACK_COMPONENTS_ALL \"${SUNSHINE_WINDOWS_PACKAGE_COMPONENTS}\")\n"
         "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_hid_driver)\n"
+        "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_microphone_driver)\n"
         "endif()\n")
 file(GENERATE
         OUTPUT "${SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG}"

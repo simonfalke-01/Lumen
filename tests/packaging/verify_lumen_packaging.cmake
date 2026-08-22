@@ -78,6 +78,10 @@ assert_file_contains(
     "Property Id=\"LUMEN_INSTALL_VHID\" Value=\"0\""
     "Virtual HID must remain explicit opt-in")
 assert_file_contains(
+    "cmake/packaging/wix_resources/sunshine-installer.wxs"
+    "Property Id=\"LUMEN_INSTALL_VMIC\" Value=\"0\""
+    "Virtual Microphone must remain explicit opt-in")
+assert_file_contains(
     "cmake/packaging/wix_resources/patch.xml"
     "Condition=\"NOT Installed AND LUMEN_INSTALL_VHID = 0\""
     "Virtual HID opt-out must not suppress removal of an installed feature")
@@ -85,6 +89,63 @@ assert_file_excludes(
     "cmake/packaging/wix_resources/patch.xml"
     "Condition=\"LUMEN_INSTALL_VHID = 0\""
     "Virtual HID opt-out must only apply during a fresh install")
+assert_file_contains(
+    "cmake/packaging/wix_resources/patch.xml"
+    "CM_C_virtual_microphone_driver"
+    "WiX must patch the optional Virtual Microphone feature")
+assert_file_contains(
+    "cmake/packaging/wix_resources/patch.xml"
+    "NOT Installed AND LUMEN_INSTALL_VMIC = 0"
+    "Virtual Microphone must default off only on fresh installs")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR]=]
+    "Windows packaging must accept an isolated Virtual Microphone package")
+foreach(virtual_microphone_package_file IN ITEMS
+        "LumenVirtualMicrophone.inf"
+        "LumenVirtualMicrophone.sys"
+        "LumenVirtualMicrophone.cat")
+    assert_file_contains_literal(
+        "cmake/packaging/windows.cmake"
+        "${virtual_microphone_package_file}"
+        "Windows packaging must require ${virtual_microphone_package_file}")
+endforeach()
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[DESTINATION "drivers/virtual-microphone"]=]
+    "The Virtual Microphone package must use its isolated directory")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_microphone_driver)]=]
+    "Lite ZIP packages must exclude the Virtual Microphone component")
+assert_file_contains_literal(
+    "tools/CMakeLists.txt"
+    [=[add_executable(lumen-vmicctl lumen-vmicctl.cpp)]=]
+    "Windows builds must produce the microphone lifecycle helper")
+assert_file_contains_literal(
+    "tools/lumen-vmicctl.cpp"
+    [=[LUMEN_VMIC_ROOT_HARDWARE_ID_W]=]
+    "The helper must scope mutations to the exact microphone root")
+assert_file_contains_literal(
+    "tools/lumen-vmicctl.cpp"
+    [=[IOCTL_LUMEN_VMIC_QUERY_ABI]=]
+    "The helper must validate the microphone control ABI")
+assert_file_contains_literal(
+    "tools/lumen-vmicctl.cpp"
+    [=[PKEY_Device_FriendlyName]=]
+    "The helper must validate the active capture endpoint")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[[string]$InstallVirtualMicrophone]=]
+    "Setup must accept MSI microphone feature ownership")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[Start-PersistedVirtualMicrophoneTransaction]=]
+    "Setup must persist microphone rollback state before mutation")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[Invoke-AllPersistedRollbacks]=]
+    "Setup failures must roll back both optional device drivers")
 assert_file_contains(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
     "Target=\"\\[INSTALL_ROOT\\]Lumen.exe\""

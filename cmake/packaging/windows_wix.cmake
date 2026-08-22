@@ -80,6 +80,31 @@ message(STATUS "cpack package directory: ${CPACK_PACKAGE_DIRECTORY}")
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/wix_resources/"
         DESTINATION "${WIX_BUILD_PARENT_DIRECTORY}/")
 
+function(lumen_remove_marked_wix_block file_path start_marker end_marker)
+    file(READ "${file_path}" contents)
+    string(FIND "${contents}" "${start_marker}" start_index)
+    string(FIND "${contents}" "${end_marker}" end_index)
+    if(start_index EQUAL -1 OR end_index EQUAL -1 OR end_index LESS start_index)
+        message(FATAL_ERROR "Missing conditional WiX markers in ${file_path}")
+    endif()
+    string(LENGTH "${end_marker}" end_marker_length)
+    math(EXPR suffix_index "${end_index} + ${end_marker_length}")
+    string(SUBSTRING "${contents}" 0 ${start_index} prefix)
+    string(SUBSTRING "${contents}" ${suffix_index} -1 suffix)
+    file(WRITE "${file_path}" "${prefix}${suffix}")
+endfunction()
+
+if(NOT SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR)
+    lumen_remove_marked_wix_block(
+            "${WIX_BUILD_PARENT_DIRECTORY}/patch.xml"
+            "<!-- LUMEN_VMIC_FEATURE_START -->"
+            "<!-- LUMEN_VMIC_FEATURE_END -->")
+    lumen_remove_marked_wix_block(
+            "${WIX_BUILD_PARENT_DIRECTORY}/sunshine-installer.wxs"
+            "<!-- LUMEN_VMIC_FEATURE_START -->"
+            "<!-- LUMEN_VMIC_FEATURE_END -->")
+endif()
+
 set(CPACK_WIX_EXTRA_SOURCES
         "${WIX_BUILD_PARENT_DIRECTORY}/sunshine-installer.wxs"
 )

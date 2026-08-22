@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('install-no-vhid', 'install-vhid', 'upgrade', 'legacy-import')]
+    [ValidateSet('install-no-vhid', 'install-vhid', 'install-vmic', 'upgrade', 'legacy-import')]
     [string]$Scenario
 )
 
@@ -173,6 +173,45 @@ switch ($Scenario) {
             -FailureMessage 'MSI uninstall with Virtual HID failed.')
         if (Test-Path 'C:\Program Files\Lumen\tools\lumen-vhidctl.exe') {
             throw 'Virtual HID helper remains after MSI uninstall.'
+        }
+    }
+    'install-vmic' {
+        [void](Invoke-Msi `
+            -Arguments @(
+                '/i',
+                "`"$msiPath`"",
+                '/qn',
+                '/norestart',
+                'LUMEN_INSTALL_VHID=0',
+                'LUMEN_INSTALL_VMIC=1'
+            ) `
+            -LogName 'lumen-msi-install-vmic.log' `
+            -FailureMessage 'MSI install with Virtual Microphone failed.')
+        $helper = 'C:\Program Files\Lumen\tools\lumen-vmicctl.exe'
+        & $helper status --json
+        if ($LASTEXITCODE -ne 0) {
+            Get-Content (Join-Path $artifactDirectory 'lumen-msi-install-vmic.log')
+            throw "Virtual Microphone status failed with exit code $LASTEXITCODE."
+        }
+        & $helper probe --json
+        if ($LASTEXITCODE -ne 0) {
+            Get-Content (Join-Path $artifactDirectory 'lumen-msi-install-vmic.log')
+            throw "Virtual Microphone protocol probe failed with exit code $LASTEXITCODE."
+        }
+        [void](Invoke-Msi `
+            -Arguments @('/x', $productCode, '/qn', '/norestart') `
+            -LogName 'lumen-msi-uninstall-vmic.log' `
+            -FailureMessage 'MSI uninstall with Virtual Microphone failed.')
+        if (Test-Path $helper) {
+            throw 'Virtual Microphone helper remains after MSI uninstall.'
+        }
+        $remainingDevices = @(
+            Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+                @($_.HardwareID) -contains 'ROOT\LumenVirtualMicrophone'
+            }
+        )
+        if ($remainingDevices.Count -ne 0) {
+            throw "Virtual Microphone device remains after MSI uninstall: $($remainingDevices.Count)."
         }
     }
     'upgrade' {

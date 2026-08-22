@@ -4,9 +4,14 @@
  */
 
 // standard includes
+#include <array>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <queue>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 // lib includes
 #include <boost/endian/arithmetic.hpp>
@@ -20,6 +25,8 @@ extern "C" {
 }
 
 // local includes
+#include "client_microphone.h"
+#include "client_microphone_protocol.h"
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
@@ -33,6 +40,10 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+
+#ifdef _WIN32
+  #include "platform/windows/virtual_microphone.h"
+#endif
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
@@ -78,6 +89,94 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace stream {
+  bool microphone_replay_window_t::may_accept(std::uint64_t sequence) const {
+    if (!initialized_ || sequence > highest_) {
+      return true;
+    }
+
+    const auto distance = highest_ - sequence;
+    if (distance >= 128) {
+      return false;
+    }
+
+    const auto word = static_cast<std::size_t>(distance / 64);
+    const auto bit = static_cast<unsigned int>(distance % 64);
+    return (bitmap_[word] & (std::uint64_t {1} << bit)) == 0;
+  }
+
+  bool microphone_replay_window_t::would_advance(std::uint64_t sequence) const {
+    return !initialized_ || sequence > highest_;
+  }
+
+  void microphone_replay_window_t::commit(std::uint64_t sequence) {
+    if (!initialized_) {
+      initialized_ = true;
+      highest_ = sequence;
+      bitmap_[0] = 1;
+      bitmap_[1] = 0;
+      return;
+    }
+
+    if (sequence > highest_) {
+      const auto distance = sequence - highest_;
+      if (distance >= 128) {
+        bitmap_ = {1, 0};
+      } else if (distance >= 64) {
+        bitmap_[1] = bitmap_[0] << (distance - 64);
+        bitmap_[0] = 1;
+      } else {
+        bitmap_[1] = (bitmap_[1] << distance) | (bitmap_[0] >> (64 - distance));
+        bitmap_[0] = (bitmap_[0] << distance) | 1;
+      }
+      highest_ = sequence;
+      return;
+    }
+
+    const auto distance = highest_ - sequence;
+    if (distance < 128) {
+      const auto word = static_cast<std::size_t>(distance / 64);
+      const auto bit = static_cast<unsigned int>(distance % 64);
+      bitmap_[word] |= std::uint64_t {1} << bit;
+    }
+  }
+
+  void microphone_replay_window_t::reset() {
+    bitmap_ = {};
+    highest_ = 0;
+    initialized_ = false;
+  }
+
+  bool microphone_endpoint_tracker_t::accept_authenticated(const udp::endpoint &endpoint, bool hello) {
+    if (!claimed_ && !hello) {
+      return false;
+    }
+
+    endpoint_ = endpoint;
+    claimed_ = true;
+    return true;
+  }
+
+  bool microphone_endpoint_tracker_t::claimed() const {
+    return claimed_;
+  }
+
+  const udp::endpoint &microphone_endpoint_tracker_t::endpoint() const {
+    return endpoint_;
+  }
+
+  void microphone_endpoint_tracker_t::reset() {
+    endpoint_ = {};
+    claimed_ = false;
+  }
+
+  bool client_microphone_available() {
+#ifdef _WIN32
+    auto microphone = platf::win_audio::make_virtual_microphone();
+    return microphone && microphone->probe();
+#else
+    return false;
+#endif
+  }
 
   /**
    * @brief Enumerates supported socket options.
@@ -451,6 +550,29 @@ namespace stream {
   /**
    * @brief UDP broadcast socket and target address state.
    */
+  struct microphone_datagram_t {
+    std::vector<std::uint8_t> bytes;  ///< Complete LMC1 datagram bytes.
+    udp::endpoint peer;  ///< Source endpoint supplied by the UDP socket.
+  };
+
+  /**
+   * @brief Bounded per-session queue carrying routed microphone datagrams.
+   */
+  using microphone_queue_t = std::shared_ptr<safe::queue_t<microphone_datagram_t>>;
+
+  /**
+   * @brief Convert a binary microphone session identifier into a map key.
+   *
+   * @param session_id Exact 16-byte session identifier.
+   * @return Binary string preserving every identifier byte.
+   */
+  std::string client_microphone_route_key(const std::array<std::uint8_t, 16> &session_id) {
+    return {
+      reinterpret_cast<const char *>(session_id.data()),
+      session_id.size()
+    };
+  }
+
   struct broadcast_ctx_t {
     message_queue_queue_t message_queue_queue;  ///< Queues carrying encoded video and audio packets to sender threads.
 
@@ -458,11 +580,16 @@ namespace stream {
     std::jthread video_thread;  ///< Thread that sends encoded video packets.
     std::jthread audio_thread;  ///< Thread that sends encoded audio packets.
     std::jthread control_thread;  ///< Thread that runs the ENet control server.
+    std::jthread microphone_thread;  ///< Thread that routes reverse client microphone UDP datagrams.
 
     asio::io_context io_context;  ///< Asio context used by the UDP broadcast sockets.
 
     udp::socket video_sock {io_context};  ///< UDP socket bound for video packet transmission.
     udp::socket audio_sock {io_context};  ///< UDP socket bound for audio packet transmission.
+    udp::socket microphone_sock {io_context};  ///< UDP socket bound for client microphone input.
+
+    sync_util::sync_t<std::unordered_map<std::string, std::weak_ptr<session_t>>> microphone_routes;  ///< Session-ID routes for reverse microphone UDP traffic.
+    std::atomic_bool microphone_bound {};  ///< Whether the optional microphone UDP socket is bound and accepting datagrams.
 
     control_server_t control_server;  ///< ENet server for GameStream control packets.
   };
@@ -479,6 +606,7 @@ namespace stream {
 
     std::jthread audioThread;  ///< Audio thread.
     std::jthread videoThread;  ///< Video thread.
+    std::jthread microphoneThread;  ///< Optional client microphone authentication, decode, and injection thread.
 
     std::chrono::steady_clock::time_point pingTimeout;  ///< Deadline for receiving the next client ping.
 
@@ -533,6 +661,22 @@ namespace stream {
       platf::feedback_queue_t feedback_queue;
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
     } control;  ///< Runtime state for the encrypted GameStream control channel.
+
+    struct {
+      std::array<std::uint8_t, 16> session_id {};  ///< Public routing identifier returned by SETUP.
+      std::array<std::uint8_t, 16> salt {};  ///< HKDF salt returned by SETUP.
+      std::array<std::uint8_t, 4> nonce_prefix {};  ///< HKDF-derived GCM nonce prefix.
+      std::optional<crypto::aes_256_gcm_t> cipher;  ///< Microphone-specific AES-256-GCM key.
+      microphone_replay_window_t replay;  ///< Authenticated 128-packet replay window.
+      microphone_endpoint_tracker_t endpoints;  ///< Authenticated HELLO and NAT-rebind policy.
+      microphone_queue_t datagrams;  ///< Bounded queue populated by the shared UDP router.
+      std::unique_ptr<client_microphone::sink_t> sink;  ///< Platform virtual microphone injection backend.
+      std::unique_ptr<client_microphone::receiver_t> receiver;  ///< Jitter, Opus, FEC, and PCM delivery core.
+      std::uint64_t generation {};  ///< Current nonzero driver and decoder generation.
+      std::uint64_t reset_sequence_barrier {};  ///< Newest authenticated RESET sequence already applied.
+      bool reset_barrier_active {};  ///< Whether delayed pre-RESET media must be rejected.
+      bool ended {};  ///< Whether authenticated END closed the negotiated generation.
+    } microphone;  ///< Optional client-to-host microphone runtime state.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
@@ -1898,6 +2042,232 @@ namespace stream {
   }
 
   /**
+   * @brief Construct the deterministic microphone GCM nonce for one datagram.
+   *
+   * @param prefix Four-byte session nonce prefix derived by HKDF.
+   * @param sequence Monotonic packet sequence.
+   * @return Four-byte prefix followed by the eight-byte big-endian sequence.
+   */
+  static crypto::aes_256_gcm_t::nonce_t microphone_nonce(
+    const std::array<std::uint8_t, 4> &prefix,
+    std::uint64_t sequence
+  ) {
+    crypto::aes_256_gcm_t::nonce_t nonce {};
+    std::copy(prefix.begin(), prefix.end(), nonce.begin());
+    for (std::size_t index = 0; index < sizeof(sequence); ++index) {
+      nonce[prefix.size() + index] = static_cast<std::uint8_t>(sequence >> ((sizeof(sequence) - index - 1) * 8));
+    }
+    return nonce;
+  }
+
+  /**
+   * @brief Allocate the next nonzero driver generation for a microphone session.
+   *
+   * @param session Active stream session.
+   * @return Generation unique across launch sessions and resets.
+   */
+  static std::uint64_t next_microphone_generation(session_t &session) {
+    if (session.microphone.generation == 0) {
+      session.microphone.generation = (static_cast<std::uint64_t>(session.launch_session_id) << 32U) | 1U;
+    } else {
+      ++session.microphone.generation;
+    }
+    return session.microphone.generation;
+  }
+
+  /**
+   * @brief Authenticate and process reverse microphone datagrams for one A/V session.
+   *
+   * Failures remain isolated to microphone input and never stop the enclosing
+   * GameStream session.
+   *
+   * @param session Active stream session.
+   */
+  static void clientMicrophoneThread(session_t *session) {
+    platf::set_thread_name("session::client-microphone");
+
+    auto finish = util::fail_guard([&]() {
+      if (session->microphone.receiver) {
+        session->microphone.receiver->stop();
+      }
+      session::release_client_microphone(session->launch_session_id);
+    });
+
+    try {
+      while (!session->shutdown_event->peek() && !session->microphone.ended) {
+        const auto datagram = session->microphone.datagrams->pop(5ms);
+        const auto now = client_microphone::clock_t::now();
+        if (!datagram) {
+          session->microphone.receiver->poll(now);
+          continue;
+        }
+
+        const auto packet = client_microphone::protocol::parse(datagram->bytes);
+        if (!packet || packet->session_id != session->microphone.session_id ||
+            !session->microphone.replay.may_accept(packet->packet_sequence)) {
+          continue;
+        }
+
+        crypto::aes_t plaintext;
+        const auto nonce = microphone_nonce(session->microphone.nonce_prefix, packet->packet_sequence);
+        if (!session->microphone.cipher->decrypt(
+              packet->ciphertext,
+              packet->authenticated_header,
+              nonce,
+              packet->authentication_tag,
+              plaintext
+            )) {
+          continue;
+        }
+
+        const auto hello = packet->type == client_microphone::protocol::packet_type_t::hello;
+        if ((hello && (packet->packet_sequence != 0 || session->microphone.endpoints.claimed())) ||
+            !session->microphone.endpoints.accept_authenticated(datagram->peer, hello)) {
+          continue;
+        }
+
+        const auto ordered_control =
+          packet->type == client_microphone::protocol::packet_type_t::reset ||
+          packet->type == client_microphone::protocol::packet_type_t::end;
+        if ((ordered_control && !session->microphone.replay.would_advance(packet->packet_sequence)) ||
+            (packet->type == client_microphone::protocol::packet_type_t::audio &&
+             session->microphone.reset_barrier_active &&
+             packet->packet_sequence < session->microphone.reset_sequence_barrier)) {
+          continue;
+        }
+
+        session->microphone.replay.commit(packet->packet_sequence);
+
+        switch (packet->type) {
+          case client_microphone::protocol::packet_type_t::hello:
+            if (!session->microphone.receiver->reset(next_microphone_generation(*session), now)) {
+              session->microphone.ended = true;
+            }
+            break;
+
+          case client_microphone::protocol::packet_type_t::audio:
+            if (session->microphone.generation == 0 || !session->microphone.receiver->active()) {
+              break;
+            }
+            session->microphone.receiver->submit(
+              {
+                session->microphone.generation,
+                packet->packet_sequence,
+                packet->timestamp_48khz,
+                (packet->flags & client_microphone::protocol::flag_silence) != 0 ?
+                  client_microphone::packet_kind_e::silence :
+                  client_microphone::packet_kind_e::opus,
+                std::move(plaintext),
+              },
+              now
+            );
+            break;
+
+          case client_microphone::protocol::packet_type_t::reset:
+            session->microphone.reset_sequence_barrier = packet->packet_sequence;
+            session->microphone.reset_barrier_active = true;
+            if (session->microphone.generation != 0 &&
+                !session->microphone.receiver->reset(next_microphone_generation(*session), now)) {
+              session->microphone.ended = true;
+            }
+            break;
+
+          case client_microphone::protocol::packet_type_t::end:
+            session->microphone.receiver->stop();
+            session->microphone.ended = true;
+            break;
+        }
+
+        session->microphone.receiver->poll(now);
+      }
+    } catch (const std::exception &exception) {
+      BOOST_LOG(error) << "Client microphone disabled for this session: "sv << exception.what();
+    }
+  }
+
+  /**
+   * @brief Route microphone UDP datagrams to sessions by their full 16-byte identifier.
+   *
+   * Framing is validated before lookup, while all authentication and endpoint
+   * state changes remain in the owning session thread.
+   *
+   * @param ctx Shared broadcast context owning the UDP socket and route map.
+   */
+  static void clientMicrophoneRouterThread(broadcast_ctx_t &ctx) {
+    platf::set_thread_name("stream::client-microphone-router");
+    std::array<std::uint8_t, client_microphone::protocol::maximum_datagram_size> buffer {};
+
+    while (ctx.microphone_bound.load(std::memory_order_acquire)) {
+      udp::endpoint peer;
+      boost::system::error_code error;
+      const auto size = ctx.microphone_sock.receive_from(asio::buffer(buffer), peer, 0, error);
+      if (error) {
+        if (error == asio::error::operation_aborted || error == asio::error::bad_descriptor) {
+          break;
+        }
+        continue;
+      }
+
+      const auto bytes = std::span<const std::uint8_t> {buffer.data(), size};
+      const auto packet = client_microphone::protocol::parse(bytes);
+      if (!packet) {
+        continue;
+      }
+
+      std::shared_ptr<session_t> session;
+      {
+        auto routes = ctx.microphone_routes.lock();
+        const auto route = ctx.microphone_routes->find(client_microphone_route_key(packet->session_id));
+        if (route == ctx.microphone_routes->end()) {
+          continue;
+        }
+        session = route->second.lock();
+        if (!session) {
+          ctx.microphone_routes->erase(route);
+          continue;
+        }
+      }
+
+      if (session->microphone.datagrams) {
+        session->microphone.datagrams->raise(
+          microphone_datagram_t {{bytes.begin(), bytes.end()}, std::move(peer)}
+        );
+      }
+    }
+  }
+
+  /**
+   * @brief Register one session-ID route in the shared microphone UDP router.
+   *
+   * @param ctx Shared broadcast context.
+   * @param session Session retained weakly by the route.
+   */
+  static void register_client_microphone_route(
+    broadcast_ctx_t &ctx,
+    const std::shared_ptr<session_t> &session
+  ) {
+    auto routes = ctx.microphone_routes.lock();
+    ctx.microphone_routes->insert_or_assign(
+      client_microphone_route_key(session->microphone.session_id),
+      std::weak_ptr<session_t> {session}
+    );
+  }
+
+  /**
+   * @brief Remove one session-ID route before session destruction.
+   *
+   * @param ctx Shared broadcast context.
+   * @param session_id Exact microphone route identifier.
+   */
+  static void unregister_client_microphone_route(
+    broadcast_ctx_t &ctx,
+    const std::array<std::uint8_t, 16> &session_id
+  ) {
+    auto routes = ctx.microphone_routes.lock();
+    ctx.microphone_routes->erase(client_microphone_route_key(session_id));
+  }
+
+  /**
    * @brief Bind the GameStream UDP and control sockets used for a streaming session.
    */
   int start_broadcast(broadcast_ctx_t &ctx) {
@@ -1906,6 +2276,7 @@ namespace stream {
     auto control_port = net::map_port(CONTROL_PORT);
     auto video_port = net::map_port(VIDEO_STREAM_PORT);
     auto audio_port = net::map_port(AUDIO_STREAM_PORT);
+    auto microphone_port = net::map_port(MICROPHONE_STREAM_PORT);
 
     if (ctx.control_server.bind(address_family, control_port)) {
       BOOST_LOG(error) << "Couldn't bind Control server to port ["sv << control_port << "], likely another process already bound to the port"sv;
@@ -1956,6 +2327,23 @@ namespace stream {
       return -1;
     }
 
+    if (config::audio.client_microphone && client_microphone_available()) {
+      ctx.microphone_sock.open(protocol, ec);
+      if (!ec) {
+        ctx.microphone_sock.bind(udp::endpoint(bind_addr, microphone_port), ec);
+      }
+
+      if (ec) {
+        BOOST_LOG(error) << "Client microphone unavailable because UDP port ["sv << microphone_port
+                         << "] could not be bound: "sv << ec.message();
+        boost::system::error_code close_error;
+        ctx.microphone_sock.close(close_error);
+      } else {
+        ctx.microphone_bound.store(true, std::memory_order_release);
+        ctx.microphone_thread = std::jthread {clientMicrophoneRouterThread, std::ref(ctx)};
+      }
+    }
+
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
     ctx.video_thread = std::jthread {videoBroadcastThread, std::ref(ctx.video_sock)};
@@ -1987,6 +2375,10 @@ namespace stream {
 
     ctx.video_sock.close();
     ctx.audio_sock.close();
+    if (ctx.microphone_bound.exchange(false, std::memory_order_acq_rel)) {
+      boost::system::error_code error;
+      ctx.microphone_sock.close(error);
+    }
 
     video_packets.reset();
     audio_packets.reset();
@@ -1999,6 +2391,10 @@ namespace stream {
     ctx.audio_thread.join();
     BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
     ctx.control_thread.join();
+    if (ctx.microphone_thread.joinable()) {
+      BOOST_LOG(debug) << "Waiting for client microphone router thread to end..."sv;
+      ctx.microphone_thread.join();
+    }
     BOOST_LOG(debug) << "All broadcasting threads ended"sv;
 
     broadcast_shutdown_event->reset();
@@ -2124,6 +2520,17 @@ namespace stream {
 
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
+    std::atomic_uint32_t client_microphone_owner;  ///< Launch session holding the single virtual microphone writer slot.
+
+    bool claim_client_microphone(std::uint32_t launch_session_id) {
+      auto expected = std::uint32_t {0};
+      return client_microphone_owner.compare_exchange_strong(expected, launch_session_id) || expected == launch_session_id;
+    }
+
+    void release_client_microphone(std::uint32_t launch_session_id) {
+      auto expected = launch_session_id;
+      client_microphone_owner.compare_exchange_strong(expected, 0);
+    }
 
     /**
      * @brief Platform handle returned from stream setup.
@@ -2171,6 +2578,23 @@ namespace stream {
         task_pool.cancel(force_kill);
       });
 
+      if (session.config.client_microphone) {
+        if (session.broadcast_ref) {
+          unregister_client_microphone_route(*session.broadcast_ref.get(), session.microphone.session_id);
+        }
+        if (session.microphone.datagrams) {
+          session.microphone.datagrams->stop();
+        }
+        if (session.microphoneThread.joinable()) {
+          BOOST_LOG(debug) << "Waiting for client microphone to end..."sv;
+          session.microphoneThread.join();
+        }
+        if (session.microphone.receiver) {
+          session.microphone.receiver->stop();
+        }
+        release_client_microphone(session.launch_session_id);
+      }
+
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
       session.videoThread.join();
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
@@ -2206,11 +2630,20 @@ namespace stream {
     /**
      * @brief Start the audio, video, and control workers for a streaming session.
      */
-    int start(session_t &session, const std::string &addr_string) {
+    int start(const std::shared_ptr<session_t> &session_ptr, const std::string &addr_string) {
+      auto &session = *session_ptr;
       session.input = input::alloc(session.mail);
 
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {
+        return -1;
+      }
+
+      if (session.config.client_microphone &&
+          (!session.broadcast_ref->microphone_bound.load(std::memory_order_acquire) ||
+           !session.microphone.cipher || !session.microphone.receiver || !session.microphone.datagrams)) {
+        BOOST_LOG(error) << "Client microphone negotiation failed because its UDP listener or driver is unavailable"sv;
+        release_client_microphone(session.launch_session_id);
         return -1;
       }
 
@@ -2231,6 +2664,11 @@ namespace stream {
       session.audio.peer.port(0);
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+
+      if (session.config.client_microphone) {
+        register_client_microphone_route(*session.broadcast_ref.get(), session_ptr);
+        session.microphoneThread = std::jthread {clientMicrophoneThread, &session};
+      }
 
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
@@ -2261,6 +2699,50 @@ namespace stream {
       session->client_cert = launch_session.client_cert;
 
       session->config = config;
+
+      if (session->config.client_microphone) {
+        session->microphone.session_id = launch_session.client_microphone_session_id;
+        session->microphone.salt = launch_session.client_microphone_salt;
+        constexpr auto key_info = "lumen/client-microphone/client-to-host/v1"sv;
+        constexpr auto derived_size = crypto::aes_256_gcm_t::key_size + 4;
+        const auto derived = crypto::hkdf_sha256(
+          launch_session.gcm_key,
+          session->microphone.salt,
+          key_info,
+          derived_size
+        );
+
+        if (!derived) {
+          BOOST_LOG(error) << "Unable to derive client microphone session key"sv;
+          session->config.client_microphone = false;
+        } else {
+          crypto::aes_256_gcm_t::key_t key {};
+          std::copy_n(derived->begin(), key.size(), key.begin());
+          std::copy_n(derived->begin() + key.size(), session->microphone.nonce_prefix.size(), session->microphone.nonce_prefix.begin());
+          session->microphone.cipher.emplace(key);
+          session->microphone.datagrams = std::make_shared<safe::queue_t<microphone_datagram_t>>(64);
+
+#ifdef _WIN32
+          try {
+            session->microphone.sink = platf::win_audio::make_virtual_microphone();
+            session->microphone.receiver = std::make_unique<client_microphone::receiver_t>(
+              std::make_unique<client_microphone::opus_decoder_t>(),
+              *session->microphone.sink
+            );
+          } catch (const std::exception &exception) {
+            BOOST_LOG(error) << "Unable to initialize client microphone: "sv << exception.what();
+            session->microphone.receiver.reset();
+            session->microphone.sink.reset();
+            session->config.client_microphone = false;
+          }
+#else
+          session->config.client_microphone = false;
+#endif
+        }
+      }
+      if (!session->config.client_microphone) {
+        release_client_microphone(session->launch_session_id);
+      }
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);

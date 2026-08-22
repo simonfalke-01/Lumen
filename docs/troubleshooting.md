@@ -332,8 +332,8 @@ Virtual HID.
 > compatible, accessible driver is installed.
 
 If the installed driver and application use incompatible protocol versions, keep both on the same Lumen release or
-run installer repair. Uninstalling Lumen stops the service before removing the Virtual HID device and driver
-package. Use Windows **Installed apps** to repair or uninstall Lumen; Windows may require a restart to finish
+run installer repair. Uninstalling Lumen stops the service before removing the Virtual HID device and driver package.
+Use Windows **Installed apps** to repair or uninstall Lumen; Windows may require a restart to finish
 removing an in-use driver.
 
 If initialization fails, or input submission fails before the driver accepts its first report, Lumen uses SendInput.
@@ -354,6 +354,22 @@ Lumen Virtual HID failed closed (stage=..., status=...)
 
 `SendInput` remains subject to Windows User Interface Privilege Isolation (UIPI). It may not control an application at
 a higher integrity level, and Windows does not reliably identify UIPI as the reason an input call failed.
+
+### Client microphone endpoint is unavailable
+
+The optional client microphone feature requires the Windows installer's **Client Microphone Passthrough** component.
+From the installed Lumen service context, the lifecycle helper verifies the exact root device, active capture
+endpoint, and control ABI:
+
+```bat
+cd /d "%ProgramFiles%\Lumen"
+tools\lumen-vmicctl.exe status --json
+tools\lumen-vmicctl.exe probe --json
+```
+
+Healthy output reports one `ROOT\LumenVirtualMicrophone` root, one active `Lumen Virtual Microphone` capture endpoint,
+and ABI state `compatible`. The control path is restricted to `LumenService`, so `probe` reports `inaccessible` from a
+normal Administrator shell. Repair the same Lumen release if the root, endpoint, and ABI versions do not match.
 
 ### No gamepad detected
 You must install ViGEmBus to use virtual gamepads. You can install this from the troubleshooting tab of the web UI.

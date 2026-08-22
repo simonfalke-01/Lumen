@@ -6,6 +6,12 @@
     <Level Value="0" Condition="NOT Installed AND LUMEN_INSTALL_VHID = 0"/>
     <Level Value="1" Condition="LUMEN_INSTALL_VHID = 1"/>
   </CPackWiXFragment>
+  <!-- LUMEN_VMIC_FEATURE_START -->
+  <CPackWiXFragment Id="CM_C_virtual_microphone_driver">
+    <Level Value="0" Condition="NOT Installed AND LUMEN_INSTALL_VMIC = 0"/>
+    <Level Value="1" Condition="LUMEN_INSTALL_VMIC = 1"/>
+  </CPackWiXFragment>
+  <!-- LUMEN_VMIC_FEATURE_END -->
   <CPackWiXFragment Id="CM_CP_application.tools.lumensvc.exe">
     <ServiceInstall Id="InstallLumenService"
                     Name="LumenService"

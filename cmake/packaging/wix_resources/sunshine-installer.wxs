@@ -53,6 +53,7 @@
     </StandardDirectory>
 
     <Property Id="LUMEN_INSTALL_VHID" Value="0" Secure="yes"/>
+    <Property Id="LUMEN_INSTALL_VMIC" Value="0" Secure="yes"/>
 
     <!-- Normalize the public silent-install property to the actual feature
          action/current state before building deferred CustomActionData. -->
@@ -72,6 +73,25 @@
                  Action="ResolveLumenVhidNotInstalled"
                  Value="0" After="ResolveLumenVhidInstalled" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND !CM_C_virtual_hid_driver &lt;&gt; 3"/>
+
+    <!-- LUMEN_VMIC_FEATURE_START -->
+    <SetProperty Id="LUMEN_INSTALL_VMIC"
+                 Action="ResolveLumenVmicSelected"
+                 Value="1" After="CostFinalize" Sequence="execute"
+                 Condition="NOT (REMOVE=&quot;ALL&quot;) AND &amp;CM_C_virtual_microphone_driver = 3"/>
+    <SetProperty Id="LUMEN_INSTALL_VMIC"
+                 Action="ResolveLumenVmicDeselected"
+                 Value="0" After="ResolveLumenVmicSelected" Sequence="execute"
+                 Condition="NOT (REMOVE=&quot;ALL&quot;) AND &amp;CM_C_virtual_microphone_driver &lt;&gt; 3"/>
+    <SetProperty Id="LUMEN_INSTALL_VMIC"
+                 Action="ResolveLumenVmicInstalled"
+                 Value="1" After="CostFinalize" Sequence="execute"
+                 Condition="REMOVE=&quot;ALL&quot; AND !CM_C_virtual_microphone_driver = 3"/>
+    <SetProperty Id="LUMEN_INSTALL_VMIC"
+                 Action="ResolveLumenVmicNotInstalled"
+                 Value="0" After="ResolveLumenVmicInstalled" Sequence="execute"
+                 Condition="REMOVE=&quot;ALL&quot; AND !CM_C_virtual_microphone_driver &lt;&gt; 3"/>
+    <!-- LUMEN_VMIC_FEATURE_END -->
 
     <!-- Service installation/removal remains in MSI service tables. These two
          actions select the declaratively installed service's start mode. -->
@@ -147,32 +167,32 @@
 
     <SetProperty Id="CA_LumenInstallRollback"
                  Action="SetLumenInstallRollbackData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID] -InstallVirtualMicrophone [LUMEN_INSTALL_VMIC]"
                  After="InstallFiles" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_LumenInstall"
                  Action="SetLumenInstallData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action install -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action install -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID] -InstallVirtualMicrophone [LUMEN_INSTALL_VMIC]"
                  After="SetLumenInstallRollbackData" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_LumenInstallCommit"
                  Action="SetLumenInstallCommitData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind install -InstallVirtualHid [LUMEN_INSTALL_VHID] -InstallVirtualMicrophone [LUMEN_INSTALL_VMIC]"
                  After="SetLumenInstallData" Sequence="execute"
                  Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
     <SetProperty Id="CA_LumenUninstallRollback"
                  Action="SetLumenUninstallRollbackData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action rollback -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID] -InstallVirtualMicrophone [LUMEN_INSTALL_VMIC]"
                  After="InstallInitialize" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_LumenUninstall"
                  Action="SetLumenUninstallData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action uninstall -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\lumen-setup.ps1&quot; -Action uninstall -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID] -InstallVirtualMicrophone [LUMEN_INSTALL_VMIC]"
                  After="SetLumenUninstallRollbackData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_LumenUninstallCommit"
                  Action="SetLumenUninstallCommitData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\lumen-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID]"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\lumen-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID] -InstallVirtualMicrophone [LUMEN_INSTALL_VMIC]"
                  After="SetLumenUninstallData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
   </Fragment>
