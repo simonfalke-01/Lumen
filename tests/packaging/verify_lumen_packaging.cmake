@@ -135,6 +135,44 @@ assert_file_contains_literal(
     [=[PKEY_Device_FriendlyName]=]
     "The helper must validate the active capture endpoint")
 assert_file_contains_literal(
+    "tools/lumen-vmicctl.cpp"
+    [=[constexpr int kReadyWaitAttempts = 300;]=]
+    "The helper must allow Core Audio endpoint materialization to complete")
+assert_file_contains_literal(
+    "tools/lumen-vmicctl.cpp"
+    [=[PKEY_DeviceInterface_FriendlyName]=]
+    "The helper must retain adapter names for endpoint diagnostics")
+assert_file_contains_literal(
+    "tools/lumen-vmicctl.cpp"
+    [=[PKEY_Device_InstanceId]=]
+    "The helper must read the immutable Core Audio endpoint instance ID")
+assert_file_contains_literal(
+    "tools/lumen-vmicctl.cpp"
+    [=[CM_Locate_DevNodeW(]=]
+    "The helper must resolve the endpoint instance ID to a PnP node")
+assert_file_contains_literal(
+    "tools/lumen-vmicctl.cpp"
+    [=[CM_Get_Parent(&parent, current, 0)]=]
+    "The helper must verify immutable endpoint ancestry")
+assert_file_excludes(
+    "tools/lumen-vmicctl.cpp"
+    "endpoint_name_matches"
+    "Mutable endpoint names must not establish VMIC ownership")
+foreach(virtual_microphone_readiness_field IN ITEMS
+        "roots_ready="
+        "tree_ready="
+        "endpoint_ready="
+        "control_ready="
+        "endpoint_property_hresult="
+        "endpoint_names="
+        "adapter_names="
+        "endpoint_instance_ids=")
+    assert_file_contains_literal(
+        "tools/lumen-vmicctl.cpp"
+        "${virtual_microphone_readiness_field}"
+        "VMIC readiness failures must identify ${virtual_microphone_readiness_field}")
+endforeach()
+assert_file_contains_literal(
     "src_assets/windows/misc/sunshine-setup.ps1"
     [=[[string]$InstallVirtualMicrophone]=]
     "Setup must accept MSI microphone feature ownership")

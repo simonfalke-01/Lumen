@@ -33,12 +33,14 @@
 // MinGW's functiondiscoverykeys_devpkey.h is order-sensitive. Define the one
 // documented property key this standalone helper consumes.
 DEFINE_PROPERTYKEY(PKEY_Device_FriendlyName, 0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0, 14);
+DEFINE_PROPERTYKEY(PKEY_DeviceInterface_FriendlyName, 0x026e516e, 0xb814, 0x414b, 0x83, 0xcd, 0x85, 0x6d, 0x6f, 0xef, 0x48, 0x22, 2);
+DEFINE_PROPERTYKEY(PKEY_Device_InstanceId, 0x78c34fc8, 0x104a, 0x4aca, 0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57, 256);
 
 namespace {
   constexpr wchar_t kDeviceDescription[] = L"Lumen Virtual Microphone";
-  constexpr wchar_t kEndpointFriendlyName[] = L"Lumen Virtual Microphone";
   constexpr DWORD kInstallFlagForce = 0x00000001;
-  constexpr int kReadyWaitAttempts = 100;
+  constexpr int kReadyWaitAttempts = 300;
+  constexpr DWORD kReadyWaitIntervalMs = 100;
 
   /** Stable process exit codes consumed by Windows packaging. */
   enum class exit_code : int {
@@ -172,10 +174,20 @@ namespace {
     LUMEN_VMIC_QUERY_ABI_RESPONSE abi {};  ///< Returned ABI when available.
   };
 
+  /** Convert a probe state to its stable output label. */
+  const wchar_t *probe_state_name(probe_state state);
+
   /** Active Core Audio capture-endpoint inventory. */
   struct endpoint_inventory {
-    unsigned matching_count = 0;  ///< Endpoints with the exact friendly name.
-    HRESULT error = S_OK;  ///< COM/Core Audio failure.
+    unsigned active_count = 0;  ///< Active capture endpoints inspected.
+    unsigned located_count = 0;  ///< Endpoint instance IDs resolved to PnP nodes.
+    unsigned matching_count = 0;  ///< Endpoints descending from the exact Lumen root.
+    std::vector<std::wstring> endpoint_names;  ///< Observed endpoint display names.
+    std::vector<std::wstring> adapter_names;  ///< Observed adapter/interface names.
+    std::vector<std::wstring> instance_ids;  ///< Observed immutable endpoint instance IDs.
+    HRESULT error = S_OK;  ///< Collection-level COM/Core Audio failure.
+    HRESULT property_error = S_OK;  ///< First per-endpoint property failure.
+    CONFIGRET ancestry_error = CR_SUCCESS;  ///< First endpoint ancestry lookup error.
 
     /** Return whether exactly one active endpoint is present. */
     [[nodiscard]] bool healthy() const noexcept {
@@ -373,8 +385,35 @@ namespace {
     }
   }
 
-  /** Count exact active Core Audio capture endpoints. */
-  endpoint_inventory find_capture_endpoint() {
+  /** Return whether one PnP node reaches the exact root through immutable parent links. */
+  bool device_descends_from(DEVINST device, DEVINST expected_root, CONFIGRET &error) {
+    if (device == 0 || expected_root == 0) {
+      error = CR_SUCCESS;
+      return false;
+    }
+    DEVINST current = device;
+    for (unsigned depth = 0; depth < 128; ++depth) {
+      if (current == expected_root) {
+        error = CR_SUCCESS;
+        return true;
+      }
+      DEVINST parent = 0;
+      error = CM_Get_Parent(&parent, current, 0);
+      if (error == CR_NO_SUCH_DEVNODE) {
+        error = CR_SUCCESS;
+        return false;
+      }
+      if (error != CR_SUCCESS) {
+        return false;
+      }
+      current = parent;
+    }
+    error = CR_INVALID_DATA;
+    return false;
+  }
+
+  /** Inventory active Core Audio capture endpoints descending from one exact PnP root. */
+  endpoint_inventory find_capture_endpoint(DEVINST expected_root) {
     endpoint_inventory result;
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool uninitialize = SUCCEEDED(initialized);
@@ -399,32 +438,76 @@ namespace {
     UINT count = 0;
     if (SUCCEEDED(result.error)) {
       result.error = devices->GetCount(&count);
+      result.active_count = count;
     }
     for (UINT index = 0; SUCCEEDED(result.error) && index < count; ++index) {
       IMMDevice *device = nullptr;
       IPropertyStore *properties = nullptr;
-      PROPVARIANT name;
-      PropVariantInit(&name);
+      PROPVARIANT endpoint_name;
+      PROPVARIANT adapter_name;
+      PROPVARIANT instance_id;
+      PropVariantInit(&endpoint_name);
+      PropVariantInit(&adapter_name);
+      PropVariantInit(&instance_id);
       HRESULT current = devices->Item(index, &device);
       if (SUCCEEDED(current)) {
         current = device->OpenPropertyStore(STGM_READ, &properties);
       }
+      HRESULT endpoint_name_status = current;
+      HRESULT adapter_name_status = current;
+      HRESULT instance_id_status = current;
       if (SUCCEEDED(current)) {
-        current = properties->GetValue(PKEY_Device_FriendlyName, &name);
+        endpoint_name_status = properties->GetValue(PKEY_Device_FriendlyName, &endpoint_name);
+        adapter_name_status = properties->GetValue(PKEY_DeviceInterface_FriendlyName, &adapter_name);
+        instance_id_status = properties->GetValue(PKEY_Device_InstanceId, &instance_id);
       }
-      if (SUCCEEDED(current) && name.vt == VT_LPWSTR && name.pwszVal != nullptr &&
-          _wcsicmp(name.pwszVal, kEndpointFriendlyName) == 0) {
-        ++result.matching_count;
+      const bool endpoint_name_valid = SUCCEEDED(endpoint_name_status) &&
+                                       endpoint_name.vt == VT_LPWSTR &&
+                                       endpoint_name.pwszVal != nullptr;
+      const bool adapter_name_valid = SUCCEEDED(adapter_name_status) &&
+                                      adapter_name.vt == VT_LPWSTR &&
+                                      adapter_name.pwszVal != nullptr;
+      const bool instance_id_valid = SUCCEEDED(instance_id_status) &&
+                                     instance_id.vt == VT_LPWSTR &&
+                                     instance_id.pwszVal != nullptr;
+      if (endpoint_name_valid) {
+        result.endpoint_names.emplace_back(endpoint_name.pwszVal);
       }
-      PropVariantClear(&name);
+      if (adapter_name_valid) {
+        result.adapter_names.emplace_back(adapter_name.pwszVal);
+      }
+      if (instance_id_valid) {
+        result.instance_ids.emplace_back(instance_id.pwszVal);
+        DEVINST endpoint_node = 0;
+        const CONFIGRET locate_error = CM_Locate_DevNodeW(
+          &endpoint_node,
+          instance_id.pwszVal,
+          CM_LOCATE_DEVNODE_NORMAL
+        );
+        if (locate_error == CR_SUCCESS) {
+          ++result.located_count;
+          CONFIGRET ancestry_error = CR_SUCCESS;
+          if (device_descends_from(endpoint_node, expected_root, ancestry_error)) {
+            ++result.matching_count;
+          }
+          if (ancestry_error != CR_SUCCESS && result.ancestry_error == CR_SUCCESS) {
+            result.ancestry_error = ancestry_error;
+          }
+        } else if (result.ancestry_error == CR_SUCCESS) {
+          result.ancestry_error = locate_error;
+        }
+      }
+      PropVariantClear(&endpoint_name);
+      PropVariantClear(&adapter_name);
+      PropVariantClear(&instance_id);
       if (properties != nullptr) {
         properties->Release();
       }
       if (device != nullptr) {
         device->Release();
       }
-      if (FAILED(current)) {
-        result.error = current;
+      if ((FAILED(current) || !instance_id_valid) && SUCCEEDED(result.property_error)) {
+        result.property_error = FAILED(current) ? current : instance_id_status;
       }
     }
 
@@ -438,6 +521,67 @@ namespace {
       CoUninitialize();
     }
     return result;
+  }
+
+  /** Emit every readiness predicate after the bounded asynchronous wait expires. */
+  int fail_readiness(
+    size_t root_count,
+    bool tree_started,
+    const endpoint_inventory &endpoints,
+    const probe_result &control,
+    const pnp_diagnostic &pnp
+  ) {
+    std::wcerr << L"result=error code=" << static_cast<int>(exit_code::mutation_failed)
+               << L" operation=verify-driver-readiness win32=" << ERROR_NOT_READY
+               << L" roots_ready=" << (root_count == 1 ? 1 : 0)
+               << L" tree_ready=" << (tree_started ? 1 : 0)
+               << L" endpoint_ready=" << (endpoints.healthy() ? 1 : 0)
+               << L" control_ready=" << (control.state == probe_state::compatible ? 1 : 0)
+               << L" root_devices=" << root_count
+               << L" active_capture_endpoints=" << endpoints.active_count
+               << L" located_capture_endpoints=" << endpoints.located_count
+               << L" matching_capture_endpoints=" << endpoints.matching_count
+               << L" endpoint_hresult=" << static_cast<std::uint32_t>(endpoints.error)
+               << L" endpoint_property_hresult=" << static_cast<std::uint32_t>(endpoints.property_error)
+               << L" endpoint_cm_error=" << endpoints.ancestry_error
+               << L" control_state=" << probe_state_name(control.state)
+               << L" control_win32=" << control.error
+               << L" abi_version=" << control.abi.abi_version
+               << L" sample_rate=" << control.abi.sample_rate_hz
+               << L" channels=" << control.abi.channel_count
+               << L" bits_per_sample=" << control.abi.bits_per_sample
+               << L" max_write_frames=" << control.abi.max_write_frames
+               << L" wait_ms=" << (kReadyWaitAttempts * kReadyWaitIntervalMs)
+               << L" endpoint_names=\"";
+    for (size_t index = 0; index < endpoints.endpoint_names.size(); ++index) {
+      if (index != 0) {
+        std::wcerr << L'|';
+      }
+      std::wcerr << json_escape(endpoints.endpoint_names[index]);
+    }
+    std::wcerr << L"\" adapter_names=\"";
+    for (size_t index = 0; index < endpoints.adapter_names.size(); ++index) {
+      if (index != 0) {
+        std::wcerr << L'|';
+      }
+      std::wcerr << json_escape(endpoints.adapter_names[index]);
+    }
+    std::wcerr << L"\" endpoint_instance_ids=\"";
+    for (size_t index = 0; index < endpoints.instance_ids.size(); ++index) {
+      if (index != 0) {
+        std::wcerr << L'|';
+      }
+      std::wcerr << json_escape(endpoints.instance_ids[index]);
+    }
+    std::wcerr << L'\"';
+    if (pnp.available) {
+      std::wcerr << L" cm_status=" << pnp.status << L" cm_problem=" << pnp.problem;
+    }
+    if (pnp.error != CR_SUCCESS) {
+      std::wcerr << L" cm_error=" << pnp.error;
+    }
+    std::wcerr << L'\n';
+    return static_cast<int>(exit_code::mutation_failed);
   }
 
   /** Query and validate the exact control-device ABI. */
@@ -734,12 +878,15 @@ namespace {
     pnp_diagnostic diagnostic;
     const bool root_healthy = devices.devices.size() == 1 &&
                               device_tree_started(devices.devices[0].DevInst, diagnostic);
-    const endpoint_inventory endpoints = find_capture_endpoint();
+    const DEVINST expected_root = devices.devices.size() == 1 ? devices.devices[0].DevInst : 0;
+    const endpoint_inventory endpoints = find_capture_endpoint(expected_root);
     const probe_result control = query_protocol();
     const bool healthy = root_healthy && endpoints.healthy() && control.state == probe_state::compatible;
     if (json) {
       std::wcout << L"{\"state\":\"" << (healthy ? L"installed" : L"unhealthy")
                  << L"\",\"rootDevices\":" << devices.devices.size()
+                 << L",\"activeCaptureEndpoints\":" << endpoints.active_count
+                 << L",\"locatedCaptureEndpoints\":" << endpoints.located_count
                  << L",\"captureEndpoints\":" << endpoints.matching_count
                  << L",\"control\":\"" << probe_state_name(control.state) << L"\"";
       if (control.state == probe_state::compatible) {
@@ -750,8 +897,14 @@ namespace {
       std::wcout << L"state=" << (healthy ? L"installed" : L"unhealthy")
                  << L" hardware_id=\"" << LUMEN_VMIC_ROOT_HARDWARE_ID_W << L"\""
                  << L" roots=" << devices.devices.size()
+                 << L" active_capture_endpoints=" << endpoints.active_count
+                 << L" located_capture_endpoints=" << endpoints.located_count
                  << L" capture_endpoints=" << endpoints.matching_count
-                 << L" control=" << probe_state_name(control.state) << L'\n';
+                 << L" endpoint_hresult=" << static_cast<std::uint32_t>(endpoints.error)
+                 << L" endpoint_property_hresult=" << static_cast<std::uint32_t>(endpoints.property_error)
+                 << L" endpoint_cm_error=" << endpoints.ancestry_error
+                 << L" control=" << probe_state_name(control.state)
+                 << L" control_win32=" << control.error << L'\n';
     }
     if (healthy) {
       return static_cast<int>(exit_code::success);
@@ -876,16 +1029,23 @@ namespace {
 
     if (!reboot) {
       pnp_diagnostic last_diagnostic;
+      size_t last_root_count = 0;
+      bool last_tree_started = false;
+      endpoint_inventory last_endpoints;
+      probe_result last_control;
       for (int attempt = 0; attempt < kReadyWaitAttempts; ++attempt) {
         auto installed = enumerate_devices(DIGCF_ALLCLASSES | DIGCF_PRESENT);
         pnp_diagnostic diagnostic;
         const bool tree_started = installed.error == ERROR_SUCCESS && installed.devices.size() == 1 &&
                                   device_tree_started(installed.devices[0].DevInst, diagnostic);
-        if (diagnostic.available || diagnostic.error != CR_SUCCESS) {
-          last_diagnostic = diagnostic;
-        }
-        const endpoint_inventory endpoints = find_capture_endpoint();
+        last_diagnostic = diagnostic;
+        const DEVINST expected_root = installed.devices.size() == 1 ? installed.devices[0].DevInst : 0;
+        const endpoint_inventory endpoints = find_capture_endpoint(expected_root);
         const probe_result control = query_protocol();
+        last_root_count = installed.devices.size();
+        last_tree_started = tree_started;
+        last_endpoints = endpoints;
+        last_control = control;
         if (tree_started && endpoints.healthy() && control.state == probe_state::compatible) {
           std::wcout << L"result=success action=install-or-update hardware_id=\""
                      << LUMEN_VMIC_ROOT_HARDWARE_ID_W << L"\" protocol="
@@ -895,15 +1055,18 @@ namespace {
         if (installed.error != ERROR_SUCCESS) {
           return fail(exit_code::mutation_failed, L"verify-devices", installed.error);
         }
-        if (FAILED(endpoints.error)) {
-          return fail(exit_code::mutation_failed, L"verify-capture-endpoint", static_cast<DWORD>(endpoints.error));
-        }
         if (control.state == probe_state::inaccessible) {
           return fail(exit_code::mutation_failed, L"verify-control-abi", control.error);
         }
-        Sleep(100);
+        Sleep(kReadyWaitIntervalMs);
       }
-      return fail(exit_code::mutation_failed, L"verify-driver-readiness", ERROR_NOT_READY, &last_diagnostic);
+      return fail_readiness(
+        last_root_count,
+        last_tree_started,
+        last_endpoints,
+        last_control,
+        last_diagnostic
+      );
     }
 
     std::wcout << L"result=reboot-required action=install-or-update hardware_id=\""

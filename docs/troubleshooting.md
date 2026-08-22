@@ -369,7 +369,12 @@ tools\lumen-vmicctl.exe probe --json
 
 Healthy output reports one `ROOT\LumenVirtualMicrophone` root, one active `Lumen Virtual Microphone` capture endpoint,
 and ABI state `compatible`. The control path is restricted to `LumenService`, so `probe` reports `inaccessible` from a
-normal Administrator shell. Repair the same Lumen release if the root, endpoint, and ABI versions do not match.
+normal Administrator shell. Endpoint names are diagnostic only because Windows permits users to rename them. The
+helper instead resolves each active capture endpoint's immutable device instance ID and requires its Plug and Play
+parent chain to reach the exact `ROOT\LumenVirtualMicrophone` node. Installation allows up to 30 seconds for
+asynchronous Core Audio endpoint materialization. A readiness failure reports the root, device tree, endpoint
+instance IDs and names, and control ABI predicates independently. Repair the same Lumen release if those predicates
+do not converge.
 
 ### No gamepad detected
 You must install ViGEmBus to use virtual gamepads. You can install this from the troubleshooting tab of the web UI.
