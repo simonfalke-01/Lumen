@@ -1462,14 +1462,17 @@ namespace {
    *
    * @param device Open owning control-interface handle.
    * @param created Created Generic PID gamepad metadata.
+   * @param operation Receives the exact failed I/O stage.
    * @param error Receives the first Win32 or validation error.
    * @return `true` when both HID directions return the exact distinctive reports.
    */
   bool round_trip_generic_io(
     HANDLE device,
     const LUMEN_VHID_GAMEPAD_CREATE_RESPONSE &created,
+    const wchar_t *&operation,
     DWORD &error
   ) {
+    operation = L"open-generic-input";
     HANDLE hid = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
       hid = open_gamepad_collection(
@@ -1492,6 +1495,7 @@ namespace {
       return false;
     }
 
+    operation = L"validate-generic-metadata";
     if (created.input_report_size != 9u || created.input_report_id != 0x01u) {
       CloseHandle(hid);
       error = ERROR_INVALID_DATA;
@@ -1510,6 +1514,7 @@ namespace {
     };
     std::array<std::uint8_t, 9> observed_input {};
     OVERLAPPED input_read {};
+    operation = L"create-generic-input-event";
     input_read.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (input_read.hEvent == nullptr) {
       error = GetLastError();
@@ -1517,6 +1522,7 @@ namespace {
       return false;
     }
     DWORD input_bytes = 0;
+    operation = L"start-generic-input-read";
     const bool read_started = ReadFile(
                                 hid,
                                 observed_input.data(),
@@ -1538,6 +1544,7 @@ namespace {
     submit.report_size = static_cast<std::uint32_t>(input_report.size());
     std::copy(input_report.begin(), input_report.end(), submit.report);
     DWORD returned = 0;
+    operation = L"submit-distinctive-generic-input";
     if (!DeviceIoControl(
           device,
           IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT,
@@ -1556,6 +1563,7 @@ namespace {
       CloseHandle(hid);
       return false;
     }
+    operation = L"receive-distinctive-generic-input";
     const auto wait = WaitForSingleObject(input_read.hEvent, 5000u);
     const bool input_ok = wait == WAIT_OBJECT_0 &&
                           GetOverlappedResult(hid, &input_read, &input_bytes, FALSE) != FALSE &&
@@ -1572,6 +1580,7 @@ namespace {
     }
     CloseHandle(input_read.hEvent);
     CloseHandle(hid);
+    operation = L"open-generic-output";
     hid = open_gamepad_collection(
       created.vendor_id,
       created.product_id,
@@ -1587,6 +1596,7 @@ namespace {
     read_request.version = LUMEN_VHID_GAMEPAD_ABI_VERSION;
     read_request.size = sizeof(read_request);
     read_request.handle = created.handle;
+    operation = L"drain-generic-output";
     for (;;) {
       LUMEN_VHID_GAMEPAD_OUTPUT_RESPONSE pending {};
       returned = 0;
@@ -1630,6 +1640,7 @@ namespace {
     output_report[0] = 0x1du;  // Generic PID Device Gain.
     output_report[1] = 0x7fu;
     DWORD output_bytes = 0;
+    operation = L"write-generic-pid-output";
     const bool write_ok = WriteFile(
                             hid,
                             output_report.data(),
@@ -1644,6 +1655,7 @@ namespace {
       return false;
     }
 
+    operation = L"read-generic-pid-output";
     for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
       LUMEN_VHID_GAMEPAD_OUTPUT_RESPONSE response {};
       returned = 0;
@@ -2114,10 +2126,11 @@ namespace {
       return report_gamepad_smoke_failure(json, L"verify-owner-cleanup", ERROR_NOT_READY);
     }
 
-    if (!round_trip_generic_io(device, created, error)) {
+    const wchar_t *io_operation = L"round-trip-generic-hid";
+    if (!round_trip_generic_io(device, created, io_operation, error)) {
       cleanup();
       CloseHandle(device);
-      return report_gamepad_smoke_failure(json, L"round-trip-generic-hid", error);
+      return report_gamepad_smoke_failure(json, io_operation, error);
     }
 
     for (std::uint32_t index = 1; index < before.max_gamepads; ++index) {
