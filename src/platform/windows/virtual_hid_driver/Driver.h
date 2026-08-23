@@ -15,6 +15,7 @@
 
 /* VHF requires the NT and WDF declarations above. */
 #include "../virtual_hid_protocol.h"
+#include "DynamicGamepad.h"
 #include "ReportQueue.h"
 
 #include <vhf.h>
@@ -42,6 +43,9 @@ typedef struct LUMEN_VHID_DEVICE_CONTEXT {
   LUMEN_VHID_QUEUED_REPORT in_flight_report;  ///< Stable storage retained until the next callback.
   HANDLE submissions_drained_event;  ///< Manual-reset event signaled when no submit call is active.
   HANDLE reports_drained_event;  ///< Manual-reset event signaled after VHF consumes all queued reports.
+  uint64_t next_gamepad_device_id;  ///< Next nonzero dynamic-gamepad identifier.
+  uint64_t next_gamepad_generation;  ///< Next nonzero stale-handle generation.
+  LUMEN_VHID_DYNAMIC_GAMEPAD gamepads[LUMEN_VHID_MAX_GAMEPADS];  ///< Isolated fixed dynamic-gamepad slots.
 } LUMEN_VHID_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LUMEN_VHID_DEVICE_CONTEXT, LumenVhidGetDeviceContext);
@@ -54,7 +58,7 @@ EVT_WDF_DRIVER_DEVICE_ADD LumenVhidEvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE LumenVhidEvtDevicePrepareHardware;
 /** Stop VHF and close the local target before hardware resources are released. */
 EVT_WDF_DEVICE_RELEASE_HARDWARE LumenVhidEvtDeviceReleaseHardware;
-/** Dispatch the four exact METHOD_BUFFERED control operations. */
+/** Dispatch the static ABI and additive dynamic-gamepad operations. */
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL LumenVhidEvtIoDeviceControl;
 /** Reset VHF and release ownership held by a closing file. */
 EVT_WDF_FILE_CLEANUP LumenVhidEvtFileCleanup;

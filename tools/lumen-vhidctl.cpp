@@ -29,10 +29,16 @@
 #include <string_view>
 #include <vector>
 
+// lib includes
+#include <ViGEm/Client.h>
+#include <Xinput.h>
+
 namespace {
-  constexpr wchar_t kDeviceDescription[] = L"Lumen Virtual HID Keyboard and Mouse";
+  constexpr wchar_t kDeviceDescription[] = L"Lumen Virtual Input";
   constexpr DWORD kInstallFlagForce = 0x00000001;
   constexpr int kInterfaceWaitAttempts = 30;
+  constexpr int kGamepadSmokeWaitAttempts = 300;
+  constexpr std::uint32_t kProtocolGeneration = 3;
 
   /** Stable process exit codes consumed by Windows packaging. */
   enum class exit_code : int {
@@ -181,6 +187,11 @@ namespace {
     probe_state state = probe_state::absent;
     DWORD error = ERROR_SUCCESS;
     std::uint32_t abi_version = 0;
+    std::uint32_t gamepad_abi_version = 0;
+    std::uint32_t gamepad_capability_flags = 0;
+    std::uint64_t supported_gamepad_profiles = 0;
+    std::uint32_t max_gamepads = 0;
+    std::uint32_t active_gamepads = 0;
   };
 
   /** Driver package generation selected by an exact supported class GUID. */
@@ -562,9 +573,180 @@ namespace {
     }
   }
 
-  /** Query ABI readiness when the SYSTEM-only control interface ACL permits it. */
-  probe_result query_protocol() {
-    probe_result result;
+  /**
+   * @brief Count present HID gamepad collections with one exact reported identity.
+   *
+   * @param vendor_id Expected HID vendor identifier.
+   * @param product_id Expected HID product identifier.
+   * @param version_number Expected HID version number.
+   * @param error Receives an interface-enumeration error.
+   * @return Number of matching present gamepad collections.
+   */
+  unsigned count_gamepad_collections(
+    std::uint16_t vendor_id,
+    std::uint16_t product_id,
+    std::uint16_t version_number,
+    DWORD &error
+  ) {
+    error = ERROR_SUCCESS;
+    unsigned count = 0;
+    GUID hid_guid {};
+    HidD_GetHidGuid(&hid_guid);
+    device_info_set set(SetupDiGetClassDevsW(&hid_guid, nullptr, nullptr, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT));
+    if (!set.valid()) {
+      error = GetLastError();
+      return 0;
+    }
+
+    for (DWORD index = 0;; ++index) {
+      SP_DEVICE_INTERFACE_DATA interface_data {};
+      interface_data.cbSize = sizeof(interface_data);
+      if (!SetupDiEnumDeviceInterfaces(set.get(), nullptr, &hid_guid, index, &interface_data)) {
+        const DWORD enumeration_error = GetLastError();
+        if (enumeration_error != ERROR_NO_MORE_ITEMS) {
+          error = enumeration_error;
+        }
+        return count;
+      }
+
+      DWORD required = 0;
+      SetupDiGetDeviceInterfaceDetailW(set.get(), &interface_data, nullptr, 0, &required, nullptr);
+      if (required == 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        continue;
+      }
+      std::vector<BYTE> buffer(required, 0);
+      auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buffer.data());
+      detail->cbSize = sizeof(*detail);
+      if (!SetupDiGetDeviceInterfaceDetailW(set.get(), &interface_data, detail, required, nullptr, nullptr)) {
+        continue;
+      }
+
+      const HANDLE probe = CreateFileW(
+        detail->DevicePath,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+      );
+      if (probe == INVALID_HANDLE_VALUE) {
+        continue;
+      }
+      HIDD_ATTRIBUTES attributes {};
+      attributes.Size = sizeof(attributes);
+      PHIDP_PREPARSED_DATA preparsed_data = nullptr;
+      HIDP_CAPS capabilities {};
+      const bool matches = HidD_GetAttributes(probe, &attributes) &&
+                           attributes.VendorID == vendor_id &&
+                           attributes.ProductID == product_id &&
+                           attributes.VersionNumber == version_number &&
+                           HidD_GetPreparsedData(probe, &preparsed_data) &&
+                           HidP_GetCaps(preparsed_data, &capabilities) == HIDP_STATUS_SUCCESS &&
+                           capabilities.UsagePage == HID_USAGE_PAGE_GENERIC &&
+                           (capabilities.Usage == HID_USAGE_GENERIC_GAMEPAD ||
+                            capabilities.Usage == HID_USAGE_GENERIC_JOYSTICK);
+      if (preparsed_data != nullptr) {
+        HidD_FreePreparsedData(preparsed_data);
+      }
+      CloseHandle(probe);
+      if (matches) {
+        ++count;
+      }
+    }
+  }
+
+  /**
+   * @brief Open one present HID gamepad or joystick collection with an exact identity.
+   *
+   * @param vendor_id Expected HID vendor identifier.
+   * @param product_id Expected HID product identifier.
+   * @param version_number Expected HID version number.
+   * @param overlapped Whether the handle will be used for overlapped I/O.
+   * @param error Receives a Win32 enumeration or open error.
+   * @return Writable HID handle, or INVALID_HANDLE_VALUE when no match is present.
+   */
+  HANDLE open_gamepad_collection(
+    std::uint16_t vendor_id,
+    std::uint16_t product_id,
+    std::uint16_t version_number,
+    bool overlapped,
+    DWORD &error
+  ) {
+    error = ERROR_FILE_NOT_FOUND;
+    GUID hid_guid {};
+    HidD_GetHidGuid(&hid_guid);
+    device_info_set set(SetupDiGetClassDevsW(&hid_guid, nullptr, nullptr, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT));
+    if (!set.valid()) {
+      error = GetLastError();
+      return INVALID_HANDLE_VALUE;
+    }
+
+    for (DWORD index = 0;; ++index) {
+      SP_DEVICE_INTERFACE_DATA interface_data {};
+      interface_data.cbSize = sizeof(interface_data);
+      if (!SetupDiEnumDeviceInterfaces(set.get(), nullptr, &hid_guid, index, &interface_data)) {
+        const auto enumeration_error = GetLastError();
+        if (enumeration_error != ERROR_NO_MORE_ITEMS) {
+          error = enumeration_error;
+        }
+        return INVALID_HANDLE_VALUE;
+      }
+      DWORD required = 0;
+      SetupDiGetDeviceInterfaceDetailW(set.get(), &interface_data, nullptr, 0, &required, nullptr);
+      if (required == 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        continue;
+      }
+      std::vector<BYTE> buffer(required, 0);
+      auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buffer.data());
+      detail->cbSize = sizeof(*detail);
+      if (!SetupDiGetDeviceInterfaceDetailW(set.get(), &interface_data, detail, required, nullptr, nullptr)) {
+        continue;
+      }
+
+      const HANDLE candidate = CreateFileW(
+        detail->DevicePath,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        overlapped ? FILE_FLAG_OVERLAPPED : FILE_ATTRIBUTE_NORMAL,
+        nullptr
+      );
+      if (candidate == INVALID_HANDLE_VALUE) {
+        continue;
+      }
+      HIDD_ATTRIBUTES attributes {};
+      attributes.Size = sizeof(attributes);
+      PHIDP_PREPARSED_DATA preparsed_data = nullptr;
+      HIDP_CAPS capabilities {};
+      const bool matches = HidD_GetAttributes(candidate, &attributes) &&
+                           attributes.VendorID == vendor_id &&
+                           attributes.ProductID == product_id &&
+                           attributes.VersionNumber == version_number &&
+                           HidD_GetPreparsedData(candidate, &preparsed_data) &&
+                           HidP_GetCaps(preparsed_data, &capabilities) == HIDP_STATUS_SUCCESS &&
+                           capabilities.UsagePage == HID_USAGE_PAGE_GENERIC &&
+                           (capabilities.Usage == HID_USAGE_GENERIC_GAMEPAD ||
+                            capabilities.Usage == HID_USAGE_GENERIC_JOYSTICK);
+      if (preparsed_data != nullptr) {
+        HidD_FreePreparsedData(preparsed_data);
+      }
+      if (matches) {
+        error = ERROR_SUCCESS;
+        return candidate;
+      }
+      CloseHandle(candidate);
+    }
+  }
+
+  /**
+   * @brief Open the single present SYSTEM-only Lumen control interface.
+   *
+   * @param error Receives the Win32 error when the interface cannot be opened.
+   * @return An open device handle, or INVALID_HANDLE_VALUE on failure.
+   */
+  HANDLE open_control_device(DWORD &error) {
     device_info_set set(SetupDiGetClassDevsW(
       &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID,
       nullptr,
@@ -572,33 +754,32 @@ namespace {
       DIGCF_DEVICEINTERFACE | DIGCF_PRESENT
     ));
     if (!set.valid()) {
-      result.error = GetLastError();
-      result.state = result.error == ERROR_ACCESS_DENIED ? probe_state::inaccessible : probe_state::incompatible;
-      return result;
+      error = GetLastError();
+      return INVALID_HANDLE_VALUE;
     }
     SP_DEVICE_INTERFACE_DATA interface_data {};
     interface_data.cbSize = sizeof(interface_data);
     if (!SetupDiEnumDeviceInterfaces(set.get(), nullptr, &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID, 0, &interface_data)) {
-      result.error = GetLastError();
-      result.state = result.error == ERROR_NO_MORE_ITEMS ? probe_state::absent : probe_state::incompatible;
-      return result;
+      error = GetLastError();
+      return INVALID_HANDLE_VALUE;
     }
     DWORD required = 0;
     SetupDiGetDeviceInterfaceDetailW(set.get(), &interface_data, nullptr, 0, &required, nullptr);
     if (required < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) {
-      result.error = GetLastError();
-      result.state = probe_state::incompatible;
-      return result;
+      error = GetLastError();
+      if (error == ERROR_SUCCESS) {
+        error = ERROR_INVALID_DATA;
+      }
+      return INVALID_HANDLE_VALUE;
     }
     std::vector<BYTE> detail_buffer(required, 0);
     auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(detail_buffer.data());
     detail->cbSize = sizeof(*detail);
     if (!SetupDiGetDeviceInterfaceDetailW(set.get(), &interface_data, detail, required, nullptr, nullptr)) {
-      result.error = GetLastError();
-      result.state = probe_state::incompatible;
-      return result;
+      error = GetLastError();
+      return INVALID_HANDLE_VALUE;
     }
-    HANDLE device = CreateFileW(
+    const HANDLE device = CreateFileW(
       detail->DevicePath,
       GENERIC_READ | GENERIC_WRITE,
       FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -608,8 +789,41 @@ namespace {
       nullptr
     );
     if (device == INVALID_HANDLE_VALUE) {
-      result.error = GetLastError();
-      result.state = result.error == ERROR_ACCESS_DENIED ? probe_state::inaccessible : probe_state::incompatible;
+      error = GetLastError();
+      return INVALID_HANDLE_VALUE;
+    }
+    error = ERROR_SUCCESS;
+    return device;
+  }
+
+  /** @brief Return every dynamic-gamepad capability required by Lumen. */
+  constexpr std::uint32_t required_gamepad_capabilities() {
+    return LUMEN_VHID_GAMEPAD_CAPABILITY_OUTPUT_REPORTS |
+           LUMEN_VHID_GAMEPAD_CAPABILITY_FEATURE_REPORTS |
+           LUMEN_VHID_GAMEPAD_CAPABILITY_OWNER_CLEANUP |
+           LUMEN_VHID_GAMEPAD_CAPABILITY_SESSION_TOKENS;
+  }
+
+  /** @brief Return the exact non-XInput profile set required by Lumen. */
+  constexpr std::uint64_t required_gamepad_profiles() {
+    return LUMEN_VHID_GAMEPAD_PROFILE_BIT(LUMEN_VHID_GAMEPAD_PROFILE_GENERIC) |
+           LUMEN_VHID_GAMEPAD_PROFILE_BIT(LUMEN_VHID_GAMEPAD_PROFILE_XBOX_ONE) |
+           LUMEN_VHID_GAMEPAD_PROFILE_BIT(LUMEN_VHID_GAMEPAD_PROFILE_XBOX_SERIES) |
+           LUMEN_VHID_GAMEPAD_PROFILE_BIT(LUMEN_VHID_GAMEPAD_PROFILE_DUALSENSE) |
+           LUMEN_VHID_GAMEPAD_PROFILE_BIT(LUMEN_VHID_GAMEPAD_PROFILE_SWITCH_PRO) |
+           LUMEN_VHID_GAMEPAD_PROFILE_BIT(LUMEN_VHID_GAMEPAD_PROFILE_DUALSHOCK4);
+  }
+
+  /** @brief Query static and dynamic ABI readiness when the SYSTEM-only interface ACL permits it. */
+  probe_result query_protocol() {
+    probe_result result;
+    DWORD open_error = ERROR_SUCCESS;
+    const HANDLE device = open_control_device(open_error);
+    if (device == INVALID_HANDLE_VALUE) {
+      result.error = open_error;
+      result.state = open_error == ERROR_NO_MORE_ITEMS ? probe_state::absent :
+                     open_error == ERROR_ACCESS_DENIED ? probe_state::inaccessible :
+                                                         probe_state::incompatible;
       return result;
     }
 
@@ -626,19 +840,63 @@ namespace {
                       nullptr
                     ) != FALSE;
     result.error = ok ? ERROR_SUCCESS : GetLastError();
-    CloseHandle(device);
 
     if (!ok) {
+      CloseHandle(device);
       result.state = result.error == ERROR_ACCESS_DENIED ? probe_state::inaccessible : probe_state::incompatible;
       return result;
     }
     if (returned != sizeof(response) || response.abi_version != LUMEN_VHID_ABI_VERSION || response.ready != 1) {
+      CloseHandle(device);
       result.error = ERROR_REVISION_MISMATCH;
+      result.state = probe_state::incompatible;
+      return result;
+    }
+
+    LUMEN_VHID_GAMEPAD_CAPABILITIES_RESPONSE gamepad {};
+    returned = 0;
+    const bool gamepad_ok = DeviceIoControl(
+                              device,
+                              IOCTL_LUMEN_VHID_GAMEPAD_GET_CAPABILITIES,
+                              nullptr,
+                              0,
+                              &gamepad,
+                              sizeof(gamepad),
+                              &returned,
+                              nullptr
+                            ) != FALSE;
+    result.error = gamepad_ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(device);
+    const auto required_profiles = required_gamepad_profiles();
+    if (!gamepad_ok ||
+        returned != sizeof(gamepad) ||
+        gamepad.version != LUMEN_VHID_GAMEPAD_ABI_VERSION ||
+        gamepad.size != sizeof(gamepad) ||
+        gamepad.base_abi_version != LUMEN_VHID_ABI_VERSION ||
+        (gamepad.capability_flags & required_gamepad_capabilities()) != required_gamepad_capabilities() ||
+        (gamepad.supported_profiles & required_profiles) != required_profiles ||
+        (gamepad.supported_profiles &
+         LUMEN_VHID_GAMEPAD_PROFILE_BIT(LUMEN_VHID_GAMEPAD_PROFILE_XBOX_360_RESERVED)) != 0 ||
+        gamepad.max_devices == 0 ||
+        gamepad.max_devices > LUMEN_VHID_MAX_GAMEPADS ||
+        gamepad.active_devices > gamepad.max_devices ||
+        gamepad.max_input_report_size == 0 ||
+        gamepad.max_output_report_size == 0 ||
+        gamepad.max_input_report_size > LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE ||
+        gamepad.max_output_report_size > LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE) {
+      if (result.error == ERROR_SUCCESS) {
+        result.error = ERROR_REVISION_MISMATCH;
+      }
       result.state = probe_state::incompatible;
       return result;
     }
     result.state = probe_state::compatible;
     result.abi_version = response.abi_version;
+    result.gamepad_abi_version = gamepad.version;
+    result.gamepad_capability_flags = gamepad.capability_flags;
+    result.supported_gamepad_profiles = gamepad.supported_profiles;
+    result.max_gamepads = gamepad.max_devices;
+    result.active_gamepads = gamepad.active_devices;
     return result;
   }
 
@@ -955,16 +1213,45 @@ namespace {
       }
       return static_cast<int>(exit_code::incompatible);
     }
+    const probe_result control = query_protocol();
     if (json) {
       std::wcout << L"{\"state\":\"installed\",\"rootDevices\":" << devices.devices.size()
                  << L",\"keyboards\":" << collections.keyboard_count
                  << L",\"mice\":" << collections.mouse_count
-                 << L",\"consumers\":" << collections.consumer_count << L"}\n";
+                 << L",\"consumers\":" << collections.consumer_count
+                 << L",\"control\":\"" << probe_state_name(control.state) << L"\"";
+      if (control.state == probe_state::compatible) {
+        std::wcout << L",\"protocolGeneration\":" << kProtocolGeneration
+                   << L",\"abiVersion\":" << control.abi_version
+                   << L",\"gamepadAbiVersion\":" << control.gamepad_abi_version
+                   << L",\"gamepadCapabilityFlags\":" << control.gamepad_capability_flags
+                   << L",\"supportedGamepadProfiles\":" << control.supported_gamepad_profiles
+                   << L",\"maxGamepads\":" << control.max_gamepads
+                   << L",\"activeGamepads\":" << control.active_gamepads;
+      }
+      if (control.error != ERROR_SUCCESS) {
+        std::wcout << L",\"controlWin32\":" << control.error;
+      }
+      std::wcout << L"}\n";
     } else {
       std::wcout << L"state=installed hardware_id=\"" << LUMEN_VHID_ROOT_HARDWARE_ID_W
                  << L"\" keyboards=" << collections.keyboard_count
                  << L" mice=" << collections.mouse_count
-                 << L" consumers=" << collections.consumer_count << L'\n';
+                 << L" consumers=" << collections.consumer_count
+                 << L" control=" << probe_state_name(control.state);
+      if (control.state == probe_state::compatible) {
+        std::wcout << L" protocol_generation=" << kProtocolGeneration
+                   << L" abi=" << control.abi_version
+                   << L" gamepad_abi=" << control.gamepad_abi_version
+                   << L" gamepad_capabilities=" << control.gamepad_capability_flags
+                   << L" supported_gamepad_profiles=" << control.supported_gamepad_profiles
+                   << L" max_gamepads=" << control.max_gamepads
+                   << L" active_gamepads=" << control.active_gamepads;
+      }
+      if (control.error != ERROR_SUCCESS) {
+        std::wcout << L" control_win32=" << control.error;
+      }
+      std::wcout << L'\n';
     }
     return static_cast<int>(exit_code::success);
   }
@@ -976,7 +1263,13 @@ namespace {
     if (json) {
       std::wcout << L"{\"state\":\"" << probe_state_name(result.state) << L"\"";
       if (result.state == probe_state::compatible) {
-        std::wcout << L",\"abiVersion\":" << result.abi_version;
+        std::wcout << L",\"protocolGeneration\":" << kProtocolGeneration
+                   << L",\"abiVersion\":" << result.abi_version
+                   << L",\"gamepadAbiVersion\":" << result.gamepad_abi_version
+                   << L",\"gamepadCapabilityFlags\":" << result.gamepad_capability_flags
+                   << L",\"supportedGamepadProfiles\":" << result.supported_gamepad_profiles
+                   << L",\"maxGamepads\":" << result.max_gamepads
+                   << L",\"activeGamepads\":" << result.active_gamepads;
       }
       if (result.error != ERROR_SUCCESS) {
         std::wcout << L",\"win32\":" << result.error;
@@ -984,12 +1277,930 @@ namespace {
       std::wcout << L"}\n";
     } else {
       std::wcout << L"state=" << probe_state_name(result.state);
+      if (result.state == probe_state::compatible) {
+        std::wcout << L" protocol_generation=" << kProtocolGeneration
+                   << L" abi=" << result.abi_version
+                   << L" gamepad_abi=" << result.gamepad_abi_version
+                   << L" gamepad_capabilities=" << result.gamepad_capability_flags
+                   << L" supported_gamepad_profiles=" << result.supported_gamepad_profiles
+                   << L" max_gamepads=" << result.max_gamepads
+                   << L" active_gamepads=" << result.active_gamepads;
+      }
       if (result.error != ERROR_SUCCESS) {
         std::wcout << L" win32=" << result.error;
       }
       std::wcout << L'\n';
     }
     return static_cast<int>(probe_exit_code(result.state));
+  }
+
+  /**
+   * @brief Determine whether the helper is running as the LocalSystem account.
+   *
+   * @param error Receives a Win32 query error, or ERROR_SUCCESS for a definitive result.
+   * @return true only when the process token user is the well-known LocalSystem SID.
+   */
+  bool running_as_local_system(DWORD &error) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+      error = GetLastError();
+      return false;
+    }
+    DWORD required = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+    if (required == 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+      error = GetLastError();
+      CloseHandle(token);
+      return false;
+    }
+    std::vector<BYTE> token_buffer(required, 0);
+    if (!GetTokenInformation(token, TokenUser, token_buffer.data(), required, &required)) {
+      error = GetLastError();
+      CloseHandle(token);
+      return false;
+    }
+    CloseHandle(token);
+
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> system_sid {};
+    DWORD system_sid_size = static_cast<DWORD>(system_sid.size());
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, system_sid.data(), &system_sid_size)) {
+      error = GetLastError();
+      return false;
+    }
+    const auto *token_user = reinterpret_cast<const TOKEN_USER *>(token_buffer.data());
+    error = ERROR_SUCCESS;
+    return EqualSid(token_user->User.Sid, system_sid.data()) != FALSE;
+  }
+
+  /**
+   * @brief Create one dynamic gamepad profile and validate the complete response.
+   *
+   * @param device Open owning control-interface handle.
+   * @param client_device_id Stable smoke-test device identifier.
+   * @param profile Built-in dynamic-gamepad profile.
+   * @param created Receives the authenticated gamepad response.
+   * @param error Receives a Win32 or response-validation error.
+   * @return true only when creation and response validation both succeed.
+   */
+  bool create_gamepad(
+    HANDLE device,
+    std::uint64_t client_device_id,
+    std::uint32_t profile,
+    LUMEN_VHID_GAMEPAD_CREATE_RESPONSE &created,
+    DWORD &error
+  ) {
+    LUMEN_VHID_GAMEPAD_CREATE_REQUEST request {};
+    request.version = LUMEN_VHID_GAMEPAD_ABI_VERSION;
+    request.size = sizeof(request);
+    request.client_device_id = client_device_id;
+    request.profile = profile;
+    DWORD returned = 0;
+    const bool ok = DeviceIoControl(
+                      device,
+                      IOCTL_LUMEN_VHID_GAMEPAD_CREATE,
+                      &request,
+                      sizeof(request),
+                      &created,
+                      sizeof(created),
+                      &returned,
+                      nullptr
+                    ) != FALSE;
+    error = ok ? ERROR_SUCCESS : GetLastError();
+    const bool token_present = std::any_of(
+      std::begin(created.handle.session_token),
+      std::end(created.handle.session_token),
+      [](std::uint8_t value) {
+        return value != 0;
+      }
+    );
+    const bool valid = ok &&
+                       returned == sizeof(created) &&
+                       created.version == LUMEN_VHID_GAMEPAD_ABI_VERSION &&
+                       created.size == sizeof(created) &&
+                       created.handle.device_id != 0 &&
+                       created.handle.generation != 0 &&
+                       token_present &&
+                       created.profile == profile &&
+                       created.input_report_size != 0 &&
+                       created.input_report_size <= LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE;
+    if (!valid && error == ERROR_SUCCESS) {
+      error = ERROR_INVALID_DATA;
+    }
+    return valid;
+  }
+
+  /**
+   * @brief Submit one exact neutral input report for a created gamepad.
+   *
+   * @param device Open owning control-interface handle.
+   * @param created Created gamepad metadata.
+   * @param error Receives the Win32 result.
+   * @return `true` when the driver accepts the neutral report.
+   */
+  bool submit_neutral_gamepad(
+    HANDLE device,
+    const LUMEN_VHID_GAMEPAD_CREATE_RESPONSE &created,
+    DWORD &error
+  ) {
+    LUMEN_VHID_GAMEPAD_SUBMIT_REPORT_REQUEST request {};
+    request.version = LUMEN_VHID_GAMEPAD_ABI_VERSION;
+    request.size = sizeof(request);
+    request.handle = created.handle;
+    request.report_size = created.input_report_size;
+    if (created.input_report_id != 0) {
+      request.report[0] = created.input_report_id;
+    }
+    DWORD returned = 0;
+    const bool ok = DeviceIoControl(
+                      device,
+                      IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT,
+                      &request,
+                      sizeof(request),
+                      nullptr,
+                      0,
+                      &returned,
+                      nullptr
+                    ) != FALSE;
+    error = ok ? ERROR_SUCCESS : GetLastError();
+    return ok;
+  }
+
+  /**
+   * @brief Wait for an exact number of present collections for one created identity.
+   *
+   * @param created Created gamepad identity.
+   * @param expected Expected number of matching HID collections.
+   * @param error Receives an enumeration or timeout error.
+   * @return `true` when the collection count reaches the expected value.
+   */
+  bool wait_for_gamepad_count(
+    const LUMEN_VHID_GAMEPAD_CREATE_RESPONSE &created,
+    unsigned expected,
+    DWORD &error
+  ) {
+    for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+      const auto count = count_gamepad_collections(
+        created.vendor_id,
+        created.product_id,
+        created.version_number,
+        error
+      );
+      if (error != ERROR_SUCCESS) {
+        return false;
+      }
+      if (count == expected) {
+        return true;
+      }
+      Sleep(100);
+    }
+    error = ERROR_NOT_READY;
+    return false;
+  }
+
+  /**
+   * @brief Round-trip Generic input and PID output through the enumerated HID collection.
+   *
+   * @param device Open owning control-interface handle.
+   * @param created Created Generic PID gamepad metadata.
+   * @param error Receives the first Win32 or validation error.
+   * @return `true` when both HID directions return the exact distinctive reports.
+   */
+  bool round_trip_generic_io(
+    HANDLE device,
+    const LUMEN_VHID_GAMEPAD_CREATE_RESPONSE &created,
+    DWORD &error
+  ) {
+    HANDLE hid = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+      hid = open_gamepad_collection(
+        created.vendor_id,
+        created.product_id,
+        created.version_number,
+        true,
+        error
+      );
+      if (hid != INVALID_HANDLE_VALUE) {
+        break;
+      }
+      if (error != ERROR_FILE_NOT_FOUND) {
+        return false;
+      }
+      Sleep(100);
+    }
+    if (hid == INVALID_HANDLE_VALUE) {
+      error = ERROR_NOT_READY;
+      return false;
+    }
+
+    if (created.input_report_size != 9u || created.input_report_id != 0x01u) {
+      CloseHandle(hid);
+      error = ERROR_INVALID_DATA;
+      return false;
+    }
+    std::array<std::uint8_t, 9> input_report {
+      0x01u,
+      0x01u,
+      0x00u,
+      0x20u,
+      0xe0u,
+      0x90u,
+      0x70u,
+      0xffu,
+      0xffu,
+    };
+    std::array<std::uint8_t, 9> observed_input {};
+    OVERLAPPED input_read {};
+    input_read.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (input_read.hEvent == nullptr) {
+      error = GetLastError();
+      CloseHandle(hid);
+      return false;
+    }
+    DWORD input_bytes = 0;
+    const bool read_started = ReadFile(
+                                hid,
+                                observed_input.data(),
+                                static_cast<DWORD>(observed_input.size()),
+                                &input_bytes,
+                                &input_read
+                              ) != FALSE;
+    error = read_started ? ERROR_SUCCESS : GetLastError();
+    if (!read_started && error != ERROR_IO_PENDING) {
+      CloseHandle(input_read.hEvent);
+      CloseHandle(hid);
+      return false;
+    }
+
+    LUMEN_VHID_GAMEPAD_SUBMIT_REPORT_REQUEST submit {};
+    submit.version = LUMEN_VHID_GAMEPAD_ABI_VERSION;
+    submit.size = sizeof(submit);
+    submit.handle = created.handle;
+    submit.report_size = static_cast<std::uint32_t>(input_report.size());
+    std::copy(input_report.begin(), input_report.end(), submit.report);
+    DWORD returned = 0;
+    if (!DeviceIoControl(
+          device,
+          IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT,
+          &submit,
+          sizeof(submit),
+          nullptr,
+          0,
+          &returned,
+          nullptr
+        )) {
+      error = GetLastError();
+      CancelIoEx(hid, &input_read);
+      DWORD ignored = 0;
+      static_cast<void>(GetOverlappedResult(hid, &input_read, &ignored, TRUE));
+      CloseHandle(input_read.hEvent);
+      CloseHandle(hid);
+      return false;
+    }
+    const auto wait = WaitForSingleObject(input_read.hEvent, 5000u);
+    const bool input_ok = wait == WAIT_OBJECT_0 &&
+                          GetOverlappedResult(hid, &input_read, &input_bytes, FALSE) != FALSE &&
+                          input_bytes == input_report.size() &&
+                          observed_input == input_report;
+    if (!input_ok) {
+      error = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+      CancelIoEx(hid, &input_read);
+      DWORD ignored = 0;
+      static_cast<void>(GetOverlappedResult(hid, &input_read, &ignored, TRUE));
+      CloseHandle(input_read.hEvent);
+      CloseHandle(hid);
+      return false;
+    }
+    CloseHandle(input_read.hEvent);
+    CloseHandle(hid);
+    hid = open_gamepad_collection(
+      created.vendor_id,
+      created.product_id,
+      created.version_number,
+      false,
+      error
+    );
+    if (hid == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+
+    LUMEN_VHID_GAMEPAD_AUTHENTICATED_REQUEST read_request {};
+    read_request.version = LUMEN_VHID_GAMEPAD_ABI_VERSION;
+    read_request.size = sizeof(read_request);
+    read_request.handle = created.handle;
+    for (;;) {
+      LUMEN_VHID_GAMEPAD_OUTPUT_RESPONSE pending {};
+      returned = 0;
+      const bool read_ok = DeviceIoControl(
+                             device,
+                             IOCTL_LUMEN_VHID_GAMEPAD_READ_OUTPUT,
+                             &read_request,
+                             sizeof(read_request),
+                             &pending,
+                             sizeof(pending),
+                             &returned,
+                             nullptr
+                           ) != FALSE;
+      error = read_ok ? ERROR_SUCCESS : GetLastError();
+      if (!read_ok && error == ERROR_NO_MORE_ITEMS) {
+        break;
+      }
+      const bool valid = read_ok &&
+                         returned == sizeof(pending) &&
+                         pending.version == LUMEN_VHID_GAMEPAD_ABI_VERSION &&
+                         pending.size == sizeof(pending) &&
+                         pending.handle.device_id == created.handle.device_id &&
+                         pending.handle.generation == created.handle.generation &&
+                         std::equal(
+                           std::begin(pending.handle.session_token),
+                           std::end(pending.handle.session_token),
+                           std::begin(created.handle.session_token)
+                         ) &&
+                         pending.report_size != 0 &&
+                         pending.report_size <= LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE;
+      if (!valid) {
+        if (error == ERROR_SUCCESS) {
+          error = ERROR_INVALID_DATA;
+        }
+        CloseHandle(hid);
+        return false;
+      }
+    }
+
+    std::array<std::uint8_t, 22> output_report {};
+    output_report[0] = 0x1du;  // Generic PID Device Gain.
+    output_report[1] = 0x7fu;
+    const bool write_ok = HidD_SetOutputReport(
+                            hid,
+                            output_report.data(),
+                            static_cast<ULONG>(output_report.size())
+                          ) != FALSE;
+    error = write_ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(hid);
+    if (!write_ok) {
+      return false;
+    }
+
+    for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+      LUMEN_VHID_GAMEPAD_OUTPUT_RESPONSE response {};
+      returned = 0;
+      const bool read_ok = DeviceIoControl(
+                             device,
+                             IOCTL_LUMEN_VHID_GAMEPAD_READ_OUTPUT,
+                             &read_request,
+                             sizeof(read_request),
+                             &response,
+                             sizeof(response),
+                             &returned,
+                             nullptr
+                           ) != FALSE;
+      error = read_ok ? ERROR_SUCCESS : GetLastError();
+      if (!read_ok && error == ERROR_NO_MORE_ITEMS) {
+        Sleep(10);
+        continue;
+      }
+      const bool well_formed = read_ok &&
+                               returned == sizeof(response) &&
+                               response.version == LUMEN_VHID_GAMEPAD_ABI_VERSION &&
+                               response.size == sizeof(response) &&
+                               response.handle.device_id == created.handle.device_id &&
+                               response.handle.generation == created.handle.generation &&
+                               std::equal(
+                                 std::begin(response.handle.session_token),
+                                 std::end(response.handle.session_token),
+                                 std::begin(created.handle.session_token)
+                               ) &&
+                               response.report_size != 0 &&
+                               response.report_size <= LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE;
+      if (!well_formed) {
+        if (error == ERROR_SUCCESS) {
+          error = ERROR_INVALID_DATA;
+        }
+        return false;
+      }
+      if (response.report_size == output_report.size() &&
+          std::equal(output_report.begin(), output_report.end(), response.report)) {
+        return true;
+      }
+    }
+    error = ERROR_TIMEOUT;
+    return false;
+  }
+
+  /**
+   * @brief Verify that one authenticated request is rejected.
+   *
+   * @param device Control-interface handle used for the negative request.
+   * @param control_code IOCTL expected to reject the request.
+   * @param request Request bytes.
+   * @param request_size Request byte count.
+   * @param error Receives ERROR_SUCCESS after an access-denied rejection, the
+   * unexpected rejection error, or ERROR_INVALID_ACCESS after acceptance.
+   * @return true only when DeviceIoControl rejects the request with ERROR_ACCESS_DENIED.
+   */
+  bool authenticated_request_rejected(
+    HANDLE device,
+    DWORD control_code,
+    void *request,
+    DWORD request_size,
+    DWORD &error
+  ) {
+    DWORD returned = 0;
+    if (DeviceIoControl(
+          device,
+          control_code,
+          request,
+          request_size,
+          nullptr,
+          0,
+          &returned,
+          nullptr
+        )) {
+      error = ERROR_INVALID_ACCESS;
+      return false;
+    }
+    error = GetLastError();
+    if (error != ERROR_ACCESS_DENIED) {
+      return false;
+    }
+    error = ERROR_SUCCESS;
+    return true;
+  }
+
+  /**
+   * @brief Destroy one authenticated dynamic gamepad.
+   *
+   * @param device Open Lumen control-interface handle.
+   * @param handle Exact gamepad identity and session token.
+   * @param error Receives the Win32 result.
+   * @return true when the driver accepted the destroy request.
+   */
+  bool destroy_gamepad(HANDLE device, const LUMEN_VHID_GAMEPAD_HANDLE &handle, DWORD &error) {
+    LUMEN_VHID_GAMEPAD_AUTHENTICATED_REQUEST request {};
+    request.version = LUMEN_VHID_GAMEPAD_ABI_VERSION;
+    request.size = sizeof(request);
+    request.handle = handle;
+    DWORD returned = 0;
+    const bool ok = DeviceIoControl(
+                      device,
+                      IOCTL_LUMEN_VHID_GAMEPAD_DESTROY,
+                      &request,
+                      sizeof(request),
+                      nullptr,
+                      0,
+                      &returned,
+                      nullptr
+                    ) != FALSE;
+    error = ok ? ERROR_SUCCESS : GetLastError();
+    return ok;
+  }
+
+  /**
+   * @brief Report one dynamic-gamepad smoke failure in the requested format.
+   *
+   * @param json Whether to emit JSON.
+   * @param operation Stable operation that failed.
+   * @param error Win32 failure code.
+   * @return The stable mutation-failed process exit code.
+   */
+  int report_gamepad_smoke_failure(bool json, const wchar_t *operation, DWORD error) {
+    if (json) {
+      std::wcout << L"{\"state\":\"failed\",\"operation\":\"" << operation
+                 << L"\",\"win32\":" << error << L"}\n";
+    } else {
+      std::wcout << L"state=failed operation=" << operation << L" win32=" << error << L'\n';
+    }
+    return static_cast<int>(exit_code::mutation_failed);
+  }
+
+  /**
+   * @brief Validate the retained Xbox 360 path through ViGEmBus and XInput.
+   *
+   * @param json Whether to emit JSON.
+   * @return A stable helper exit code.
+   */
+  int smoke_vigem(bool json) {
+    DWORD error = ERROR_SUCCESS;
+    if (!running_as_local_system(error)) {
+      return report_gamepad_smoke_failure(
+        json,
+        L"require-local-system",
+        error == ERROR_SUCCESS ? ERROR_ACCESS_DENIED : error
+      );
+    }
+
+    PVIGEM_CLIENT client = nullptr;
+    VIGEM_ERROR status = VIGEM_ERROR_BUS_NOT_FOUND;
+    for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+      auto *candidate = vigem_alloc();
+      if (candidate == nullptr) {
+        return report_gamepad_smoke_failure(json, L"allocate-vigem-client", ERROR_NOT_ENOUGH_MEMORY);
+      }
+      status = vigem_connect(candidate);
+      if (VIGEM_SUCCESS(status)) {
+        client = candidate;
+        break;
+      }
+      vigem_free(candidate);
+      Sleep(100);
+    }
+    if (client == nullptr) {
+      return report_gamepad_smoke_failure(json, L"connect-vigem", static_cast<DWORD>(status));
+    }
+    auto *target = vigem_target_x360_alloc();
+    if (target == nullptr) {
+      vigem_disconnect(client);
+      vigem_free(client);
+      return report_gamepad_smoke_failure(json, L"allocate-x360", ERROR_NOT_ENOUGH_MEMORY);
+    }
+    status = vigem_target_add(client, target);
+    if (!VIGEM_SUCCESS(status)) {
+      vigem_target_free(target);
+      vigem_disconnect(client);
+      vigem_free(client);
+      return report_gamepad_smoke_failure(json, L"attach-x360", static_cast<DWORD>(status));
+    }
+
+    XUSB_REPORT report {};
+    XUSB_REPORT_INIT(&report);
+    report.wButtons = XUSB_GAMEPAD_A | XUSB_GAMEPAD_Y;
+    report.bLeftTrigger = 37u;
+    report.bRightTrigger = 211u;
+    report.sThumbLX = 1234;
+    report.sThumbLY = -2345;
+    report.sThumbRX = 4567;
+    report.sThumbRY = -5678;
+    status = vigem_target_x360_update(client, target, report);
+    int xinput_index = -1;
+    if (VIGEM_SUCCESS(status)) {
+      for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts && xinput_index < 0; ++attempt) {
+        for (DWORD index = 0; index < XUSER_MAX_COUNT; ++index) {
+          XINPUT_STATE state {};
+          if (XInputGetState(index, &state) == ERROR_SUCCESS &&
+              state.Gamepad.wButtons == report.wButtons &&
+              state.Gamepad.bLeftTrigger == report.bLeftTrigger &&
+              state.Gamepad.bRightTrigger == report.bRightTrigger &&
+              state.Gamepad.sThumbLX == report.sThumbLX &&
+              state.Gamepad.sThumbLY == report.sThumbLY &&
+              state.Gamepad.sThumbRX == report.sThumbRX &&
+              state.Gamepad.sThumbRY == report.sThumbRY) {
+            xinput_index = static_cast<int>(index);
+            break;
+          }
+        }
+        if (xinput_index < 0) {
+          Sleep(100);
+        }
+      }
+    }
+
+    if (vigem_target_is_attached(target)) {
+      static_cast<void>(vigem_target_remove(client, target));
+    }
+    vigem_target_free(target);
+    vigem_disconnect(client);
+    vigem_free(client);
+    if (!VIGEM_SUCCESS(status)) {
+      return report_gamepad_smoke_failure(json, L"submit-x360", static_cast<DWORD>(status));
+    }
+    if (xinput_index < 0) {
+      return report_gamepad_smoke_failure(json, L"verify-xinput", ERROR_DEVICE_NOT_CONNECTED);
+    }
+
+    if (json) {
+      std::wcout << L"{\"state\":\"passed\",\"backend\":\"vigem\",\"profile\":\"x360\",\"xinputIndex\":"
+                 << xinput_index << L"}\n";
+    } else {
+      std::wcout << L"state=passed backend=vigem profile=x360 xinput_index=" << xinput_index << L'\n';
+    }
+    return static_cast<int>(exit_code::success);
+  }
+
+  /**
+   * @brief Exercise the complete SYSTEM-only dynamic-gamepad lifecycle.
+   *
+   * Creates, enumerates, submits to, and destroys every supported VHF profile.
+   * Generic PID must return a distinctive input report through HID and an exact
+   * HID output report through the authenticated queue. The smoke also verifies
+   * handle and file ownership, owner-file cleanup, the maximum-device bound,
+   * and removal of every dynamic HID collection.
+   *
+   * @param json Whether to emit JSON.
+   * @return A stable helper exit code.
+   */
+  int smoke_gamepad(bool json) {
+    DWORD error = ERROR_SUCCESS;
+    if (!running_as_local_system(error)) {
+      return report_gamepad_smoke_failure(
+        json,
+        L"require-local-system",
+        error == ERROR_SUCCESS ? ERROR_ACCESS_DENIED : error
+      );
+    }
+
+    const probe_result before = query_protocol();
+    if (before.state != probe_state::compatible) {
+      return report_gamepad_smoke_failure(
+        json,
+        L"query-capabilities",
+        before.error == ERROR_SUCCESS ? ERROR_REVISION_MISMATCH : before.error
+      );
+    }
+    if (before.active_gamepads != 0) {
+      return report_gamepad_smoke_failure(json, L"require-idle-runtime", ERROR_BUSY);
+    }
+
+    const HANDLE device = open_control_device(error);
+    if (device == INVALID_HANDLE_VALUE) {
+      return report_gamepad_smoke_failure(json, L"open-control-interface", error);
+    }
+
+    constexpr std::array<std::uint32_t, 6> profiles {
+      LUMEN_VHID_GAMEPAD_PROFILE_GENERIC,
+      LUMEN_VHID_GAMEPAD_PROFILE_XBOX_ONE,
+      LUMEN_VHID_GAMEPAD_PROFILE_XBOX_SERIES,
+      LUMEN_VHID_GAMEPAD_PROFILE_DUALSENSE,
+      LUMEN_VHID_GAMEPAD_PROFILE_SWITCH_PRO,
+      LUMEN_VHID_GAMEPAD_PROFILE_DUALSHOCK4,
+    };
+    for (std::size_t index = 0; index < profiles.size(); ++index) {
+      LUMEN_VHID_GAMEPAD_CREATE_RESPONSE profile_device {};
+      if (!create_gamepad(
+            device,
+            UINT64_C(0x4c554d5000000000) + index,
+            profiles[index],
+            profile_device,
+            error
+          )) {
+        CloseHandle(device);
+        return report_gamepad_smoke_failure(json, L"create-profile", error);
+      }
+      if (!wait_for_gamepad_count(profile_device, 1, error) ||
+          !submit_neutral_gamepad(device, profile_device, error)) {
+        DWORD ignored = ERROR_SUCCESS;
+        destroy_gamepad(device, profile_device.handle, ignored);
+        CloseHandle(device);
+        return report_gamepad_smoke_failure(json, L"validate-profile", error);
+      }
+      if (!destroy_gamepad(device, profile_device.handle, error) ||
+          !wait_for_gamepad_count(profile_device, 0, error)) {
+        CloseHandle(device);
+        return report_gamepad_smoke_failure(json, L"destroy-profile", error);
+      }
+    }
+
+    std::vector<LUMEN_VHID_GAMEPAD_HANDLE> handles;
+    handles.reserve(LUMEN_VHID_MAX_GAMEPADS);
+    const auto cleanup = [&]() {
+      DWORD ignored = ERROR_SUCCESS;
+      for (auto handle = handles.rbegin(); handle != handles.rend(); ++handle) {
+        destroy_gamepad(device, *handle, ignored);
+      }
+      handles.clear();
+    };
+
+    LUMEN_VHID_GAMEPAD_CREATE_RESPONSE created {};
+    if (!create_gamepad(
+          device,
+          UINT64_C(0x4c554d454e534d4b),
+          LUMEN_VHID_GAMEPAD_PROFILE_GENERIC,
+          created,
+          error
+        )) {
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"create-gamepad", error);
+    }
+    handles.push_back(created.handle);
+
+    bool enumerated = false;
+    for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+      const unsigned gamepad_count = count_gamepad_collections(
+        created.vendor_id,
+        created.product_id,
+        created.version_number,
+        error
+      );
+      if (error != ERROR_SUCCESS) {
+        cleanup();
+        CloseHandle(device);
+        return report_gamepad_smoke_failure(json, L"enumerate-gamepad", error);
+      }
+      if (gamepad_count == 1) {
+        enumerated = true;
+        break;
+      }
+      Sleep(100);
+    }
+    if (!enumerated) {
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"enumerate-gamepad", ERROR_NOT_READY);
+    }
+
+    LUMEN_VHID_GAMEPAD_SUBMIT_REPORT_REQUEST submit {};
+    submit.version = LUMEN_VHID_GAMEPAD_ABI_VERSION;
+    submit.size = sizeof(submit);
+    submit.handle = created.handle;
+    submit.report_size = created.input_report_size;
+    if (created.input_report_id != 0) {
+      submit.report[0] = created.input_report_id;
+    }
+
+    auto invalid_token = submit;
+    invalid_token.handle.session_token[0] ^= 0xff;
+    if (!authenticated_request_rejected(
+          device,
+          IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT,
+          &invalid_token,
+          sizeof(invalid_token),
+          error
+        )) {
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"reject-mutated-token", error);
+    }
+
+    auto invalid_device = submit;
+    ++invalid_device.handle.device_id;
+    if (!authenticated_request_rejected(
+          device,
+          IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT,
+          &invalid_device,
+          sizeof(invalid_device),
+          error
+        )) {
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"reject-mutated-device", error);
+    }
+
+    const HANDLE second_device = open_control_device(error);
+    if (second_device == INVALID_HANDLE_VALUE) {
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"open-second-control-interface", error);
+    }
+    if (!authenticated_request_rejected(
+          second_device,
+          IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT,
+          &submit,
+          sizeof(submit),
+          error
+        )) {
+      CloseHandle(second_device);
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"reject-cross-file-submit", error);
+    }
+    LUMEN_VHID_GAMEPAD_AUTHENTICATED_REQUEST cross_file_destroy {};
+    cross_file_destroy.version = LUMEN_VHID_GAMEPAD_ABI_VERSION;
+    cross_file_destroy.size = sizeof(cross_file_destroy);
+    cross_file_destroy.handle = created.handle;
+    if (!authenticated_request_rejected(
+          second_device,
+          IOCTL_LUMEN_VHID_GAMEPAD_DESTROY,
+          &cross_file_destroy,
+          sizeof(cross_file_destroy),
+          error
+        )) {
+      CloseHandle(second_device);
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"reject-cross-file-destroy", error);
+    }
+
+    LUMEN_VHID_GAMEPAD_CREATE_RESPONSE cleanup_probe {};
+    if (!create_gamepad(
+          second_device,
+          UINT64_C(0x4c554d454e434c4e),
+          LUMEN_VHID_GAMEPAD_PROFILE_GENERIC,
+          cleanup_probe,
+          error
+        )) {
+      CloseHandle(second_device);
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"create-cleanup-probe", error);
+    }
+    CloseHandle(second_device);
+    bool owner_cleanup = false;
+    for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+      const probe_result cleanup_state = query_protocol();
+      const unsigned gamepad_count = count_gamepad_collections(
+        created.vendor_id,
+        created.product_id,
+        created.version_number,
+        error
+      );
+      if (error != ERROR_SUCCESS) {
+        cleanup();
+        CloseHandle(device);
+        return report_gamepad_smoke_failure(json, L"verify-owner-cleanup", error);
+      }
+      if (cleanup_state.state == probe_state::compatible &&
+          cleanup_state.active_gamepads == 1 &&
+          gamepad_count == 1) {
+        owner_cleanup = true;
+        break;
+      }
+      Sleep(100);
+    }
+    if (!owner_cleanup) {
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"verify-owner-cleanup", ERROR_NOT_READY);
+    }
+
+    if (!round_trip_generic_io(device, created, error)) {
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"round-trip-generic-hid", error);
+    }
+
+    for (std::uint32_t index = 1; index < before.max_gamepads; ++index) {
+      LUMEN_VHID_GAMEPAD_CREATE_RESPONSE additional {};
+      if (!create_gamepad(
+            device,
+            UINT64_C(0x4c554d454e000000) + index,
+            LUMEN_VHID_GAMEPAD_PROFILE_GENERIC,
+            additional,
+            error
+          )) {
+        cleanup();
+        CloseHandle(device);
+        return report_gamepad_smoke_failure(json, L"fill-gamepad-capacity", error);
+      }
+      handles.push_back(additional.handle);
+    }
+    const probe_result at_capacity = query_protocol();
+    if (at_capacity.state != probe_state::compatible || at_capacity.active_gamepads != before.max_gamepads) {
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"verify-gamepad-capacity", ERROR_INVALID_DATA);
+    }
+    LUMEN_VHID_GAMEPAD_CREATE_RESPONSE overflow {};
+    if (create_gamepad(
+          device,
+          UINT64_C(0x4c554d454effffff),
+          LUMEN_VHID_GAMEPAD_PROFILE_GENERIC,
+          overflow,
+          error
+        )) {
+      handles.push_back(overflow.handle);
+      cleanup();
+      CloseHandle(device);
+      return report_gamepad_smoke_failure(json, L"reject-gamepad-overflow", ERROR_INVALID_ACCESS);
+    }
+
+    for (auto handle = handles.rbegin(); handle != handles.rend(); ++handle) {
+      if (!destroy_gamepad(device, *handle, error)) {
+        CloseHandle(device);
+        return report_gamepad_smoke_failure(json, L"destroy-gamepad", error);
+      }
+    }
+    handles.clear();
+    CloseHandle(device);
+
+    probe_result after;
+    for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+      after = query_protocol();
+      const unsigned gamepad_count = count_gamepad_collections(
+        created.vendor_id,
+        created.product_id,
+        created.version_number,
+        error
+      );
+      if (error != ERROR_SUCCESS) {
+        return report_gamepad_smoke_failure(json, L"verify-gamepad-removed", error);
+      }
+      if (after.state == probe_state::compatible && after.active_gamepads == 0 && gamepad_count == 0) {
+        if (json) {
+          std::wcout << L"{\"state\":\"passed\",\"protocolGeneration\":" << kProtocolGeneration
+                     << L",\"gamepadAbiVersion\":" << after.gamepad_abi_version
+                     << L",\"profile\":\"generic\",\"enumerated\":true"
+                     << L",\"tokenRejected\":true,\"deviceRejected\":true,\"crossFileRejected\":true"
+                     << L",\"ownerCleanup\":true,\"profilesValidated\":" << profiles.size()
+                     << L",\"capacity\":" << before.max_gamepads
+                     << L",\"overflowRejected\":true,\"submitted\":true"
+                     << L",\"input\":\"received\",\"output\":\"received\""
+                     << L",\"destroyed\":true,\"activeGamepads\":" << after.active_gamepads << L"}\n";
+        } else {
+          std::wcout << L"state=passed protocol_generation=" << kProtocolGeneration
+                     << L" gamepad_abi=" << after.gamepad_abi_version
+                     << L" profile=generic enumerated=true token_rejected=true device_rejected=true"
+                     << L" cross_file_rejected=true owner_cleanup=true profiles_validated=" << profiles.size()
+                     << L" capacity=" << before.max_gamepads
+                     << L" overflow_rejected=true submitted=true input=received output=received"
+                     << L" destroyed=true active_gamepads=" << after.active_gamepads << L'\n';
+        }
+        return static_cast<int>(exit_code::success);
+      }
+      Sleep(100);
+    }
+    return report_gamepad_smoke_failure(
+      json,
+      L"verify-destroyed",
+      after.error == ERROR_SUCCESS ? ERROR_NOT_READY : after.error
+    );
   }
 
   /** Idempotently create the root node and force-bind the supplied driver INF. */
@@ -1091,8 +2302,9 @@ namespace {
         if (*generation == package_generation::current &&
             collections.healthy() && children_started && control_probe.state == probe_state::compatible) {
           std::wcout << L"result=success action=install-or-update hardware_id=\""
-                     << LUMEN_VHID_ROOT_HARDWARE_ID_W << L"\" protocol="
-                     << LUMEN_VHID_ABI_VERSION << L'\n';
+                     << LUMEN_VHID_ROOT_HARDWARE_ID_W << L"\" protocol_generation="
+                     << kProtocolGeneration << L" base_abi=" << LUMEN_VHID_ABI_VERSION
+                     << L" gamepad_abi=" << LUMEN_VHID_GAMEPAD_ABI_VERSION << L'\n';
           return static_cast<int>(exit_code::success);
         }
         if (*generation == package_generation::current && collections.error != ERROR_SUCCESS) {
@@ -1110,8 +2322,9 @@ namespace {
     }
 
     std::wcout << L"result=reboot-required action=install-or-update hardware_id=\""
-               << LUMEN_VHID_ROOT_HARDWARE_ID_W << L"\" protocol="
-               << LUMEN_VHID_ABI_VERSION << L'\n';
+               << LUMEN_VHID_ROOT_HARDWARE_ID_W << L"\" protocol_generation="
+               << kProtocolGeneration << L" base_abi=" << LUMEN_VHID_ABI_VERSION
+               << L" gamepad_abi=" << LUMEN_VHID_GAMEPAD_ABI_VERSION << L'\n';
     return static_cast<int>(exit_code::reboot_required);
   }
 
@@ -1225,6 +2438,8 @@ namespace {
   /** Print the command and stable exit-code contract. */
   int usage() {
     std::wcerr << L"usage: lumen-vhidctl status [--json] | probe [--json] | "
+                  L"smoke-gamepad [--json] | "
+                  L"smoke-vigem [--json] | "
                   L"install-or-update <inf-path> | uninstall\n"
                   L"exit_codes: success=0 mutation_failed=1 absent=2 inaccessible=3 "
                   L"incompatible=4 reboot_required=3010\n";
@@ -1251,6 +2466,16 @@ int main() {
   } else if (argument_count == 3 && _wcsicmp(arguments[1], L"probe") == 0 &&
              _wcsicmp(arguments[2], L"--json") == 0) {
     result = probe(true);
+  } else if (argument_count == 2 && _wcsicmp(arguments[1], L"smoke-gamepad") == 0) {
+    result = smoke_gamepad(false);
+  } else if (argument_count == 3 && _wcsicmp(arguments[1], L"smoke-gamepad") == 0 &&
+             _wcsicmp(arguments[2], L"--json") == 0) {
+    result = smoke_gamepad(true);
+  } else if (argument_count == 2 && _wcsicmp(arguments[1], L"smoke-vigem") == 0) {
+    result = smoke_vigem(false);
+  } else if (argument_count == 3 && _wcsicmp(arguments[1], L"smoke-vigem") == 0 &&
+             _wcsicmp(arguments[2], L"--json") == 0) {
+    result = smoke_vigem(true);
   } else if (argument_count == 3 && _wcsicmp(arguments[1], L"install-or-update") == 0) {
     result = install_or_update(arguments[2]);
   } else if (argument_count == 2 && _wcsicmp(arguments[1], L"uninstall") == 0) {

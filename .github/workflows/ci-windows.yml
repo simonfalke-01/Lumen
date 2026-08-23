@@ -775,7 +775,7 @@ jobs:
         shell: msys2 {0}
         run: |
           cmake-build-windows/tests/test_sunshine.exe \
-            --gtest_filter='VirtualHidProtocolTest.*:VirtualHidKeyMappingTest.*:*virtual_hid_input_test.*:*virtual_hid_mouse_button_test.*:*send_input_transport_test.*:*send_input_mouse_button_test.*:InputBatchingTest.*:VirtualMicrophone*.*:ClientMicrophone*.*:client_microphone_test.*'
+            --gtest_filter='VirtualHidProtocolTest.*:VirtualHidKeyMappingTest.*:VirtualHidGamepadProtocolTest.*:VirtualHidDriverIsolationTest.*:VirtualHidReportQueueTest.*:DynamicGamepad*.*:GamepadRouterTest.*:VirtualHidGamepadTest.*:VirtualHidSessionTest.*:Libvirtualhid*.*:GamepadBackendValues/*.*:*virtual_hid_input_test.*:*virtual_hid_mouse_button_test.*:*send_input_transport_test.*:*send_input_mouse_button_test.*:InputBatchingTest.*:VirtualMicrophone*.*:ClientMicrophone*.*:client_microphone_test.*'
 
       - name: Run complete Windows release test suite
         if: inputs.release_tag != ''

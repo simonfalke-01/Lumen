@@ -850,6 +850,7 @@ namespace config {
       platf::supported_gamepads(nullptr).front().name.data(),
       platf::supported_gamepads(nullptr).front().name.size(),
     },  // Default gamepad
+    "auto",  // prefer the profile-compatible Windows virtual gamepad backend
     "auto",  // prefer Virtual HID with SendInput fallback on Windows
     true,  // back as touchpad click enabled (manual DS4 only)
     true,  // client gamepads with motion events are emulated as DS4
@@ -1804,6 +1805,7 @@ namespace config {
     }
 
     string_restricted_f(vars, "gamepad"s, input.gamepad, get_supported_gamepad_options());
+    string_restricted_f(vars, "gamepad_backend", input.gamepad_backend, {"auto"sv, "virtualhid"sv, "vigem"sv});
     string_restricted_f(vars, "windows_input_backend", input.windows_input_backend, {"auto"sv, "sendinput"sv});
     bool_f(vars, "ds4_back_as_touchpad_click", input.ds4_back_as_touchpad_click);
     bool_f(vars, "motion_as_ds4", input.motion_as_ds4);

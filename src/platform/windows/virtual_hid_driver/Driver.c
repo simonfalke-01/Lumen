@@ -474,7 +474,7 @@ static NTSTATUS LumenVhidHandleGetInfo(LUMEN_VHID_DEVICE_CONTEXT *context, WDFRE
 }
 
 /**
- * Dispatch the four exact custom control operations.
+ * Dispatch the static ABI and additive dynamic-gamepad control operations.
  *
  * @param queue Default device queue.
  * @param request Current METHOD_BUFFERED request.
@@ -489,11 +489,30 @@ VOID LumenVhidEvtIoDeviceControl(WDFQUEUE queue, WDFREQUEST request, size_t outp
   const void *input;
   size_t input_size;
   WDFFILEOBJECT file_object;
+  BOOLEAN gamepad_handled;
   NTSTATUS status;
 
   status = LumenVhidGetKnownFileObject(device, request, &file_object);
   if (!NT_SUCCESS(status)) {
     WdfRequestComplete(request, status);
+    return;
+  }
+
+  status = LumenVhidGamepadDispatchIoctl(
+    context,
+    request,
+    file_object,
+    output_buffer_length,
+    input_buffer_length,
+    io_control_code,
+    &gamepad_handled
+  );
+  if (gamepad_handled) {
+    WdfRequestCompleteWithInformation(
+      request,
+      status,
+      NT_SUCCESS(status) ? WdfRequestGetInformation(request) : 0
+    );
     return;
   }
 
@@ -596,6 +615,7 @@ VOID LumenVhidEvtFileCleanup(WDFFILEOBJECT file_object) {
   file_context = LumenVhidGetFileContext(file_object);
   file_context->closing = TRUE;
   context = LumenVhidGetDeviceContext(device);
+  LumenVhidGamepadCleanupFile(context, file_object);
   status = WdfWaitLockAcquire(context->state_lock, NULL);
   if (!NT_SUCCESS(status)) {
     return;
@@ -616,6 +636,7 @@ VOID LumenVhidEvtFileCleanup(WDFFILEOBJECT file_object) {
 VOID LumenVhidEvtDeviceCleanup(WDFOBJECT device_object) {
   LUMEN_VHID_DEVICE_CONTEXT *context = LumenVhidGetDeviceContext(device_object);
 
+  LumenVhidGamepadUninitialize(context);
   LumenVhidStopAndCloseTarget(context);
   if (context->reports_drained_event != NULL) {
     CloseHandle(context->reports_drained_event);
@@ -666,6 +687,7 @@ NTSTATUS LumenVhidEvtDeviceReleaseHardware(WDFDEVICE device, WDFCMRESLIST resour
 
   UNREFERENCED_PARAMETER(resources_translated);
 
+  LumenVhidGamepadReleaseHardware(context);
   LumenVhidStopAndCloseTarget(context);
   return STATUS_SUCCESS;
 }
@@ -719,6 +741,10 @@ NTSTATUS LumenVhidEvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
     CloseHandle(context->submissions_drained_event);
     context->submissions_drained_event = NULL;
     return STATUS_INSUFFICIENT_RESOURCES;
+  }
+  status = LumenVhidGamepadInitialize(context);
+  if (!NT_SUCCESS(status)) {
+    return status;
   }
   status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID, NULL);
   if (!NT_SUCCESS(status)) {

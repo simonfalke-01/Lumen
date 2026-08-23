@@ -59,12 +59,56 @@ extern "C" {
 
 /** Exact driver/client ABI version. */
 #define LUMEN_VHID_ABI_VERSION 2u
+/** Separately negotiated dynamic-gamepad extension ABI version. */
+#define LUMEN_VHID_GAMEPAD_ABI_VERSION 1u
 /** Number of keyboard bitmap bytes covering usages 00-DF. */
 #define LUMEN_VHID_NKRO_BITMAP_SIZE 28u
 /** Number of simultaneously pressed Consumer Control usages. */
 #define LUMEN_VHID_CONSUMER_USAGE_COUNT 4u
 /** Number of Mouse top-level collections published by ABI v2. */
 #define LUMEN_VHID_MOUSE_COLLECTION_COUNT 2u
+/** Maximum number of concurrent dynamic VHF gamepads. */
+#define LUMEN_VHID_MAX_GAMEPADS 16u
+/** Bytes in an unguessable per-gamepad session token. */
+#define LUMEN_VHID_GAMEPAD_SESSION_TOKEN_SIZE 32u
+/** Largest complete dynamic-gamepad input or output report. */
+#define LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE 256u
+
+/** @name Built-in dynamic-gamepad profiles
+ *
+ * Values intentionally match libvirtualhid revision 15a37d34. Xbox 360 is
+ * reserved because Windows XInput compatibility remains ViGEm-backed.
+ * @{ */
+#define LUMEN_VHID_GAMEPAD_PROFILE_GENERIC 0u
+#define LUMEN_VHID_GAMEPAD_PROFILE_XBOX_360_RESERVED 1u
+#define LUMEN_VHID_GAMEPAD_PROFILE_XBOX_ONE 2u
+#define LUMEN_VHID_GAMEPAD_PROFILE_XBOX_SERIES 3u
+#define LUMEN_VHID_GAMEPAD_PROFILE_DUALSENSE 4u
+#define LUMEN_VHID_GAMEPAD_PROFILE_SWITCH_PRO 5u
+#define LUMEN_VHID_GAMEPAD_PROFILE_DUALSHOCK4 6u
+#define LUMEN_VHID_GAMEPAD_PROFILE_COUNT 7u
+/** @} */
+
+/** Return the supported-profile bit corresponding to a built-in profile. */
+#define LUMEN_VHID_GAMEPAD_PROFILE_BIT(profile) (UINT64_C(1) << (profile))
+
+/** @name Dynamic-gamepad profile capabilities
+ * @{ */
+#define LUMEN_VHID_GAMEPAD_FEATURE_RUMBLE 0x00000001u
+#define LUMEN_VHID_GAMEPAD_FEATURE_MOTION 0x00000002u
+#define LUMEN_VHID_GAMEPAD_FEATURE_TOUCHPAD 0x00000004u
+#define LUMEN_VHID_GAMEPAD_FEATURE_RGB_LED 0x00000008u
+#define LUMEN_VHID_GAMEPAD_FEATURE_BATTERY 0x00000010u
+#define LUMEN_VHID_GAMEPAD_FEATURE_ADAPTIVE_TRIGGERS 0x00000020u
+/** @} */
+
+/** @name Dynamic-gamepad extension capabilities
+ * @{ */
+#define LUMEN_VHID_GAMEPAD_CAPABILITY_OUTPUT_REPORTS 0x00000001u
+#define LUMEN_VHID_GAMEPAD_CAPABILITY_FEATURE_REPORTS 0x00000002u
+#define LUMEN_VHID_GAMEPAD_CAPABILITY_OWNER_CLEANUP 0x00000004u
+#define LUMEN_VHID_GAMEPAD_CAPABILITY_SESSION_TOKENS 0x00000008u
+/** @} */
 
 /** @name Fixed HID identity
  * @{ */
@@ -99,6 +143,18 @@ extern "C" {
   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802u, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define IOCTL_LUMEN_VHID_RESET_AND_RELEASE \
   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803u, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_LUMEN_VHID_GAMEPAD_GET_CAPABILITIES \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810u, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_LUMEN_VHID_GAMEPAD_CREATE \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811u, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_LUMEN_VHID_GAMEPAD_DESTROY \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812u, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x813u, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_LUMEN_VHID_GAMEPAD_READ_OUTPUT \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x814u, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_LUMEN_VHID_GAMEPAD_RESET_RUNTIME \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x815u, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
   /** @} */
 
 #pragma pack(push, 1)
@@ -154,6 +210,78 @@ extern "C" {
     } report;  ///< Complete report selected by report_kind.
   } LUMEN_VHID_SUBMIT_REPORT_REQUEST;
 
+  /** Opaque authenticated identity of one dynamic gamepad generation. */
+  typedef struct LUMEN_VHID_GAMEPAD_HANDLE {
+    uint64_t device_id;  ///< Driver-assigned identifier, never zero.
+    uint64_t generation;  ///< Monotonic generation preventing stale-slot reuse.
+    uint8_t session_token[LUMEN_VHID_GAMEPAD_SESSION_TOKEN_SIZE];  ///< Driver-generated random bearer token.
+  } LUMEN_VHID_GAMEPAD_HANDLE;
+
+  /** Exact response returned by IOCTL_LUMEN_VHID_GAMEPAD_GET_CAPABILITIES. */
+  typedef struct LUMEN_VHID_GAMEPAD_CAPABILITIES_RESPONSE {
+    uint32_t version;  ///< LUMEN_VHID_GAMEPAD_ABI_VERSION.
+    uint32_t size;  ///< sizeof(LUMEN_VHID_GAMEPAD_CAPABILITIES_RESPONSE).
+    uint32_t base_abi_version;  ///< LUMEN_VHID_ABI_VERSION for the static collections.
+    uint32_t capability_flags;  ///< LUMEN_VHID_GAMEPAD_CAPABILITY_* bitmap.
+    uint64_t supported_profiles;  ///< LUMEN_VHID_GAMEPAD_PROFILE_BIT values.
+    uint32_t max_devices;  ///< LUMEN_VHID_MAX_GAMEPADS.
+    uint32_t active_devices;  ///< Snapshot of currently live dynamic gamepads.
+    uint32_t max_input_report_size;  ///< LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE.
+    uint32_t max_output_report_size;  ///< LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE.
+  } LUMEN_VHID_GAMEPAD_CAPABILITIES_RESPONSE;
+
+  /** Exact input accepted by IOCTL_LUMEN_VHID_GAMEPAD_CREATE. */
+  typedef struct LUMEN_VHID_GAMEPAD_CREATE_REQUEST {
+    uint32_t version;  ///< LUMEN_VHID_GAMEPAD_ABI_VERSION.
+    uint32_t size;  ///< sizeof(LUMEN_VHID_GAMEPAD_CREATE_REQUEST).
+    uint64_t client_device_id;  ///< Stable caller identifier used for profile identity data.
+    uint32_t profile;  ///< One supported LUMEN_VHID_GAMEPAD_PROFILE_* value.
+    uint32_t reserved;  ///< Must be zero.
+  } LUMEN_VHID_GAMEPAD_CREATE_REQUEST;
+
+  /** Exact output returned by IOCTL_LUMEN_VHID_GAMEPAD_CREATE. */
+  typedef struct LUMEN_VHID_GAMEPAD_CREATE_RESPONSE {
+    uint32_t version;  ///< LUMEN_VHID_GAMEPAD_ABI_VERSION.
+    uint32_t size;  ///< sizeof(LUMEN_VHID_GAMEPAD_CREATE_RESPONSE).
+    LUMEN_VHID_GAMEPAD_HANDLE handle;  ///< Authenticated handle for all later operations.
+    uint32_t profile;  ///< Effective built-in profile.
+    uint32_t feature_flags;  ///< LUMEN_VHID_GAMEPAD_FEATURE_* bitmap.
+    uint16_t vendor_id;  ///< Advertised HID vendor identifier.
+    uint16_t product_id;  ///< Advertised HID product identifier.
+    uint16_t version_number;  ///< Advertised HID version number.
+    uint8_t input_report_id;  ///< Primary input report ID; zero means unnumbered.
+    uint8_t reserved0;  ///< Zero.
+    uint32_t input_report_size;  ///< Exact accepted complete input report size.
+    uint32_t output_report_size;  ///< Largest expected output report size.
+  } LUMEN_VHID_GAMEPAD_CREATE_RESPONSE;
+
+  /** Header common to authenticated destroy, read, and reset operations. */
+  typedef struct LUMEN_VHID_GAMEPAD_AUTHENTICATED_REQUEST {
+    uint32_t version;  ///< LUMEN_VHID_GAMEPAD_ABI_VERSION.
+    uint32_t size;  ///< sizeof(LUMEN_VHID_GAMEPAD_AUTHENTICATED_REQUEST).
+    LUMEN_VHID_GAMEPAD_HANDLE handle;  ///< Exact current device identity and token.
+  } LUMEN_VHID_GAMEPAD_AUTHENTICATED_REQUEST;
+
+  /** Exact input accepted by IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT. */
+  typedef struct LUMEN_VHID_GAMEPAD_SUBMIT_REPORT_REQUEST {
+    uint32_t version;  ///< LUMEN_VHID_GAMEPAD_ABI_VERSION.
+    uint32_t size;  ///< sizeof(LUMEN_VHID_GAMEPAD_SUBMIT_REPORT_REQUEST).
+    LUMEN_VHID_GAMEPAD_HANDLE handle;  ///< Exact current device identity and token.
+    uint32_t report_size;  ///< Valid bytes in report; must match the profile.
+    uint32_t reserved;  ///< Must be zero.
+    uint8_t report[LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE];  ///< Complete HID input report.
+  } LUMEN_VHID_GAMEPAD_SUBMIT_REPORT_REQUEST;
+
+  /** Exact output returned by IOCTL_LUMEN_VHID_GAMEPAD_READ_OUTPUT. */
+  typedef struct LUMEN_VHID_GAMEPAD_OUTPUT_RESPONSE {
+    uint32_t version;  ///< LUMEN_VHID_GAMEPAD_ABI_VERSION.
+    uint32_t size;  ///< sizeof(LUMEN_VHID_GAMEPAD_OUTPUT_RESPONSE).
+    LUMEN_VHID_GAMEPAD_HANDLE handle;  ///< Device generation that produced the event.
+    uint32_t report_size;  ///< Valid bytes in report.
+    uint32_t reserved;  ///< Zero.
+    uint8_t report[LUMEN_VHID_GAMEPAD_MAX_REPORT_SIZE];  ///< Complete HID output or feature report.
+  } LUMEN_VHID_GAMEPAD_OUTPUT_RESPONSE;
+
 #pragma pack(pop)
 
 #define LUMEN_VHID_STATIC_ASSERT(expression, name) \
@@ -168,10 +296,26 @@ extern "C" {
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_CONSUMER_REPORT) == 9, consumer_report_size);
   LUMEN_VHID_STATIC_ASSERT(offsetof(LUMEN_VHID_SUBMIT_REPORT_REQUEST, report) == 4, submit_report_offset);
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_SUBMIT_REPORT_REQUEST) == 34, submit_report_request_size);
+  LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_GAMEPAD_HANDLE) == 48, gamepad_handle_size);
+  LUMEN_VHID_STATIC_ASSERT(offsetof(LUMEN_VHID_GAMEPAD_HANDLE, session_token) == 16, gamepad_token_offset);
+  LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_GAMEPAD_CAPABILITIES_RESPONSE) == 40, gamepad_capabilities_size);
+  LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_GAMEPAD_CREATE_REQUEST) == 24, gamepad_create_request_size);
+  LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_GAMEPAD_CREATE_RESPONSE) == 80, gamepad_create_response_size);
+  LUMEN_VHID_STATIC_ASSERT(offsetof(LUMEN_VHID_GAMEPAD_CREATE_RESPONSE, handle) == 8, gamepad_create_handle_offset);
+  LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_GAMEPAD_AUTHENTICATED_REQUEST) == 56, gamepad_authenticated_request_size);
+  LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_GAMEPAD_SUBMIT_REPORT_REQUEST) == 320, gamepad_submit_request_size);
+  LUMEN_VHID_STATIC_ASSERT(offsetof(LUMEN_VHID_GAMEPAD_SUBMIT_REPORT_REQUEST, report) == 64, gamepad_submit_report_offset);
+  LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_GAMEPAD_OUTPUT_RESPONSE) == 320, gamepad_output_response_size);
   LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_GET_INFO & 3u) == METHOD_BUFFERED, get_info_ioctl_buffered);
   LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_CLAIM & 3u) == METHOD_BUFFERED, claim_ioctl_buffered);
   LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_SUBMIT_REPORT & 3u) == METHOD_BUFFERED, submit_ioctl_buffered);
   LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_RESET_AND_RELEASE & 3u) == METHOD_BUFFERED, reset_ioctl_buffered);
+  LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_GAMEPAD_GET_CAPABILITIES & 3u) == METHOD_BUFFERED, gamepad_capabilities_ioctl_buffered);
+  LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_GAMEPAD_CREATE & 3u) == METHOD_BUFFERED, gamepad_create_ioctl_buffered);
+  LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_GAMEPAD_DESTROY & 3u) == METHOD_BUFFERED, gamepad_destroy_ioctl_buffered);
+  LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT & 3u) == METHOD_BUFFERED, gamepad_submit_ioctl_buffered);
+  LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_GAMEPAD_READ_OUTPUT & 3u) == METHOD_BUFFERED, gamepad_read_output_ioctl_buffered);
+  LUMEN_VHID_STATIC_ASSERT((IOCTL_LUMEN_VHID_GAMEPAD_RESET_RUNTIME & 3u) == METHOD_BUFFERED, gamepad_reset_runtime_ioctl_buffered);
 
 #undef LUMEN_VHID_STATIC_ASSERT
 

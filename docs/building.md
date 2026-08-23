@@ -204,8 +204,10 @@ For ARM64: To build frontend, you also need to install [Node.JS](https://nodejs.
 ##### Lumen Virtual HID driver
 
 The Windows application and Lumen Virtual HID driver use separate toolchains. The Virtual HID driver currently supports
-Windows 11 x64 only. Continue to build the AMD64 application in MSYS2 UCRT64, but build the VHF driver with MSVC from
-Visual Studio and the Windows Driver Kit (WDK). Do not build the driver with the MSYS2 application toolchain.
+Windows 11 x64 only. One root driver and one SYSTEM-only control interface provide Lumen's virtual keyboard, relative
+and absolute mouse, consumer controls, and dynamic gamepads. Continue to build the AMD64 application in MSYS2 UCRT64,
+but build the VHF driver with MSVC from Visual Studio and the Windows Driver Kit (WDK). Do not build the driver with the
+MSYS2 application toolchain.
 
 Install [Visual Studio 2022](https://visualstudio.microsoft.com/vs/) with the **Desktop development with C++** workload,
 a Windows 11 SDK, and the matching [Windows Driver Kit](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk).
@@ -219,13 +221,27 @@ The default build output is
 `src/platform/windows/virtual_hid_driver/build/x64/Release/package`. The regular CMake build does not build or sign the
 driver. To include it in an installer, supply its package directory with
 `SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR`. Omitting that option produces a package without the Virtual HID driver;
-Lumen remains usable with `windows_input_backend = sendinput`.
+Lumen remains usable with `windows_input_backend = sendinput`, and Xbox 360 gamepads remain available through ViGEm.
 
 A Lumen Windows package contains the x64 `LumenVirtualHid.inf`, `LumenVirtualHid.cat`, `LumenVirtualHid.dll`, and
 a bundled `.cer` file when configured with `SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON`. Setup trusts only that
 certificate. A committed upgrade replaces only the recorded prior Lumen signer, and a committed uninstall removes
-only the recorded thumbprint. Users can deselect Virtual HID and use `SendInput`. The Windows ARM64 application build
-has no Virtual HID driver package and uses `SendInput`.
+only the recorded thumbprint. The MSI exposes one optional **Lumen Virtual Input** feature for the entire driver; it
+does not install libvirtualhid's broker, service, installer, or licensing UI. Users can deselect this feature and use
+`SendInput` plus ViGEm-backed Xbox 360 controllers. The Windows ARM64 application build has no Virtual HID driver
+package and uses `SendInput` plus ViGEm.
+
+Protocol generation 3 preserves the static keyboard/mouse ABI at version 2 and negotiates the dynamic-gamepad extension
+separately at version 1, so old static-input clients are not broken by larger structures. The extension remains part of
+the existing `LumenVirtualHid` service and package identity. Build validation runs
+`lumen-vhidctl smoke-gamepad` as LocalSystem to create, enumerate, submit to, and destroy every supported VHF profile.
+For Generic PID it reads a distinctive submitted input report from the real HID collection, writes a PID output report,
+and requires that exact report through the authenticated output queue. It also rejects mutated and cross-file handles,
+verifies owner-file cleanup and the 16-device limit, and confirms every HID collection disappears. The helper must not
+make the control interface accessible to normal
+administrators or install a separate broker.
+The same installed helper runs `smoke-vigem` after provisioning the bundled ViGEmBus package, submits a distinctive
+Xbox 360 state, and requires the exact state through `XInputGetState`.
 
 ##### Lumen Virtual Microphone driver
 

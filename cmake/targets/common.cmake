@@ -93,6 +93,8 @@ string(APPEND VIGEM_COMPILE_FLAGS "-Wno-misleading-indentation ")
 string(APPEND VIGEM_COMPILE_FLAGS "-Wno-class-memaccess ")
 string(APPEND VIGEM_COMPILE_FLAGS "-Wno-unused-function ")
 string(APPEND VIGEM_COMPILE_FLAGS "-Wno-unused-variable ")
+string(APPEND VIGEM_COMPILE_FLAGS "-Wno-missing-field-initializers ")
+string(APPEND VIGEM_COMPILE_FLAGS "-Wno-cast-function-type ")
 set_source_files_properties("${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
         DIRECTORY "${CMAKE_SOURCE_DIR}" "${TEST_DIR}"
         PROPERTIES

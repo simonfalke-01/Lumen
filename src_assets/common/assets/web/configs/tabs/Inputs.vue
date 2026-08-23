@@ -40,17 +40,33 @@ const config = ref(props.config)
           </template>
 
           <template #windows>
-            <option value="ds4">{{ $t('config.gamepad_ds4') }}</option>
-            <option value="x360">{{ $t('config.gamepad_x360') }}</option>
+            <option value="generic">{{ $t('config.gamepad_windows_generic') }}</option>
+            <option value="x360">{{ $t('config.gamepad_windows_x360') }}</option>
+            <option value="xone">{{ $t('config.gamepad_windows_xone') }}</option>
+            <option value="xseries">{{ $t('config.gamepad_windows_xseries') }}</option>
+            <option value="ds4">{{ $t('config.gamepad_windows_ds4') }}</option>
+            <option value="ds5">{{ $t('config.gamepad_windows_ds5') }}</option>
+            <option value="switch">{{ $t('config.gamepad_windows_switch') }}</option>
           </template>
         </PlatformLayout>
       </select>
       <div class="form-text">{{ $t('config.gamepad_desc') }}</div>
     </div>
 
+    <!-- Windows virtual gamepad backend -->
+    <div class="mb-3" v-if="config.controller === 'enabled' && platform === 'windows'">
+      <label for="gamepad_backend" class="form-label">{{ $t('config.gamepad_backend') }}</label>
+      <select id="gamepad_backend" class="form-select" v-model="config.gamepad_backend">
+        <option value="auto">{{ $t('config.gamepad_backend_auto') }}</option>
+        <option value="virtualhid">{{ $t('config.gamepad_backend_virtualhid') }}</option>
+        <option value="vigem">{{ $t('config.gamepad_backend_vigem') }}</option>
+      </select>
+      <div class="form-text">{{ $t('config.gamepad_backend_desc') }}</div>
+    </div>
+
     <!-- Additional options based on gamepad type -->
     <template v-if="config.controller === 'enabled'">
-      <template v-if="config.gamepad === 'ds4' || config.gamepad === 'ds5' || (config.gamepad === 'auto' && platform !== 'macos')">
+      <template v-if="config.gamepad === 'ds4' || config.gamepad === 'ds5' || (config.gamepad === 'auto' && platform === 'linux')">
         <div class="mb-3 accordion">
           <div class="accordion-item">
             <h2 class="accordion-header">
@@ -62,16 +78,16 @@ const config = ref(props.config)
             <div id="panelsStayOpen-collapseOne" class="accordion-collapse collapse show"
                  aria-labelledby="panelsStayOpen-headingOne">
               <div class="accordion-body">
-                <!-- Automatic detection options (for Windows and Linux) -->
-                <template v-if="config.gamepad === 'auto' && (platform === 'windows' || platform === 'linux')">
-                  <!-- Gamepad with motion-capability as DS4(Windows)/DS5(Linux) -->
+                <!-- Linux automatic detection options -->
+                <template v-if="config.gamepad === 'auto' && platform === 'linux'">
+                  <!-- Gamepad with motion capability as DS5 -->
                   <Checkbox class="mb-3"
                             id="motion_as_ds4"
                             locale-prefix="config"
                             v-model="config.motion_as_ds4"
                             default="true"
                   ></Checkbox>
-                  <!-- Gamepad with touch-capability as DS4(Windows)/DS5(Linux) -->
+                  <!-- Gamepad with touch capability as DS5 -->
                   <Checkbox class="mb-3"
                             id="touchpad_as_ds4"
                             locale-prefix="config"
@@ -79,8 +95,8 @@ const config = ref(props.config)
                             default="true"
                   ></Checkbox>
                 </template>
-                <!-- DS4 option: DS4 back button as touchpad click (on Automatic: Windows only) -->
-                <template v-if="config.gamepad === 'ds4' || (config.gamepad === 'auto' && platform === 'windows')">
+                <!-- DS4 option: DS4 back button as touchpad click -->
+                <template v-if="config.gamepad === 'ds4'">
                   <Checkbox class="mb-3"
                             id="ds4_back_as_touchpad_click"
                             locale-prefix="config"

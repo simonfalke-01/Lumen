@@ -64,7 +64,7 @@
       <ExceptionHandling>false</ExceptionHandling>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>VhfUm.lib;mincore.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>VhfUm.lib;bcrypt.lib;mincore.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
@@ -73,10 +73,16 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Driver.c" />
+    <ClCompile Include="DynamicGamepad.c" />
+    <ClCompile Include="DynamicGamepadProfiles.c" />
     <ClCompile Include="HidDescriptors.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="DynamicGamepad.h" />
+    <ClInclude Include="DynamicGamepadProfiles.h" />
+    <ClInclude Include="DynamicGamepadValidation.h" />
+    <ClInclude Include="DynamicReportQueue.h" />
     <ClInclude Include="HidDescriptors.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="..\virtual_hid_protocol.h" />

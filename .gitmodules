@@ -21,6 +21,9 @@
 	path = third-party/libdisplaydevice
 	url = https://github.com/LizardByte/libdisplaydevice.git
 	branch = master
+[submodule "third-party/libvirtualhid"]
+	path = third-party/libvirtualhid
+	url = https://github.com/LizardByte/libvirtualhid.git
 [submodule "third-party/lizardbyte-common"]
 	path = third-party/lizardbyte-common
 	url = https://github.com/LizardByte/lizardbyte-common.git

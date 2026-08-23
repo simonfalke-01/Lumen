@@ -66,23 +66,75 @@ function Assert-VirtualHidHealthy {
     param([string]$FailureLog)
 
     $helper = 'C:\Program Files\Lumen\tools\lumen-vhidctl.exe'
-    & $helper status --json
-    if ($LASTEXITCODE -ne 0) {
+    $vigemInstaller = 'C:\Program Files\Lumen\third-party\vigembus_installer.exe'
+    if (-not (Test-Path -LiteralPath $vigemInstaller -PathType Leaf)) {
+        throw "Bundled ViGEmBus installer is missing: $vigemInstaller"
+    }
+    $vigemInstall = Start-Process `
+        -FilePath $vigemInstaller `
+        -ArgumentList @('/install', '/quiet', '/norestart') `
+        -Wait `
+        -PassThru
+    if ($vigemInstall.ExitCode -eq 3010) {
+        throw 'ViGEmBus installation requires a reboot; XInput validation cannot continue.'
+    }
+    if ($vigemInstall.ExitCode -ne 0) {
+        throw "ViGEmBus installation failed with exit code $($vigemInstall.ExitCode)."
+    }
+    Restart-Service -Name LumenService -Force
+    Assert-ServiceRunning
+    $statusOutput = @(& $helper status --json)
+    $statusExitCode = $LASTEXITCODE
+    $statusText = ($statusOutput -join [Environment]::NewLine).Trim()
+    Write-Host $statusText
+    try {
+        $status = $statusText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
         Get-Content (Join-Path $artifactDirectory $FailureLog)
-        throw "Virtual HID status failed with exit code $LASTEXITCODE."
+        throw "Virtual HID status did not return valid JSON: $($_.Exception.Message)"
+    }
+    if ($statusExitCode -ne 0 -or
+        $status.state -ne 'installed' -or
+        [int]$status.rootDevices -ne 1 -or
+        [int]$status.keyboards -ne 1 -or
+        [int]$status.mice -ne 2 -or
+        [int]$status.consumers -ne 1 -or
+        $status.control -ne 'inaccessible' -or
+        [int]$status.controlWin32 -ne 5) {
+        Get-Content (Join-Path $artifactDirectory $FailureLog)
+        throw (
+            'Virtual HID runneradmin status contract mismatch: ' +
+            "exit=$statusExitCode state='$($status.state)' roots=$($status.rootDevices) " +
+            "keyboards=$($status.keyboards) mice=$($status.mice) consumers=$($status.consumers) " +
+            "control='$($status.control)' win32=$($status.controlWin32)."
+        )
     }
     $taskName = "Lumen-VHID-Probe-$([Guid]::NewGuid().ToString('N'))"
     $probeScript = Join-Path $artifactDirectory 'lumen-vhid-probe.ps1'
     $probeOutput = Join-Path $artifactDirectory 'lumen-vhid-probe.json'
     $probeExit = Join-Path $artifactDirectory 'lumen-vhid-probe.exit'
+    $smokeOutput = Join-Path $artifactDirectory 'lumen-vhid-gamepad-smoke.json'
+    $smokeExit = Join-Path $artifactDirectory 'lumen-vhid-gamepad-smoke.exit'
+    $vigemOutput = Join-Path $artifactDirectory 'lumen-vigem-smoke.json'
+    $vigemExit = Join-Path $artifactDirectory 'lumen-vigem-smoke.exit'
     $escapedHelper = $helper.Replace("'", "''")
-    $escapedOutput = $probeOutput.Replace("'", "''")
-    $escapedExit = $probeExit.Replace("'", "''")
-    Remove-Item $probeOutput, $probeExit -Force -ErrorAction SilentlyContinue
+    $escapedProbeOutput = $probeOutput.Replace("'", "''")
+    $escapedProbeExit = $probeExit.Replace("'", "''")
+    $escapedSmokeOutput = $smokeOutput.Replace("'", "''")
+    $escapedSmokeExit = $smokeExit.Replace("'", "''")
+    $escapedVigemOutput = $vigemOutput.Replace("'", "''")
+    $escapedVigemExit = $vigemExit.Replace("'", "''")
+    Remove-Item $probeOutput, $probeExit, $smokeOutput, $smokeExit, $vigemOutput, $vigemExit -Force -ErrorAction SilentlyContinue
     @"
-& '$escapedHelper' probe --json | Set-Content -LiteralPath '$escapedOutput' -Encoding UTF8
+& '$escapedHelper' probe --json | Set-Content -LiteralPath '$escapedProbeOutput' -Encoding UTF8
 `$probeExitCode = `$LASTEXITCODE
-Set-Content -LiteralPath '$escapedExit' -Value `$probeExitCode -NoNewline
+Set-Content -LiteralPath '$escapedProbeExit' -Value `$probeExitCode -NoNewline
+& '$escapedHelper' smoke-gamepad --json | Set-Content -LiteralPath '$escapedSmokeOutput' -Encoding UTF8
+`$smokeExitCode = `$LASTEXITCODE
+Set-Content -LiteralPath '$escapedSmokeExit' -Value `$smokeExitCode -NoNewline
+& '$escapedHelper' smoke-vigem --json | Set-Content -LiteralPath '$escapedVigemOutput' -Encoding UTF8
+`$vigemExitCode = `$LASTEXITCODE
+Set-Content -LiteralPath '$escapedVigemExit' -Value `$vigemExitCode -NoNewline
 "@ | Set-Content -LiteralPath $probeScript -Encoding UTF8
 
     $action = New-ScheduledTaskAction `
@@ -99,24 +151,136 @@ Set-Content -LiteralPath '$escapedExit' -Value `$probeExitCode -NoNewline
             -Principal $principal `
             -Force | Out-Null
         Start-ScheduledTask -TaskName $taskName
-        $deadline = (Get-Date).AddSeconds(30)
-        while (-not (Test-Path -LiteralPath $probeExit -PathType Leaf) -and
+        $deadline = (Get-Date).AddSeconds(300)
+        while (-not (Test-Path -LiteralPath $vigemExit -PathType Leaf) -and
             (Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 100
         }
-        if (-not (Test-Path -LiteralPath $probeExit -PathType Leaf)) {
-            throw 'Virtual HID protocol probe timed out.'
+        if (-not (Test-Path -LiteralPath $vigemExit -PathType Leaf)) {
+            throw 'Virtual HID protocol, gamepad, or ViGEm/XInput smoke timed out.'
         }
-        Get-Content -LiteralPath $probeOutput
+        $probeText = (Get-Content -LiteralPath $probeOutput -Raw).Trim()
+        Write-Host $probeText
         $probeExitCode = [int](Get-Content -LiteralPath $probeExit -Raw)
         if ($probeExitCode -ne 0) {
             Get-Content (Join-Path $artifactDirectory $FailureLog)
             throw "Virtual HID protocol probe failed with exit code $probeExitCode."
         }
+        try {
+            $probe = $probeText | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "Virtual HID SYSTEM probe did not return valid JSON: $($_.Exception.Message)"
+        }
+        if ($probe.state -ne 'compatible' -or
+            [int]$probe.protocolGeneration -ne 3 -or
+            [int]$probe.abiVersion -ne 2 -or
+            [int]$probe.gamepadAbiVersion -ne 1 -or
+            (([int]$probe.gamepadCapabilityFlags -band 15) -ne 15) -or
+            (([int64]$probe.supportedGamepadProfiles -band 125) -ne 125) -or
+            (([int64]$probe.supportedGamepadProfiles -band 2) -ne 0) -or
+            [int]$probe.maxGamepads -ne 16 -or
+            [int]$probe.activeGamepads -ne 0) {
+            throw "Virtual HID SYSTEM capability contract mismatch: $probeText"
+        }
+
+        $smokeText = (Get-Content -LiteralPath $smokeOutput -Raw).Trim()
+        Write-Host $smokeText
+        $smokeExitCode = [int](Get-Content -LiteralPath $smokeExit -Raw)
+        if ($smokeExitCode -ne 0) {
+            Get-Content (Join-Path $artifactDirectory $FailureLog)
+            throw "Virtual HID dynamic-gamepad smoke failed with exit code $smokeExitCode."
+        }
+        try {
+            $smoke = $smokeText | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "Virtual HID gamepad smoke did not return valid JSON: $($_.Exception.Message)"
+        }
+        if ($smoke.state -ne 'passed' -or
+            [int]$smoke.protocolGeneration -ne 3 -or
+            [int]$smoke.gamepadAbiVersion -ne 1 -or
+            $smoke.profile -ne 'generic' -or
+            $smoke.enumerated -ne $true -or
+            $smoke.tokenRejected -ne $true -or
+            $smoke.deviceRejected -ne $true -or
+            $smoke.crossFileRejected -ne $true -or
+            $smoke.ownerCleanup -ne $true -or
+            [int]$smoke.profilesValidated -ne 6 -or
+            [int]$smoke.capacity -ne 16 -or
+            $smoke.overflowRejected -ne $true -or
+            $smoke.submitted -ne $true -or
+            $smoke.input -ne 'received' -or
+            $smoke.output -ne 'received' -or
+            $smoke.destroyed -ne $true -or
+            [int]$smoke.activeGamepads -ne 0) {
+            throw "Virtual HID dynamic-gamepad smoke contract mismatch: $smokeText"
+        }
+
+        $vigemText = (Get-Content -LiteralPath $vigemOutput -Raw).Trim()
+        Write-Host $vigemText
+        $vigemExitCode = [int](Get-Content -LiteralPath $vigemExit -Raw)
+        if ($vigemExitCode -ne 0) {
+            Get-Content (Join-Path $artifactDirectory $FailureLog)
+            throw "ViGEm/XInput smoke failed with exit code $vigemExitCode."
+        }
+        try {
+            $vigem = $vigemText | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "ViGEm/XInput smoke did not return valid JSON: $($_.Exception.Message)"
+        }
+        if ($vigem.state -ne 'passed' -or
+            $vigem.backend -ne 'vigem' -or
+            $vigem.profile -ne 'x360' -or
+            [int]$vigem.xinputIndex -lt 0 -or
+            [int]$vigem.xinputIndex -ge 4) {
+            throw "ViGEm/XInput smoke contract mismatch: $vigemText"
+        }
     } finally {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-Item $probeScript, $probeExit -Force -ErrorAction SilentlyContinue
+        Remove-Item $probeScript, $probeExit, $smokeExit, $vigemExit -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Assert-VirtualHidRemoved {
+    $helper = 'C:\Program Files\Lumen\tools\lumen-vhidctl.exe'
+    $dynamicIdentities = @(
+        'VID_1209&PID_0001',
+        'VID_045E&PID_02EA',
+        'VID_045E&PID_0B12',
+        'VID_054C&PID_05C4',
+        'VID_054C&PID_0CE6',
+        'VID_057E&PID_2009'
+    )
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        $roots = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.InstanceId -like 'ROOT\LUMENVIRTUALHID*'
+        })
+        $hidCollections = @(Get-PnpDevice -PresentOnly -Class HIDClass -ErrorAction SilentlyContinue | Where-Object {
+            $instanceId = $_.InstanceId
+            $instanceId -match 'VID_4C42&PID_0001' -or
+                @($dynamicIdentities | Where-Object { $instanceId -match [regex]::Escape($_) }).Count -ne 0
+        })
+        $driverStoreText = (& pnputil.exe /enum-drivers /files 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw "pnputil failed while verifying Virtual HID removal: $driverStoreText"
+        }
+        $packagePresent = $driverStoreText -match '(?im)LumenVirtualHid\.inf'
+        $helperPresent = Test-Path -LiteralPath $helper -PathType Leaf
+        if ($roots.Count -eq 0 -and
+            $hidCollections.Count -eq 0 -and
+            -not $packagePresent -and
+            -not $helperPresent) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+
+    throw (
+        'Virtual HID uninstall left owned resources behind: ' +
+        "roots=$($roots.InstanceId -join ',') " +
+        "hidCollections=$($hidCollections.InstanceId -join ',') " +
+        "packagePresent=$packagePresent helperPresent=$helperPresent."
+    )
 }
 
 function Get-MsiProperty {
@@ -171,9 +335,7 @@ switch ($Scenario) {
             -Arguments @('/x', $productCode, '/qn', '/norestart') `
             -LogName 'lumen-msi-uninstall-vhid.log' `
             -FailureMessage 'MSI uninstall with Virtual HID failed.')
-        if (Test-Path 'C:\Program Files\Lumen\tools\lumen-vhidctl.exe') {
-            throw 'Virtual HID helper remains after MSI uninstall.'
-        }
+        Assert-VirtualHidRemoved
     }
     'install-vmic' {
         [void](Invoke-Msi `

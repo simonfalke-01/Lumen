@@ -17,20 +17,31 @@
 #include <Windows.h>
 
 // standard includes
+#include <array>
+#include <atomic>
 #include <cmath>
+#include <memory>
+#include <mutex>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
 // lib includes
 #include <ViGEm/Client.h>
+#include <ViGEm/km/BusShared.h>
 
 // local includes
+#include "gamepad_router.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "virtual_hid_gamepad.h"
 #include "virtual_hid_input.h"
+
+// Pinned ViGEmClient internals required to own a joinable X360 notification worker.
+#include "third-party/ViGEmClient/src/Internal.h"
 
 namespace platf {
   using namespace std::literals;
@@ -46,50 +57,17 @@ namespace platf {
    */
   using target_t = util::safe_ptr<_VIGEM_TARGET_T, vigem_target_free>;
 
-  /**
-   * @brief Handle Xbox 360 virtual gamepad notification events.
-   *
-   * @param client ViGEm client.
-   * @param target ViGEm target.
-   * @param largeMotor Large motor strength.
-   * @param smallMotor Small motor strength.
-   * @param userdata User data pointer.
-   */
-  void CALLBACK x360_notify(
-    client_t::pointer client,
-    target_t::pointer target,
-    std::uint8_t largeMotor,
-    std::uint8_t smallMotor,
-    std::uint8_t /* led_number */,
-    void *userdata
-  );
+  class vigem_t;
 
   /**
-   * @brief Handle DualShock 4 virtual gamepad notification events.
-   *
-   * @param client ViGEm client.
-   * @param target ViGEm target.
-   * @param largeMotor Large motor strength.
-   * @param smallMotor Small motor strength.
-   * @param led_color Requested lightbar color.
-   * @param userdata User data pointer.
+   * @brief Immutable identity passed to one ViGEm notification registration.
    */
-  void CALLBACK ds4_notify(
-    client_t::pointer client,
-    target_t::pointer target,
-    std::uint8_t largeMotor,
-    std::uint8_t smallMotor,
-    DS4_LIGHTBAR_COLOR /* led_color */,
-    void *userdata
-  );
-
-  /**
-   * @brief Last touch coordinates reported by a virtual gamepad.
-   */
-  struct gp_touch_context_t {
-    uint8_t pointerIndex;  ///< Pointer index.
-    uint16_t x;  ///< X.
-    uint16_t y;  ///< Y.
+  struct vigem_notification_t {
+    vigem_t *owner {};  ///< ViGEm context that owns the registered target.
+    int global_index {};  ///< Router slot used by this exact registration.
+    std::uint64_t generation {};  ///< Router generation captured before worker start.
+    std::atomic_bool active {false};  ///< Cleared before worker cancellation or slot reuse.
+    std::jthread worker;  ///< Joinable X360 output worker owned by this bounded slot.
   };
 
   /**
@@ -102,19 +80,16 @@ namespace platf {
     union {
       XUSB_REPORT x360;
       DS4_REPORT_EX ds4;
-    } report;  ///< Current HID report for the virtual controller..
+    } report;  ///< Legacy ViGEm report storage; allocation is X360-only.
 
-    // Map from pointer ID to pointer index
-    std::map<uint32_t, uint8_t> pointer_id_map;  ///< Pointer ID map.
-    uint8_t available_pointers;  ///< Available pointers.
-
+    std::map<uint32_t, uint8_t> pointer_id_map;  ///< Legacy DS4 touch map.
+    uint8_t available_pointers {};  ///< Legacy DS4 available touch pointers.
     uint8_t client_relative_index;  ///< Client relative index.
-
-    thread_pool_util::ThreadPool::task_id_t repeat_task {};  ///< Repeat task.
-    std::chrono::steady_clock::time_point last_report_ts;  ///< Last report ts.
-
+    vigem_notification_t notification;  ///< Bounded exact notification registration identity.
+    thread_pool_util::ThreadPool::task_id_t repeat_task {};  ///< Legacy DS4 repeat task.
+    std::chrono::steady_clock::time_point last_report_ts;  ///< Legacy DS4 report time.
     gamepad_feedback_msg_t last_rumble;  ///< Last rumble.
-    gamepad_feedback_msg_t last_rgb_led;  ///< Last RGB led.
+    gamepad_feedback_msg_t last_rgb_led;  ///< Legacy DS4 LED feedback.
   };
 
   constexpr float EARTH_G = 9.80665f;  ///< Meters per second squared represented by one gravity unit.
@@ -258,30 +233,113 @@ namespace platf {
       client_t client {vigem_alloc()};
       VIGEM_ERROR status = vigem_connect(client.get());
       if (!VIGEM_SUCCESS(status)) {
-        // Log a special fatal message for this case to show the error in the web UI
-        BOOST_LOG(fatal) << "ViGEmBus is not installed or running. You must install ViGEmBus for gamepad support!"sv;
-      } else {
-        vigem_disconnect(client.get());
+        BOOST_LOG(warning) << "ViGEmBus is unavailable; Xbox 360/XInput emulation is disabled, but Lumen Virtual HID gamepads may still work"sv;
+        return -1;
+      }
+      vigem_disconnect(client.get());
+
+      for (int index = 0; index < static_cast<int>(gamepads.size()); ++index) {
+        gamepads[index].notification.owner = this;
+        gamepads[index].notification.global_index = index;
+        gamepads[index].notification.active.store(false);
       }
 
-      gamepads.resize(MAX_GAMEPADS);
-
       return 0;
+    }
+
+    /**
+     * @brief Read X360 output on a joinable per-slot worker.
+     *
+     * @param notification Bounded slot notification state.
+     * @param vigem_client Connected ViGEm client retained until the worker joins.
+     * @param target Connected X360 target retained until the worker joins.
+     * @param stop_token Cooperative cancellation token.
+     */
+    void run_notification(
+      vigem_notification_t *notification,
+      client_t::pointer vigem_client,
+      target_t::pointer target,
+      std::stop_token stop_token
+    ) noexcept {
+      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      if (event == nullptr) {
+        BOOST_LOG(warning) << "Couldn't create ViGEm X360 notification event: "sv << GetLastError();
+        return;
+      }
+
+      OVERLAPPED overlapped {};
+      overlapped.hEvent = event;
+      std::stop_callback cancel {stop_token, [vigem_client, &overlapped] {
+                                   if (vigem_client != nullptr &&
+                                       vigem_client->hBusDevice != INVALID_HANDLE_VALUE) {
+                                     CancelIoEx(vigem_client->hBusDevice, &overlapped);
+                                   }
+                                 }};
+
+      while (!stop_token.stop_requested()) {
+        DWORD transferred = 0;
+        XUSB_REQUEST_NOTIFICATION output;
+        XUSB_REQUEST_NOTIFICATION_INIT(&output, target->SerialNo);
+        overlapped.Internal = 0;
+        overlapped.InternalHigh = 0;
+        overlapped.Offset = 0;
+        overlapped.OffsetHigh = 0;
+        ResetEvent(event);
+        const BOOL started = DeviceIoControl(
+          vigem_client->hBusDevice,
+          IOCTL_XUSB_REQUEST_NOTIFICATION,
+          &output,
+          output.Size,
+          &output,
+          output.Size,
+          &transferred,
+          &overlapped
+        );
+        if (!started && GetLastError() != ERROR_IO_PENDING) {
+          if (!stop_token.stop_requested()) {
+            BOOST_LOG(warning) << "ViGEm X360 notification request failed: "sv << GetLastError();
+          }
+          break;
+        }
+        if (stop_token.stop_requested()) {
+          CancelIoEx(vigem_client->hBusDevice, &overlapped);
+        }
+        if (!GetOverlappedResult(vigem_client->hBusDevice, &overlapped, &transferred, TRUE)) {
+          const auto error = GetLastError();
+          if (!stop_token.stop_requested() && error != ERROR_OPERATION_ABORTED &&
+              error != ERROR_ACCESS_DENIED && error != ERROR_INVALID_HANDLE) {
+            BOOST_LOG(warning) << "ViGEm X360 notification read failed: "sv << error;
+          }
+          break;
+        }
+        if (!stop_token.stop_requested() && notification->active.load()) {
+          rumble(
+            notification->global_index,
+            notification->generation,
+            notification,
+            target,
+            output.LargeMotor,
+            output.SmallMotor
+          );
+        }
+      }
+      CloseHandle(event);
     }
 
     /**
      * @brief Attaches a new gamepad.
      * @param id The gamepad ID.
      * @param feedback_queue The queue for posting messages back to the client.
-     * @param gp_type The type of gamepad.
+     * @param generation Router generation assigned to this allocation.
      * @return 0 on success.
      */
-    int alloc_gamepad_internal(const gamepad_id_t &id, feedback_queue_t &feedback_queue, VIGEM_TARGET_TYPE gp_type) {
+    int alloc_gamepad_internal(
+      const gamepad_id_t &id,
+      feedback_queue_t &feedback_queue,
+      std::uint64_t generation
+    ) {
       auto &gamepad = gamepads[id.globalIndex];
       assert(!gamepad.gp);
-
-      gamepad.client_relative_index = id.clientRelativeIndex;
-      gamepad.last_report_ts = std::chrono::steady_clock::now();
 
       // Establish a connect to the ViGEm driver if we don't have one yet
       if (!client) {
@@ -296,45 +354,34 @@ namespace platf {
         }
       }
 
-      if (gp_type == Xbox360Wired) {
-        gamepad.gp.reset(vigem_target_x360_alloc());
-        XUSB_REPORT_INIT(&gamepad.report.x360);
-      } else {
-        gamepad.gp.reset(vigem_target_ds4_alloc());
-
-        // There is no equivalent DS4_REPORT_EX_INIT()
-        gamepad.report.ds4 = ds4_report_init_ex;
-
-        // Set initial accelerometer and gyro state
-        ds4_update_motion(gamepad, LI_MOTION_TYPE_ACCEL, 0.0f, EARTH_G, 0.0f);
-        ds4_update_motion(gamepad, LI_MOTION_TYPE_GYRO, 0.0f, 0.0f, 0.0f);
-
-        // Request motion events from the client at 100 Hz
-        feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_ACCEL, 100));
-        feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_GYRO, 100));
-
-        // We support pointer index 0 and 1
-        gamepad.available_pointers = 0x3;
-      }
+      gamepad.gp.reset(vigem_target_x360_alloc());
+      XUSB_REPORT_INIT(&gamepad.report.x360);
 
       auto status = vigem_target_add(client.get(), gamepad.gp.get());
       if (!VIGEM_SUCCESS(status)) {
         BOOST_LOG(error) << "Couldn't add Gamepad to ViGEm connection ["sv << util::hex(status).to_string_view() << ']';
-
+        free_target(id.globalIndex);
         return -1;
       }
 
-      gamepad.feedback_queue = std::move(feedback_queue);
-
-      if (gp_type == Xbox360Wired) {
-        status = vigem_target_x360_register_notification(client.get(), gamepad.gp.get(), x360_notify, this);
-      } else {
-        status = vigem_target_ds4_register_notification(client.get(), gamepad.gp.get(), ds4_notify, this);
+      auto *notification = &gamepad.notification;
+      {
+        std::lock_guard lock(gamepads_mutex);
+        gamepad.client_relative_index = id.clientRelativeIndex;
+        gamepad.feedback_queue = std::move(feedback_queue);
+        gamepad.last_rumble = {};
+        gamepad.last_rgb_led = {};
+        notification->generation = generation;
+        notification->active.store(true);
       }
 
-      if (!VIGEM_SUCCESS(status)) {
-        BOOST_LOG(warning) << "Couldn't register notifications for rumble support ["sv << util::hex(status).to_string_view() << ']';
-      }
+      notification->worker = std::jthread(
+        [this, notification, vigem_client = client.get(), target = gamepad.gp.get()](
+          std::stop_token stop_token
+        ) {
+          run_notification(notification, vigem_client, target, stop_token);
+        }
+      );
 
       return 0;
     }
@@ -345,6 +392,19 @@ namespace platf {
      */
     void free_target(int nr) {
       auto &gamepad = gamepads[nr];
+
+      {
+        std::lock_guard lock(gamepads_mutex);
+        gamepad.notification.active.store(false);
+        gamepad.feedback_queue.reset();
+        gamepad.last_rumble = {};
+        gamepad.last_rgb_led = {};
+      }
+
+      if (gamepad.notification.worker.joinable()) {
+        gamepad.notification.worker.request_stop();
+        gamepad.notification.worker.join();
+      }
 
       if (gamepad.repeat_task) {
         task_pool.cancel(gamepad.repeat_task);
@@ -359,6 +419,7 @@ namespace platf {
       }
 
       gamepad.gp.reset();
+      gamepad.notification.generation = 0;
 
       // Disconnect from ViGEm if we just removed the last gamepad
       bool disconnect = true;
@@ -377,127 +438,192 @@ namespace platf {
 
     /**
      * @brief Pass rumble data back to the client.
+     * @param global_index Global gamepad slot.
+     * @param generation Exact router generation that registered the callback.
+     * @param notification Exact immutable notification identity.
      * @param target The gamepad.
      * @param largeMotor The large motor.
      * @param smallMotor The small motor.
      */
-    void rumble(target_t::pointer target, std::uint8_t largeMotor, std::uint8_t smallMotor) {
-      for (int x = 0; x < gamepads.size(); ++x) {
-        auto &gamepad = gamepads[x];
-
-        if (gamepad.gp.get() == target) {
-          // Convert from 8-bit to 16-bit values
-          uint16_t normalizedLargeMotor = largeMotor << 8;
-          uint16_t normalizedSmallMotor = smallMotor << 8;
-
-          // Don't resend duplicate rumble data
-          if (normalizedSmallMotor != gamepad.last_rumble.data.rumble.highfreq || normalizedLargeMotor != gamepad.last_rumble.data.rumble.lowfreq) {
-            // We have to use the client-relative index when communicating back to the client
-            gamepad_feedback_msg_t msg = gamepad_feedback_msg_t::make_rumble(
-              gamepad.client_relative_index,
-              normalizedLargeMotor,
-              normalizedSmallMotor
-            );
-            gamepad.feedback_queue->raise(msg);
-            gamepad.last_rumble = msg;
-          }
+    void rumble(
+      int global_index,
+      std::uint64_t generation,
+      const vigem_notification_t *notification,
+      target_t::pointer target,
+      std::uint8_t largeMotor,
+      std::uint8_t smallMotor
+    ) {
+      feedback_queue_t feedback_queue;
+      gamepad_feedback_msg_t message;
+      {
+        std::lock_guard lock(gamepads_mutex);
+        if (global_index < 0 || global_index >= static_cast<int>(gamepads.size())) {
           return;
         }
-      }
-    }
-
-    /**
-     * @brief Pass RGB LED data back to the client.
-     * @param target The gamepad.
-     * @param r The red channel.
-     * @param g The red channel.
-     * @param b The red channel.
-     */
-    void set_rgb_led(target_t::pointer target, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
-      for (int x = 0; x < gamepads.size(); ++x) {
-        auto &gamepad = gamepads[x];
-
-        if (gamepad.gp.get() == target) {
-          // Don't resend duplicate RGB data
-          if (r != gamepad.last_rgb_led.data.rgb_led.r || g != gamepad.last_rgb_led.data.rgb_led.g || b != gamepad.last_rgb_led.data.rgb_led.b) {
-            // We have to use the client-relative index when communicating back to the client
-            gamepad_feedback_msg_t msg = gamepad_feedback_msg_t::make_rgb_led(gamepad.client_relative_index, r, g, b);
-            gamepad.feedback_queue->raise(msg);
-            gamepad.last_rgb_led = msg;
-          }
+        auto &gamepad = gamepads[global_index];
+        if (gamepad.notification.generation != generation || &gamepad.notification != notification ||
+            gamepad.gp.get() != target || !gamepad.feedback_queue) {
           return;
         }
+
+        const auto normalized_large_motor = static_cast<std::uint16_t>(largeMotor) << 8U;
+        const auto normalized_small_motor = static_cast<std::uint16_t>(smallMotor) << 8U;
+        if (normalized_small_motor == gamepad.last_rumble.data.rumble.highfreq &&
+            normalized_large_motor == gamepad.last_rumble.data.rumble.lowfreq) {
+          return;
+        }
+        message = gamepad_feedback_msg_t::make_rumble(
+          gamepad.client_relative_index,
+          normalized_large_motor,
+          normalized_small_motor
+        );
+        gamepad.last_rumble = message;
+        feedback_queue = gamepad.feedback_queue;
       }
+      feedback_queue->raise(message);
     }
 
     /**
      * @brief Detach all virtual gamepads and disconnect from the ViGEm client.
      */
     ~vigem_t() {
-      if (client) {
-        for (auto &gamepad : gamepads) {
-          if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
-            auto status = vigem_target_remove(client.get(), gamepad.gp.get());
-            if (!VIGEM_SUCCESS(status)) {
-              BOOST_LOG(warning) << "Couldn't detach gamepad from ViGEm ["sv << util::hex(status).to_string_view() << ']';
-            }
-          }
+      for (int index = 0; index < static_cast<int>(gamepads.size()); ++index) {
+        if (gamepads[index].gp) {
+          free_target(index);
         }
-
+      }
+      if (client) {
         vigem_disconnect(client.get());
       }
     }
 
-    std::vector<gamepad_context_t> gamepads;  ///< Virtual gamepads owned by this ViGEm connection.
+    std::array<gamepad_context_t, MAX_GAMEPADS> gamepads;  ///< Virtual gamepads owned by this ViGEm connection.
 
     client_t client;  ///< ViGEm client connection used to create virtual gamepads.
+    std::mutex gamepads_mutex;  ///< Protects callback routing and generation state.
   };
 
-  void CALLBACK x360_notify(
-    client_t::pointer client,
-    target_t::pointer target,
-    std::uint8_t largeMotor,
-    std::uint8_t smallMotor,
-    std::uint8_t /* led_number */,
-    void *userdata
-  ) {
-    BOOST_LOG(debug)
-      << "largeMotor: "sv << (int) largeMotor << std::endl
-      << "smallMotor: "sv << (int) smallMotor;
+  /**
+   * @brief Submit ordinary state through an already allocated ViGEm target.
+   *
+   * @param vigem Global ViGEm context.
+   * @param nr Global gamepad slot.
+   * @param state Current GameStream controller state.
+   * @return `true` when ViGEm accepted the complete report.
+   */
+  static bool vigem_gamepad_update(vigem_t *vigem, int nr, const gamepad_state_t &state);
 
-    task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
-  }
+  /**
+   * @brief Ignore touch input for the X360-only ViGEm route.
+   *
+   * @param vigem Global ViGEm context.
+   * @param touch Controller touch event.
+   * @return `true` because the visible X360 profile intentionally lacks touch.
+   */
+  static bool vigem_gamepad_touch(vigem_t *vigem, const gamepad_touch_t &touch);
 
-  void CALLBACK ds4_notify(
-    client_t::pointer client,
-    target_t::pointer target,
-    std::uint8_t largeMotor,
-    std::uint8_t smallMotor,
-    DS4_LIGHTBAR_COLOR led_color,
-    void *userdata
-  ) {
-    BOOST_LOG(debug)
-      << "largeMotor: "sv << (int) largeMotor << std::endl
-      << "smallMotor: "sv << (int) smallMotor << std::endl
-      << "LED: "sv << util::hex(led_color.Red).to_string_view() << ' '
-      << util::hex(led_color.Green).to_string_view() << ' '
-      << util::hex(led_color.Blue).to_string_view() << std::endl;
+  /**
+   * @brief Ignore motion input for the X360-only ViGEm route.
+   *
+   * @param vigem Global ViGEm context.
+   * @param motion Controller motion event.
+   * @return `true` because the visible X360 profile intentionally lacks motion.
+   */
+  static bool vigem_gamepad_motion(vigem_t *vigem, const gamepad_motion_t &motion);
 
-    task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
-    task_pool.push(&vigem_t::set_rgb_led, (vigem_t *) userdata, target, led_color.Red, led_color.Green, led_color.Blue);
-  }
+  /**
+   * @brief Ignore battery input for the X360-only ViGEm route.
+   *
+   * @param vigem Global ViGEm context.
+   * @param battery Controller battery event.
+   * @return `true` because the visible X360 profile intentionally lacks battery state.
+   */
+  static bool vigem_gamepad_battery(vigem_t *vigem, const gamepad_battery_t &battery);
+
+  /**
+   * @brief Router-owned ViGEm Xbox 360 target adapter.
+   */
+  class vigem_backend_t final: public win_gamepad::backend_t {
+  public:
+    /**
+     * @brief Construct an attached ViGEm target.
+     *
+     * @param vigem Global ViGEm context.
+     * @param global_index Global gamepad slot.
+     * @param generation Router slot generation.
+     */
+    vigem_backend_t(vigem_t *vigem, int global_index, std::uint64_t generation):
+        vigem_ {vigem},
+        global_index_ {global_index},
+        generation_ {generation} {
+    }
+
+    /**
+     * @brief Detach the target if the router did not already close it.
+     */
+    ~vigem_backend_t() override {
+      close();
+    }
+
+    win_gamepad::backend_kind_e kind() const noexcept override {
+      return win_gamepad::backend_kind_e::vigem;
+    }
+
+    win_gamepad::profile_kind_e profile() const noexcept override {
+      return win_gamepad::profile_kind_e::xbox_360;
+    }
+
+    win_gamepad::backend_identity_t identity() const noexcept override {
+      return {
+        .device_id = generation_,
+        .token = {},
+      };
+    }
+
+    bool update(const gamepad_state_t &state) override {
+      return !closed_ && vigem_gamepad_update(vigem_, global_index_, state);
+    }
+
+    bool touch(const gamepad_touch_t &touch_event) override {
+      return !closed_ && vigem_gamepad_touch(vigem_, touch_event);
+    }
+
+    bool motion(const gamepad_motion_t &motion_event) override {
+      return !closed_ && vigem_gamepad_motion(vigem_, motion_event);
+    }
+
+    bool battery(const gamepad_battery_t &battery_event) override {
+      return !closed_ && vigem_gamepad_battery(vigem_, battery_event);
+    }
+
+    void close() noexcept override {
+      if (!std::exchange(closed_, true) && vigem_) {
+        vigem_->free_target(global_index_);
+      }
+    }
+
+  private:
+    vigem_t *vigem_ {};  ///< Non-owning global ViGEm context.
+    int global_index_ {};  ///< Global gamepad slot.
+    std::uint64_t generation_ {};  ///< Router slot generation.
+    bool closed_ {};  ///< Idempotent teardown fence.
+  };
 
   /**
    * @brief Global inputtino device handles shared by clients.
    */
   struct input_raw_t {
     ~input_raw_t() {
+      gamepads.reset();
+      gamepad_session.reset();
       keyboard_mouse.reset();
       delete vigem;
     }
 
     std::unique_ptr<win_input::transport_t> keyboard_mouse;  ///< Selected keyboard and mouse transport.
     vigem_t *vigem;  ///< Vigem.
+    std::shared_ptr<win_gamepad::virtual_hid_session_t> gamepad_session;  ///< Dynamic VHF gamepad session.
+    std::unique_ptr<win_gamepad::router_t> gamepads;  ///< Tagged per-slot gamepad router.
 
     decltype(CreateSyntheticPointerDevice) *fnCreateSyntheticPointerDevice;  ///< Fn create synthetic pointer device.
     decltype(InjectSyntheticPointerInput) *fnInjectSyntheticPointerInput;  ///< Fn inject synthetic pointer input.
@@ -515,6 +641,52 @@ namespace platf {
       raw.vigem = nullptr;
     }
 
+    raw.gamepad_session = std::make_shared<win_gamepad::virtual_hid_session_t>(
+      win_gamepad::make_system_gamepad_channel()
+    );
+    if (!raw.gamepad_session->initialize()) {
+      BOOST_LOG(warning) << "Lumen Virtual HID gamepads unavailable: "sv << raw.gamepad_session->failure();
+    }
+
+    auto vigem_factory = [raw_ptr = &raw](
+                           win_gamepad::profile_kind_e profile,
+                           const gamepad_id_t &id,
+                           const gamepad_arrival_t &,
+                           feedback_queue_t feedback_queue,
+                           std::uint64_t generation
+                         ) -> win_gamepad::create_result_t {
+      if (profile != win_gamepad::profile_kind_e::xbox_360) {
+        return {
+          .backend = {},
+          .became_visible = false,
+          .error = "ViGEm is restricted to Xbox 360/XInput",
+        };
+      }
+      if (!raw_ptr->vigem) {
+        return {
+          .backend = {},
+          .became_visible = false,
+          .error = "ViGEmBus is unavailable",
+        };
+      }
+      if (raw_ptr->vigem->alloc_gamepad_internal(id, feedback_queue, generation) != 0) {
+        return {
+          .backend = {},
+          .became_visible = false,
+          .error = "ViGEmBus rejected Xbox 360 target creation",
+        };
+      }
+      return {
+        .backend = std::make_unique<vigem_backend_t>(raw_ptr->vigem, id.globalIndex, generation),
+        .became_visible = false,
+        .error = {},
+      };
+    };
+    raw.gamepads = std::make_unique<win_gamepad::router_t>(
+      win_gamepad::make_virtual_hid_gamepad_factory(raw.gamepad_session),
+      std::move(vigem_factory)
+    );
+
     // Get pointers to virtual touch/pen input functions (Win10 1809+)
     raw.fnCreateSyntheticPointerDevice = (decltype(CreateSyntheticPointerDevice) *) GetProcAddress(GetModuleHandleA("user32.dll"), "CreateSyntheticPointerDevice");
     raw.fnInjectSyntheticPointerInput = (decltype(InjectSyntheticPointerInput) *) GetProcAddress(GetModuleHandleA("user32.dll"), "InjectSyntheticPointerInput");
@@ -526,7 +698,7 @@ namespace platf {
   /**
    * @brief Calls InjectSyntheticPointerInput() and switches input desktops if required.
    * @details Must only be called if InjectSyntheticPointerInput() is available.
-   * @param input The global input context.
+   * @param input Global Windows input state.
    * @param device The synthetic pointer device handle.
    * @param pointerInfo An array of `POINTER_TYPE_INFO` structs.
    * @param count The number of elements in `pointerInfo`.
@@ -670,7 +842,7 @@ namespace platf {
 
   /**
    * @brief Allocates a context to store per-client input data.
-   * @param input The global input context.
+   * @param input Global Windows input context.
    * @return A unique pointer to a per-client input data context.
    */
   std::unique_ptr<client_input_t> allocate_client_input_context(input_t &input) {
@@ -1119,66 +1291,38 @@ namespace platf {
 
   int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
     auto raw = (input_raw_t *) input.get();
-
-    if (!raw->vigem) {
-      return 0;
+    if (!raw->gamepads) {
+      return -1;
     }
-
-    VIGEM_TARGET_TYPE selectedGamepadType;
-
-    if (config::input.gamepad == "x360"sv) {
-      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be Xbox 360 controller (manual selection)"sv;
-      selectedGamepadType = Xbox360Wired;
-    } else if (config::input.gamepad == "ds4"sv) {
-      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (manual selection)"sv;
-      selectedGamepadType = DualShock4Wired;
-    } else if (metadata.type == LI_CTYPE_PS) {
-      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (auto-selected by client-reported type)"sv;
-      selectedGamepadType = DualShock4Wired;
-    } else if (metadata.type == LI_CTYPE_XBOX) {
-      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be Xbox 360 controller (auto-selected by client-reported type)"sv;
-      selectedGamepadType = Xbox360Wired;
-    } else if (config::input.motion_as_ds4 && (metadata.capabilities & (LI_CCAP_ACCEL | LI_CCAP_GYRO))) {
-      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (auto-selected by motion sensor presence)"sv;
-      selectedGamepadType = DualShock4Wired;
-    } else if (config::input.touchpad_as_ds4 && (metadata.capabilities & LI_CCAP_TOUCHPAD)) {
-      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (auto-selected by touchpad presence)"sv;
-      selectedGamepadType = DualShock4Wired;
-    } else {
-      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be Xbox 360 controller (default)"sv;
-      selectedGamepadType = Xbox360Wired;
+    std::string error;
+    if (!raw->gamepads->allocate(
+          id,
+          metadata,
+          config::input.gamepad,
+          config::input.gamepad_backend,
+          std::move(feedback_queue),
+          error
+        )) {
+      BOOST_LOG(warning) << "Unable to allocate Windows gamepad "sv << id.globalIndex << ": "sv << error;
+      return -1;
     }
-
-    if (selectedGamepadType == Xbox360Wired) {
-      if (metadata.capabilities & (LI_CCAP_ACCEL | LI_CCAP_GYRO)) {
-        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " has motion sensors, but they are not usable when emulating an Xbox 360 controller"sv;
-      }
-      if (metadata.capabilities & LI_CCAP_TOUCHPAD) {
-        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " has a touchpad, but it is not usable when emulating an Xbox 360 controller"sv;
-      }
-      if (metadata.capabilities & LI_CCAP_RGB_LED) {
-        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " has an RGB LED, but it is not usable when emulating an Xbox 360 controller"sv;
-      }
-    } else if (selectedGamepadType == DualShock4Wired) {
-      if (!(metadata.capabilities & (LI_CCAP_ACCEL | LI_CCAP_GYRO))) {
-        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " is emulating a DualShock 4 controller, but the client gamepad doesn't have motion sensors active"sv;
-      }
-      if (!(metadata.capabilities & LI_CCAP_TOUCHPAD)) {
-        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " is emulating a DualShock 4 controller, but the client gamepad doesn't have a touchpad"sv;
-      }
+    if (!error.empty()) {
+      BOOST_LOG(warning) << "Windows gamepad "sv << id.globalIndex << ": "sv << error;
     }
-
-    return raw->vigem->alloc_gamepad_internal(id, feedback_queue, selectedGamepadType);
+    const auto route = raw->gamepads->snapshot(id.globalIndex);
+    BOOST_LOG(info)
+      << "Gamepad "sv << id.globalIndex << " allocated with backend "sv
+      << (route.backend == win_gamepad::backend_kind_e::virtual_hid ? "virtualhid"sv : "vigem"sv);
+    return 0;
   }
 
   void free_gamepad(input_t &input, int nr) {
     auto raw = (input_raw_t *) input.get();
 
-    if (!raw->vigem) {
+    if (!raw->gamepads) {
       return;
     }
-
-    raw->vigem->free_target(nr);
+    raw->gamepads->free(nr);
   }
 
   /**
@@ -1427,58 +1571,47 @@ namespace platf {
 
   /**
    * @brief Submit updated Sunshine gamepad state to the virtual device.
-   * @param input The input context.
+   * @param vigem Global ViGEm context.
    * @param nr The gamepad index to update.
    * @param gamepad_state The gamepad button/axis state sent from the client.
    */
-  void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state) {
-    auto vigem = ((input_raw_t *) input.get())->vigem;
-
-    // If there is no gamepad support
+  static bool vigem_gamepad_update(vigem_t *vigem, int nr, const gamepad_state_t &gamepad_state) {
     if (!vigem) {
-      return;
+      return false;
     }
 
     auto &gamepad = vigem->gamepads[nr];
     if (!gamepad.gp) {
-      return;
+      return false;
     }
 
-    VIGEM_ERROR status;
-
-    if (vigem_target_get_type(gamepad.gp.get()) == Xbox360Wired) {
-      x360_update_state(gamepad, gamepad_state);
-      status = vigem_target_x360_update(vigem->client.get(), gamepad.gp.get(), gamepad.report.x360);
-      if (!VIGEM_SUCCESS(status)) {
-        BOOST_LOG(warning) << "Couldn't send gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
-      }
-    } else {
-      ds4_update_state(gamepad, gamepad_state);
-      ds4_update_ts_and_send(vigem, nr);
+    x360_update_state(gamepad, gamepad_state);
+    const auto status = vigem_target_x360_update(vigem->client.get(), gamepad.gp.get(), gamepad.report.x360);
+    if (!VIGEM_SUCCESS(status)) {
+      BOOST_LOG(warning) << "Couldn't send gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
+      return false;
     }
+    return true;
   }
 
   /**
    * @brief Sends a gamepad touch event to the OS.
-   * @param input The global input context.
+   * @param vigem Global ViGEm context.
    * @param touch The touch event.
    */
-  void gamepad_touch(input_t &input, const gamepad_touch_t &touch) {
-    auto vigem = ((input_raw_t *) input.get())->vigem;
-
-    // If there is no gamepad support
+  static bool vigem_gamepad_touch(vigem_t *vigem, const gamepad_touch_t &touch) {
     if (!vigem) {
-      return;
+      return false;
     }
 
     auto &gamepad = vigem->gamepads[touch.id.globalIndex];
     if (!gamepad.gp) {
-      return;
+      return false;
     }
 
     // Touch is only supported on DualShock 4 controllers
     if (vigem_target_get_type(gamepad.gp.get()) != DualShock4Wired) {
-      return;
+      return true;
     }
 
     auto &report = gamepad.report.ds4.Report;
@@ -1503,7 +1636,7 @@ namespace platf {
         report.sCurrentTouch.bIsUpTrackingNum2++;
       } else {
         BOOST_LOG(warning) << "No more free pointer indices! Did the client miss an touch up event?"sv;
-        return;
+        return false;
       }
     } else if (touch.eventType == LI_TOUCH_EVENT_CANCEL_ALL) {
       // Raise both pointers
@@ -1519,7 +1652,7 @@ namespace platf {
       auto i = gamepad.pointer_id_map.find(touch.pointerId);
       if (i == gamepad.pointer_id_map.end()) {
         BOOST_LOG(warning) << "Pointer ID not found! Did the client miss a touch down event?"sv;
-        return;
+        return false;
       }
 
       pointerIndex = (*i).second;
@@ -1539,7 +1672,7 @@ namespace platf {
         gamepad.available_pointers |= (1 << pointerIndex);
       } else if (touch.eventType != LI_TOUCH_EVENT_MOVE) {
         BOOST_LOG(warning) << "Unsupported touch event for gamepad: "sv << (uint32_t) touch.eventType;
-        return;
+        return false;
       }
     }
 
@@ -1562,56 +1695,52 @@ namespace platf {
     }
 
     ds4_update_ts_and_send(vigem, touch.id.globalIndex);
+    return true;
   }
 
   /**
    * @brief Sends a gamepad motion event to the OS.
-   * @param input The global input context.
+   * @param vigem Global ViGEm context.
    * @param motion The motion event.
    */
-  void gamepad_motion(input_t &input, const gamepad_motion_t &motion) {
-    auto vigem = ((input_raw_t *) input.get())->vigem;
-
-    // If there is no gamepad support
+  static bool vigem_gamepad_motion(vigem_t *vigem, const gamepad_motion_t &motion) {
     if (!vigem) {
-      return;
+      return false;
     }
 
     auto &gamepad = vigem->gamepads[motion.id.globalIndex];
     if (!gamepad.gp) {
-      return;
+      return false;
     }
 
     // Motion is only supported on DualShock 4 controllers
     if (vigem_target_get_type(gamepad.gp.get()) != DualShock4Wired) {
-      return;
+      return true;
     }
 
     ds4_update_motion(gamepad, motion.motionType, motion.x, motion.y, motion.z);
     ds4_update_ts_and_send(vigem, motion.id.globalIndex);
+    return true;
   }
 
   /**
    * @brief Sends a gamepad battery event to the OS.
-   * @param input The global input context.
+   * @param vigem Global ViGEm context.
    * @param battery The battery event.
    */
-  void gamepad_battery(input_t &input, const gamepad_battery_t &battery) {
-    auto vigem = ((input_raw_t *) input.get())->vigem;
-
-    // If there is no gamepad support
+  static bool vigem_gamepad_battery(vigem_t *vigem, const gamepad_battery_t &battery) {
     if (!vigem) {
-      return;
+      return false;
     }
 
     auto &gamepad = vigem->gamepads[battery.id.globalIndex];
     if (!gamepad.gp) {
-      return;
+      return false;
     }
 
     // Battery is only supported on DualShock 4 controllers
     if (vigem_target_get_type(gamepad.gp.get()) != DualShock4Wired) {
-      return;
+      return true;
     }
 
     // For details on the report format of these battery level fields, see:
@@ -1662,6 +1791,60 @@ namespace platf {
     }
 
     ds4_update_ts_and_send(vigem, battery.id.globalIndex);
+    return true;
+  }
+
+  /**
+   * @brief Route ordinary gamepad state to the slot's tagged backend.
+   *
+   * @param input Global Windows input context.
+   * @param nr Global gamepad slot.
+   * @param gamepad_state Current buttons, sticks, and triggers.
+   */
+  void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state) {
+    auto *raw = (input_raw_t *) input.get();
+    if (raw->gamepads) {
+      static_cast<void>(raw->gamepads->update(nr, gamepad_state));
+    }
+  }
+
+  /**
+   * @brief Route gamepad touch input to the slot's tagged backend.
+   *
+   * @param input Global Windows input context.
+   * @param touch Controller touch event.
+   */
+  void gamepad_touch(input_t &input, const gamepad_touch_t &touch) {
+    auto *raw = (input_raw_t *) input.get();
+    if (raw->gamepads) {
+      static_cast<void>(raw->gamepads->touch(touch));
+    }
+  }
+
+  /**
+   * @brief Route gamepad motion input to the slot's tagged backend.
+   *
+   * @param input Global Windows input context.
+   * @param motion Controller motion sample.
+   */
+  void gamepad_motion(input_t &input, const gamepad_motion_t &motion) {
+    auto *raw = (input_raw_t *) input.get();
+    if (raw->gamepads) {
+      static_cast<void>(raw->gamepads->motion(motion));
+    }
+  }
+
+  /**
+   * @brief Route gamepad battery input to the slot's tagged backend.
+   *
+   * @param input Global Windows input context.
+   * @param battery Controller battery metadata.
+   */
+  void gamepad_battery(input_t &input, const gamepad_battery_t &battery) {
+    auto *raw = (input_raw_t *) input.get();
+    if (raw->gamepads) {
+      static_cast<void>(raw->gamepads->battery(battery));
+    }
   }
 
   void freeInput(void *p) {
@@ -1674,23 +1857,47 @@ namespace platf {
     if (!input) {
       static std::vector gps {
         supported_gamepad_t {"auto", true, ""},
+        supported_gamepad_t {"generic", false, ""},
         supported_gamepad_t {"x360", false, ""},
+        supported_gamepad_t {"xone", false, ""},
+        supported_gamepad_t {"xseries", false, ""},
         supported_gamepad_t {"ds4", false, ""},
+        supported_gamepad_t {"ds5", false, ""},
+        supported_gamepad_t {"switch", false, ""},
       };
 
       return gps;
     }
 
-    auto vigem = ((input_raw_t *) input)->vigem;
-    auto enabled = vigem != nullptr;
-    auto reason = enabled ? "" : "gamepads.vigem-not-available";
-
-    // ds4 == ps4
+    const auto *raw = (input_raw_t *) input;
+    const bool vhid_available = raw->gamepad_session && raw->gamepad_session->available();
+    const bool vigem_available = raw->vigem != nullptr;
+    const bool vhid_enabled = vhid_available && config::input.gamepad_backend != "vigem"sv;
+    const bool vigem_enabled = vigem_available && config::input.gamepad_backend != "virtualhid"sv;
+    const std::string vhid_reason = vhid_enabled ? "" : "gamepads.virtualhid-not-available";
+    const std::string vigem_reason = vigem_enabled ? "" : "gamepads.vigem-not-available";
+    const bool auto_enabled = config::input.gamepad_backend == "virtualhid"sv ? vhid_enabled :
+                              config::input.gamepad_backend == "vigem"sv      ? vigem_enabled :
+                                                                                (vhid_enabled || vigem_enabled);
     static std::vector gps {
-      supported_gamepad_t {"auto", true, reason},
-      supported_gamepad_t {"x360", enabled, reason},
-      supported_gamepad_t {"ds4", enabled, reason}
+      supported_gamepad_t {"auto", true, ""},
+      supported_gamepad_t {"generic", false, ""},
+      supported_gamepad_t {"x360", false, ""},
+      supported_gamepad_t {"xone", false, ""},
+      supported_gamepad_t {"xseries", false, ""},
+      supported_gamepad_t {"ds4", false, ""},
+      supported_gamepad_t {"ds5", false, ""},
+      supported_gamepad_t {"switch", false, ""},
     };
+
+    gps[0] = {"auto", auto_enabled, auto_enabled ? "" : "gamepads.no-backend-available"};
+    gps[1] = {"generic", vhid_enabled, vhid_reason};
+    gps[2] = {"x360", vigem_enabled, vigem_reason};
+    gps[3] = {"xone", vhid_enabled, vhid_reason};
+    gps[4] = {"xseries", vhid_enabled, vhid_reason};
+    gps[5] = {"ds4", vhid_enabled, vhid_reason};
+    gps[6] = {"ds5", vhid_enabled, vhid_reason};
+    gps[7] = {"switch", vhid_enabled, vhid_reason};
 
     for (auto &[name, is_enabled, reason_disabled] : gps) {
       if (!is_enabled) {
@@ -1708,8 +1915,8 @@ namespace platf {
   platform_caps::caps_t get_capabilities() {
     platform_caps::caps_t caps = 0;
 
-    // We support controller touchpad input as long as we're not emulating X360
-    if (config::input.gamepad != "x360"sv) {
+    // ViGEm is X360-only. Modern Virtual HID profiles can expose touchpads.
+    if (config::input.gamepad != "x360"sv && config::input.gamepad_backend != "vigem"sv) {
       caps |= platform_caps::controller_touch;
     }
 

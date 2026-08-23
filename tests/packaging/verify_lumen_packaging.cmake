@@ -77,6 +77,71 @@ assert_file_contains(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
     "Property Id=\"LUMEN_INSTALL_VHID\" Value=\"0\""
     "Virtual HID must remain explicit opt-in")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISPLAY_NAME "Lumen Virtual Input")]=]
+    "The single Virtual HID feature must describe every Lumen virtual input class")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[COMPONENT virtual_hid_driver]=]
+    "Keyboard, mouse, and dynamic gamepads must remain in one Virtual HID MSI feature")
+assert_file_excludes(
+    "cmake/packaging/windows.cmake"
+    "libvirtualhid(_broker|_driver|_service)?"
+    "Windows packaging must not add the upstream broker, service, or second driver")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[RENAME "vigembus_installer.exe"]=]
+    "Windows packaging must retain ViGEm for Xbox 360/XInput compatibility")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[COMPONENT gamepad]=]
+    "ViGEm must remain an independently selectable compatibility component")
+foreach(vhid_gamepad_helper_contract IN ITEMS
+        "IOCTL_LUMEN_VHID_GAMEPAD_GET_CAPABILITIES"
+        "IOCTL_LUMEN_VHID_GAMEPAD_CREATE"
+        "IOCTL_LUMEN_VHID_GAMEPAD_SUBMIT_REPORT"
+        "IOCTL_LUMEN_VHID_GAMEPAD_READ_OUTPUT"
+        "IOCTL_LUMEN_VHID_GAMEPAD_DESTROY"
+        "count_gamepad_collections"
+        "open_gamepad_collection"
+        "round_trip_generic_io"
+        "kProtocolGeneration = 3"
+        "running_as_local_system"
+        "smoke-gamepad"
+        "smoke-vigem")
+    assert_file_contains_literal(
+        "tools/lumen-vhidctl.cpp"
+        "${vhid_gamepad_helper_contract}"
+        "The Virtual HID helper must retain ${vhid_gamepad_helper_contract}")
+endforeach()
+assert_file_contains_literal(
+    ".github/scripts/test-windows-msi.ps1"
+    [=[& '$escapedHelper' smoke-gamepad --json]=]
+    "MSI validation must run the dynamic-gamepad smoke as LocalSystem")
+assert_file_contains_literal(
+    ".github/scripts/test-windows-msi.ps1"
+    [=[& '$escapedHelper' smoke-vigem --json]=]
+    "MSI validation must run the ViGEm/XInput smoke as LocalSystem")
+assert_file_contains_literal(
+    "tools/CMakeLists.txt"
+    "xinput9_1_0"
+    "The Virtual HID helper must link the XInput validation API")
+assert_file_contains_literal(
+    ".github/scripts/test-windows-msi.ps1"
+    [=[New-ScheduledTaskPrincipal]=]
+    "MSI validation must use a service-account task for the SYSTEM-only control interface")
+foreach(vhid_uninstall_contract IN ITEMS
+        "Assert-VirtualHidRemoved"
+        "ROOT\\LUMENVIRTUALHID"
+        "VID_4C42&PID_0001"
+        "VID_1209&PID_0001"
+        "LumenVirtualHid\\.inf")
+    assert_file_contains_literal(
+        ".github/scripts/test-windows-msi.ps1"
+        "${vhid_uninstall_contract}"
+        "MSI uninstall verification must retain ${vhid_uninstall_contract}")
+endforeach()
 assert_file_contains(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
     "Property Id=\"LUMEN_INSTALL_VMIC\" Value=\"0\""

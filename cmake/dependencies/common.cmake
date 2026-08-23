@@ -24,6 +24,10 @@ add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/lizardbyte-common")
 # libdisplaydevice
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libdisplaydevice")
 
+# Portable libvirtualhid gamepad profiles and report codecs only. Lumen keeps
+# exclusive ownership of its input router, Windows driver, and installer.
+include("${CMAKE_MODULE_PATH}/dependencies/libvirtualhid_core.cmake")
+
 if(SUNSHINE_ENABLE_TRAY)
     if(SUNSHINE_USE_STATIC_QT)
         set(_sunshine_find_library_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")

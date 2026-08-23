@@ -189,9 +189,19 @@ and enter its device name in the [audio_sink](configuration.md#audio_sink) field
 > Gamepads are not currently supported.
 
 ### Windows
-In order for virtual gamepads to work, you must install ViGEmBus. You can do this from the troubleshooting tab
-in the web UI, as long as you are running Lumen as a service or as an administrator. After installation, it is
-recommended to restart your computer.
+Lumen has two complementary virtual-gamepad paths on Windows:
+
+- Xbox 360 compatibility uses ViGEmBus and exposes an XInput controller. Install ViGEmBus from the troubleshooting
+  tab while Lumen runs as a service or as an administrator.
+- Generic, Xbox One, Xbox Series, DualShock 4, DualSense, and Switch Pro profiles use the optional **Lumen Virtual
+  Input** MSI feature. These are standard HID devices used through HID-aware APIs and GameInput.
+
+The default `gamepad_backend = auto` keeps Xbox and unknown automatic controllers on Xbox 360/ViGEm, routes
+PlayStation and Nintendo automatic controllers through Lumen Virtual HID, and uses Lumen Virtual HID for an explicitly
+selected modern or generic profile. If an automatically selected modern profile fails before becoming visible, Lumen
+logs that Virtual HID error and falls back to Xbox 360/ViGEm; explicit profiles and visible devices never change
+identity. The driver control interface remains restricted to the Lumen service; no separate broker or user-accessible
+control service is installed.
 
 ![ViGEmBus Installation](images/vigembus-installer.png)
 

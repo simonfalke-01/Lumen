@@ -27,6 +27,11 @@ The release tag must exactly equal `v` followed by the contents of `version.txt`
    Windows workflow, reruns the non-driver installer validation scenarios, and downloads the versioned Lumen artifacts.
    The optional Virtual HID install/uninstall scenario remains a required check in the normal Windows CI before the tag
    is created; it is not repeated during release publication because hosted driver installation is nondeterministic.
+   That scenario must validate the ABI version and capability flags and run the LocalSystem-only dynamic-gamepad smoke:
+   create, enumerate, submit to, and destroy all six VHF profiles; round-trip distinctive Generic input and PID output
+   through the real HID collection; reject mutated and cross-file handles; exercise owner-file cleanup and the 16-device
+   bound; and verify that no dynamic device or HID collection remains. It must separately validate the retained
+   Xbox 360/ViGEm path through XInput.
 5. Approve the deployment in the protected GitHub `release` environment when the validation evidence is complete.
 6. After approval, the workflow revalidates the remote tag target, generates `SHA256SUMS` and `update-manifest.json`, records GitHub artifact
    provenance attestations, and publishes the GitHub Release with generated notes.

@@ -172,6 +172,16 @@ endif ()
 set(SUNSHINE_SOURCES
         ${SUNSHINE_TARGET_FILES})
 
+# The Windows gamepad router, dynamic-session state machine, and report adapter
+# are intentionally portable so their fake-channel tests run on every host.
+# Windows builds already receive these sources through PLATFORM_TARGET_FILES.
+if(NOT WIN32)
+    list(APPEND SUNSHINE_SOURCES
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/gamepad_router.cpp
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_gamepad.cpp
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_session.cpp)
+endif()
+
 # remove main.cpp from the list of sources
 list(REMOVE_ITEM SUNSHINE_SOURCES ${CMAKE_SOURCE_DIR}/src/main.cpp)
 
@@ -239,6 +249,8 @@ add_dependencies(${PROJECT_NAME} sync_locale_files)
 # Build the list of libraries to link
 set(TEST_LINK_LIBRARIES
     ${SUNSHINE_EXTERNAL_LIBRARIES}
+    Lumen::libvirtualhid_core
+    Lumen::libvirtualhid_gamepad_core
     lizardbyte::test_support
     ${PLATFORM_LIBRARIES}
 )

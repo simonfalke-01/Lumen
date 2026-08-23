@@ -19,6 +19,20 @@ set(CPACK_PACKAGE_FILE_NAME
         "${CPACK_PACKAGE_NAME}-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_STRIP_FILES YES)
 
+# Retain the exact MIT notice for the portable libvirtualhid core. The
+# separately licensed upstream Windows driver and broker are not distributed.
+install(FILES "${CMAKE_SOURCE_DIR}/NOTICE"
+        DESTINATION "share/licenses/Lumen"
+        COMPONENT application)
+install(FILES "${CMAKE_SOURCE_DIR}/third-party/libvirtualhid/LICENSES/MIT.md"
+        DESTINATION "share/licenses/Lumen"
+        RENAME "libvirtualhid-MIT.txt"
+        COMPONENT application)
+install(FILES "${CMAKE_SOURCE_DIR}/third-party/libvirtualhid/LICENSES/README.md"
+        DESTINATION "share/licenses/Lumen"
+        RENAME "libvirtualhid-license-map.txt"
+        COMPONENT application)
+
 # install common assets
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/"
         DESTINATION "${SUNSHINE_ASSETS_DIR}"

@@ -223,6 +223,10 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${OPENSSL_LIBRARIES}
         ${PLATFORM_LIBRARIES})
 
+if(WIN32)
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES Lumen::libvirtualhid_gamepad_core)
+endif()
+
 # tray icon
 if(SUNSHINE_ENABLE_TRAY)
     list(APPEND SUNSHINE_EXTERNAL_LIBRARIES tray::tray)

@@ -48,12 +48,23 @@ target_link_libraries(sunshinesvc
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshinesvc PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
-add_executable(lumen-vhidctl lumen-vhidctl.cpp)
+add_executable(lumen-vhidctl
+        lumen-vhidctl.cpp
+        ${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp)
+set_source_files_properties(
+        ${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp
+        PROPERTIES
+        COMPILE_DEFINITIONS "UNICODE=1;ERROR_INVALID_DEVICE_OBJECT_PARAMETER=650"
+        COMPILE_OPTIONS "-Wno-unknown-pragmas;-Wno-misleading-indentation;-Wno-class-memaccess;-Wno-unused-function;-Wno-unused-variable;-Wno-missing-field-initializers;-Wno-cast-function-type")
+target_include_directories(lumen-vhidctl PRIVATE
+        ${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include
+        ${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src)
 target_link_libraries(lumen-vhidctl
         cfgmgr32
         hid
         setupapi
-        shell32)
+        shell32
+        xinput9_1_0)
 target_compile_options(lumen-vhidctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
 # Dedicated Windows device lifecycle helper for the optional capture-only

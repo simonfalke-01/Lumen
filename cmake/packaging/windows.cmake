@@ -257,13 +257,14 @@ set(CPACK_COMPONENT_ASSETS_GROUP "Core")
 set(CPACK_COMPONENT_ASSETS_REQUIRED true)
 
 # Lumen Virtual HID driver and management helper
-set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISPLAY_NAME "Virtual Keyboard and Mouse")
+set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISPLAY_NAME "Lumen Virtual Input")
 if(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE)
     set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
-            "Optional Lumen Virtual HID keyboard and mouse driver.")
+            "Optional Lumen Virtual HID keyboard, mouse, consumer-control, and modern gamepad driver.")
 else()
     set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
-            "Optional Lumen Virtual HID keyboard and mouse driver. Leave disabled to use SendInput only.")
+            "Optional Lumen Virtual HID keyboard, mouse, consumer-control, and modern gamepad driver. "
+            "Leave disabled to use SendInput and ViGEm-backed Xbox 360 controllers.")
 endif()
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_GROUP "Core")
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DEPENDS application)

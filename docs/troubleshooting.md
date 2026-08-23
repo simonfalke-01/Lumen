@@ -380,9 +380,25 @@ the root, device tree, endpoint and adapter names, and control ABI predicates in
 release if those predicates do not converge.
 
 ### No gamepad detected
-You must install ViGEmBus to use virtual gamepads. You can install this from the troubleshooting tab of the web UI.
+First check the configured Windows backend and profile:
 
-Alternatively, you can manually install it from
+- `gamepad_backend = auto` uses ViGEm for explicit Xbox 360 plus Xbox/unknown automatic controllers, and Lumen Virtual
+  HID for modern/generic explicit profiles plus PlayStation/Nintendo automatic controllers. An automatic Virtual HID
+  creation failure may fall back to Xbox 360/ViGEm only before the device becomes visible, with the original failure
+  logged.
+- `gamepad_backend = vigem` accepts only `gamepad = x360`. Install ViGEmBus from the troubleshooting tab of the web UI.
+- `gamepad_backend = virtualhid` rejects `gamepad = x360` without falling back. Install the **Lumen Virtual Input** MSI
+  feature and choose `generic`, `xone`, `xseries`, `ds4`, `ds5`, or `switch`.
+
+An explicit incompatible combination is reported instead of silently changing the selected profile or backend. The
+Lumen Virtual HID control interface is intentionally available only to the Lumen service running as LocalSystem; an
+`inaccessible` result from `lumen-vhidctl probe` in a normal Administrator shell is expected.
+
+A LocalSystem `probe --json` reports protocol generation 3 as base ABI 2 plus dynamic-gamepad ABI 1. A different base
+or gamepad ABI is incompatible; Lumen keeps the Xbox 360/ViGEm path available instead of sending modern reports to a
+mismatched driver.
+
+You can also manually install ViGEmBus from
 [ViGEmBus releases](https://github.com/nefarius/ViGEmBus/releases/latest). You must use version 1.17 or newer.
 
 After installation, it is recommended to restart your computer.

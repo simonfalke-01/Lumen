@@ -331,7 +331,9 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            The type of gamepad to emulate on the host.
+            The controller profile to emulate on the host. On Windows, modern and generic profiles are
+            standard HID devices discoverable through HID-aware software and GameInput. Xbox 360 remains
+            a ViGEm-backed XInput controller for compatibility.
         </td>
     </tr>
     <tr>
@@ -347,20 +349,31 @@ The key retains its upstream name for compatibility with existing configuration 
             @endcode</td>
     </tr>
     <tr>
-        <td rowspan="6">Choices</td>
+        <td rowspan="8">Choices</td>
+        <td>auto</td>
+        <td>Select a profile from the controller family reported by the client. On Windows, PlayStation selects
+            DualSense through Lumen Virtual HID, Nintendo selects Switch Pro through Lumen Virtual HID, and Xbox
+            or unknown selects Xbox 360 through ViGEm for compatibility.</td>
+    </tr>
+    <tr>
+        <td>generic</td>
+        <td>Generic HID gamepad
+            @note{This option applies to Windows only.}</td>
+    </tr>
+    <tr>
         <td>ds4</td>
         <td>DualShock 4 controller (PS4)
             @note{This option applies to Windows only.}</td>
     </tr>
     <tr>
         <td>ds5</td>
-        <td>DualShock 5 controller (PS5)
-            @note{This option applies to FreeBSD and Linux only.}</td>
+        <td>DualSense controller (PS5)
+            @note{This option applies to FreeBSD, Linux, and Windows.}</td>
     </tr>
     <tr>
         <td>switch</td>
         <td>Switch Pro controller
-            @note{This option applies to FreeBSD and Linux only.}</td>
+            @note{This option applies to FreeBSD, Linux, and Windows.}</td>
     </tr>
     <tr>
         <td>x360</td>
@@ -370,7 +383,55 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>xone</td>
         <td>Xbox One controller
-            @note{This option applies to FreeBSD and Linux only.}</td>
+            @note{This option applies to FreeBSD, Linux, and Windows.}</td>
+    </tr>
+    <tr>
+        <td>xseries</td>
+        <td>Xbox Series controller
+            @note{This option applies to Windows only.}</td>
+    </tr>
+</table>
+
+### gamepad_backend
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Select the Windows virtual-gamepad transport independently from the emulated profile.
+            Explicit incompatible combinations fail without silently changing transports or profiles.
+            @note{This option applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            gamepad_backend = auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>auto</td>
+        <td>Use ViGEm for explicit Xbox 360 and Xbox/unknown automatic controllers. Use Lumen Virtual HID for
+            generic, Xbox One, Xbox Series, DualShock 4, DualSense, and Switch Pro explicit profiles, plus
+            PlayStation/Nintendo automatic controllers. If an automatically selected Virtual HID profile fails
+            before Windows can see the device, log the failure and fall back to Xbox 360/ViGEm. Never change
+            backend or identity after a device becomes visible.</td>
+    </tr>
+    <tr>
+        <td>virtualhid</td>
+        <td>Require Lumen Virtual HID and expose a HID/GameInput controller. Xbox 360 is rejected
+            because VHF cannot provide a compatible XInput device.</td>
+    </tr>
+    <tr>
+        <td>vigem</td>
+        <td>Require ViGEm and expose an Xbox 360 XInput controller. Other profiles are rejected.</td>
     </tr>
 </table>
 
@@ -405,12 +466,13 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            If a client reports that a connected gamepad has motion sensor support, emulate it on the
-            host as a DS4 controller.
+            On Linux, if a client reports that a connected gamepad has motion sensor support, prefer a
+            PlayStation-style controller during automatic profile selection.
             <br>
             <br>
             When disabled, motion sensors will not be taken into account during gamepad type selection.
-            @hint{Only applies when gamepad is set to auto.}
+            @hint{Only applies on Linux when gamepad is set to auto. Windows uses the client-reported
+            controller family and ignores this legacy selector.}
         </td>
     </tr>
     <tr>
@@ -433,12 +495,13 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            If a client reports that a connected gamepad has a touchpad, emulate it on the host
-            as a DS4 controller.
+            On Linux, if a client reports that a connected gamepad has a touchpad, prefer a
+            PlayStation-style controller during automatic profile selection.
             <br>
             <br>
             When disabled, touchpad presence will not be taken into account during gamepad type selection.
-            @hint{Only applies when gamepad is set to auto.}
+            @hint{Only applies on Linux when gamepad is set to auto. Windows uses the client-reported
+            controller family and ignores this legacy selector.}
         </td>
     </tr>
     <tr>
