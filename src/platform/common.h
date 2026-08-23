@@ -10,6 +10,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -939,11 +940,11 @@ namespace platf {
 
   /**
    * @brief Name the current thread for use with development tools.
-   * @note On Linux this will be truncated after 15 characters.
+   * @note On Linux and FreeBSD this will be truncated after 15 characters.
    *
    * @param name Human-readable name to assign.
    */
-  void set_thread_name(const std::string &name);
+  void set_thread_name(std::string_view name);
 
   void enable_mouse_keys();
 

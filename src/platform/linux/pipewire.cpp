@@ -128,11 +128,16 @@ namespace pipewire {
    */
   struct img_descriptor_t: public egl::img_descriptor_t {
     ~img_descriptor_t() override {
-      if (data) {
+      // Memory capture points data at PipeWire's staging vector. Only release
+      // storage that this image allocated itself for a dummy frame.
+      if (data && data_owned) {
         delete[] data;
-        data = nullptr;
       }
+      data = nullptr;
+      data_owned = false;
     }
+
+    bool data_owned = false;  ///< Whether this image owns `data` and must release it.
   };
 
   /**
@@ -430,13 +435,15 @@ namespace pipewire {
 
       struct spa_buffer *buf = stream_data.current_buffer->buffer;
       if (buf->datas[0].chunk->size != 0) {
-        auto *img_descriptor = static_cast<egl::img_descriptor_t *>(img);
+        auto *img_descriptor = static_cast<img_descriptor_t *>(img);
         fill_img_metadata(img_descriptor, buf);
         if (buf->datas[0].type == SPA_DATA_DmaBuf) {
           fill_img_dmabuf(img_descriptor, buf, stream_data);
         } else {
           img->data = stream_data.front_buffer->data();
+          img_descriptor->data_owned = false;
           img->row_pitch = stream_data.local_stride;
+          img->pixel_pitch = stream_data.format.info.raw.format == SPA_VIDEO_FORMAT_NV12 ? 1 : 4;
         }
       }
 
@@ -937,6 +944,7 @@ namespace pipewire {
       img->sequence = 0;
       img->serial = std::numeric_limits<decltype(img->serial)>::max();
       img->data = nullptr;
+      img->data_owned = false;
       std::fill_n(img->sd.fds, 4, -1);
 
       return img;
@@ -1061,7 +1069,17 @@ namespace pipewire {
      * @return Capture status reported to the streaming pipeline.
      */
     int dummy_img(platf::img_t *img) override {
-      // Empty images are recognized as dummies by the zero sequence number
+      // Software conversion requires valid pixels even for a dummy frame.
+      if (img->data == nullptr) {
+        const auto width = img->width;
+        const auto height = img->height;
+        if (width > 0 && height > 0) {
+          img->data = new uint8_t[static_cast<size_t>(width) * height * 4]();  // NOSONAR(cpp:S5025) - owned and released by img_descriptor_t
+          static_cast<img_descriptor_t *>(img)->data_owned = true;
+          img->row_pitch = width * 4;
+          img->pixel_pitch = 4;
+        }
+      }
       return 0;
     }
 

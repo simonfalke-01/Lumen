@@ -7,8 +7,17 @@
 
 // standard includes
 #include <algorithm>
+#include <limits>
+#include <optional>
 #include <tuple>
 #include <utility>
+#include <vector>
+
+// ffmpeg includes
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+}
 
 // local includes
 #include <src/config.h>
@@ -93,7 +102,88 @@ TEST(AmfH264OptionsTest, CoderUsesConfiguredValue) {
   ASSERT_TRUE(std::holds_alternative<int *>(coder_option->value));
   EXPECT_EQ(&config::video.amd.amd_coder, std::get<int *>(coder_option->value));
 }
+
+/**
+ * @brief Verify that the AMF maximum access-unit size is mapped only to supported codecs.
+ */
+struct AmfMaxAuSizeOptionsTest: testing::TestWithParam<std::tuple<const video::encoder_t::codec_t *, bool>> {};
+
+TEST_P(AmfMaxAuSizeOptionsTest, UsesConfiguredValueForSupportedCodecsOnly) {
+  const auto &[codec, supported] = GetParam();
+  const auto option = std::ranges::find(codec->common_options, "max_au_size"sv, &video::encoder_t::option_t::name);
+
+  if (!supported) {
+    EXPECT_EQ(codec->common_options.end(), option);
+    return;
+  }
+
+  ASSERT_NE(codec->common_options.end(), option);
+  ASSERT_TRUE(std::holds_alternative<std::optional<int> *>(option->value));
+  EXPECT_EQ(&config::video.amd.amd_max_au_size, std::get<std::optional<int> *>(option->value));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  AmfCodecOptions,
+  AmfMaxAuSizeOptionsTest,
+  testing::Values(
+    std::make_tuple(&video::amdvce.h264, true),
+    std::make_tuple(&video::amdvce.hevc, true),
+    std::make_tuple(&video::amdvce.av1, false)
+  )
+);
 #endif
+
+using AmfMaxAuSizeConfigParam = std::tuple<std::string_view, std::optional<int>>;
+
+/**
+ * @brief Verify parsing and validation of the AMF maximum access-unit size.
+ */
+struct AmfMaxAuSizeConfigTest: BaseTest, testing::WithParamInterface<AmfMaxAuSizeConfigParam> {
+  void SetUp() override {
+    BaseTest::SetUp();
+    config::video.amd.amd_max_au_size.reset();
+    config::stream.file_apps = SUNSHINE_SOURCE_DIR "/tests/unit/test_video.cpp";
+  }
+
+  void TearDown() override {
+    config::video = original_video;
+    config::audio = original_audio;
+    config::stream = original_stream;
+    config::nvhttp = original_nvhttp;
+    config::input = original_input;
+    config::sunshine = original_sunshine;
+    config::modified_config_settings = original_modified_config_settings;
+    BaseTest::TearDown();
+  }
+
+  config::video_t original_video {config::video};  ///< Video configuration restored after each test.
+  config::audio_t original_audio {config::audio};  ///< Audio configuration restored after each test.
+  config::stream_t original_stream {config::stream};  ///< Stream configuration restored after each test.
+  config::nvhttp_t original_nvhttp {config::nvhttp};  ///< HTTP configuration restored after each test.
+  config::input_t original_input {config::input};  ///< Input configuration restored after each test.
+  config::sunshine_t original_sunshine {config::sunshine};  ///< Core configuration restored after each test.
+  decltype(config::modified_config_settings) original_modified_config_settings {config::modified_config_settings};  ///< Modified settings restored after each test.
+};
+
+TEST_P(AmfMaxAuSizeConfigTest, AcceptsOnlyFfmpegSupportedRange) {
+  const auto &[setting, expected] = GetParam();
+  config::apply_config_for_test(setting);
+
+  EXPECT_EQ(expected, config::video.amd.amd_max_au_size);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  AmfMaxAuSizeValues,
+  AmfMaxAuSizeConfigTest,
+  testing::Values(
+    AmfMaxAuSizeConfigParam {""sv, std::nullopt},
+    AmfMaxAuSizeConfigParam {"amd_max_au_size = -2\n"sv, std::nullopt},
+    AmfMaxAuSizeConfigParam {"amd_max_au_size = -1\n"sv, -1},
+    AmfMaxAuSizeConfigParam {"amd_max_au_size = 0\n"sv, 0},
+    AmfMaxAuSizeConfigParam {"amd_max_au_size = 800000\n"sv, 800000},
+    AmfMaxAuSizeConfigParam {"amd_max_au_size = 2147483647\n"sv, std::numeric_limits<int>::max()}
+  )
+);
 
 struct FramerateX100Test: BaseTest, testing::WithParamInterface<std::tuple<std::int32_t, AVRational>> {};
 
@@ -122,6 +212,66 @@ INSTANTIATE_TEST_SUITE_P(
     std::make_tuple(9498, AVRational {4749, 50})  // from my LG 27GN950
   )
 );
+
+/**
+ * @brief Verify software conversion of packed BGR0 and NV12 frames with varied strides.
+ */
+TEST(SoftwareEncoderConversion, Bgr0AndNv12) {
+  constexpr int width = 320;
+  constexpr int height = 240;
+
+  AVFrame *frame = av_frame_alloc();
+  ASSERT_NE(frame, nullptr);
+  frame->width = width;
+  frame->height = height;
+  frame->format = AV_PIX_FMT_YUV420P;
+
+  video::avcodec_software_encode_device_t device;
+  ASSERT_EQ(device.init(width, height, frame, AV_PIX_FMT_YUV420P, false), 0);
+  ASSERT_EQ(device.set_frame(frame, nullptr), 0);
+
+  std::vector<uint8_t> bgr0_buffer(static_cast<size_t>(width) * height * 4);
+  platf::img_t bgr0_img {};
+  bgr0_img.data = bgr0_buffer.data();
+  bgr0_img.width = width;
+  bgr0_img.height = height;
+  bgr0_img.row_pitch = width * 4;
+  bgr0_img.pixel_pitch = 4;
+  EXPECT_EQ(device.convert(bgr0_img), 0);
+
+  std::vector<uint8_t> nv12_buffer(static_cast<size_t>(width) * height * 3 / 2);
+  platf::img_t nv12_img {};
+  nv12_img.data = nv12_buffer.data();
+  nv12_img.width = width;
+  nv12_img.height = height;
+  nv12_img.row_pitch = width;
+  nv12_img.pixel_pitch = 1;
+  EXPECT_EQ(device.convert(nv12_img), 0);
+
+  constexpr int padded_stride = width + 32;
+  std::vector<uint8_t> padded_nv12_buffer(static_cast<size_t>(padded_stride) * height * 3 / 2);
+  platf::img_t padded_nv12_img {};
+  padded_nv12_img.data = padded_nv12_buffer.data();
+  padded_nv12_img.width = width;
+  padded_nv12_img.height = height;
+  padded_nv12_img.row_pitch = padded_stride;
+  padded_nv12_img.pixel_pitch = 1;
+  EXPECT_EQ(device.convert(padded_nv12_img), 0);
+
+  platf::img_t fallback_bgr0_img {};
+  fallback_bgr0_img.data = bgr0_buffer.data();
+  fallback_bgr0_img.width = width;
+  fallback_bgr0_img.height = height;
+  fallback_bgr0_img.row_pitch = width * 4;
+  EXPECT_EQ(device.convert(fallback_bgr0_img), 0);
+
+  platf::img_t fallback_nv12_img {};
+  fallback_nv12_img.data = nv12_buffer.data();
+  fallback_nv12_img.width = width;
+  fallback_nv12_img.height = height;
+  fallback_nv12_img.row_pitch = width;
+  EXPECT_EQ(device.convert(fallback_nv12_img), 0);
+}
 
 struct FramerateToRationalTest: testing::TestWithParam<std::tuple<int, int, AVRational>> {};
 

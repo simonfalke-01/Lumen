@@ -37,6 +37,7 @@
 #endif
 #ifdef __FreeBSD__
   #include <net/if_dl.h>  // For sockaddr_dl, LLADDR, and AF_LINK
+  #include <pthread_np.h>  // For pthread_set_name_np
   #include <sys/syscall.h>  // For syscall: SYS_thr_self
   #include <sys/thr.h>  // For thr_self
 #endif
@@ -512,8 +513,14 @@ namespace platf {
     }
   }
 
-  void set_thread_name(const std::string &name) {
-    pthread_setname_np(pthread_self(), name.c_str());
+  void set_thread_name(std::string_view name) {
+    // Truncate name to fit in Linux/FreeBSD kernel's 16 byte limit
+    std::string tr_name {name.substr(0, 15)};
+#ifdef __FreeBSD__
+    pthread_set_name_np(pthread_self(), tr_name.c_str());
+#else
+    pthread_setname_np(pthread_self(), tr_name.c_str());
+#endif
   }
 
   /**

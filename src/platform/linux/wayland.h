@@ -268,7 +268,7 @@ namespace wl {
      * @brief Store the active pixel mode reported by wl-output.
      *
      * @param wl_output Wayland output.
-     * @param flags Bit flags that modify the requested operation.
+     * @param flags Wayland output-mode flags; only `WL_OUTPUT_MODE_CURRENT` updates the viewport.
      * @param width Frame or display width in pixels.
      * @param height Frame or display height in pixels.
      * @param refresh Output refresh rate in mHz.
