@@ -638,6 +638,24 @@ namespace platf::win_input {
     return request;
   }
 
+  result_t virtual_hid_transport_t::prepare_mouse_mode_switch(bool absolute_target) {
+    if (absolute_mouse_mode_ == absolute_target || held_buttons_ == 0) {
+      return {};
+    }
+
+    auto neutral = mouse_state_report();
+    if (absolute_mouse_mode_) {
+      neutral.report.absolute_mouse.buttons = 0;
+    } else {
+      neutral.report.relative_mouse.buttons = 0;
+    }
+    const auto result = submit_report(neutral, "mouse collection neutral report");
+    if (result) {
+      acknowledged_buttons_ = 0;
+    }
+    return result;
+  }
+
   void virtual_hid_transport_t::clear_virtual_state() noexcept {
     held_keys_.clear();
     held_consumers_.clear();
@@ -741,6 +759,11 @@ namespace platf::win_input {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
 
+    const auto mode_switch = prepare_mouse_mode_switch(false);
+    if (!mode_switch) {
+      return mode_switch;
+    }
+
     std::int64_t remaining_x = delta_x;
     std::int64_t remaining_y = delta_y;
     bool submit_zero = remaining_x == 0 && remaining_y == 0;
@@ -792,6 +815,11 @@ namespace platf::win_input {
     }
     if (backend_.load() != backend_t::virtual_hid) {
       return {completion_t::ambiguous, ERROR_NOT_READY};
+    }
+
+    const auto mode_switch = prepare_mouse_mode_switch(true);
+    if (!mode_switch) {
+      return mode_switch;
     }
 
     LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};

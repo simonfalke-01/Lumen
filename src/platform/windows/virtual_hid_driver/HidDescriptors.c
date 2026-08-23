@@ -1,6 +1,6 @@
 /**
  * @file HidDescriptors.c
- * @brief Three-collection VHF report descriptor for Lumen input injection.
+ * @brief Four-collection VHF report descriptor for Lumen input injection.
  */
 
 #include "HidDescriptors.h"
@@ -13,9 +13,9 @@
  * Report 1 is an eight-bit modifier state followed by 224 one-bit
  * Keyboard/Keypad usages (00-DF). Report 2 is a five-button relative mouse
  * with signed 16-bit X, Y, wheel, and AC Pan deltas. Report 3 is a Consumer
- * Control array containing up to four simultaneous 16-bit usages. Report 4
- * shares the Mouse application collection and provides five buttons, unsigned
- * 16-bit absolute X and Y, and signed 16-bit wheel and AC Pan deltas.
+ * Control array containing up to four simultaneous 16-bit usages. Report 4 is
+ * a separate five-button absolute mouse with unsigned 16-bit X and Y plus
+ * signed 16-bit wheel and AC Pan deltas.
  */
 const BYTE LumenVhidReportDescriptor[] = {
   /* NKRO keyboard top-level collection. */
@@ -128,7 +128,20 @@ const BYTE LumenVhidReportDescriptor[] = {
   0x01, /*     Report Count (1) */
   0x81,
   0x06, /*     Input (Data, Variable, Relative) */
-  /* Absolute pointer report in the same Mouse and Pointer collections. */
+  0xc0, /*   End Collection (Pointer Physical) */
+  0xc0, /* End Collection (Application) */
+
+  /* Absolute mouse top-level collection. */
+  0x05,
+  0x01, /* Usage Page (Generic Desktop) */
+  0x09,
+  0x02, /* Usage (Mouse) */
+  0xa1,
+  0x01, /* Collection (Application) */
+  0x09,
+  0x01, /*   Usage (Pointer) */
+  0xa1,
+  0x00, /*   Collection (Physical) */
   0x85,
   LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE, /*     Report ID (4) */
   0x05,

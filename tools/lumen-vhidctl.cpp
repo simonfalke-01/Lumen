@@ -164,7 +164,7 @@ namespace {
 
     /** Return whether every required Lumen HID collection is present. */
     [[nodiscard]] bool healthy() const noexcept {
-      return keyboard_count == 1 && mouse_count == 1 && consumer_count == 1;
+      return keyboard_count == 1 && mouse_count == LUMEN_VHID_MOUSE_COLLECTION_COUNT && consumer_count == 1;
     }
   };
 

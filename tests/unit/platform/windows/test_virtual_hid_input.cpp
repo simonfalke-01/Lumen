@@ -704,6 +704,64 @@ TEST_F(virtual_hid_input_test, RelativeMovementReturnsButtonsAndWheelsToRelative
   EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
+TEST_F(virtual_hid_input_test, RelativeToAbsoluteSwitchNeutralizesOldMouseCollectionWithButtonsHeld) {
+  initialize();
+
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_RIGHT, false));
+  ASSERT_TRUE(transport->absolute_mouse(75.0f, 25.0f, 100, 100));
+
+  ASSERT_EQ(channel->submissions.size(), 4);
+  EXPECT_EQ(channel->submissions[1].report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
+  EXPECT_EQ(channel->submissions[1].report.relative_mouse.buttons, 0x03);
+  EXPECT_EQ(channel->submissions[2].report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
+  EXPECT_EQ(channel->submissions[2].report.relative_mouse.buttons, 0x00);
+  EXPECT_EQ(channel->submissions[3].report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+  EXPECT_EQ(channel->submissions[3].report.absolute_mouse.buttons, 0x03);
+  EXPECT_EQ(channel->submissions[3].report.absolute_mouse.x, 49151);
+  EXPECT_EQ(channel->submissions[3].report.absolute_mouse.y, 16384);
+  EXPECT_EQ(transport->acknowledged_mouse_buttons(), 0x03);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, AbsoluteToRelativeSwitchNeutralizesOldMouseCollectionWithButtonsHeld) {
+  initialize();
+
+  ASSERT_TRUE(transport->absolute_mouse(25.0f, 75.0f, 100, 100));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  ASSERT_TRUE(transport->move_mouse(4, -6));
+
+  ASSERT_EQ(channel->submissions.size(), 4);
+  EXPECT_EQ(channel->submissions[1].report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+  EXPECT_EQ(channel->submissions[1].report.absolute_mouse.buttons, 0x01);
+  EXPECT_EQ(channel->submissions[2].report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.buttons, 0x00);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.x, 16384);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.y, 49151);
+  EXPECT_EQ(channel->submissions[3].report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
+  EXPECT_EQ(channel->submissions[3].report.relative_mouse.buttons, 0x01);
+  EXPECT_EQ(channel->submissions[3].report.relative_mouse.x, 4);
+  EXPECT_EQ(channel->submissions[3].report.relative_mouse.y, -6);
+  EXPECT_EQ(transport->acknowledged_mouse_buttons(), 0x01);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, ModeSwitchNeutralFailureFailsClosedWithoutSendInput) {
+  initialize();
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  channel->submit_results.push_back({false, ERROR_WRITE_FAULT});
+
+  const auto result = transport->absolute_mouse(50.0f, 50.0f, 100, 100);
+
+  EXPECT_FALSE(result);
+  EXPECT_EQ(result.completion, platf::win_input::completion_t::ambiguous);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::fail_closed);
+  ASSERT_EQ(channel->submissions.size(), 2);
+  EXPECT_EQ(channel->submissions.back().report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
+  EXPECT_EQ(channel->submissions.back().report.relative_mouse.buttons, 0x00);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
 TEST_F(virtual_hid_input_test, BuildsSegmentedRelativeMouseReports) {
   initialize();
 

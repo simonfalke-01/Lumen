@@ -513,7 +513,8 @@ The key retains its upstream name for compatibility with existing configuration 
             Selects the Windows keyboard and mouse input backend. Automatic selects the Lumen Virtual HID driver when
             its Windows 11 x64 package is installed, compatible, and accessible to the service. Otherwise, Lumen
             uses SendInput. Virtual HID handles supported keyboard and Consumer Control usages plus relative and
-            absolute mouse input. It rejects unsupported keys, Consumer Control overflow, and Unicode text without
+            absolute mouse input through separate relative and absolute HID mouse collections. It rejects unsupported
+            keys, Consumer Control overflow, and Unicode text without
             mixing SendInput into an active Virtual HID session. SendInput fallback is allowed only when initialization
             fails or the first actual Virtual HID report is rejected. A later report failure fails closed; a successful
             session reset neutralizes, releases, and reclaims Virtual HID.

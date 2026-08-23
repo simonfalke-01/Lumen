@@ -305,7 +305,8 @@ tools\lumen-vhidctl.exe status --json
 
 `status --json` does not require elevation. Its `state` is `installed`, `absent`, or `unhealthy`; it reports whether the
 root device and expected HID collections are present and started. It does not prove that the service can use the exact
-driver ABI.
+driver ABI. The current ABI requires exactly one keyboard, two mouse collections (relative and absolute), and one
+Consumer Control collection.
 
 The exact ABI check is separate:
 

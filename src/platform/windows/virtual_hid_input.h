@@ -191,6 +191,13 @@ namespace platf::win_input {
     LUMEN_VHID_SUBMIT_REPORT_REQUEST mouse_state_report() const;
 
     /**
+     * @brief Neutralize the old mouse collection before switching pointer PDOs.
+     * @param absolute_target Whether the next report targets the absolute mouse collection.
+     * @return Accepted result, or the old-collection submission failure.
+     */
+    result_t prepare_mouse_mode_switch(bool absolute_target);
+
+    /**
      * @brief Clear all application-side state owned by the Virtual HID session.
      */
     void clear_virtual_state() noexcept;

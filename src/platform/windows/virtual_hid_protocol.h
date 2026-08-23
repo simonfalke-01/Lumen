@@ -63,6 +63,8 @@ extern "C" {
 #define LUMEN_VHID_NKRO_BITMAP_SIZE 28u
 /** Number of simultaneously pressed Consumer Control usages. */
 #define LUMEN_VHID_CONSUMER_USAGE_COUNT 4u
+/** Number of Mouse top-level collections published by ABI v2. */
+#define LUMEN_VHID_MOUSE_COLLECTION_COUNT 2u
 
 /** @name Fixed HID identity
  * @{ */
