@@ -122,16 +122,12 @@ function Assert-VirtualHidHealthy {
     $probeExit = Join-Path $artifactDirectory 'lumen-vhid-probe.exit'
     $smokeOutput = Join-Path $artifactDirectory 'lumen-vhid-gamepad-smoke.json'
     $smokeExit = Join-Path $artifactDirectory 'lumen-vhid-gamepad-smoke.exit'
-    $vigemOutput = Join-Path $artifactDirectory 'lumen-vigem-smoke.json'
-    $vigemExit = Join-Path $artifactDirectory 'lumen-vigem-smoke.exit'
     $escapedHelper = $helper.Replace("'", "''")
     $escapedProbeOutput = $probeOutput.Replace("'", "''")
     $escapedProbeExit = $probeExit.Replace("'", "''")
     $escapedSmokeOutput = $smokeOutput.Replace("'", "''")
     $escapedSmokeExit = $smokeExit.Replace("'", "''")
-    $escapedVigemOutput = $vigemOutput.Replace("'", "''")
-    $escapedVigemExit = $vigemExit.Replace("'", "''")
-    Remove-Item $probeOutput, $probeExit, $smokeOutput, $smokeExit, $vigemOutput, $vigemExit -Force -ErrorAction SilentlyContinue
+    Remove-Item $probeOutput, $probeExit, $smokeOutput, $smokeExit -Force -ErrorAction SilentlyContinue
     @"
 & '$escapedHelper' probe --json | Set-Content -LiteralPath '$escapedProbeOutput' -Encoding UTF8
 `$probeExitCode = `$LASTEXITCODE
@@ -139,9 +135,6 @@ Set-Content -LiteralPath '$escapedProbeExit' -Value `$probeExitCode -NoNewline
 & '$escapedHelper' smoke-gamepad --json | Set-Content -LiteralPath '$escapedSmokeOutput' -Encoding UTF8
 `$smokeExitCode = `$LASTEXITCODE
 Set-Content -LiteralPath '$escapedSmokeExit' -Value `$smokeExitCode -NoNewline
-& '$escapedHelper' smoke-vigem --json | Set-Content -LiteralPath '$escapedVigemOutput' -Encoding UTF8
-`$vigemExitCode = `$LASTEXITCODE
-Set-Content -LiteralPath '$escapedVigemExit' -Value `$vigemExitCode -NoNewline
 "@ | Set-Content -LiteralPath $probeScript -Encoding UTF8
 
     $action = New-ScheduledTaskAction `
@@ -159,12 +152,12 @@ Set-Content -LiteralPath '$escapedVigemExit' -Value `$vigemExitCode -NoNewline
             -Force | Out-Null
         Start-ScheduledTask -TaskName $taskName
         $deadline = (Get-Date).AddSeconds(300)
-        while (-not (Test-Path -LiteralPath $vigemExit -PathType Leaf) -and
+        while (-not (Test-Path -LiteralPath $smokeExit -PathType Leaf) -and
             (Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 100
         }
-        if (-not (Test-Path -LiteralPath $vigemExit -PathType Leaf)) {
-            throw 'Virtual HID protocol, gamepad, or ViGEm/XInput smoke timed out.'
+        if (-not (Test-Path -LiteralPath $smokeExit -PathType Leaf)) {
+            throw 'Virtual HID protocol or gamepad smoke timed out.'
         }
         $probeText = (Get-Content -LiteralPath $probeOutput -Raw).Trim()
         Write-Host $probeText
@@ -221,30 +214,31 @@ Set-Content -LiteralPath '$escapedVigemExit' -Value `$vigemExitCode -NoNewline
             [int]$smoke.activeGamepads -ne 0) {
             throw "Virtual HID dynamic-gamepad smoke contract mismatch: $smokeText"
         }
-
-        $vigemText = (Get-Content -LiteralPath $vigemOutput -Raw).Trim()
-        Write-Host $vigemText
-        $vigemExitCode = [int](Get-Content -LiteralPath $vigemExit -Raw)
-        if ($vigemExitCode -ne 0) {
-            Get-Content (Join-Path $artifactDirectory $FailureLog)
-            throw "ViGEm/XInput smoke failed with exit code $vigemExitCode."
-        }
-        try {
-            $vigem = $vigemText | ConvertFrom-Json -ErrorAction Stop
-        } catch {
-            throw "ViGEm/XInput smoke did not return valid JSON: $($_.Exception.Message)"
-        }
-        if ($vigem.state -ne 'passed' -or
-            $vigem.backend -ne 'vigem' -or
-            $vigem.profile -ne 'x360' -or
-            [int]$vigem.xinputIndex -lt 0 -or
-            [int]$vigem.xinputIndex -ge 4) {
-            throw "ViGEm/XInput smoke contract mismatch: $vigemText"
-        }
     } finally {
         Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-Item $probeScript, $probeExit, $smokeExit, $vigemExit -Force -ErrorAction SilentlyContinue
+        Remove-Item $probeScript, $probeExit, $smokeExit -Force -ErrorAction SilentlyContinue
+    }
+
+    $vigemOutput = @(& $helper smoke-vigem --json)
+    $vigemExitCode = $LASTEXITCODE
+    $vigemText = ($vigemOutput -join [Environment]::NewLine).Trim()
+    Write-Host $vigemText
+    if ($vigemExitCode -ne 0) {
+        Get-Content (Join-Path $artifactDirectory $FailureLog)
+        throw "ViGEm/XInput smoke failed with exit code $vigemExitCode."
+    }
+    try {
+        $vigem = $vigemText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "ViGEm/XInput smoke did not return valid JSON: $($_.Exception.Message)"
+    }
+    if ($vigem.state -ne 'passed' -or
+        $vigem.backend -ne 'vigem' -or
+        $vigem.profile -ne 'x360' -or
+        [int]$vigem.xinputIndex -lt 0 -or
+        [int]$vigem.xinputIndex -ge 4) {
+        throw "ViGEm/XInput smoke contract mismatch: $vigemText"
     }
 }
 

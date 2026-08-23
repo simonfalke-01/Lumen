@@ -1805,15 +1805,6 @@ namespace {
    * @return A stable helper exit code.
    */
   int smoke_vigem(bool json) {
-    DWORD error = ERROR_SUCCESS;
-    if (!running_as_local_system(error)) {
-      return report_gamepad_smoke_failure(
-        json,
-        L"require-local-system",
-        error == ERROR_SUCCESS ? ERROR_ACCESS_DENIED : error
-      );
-    }
-
     PVIGEM_CLIENT client = nullptr;
     VIGEM_ERROR status = VIGEM_ERROR_BUS_NOT_FOUND;
     for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {

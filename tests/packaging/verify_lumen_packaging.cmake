@@ -121,8 +121,8 @@ assert_file_contains_literal(
     "MSI validation must run the dynamic-gamepad smoke as LocalSystem")
 assert_file_contains_literal(
     ".github/scripts/test-windows-msi.ps1"
-    [=[& '$escapedHelper' smoke-vigem --json]=]
-    "MSI validation must run the ViGEm/XInput smoke as LocalSystem")
+    [=[@(& $helper smoke-vigem --json)]=]
+    "MSI validation must run the ViGEm/XInput smoke in the interactive runner session")
 assert_file_contains_literal(
     "tools/CMakeLists.txt"
     "xinput9_1_0"
