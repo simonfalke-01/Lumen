@@ -241,7 +241,9 @@ verifies owner-file cleanup and the 16-device limit, and confirms every HID coll
 make the control interface accessible to normal
 administrators or install a separate broker.
 The same installed helper runs `smoke-vigem` after provisioning the bundled ViGEmBus package, submits a distinctive
-Xbox 360 state, and requires the exact state through `XInputGetState`.
+Xbox 360 state, and requires ViGEmBus to assign a valid XUSB user index. It also reports whether the current process
+can read the exact state through `XInputGetState`; that diagnostic is not a gate because Windows service and hosted-CI
+sessions can be isolated from the interactive XInput device namespace even when the ViGEm target is healthy.
 
 ##### Lumen Virtual Microphone driver
 

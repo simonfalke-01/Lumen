@@ -226,19 +226,20 @@ Set-Content -LiteralPath '$escapedSmokeExit' -Value `$smokeExitCode -NoNewline
     Write-Host $vigemText
     if ($vigemExitCode -ne 0) {
         Get-Content (Join-Path $artifactDirectory $FailureLog)
-        throw "ViGEm/XInput smoke failed with exit code $vigemExitCode."
+        throw "ViGEm/XUSB smoke failed with exit code $vigemExitCode."
     }
     try {
         $vigem = $vigemText | ConvertFrom-Json -ErrorAction Stop
     } catch {
-        throw "ViGEm/XInput smoke did not return valid JSON: $($_.Exception.Message)"
+        throw "ViGEm/XUSB smoke did not return valid JSON: $($_.Exception.Message)"
     }
     if ($vigem.state -ne 'passed' -or
         $vigem.backend -ne 'vigem' -or
         $vigem.profile -ne 'x360' -or
-        [int]$vigem.xinputIndex -lt 0 -or
-        [int]$vigem.xinputIndex -ge 4) {
-        throw "ViGEm/XInput smoke contract mismatch: $vigemText"
+        [int]$vigem.userIndex -lt 0 -or
+        [int]$vigem.userIndex -ge 4 -or
+        $vigem.xinputApiVisible -isnot [bool]) {
+        throw "ViGEm/XUSB smoke contract mismatch: $vigemText"
     }
 }
 

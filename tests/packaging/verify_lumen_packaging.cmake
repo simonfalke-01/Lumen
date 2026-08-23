@@ -122,7 +122,11 @@ assert_file_contains_literal(
 assert_file_contains_literal(
     ".github/scripts/test-windows-msi.ps1"
     [=[@(& $helper smoke-vigem --json)]=]
-    "MSI validation must run the ViGEm/XInput smoke in the interactive runner session")
+    "MSI validation must run the ViGEm/XUSB smoke in the interactive runner session")
+assert_file_contains_literal(
+    "tools/lumen-vhidctl.cpp"
+    "vigem_target_x360_get_user_index"
+    "The ViGEm smoke must verify the authoritative XUSB user-index assignment")
 assert_file_contains_literal(
     "tools/CMakeLists.txt"
     "xinput9_1_0"

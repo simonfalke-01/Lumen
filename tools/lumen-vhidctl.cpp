@@ -38,6 +38,7 @@ namespace {
   constexpr DWORD kInstallFlagForce = 0x00000001;
   constexpr int kInterfaceWaitAttempts = 30;
   constexpr int kGamepadSmokeWaitAttempts = 300;
+  constexpr int kXinputVisibilityWaitAttempts = 20;  ///< Best-effort XInput diagnostic wait, in 100 ms attempts.
   constexpr std::uint32_t kProtocolGeneration = 3;
 
   /** Stable process exit codes consumed by Windows packaging. */
@@ -1799,7 +1800,7 @@ namespace {
   }
 
   /**
-   * @brief Validate the retained Xbox 360 path through ViGEmBus and XInput.
+   * @brief Validate the retained Xbox 360 path through ViGEmBus.
    *
    * @param json Whether to emit JSON.
    * @return A stable helper exit code.
@@ -1847,12 +1848,21 @@ namespace {
     report.sThumbRX = 4567;
     report.sThumbRY = -5678;
     status = vigem_target_x360_update(client, target, report);
-    int xinput_index = -1;
+    ULONG user_index = XUSER_MAX_COUNT;
+    VIGEM_ERROR user_index_status = VIGEM_ERROR_TARGET_UNINITIALIZED;
+    bool xinput_api_visible = false;
     if (VIGEM_SUCCESS(status)) {
-      for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts && xinput_index < 0; ++attempt) {
-        for (DWORD index = 0; index < XUSER_MAX_COUNT; ++index) {
+      for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+        user_index_status = vigem_target_x360_get_user_index(client, target, &user_index);
+        if (VIGEM_SUCCESS(user_index_status)) {
+          break;
+        }
+        Sleep(100);
+      }
+      if (VIGEM_SUCCESS(user_index_status) && user_index < XUSER_MAX_COUNT) {
+        for (int attempt = 0; attempt < kXinputVisibilityWaitAttempts; ++attempt) {
           XINPUT_STATE state {};
-          if (XInputGetState(index, &state) == ERROR_SUCCESS &&
+          if (XInputGetState(user_index, &state) == ERROR_SUCCESS &&
               state.Gamepad.wButtons == report.wButtons &&
               state.Gamepad.bLeftTrigger == report.bLeftTrigger &&
               state.Gamepad.bRightTrigger == report.bRightTrigger &&
@@ -1860,11 +1870,9 @@ namespace {
               state.Gamepad.sThumbLY == report.sThumbLY &&
               state.Gamepad.sThumbRX == report.sThumbRX &&
               state.Gamepad.sThumbRY == report.sThumbRY) {
-            xinput_index = static_cast<int>(index);
+            xinput_api_visible = true;
             break;
           }
-        }
-        if (xinput_index < 0) {
           Sleep(100);
         }
       }
@@ -1879,15 +1887,19 @@ namespace {
     if (!VIGEM_SUCCESS(status)) {
       return report_gamepad_smoke_failure(json, L"submit-x360", static_cast<DWORD>(status));
     }
-    if (xinput_index < 0) {
-      return report_gamepad_smoke_failure(json, L"verify-xinput", ERROR_DEVICE_NOT_CONNECTED);
+    if (!VIGEM_SUCCESS(user_index_status)) {
+      return report_gamepad_smoke_failure(json, L"verify-xusb-user-index", static_cast<DWORD>(user_index_status));
+    }
+    if (user_index >= XUSER_MAX_COUNT) {
+      return report_gamepad_smoke_failure(json, L"verify-xusb-user-index", ERROR_INVALID_DATA);
     }
 
     if (json) {
-      std::wcout << L"{\"state\":\"passed\",\"backend\":\"vigem\",\"profile\":\"x360\",\"xinputIndex\":"
-                 << xinput_index << L"}\n";
+      std::wcout << L"{\"state\":\"passed\",\"backend\":\"vigem\",\"profile\":\"x360\",\"userIndex\":"
+                 << user_index << L",\"xinputApiVisible\":" << (xinput_api_visible ? L"true" : L"false") << L"}\n";
     } else {
-      std::wcout << L"state=passed backend=vigem profile=x360 xinput_index=" << xinput_index << L'\n';
+      std::wcout << L"state=passed backend=vigem profile=x360 user_index=" << user_index
+                 << L" xinput_api_visible=" << (xinput_api_visible ? L"true" : L"false") << L'\n';
     }
     return static_cast<int>(exit_code::success);
   }
