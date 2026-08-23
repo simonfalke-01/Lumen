@@ -98,6 +98,18 @@ list(APPEND TEST_DEFINITIONS SUNSHINE_TEST_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}"
 # Remove the existing definition from SUNSHINE_DEFINITIONS to avoid redefinition error
 list(FILTER SUNSHINE_DEFINITIONS EXCLUDE REGEX "^SUNSHINE_ASSETS_DIR=")
 list(APPEND TEST_DEFINITIONS SUNSHINE_ASSETS_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test_assets")
+if(WIN32)
+    set(TEST_DEFAULT_APPS "${CMAKE_SOURCE_DIR}/src_assets/windows/assets/apps.json")
+elseif(APPLE)
+    set(TEST_DEFAULT_APPS "${CMAKE_SOURCE_DIR}/src_assets/macos/assets/apps.json")
+else()
+    set(TEST_DEFAULT_APPS "${CMAKE_SOURCE_DIR}/src_assets/linux/assets/apps.json")
+endif()
+configure_file(
+        "${TEST_DEFAULT_APPS}"
+        "${CMAKE_CURRENT_BINARY_DIR}/test_assets/apps.json"
+        COPYONLY)
 
 if(NOT WIN32)
     find_package(Udev 255)  # we need 255+ for udevadm verify
