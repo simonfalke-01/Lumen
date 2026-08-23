@@ -126,7 +126,28 @@ assert_file_contains_literal(
 assert_file_contains_literal(
     "tools/lumen-vhidctl.cpp"
     "vigem_target_x360_get_user_index"
-    "The ViGEm smoke must verify the authoritative XUSB user-index assignment")
+    "The ViGEm smoke must retain XUSB user-index diagnostics")
+assert_file_contains_literal(
+    "tools/lumen-vhidctl.cpp"
+    "vigem_target_get_index"
+    "The ViGEm smoke must verify an indexed bus target")
+assert_file_contains_literal(
+    "tools/lumen-vhidctl.cpp"
+    "vigem_target_is_attached"
+    "The ViGEm smoke must verify a live bus target")
+assert_file_contains_literal(
+    "tools/lumen-vhidctl.cpp"
+    "VIGEM_ERROR_XUSB_USERINDEX_OUT_OF_RANGE"
+    "The ViGEm smoke must tolerate a missing hosted-session XUSB user index")
+foreach(vigem_smoke_field IN ITEMS
+        "busDeviceIndex"
+        "userIndexAvailable"
+        "xinputApiVisible")
+    assert_file_contains_literal(
+        ".github/scripts/test-windows-msi.ps1"
+        "${vigem_smoke_field}"
+        "MSI validation must retain the ${vigem_smoke_field} ViGEm smoke field")
+endforeach()
 assert_file_contains_literal(
     "tools/CMakeLists.txt"
     "xinput9_1_0"

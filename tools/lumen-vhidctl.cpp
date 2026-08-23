@@ -1848,13 +1848,15 @@ namespace {
     report.sThumbRX = 4567;
     report.sThumbRY = -5678;
     status = vigem_target_x360_update(client, target, report);
+    const ULONG bus_device_index = vigem_target_get_index(target);
+    const bool target_attached = vigem_target_is_attached(target) != FALSE;
     ULONG user_index = XUSER_MAX_COUNT;
     VIGEM_ERROR user_index_status = VIGEM_ERROR_TARGET_UNINITIALIZED;
     bool xinput_api_visible = false;
     if (VIGEM_SUCCESS(status)) {
-      for (int attempt = 0; attempt < kGamepadSmokeWaitAttempts; ++attempt) {
+      for (int attempt = 0; attempt < kXinputVisibilityWaitAttempts; ++attempt) {
         user_index_status = vigem_target_x360_get_user_index(client, target, &user_index);
-        if (VIGEM_SUCCESS(user_index_status)) {
+        if (user_index_status != VIGEM_ERROR_XUSB_USERINDEX_OUT_OF_RANGE) {
           break;
         }
         Sleep(100);
@@ -1887,19 +1889,38 @@ namespace {
     if (!VIGEM_SUCCESS(status)) {
       return report_gamepad_smoke_failure(json, L"submit-x360", static_cast<DWORD>(status));
     }
-    if (!VIGEM_SUCCESS(user_index_status)) {
-      return report_gamepad_smoke_failure(json, L"verify-xusb-user-index", static_cast<DWORD>(user_index_status));
+    if (!target_attached || bus_device_index == 0) {
+      return report_gamepad_smoke_failure(json, L"verify-vigem-target", ERROR_DEVICE_NOT_CONNECTED);
     }
-    if (user_index >= XUSER_MAX_COUNT) {
-      return report_gamepad_smoke_failure(json, L"verify-xusb-user-index", ERROR_INVALID_DATA);
+    if (!VIGEM_SUCCESS(user_index_status) && user_index_status != VIGEM_ERROR_XUSB_USERINDEX_OUT_OF_RANGE) {
+      return report_gamepad_smoke_failure(json, L"probe-xusb-user-index", static_cast<DWORD>(user_index_status));
+    }
+    const bool user_index_available = VIGEM_SUCCESS(user_index_status);
+    if (user_index_available && user_index >= XUSER_MAX_COUNT) {
+      return report_gamepad_smoke_failure(json, L"probe-xusb-user-index", ERROR_INVALID_DATA);
     }
 
     if (json) {
-      std::wcout << L"{\"state\":\"passed\",\"backend\":\"vigem\",\"profile\":\"x360\",\"userIndex\":"
-                 << user_index << L",\"xinputApiVisible\":" << (xinput_api_visible ? L"true" : L"false") << L"}\n";
+      std::wcout << L"{\"state\":\"passed\",\"backend\":\"vigem\",\"profile\":\"x360\",\"busDeviceIndex\":"
+                 << bus_device_index << L",\"userIndexAvailable\":" << (user_index_available ? L"true" : L"false")
+                 << L",\"userIndex\":";
+      if (user_index_available) {
+        std::wcout << user_index;
+      } else {
+        std::wcout << L"null";
+      }
+      std::wcout << L",\"xinputApiVisible\":" << (xinput_api_visible ? L"true" : L"false") << L"}\n";
     } else {
-      std::wcout << L"state=passed backend=vigem profile=x360 user_index=" << user_index
-                 << L" xinput_api_visible=" << (xinput_api_visible ? L"true" : L"false") << L'\n';
+      std::wcout << L"state=passed backend=vigem profile=x360 bus_device_index=" << bus_device_index
+                 << L" user_index_available=" << (user_index_available ? L"true" : L"false")
+                 << L" user_index=";
+      if (user_index_available) {
+        std::wcout << user_index;
+      } else {
+        std::wcout << L"unavailable";
+      }
+      std::wcout
+        << L" xinput_api_visible=" << (xinput_api_visible ? L"true" : L"false") << L'\n';
     }
     return static_cast<int>(exit_code::success);
   }

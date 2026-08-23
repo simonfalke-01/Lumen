@@ -236,8 +236,11 @@ Set-Content -LiteralPath '$escapedSmokeExit' -Value `$smokeExitCode -NoNewline
     if ($vigem.state -ne 'passed' -or
         $vigem.backend -ne 'vigem' -or
         $vigem.profile -ne 'x360' -or
-        [int]$vigem.userIndex -lt 0 -or
-        [int]$vigem.userIndex -ge 4 -or
+        [int]$vigem.busDeviceIndex -le 0 -or
+        $vigem.userIndexAvailable -isnot [bool] -or
+        ($vigem.userIndexAvailable -and
+            ([int]$vigem.userIndex -lt 0 -or [int]$vigem.userIndex -ge 4)) -or
+        (-not $vigem.userIndexAvailable -and $null -ne $vigem.userIndex) -or
         $vigem.xinputApiVisible -isnot [bool]) {
         throw "ViGEm/XUSB smoke contract mismatch: $vigemText"
     }
