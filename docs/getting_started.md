@@ -60,8 +60,9 @@ the reason in the log. Deselect the feature to install without a bundled driver.
 > [!NOTE]
 > Only the service account (`SYSTEM`) can probe the exact Virtual HID ABI or submit Virtual HID input. Launching
 > Lumen directly uses `SendInput`, even when it is run as Administrator. Virtual HID handles supported keyboard input,
-> relative mouse movement, mouse buttons, and wheel scrolling. Unicode text and absolute positioning use the auxiliary
-> `SendInput` path.
+> Consumer Control input, relative and absolute mouse movement, mouse buttons, and wheel scrolling. While Virtual HID is
+> active, unsupported keys, Consumer Control overflow, and Unicode text are rejected instead of being mixed through
+> `SendInput`. A successful input-session reset neutralizes and reclaims Virtual HID for the next session.
 
 To install without the bundled driver from the command line, set the MSI property to `0`:
 

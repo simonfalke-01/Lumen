@@ -13,7 +13,9 @@
  * Report 1 is an eight-bit modifier state followed by 224 one-bit
  * Keyboard/Keypad usages (00-DF). Report 2 is a five-button relative mouse
  * with signed 16-bit X, Y, wheel, and AC Pan deltas. Report 3 is a Consumer
- * Control array containing up to four simultaneous 16-bit usages.
+ * Control array containing up to four simultaneous 16-bit usages. Report 4
+ * shares the Mouse application collection and provides five buttons, unsigned
+ * 16-bit absolute X and Y, and signed 16-bit wheel and AC Pan deltas.
  */
 const BYTE LumenVhidReportDescriptor[] = {
   /* NKRO keyboard top-level collection. */
@@ -126,7 +128,90 @@ const BYTE LumenVhidReportDescriptor[] = {
   0x01, /*     Report Count (1) */
   0x81,
   0x06, /*     Input (Data, Variable, Relative) */
-  0xc0, /*   End Collection (Physical) */
+  0xc0, /*   End Collection (Relative Pointer Physical) */
+
+  /* Absolute pointer report in the same Mouse top-level collection. */
+  0x05,
+  0x01, /*   Usage Page (Generic Desktop) */
+  0x09,
+  0x01, /*   Usage (Pointer) */
+  0xa1,
+  0x00, /*   Collection (Physical) */
+  0x85,
+  LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE, /*     Report ID (4) */
+  0x05,
+  0x09, /*     Usage Page (Button) */
+  0x19,
+  0x01, /*     Usage Minimum (Button 1) */
+  0x29,
+  0x05, /*     Usage Maximum (Button 5) */
+  0x15,
+  0x00, /*     Logical Minimum (0) */
+  0x25,
+  0x01, /*     Logical Maximum (1) */
+  0x75,
+  0x01, /*     Report Size (1) */
+  0x95,
+  0x05, /*     Report Count (5) */
+  0x81,
+  0x02, /*     Input (Data, Variable, Absolute) */
+  0x75,
+  0x03, /*     Report Size (3) */
+  0x95,
+  0x01, /*     Report Count (1) */
+  0x81,
+  0x03, /*     Input (Constant, Variable, Absolute) */
+  0x05,
+  0x01, /*     Usage Page (Generic Desktop) */
+  0x09,
+  0x30, /*     Usage (X) */
+  0x09,
+  0x31, /*     Usage (Y) */
+  0x15,
+  0x00, /*     Logical Minimum (0) */
+  0x27,
+  0xff,
+  0xff,
+  0x00,
+  0x00, /*     Logical Maximum (65535) */
+  0x75,
+  0x10, /*     Report Size (16) */
+  0x95,
+  0x02, /*     Report Count (2) */
+  0x81,
+  0x02, /*     Input (Data, Variable, Absolute) */
+  0x09,
+  0x38, /*     Usage (Wheel) */
+  0x16,
+  0x00,
+  0x80, /*     Logical Minimum (-32768) */
+  0x26,
+  0xff,
+  0x7f, /*     Logical Maximum (32767) */
+  0x75,
+  0x10, /*     Report Size (16) */
+  0x95,
+  0x01, /*     Report Count (1) */
+  0x81,
+  0x06, /*     Input (Data, Variable, Relative) */
+  0x05,
+  0x0c, /*     Usage Page (Consumer) */
+  0x0a,
+  0x38,
+  0x02, /*     Usage (AC Pan) */
+  0x16,
+  0x00,
+  0x80, /*     Logical Minimum (-32768) */
+  0x26,
+  0xff,
+  0x7f, /*     Logical Maximum (32767) */
+  0x75,
+  0x10, /*     Report Size (16) */
+  0x95,
+  0x01, /*     Report Count (1) */
+  0x81,
+  0x06, /*     Input (Data, Variable, Relative) */
+  0xc0, /*   End Collection (Absolute Pointer Physical) */
   0xc0, /* End Collection (Application) */
 
   /* Consumer Control top-level collection. */

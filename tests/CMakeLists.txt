@@ -175,9 +175,27 @@ set(SUNSHINE_SOURCES
 # remove main.cpp from the list of sources
 list(REMOVE_ITEM SUNSHINE_SOURCES ${CMAKE_SOURCE_DIR}/src/main.cpp)
 
+# Keep the driver-side queue source compatible with the WDK's C compiler on
+# every host, independently of the C++ GoogleTest translation units.
+add_library(lumen_vhid_report_queue_c_smoke OBJECT
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/virtual_hid_report_queue_c_smoke.c)
+set_target_properties(lumen_vhid_report_queue_c_smoke PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF)
+target_include_directories(lumen_vhid_report_queue_c_smoke PRIVATE
+        ${CMAKE_SOURCE_DIR})
+if(MSVC)
+    target_compile_options(lumen_vhid_report_queue_c_smoke PRIVATE /W4 /WX)
+else()
+    target_compile_options(lumen_vhid_report_queue_c_smoke PRIVATE -Wall -Wextra -Werror -pedantic)
+endif()
+
 add_executable(${PROJECT_NAME}
         ${TEST_SOURCES}
-        ${SUNSHINE_SOURCES})
+        ${SUNSHINE_SOURCES}
+        $<TARGET_OBJECTS:lumen_vhid_report_queue_c_smoke>)
+add_dependencies(${PROJECT_NAME} lumen_vhid_report_queue_c_smoke)
 
 # Copy files needed for config consistency tests to build directory
 # This ensures both CLI and CLion can access the same files relative to the test executable

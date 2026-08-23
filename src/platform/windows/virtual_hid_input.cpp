@@ -17,6 +17,7 @@
 
 // standard includes
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -335,6 +336,20 @@ namespace platf::win_input {
     constexpr std::uint32_t key_transition_id(std::uint16_t modcode, std::uint8_t flags) noexcept {
       return static_cast<std::uint32_t>(modcode) | (static_cast<std::uint32_t>(flags) << 16U);
     }
+
+    /**
+     * @brief Normalize one source coordinate into the HID absolute axis range.
+     * @param coordinate Coordinate in source-axis units.
+     * @param extent Positive source-axis extent.
+     * @return Normalized coordinate, or no value for invalid input.
+     */
+    std::optional<std::uint16_t> normalize_absolute_axis(float coordinate, std::int32_t extent) {
+      if (extent <= 0 || !std::isfinite(coordinate)) {
+        return std::nullopt;
+      }
+      const auto clamped = std::clamp(static_cast<double>(coordinate), 0.0, static_cast<double>(extent));
+      return static_cast<std::uint16_t>(std::lround(clamped * (65535.0 / static_cast<double>(extent))));
+    }
   }  // namespace
 
   std::optional<std::uint8_t> map_scan_code_to_hid_usage(UINT scan_code) {
@@ -607,6 +622,36 @@ namespace platf::win_input {
     return report;
   }
 
+  LUMEN_VHID_SUBMIT_REPORT_REQUEST virtual_hid_transport_t::mouse_state_report() const {
+    LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+    if (absolute_mouse_mode_) {
+      request.report_kind = LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE;
+      request.report.absolute_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE;
+      request.report.absolute_mouse.buttons = held_buttons_;
+      request.report.absolute_mouse.x = absolute_x_;
+      request.report.absolute_mouse.y = absolute_y_;
+    } else {
+      request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
+      request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
+      request.report.relative_mouse.buttons = held_buttons_;
+    }
+    return request;
+  }
+
+  void virtual_hid_transport_t::clear_virtual_state() noexcept {
+    held_keys_.clear();
+    held_consumers_.clear();
+    held_buttons_ = 0;
+    acknowledged_keyboard_ = {};
+    acknowledged_keyboard_.report_id = LUMEN_VHID_REPORT_ID_KEYBOARD;
+    acknowledged_buttons_ = 0;
+    absolute_mouse_mode_ = false;
+    absolute_x_ = 0;
+    absolute_y_ = 0;
+    vertical_wheel_remainder_ = 0;
+    horizontal_wheel_remainder_ = 0;
+  }
+
   result_t virtual_hid_transport_t::submit_report(
     const LUMEN_VHID_SUBMIT_REPORT_REQUEST &request,
     const char *stage
@@ -645,14 +690,19 @@ namespace platf::win_input {
         std::numeric_limits<std::int16_t>::min(),
         std::numeric_limits<std::int16_t>::max()
       );
-      LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
-      request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
-      request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-      request.report.relative_mouse.buttons = held_buttons_;
+      auto request = mouse_state_report();
       if (horizontal) {
-        request.report.relative_mouse.horizontal_wheel = static_cast<std::int16_t>(segment);
+        if (absolute_mouse_mode_) {
+          request.report.absolute_mouse.horizontal_wheel = static_cast<std::int16_t>(segment);
+        } else {
+          request.report.relative_mouse.horizontal_wheel = static_cast<std::int16_t>(segment);
+        }
       } else {
-        request.report.relative_mouse.vertical_wheel = static_cast<std::int16_t>(segment);
+        if (absolute_mouse_mode_) {
+          request.report.absolute_mouse.vertical_wheel = static_cast<std::int16_t>(segment);
+        } else {
+          request.report.relative_mouse.vertical_wheel = static_cast<std::int16_t>(segment);
+        }
       }
       const auto result = submit_report(request, stage);
       if (!result) {
@@ -715,6 +765,7 @@ namespace platf::win_input {
       if (!result) {
         return backend_.load() == backend_t::send_input ? fallback_->move_mouse(delta_x, delta_y) : result;
       }
+      absolute_mouse_mode_ = false;
       acknowledged_buttons_ = held_buttons_;
       remaining_x -= segment_x;
       remaining_y -= segment_y;
@@ -729,11 +780,37 @@ namespace platf::win_input {
     std::int32_t source_width,
     std::int32_t source_height
   ) {
+    const auto normalized_x = normalize_absolute_axis(x, source_width);
+    const auto normalized_y = normalize_absolute_axis(y, source_height);
+    if (!normalized_x || !normalized_y) {
+      return {completion_t::rejected, ERROR_INVALID_PARAMETER};
+    }
+
     std::lock_guard lock(mutex_);
-    if (backend_.load() == backend_t::fail_closed) {
+    if (backend_.load() == backend_t::send_input) {
+      return fallback_->absolute_mouse(x, y, source_width, source_height);
+    }
+    if (backend_.load() != backend_t::virtual_hid) {
       return {completion_t::ambiguous, ERROR_NOT_READY};
     }
-    return fallback_->absolute_mouse(x, y, source_width, source_height);
+
+    LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
+    request.report_kind = LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE;
+    request.report.absolute_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE;
+    request.report.absolute_mouse.buttons = held_buttons_;
+    request.report.absolute_mouse.x = *normalized_x;
+    request.report.absolute_mouse.y = *normalized_y;
+    const auto result = submit_report(request, "absolute mouse report");
+    if (!result) {
+      return backend_.load() == backend_t::send_input ?
+               fallback_->absolute_mouse(x, y, source_width, source_height) :
+               result;
+    }
+    absolute_mouse_mode_ = true;
+    absolute_x_ = *normalized_x;
+    absolute_y_ = *normalized_y;
+    acknowledged_buttons_ = held_buttons_;
+    return {};
   }
 
   result_t virtual_hid_transport_t::mouse_button(int button, bool release) {
@@ -756,10 +833,7 @@ namespace platf::win_input {
     } else {
       held_buttons_ |= bit;
     }
-    LUMEN_VHID_SUBMIT_REPORT_REQUEST request {};
-    request.report_kind = LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE;
-    request.report.relative_mouse.report_id = LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE;
-    request.report.relative_mouse.buttons = held_buttons_;
+    const auto request = mouse_state_report();
     const auto result = submit_report(request, "mouse button report");
     if (!result && backend_.load() == backend_t::send_input) {
       held_buttons_ = previous;
@@ -819,14 +893,6 @@ namespace platf::win_input {
     }
 
     const auto transition_id = key_transition_id(modcode, flags);
-    if (release && fallback_keys_.contains(transition_id)) {
-      const auto result = fallback_->keyboard(modcode, true, flags);
-      if (result) {
-        fallback_keys_.erase(transition_id);
-      }
-      return result;
-    }
-
     if (const auto usage = map_key_to_consumer_usage(modcode)) {
       const auto previous = held_consumers_;
       if (release) {
@@ -835,11 +901,7 @@ namespace platf::win_input {
         }
         held_consumers_.erase(transition_id);
       } else if (!held_consumers_.contains(transition_id) && held_consumers_.size() >= LUMEN_VHID_CONSUMER_USAGE_COUNT) {
-        const auto result = fallback_->keyboard(modcode, false, flags);
-        if (result) {
-          fallback_keys_.insert(transition_id);
-        }
-        return result;
+        return {completion_t::rejected, ERROR_BUFFER_OVERFLOW};
       } else {
         held_consumers_[transition_id] = *usage;
       }
@@ -857,7 +919,9 @@ namespace platf::win_input {
     const auto previous = held_keys_;
     if (release) {
       if (!held_keys_.contains(transition_id)) {
-        return {};
+        return map_key_to_hid_usage(modcode, flags, config::input.always_send_scancodes) ?
+                 result_t {} :
+                 result_t {completion_t::rejected, ERROR_NOT_SUPPORTED};
       }
       held_keys_.erase(transition_id);
     } else {
@@ -865,11 +929,7 @@ namespace platf::win_input {
       if (usage) {
         held_keys_[transition_id] = *usage;
       } else {
-        const auto result = fallback_->keyboard(modcode, false, flags);
-        if (result) {
-          fallback_keys_.insert(transition_id);
-        }
-        return result;
+        return {completion_t::rejected, ERROR_NOT_SUPPORTED};
       }
     }
 
@@ -889,30 +949,25 @@ namespace platf::win_input {
 
   result_t virtual_hid_transport_t::unicode(const char *utf8, int size) {
     std::lock_guard lock(mutex_);
-    if (backend_.load() == backend_t::fail_closed) {
-      return {completion_t::ambiguous, ERROR_NOT_READY};
+    if (backend_.load() == backend_t::send_input) {
+      return fallback_->unicode(utf8, size);
     }
-    return fallback_->unicode(utf8, size);
+    if (backend_.load() == backend_t::virtual_hid) {
+      return {completion_t::rejected, ERROR_NOT_SUPPORTED};
+    }
+    return {completion_t::ambiguous, ERROR_NOT_READY};
   }
 
   result_t virtual_hid_transport_t::reset_session() {
     std::lock_guard lock(mutex_);
-    vertical_wheel_remainder_ = 0;
-    horizontal_wheel_remainder_ = 0;
     if (backend_.load() == backend_t::send_input) {
       return fallback_->reset_session();
     }
-    if (backend_.load() == backend_t::virtual_hid) {
-      return fallback_->neutralize();
-    }
-    if (backend_.load() != backend_t::fail_closed) {
+    if (backend_.load() != backend_t::virtual_hid && backend_.load() != backend_t::fail_closed) {
       return {completion_t::rejected, ERROR_NOT_READY};
     }
 
-    held_keys_.clear();
-    held_consumers_.clear();
-    fallback_keys_.clear();
-    held_buttons_ = 0;
+    clear_virtual_state();
     const auto result = channel_->reset_and_release();
     if (!result) {
       set_failure("reset and release", result.status);
@@ -920,19 +975,21 @@ namespace platf::win_input {
       return {completion_t::ambiguous, result.status};
     }
 
-    channel_->close();
     accepted_virtual_input_ = false;
-    acknowledged_keyboard_ = {};
-    acknowledged_keyboard_.report_id = LUMEN_VHID_REPORT_ID_KEYBOARD;
-    acknowledged_buttons_ = 0;
-    backend_.store(backend_t::send_input);
+    const auto claim = channel_->claim();
+    if (!claim) {
+      set_failure("session reclaim", claim.status);
+      channel_->close();
+      backend_.store(backend_t::send_input);
+      return fallback_->neutralize();
+    }
+
+    backend_.store(backend_t::virtual_hid);
     return fallback_->neutralize();
   }
 
   result_t virtual_hid_transport_t::neutralize() {
     std::lock_guard lock(mutex_);
-    vertical_wheel_remainder_ = 0;
-    horizontal_wheel_remainder_ = 0;
     if (backend_.load() == backend_t::send_input) {
       return fallback_->neutralize();
     }
@@ -940,10 +997,7 @@ namespace platf::win_input {
       return {completion_t::rejected, ERROR_NOT_READY};
     }
 
-    held_keys_.clear();
-    held_consumers_.clear();
-    fallback_keys_.clear();
-    held_buttons_ = 0;
+    clear_virtual_state();
     const auto result = channel_->reset_and_release();
     channel_->close();
     if (!result) {

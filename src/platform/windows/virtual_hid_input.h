@@ -16,7 +16,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace platf::win_input {
   /**
@@ -117,9 +116,9 @@ namespace platf::win_input {
   class virtual_hid_transport_t final: public transport_t {
   public:
     /**
-     * @brief Construct a transport from injectable channel and SendInput objects.
+     * @brief Construct a transport from injectable Virtual HID and SendInput backends.
      * @param channel Virtual HID channel.
-     * @param fallback SendInput compatibility and auxiliary transport.
+     * @param fallback SendInput transport used only when Virtual HID is inactive.
      */
     virtual_hid_transport_t(
       std::shared_ptr<virtual_hid_channel_t> channel,
@@ -186,6 +185,17 @@ namespace platf::win_input {
     LUMEN_VHID_CONSUMER_REPORT consumer_report() const;
 
     /**
+     * @brief Build a zero-motion mouse report for the active coordinate mode.
+     * @return Relative or absolute mouse report request carrying current state.
+     */
+    LUMEN_VHID_SUBMIT_REPORT_REQUEST mouse_state_report() const;
+
+    /**
+     * @brief Clear all application-side state owned by the Virtual HID session.
+     */
+    void clear_virtual_state() noexcept;
+
+    /**
      * @brief Submit one report and enforce the accepted-input failure boundary.
      * @param request Tagged report request.
      * @param stage Diagnostic stage name.
@@ -218,16 +228,18 @@ namespace platf::win_input {
     void set_failure(const char *stage, DWORD status);
 
     std::shared_ptr<virtual_hid_channel_t> channel_;  ///< Secured driver channel.
-    std::unique_ptr<send_input_transport_t> fallback_;  ///< SendInput auxiliary transport.
+    std::unique_ptr<send_input_transport_t> fallback_;  ///< SendInput transport used only outside active Virtual HID.
     mutable std::mutex mutex_;  ///< Serializes reports, state, and recovery.
     std::atomic<backend_t> backend_ {backend_t::probing};  ///< Current stateful backend.
     bool accepted_virtual_input_ {false};  ///< Whether any Virtual HID report was accepted.
     std::unordered_map<std::uint32_t, std::uint8_t> held_keys_;  ///< Held keyboard usages by key and packet flags.
     std::unordered_map<std::uint32_t, std::uint16_t> held_consumers_;  ///< Held consumer usages by key and packet flags.
-    std::unordered_set<std::uint32_t> fallback_keys_;  ///< Held SendInput transitions by key and packet flags.
     LUMEN_VHID_KEYBOARD_REPORT acknowledged_keyboard_ {};  ///< Last accepted keyboard snapshot.
     std::uint8_t held_buttons_ {0};  ///< Desired mouse-button bitmap.
     std::uint8_t acknowledged_buttons_ {0};  ///< Last accepted mouse-button bitmap.
+    bool absolute_mouse_mode_ {false};  ///< Whether subsequent mouse state uses the absolute report.
+    std::uint16_t absolute_x_ {0};  ///< Last accepted normalized absolute horizontal coordinate.
+    std::uint16_t absolute_y_ {0};  ///< Last accepted normalized absolute vertical coordinate.
     std::int32_t vertical_wheel_remainder_ {0};  ///< Pending vertical Windows wheel units.
     std::int32_t horizontal_wheel_remainder_ {0};  ///< Pending horizontal Windows wheel units.
     std::string failure_stage_;  ///< Most recent diagnostic stage.

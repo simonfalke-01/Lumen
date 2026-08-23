@@ -42,6 +42,76 @@ using namespace std::literals;
 
 namespace input {
 
+  void detail::delayed_left_state_t::on_absolute_move() noexcept {
+    delay_enabled_ = true;
+  }
+
+  detail::delayed_left_decision_t detail::delayed_left_state_t::on_relative_move() noexcept {
+    delayed_left_decision_t decision {};
+    delay_enabled_ = false;
+    if (release_pending_) {
+      release_pending_ = false;
+      ++generation_;
+      decision.cancel_timer = true;
+      decision.emit_left_release = true;
+    }
+    return decision;
+  }
+
+  detail::delayed_left_decision_t detail::delayed_left_state_t::on_left_down() noexcept {
+    delayed_left_decision_t decision {};
+    if (release_pending_) {
+      release_pending_ = false;
+      ++generation_;
+      decision.cancel_timer = true;
+      decision.emit_left_release = true;
+    }
+    return decision;
+  }
+
+  detail::delayed_left_decision_t detail::delayed_left_state_t::on_left_up() noexcept {
+    delayed_left_decision_t decision {};
+    if (!delay_enabled_ || release_pending_) {
+      return decision;
+    }
+    release_pending_ = true;
+    decision.schedule_timer = true;
+    decision.generation = ++generation_;
+    return decision;
+  }
+
+  detail::delayed_left_decision_t detail::delayed_left_state_t::on_right_down() const noexcept {
+    delayed_left_decision_t decision {};
+    decision.synthesize_right_click = release_pending_;
+    return decision;
+  }
+
+  detail::delayed_left_decision_t detail::delayed_left_state_t::on_timer(
+    std::uint64_t generation,
+    bool left_pressed
+  ) noexcept {
+    delayed_left_decision_t decision {};
+    if (!release_pending_ || generation != generation_) {
+      return decision;
+    }
+    release_pending_ = false;
+    decision.consume_timer = true;
+    decision.emit_left_release = !left_pressed;
+    return decision;
+  }
+
+  detail::delayed_left_decision_t detail::delayed_left_state_t::on_reset() noexcept {
+    delayed_left_decision_t decision {};
+    delay_enabled_ = true;
+    ++generation_;
+    if (release_pending_) {
+      release_pending_ = false;
+      decision.cancel_timer = true;
+      decision.emit_left_release = true;
+    }
+    return decision;
+  }
+
   bool detail::checked_add_int16(std::int16_t lhs, std::int16_t rhs, std::int16_t &result) {
     const auto sum = static_cast<std::int32_t>(lhs) + static_cast<std::int32_t>(rhs);
     if (sum < std::numeric_limits<std::int16_t>::min() || sum > std::numeric_limits<std::int16_t>::max()) {
@@ -172,6 +242,7 @@ namespace input {
   static std::unordered_map<key_press_id_t, bool> key_press {};
   static std::array<std::uint8_t, BUTTON_X2 + 1> mouse_press {};  ///< Pressed state indexed by Moonlight button ID.
   static_assert(mouse_press.size() > BUTTON_X2, "Mouse state must include every Moonlight button ID");
+  static std::mutex mouse_press_mutex;  ///< Serializes mouse state with delayed left-button releases.
   static std::mutex reset_tasks_mutex;
   static std::vector<std::future<void>> reset_tasks;
   static bool input_shutting_down {false};
@@ -276,6 +347,7 @@ namespace input {
     std::mutex input_queue_lock;  ///< Input queue lock.
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
+    detail::delayed_left_state_t delayed_left_button;  ///< Portable delayed left-button decision state.
 
     input::touch_port_t touch_port;  ///< Touch coordinate bounds for the current stream.
 
@@ -583,7 +655,18 @@ namespace input {
       return;
     }
 
-    input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
+    {
+      std::lock_guard lock(mouse_press_mutex);
+      const auto decision = input->delayed_left_button.on_relative_move();
+      if (decision.cancel_timer) {
+        task_pool.cancel(input->mouse_left_button_timeout);
+      }
+      if (decision.emit_left_release) {
+        platf::button_mouse(platf_input, BUTTON_LEFT, true);
+        mouse_press[BUTTON_LEFT] = false;
+      }
+      input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
+    }
     platf::move_mouse(platf_input, util::endian::big(packet->deltaX), util::endian::big(packet->deltaY));
   }
 
@@ -686,8 +769,12 @@ namespace input {
       return;
     }
 
-    if (input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
-      input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
+    {
+      std::lock_guard lock(mouse_press_mutex);
+      input->delayed_left_button.on_absolute_move();
+      if (input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
+        input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
+      }
     }
 
     float x = util::endian::big(packet->x);
@@ -744,6 +831,18 @@ namespace input {
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
     auto button = util::endian::big(packet->button);
+    std::lock_guard lock(mouse_press_mutex);
+
+    if (button == BUTTON_LEFT && !release) {
+      const auto decision = input->delayed_left_button.on_left_down();
+      if (decision.cancel_timer) {
+        task_pool.cancel(input->mouse_left_button_timeout);
+      }
+      if (decision.emit_left_release) {
+        platf::button_mouse(platf_input, BUTTON_LEFT, true);
+      }
+      input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
+    }
     if (button >= BUTTON_LEFT && button <= BUTTON_X2) {
       if (mouse_press[button] != release) {
         // button state is already what we want
@@ -763,30 +862,35 @@ namespace input {
      *
      * Try to make sure BUTTON_RIGHT gets called before BUTTON_LEFT is released.
      *
-     * input->mouse_left_button_timeout can only be nullptr
-     * when the last mouse coordinates were absolute
+     * delayed_left_button determines whether this logical release needs a timer.
      */
-    if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
+    if (button == BUTTON_LEFT && release) {
+      const auto decision = input->delayed_left_button.on_left_up();
+      if (!decision.schedule_timer) {
+        platf::button_mouse(platf_input, button, release);
+        return;
+      }
+      const auto generation = decision.generation;
       auto f = [=]() {
-        auto left_released = mouse_press[BUTTON_LEFT];
-        if (left_released) {
-          // Already released left button
-          return;
+        std::lock_guard lock(mouse_press_mutex);
+        const auto timer_decision = input->delayed_left_button.on_timer(
+          generation,
+          mouse_press[BUTTON_LEFT]
+        );
+        if (timer_decision.consume_timer) {
+          input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
         }
-        platf::button_mouse(platf_input, BUTTON_LEFT, release);
-
-        mouse_press[BUTTON_LEFT] = false;
-        input->mouse_left_button_timeout = nullptr;
+        if (timer_decision.emit_left_release) {
+          platf::button_mouse(platf_input, BUTTON_LEFT, true);
+          mouse_press[BUTTON_LEFT] = false;
+        }
       };
 
       input->mouse_left_button_timeout = task_pool.pushDelayed(std::move(f), 10ms).task_id;
 
       return;
     }
-    if (
-      button == BUTTON_RIGHT && !release &&
-      input->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY
-    ) {
+    if (button == BUTTON_RIGHT && !release && input->delayed_left_button.on_right_down().synthesize_right_click) {
       platf::button_mouse(platf_input, BUTTON_RIGHT, false);
       platf::button_mouse(platf_input, BUTTON_RIGHT, true);
 
@@ -1895,7 +1999,16 @@ namespace input {
    */
   void reset(std::shared_ptr<input_t> &input) {
     task_pool.cancel(key_press_repeat_id);
-    task_pool.cancel(input->mouse_left_button_timeout);
+    bool flush_pending_left_release = false;
+    {
+      std::lock_guard lock(mouse_press_mutex);
+      const auto decision = input->delayed_left_button.on_reset();
+      if (decision.cancel_timer) {
+        task_pool.cancel(input->mouse_left_button_timeout);
+      }
+      flush_pending_left_release = decision.emit_left_release;
+      input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
+    }
 
     // Ensure input is synchronous, by using the task_pool
     std::lock_guard lock(reset_tasks_mutex);
@@ -1905,11 +2018,14 @@ namespace input {
     std::erase_if(reset_tasks, [](std::future<void> &reset) {
       return reset.wait_for(0s) == std::future_status::ready;
     });
-    reset_tasks.emplace_back(task_pool.push([]() {
-      for (int button = BUTTON_LEFT; button <= BUTTON_X2; ++button) {
-        if (mouse_press[button]) {
-          platf::button_mouse(platf_input, button, true);
-          mouse_press[button] = false;
+    reset_tasks.emplace_back(task_pool.push([flush_pending_left_release]() {
+      {
+        std::lock_guard mouse_lock(mouse_press_mutex);
+        for (int button = BUTTON_LEFT; button <= BUTTON_X2; ++button) {
+          if (mouse_press[button] || (button == BUTTON_LEFT && flush_pending_left_release)) {
+            platf::button_mouse(platf_input, button, true);
+            mouse_press[button] = false;
+          }
         }
       }
 

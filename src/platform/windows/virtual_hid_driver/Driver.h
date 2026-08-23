@@ -15,6 +15,7 @@
 
 /* VHF requires the NT and WDF declarations above. */
 #include "../virtual_hid_protocol.h"
+#include "ReportQueue.h"
 
 #include <vhf.h>
 
@@ -25,14 +26,22 @@ typedef struct LUMEN_VHID_FILE_CONTEXT {
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LUMEN_VHID_FILE_CONTEXT, LumenVhidGetFileContext);
 
-/** Per-device VHF transport and exact open-file ownership state. */
+/** Per-device VHF transport, input queue, and exact open-file ownership state. */
 typedef struct LUMEN_VHID_DEVICE_CONTEXT {
   WDFDEVICE device;  ///< Owning UMDF device.
   WDFIOTARGET local_target;  ///< PrepareHardware-owned local target supplying VHF's UMDF handle.
   VHFHANDLE vhf_handle;  ///< Started virtual HID device, or NULL when unavailable.
-  WDFWAITLOCK state_lock;  ///< Serializes ownership, report submission, and VHF reset.
+  WDFWAITLOCK state_lock;  ///< Serializes ownership, queue state, submission grants, and VHF reset.
   WDFFILEOBJECT owner_file;  ///< Exact framework file that currently owns submission.
   BOOLEAN ready;  ///< True only while vhf_handle has started successfully.
+  BOOLEAN shutting_down;  ///< True while callbacks and new submissions must drain or stop.
+  BOOLEAN vhf_ready_for_input_report;  ///< One outstanding VHF readiness grant.
+  BOOLEAN input_submission_active;  ///< True only across one unlocked VhfReadReportSubmit call.
+  BOOLEAN has_in_flight_report;  ///< True while VHF may reference in_flight_report bytes.
+  LUMEN_VHID_REPORT_QUEUE pending_reports;  ///< Ordered bounded reports awaiting a readiness grant.
+  LUMEN_VHID_QUEUED_REPORT in_flight_report;  ///< Stable storage retained until the next callback.
+  HANDLE submissions_drained_event;  ///< Manual-reset event signaled when no submit call is active.
+  HANDLE reports_drained_event;  ///< Manual-reset event signaled after VHF consumes all queued reports.
 } LUMEN_VHID_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LUMEN_VHID_DEVICE_CONTEXT, LumenVhidGetDeviceContext);
@@ -51,5 +60,7 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL LumenVhidEvtIoDeviceControl;
 EVT_WDF_FILE_CLEANUP LumenVhidEvtFileCleanup;
 /** Synchronously delete VHF when its UMDF parent device is destroyed. */
 EVT_WDF_OBJECT_CONTEXT_CLEANUP LumenVhidEvtDeviceCleanup;
+/** Release the previous report buffer and consume one new VHF readiness grant. */
+EVT_VHF_READY_FOR_NEXT_READ_REPORT LumenVhidEvtVhfReadyForNextReadReport;
 
 #endif /* LUMEN_VIRTUAL_HID_DRIVER_H */

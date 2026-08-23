@@ -14,6 +14,7 @@
   #include <array>
   #include <cstdint>
   #include <deque>
+  #include <limits>
   #include <memory>
   #include <optional>
   #include <utility>
@@ -516,71 +517,191 @@ TEST_F(virtual_hid_input_test, MapsCommonMediaKeyThroughConsumerControl) {
   EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
-TEST_F(virtual_hid_input_test, UsesPerKeySendInputForUnsupportedKeyWhileHealthy) {
+TEST_F(virtual_hid_input_test, RejectsUnsupportedKeyWithoutSendInputWhileVirtualHidIsActive) {
   initialize();
 
-  const auto result = transport->keyboard(VK_PACKET, false, 0);
+  const auto press = transport->keyboard(VK_PACKET, false, 0);
+  const auto release = transport->keyboard(VK_PACKET, true, 0);
 
-  ASSERT_TRUE(result);
+  EXPECT_FALSE(press);
+  EXPECT_EQ(press.completion, platf::win_input::completion_t::rejected);
+  EXPECT_EQ(press.status, ERROR_NOT_SUPPORTED);
+  EXPECT_FALSE(release);
+  EXPECT_EQ(release.completion, platf::win_input::completion_t::rejected);
+  EXPECT_EQ(release.status, ERROR_NOT_SUPPORTED);
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
   EXPECT_TRUE(channel->submissions.empty());
-  ASSERT_EQ(fallback_api->submitted.size(), 1);
-  EXPECT_EQ(fallback_api->submitted[0].ki.wVk, VK_PACKET);
+  EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
-TEST_F(virtual_hid_input_test, RoutesSystemSleepThroughSendInputInsteadOfKeyboardPage) {
+TEST_F(virtual_hid_input_test, RejectsSystemSleepWithoutSendInputWhileVirtualHidIsActive) {
   initialize();
 
   const auto result = transport->keyboard(VK_SLEEP, false, 0);
 
-  ASSERT_TRUE(result);
+  EXPECT_FALSE(result);
+  EXPECT_EQ(result.completion, platf::win_input::completion_t::rejected);
+  EXPECT_EQ(result.status, ERROR_NOT_SUPPORTED);
   EXPECT_TRUE(channel->submissions.empty());
-  ASSERT_EQ(fallback_api->submitted.size(), 1);
-  EXPECT_EQ(fallback_api->submitted[0].ki.wVk, 0);
-  EXPECT_EQ(fallback_api->submitted[0].ki.wScan, 0x5F);
-  EXPECT_EQ(fallback_api->submitted[0].ki.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
+  EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
-TEST_F(virtual_hid_input_test, RoutesMatchingUnsupportedReleaseThroughSendInput) {
+TEST_F(virtual_hid_input_test, RejectsConsumerOverflowWithoutSendInput) {
   initialize();
 
-  ASSERT_TRUE(transport->keyboard(VK_PACKET, false, 0));
+  ASSERT_TRUE(transport->keyboard(VK_VOLUME_UP, false, 0));
+  ASSERT_TRUE(transport->keyboard(VK_VOLUME_DOWN, false, 0));
+  ASSERT_TRUE(transport->keyboard(VK_VOLUME_MUTE, false, 0));
+  ASSERT_TRUE(transport->keyboard(VK_MEDIA_NEXT_TRACK, false, 0));
 
-  const auto result = transport->keyboard(VK_PACKET, true, 0);
+  const auto overflow = transport->keyboard(VK_MEDIA_PREV_TRACK, false, 0);
 
-  ASSERT_TRUE(result);
+  EXPECT_FALSE(overflow);
+  EXPECT_EQ(overflow.completion, platf::win_input::completion_t::rejected);
+  EXPECT_EQ(overflow.status, ERROR_BUFFER_OVERFLOW);
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
-  EXPECT_TRUE(channel->submissions.empty());
-  ASSERT_EQ(fallback_api->submitted.size(), 2);
-  EXPECT_EQ(fallback_api->submitted[1].ki.dwFlags, KEYEVENTF_KEYUP);
+  EXPECT_EQ(channel->submissions.size(), 4);
+  EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
-TEST_F(virtual_hid_input_test, TracksFallbackKeysIndependentlyByPacketFlags) {
+TEST_F(virtual_hid_input_test, RejectsUnicodeWithoutSendInputWhileVirtualHidIsActive) {
   initialize();
+  constexpr char utf8[] = "\xC3\xA9";
 
-  ASSERT_TRUE(transport->keyboard(VK_PACKET, false, 0));
-  ASSERT_TRUE(transport->keyboard(VK_PACKET, false, SS_KBE_FLAG_NON_NORMALIZED));
-  ASSERT_TRUE(transport->keyboard(VK_PACKET, true, 0));
-  ASSERT_TRUE(transport->keyboard(VK_PACKET, true, SS_KBE_FLAG_NON_NORMALIZED));
+  const auto result = transport->unicode(utf8, 2);
 
-  ASSERT_EQ(fallback_api->submitted.size(), 4);
-  EXPECT_EQ(fallback_api->submitted[2].ki.dwFlags, KEYEVENTF_KEYUP);
-  EXPECT_EQ(fallback_api->submitted[3].ki.dwFlags, KEYEVENTF_KEYUP);
+  EXPECT_FALSE(result);
+  EXPECT_EQ(result.completion, platf::win_input::completion_t::rejected);
+  EXPECT_EQ(result.status, ERROR_NOT_SUPPORTED);
+  EXPECT_TRUE(channel->submissions.empty());
+  EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
-TEST_F(virtual_hid_input_test, RoutesAbsoluteMouseAndUnicodeThroughSendInputWhileHealthy) {
+TEST_F(virtual_hid_input_test, RoutesAbsoluteMouseExclusivelyThroughVirtualHid) {
   initialize();
 
   ASSERT_TRUE(transport->absolute_mouse(50.0f, 25.0f, 100, 100));
-  constexpr char utf8[] = "\xC3\xA9";
-  ASSERT_TRUE(transport->unicode(utf8, 2));
+
+  ASSERT_EQ(channel->submissions.size(), 1);
+  const auto &absolute = channel->submissions.front();
+  EXPECT_EQ(absolute.report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+  EXPECT_EQ(absolute.report.absolute_mouse.report_id, LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE);
+  EXPECT_EQ(absolute.report.absolute_mouse.x, 32768);
+  EXPECT_EQ(absolute.report.absolute_mouse.y, 16384);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, RejectsInvalidAbsoluteCoordinatesWithoutFallback) {
+  initialize();
+
+  EXPECT_FALSE(transport->absolute_mouse(1.0f, 1.0f, 0, 100));
+  EXPECT_FALSE(transport->absolute_mouse(std::numeric_limits<float>::quiet_NaN(), 1.0f, 100, 100));
 
   EXPECT_TRUE(channel->submissions.empty());
-  ASSERT_EQ(fallback_api->submitted.size(), 3);
-  EXPECT_EQ(fallback_api->submitted[0].type, INPUT_MOUSE);
-  EXPECT_EQ(fallback_api->submitted[0].mi.dwFlags, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK);
-  EXPECT_EQ(fallback_api->submitted[1].ki.dwFlags, KEYEVENTF_UNICODE);
-  EXPECT_EQ(fallback_api->submitted[2].ki.dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
+}
+
+TEST_F(virtual_hid_input_test, SendsInitialAbsoluteLeftClickAsCompleteAbsoluteSnapshots) {
+  initialize();
+
+  ASSERT_TRUE(transport->absolute_mouse(10.0f, 20.0f, 100, 100));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, true));
+
+  ASSERT_EQ(channel->submissions.size(), 3);
+  for (const auto &submission : channel->submissions) {
+    EXPECT_EQ(submission.report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+    EXPECT_EQ(submission.report.absolute_mouse.report_id, LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE);
+    EXPECT_EQ(submission.report.absolute_mouse.x, 6554);
+    EXPECT_EQ(submission.report.absolute_mouse.y, 13107);
+  }
+  EXPECT_EQ(channel->submissions[1].report.absolute_mouse.buttons, 0x01);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.buttons, 0x00);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, PreservesAbsoluteCoordinatesAcrossRightThenLeftClicks) {
+  initialize();
+
+  ASSERT_TRUE(transport->absolute_mouse(75.0f, 25.0f, 100, 100));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_RIGHT, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_RIGHT, true));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, true));
+
+  ASSERT_EQ(channel->submissions.size(), 5);
+  EXPECT_EQ(channel->submissions[1].report.absolute_mouse.buttons, 0x02);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.buttons, 0x00);
+  EXPECT_EQ(channel->submissions[3].report.absolute_mouse.buttons, 0x01);
+  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.buttons, 0x00);
+  for (const auto &submission : channel->submissions) {
+    EXPECT_EQ(submission.report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+    EXPECT_EQ(submission.report.absolute_mouse.x, 49151);
+    EXPECT_EQ(submission.report.absolute_mouse.y, 16384);
+  }
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, RepeatedAbsoluteLeftClicksNeverUseSendInput) {
+  initialize();
+
+  ASSERT_TRUE(transport->absolute_mouse(50.0f, 50.0f, 100, 100));
+  for (int click = 0; click < 3; ++click) {
+    ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+    ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, true));
+  }
+
+  ASSERT_EQ(channel->submissions.size(), 7);
+  for (std::size_t index = 1; index < channel->submissions.size(); ++index) {
+    EXPECT_EQ(channel->submissions[index].report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+    EXPECT_EQ(channel->submissions[index].report.absolute_mouse.buttons, index % 2 == 1 ? 0x01 : 0x00);
+  }
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, InterleavesAbsoluteMovesButtonsAndWheelsInOneReportMode) {
+  initialize();
+
+  ASSERT_TRUE(transport->absolute_mouse(25.0f, 75.0f, 100, 100));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA));
+  ASSERT_TRUE(transport->absolute_mouse(50.0f, 25.0f, 100, 100));
+  ASSERT_TRUE(transport->horizontal_scroll(-2 * WHEEL_DELTA));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, true));
+
+  ASSERT_EQ(channel->submissions.size(), 6);
+  for (const auto &submission : channel->submissions) {
+    EXPECT_EQ(submission.report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+  }
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.buttons, 0x01);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.x, 16384);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.y, 49151);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.vertical_wheel, 1);
+  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.buttons, 0x01);
+  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.x, 32768);
+  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.y, 16384);
+  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.horizontal_wheel, -2);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
+TEST_F(virtual_hid_input_test, RelativeMovementReturnsButtonsAndWheelsToRelativeReports) {
+  initialize();
+
+  ASSERT_TRUE(transport->absolute_mouse(50.0f, 50.0f, 100, 100));
+  ASSERT_TRUE(transport->move_mouse(1, -1));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA));
+
+  ASSERT_EQ(channel->submissions.size(), 4);
+  EXPECT_EQ(channel->submissions[0].report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
+  for (std::size_t index = 1; index < channel->submissions.size(); ++index) {
+    EXPECT_EQ(channel->submissions[index].report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
+  }
+  EXPECT_EQ(channel->submissions[2].report.relative_mouse.buttons, 0x01);
+  EXPECT_EQ(channel->submissions[3].report.relative_mouse.buttons, 0x01);
+  EXPECT_EQ(channel->submissions[3].report.relative_mouse.vertical_wheel, 1);
+  EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
 TEST_F(virtual_hid_input_test, BuildsSegmentedRelativeMouseReports) {
@@ -661,6 +782,27 @@ TEST_F(virtual_hid_input_test, ResetSessionClearsFractionalVirtualHidWheelDetent
   ASSERT_EQ(channel->submissions.size(), 2);
   EXPECT_EQ(channel->submissions[0].report.relative_mouse.vertical_wheel, 1);
   EXPECT_EQ(channel->submissions[1].report.relative_mouse.horizontal_wheel, 1);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+  EXPECT_EQ(channel->reset_calls, 1);
+  EXPECT_EQ(channel->claim_calls, 2);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
+}
+
+TEST_F(virtual_hid_input_test, SessionResetNeutralizesAndReclaimsAbsoluteMouseState) {
+  initialize();
+  ASSERT_TRUE(transport->absolute_mouse(75.0f, 25.0f, 100, 100));
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+
+  ASSERT_TRUE(transport->reset_session());
+
+  EXPECT_EQ(channel->reset_calls, 1);
+  EXPECT_EQ(channel->claim_calls, 2);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
+  EXPECT_EQ(transport->acknowledged_mouse_buttons(), 0);
+  ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
+  ASSERT_EQ(channel->submissions.size(), 3);
+  EXPECT_EQ(channel->submissions.back().report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
+  EXPECT_EQ(channel->submissions.back().report.relative_mouse.buttons, 0x01);
   EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
@@ -766,6 +908,52 @@ TEST_F(virtual_hid_input_test, FallsBackWhenFirstVirtualReportIsRejected) {
   EXPECT_EQ(fallback_api->submitted[0].mi.dy, -7);
 }
 
+TEST_F(virtual_hid_input_test, AllowsUnsupportedOperationsAfterActualReportSelectsSendInputFallback) {
+  initialize();
+  channel->submit_results.push_back({false, ERROR_WRITE_FAULT});
+  ASSERT_TRUE(transport->move_mouse(5, -7));
+  ASSERT_EQ(transport->backend(), platf::win_input::backend_t::send_input);
+
+  ASSERT_TRUE(transport->keyboard(VK_PACKET, false, 0));
+  constexpr char utf8[] = "\xC3\xA9";
+  ASSERT_TRUE(transport->unicode(utf8, 2));
+
+  ASSERT_EQ(fallback_api->submitted.size(), 4);
+  EXPECT_EQ(fallback_api->submitted[0].type, INPUT_MOUSE);
+  EXPECT_EQ(fallback_api->submitted[1].type, INPUT_KEYBOARD);
+  EXPECT_EQ(fallback_api->submitted[2].ki.dwFlags, KEYEVENTF_UNICODE);
+  EXPECT_EQ(fallback_api->submitted[3].ki.dwFlags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+}
+
+TEST_F(virtual_hid_input_test, FallsBackForAbsoluteMouseOnlyBeforeAnyVirtualReportIsAccepted) {
+  initialize();
+  channel->submit_results.push_back({false, ERROR_WRITE_FAULT});
+
+  const auto result = transport->absolute_mouse(50.0f, 25.0f, 100, 100);
+
+  ASSERT_TRUE(result);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::send_input);
+  ASSERT_EQ(fallback_api->submitted.size(), 1);
+  EXPECT_EQ(fallback_api->submitted[0].type, INPUT_MOUSE);
+  EXPECT_EQ(
+    fallback_api->submitted[0].mi.dwFlags,
+    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+  );
+}
+
+TEST_F(virtual_hid_input_test, FailedAbsoluteMouseAfterAcceptanceNeverUsesSendInput) {
+  initialize();
+  ASSERT_TRUE(transport->keyboard('A', false, 0));
+  channel->submit_results.push_back({false, ERROR_WRITE_FAULT});
+
+  const auto result = transport->absolute_mouse(50.0f, 25.0f, 100, 100);
+
+  EXPECT_FALSE(result);
+  EXPECT_EQ(result.completion, platf::win_input::completion_t::ambiguous);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::fail_closed);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+}
+
 TEST_F(virtual_hid_input_test, FailsClosedAfterAnyAcceptedVirtualReport) {
   initialize();
   ASSERT_TRUE(transport->keyboard('A', false, 0));
@@ -796,11 +984,14 @@ TEST_F(virtual_hid_input_test, ResetRecoversFailClosedTransportWithoutReplay) {
 
   ASSERT_TRUE(result);
   EXPECT_EQ(channel->reset_calls, 1);
-  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::send_input);
+  EXPECT_EQ(channel->claim_calls, 2);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
   EXPECT_TRUE(fallback_api->submitted.empty());
   ASSERT_TRUE(transport->move_mouse(3, 4));
-  ASSERT_EQ(fallback_api->submitted.size(), 1);
-  EXPECT_EQ(fallback_api->submitted[0].mi.dx, 3);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+  ASSERT_EQ(channel->submissions.size(), 4);
+  EXPECT_EQ(channel->submissions.back().report.relative_mouse.x, 3);
+  EXPECT_EQ(channel->submissions.back().report.relative_mouse.y, 4);
 }
 
 TEST_F(virtual_hid_input_test, ResetFailureKeepsTransportFailClosed) {

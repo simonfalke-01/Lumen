@@ -94,6 +94,85 @@ TEST(InputBatchingTest, HorizontalScrollRejectsOverflowWithoutMutation) {
   EXPECT_EQ(dest, std::numeric_limits<std::int16_t>::min());
 }
 
+TEST(DelayedLeftStateTest, AbsoluteClickSchedulesAndConsumesOneReleaseTimer) {
+  input::detail::delayed_left_state_t state;
+  state.on_absolute_move();
+
+  const auto down = state.on_left_down();
+  EXPECT_FALSE(down.cancel_timer);
+  EXPECT_FALSE(down.emit_left_release);
+
+  const auto up = state.on_left_up();
+  EXPECT_TRUE(up.schedule_timer);
+  EXPECT_GT(up.generation, 0U);
+
+  const auto timer = state.on_timer(up.generation, false);
+  EXPECT_TRUE(timer.consume_timer);
+  EXPECT_TRUE(timer.emit_left_release);
+  EXPECT_FALSE(state.on_timer(up.generation, false).consume_timer);
+}
+
+TEST(DelayedLeftStateTest, NewLeftDownFlushesPendingReleaseBeforePress) {
+  input::detail::delayed_left_state_t state;
+  state.on_absolute_move();
+  const auto pending = state.on_left_up();
+  ASSERT_TRUE(pending.schedule_timer);
+
+  const auto down = state.on_left_down();
+  EXPECT_TRUE(down.cancel_timer);
+  EXPECT_TRUE(down.emit_left_release);
+  EXPECT_FALSE(state.on_timer(pending.generation, false).consume_timer);
+}
+
+TEST(DelayedLeftStateTest, RightDownIsSynthesizedWhileLeftReleaseRemainsPending) {
+  input::detail::delayed_left_state_t state;
+  const auto pending = state.on_left_up();
+  ASSERT_TRUE(pending.schedule_timer);
+
+  EXPECT_TRUE(state.on_right_down().synthesize_right_click);
+  const auto timer = state.on_timer(pending.generation, false);
+  EXPECT_TRUE(timer.consume_timer);
+  EXPECT_TRUE(timer.emit_left_release);
+  EXPECT_FALSE(state.on_right_down().synthesize_right_click);
+}
+
+TEST(DelayedLeftStateTest, RelativeMoveCancelsAndFlushesPendingRelease) {
+  input::detail::delayed_left_state_t state;
+  const auto pending = state.on_left_up();
+  ASSERT_TRUE(pending.schedule_timer);
+
+  const auto relative = state.on_relative_move();
+  EXPECT_TRUE(relative.cancel_timer);
+  EXPECT_TRUE(relative.emit_left_release);
+  EXPECT_FALSE(state.on_timer(pending.generation, false).consume_timer);
+  EXPECT_FALSE(state.on_left_up().schedule_timer);
+  EXPECT_FALSE(state.on_relative_move().cancel_timer);
+
+  state.on_absolute_move();
+  EXPECT_TRUE(state.on_left_up().schedule_timer);
+}
+
+TEST(DelayedLeftStateTest, ResetInvalidatesAlreadyDequeuedTimerGeneration) {
+  input::detail::delayed_left_state_t state;
+  const auto dequeued = state.on_left_up();
+  ASSERT_TRUE(dequeued.schedule_timer);
+
+  const auto reset = state.on_reset();
+  EXPECT_TRUE(reset.cancel_timer);
+  EXPECT_TRUE(reset.emit_left_release);
+  const auto stale = state.on_timer(dequeued.generation, false);
+  EXPECT_FALSE(stale.consume_timer);
+  EXPECT_FALSE(stale.emit_left_release);
+
+  const auto next = state.on_left_up();
+  EXPECT_TRUE(next.schedule_timer);
+  EXPECT_GT(next.generation, dequeued.generation);
+  const auto newer_press = state.on_timer(next.generation, true);
+  EXPECT_TRUE(newer_press.consume_timer);
+  EXPECT_FALSE(newer_press.emit_left_release);
+  EXPECT_FALSE(state.on_reset().cancel_timer);
+}
+
 struct MouseHIDTest: PlatformTestSuite, testing::WithParamInterface<util::point_t> {
   void SetUp() override {
     BaseTest::SetUp();

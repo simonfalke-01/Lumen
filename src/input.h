@@ -20,6 +20,72 @@ namespace input {
    */
   namespace detail {
     /**
+     * @brief Platform-independent actions selected by the delayed left-button state machine.
+     */
+    struct delayed_left_decision_t {
+      bool cancel_timer {false};  ///< Cancel the currently queued timer when possible.
+      bool consume_timer {false};  ///< Clear the production timer identifier for a valid expiry.
+      bool emit_left_release {false};  ///< Emit a left-button release before continuing.
+      bool schedule_timer {false};  ///< Schedule a delayed left-button release.
+      bool synthesize_right_click {false};  ///< Emit an immediate right-button press and release.
+      std::uint64_t generation {0};  ///< Generation assigned to a newly scheduled timer.
+    };
+
+    /**
+     * @brief Portable decision state for absolute-pointer left-button release delay.
+     */
+    class delayed_left_state_t {
+    public:
+      /**
+       * @brief Enable delayed releases after absolute pointer movement.
+       */
+      void on_absolute_move() noexcept;
+
+      /**
+       * @brief Disable delay and flush any pending release before relative movement.
+       * @return Actions required by the production input layer.
+       */
+      delayed_left_decision_t on_relative_move() noexcept;
+
+      /**
+       * @brief Handle a left-button press, flushing a prior delayed release first.
+       * @return Actions required before emitting the new press.
+       */
+      delayed_left_decision_t on_left_down() noexcept;
+
+      /**
+       * @brief Handle a logical left-button release.
+       * @return Timer scheduling decision, or an empty decision when delay is disabled.
+       */
+      delayed_left_decision_t on_left_up() noexcept;
+
+      /**
+       * @brief Handle a right-button press while a left release may be pending.
+       * @return Decision indicating whether to synthesize the right click immediately.
+       */
+      delayed_left_decision_t on_right_down() const noexcept;
+
+      /**
+       * @brief Resolve one delayed timer callback.
+       * @param generation Generation captured when the timer was scheduled.
+       * @param left_pressed Whether a newer logical left press is active.
+       * @return Timer consumption and optional left-release decision.
+       */
+      delayed_left_decision_t on_timer(std::uint64_t generation, bool left_pressed) noexcept;
+
+      /**
+       * @brief Reset to the initial absolute-capable state and invalidate stale timers.
+       * @return Actions required to cancel and flush pending state.
+       */
+      delayed_left_decision_t on_reset() noexcept;
+
+    private:
+      bool delay_enabled_ {true};  ///< Whether absolute-pointer release delay is active.
+      bool release_pending_ {false};  ///< Whether one delayed left release is outstanding.
+      std::uint64_t generation_ {0};  ///< Monotonic timer invalidation generation.
+    };
+
+    /**
      * @brief Add two signed 16-bit values without overflowing.
      *
      * @param lhs Left-hand operand.

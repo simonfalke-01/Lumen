@@ -336,11 +336,13 @@ run installer repair. Uninstalling Lumen stops the service before removing the V
 Use Windows **Installed apps** to repair or uninstall Lumen; Windows may require a restart to finish
 removing an in-use driver.
 
-If initialization fails, or input submission fails before the driver accepts its first report, Lumen uses SendInput.
-After the driver accepts any report, a later submission failure fails closed and stops keyboard and mouse injection
-instead of risking duplicate or stuck input. Disconnect Moonlight to trigger the input session's atomic
-reset-and-release operation. A successful reset recovers through SendInput without replaying held state; a failed reset
-keeps input fail closed. If disconnecting does not recover input, restart `LumenService` and review the failure before
+If initialization fails, or the first actual Virtual HID report is rejected, Lumen switches the whole backend to
+SendInput. Once the driver accepts a report, Lumen does not mix per-event SendInput into the active Virtual HID session:
+supported relative and absolute mouse input remains on Virtual HID, while unsupported keys, Consumer Control overflow,
+and Unicode text are rejected. A later report failure fails closed and stops keyboard and mouse injection instead of
+risking duplicate or stuck input. Disconnect Moonlight to trigger the input session's atomic reset-and-release
+operation. A successful reset neutralizes and reclaims Virtual HID without replaying held state; a failed reset keeps
+input fail closed. If disconnecting does not recover input, restart `LumenService` and review the failure before
 reconnecting. Reboot Windows if the topology remains `unhealthy`, the installer reports that a reboot is required, or a
 service restart does not recover the driver; then rerun repair if `status --json` is still not `installed`.
 

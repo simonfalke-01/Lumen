@@ -58,7 +58,7 @@ extern "C" {
 #define LUMEN_VHID_DRIVER_SERVICE_NAME_W L"LumenVirtualHid"
 
 /** Exact driver/client ABI version. */
-#define LUMEN_VHID_ABI_VERSION 1u
+#define LUMEN_VHID_ABI_VERSION 2u
 /** Number of keyboard bitmap bytes covering usages 00-DF. */
 #define LUMEN_VHID_NKRO_BITMAP_SIZE 28u
 /** Number of simultaneously pressed Consumer Control usages. */
@@ -76,6 +76,7 @@ extern "C" {
 #define LUMEN_VHID_REPORT_KIND_KEYBOARD 1u
 #define LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE 2u
 #define LUMEN_VHID_REPORT_KIND_CONSUMER 3u
+#define LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE 4u
 /** @} */
 
 /** @name HID report identifiers
@@ -83,6 +84,7 @@ extern "C" {
 #define LUMEN_VHID_REPORT_ID_KEYBOARD 1u
 #define LUMEN_VHID_REPORT_ID_MOUSE_RELATIVE 2u
 #define LUMEN_VHID_REPORT_ID_CONSUMER 3u
+#define LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE 4u
 /** @} */
 
 /** @name SYSTEM-only METHOD_BUFFERED control codes
@@ -122,6 +124,16 @@ extern "C" {
     int16_t horizontal_wheel;  ///< Relative Consumer AC Pan HID detents.
   } LUMEN_VHID_RELATIVE_MOUSE_REPORT;
 
+  /** Complete five-button absolute mouse input report, including its report ID. */
+  typedef struct LUMEN_VHID_ABSOLUTE_MOUSE_REPORT {
+    uint8_t report_id;  ///< LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE.
+    uint8_t buttons;  ///< Complete buttons 1-5 snapshot; high bits must be zero.
+    uint16_t x;  ///< Absolute horizontal coordinate normalized to 0-65535.
+    uint16_t y;  ///< Absolute vertical coordinate normalized to 0-65535.
+    int16_t vertical_wheel;  ///< Relative vertical HID wheel detents.
+    int16_t horizontal_wheel;  ///< Relative Consumer AC Pan HID detents.
+  } LUMEN_VHID_ABSOLUTE_MOUSE_REPORT;
+
   /** Complete Consumer Control input report, including its report ID. */
   typedef struct LUMEN_VHID_CONSUMER_REPORT {
     uint8_t report_id;  ///< LUMEN_VHID_REPORT_ID_CONSUMER.
@@ -136,6 +148,7 @@ extern "C" {
       LUMEN_VHID_KEYBOARD_REPORT keyboard;  ///< NKRO keyboard state.
       LUMEN_VHID_RELATIVE_MOUSE_REPORT relative_mouse;  ///< Relative pointer state and deltas.
       LUMEN_VHID_CONSUMER_REPORT consumer;  ///< Consumer Control usage array.
+      LUMEN_VHID_ABSOLUTE_MOUSE_REPORT absolute_mouse;  ///< Absolute pointer state, coordinates, and wheels.
     } report;  ///< Complete report selected by report_kind.
   } LUMEN_VHID_SUBMIT_REPORT_REQUEST;
 
@@ -148,6 +161,8 @@ extern "C" {
   LUMEN_VHID_STATIC_ASSERT(offsetof(LUMEN_VHID_GET_INFO_RESPONSE, ready) == 4, ready_offset);
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_KEYBOARD_REPORT) == 30, keyboard_report_size);
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_RELATIVE_MOUSE_REPORT) == 10, relative_mouse_report_size);
+  LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_ABSOLUTE_MOUSE_REPORT) == 10, absolute_mouse_report_size);
+  LUMEN_VHID_STATIC_ASSERT(offsetof(LUMEN_VHID_ABSOLUTE_MOUSE_REPORT, x) == 2, absolute_mouse_x_offset);
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_CONSUMER_REPORT) == 9, consumer_report_size);
   LUMEN_VHID_STATIC_ASSERT(offsetof(LUMEN_VHID_SUBMIT_REPORT_REQUEST, report) == 4, submit_report_offset);
   LUMEN_VHID_STATIC_ASSERT(sizeof(LUMEN_VHID_SUBMIT_REPORT_REQUEST) == 34, submit_report_request_size);
