@@ -62,27 +62,34 @@ function Assert-ServiceRunning {
     throw 'LumenService is running but did not launch Lumen.exe.'
 }
 
+function Install-ViGEmBus {
+    $installer = 'C:\Program Files\Lumen\third-party\vigembus_installer.exe'
+    if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+        throw "Bundled ViGEmBus installer is missing: $installer"
+    }
+    $process = Start-Process `
+        -FilePath $installer `
+        -ArgumentList @('/install', '/quiet', '/norestart') `
+        -PassThru
+    if (-not $process.WaitForExit(2 * 60 * 1000)) {
+        & taskkill.exe /PID $process.Id /T /F | Out-Null
+        $process.WaitForExit()
+        throw 'ViGEmBus installation timed out after 2 minutes.'
+    }
+    if ($process.ExitCode -eq 3010) {
+        throw 'ViGEmBus installation requires a reboot; XInput validation cannot continue.'
+    }
+    if ($process.ExitCode -ne 0) {
+        throw "ViGEmBus installation failed with exit code $($process.ExitCode)."
+    }
+    Restart-Service -Name LumenService -Force
+    Assert-ServiceRunning
+}
+
 function Assert-VirtualHidHealthy {
     param([string]$FailureLog)
 
     $helper = 'C:\Program Files\Lumen\tools\lumen-vhidctl.exe'
-    $vigemInstaller = 'C:\Program Files\Lumen\third-party\vigembus_installer.exe'
-    if (-not (Test-Path -LiteralPath $vigemInstaller -PathType Leaf)) {
-        throw "Bundled ViGEmBus installer is missing: $vigemInstaller"
-    }
-    $vigemInstall = Start-Process `
-        -FilePath $vigemInstaller `
-        -ArgumentList @('/install', '/quiet', '/norestart') `
-        -Wait `
-        -PassThru
-    if ($vigemInstall.ExitCode -eq 3010) {
-        throw 'ViGEmBus installation requires a reboot; XInput validation cannot continue.'
-    }
-    if ($vigemInstall.ExitCode -ne 0) {
-        throw "ViGEmBus installation failed with exit code $($vigemInstall.ExitCode)."
-    }
-    Restart-Service -Name LumenService -Force
-    Assert-ServiceRunning
     $statusOutput = @(& $helper status --json)
     $statusExitCode = $LASTEXITCODE
     $statusText = ($statusOutput -join [Environment]::NewLine).Trim()
@@ -235,6 +242,7 @@ Set-Content -LiteralPath '$escapedVigemExit' -Value `$vigemExitCode -NoNewline
             throw "ViGEm/XInput smoke contract mismatch: $vigemText"
         }
     } finally {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         Remove-Item $probeScript, $probeExit, $smokeExit, $vigemExit -Force -ErrorAction SilentlyContinue
     }
@@ -330,6 +338,7 @@ switch ($Scenario) {
             -Arguments @('/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=1') `
             -LogName 'lumen-msi-install-vhid.log' `
             -FailureMessage 'MSI install with Virtual HID failed.')
+        Install-ViGEmBus
         Assert-VirtualHidHealthy -FailureLog 'lumen-msi-install-vhid.log'
         [void](Invoke-Msi `
             -Arguments @('/x', $productCode, '/qn', '/norestart') `
