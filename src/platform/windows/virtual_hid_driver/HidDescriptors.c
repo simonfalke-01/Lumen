@@ -128,15 +128,7 @@ const BYTE LumenVhidReportDescriptor[] = {
   0x01, /*     Report Count (1) */
   0x81,
   0x06, /*     Input (Data, Variable, Relative) */
-  0xc0, /*   End Collection (Relative Pointer Physical) */
-
-  /* Absolute pointer report in the same Mouse top-level collection. */
-  0x05,
-  0x01, /*   Usage Page (Generic Desktop) */
-  0x09,
-  0x01, /*   Usage (Pointer) */
-  0xa1,
-  0x00, /*   Collection (Physical) */
+  /* Absolute pointer report in the same Mouse and Pointer collections. */
   0x85,
   LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE, /*     Report ID (4) */
   0x05,
@@ -211,7 +203,7 @@ const BYTE LumenVhidReportDescriptor[] = {
   0x01, /*     Report Count (1) */
   0x81,
   0x06, /*     Input (Data, Variable, Relative) */
-  0xc0, /*   End Collection (Absolute Pointer Physical) */
+  0xc0, /*   End Collection (Pointer Physical) */
   0xc0, /* End Collection (Application) */
 
   /* Consumer Control top-level collection. */
