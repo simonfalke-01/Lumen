@@ -1693,8 +1693,18 @@ namespace {
         }
         return false;
       }
-      if (response.report_size == output_report.size() &&
-          std::equal(output_report.begin(), output_report.end(), response.report)) {
+      const bool exact_pid_gain = response.report_size >= 2u &&
+                                  response.report_size <= output_report.size() &&
+                                  response.report[0] == output_report[0] &&
+                                  response.report[1] == output_report[1] &&
+                                  std::all_of(
+                                    response.report + 2,
+                                    response.report + response.report_size,
+                                    [](std::uint8_t value) {
+                                      return value == 0;
+                                    }
+                                  );
+      if (exact_pid_gain) {
         return true;
       }
     }
