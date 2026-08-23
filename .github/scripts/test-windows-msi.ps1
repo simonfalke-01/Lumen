@@ -69,7 +69,7 @@ function Install-ViGEmBus {
     }
     $process = Start-Process `
         -FilePath $installer `
-        -ArgumentList @('/install', '/quiet', '/norestart') `
+        -ArgumentList @('/exenoui', '/qn', 'REBOOT=ReallySuppress') `
         -PassThru
     if (-not $process.WaitForExit(2 * 60 * 1000)) {
         & taskkill.exe /PID $process.Id /T /F | Out-Null
