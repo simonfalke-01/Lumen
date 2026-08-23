@@ -1629,11 +1629,15 @@ namespace {
     std::array<std::uint8_t, 22> output_report {};
     output_report[0] = 0x1du;  // Generic PID Device Gain.
     output_report[1] = 0x7fu;
-    const bool write_ok = HidD_SetOutputReport(
+    DWORD output_bytes = 0;
+    const bool write_ok = WriteFile(
                             hid,
                             output_report.data(),
-                            static_cast<ULONG>(output_report.size())
-                          ) != FALSE;
+                            static_cast<DWORD>(output_report.size()),
+                            &output_bytes,
+                            nullptr
+                          ) != FALSE &&
+                          output_bytes == output_report.size();
     error = write_ok ? ERROR_SUCCESS : GetLastError();
     CloseHandle(hid);
     if (!write_ok) {
