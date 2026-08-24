@@ -1,0 +1,12 @@
+{
+  "abi": 2,
+  "architecture": "x64",
+  "toolset": "v143",
+  "msquic_version": "2.6.0",
+  "header_sha256": "efbfbea09628819908d48de90e24aeca0adcad75b540d69f80d586e9654692e3",
+  "source_sha256": "6d8d8bbb6e44f04bdc781ab08470c32b4a8f8802dfee3dd7307b245b1e0439d9",
+  "project_sha256": "0032cc4545fbf146bc5c0f2899e042a1a54387b6dd4d4a9c31edb425c4b3d40b",
+  "msquic_header_sha256": "ebd3499686c2b3008ed0ee5b06dae1a62a50192816abfe9a67bbbba97cabb861",
+  "msquic_library_sha256": "aa08808c1ca29166ea476a66410b73c7d0d85a34459ea59a30de63cca7ad7327",
+  "msquic_runtime_sha256": "c981e61cd207f42d46b54ef7dbf1049f1f836424c3ba981f4469ac2b2bea9610"
+}
