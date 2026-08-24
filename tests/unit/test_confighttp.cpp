@@ -11,6 +11,8 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -19,6 +21,9 @@
 #include <thread>
 
 // lib imports
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl.hpp>
 #include <Simple-Web-Server/client_https.hpp>
 #include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_https.hpp>
@@ -29,6 +34,8 @@
 #include <src/crypto.h>
 #include <src/httpcommon.h>
 #include <src/network.h>
+#include <src/nvhttp.h>
+#include <src/rtsp.h>
 #include <src/utility.h>
 
 using namespace std::literals;
@@ -99,12 +106,18 @@ protected:
   std::string saved_username;
   std::string saved_password;
   std::string saved_salt;
+  std::string saved_credentials_file;
+  std::string saved_nvhttp_file_state;
   std::string saved_locale;
   std::vector<std::string> saved_csrf_allowed_origins;
   std::filesystem::path test_web_dir;
   std::filesystem::path cert_file;
   std::filesystem::path key_file;
   std::filesystem::path web_dir_test_file;
+  std::atomic<int> prehandler_invocations {0};
+  long request_timeout_seconds = confighttp::REQUEST_HEADER_TIMEOUT_SECONDS;
+  std::size_t maximum_active_connections = confighttp::MAX_ACTIVE_CONNECTIONS;
+  std::size_t maximum_active_connections_per_source = confighttp::MAX_ACTIVE_CONNECTIONS_PER_SOURCE;
 
   void SetUp() override {
     BaseTest::SetUp();
@@ -112,13 +125,18 @@ protected:
     saved_username = config::sunshine.username;
     saved_password = config::sunshine.password;
     saved_salt = config::sunshine.salt;
+    saved_credentials_file = config::sunshine.credentials_file;
+    saved_nvhttp_file_state = config::nvhttp.file_state;
     saved_locale = config::sunshine.locale;
     saved_csrf_allowed_origins = config::sunshine.csrf_allowed_origins;
 
     // Set up test credentials
     config::sunshine.username = "testuser";
     config::sunshine.salt = "testsalt";
-    config::sunshine.password = util::hex(crypto::hash("testpass" + config::sunshine.salt)).to_string();
+    static const auto test_password_hash = http::hash_user_password("testpass", "testsalt");
+    ASSERT_TRUE(test_password_hash);
+    config::sunshine.password = *test_password_hash;
+    confighttp::reset_login_throttle_for_tests();
 
     // Set test locale
     config::sunshine.locale = "en";
@@ -131,9 +149,15 @@ protected:
       "https://[::1]"
     };
 
+    nvhttp::pairing_sessions_for_tests().cancel_all();
+    nvhttp::pairing_sessions_for_tests().open();
+
     // Create test web directory in temp
     test_web_dir = std::filesystem::temp_directory_path() / "sunshine_test_confighttp";  // NOSONAR(cpp:S5443): safe for tests
     std::filesystem::create_directories(test_web_dir / "web");
+    config::sunshine.credentials_file = (test_web_dir / "credentials.json").string();
+    config::nvhttp.file_state = (test_web_dir / "state.json").string();
+    nvhttp::reset_paired_clients_for_tests();
 
     // Create test HTML file in WEB_DIR, creating parent directories with proper permissions
     std::filesystem::path web_dir_path(WEB_DIR);
@@ -160,8 +184,12 @@ protected:
     server = std::make_unique<SimpleWeb::Server<SimpleWeb::HTTPS>>(cert_file.string(), key_file.string());
     server->config.port = 0;  // OS assigns port
     server->config.reuse_address = true;
-    server->config.timeout_request = 5;
-    server->config.timeout_content = 300;
+    server->config.timeout_request = request_timeout_seconds;
+    server->config.timeout_content = confighttp::REQUEST_BODY_TIMEOUT_SECONDS;
+    server->config.max_request_streambuf_size = confighttp::MAX_REQUEST_BODY_SIZE;
+    server->config.reject_transfer_encoding = true;
+    server->config.max_active_connections = maximum_active_connections;
+    server->config.max_active_connections_per_source = maximum_active_connections_per_source;
 
     // Add a route to test authentication directly
     server->resource["^/auth-test$"]["GET"] = [](
@@ -309,6 +337,24 @@ protected:
       confighttp::browseDirectory(response, request);
     };
 
+    server->resource["^/pairing-requests-test$"]["GET"] = confighttp::getPendingPairingRequests;
+    server->resource["^/pairing-pin-test$"]["POST"] = confighttp::savePin;
+    server->resource["^/pairing-cancel-test$"]["POST"] = confighttp::cancelPendingPairingRequest;
+    server->resource["^/unpair-test$"]["POST"] = confighttp::unpair;
+    server->resource["^/password-test$"]["POST"] = [](
+                                                       const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> &response,
+                                                       const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> &request
+                                                     ) {
+      confighttp::savePassword(response, request);
+    };
+    server->resource["^/prehandler-test$"]["POST"] = [this](
+                                                         const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> &response,
+                                                         [[maybe_unused]] const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> &request
+                                                       ) {
+      ++prehandler_invocations;
+      response->write("handler-called");
+    };
+
     // Start server
     server_thread = std::jthread([this]() {
       server->start([this](const unsigned short assigned_port) {
@@ -344,8 +390,14 @@ protected:
     config::sunshine.username = saved_username;
     config::sunshine.password = saved_password;
     config::sunshine.salt = saved_salt;
+    config::sunshine.credentials_file = saved_credentials_file;
+    config::nvhttp.file_state = saved_nvhttp_file_state;
     config::sunshine.locale = saved_locale;
     config::sunshine.csrf_allowed_origins = saved_csrf_allowed_origins;
+    confighttp::reset_login_throttle_for_tests();
+    nvhttp::pairing_sessions_for_tests().cancel_all();
+    nvhttp::pairing_sessions_for_tests().open();
+    nvhttp::reset_paired_clients_for_tests();
 
     // Clean up test HTML file from WEB_DIR
     if (std::filesystem::exists(web_dir_test_file)) {
@@ -360,6 +412,57 @@ protected:
 
   static std::string create_auth_header(const std::string &username, const std::string &password) {
     return "Basic " + SimpleWeb::Crypto::Base64::encode(username + ":" + password);
+  }
+
+  std::string send_raw_https_request(const std::string_view request_text) const {
+    boost::asio::io_context io_context;
+    boost::asio::ssl::context tls_context {boost::asio::ssl::context::tls_client};
+    tls_context.set_verify_mode(boost::asio::ssl::verify_none);
+    boost::asio::ssl::stream<boost::asio::ip::tcp::socket> stream {io_context, tls_context};
+    boost::asio::ip::tcp::resolver resolver {io_context};
+    boost::asio::connect(stream.next_layer(), resolver.resolve("localhost", std::to_string(port)));
+    stream.handshake(boost::asio::ssl::stream_base::client);
+    boost::asio::write(stream, boost::asio::buffer(request_text));
+
+    std::string response_text;
+    std::array<char, 4096> buffer {};
+    boost::system::error_code error;
+    while (response_text.find("\r\n\r\n") == std::string::npos) {
+      const auto bytes_read = stream.read_some(boost::asio::buffer(buffer), error);
+      if (bytes_read > 0) {
+        response_text.append(buffer.data(), bytes_read);
+      }
+      if (error) {
+        break;
+      }
+    }
+    if (error && error != boost::asio::error::eof && error != boost::asio::ssl::error::stream_truncated) {
+      throw boost::system::system_error(error);
+    }
+    return response_text;
+  }
+
+  boost::system::error_code attempt_tls_handshake() const {
+    boost::asio::io_context io_context;
+    boost::asio::ssl::context tls_context {boost::asio::ssl::context::tls_client};
+    tls_context.set_verify_mode(boost::asio::ssl::verify_none);
+    boost::asio::ssl::stream<boost::asio::ip::tcp::socket> stream {io_context, tls_context};
+    boost::asio::ip::tcp::resolver resolver {io_context};
+    boost::system::error_code error;
+    const auto endpoints = resolver.resolve("localhost", std::to_string(port), error);
+    if (error) {
+      return error;
+    }
+    boost::asio::connect(stream.next_layer(), endpoints, error);
+    if (error) {
+      return error;
+    }
+    stream.handshake(boost::asio::ssl::stream_base::client, error);
+    if (!error) {
+      boost::system::error_code ignored;
+      stream.next_layer().close(ignored);
+    }
+    return error;
   }
 
   static void assert_security_headers(const std::shared_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>::Response> &response) {
@@ -384,6 +487,65 @@ protected:
     ASSERT_TRUE(body.find(expected_status_code) != std::string::npos);
   }
 };
+
+class ConnectionAdmissionTest: public ConfigHttpTest {
+protected:
+  void SetUp() override {
+    request_timeout_seconds = 1;
+    maximum_active_connections = 1;
+    maximum_active_connections_per_source = 1;
+    ConfigHttpTest::SetUp();
+  }
+};
+
+TEST_F(ConnectionAdmissionTest, CapsNormalizeReleaseAndExpireConnections) {
+  const auto ipv4 = boost::asio::ip::make_address("192.0.2.10");
+  const auto mapped_ipv4 = boost::asio::ip::make_address("::ffff:192.0.2.10");
+  const auto ipv6_a = boost::asio::ip::make_address("2001:db8:1234:5678::1");
+  const auto ipv6_b = boost::asio::ip::make_address("2001:db8:1234:5678::ffff");
+  EXPECT_EQ(confighttp::https_server_t::connection_source_key(ipv4), confighttp::https_server_t::connection_source_key(mapped_ipv4));
+  EXPECT_EQ(confighttp::https_server_t::connection_source_key(ipv6_a), confighttp::https_server_t::connection_source_key(ipv6_b));
+
+  boost::asio::io_context idle_io_context;
+  boost::asio::ip::tcp::resolver idle_resolver {idle_io_context};
+  boost::asio::ip::tcp::socket idle_socket {idle_io_context};
+  boost::asio::connect(idle_socket, idle_resolver.resolve("localhost", std::to_string(port)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const auto rejection = attempt_tls_handshake();
+  EXPECT_TRUE(rejection);
+
+  boost::system::error_code ignored;
+  idle_socket.close(ignored);
+  bool released = false;
+  for (int attempt = 0; attempt < 50 && !released; ++attempt) {
+    released = !attempt_tls_handshake();
+    if (!released) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+  ASSERT_TRUE(released);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  boost::asio::io_context expiring_io_context;
+  boost::asio::ip::tcp::resolver expiring_resolver {expiring_io_context};
+  boost::asio::ip::tcp::socket expiring_socket {expiring_io_context};
+  boost::asio::connect(expiring_socket, expiring_resolver.resolve("localhost", std::to_string(port)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const auto expiry_rejection = attempt_tls_handshake();
+  EXPECT_EQ(expiry_rejection, rejection);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  bool expired = false;
+  for (int attempt = 0; attempt < 50 && !expired; ++attempt) {
+    expired = !attempt_tls_handshake();
+    if (!expired) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+  EXPECT_TRUE(expired);
+  expiring_socket.close(ignored);
+}
 
 // Test: confighttp::authenticate() rejects requests without auth header
 TEST_F(ConfigHttpTest, AuthenticateRejectsNoAuth) {
@@ -423,6 +585,156 @@ TEST_F(ConfigHttpTest, AuthenticateCaseInsensitiveUsername) {
 
   const auto response = client->request("GET", "/auth-test", "", headers);
   ASSERT_EQ(response->status_code, "200 OK");
+}
+
+TEST(LoginThrottleTest, NormalizesSourcesAndExpiresBudgets) {
+  using clock_t = confighttp::login_throttle_t::clock_t;
+  confighttp::login_throttle_t throttle {16, 2, std::chrono::seconds(10)};
+  const auto start = clock_t::time_point {};
+  const auto ipv4 = boost::asio::ip::make_address("192.0.2.10");
+  const auto mapped_ipv4 = boost::asio::ip::make_address("::ffff:192.0.2.10");
+  const auto ipv6_a = boost::asio::ip::make_address("2001:db8:1234:5678::1");
+  const auto ipv6_b = boost::asio::ip::make_address("2001:db8:1234:5678::ffff");
+
+  EXPECT_EQ(confighttp::login_throttle_t::source_key(ipv4), confighttp::login_throttle_t::source_key(mapped_ipv4));
+  EXPECT_EQ(confighttp::login_throttle_t::source_key(ipv6_a), confighttp::login_throttle_t::source_key(ipv6_b));
+
+  throttle.record_failure(mapped_ipv4, start);
+  throttle.record_failure(ipv4, start);
+  EXPECT_TRUE(throttle.is_blocked(ipv4, start));
+  EXPECT_FALSE(throttle.is_blocked(ipv4, start + std::chrono::seconds(11)));
+}
+
+TEST(ConfigHttpLoggingTest, SensitiveRequestFieldsAreRedactedCaseInsensitively) {
+  constexpr std::array sensitive_fields {
+    std::pair {"aUtHoRiZaTiOn"sv, "Basic dXNlcjpwYXNzd29yZA=="sv},
+    std::pair {"PROXY-authorization"sv, "Basic cHJveHk6c2VjcmV0"sv},
+    std::pair {"cOoKiE"sv, "session=secret-cookie"sv},
+    std::pair {"x-CsRf-ToKeN"sv, "header-csrf-secret"sv},
+    std::pair {"CsRf_ToKeN"sv, "query-csrf-secret"sv},
+  };
+  for (const auto &[name, secret] : sensitive_fields) {
+    EXPECT_EQ(confighttp::request_log_value(name, secret), "[redacted]"sv);
+    EXPECT_NE(confighttp::request_log_value(name, secret), secret);
+  }
+  EXPECT_EQ(confighttp::request_log_value("Content-Type", "application/json"), "application/json"sv);
+}
+
+TEST_F(ConfigHttpTest, ThrottledAndInvalidAuthenticationResponsesMatch) {
+  SimpleWeb::CaseInsensitiveMultimap invalid_headers;
+  invalid_headers.emplace("Authorization", create_auth_header("testuser", "wrongpass"));
+  const auto invalid_response = client->request("GET", "/auth-test", "", invalid_headers);
+  const auto invalid_body = invalid_response->content.string();
+  ASSERT_EQ(invalid_response->status_code, "401 Unauthorized");
+
+  for (int attempt = 1; attempt < 5; ++attempt) {
+    const auto response = client->request("GET", "/auth-test", "", invalid_headers);
+    ASSERT_EQ(response->status_code, "401 Unauthorized");
+  }
+
+  SimpleWeb::CaseInsensitiveMultimap valid_headers;
+  valid_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto throttled_response = client->request("GET", "/auth-test", "", valid_headers);
+  EXPECT_EQ(throttled_response->status_code, invalid_response->status_code);
+  EXPECT_EQ(throttled_response->content.string(), invalid_body);
+  EXPECT_EQ(throttled_response->header.find("WWW-Authenticate")->second, invalid_response->header.find("WWW-Authenticate")->second);
+}
+
+TEST_F(ConfigHttpTest, SuccessfulLegacyAuthenticationMigratesStoredHash) {
+  config::sunshine.salt = "legacy-salt";
+  config::sunshine.password = util::hex(crypto::hash("testpass" + config::sunshine.salt)).to_string();
+  nlohmann::json legacy_credentials {
+    {"username", config::sunshine.username},
+    {"password", config::sunshine.password},
+    {"salt", config::sunshine.salt}
+  };
+  std::ofstream(config::sunshine.credentials_file) << legacy_credentials.dump();
+
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto response = client->request("GET", "/auth-test", "", headers);
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_TRUE(config::sunshine.password.starts_with("$scrypt$v1$"));
+  EXPECT_EQ(
+    http::verify_user_password("testpass", config::sunshine.password, config::sunshine.salt),
+    http::password_verification_e::CURRENT
+  );
+  std::ifstream migrated_file(config::sunshine.credentials_file);
+  const auto migrated_credentials = nlohmann::json::parse(migrated_file);
+  EXPECT_TRUE(migrated_credentials["password"].get<std::string>().starts_with("$scrypt$v1$"));
+}
+
+TEST_F(ConfigHttpTest, BootstrapRejectsRemoteSourcesAndAllowsLocalCreation) {
+  EXPECT_FALSE(confighttp::bootstrap_allowed(boost::asio::ip::make_address("192.0.2.50")));
+  EXPECT_FALSE(confighttp::bootstrap_allowed(boost::asio::ip::make_address("2001:db8::50")));
+  EXPECT_TRUE(confighttp::bootstrap_allowed(boost::asio::ip::make_address("127.0.0.1")));
+  EXPECT_TRUE(confighttp::bootstrap_allowed(boost::asio::ip::make_address("::1")));
+
+  config::sunshine.username.clear();
+  config::sunshine.password.clear();
+  config::sunshine.salt.clear();
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Content-Type", "application/json");
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  const auto response = client->request(
+    "POST",
+    "/password-test",
+    R"({"newUsername":"local-admin","newPassword":"local-password","confirmNewPassword":"local-password"})",
+    headers
+  );
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
+  EXPECT_EQ(config::sunshine.username, "local-admin");
+  EXPECT_TRUE(config::sunshine.password.starts_with("$scrypt$v1$"));
+}
+
+TEST_F(ConfigHttpTest, CredentialPersistenceFailuresLeaveActiveCredentialsUnchanged) {
+  const auto malformed_state = test_web_dir / "malformed-state.json";
+  std::ofstream(malformed_state) << "{";
+  const std::array failing_paths {
+    test_web_dir / "missing-parent" / "state.json",
+    malformed_state,
+  };
+  const auto original_username = config::sunshine.username;
+  const auto original_password = config::sunshine.password;
+  const auto original_salt = config::sunshine.salt;
+
+  for (const auto &failing_path : failing_paths) {
+    config::sunshine.credentials_file = failing_path.string();
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("Origin", std::format("https://localhost:{}", port));
+    const auto response = client->request(
+      "POST",
+      "/password-test",
+      R"({"currentUsername":"testuser","currentPassword":"testpass","newUsername":"new-admin","newPassword":"new-password","confirmNewPassword":"new-password"})",
+      headers
+    );
+
+    EXPECT_EQ(response->status_code, "400 Bad Request");
+    EXPECT_NE(response->content.string().find("Failed to save credentials"), std::string::npos);
+    EXPECT_EQ(config::sunshine.username, original_username);
+    EXPECT_EQ(config::sunshine.password, original_password);
+    EXPECT_EQ(config::sunshine.salt, original_salt);
+  }
+}
+
+TEST_F(ConfigHttpTest, RequestLimitsRejectBodiesBeforeHandler) {
+  const auto oversized_response = send_raw_https_request(std::format(
+    "POST /prehandler-test HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    confighttp::MAX_REQUEST_BODY_SIZE + 1
+  ));
+  EXPECT_NE(oversized_response.find("413 Payload Too Large"), std::string::npos) << oversized_response;
+
+  const auto chunked_response = send_raw_https_request(
+    "POST /prehandler-test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n"
+  );
+  EXPECT_NE(chunked_response.find("400 Bad Request"), std::string::npos) << chunked_response;
+
+  EXPECT_EQ(prehandler_invocations.load(), 0);
 }
 
 // Test: confighttp::send_unauthorized() sends proper 401 response
@@ -739,6 +1051,142 @@ TEST_F(ConfigHttpTest, GetLocaleReturnsJson) {
   ASSERT_TRUE(body.find("\"locale\":\"en\"") != std::string::npos || body.find("\"locale\": \"en\"") != std::string::npos);
 }
 
+TEST_F(ConfigHttpTest, PairingRequestsEndpointReturnsDisambiguators) {
+  nvhttp::pair_session_t session;
+  session.client.uniqueID = "pairing-client";
+  session.client.cert = TEST_PUBLIC_CERT;
+  session.async_insert_pin.response = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> {};
+  const auto created = nvhttp::pairing_session_manager_t::clock_t::now() - std::chrono::seconds {5};
+  ASSERT_TRUE(nvhttp::pairing_sessions_for_tests().add(std::move(session), "192.0.2.25", "00112233445566778899AABBCCDDEEFF", created));
+
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto response = client->request("GET", "/pairing-requests-test", "", headers);
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  const auto cache_control = response->header.find("Cache-Control");
+  ASSERT_NE(cache_control, response->header.end());
+  EXPECT_EQ(cache_control->second, "no-store");
+  const auto body = nlohmann::json::parse(response->content.string());
+  ASSERT_TRUE(body.contains("requests"));
+  ASSERT_EQ(body["requests"].size(), 1U);
+  const auto &request = body["requests"][0];
+  EXPECT_EQ(request["requestId"], "00112233445566778899AABBCCDDEEFF");
+  EXPECT_EQ(request["source"], "192.0.2.25");
+  EXPECT_GE(request["ageSeconds"].get<std::uint64_t>(), 5U);
+  EXPECT_EQ(request["clientFingerprint"].get<std::string>().size(), 12U);
+}
+
+TEST_F(ConfigHttpTest, PairingCancelEndpointUsesExplicitRequestId) {
+  nvhttp::pair_session_t session;
+  session.client.uniqueID = "pairing-client";
+  session.async_insert_pin.response = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> {};
+  ASSERT_TRUE(nvhttp::pairing_sessions_for_tests().add(std::move(session), "192.0.2.25", "00112233445566778899AABBCCDDEEFF"));
+
+  SimpleWeb::CaseInsensitiveMultimap auth_headers;
+  auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto token_response = client->request("GET", "/csrf-token-test", "", auth_headers);
+  const auto token = nlohmann::json::parse(token_response->content.string())["csrf_token"].get<std::string>();
+
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers;
+  headers.emplace("Content-Type", "application/json");
+  headers.emplace("X-CSRF-Token", token);
+  const auto response = client->request(
+    "POST",
+    "/pairing-cancel-test",
+    R"({"requestId":"00112233445566778899AABBCCDDEEFF"})",
+    headers
+  );
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  const auto body = nlohmann::json::parse(response->content.string());
+  EXPECT_TRUE(body["status"].get<bool>());
+  EXPECT_EQ(nvhttp::pairing_sessions_for_tests().size(), 0U);
+}
+
+TEST_F(ConfigHttpTest, PairingPinEndpointTargetsSelectedRequest) {
+  nvhttp::pair_session_t first;
+  first.client.uniqueID = "first-client";
+  first.async_insert_pin.response = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> {};
+  ASSERT_TRUE(nvhttp::pairing_sessions_for_tests().add(std::move(first), "192.0.2.91", "11111111111111111111111111111111"));
+
+  nvhttp::pair_session_t second;
+  second.client.uniqueID = "second-client";
+  second.async_insert_pin.response = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> {};
+  ASSERT_TRUE(nvhttp::pairing_sessions_for_tests().add(std::move(second), "192.0.2.92", "22222222222222222222222222222222"));
+
+  SimpleWeb::CaseInsensitiveMultimap auth_headers;
+  auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto token_response = client->request("GET", "/csrf-token-test", "", auth_headers);
+  const auto token = nlohmann::json::parse(token_response->content.string())["csrf_token"].get<std::string>();
+
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers;
+  headers.emplace("Content-Type", "application/json");
+  headers.emplace("X-CSRF-Token", token);
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const auto response = client->request(
+      "POST",
+      "/pairing-pin-test",
+      R"({"pin":"x","name":"Selected client","requestId":"11111111111111111111111111111111"})",
+      headers
+    );
+    ASSERT_EQ(response->status_code, "200 OK");
+    EXPECT_FALSE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
+  }
+
+  EXPECT_FALSE(nvhttp::pairing_sessions_for_tests().find_pending_by_request_id("11111111111111111111111111111111"));
+  EXPECT_TRUE(nvhttp::pairing_sessions_for_tests().find_pending_by_request_id("22222222222222222222222222222222"));
+}
+
+TEST_F(ConfigHttpTest, PairingPinEndpointRejectsOversizedBodyBeforeParsing) {
+  SimpleWeb::CaseInsensitiveMultimap auth_headers;
+  auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto token_response = client->request("GET", "/csrf-token-test", "", auth_headers);
+  const auto token = nlohmann::json::parse(token_response->content.string())["csrf_token"].get<std::string>();
+
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers;
+  headers.emplace("Content-Type", "application/json");
+  headers.emplace("X-CSRF-Token", token);
+  const auto response = client->request("POST", "/pairing-pin-test", std::string(1025, 'A'), headers);
+
+  ASSERT_EQ(response->status_code, "400 Bad Request");
+  EXPECT_NE(response->content.string().find("PIN request body is too large"), std::string::npos);
+}
+
+TEST_F(ConfigHttpTest, UnpairTerminatesOnlyRevokedClientsSession) {
+  constexpr auto revoked_certificate = "revoked-client-certificate"sv;
+  constexpr auto retained_certificate = "retained-client-certificate"sv;
+  nvhttp::upsert_paired_client_for_tests("Revoked client", "revoked-uuid", std::string(revoked_certificate), true);
+  nvhttp::upsert_paired_client_for_tests("Retained client", "retained-uuid", std::string(retained_certificate), true);
+
+  auto revoked_session = std::make_shared<rtsp_stream::launch_session_t>();
+  revoked_session->id = 0xA11;
+  revoked_session->client_cert = revoked_certificate;
+  rtsp_stream::launch_session_raise(revoked_session);
+
+  SimpleWeb::CaseInsensitiveMultimap auth_headers;
+  auth_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto token_response = client->request("GET", "/csrf-token-test", "", auth_headers);
+  const auto token = nlohmann::json::parse(token_response->content.string())["csrf_token"].get<std::string>();
+  SimpleWeb::CaseInsensitiveMultimap headers = auth_headers;
+  headers.emplace("Content-Type", "application/json");
+  headers.emplace("X-CSRF-Token", token);
+  const auto response = client->request("POST", "/unpair-test", R"({"uuid":"revoked-uuid"})", headers);
+
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
+  EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert(revoked_certificate), 0U);
+  EXPECT_FALSE(nvhttp::paired_client_enabled_for_tests(revoked_certificate));
+  EXPECT_TRUE(nvhttp::paired_client_enabled_for_tests(retained_certificate));
+
+  auto retained_session = std::make_shared<rtsp_stream::launch_session_t>();
+  retained_session->id = 0xB22;
+  retained_session->client_cert = retained_certificate;
+  rtsp_stream::launch_session_raise(retained_session);
+  EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert(revoked_certificate), 0U);
+  EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert(retained_certificate), 1U);
+}
+
 /**
  * @brief Test fixture for confighttp::browseDirectory tests.
  *
@@ -940,7 +1388,7 @@ TEST_F(BrowseDirectoryTest, BrowseEntryFieldsArePresent) {
   }
 }
 
-// Test: entries are sorted – all directories appear before any file
+// Test: entries are sorted; all directories appear before any file.
 TEST_F(BrowseDirectoryTest, BrowseEntriesSortedDirsFirst) {
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
@@ -1160,7 +1608,7 @@ TEST_F(BrowseDirectoryTest, BrowseWindowsEmptyPathReturnsDriveList) {
   ASSERT_EQ(json["parent"].get<std::string>(), "");
   ASSERT_GT(json["entries"].size(), 0u);
 
-  // Every entry must look like "X:\" – a drive letter root
+  // Every entry must look like "X:\": a drive-letter root.
   for (const auto &entry : json["entries"]) {
     ASSERT_EQ(entry["type"].get<std::string>(), "directory");
     const std::string name = entry["name"].get<std::string>();

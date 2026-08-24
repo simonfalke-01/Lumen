@@ -5,7 +5,11 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <array>
 #include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
 #include <utility>
 
 // lib includes
@@ -15,8 +19,14 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
 #include <curl/curl.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <Simple-Web-Server/server_http.hpp>
 #include <Simple-Web-Server/server_https.hpp>
+
+#ifdef _WIN32
+  #include <Windows.h>
+#endif
 
 // local includes
 #include "config.h"
@@ -37,6 +47,87 @@ namespace http {
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
 
+  namespace {
+    constexpr std::uint64_t PASSWORD_SCRYPT_N = 32768;  ///< Scrypt CPU/memory cost parameter.
+    constexpr std::uint64_t PASSWORD_SCRYPT_R = 8;  ///< Scrypt block-size parameter.
+    constexpr std::uint64_t PASSWORD_SCRYPT_P = 1;  ///< Scrypt parallelization parameter.
+    constexpr std::uint64_t PASSWORD_SCRYPT_MAX_MEMORY = 64ULL * 1024ULL * 1024ULL;  ///< OpenSSL memory ceiling for one derivation.
+    constexpr std::size_t PASSWORD_HASH_SIZE = 32;  ///< Derived password hash size in bytes.
+    constexpr auto PASSWORD_HASH_PREFIX = "$scrypt$v1$32768$8$1$"sv;  ///< Self-identifying current password format.
+
+    std::mutex state_file_locks_mutex;  ///< Protects the resolved-path lock registry. NOSONAR(cpp:S5421) - process-wide transaction owner
+    std::map<std::string, std::weak_ptr<std::mutex>, std::less<>> state_file_locks;  ///< Shared state-file locks by resolved path. NOSONAR(cpp:S5421)
+
+    /**
+     * @brief Compare equal-length secret representations without early exit.
+     *
+     * @param left First representation.
+     * @param right Second representation.
+     * @return True only when both representations are byte-for-byte equal.
+     */
+    bool secure_equals(const std::string_view left, const std::string_view right) {
+      return left.size() == right.size() &&
+             (left.empty() || CRYPTO_memcmp(left.data(), right.data(), left.size()) == 0);
+    }
+
+    /**
+     * @brief Resolve a stable absolute key for a possibly nonexistent state file.
+     *
+     * @param file State file path.
+     * @return Normalized absolute path key.
+     */
+    std::string state_file_key(const std::string &file) {
+      std::error_code error;
+      auto path = fs::weakly_canonical(fs::path(file), error);
+      if (error) {
+        error.clear();
+        path = fs::absolute(fs::path(file), error);
+      }
+      return (error ? fs::path(file) : path).lexically_normal().string();
+    }
+
+    /**
+     * @brief Acquire the shared mutex object for a state file path.
+     *
+     * @param file State file path.
+     * @return Mutex shared by all transactions for the resolved path.
+     */
+    std::shared_ptr<std::mutex> state_file_lock(const std::string &file) {
+      const auto key = state_file_key(file);
+      std::scoped_lock lock(state_file_locks_mutex);
+      if (const auto existing = state_file_locks.find(key); existing != state_file_locks.end()) {
+        if (auto shared = existing->second.lock()) {
+          return shared;
+        }
+      }
+
+      auto shared = std::make_shared<std::mutex>();
+      state_file_locks[key] = shared;
+      return shared;
+    }
+
+    /**
+     * @brief Replace a state file with a fully written sibling temporary file.
+     *
+     * @param temporary_path Completed temporary file.
+     * @param destination_path State file to replace.
+     * @return True when the replacement completed atomically.
+     */
+    bool replace_state_file(const fs::path &temporary_path, const fs::path &destination_path) {
+#ifdef _WIN32
+      return MoveFileExW(
+               temporary_path.c_str(),
+               destination_path.c_str(),
+               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+             ) != 0;
+#else
+      std::error_code error;
+      fs::rename(temporary_path, destination_path, error);
+      return !error;
+#endif
+    }
+  }  // namespace
+
   int reload_user_creds(const std::string &file);
   /**
    * @brief Check whether the Web UI credentials file exists and is readable.
@@ -48,6 +139,98 @@ namespace http {
 
   std::string unique_id;  ///< Unique ID.
   net::net_e origin_web_ui_allowed;  ///< Origin web ui allowed.
+
+  std::optional<std::string> hash_user_password(const std::string_view password, const std::string_view salt) {
+    std::array<std::uint8_t, PASSWORD_HASH_SIZE> derived {};
+    if (EVP_PBE_scrypt(
+          password.data(),
+          password.size(),
+          reinterpret_cast<const unsigned char *>(salt.data()),
+          salt.size(),
+          PASSWORD_SCRYPT_N,
+          PASSWORD_SCRYPT_R,
+          PASSWORD_SCRYPT_P,
+          PASSWORD_SCRYPT_MAX_MEMORY,
+          derived.data(),
+          derived.size()
+        ) != 1) {
+      return std::nullopt;
+    }
+
+    return std::string(PASSWORD_HASH_PREFIX) + util::hex(derived).to_string();
+  }
+
+  password_verification_e verify_user_password(const std::string_view password, const std::string_view stored_hash, const std::string_view salt) {
+    if (stored_hash.starts_with(PASSWORD_HASH_PREFIX)) {
+      const auto candidate = hash_user_password(password, salt);
+      return candidate && secure_equals(*candidate, stored_hash) ? password_verification_e::CURRENT : password_verification_e::INVALID;
+    }
+
+    const auto legacy_hash = util::hex(crypto::hash(std::string(password) + std::string(salt))).to_string();
+    return secure_equals(legacy_hash, stored_hash) ? password_verification_e::LEGACY : password_verification_e::INVALID;
+  }
+
+  bool read_state_file(const std::string &file, state_file_tree_t &tree) {
+    auto file_lock = state_file_lock(file);
+    std::scoped_lock lock(*file_lock);
+
+    state_file_tree_t candidate;
+    try {
+      pt::read_json(file, candidate);
+    } catch (const std::exception &exception) {
+      BOOST_LOG(error) << "Couldn't read shared state file "sv << file << ": "sv << exception.what();
+      return false;
+    }
+    tree = std::move(candidate);
+    return true;
+  }
+
+  bool update_state_file(const std::string &file, const state_file_mutator_t &mutator) {
+    auto file_lock = state_file_lock(file);
+    std::scoped_lock lock(*file_lock);
+
+    state_file_tree_t tree;
+    try {
+      if (fs::exists(file)) {
+        pt::read_json(file, tree);
+      }
+      mutator(tree);
+    } catch (const std::exception &exception) {
+      BOOST_LOG(error) << "Couldn't update shared state file "sv << file << ": "sv << exception.what();
+      return false;
+    }
+
+    const fs::path destination(file);
+    const fs::path temporary = destination.string() + ".tmp-" + crypto::rand_alphabet(16);
+    try {
+      std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+      if (!output) {
+        return false;
+      }
+      pt::write_json(output, tree);
+      output.flush();
+      if (!output) {
+        output.close();
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+        return false;
+      }
+      output.close();
+    } catch (const std::exception &exception) {
+      std::error_code ignored;
+      fs::remove(temporary, ignored);
+      BOOST_LOG(error) << "Couldn't stage shared state file "sv << file << ": "sv << exception.what();
+      return false;
+    }
+
+    if (!replace_state_file(temporary, destination)) {
+      std::error_code ignored;
+      fs::remove(temporary, ignored);
+      BOOST_LOG(error) << "Couldn't replace shared state file "sv << file;
+      return false;
+    }
+    return true;
+  }
 
   /**
    * @brief Load persisted HTTP credentials and initialize shared request state.
@@ -83,27 +266,31 @@ namespace http {
    * @param run_our_mouth Whether to log user-facing status messages.
    * @return 0 on success, non-zero on failure.
    */
-  int save_user_creds(const std::string &file, const std::string &username, const std::string &password, bool run_our_mouth) {
-    pt::ptree outputTree;
-
-    if (fs::exists(file)) {
-      try {
-        pt::read_json(file, outputTree);
-      } catch (std::exception &e) {
-        BOOST_LOG(error) << "Couldn't read user credentials: "sv << e.what();
-        return -1;
-      }
+  int save_user_creds(
+    const std::string &file,
+    const std::string &username,
+    const std::string &password,
+    bool run_our_mouth,
+    user_credentials_t *saved_credentials
+  ) {
+    const auto salt = crypto::rand_alphabet(16);
+    const auto password_hash = hash_user_password(password, salt);
+    if (!password_hash) {
+      BOOST_LOG(error) << "OpenSSL failed to derive the Web UI password hash"sv;
+      return -1;
     }
 
-    auto salt = crypto::rand_alphabet(16);
-    outputTree.put("username", username);
-    outputTree.put("salt", salt);
-    outputTree.put("password", util::hex(crypto::hash(password + salt)).to_string());
-    try {
-      pt::write_json(file, outputTree);
-    } catch (std::exception &e) {
-      BOOST_LOG(error) << "error writing to the credentials file, perhaps try this again as an administrator? Details: "sv << e.what();
+    if (!update_state_file(file, [&](state_file_tree_t &tree) {
+          tree.put("username", username);
+          tree.put("salt", salt);
+          tree.put("password", *password_hash);
+        })) {
+      BOOST_LOG(error) << "Error writing to the credentials file, perhaps try this again as an administrator"sv;
       return -1;
+    }
+
+    if (saved_credentials) {
+      *saved_credentials = user_credentials_t {username, *password_hash, salt};
     }
 
     BOOST_LOG(info) << "New credentials have been created"sv;
@@ -119,16 +306,10 @@ namespace http {
     }
 
     pt::ptree inputTree;
-    try {
-      pt::read_json(file, inputTree);
-      return inputTree.find("username") != inputTree.not_found() &&
-             inputTree.find("password") != inputTree.not_found() &&
-             inputTree.find("salt") != inputTree.not_found();
-    } catch (std::exception &e) {
-      BOOST_LOG(error) << "validating user credentials: "sv << e.what();
-    }
-
-    return false;
+    return read_state_file(file, inputTree) &&
+           inputTree.find("username") != inputTree.not_found() &&
+           inputTree.find("password") != inputTree.not_found() &&
+           inputTree.find("salt") != inputTree.not_found();
   }
 
   /**
@@ -136,11 +317,18 @@ namespace http {
    */
   int reload_user_creds(const std::string &file) {
     pt::ptree inputTree;
+    if (!read_state_file(file, inputTree)) {
+      return -1;
+    }
     try {
-      pt::read_json(file, inputTree);
-      config::sunshine.username = inputTree.get<std::string>("username");
-      config::sunshine.password = inputTree.get<std::string>("password");
-      config::sunshine.salt = inputTree.get<std::string>("salt");
+      user_credentials_t loaded {
+        inputTree.get<std::string>("username"),
+        inputTree.get<std::string>("password"),
+        inputTree.get<std::string>("salt")
+      };
+      config::sunshine.username = std::move(loaded.username);
+      config::sunshine.password = std::move(loaded.password);
+      config::sunshine.salt = std::move(loaded.salt);
     } catch (std::exception &e) {
       BOOST_LOG(error) << "loading user credentials: "sv << e.what();
       return -1;

@@ -8,6 +8,7 @@
 
 // standard includes
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -41,6 +42,7 @@
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
+#include "protocol_v3/runtime.h"
 #include "rtsp.h"
 #include "utility.h"
 #include "uuid.h"
@@ -102,6 +104,94 @@ namespace confighttp {
    */
   constexpr auto CSRF_TOKEN_LIFETIME = std::chrono::hours(1);  // Tokens valid for 1 hour
 
+  login_throttle_t login_throttle;  ///< Process-local Web UI failed-login budgets. NOSONAR(cpp:S5421) - intentionally mutable global
+
+  login_throttle_t::login_throttle_t(
+    const std::size_t maximum_sources,
+    const std::size_t maximum_failures,
+    const clock_t::duration failure_window
+  ):
+      maximum_sources_(maximum_sources),
+      maximum_failures_(maximum_failures),
+      failure_window_(failure_window) {
+  }
+
+  std::string login_throttle_t::source_key(boost::asio::ip::address address) {
+    address = net::normalize_address(address);
+    if (address.is_v4()) {
+      return "v4:"s + address.to_string();
+    }
+
+    auto bytes = address.to_v6().to_bytes();
+    std::fill(bytes.begin() + 8, bytes.end(), 0);
+    return "v6:"s + boost::asio::ip::address_v6(bytes).to_string() + "/64"s;
+  }
+
+  void login_throttle_t::prune_expired(const clock_t::time_point now) {
+    std::erase_if(sources_, [now](const auto &entry) {
+      return entry.second.expiration <= now;
+    });
+  }
+
+  bool login_throttle_t::is_blocked(const boost::asio::ip::address address, const clock_t::time_point now) {
+    std::scoped_lock lock(mutex_);
+    prune_expired(now);
+    const auto source = sources_.find(source_key(address));
+    return source != sources_.end() && source->second.failures >= maximum_failures_;
+  }
+
+  void login_throttle_t::record_failure(const boost::asio::ip::address address, const clock_t::time_point now) {
+    std::scoped_lock lock(mutex_);
+    prune_expired(now);
+
+    const auto key = source_key(address);
+    if (auto source = sources_.find(key); source != sources_.end()) {
+      ++source->second.failures;
+      return;
+    }
+
+    if (maximum_sources_ == 0) {
+      return;
+    }
+    if (sources_.size() >= maximum_sources_) {
+      const auto earliest = std::ranges::min_element(sources_, {}, [](const auto &entry) {
+        return entry.second.expiration;
+      });
+      sources_.erase(earliest);
+    }
+    sources_.emplace(key, source_state_t {1, now + failure_window_});
+  }
+
+  void login_throttle_t::record_success(const boost::asio::ip::address address) {
+    std::scoped_lock lock(mutex_);
+    sources_.erase(source_key(address));
+  }
+
+  bool bootstrap_allowed(boost::asio::ip::address address) {
+    return net::normalize_address(address).is_loopback();
+  }
+
+  std::string_view request_log_value(const std::string_view name, const std::string_view value) {
+    constexpr std::array sensitive_fields {
+      "Authorization"sv,
+      "Proxy-Authorization"sv,
+      "Cookie"sv,
+      "X-CSRF-Token"sv,
+      "csrf_token"sv,
+    };
+    const bool sensitive = std::ranges::any_of(sensitive_fields, [name](const std::string_view candidate) {
+      return boost::iequals(name, candidate);
+    });
+    return sensitive ? "[redacted]"sv : value;
+  }
+
+#ifdef SUNSHINE_TESTS
+  void reset_login_throttle_for_tests() {
+    login_throttle.record_success(boost::asio::ip::make_address("127.0.0.1"));
+    login_throttle.record_success(boost::asio::ip::make_address("::1"));
+  }
+#endif
+
   /**
    * @brief Log the request details.
    * @param request The HTTP request object.
@@ -111,13 +201,13 @@ namespace confighttp {
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
     for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << (name == "Authorization" ? "CREDENTIALS REDACTED" : val);
+      BOOST_LOG(debug) << name << " -- " << request_log_value(name, val);
     }
 
     BOOST_LOG(debug) << " [--] "sv;
 
     for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
+      BOOST_LOG(debug) << name << " -- " << request_log_value(name, val);
     }
 
     BOOST_LOG(debug) << " [--] "sv;
@@ -186,7 +276,8 @@ namespace confighttp {
    * @return True if the user is authenticated, false otherwise.
    */
   bool authenticate(const resp_https_t &response, const req_https_t &request) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const auto remote_address = request->remote_endpoint().address();
+    const auto address = net::addr_to_normalized_string(remote_address);
 
     if (const auto ip_type = net::from_address(address); ip_type > http::origin_web_ui_allowed) {
       BOOST_LOG(info) << "Web UI: ["sv << address << "] -- denied"sv;
@@ -200,6 +291,11 @@ namespace confighttp {
       return false;
     }
 
+    if (login_throttle.is_blocked(remote_address)) {
+      send_unauthorized(response, request);
+      return false;
+    }
+
     auto fg = util::fail_guard([&]() {
       send_unauthorized(response, request);
     });
@@ -209,19 +305,42 @@ namespace confighttp {
       return false;
     }
 
-    const auto &rawAuth = auth->second;
-    auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr("Basic "sv.length()));
-
-    const auto index = static_cast<int>(authData.find(':'));
-    if (index >= authData.size() - 1) {
+    std::string auth_data;
+    try {
+      const auto &raw_auth = auth->second;
+      if (!raw_auth.starts_with("Basic "sv)) {
+        login_throttle.record_failure(remote_address);
+        return false;
+      }
+      auth_data = SimpleWeb::Crypto::Base64::decode(raw_auth.substr("Basic "sv.length()));
+    } catch (const std::exception &) {
+      login_throttle.record_failure(remote_address);
       return false;
     }
 
-    const auto username = authData.substr(0, index);
-    const auto password = authData.substr(index + 1);
-
-    if (const auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string(); !boost::iequals(username, config::sunshine.username) || hash != config::sunshine.password) {
+    const auto separator = auth_data.find(':');
+    if (separator == std::string::npos || separator == 0 || separator + 1 >= auth_data.size()) {
+      login_throttle.record_failure(remote_address);
       return false;
+    }
+
+    const auto username = auth_data.substr(0, separator);
+    const auto password = auth_data.substr(separator + 1);
+    const auto password_result = http::verify_user_password(password, config::sunshine.password, config::sunshine.salt);
+
+    if (!boost::iequals(username, config::sunshine.username) || password_result == http::password_verification_e::INVALID) {
+      login_throttle.record_failure(remote_address);
+      return false;
+    }
+
+    login_throttle.record_success(remote_address);
+    if (password_result == http::password_verification_e::LEGACY) {
+      http::user_credentials_t migrated;
+      if (http::save_user_creds(config::sunshine.credentials_file, config::sunshine.username, password, false, &migrated) == 0) {
+        config::sunshine.username = std::move(migrated.username);
+        config::sunshine.password = std::move(migrated.password);
+        config::sunshine.salt = std::move(migrated.salt);
+      }
     }
 
     fg.disable();
@@ -722,7 +841,6 @@ namespace confighttp {
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      BOOST_LOG(info) << file;
       nlohmann::json file_tree = nlohmann::json::parse(file);
 
       if (input_tree["prep-cmd"].empty()) {
@@ -902,15 +1020,13 @@ namespace confighttp {
       nlohmann::json output_tree;
       std::string uuid = input_tree.value("uuid", "");
       bool enabled = input_tree.value("enabled", true);
-      output_tree["status"] = nvhttp::set_client_enabled(uuid, enabled);
+      const auto updated_certificate = nvhttp::set_client_enabled_with_certificate(uuid, enabled);
+      output_tree["status"] = updated_certificate.has_value();
 
-      if (!enabled && output_tree["status"]) {
-        auto cert = nvhttp::get_cert_by_uuid(uuid);
-        if (!cert.empty()) {
-          rtsp_stream::terminate_sessions_by_cert(cert);
-        }
+      if (!enabled && updated_certificate) {
+        rtsp_stream::terminate_sessions_by_cert(*updated_certificate);
 
-        if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
+        if (!rtsp_stream::has_session_or_pending_launch() && proc::proc.running() > 0) {
           proc::proc.terminate();
         }
       }
@@ -958,11 +1074,14 @@ namespace confighttp {
       nlohmann::json output_tree;
       const nlohmann::json input_tree = nlohmann::json::parse(ss);
       const std::string uuid = input_tree.value("uuid", "");
-      const bool removed = nvhttp::unpair_client(uuid);
-      output_tree["status"] = removed;
+      const auto removed_certificate = nvhttp::revoke_client(uuid);
+      output_tree["status"] = removed_certificate.has_value();
 
-      if (removed && nvhttp::get_all_clients().empty()) {
-        proc::proc.terminate();
+      if (removed_certificate) {
+        rtsp_stream::terminate_sessions_by_cert(*removed_certificate);
+        if (nvhttp::get_all_clients().empty()) {
+          proc::proc.terminate();
+        }
       }
 
       send_response(response, output_tree);
@@ -991,11 +1110,11 @@ namespace confighttp {
 
     print_req(request);
 
-    nvhttp::erase_all_clients();
-    proc::proc.terminate();
-
     nlohmann::json output_tree;
-    output_tree["status"] = true;
+    output_tree["status"] = nvhttp::erase_all_clients();
+    if (output_tree["status"]) {
+      proc::proc.terminate();
+    }
     send_response(response, output_tree);
   }
 
@@ -1271,8 +1390,15 @@ namespace confighttp {
     if (!check_content_type(response, request, "application/json")) {
       return;
     }
-    if (!config::sunshine.username.empty() && !authenticate(response, request)) {
-      return;
+    if (config::sunshine.username.empty()) {
+      if (!bootstrap_allowed(request->remote_endpoint().address())) {
+        response->write(SimpleWeb::StatusCode::client_error_forbidden);
+        return;
+      }
+    } else {
+      if (!authenticate(response, request)) {
+        return;
+      }
     }
 
     std::string client_id = get_client_id(request);
@@ -1301,14 +1427,20 @@ namespace confighttp {
       if (newUsername.empty()) {
         errors.emplace_back("Invalid Username");
       } else {
-        auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-        if (config::sunshine.username.empty() || (boost::iequals(username, config::sunshine.username) && hash == config::sunshine.password)) {
+        const auto password_result = http::verify_user_password(password, config::sunshine.password, config::sunshine.salt);
+        if (config::sunshine.username.empty() || (boost::iequals(username, config::sunshine.username) && password_result != http::password_verification_e::INVALID)) {
           if (newPassword.empty() || newPassword != confirmPassword) {
             errors.emplace_back("Password Mismatch");
           } else {
-            http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword);
-            http::reload_user_creds(config::sunshine.credentials_file);
-            output_tree["status"] = true;
+            http::user_credentials_t saved;
+            if (http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword, false, &saved) != 0) {
+              errors.emplace_back("Failed to save credentials");
+            } else {
+              config::sunshine.username = std::move(saved.username);
+              config::sunshine.password = std::move(saved.password);
+              config::sunshine.salt = std::move(saved.salt);
+              output_tree["status"] = true;
+            }
           }
         } else {
           errors.emplace_back("Invalid Current Credentials");
@@ -1339,7 +1471,8 @@ namespace confighttp {
    * @code{.json}
    * {
    *   "pin": "<pin>",
-   *   "name": "Friendly Client Name"
+   *   "name": "Friendly Client Name",
+   *   "requestId": "<pairing request ID>"
    * }
    * @endcode
    *
@@ -1357,6 +1490,10 @@ namespace confighttp {
     if (!validate_csrf_token(response, request, client_id)) {
       return;
     }
+    if (request->content.size() > 1024) {
+      bad_request(response, request, "PIN request body is too large");
+      return;
+    }
 
     print_req(request);
 
@@ -1367,20 +1504,290 @@ namespace confighttp {
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       const std::string name = input_tree.value("name", "");
       const std::string pin = input_tree.value("pin", "");
+      const std::string request_id = input_tree.value("requestId", "");
 
-      int _pin = 0;
-      _pin = std::stoi(pin);
-      if (_pin < 0 || _pin > 9999) {
-        bad_request(response, request, "PIN must be between 0000 and 9999");
-      }
-
-      output_tree["status"] = nvhttp::pin(pin, name);
+      output_tree["status"] = request_id.empty() ? nvhttp::pin(pin, name) : nvhttp::pin(pin, name, request_id);
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SavePin: "sv << e.what();
       bad_request(response, request, e.what());
     }
   }
+
+  /**
+   * @brief List the opaque IDs of pairing requests currently awaiting a PIN.
+   */
+  void getPendingPairingRequests(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    nlohmann::json output_tree;
+    output_tree["requests"] = nlohmann::json::array();
+    for (const auto &pending : nvhttp::pending_pairing_requests()) {
+      output_tree["requests"].push_back({{"requestId", pending.request_id}, {"source", pending.source}, {"ageSeconds", pending.age_seconds}, {"clientFingerprint", pending.client_fingerprint}});
+    }
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    headers.emplace("Cache-Control", "no-store");
+    response->write(output_tree.dump(), headers);
+  }
+
+  /**
+   * @brief Cancel one pending pairing request by opaque request ID.
+   */
+  void cancelPendingPairingRequest(const resp_https_t &response, const req_https_t &request) {
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    const std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+    if (request->content.size() > 256) {
+      bad_request(response, request, "Pairing cancellation body is too large");
+      return;
+    }
+
+    std::stringstream body;
+    body << request->content.rdbuf();
+    try {
+      const auto input_tree = nlohmann::json::parse(body);
+      const std::string request_id = input_tree.value("requestId", "");
+      nlohmann::json output_tree;
+      output_tree["status"] = nvhttp::cancel_pairing_request(request_id);
+      send_response(response, output_tree);
+    } catch (const std::exception &error) {
+      BOOST_LOG(warning) << "CancelPairingRequest: "sv << error.what();
+      bad_request(response, request, error.what());
+    }
+  }
+
+#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
+  /** @brief Restrict invitation and direct-client administration to trusted LAN scopes. */
+  bool requireLocalProtocolV3Admin(const resp_https_t &response, const req_https_t &request) {
+    if (!nvhttp::is_trusted_pairing_source(request->remote_endpoint().address())) {
+      bad_request(response, request, "Protocol-v3 pairing administration is restricted to the local network");
+      return false;
+    }
+    return true;
+  }
+
+  /** @brief Encode a public protocol-v3 client identifier for WebUI JSON. */
+  std::string protocolV3IdentifierText(const lumen::protocol_v3::control_session::Identifier &identifier) {
+    static constexpr char alphabet[] = "0123456789abcdef";
+    std::string output(identifier.size() * 2, '0');
+    for (std::size_t index = 0; index < identifier.size(); ++index) {
+      output[index * 2] = alphabet[identifier[index] >> 4U];
+      output[index * 2 + 1] = alphabet[identifier[index] & 0x0fU];
+    }
+    return output;
+  }
+
+  /** @brief Decode one exact public protocol-v3 client identifier. */
+  std::optional<lumen::protocol_v3::control_session::Identifier> protocolV3Identifier(
+    const std::string_view encoded
+  ) {
+    if (encoded.size() != 32) {
+      return std::nullopt;
+    }
+    const auto nibble = [](const char value) -> std::optional<std::uint8_t> {
+      if (value >= '0' && value <= '9') return static_cast<std::uint8_t>(value - '0');
+      if (value >= 'a' && value <= 'f') return static_cast<std::uint8_t>(value - 'a' + 10);
+      if (value >= 'A' && value <= 'F') return static_cast<std::uint8_t>(value - 'A' + 10);
+      return std::nullopt;
+    };
+    lumen::protocol_v3::control_session::Identifier output {};
+    for (std::size_t index = 0; index < output.size(); ++index) {
+      const auto high = nibble(encoded[index * 2]);
+      const auto low = nibble(encoded[index * 2 + 1]);
+      if (!high || !low) {
+        return std::nullopt;
+      }
+      output[index] = static_cast<std::uint8_t>((*high << 4U) | *low);
+    }
+    return output;
+  }
+
+  /**
+   * @brief Issue a five-minute QR invitation for direct protocol-v3 pairing.
+   */
+  void issueProtocolV3Invitation(const resp_https_t &response, const req_https_t &request) {
+    if (!check_content_type(response, request, "application/json") || !authenticate(response, request) ||
+        !requireLocalProtocolV3Admin(response, request)) {
+      return;
+    }
+    const auto client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+    if (request->content.size() > 1024) {
+      bad_request(response, request, "Protocol-v3 invitation body is too large");
+      return;
+    }
+    std::stringstream body;
+    body << request->content.rdbuf();
+    try {
+      const auto input = nlohmann::json::parse(body);
+      const auto hostname = input.value("hostname", config::nvhttp.sunshine_name);
+      const auto hostname_is_ip = input.value("hostnameIsIP", false);
+      const auto permissions = input.value<std::uint64_t>(
+        "permissions",
+        config::protocol_v3.pairing_permissions
+      );
+      auto invitation = lumen::protocol_v3::runtime::issue_active_invitation(
+        hostname,
+        hostname_is_ip,
+        permissions
+      );
+      if (!invitation) {
+        bad_request(response, request, "Unable to issue a protocol-v3 invitation");
+        return;
+      }
+      nlohmann::json output {
+        {"status", true},
+        {"invitation", *invitation},
+        {"expiresInSeconds", 300},
+        {"approvedPermissions", permissions},
+      };
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      headers.emplace("Cache-Control", "no-store");
+      headers.emplace("X-Frame-Options", "DENY");
+      response->write(output.dump(), headers);
+    } catch (const std::exception &error) {
+      bad_request(response, request, error.what());
+    }
+  }
+
+  /** @brief Return the current unexpired protocol-v3 QR invitation. */
+  void getProtocolV3Invitation(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request) || !requireLocalProtocolV3Admin(response, request)) {
+      return;
+    }
+    nlohmann::json output;
+    if (const auto invitation = lumen::protocol_v3::runtime::current_active_invitation()) {
+      output = {
+        {"status", true}, {"invitation", *invitation},
+        {"approvedPermissions", lumen::protocol_v3::runtime::active_pairing_permissions()},
+      };
+    } else {
+      output = {
+        {"status", false}, {"invitation", nullptr},
+        {"approvedPermissions", lumen::protocol_v3::runtime::active_pairing_permissions()},
+      };
+    }
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("Cache-Control", "no-store");
+    headers.emplace("X-Frame-Options", "DENY");
+    response->write(output.dump(), headers);
+  }
+
+  /** @brief Revoke the current unconsumed protocol-v3 invitation. */
+  void revokeProtocolV3Invitation(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request) || !requireLocalProtocolV3Admin(response, request)) {
+      return;
+    }
+    const auto client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+    nlohmann::json output {{"status", lumen::protocol_v3::runtime::revoke_current_active_invitation()}};
+    send_response(response, output);
+  }
+
+  /** @brief List paired direct protocol-v3 clients. */
+  void getProtocolV3Clients(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request) || !requireLocalProtocolV3Admin(response, request)) {
+      return;
+    }
+    nlohmann::json clients = nlohmann::json::array();
+    for (const auto &client : lumen::protocol_v3::runtime::active_clients()) {
+      clients.push_back({
+        {"clientId", protocolV3IdentifierText(client.client_id)},
+        {"name", client.display_name},
+        {"permissions", client.permissions},
+        {"generation", client.generation},
+        {"enabled", client.enabled},
+      });
+    }
+    nlohmann::json output {{"clients", std::move(clients)}};
+    send_response(response, output);
+  }
+
+  /** @brief Update enabled state and/or permissions for one paired v3 client. */
+  void updateProtocolV3Client(const resp_https_t &response, const req_https_t &request) {
+    if (!check_content_type(response, request, "application/json") || !authenticate(response, request) ||
+        !requireLocalProtocolV3Admin(response, request)) {
+      return;
+    }
+    const auto web_client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, web_client_id) || request->content.size() > 1024) {
+      return;
+    }
+    std::stringstream body;
+    body << request->content.rdbuf();
+    try {
+      const auto input = nlohmann::json::parse(body);
+      const auto client_id = protocolV3Identifier(input.value("clientId", ""));
+      if (!client_id || (!input.contains("enabled") && !input.contains("permissions"))) {
+        bad_request(response, request, "Invalid protocol-v3 client update");
+        return;
+      }
+      bool status = true;
+      if (input.contains("permissions")) {
+        status = lumen::protocol_v3::runtime::set_active_client_permissions(
+          *client_id,
+          input.at("permissions").get<std::uint64_t>()
+        );
+      }
+      if (status && input.contains("enabled")) {
+        status = lumen::protocol_v3::runtime::set_active_client_enabled(
+          *client_id,
+          input.at("enabled").get<bool>()
+        );
+      }
+      send_response(response, nlohmann::json {{"status", status}});
+    } catch (const std::exception &error) {
+      bad_request(response, request, error.what());
+    }
+  }
+
+  /** @brief Revoke one paired direct protocol-v3 client. */
+  void revokeProtocolV3Client(const resp_https_t &response, const req_https_t &request) {
+    if (!check_content_type(response, request, "application/json") || !authenticate(response, request) ||
+        !requireLocalProtocolV3Admin(response, request)) {
+      return;
+    }
+    const auto web_client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, web_client_id) || request->content.size() > 256) {
+      return;
+    }
+    std::stringstream body;
+    body << request->content.rdbuf();
+    try {
+      const auto input = nlohmann::json::parse(body);
+      const auto client_id = protocolV3Identifier(input.value("clientId", ""));
+      if (!client_id) {
+        bad_request(response, request, "Invalid protocol-v3 client ID");
+        return;
+      }
+      send_response(response, nlohmann::json {{
+        "status",
+        lumen::protocol_v3::runtime::revoke_active_client(*client_id),
+      }});
+    } catch (const std::exception &error) {
+      bad_request(response, request, error.what());
+    }
+  }
+#endif
 
   /**
    * @brief Reset the display device persistence.
@@ -1808,7 +2215,17 @@ namespace confighttp {
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
     server.resource["^/api/csrf-token$"]["GET"] = getCSRFToken;
     server.resource["^/api/password$"]["POST"] = savePassword;
+    server.resource["^/api/pin$"]["GET"] = getPendingPairingRequests;
     server.resource["^/api/pin$"]["POST"] = savePin;
+    server.resource["^/api/pin/cancel$"]["POST"] = cancelPendingPairingRequest;
+#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
+    server.resource["^/api/protocol-v3/invitation$"]["GET"] = getProtocolV3Invitation;
+    server.resource["^/api/protocol-v3/invitation$"]["POST"] = issueProtocolV3Invitation;
+    server.resource["^/api/protocol-v3/invitation$"]["DELETE"] = revokeProtocolV3Invitation;
+    server.resource["^/api/protocol-v3/clients$"]["GET"] = getProtocolV3Clients;
+    server.resource["^/api/protocol-v3/clients$"]["PATCH"] = updateProtocolV3Client;
+    server.resource["^/api/protocol-v3/clients$"]["DELETE"] = revokeProtocolV3Client;
+#endif
     server.resource["^/api/logs$"]["GET"] = getLogs;
     server.resource["^/api/reset-display-device-persistence$"]["POST"] = resetDisplayDevicePersistence;
     server.resource["^/api/restart$"]["POST"] = restart;
@@ -1821,6 +2238,12 @@ namespace confighttp {
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
 
     server.config.reuse_address = true;
+    server.config.timeout_request = REQUEST_HEADER_TIMEOUT_SECONDS;
+    server.config.timeout_content = REQUEST_BODY_TIMEOUT_SECONDS;
+    server.config.max_request_streambuf_size = MAX_REQUEST_BODY_SIZE;
+    server.config.reject_transfer_encoding = true;
+    server.config.max_active_connections = MAX_ACTIVE_CONNECTIONS;
+    server.config.max_active_connections_per_source = MAX_ACTIVE_CONNECTIONS_PER_SOURCE;
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
 

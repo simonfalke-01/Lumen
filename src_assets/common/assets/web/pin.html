@@ -11,6 +11,17 @@
     <h1 class="my-4 text-center">{{ $t('pin.pin_pairing') }}</h1>
     <form class="form d-flex flex-column align-items-center" id="form" @submit.prevent="registerDevice">
       <div class="card flex-column d-flex p-4 mb-4">
+        <div v-if="pendingRequests.length > 1" class="mb-3">
+          <select v-model="selectedRequestId" class="form-select" :aria-label="$t('pin.pin_pairing')" required>
+            <option disabled value="">{{ $t('pin.pin_pairing') }}</option>
+            <option v-for="request in pendingRequests" :key="request.requestId" :value="request.requestId">
+              {{ request.source }} · {{ request.clientFingerprint }} · {{ request.ageSeconds }}s
+            </option>
+          </select>
+        </div>
+        <div v-else-if="selectedRequest" class="small text-body-secondary font-monospace mb-2">
+          {{ selectedRequest.source }} · {{ selectedRequest.clientFingerprint }} · {{ selectedRequest.ageSeconds }}s
+        </div>
         <div class="input-group mt-2">
           <span class="input-group-text">
             <hash :size="18" class="icon"></hash>
@@ -23,7 +34,7 @@
           </span>
           <input type="text" :placeholder="`${$t('pin.device_name')}`" id="name-input" class="form-control" required />
         </div>
-        <button class="btn btn-primary">
+        <button class="btn btn-primary" :disabled="!selectedRequestId">
           <forward :size="18" class="icon"></forward>
           {{ $t('pin.send') }}
         </button>
@@ -55,12 +66,57 @@
       Monitor,
     },
     inject: ['i18n'],
+    data() {
+      return {
+        pendingRequests: [],
+        selectedRequestId: '',
+        refreshTimer: null,
+      };
+    },
+    computed: {
+      selectedRequest() {
+        return this.pendingRequests.find((request) => request.requestId === this.selectedRequestId);
+      },
+    },
+    mounted() {
+      this.refreshPendingRequests();
+      this.refreshTimer = window.setInterval(() => this.refreshPendingRequests(), 2000);
+    },
+    beforeUnmount() {
+      if (this.refreshTimer !== null) {
+        window.clearInterval(this.refreshTimer);
+      }
+    },
     methods: {
-      registerDevice(e) {
+      refreshPendingRequests() {
+        return apiFetch("./api/pin")
+          .then((response) => response.json())
+          .then((response) => {
+            const requests = Array.isArray(response.requests) ? response.requests : [];
+            const previouslyHadMultipleRequests = this.pendingRequests.length > 1;
+            this.pendingRequests = requests;
+            if (requests.length === 1) {
+              this.selectedRequestId = requests[0].requestId;
+            } else if (
+              (requests.length > 1 && !previouslyHadMultipleRequests) ||
+              !requests.some((request) => request.requestId === this.selectedRequestId)
+            ) {
+              this.selectedRequestId = '';
+            }
+          })
+          .catch(() => {
+            this.pendingRequests = [];
+            this.selectedRequestId = '';
+          });
+      },
+      registerDevice() {
+        if (!this.selectedRequestId) {
+          return;
+        }
         let pin = document.querySelector("#pin-input").value;
         let name = document.querySelector("#name-input").value;
         document.querySelector("#status").innerHTML = "";
-        let b = JSON.stringify({pin: pin, name: name});
+        let b = JSON.stringify({pin: pin, name: name, requestId: this.selectedRequestId});
         apiFetch("./api/pin", {
           method: "POST",
           headers: {
@@ -76,6 +132,7 @@
               ).innerHTML = `<div class="alert alert-success" role="alert">${this.i18n.t('pin.pair_success')}</div>`;
               document.querySelector("#pin-input").value = "";
               document.querySelector("#name-input").value = "";
+              this.refreshPendingRequests();
             } else {
               document.querySelector(
                 "#status"

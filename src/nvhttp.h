@@ -6,7 +6,18 @@
 #pragma once
 
 // standard includes
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/property_tree/ptree.hpp>
@@ -44,6 +55,17 @@ namespace nvhttp {
    */
   constexpr auto PORT_HTTPS = -5;
 
+  constexpr std::size_t PAIRING_REQUEST_BUFFER_LIMIT = 64 * 1024;
+  constexpr std::size_t PAIRING_UNIQUE_ID_MAX_BYTES = 128;
+  constexpr std::size_t PAIRING_CLIENT_CERT_MAX_BYTES = 16 * 1024;
+  constexpr std::size_t PAIRING_CLIENT_CERT_HEX_MAX_BYTES = PAIRING_CLIENT_CERT_MAX_BYTES * 2;
+  constexpr std::size_t PAIRING_SALT_HEX_BYTES = 32;
+  constexpr std::size_t PAIRING_CLIENT_CHALLENGE_HEX_BYTES = 32;
+  constexpr std::size_t PAIRING_SERVER_CHALLENGE_RESPONSE_HEX_BYTES = 64;
+  constexpr std::size_t PAIRING_CLIENT_SECRET_HEX_MAX_BYTES = 4096;
+  constexpr std::size_t PAIRING_CLIENT_NAME_MAX_BYTES = 128;
+  constexpr std::size_t PAIRING_REQUEST_ID_HEX_BYTES = 32;
+
   /**
    * @brief Start the nvhttp server.
    * @examples
@@ -58,6 +80,15 @@ namespace nvhttp {
    * @param cert
    */
   void setup(const std::string &pkey, const std::string &cert);
+
+  bool is_valid_pairing_unique_id(std::string_view value);
+  bool is_valid_pairing_hex(std::string_view value, std::size_t minimum_bytes, std::size_t maximum_bytes);
+  /**
+   * @brief Check whether legacy PIN pairing may originate from an address.
+   * @param address Normalized or native client source address.
+   * @return True only for loopback, local-host, or private/trusted LAN scopes.
+   */
+  bool is_trusted_pairing_source(const boost::asio::ip::address &address);
 
   /**
    * @brief Simple-Web-Server HTTPS backend configured for Sunshine certificate handling.
@@ -74,11 +105,22 @@ namespace nvhttp {
         SimpleWeb::HTTPS(io_context, ctx) {
     }
 
+    void bind_verified_client_certificate(std::string certificate) {
+      verified_client_certificate_ = std::move(certificate);
+    }
+
+    [[nodiscard]] const std::string &verified_client_certificate() const noexcept {
+      return verified_client_certificate_;
+    }
+
     virtual ~SunshineHTTPS() {
       // Gracefully shutdown the TLS connection
       SimpleWeb::error_code ec;
       shutdown(ec);
     }
+
+  private:
+    std::string verified_client_certificate_;
   };
 
   /**
@@ -120,6 +162,138 @@ namespace nvhttp {
      * @brief used as a security measure to prevent out of order calls
      */
     PAIR_PHASE last_phase = PAIR_PHASE::NONE;
+  };
+
+  /**
+   * @brief Bounded, synchronized owner for in-progress pairing handshakes.
+   *
+   * A locked session keeps both the manager lock and the session storage alive
+   * until the caller finishes mutating the handshake state. This prevents a
+   * concurrent timeout or request from erasing state while it is in use.
+   *
+   * @warning These controls bound online abuse only. The legacy GameStream
+   * four-digit PIN transcript remains susceptible to a passive offline search
+   * of all 10,000 PINs; a modern PAKE or high-entropy invitation is required to
+   * remove that protocol-level limitation.
+   */
+  class pairing_session_manager_t {
+  public:
+    using clock_t = std::chrono::steady_clock;
+    using time_point_t = clock_t::time_point;
+
+    static constexpr std::chrono::seconds SESSION_TTL {120};
+    static constexpr std::size_t MAX_GLOBAL_SESSIONS = 32;
+    static constexpr std::size_t MAX_SESSIONS_PER_SOURCE = 4;
+    static constexpr std::uint8_t MAX_PIN_ATTEMPTS = 3;
+
+    enum class add_status_e {
+      ADDED,
+      DUPLICATE_UNIQUE_ID,
+      DUPLICATE_REQUEST_ID,
+      GLOBAL_LIMIT,
+      SOURCE_LIMIT,
+      RANDOM_FAILURE,
+      CLOSED,
+      INVALID_FIELDS,
+      REPLACED
+    };
+
+    enum class pin_attempt_status_e {
+      ACCEPTED,
+      SESSION_EXHAUSTED,
+      SOURCE_RATE_LIMITED,
+      MISSING_SESSION
+    };
+
+    struct pending_request_t {
+      std::string request_id;
+      std::string source;
+      std::uint64_t age_seconds;
+      std::string client_fingerprint;
+    };
+
+    struct add_result_t {
+      add_status_e status;
+      std::string request_id;
+
+      explicit operator bool() const noexcept {
+        return status == add_status_e::ADDED || status == add_status_e::REPLACED;
+      }
+    };
+
+    class locked_session_t {
+    public:
+      locked_session_t() = default;
+      locked_session_t(locked_session_t &&) noexcept = default;
+      locked_session_t &operator=(locked_session_t &&) noexcept = default;
+
+      explicit operator bool() const noexcept;
+      pair_session_t &session() const;
+      const std::string &unique_id() const noexcept;
+      const std::string &request_id() const noexcept;
+      const std::string &source() const noexcept;
+
+    private:
+      friend class pairing_session_manager_t;
+
+      locked_session_t(
+        std::unique_lock<std::recursive_mutex> lock,
+        std::shared_ptr<pair_session_t> session,
+        std::string unique_id,
+        std::string request_id,
+        std::string source
+      );
+
+      std::unique_lock<std::recursive_mutex> lock_;
+      std::shared_ptr<pair_session_t> session_;
+      std::string unique_id_;
+      std::string request_id_;
+      std::string source_;
+    };
+
+    pairing_session_manager_t() = default;
+    pairing_session_manager_t(const pairing_session_manager_t &) = delete;
+    pairing_session_manager_t &operator=(const pairing_session_manager_t &) = delete;
+
+    add_result_t add(
+      pair_session_t session,
+      std::string source,
+      std::string request_id = {},
+      time_point_t now = clock_t::now()
+    );
+    locked_session_t find_by_unique_id(std::string_view unique_id, std::string_view source, time_point_t now = clock_t::now());
+    locked_session_t find_pending_by_request_id(std::string_view request_id, time_point_t now = clock_t::now());
+    locked_session_t find_single_pending(time_point_t now = clock_t::now());
+    pin_attempt_status_e record_pin_attempt(locked_session_t &session, time_point_t now = clock_t::now());
+    void erase(std::string_view unique_id);
+    std::size_t cleanup_expired(time_point_t now = clock_t::now());
+    bool cancel_by_request_id(std::string_view request_id);
+    void cancel_all();
+    void open();
+    void close();
+    bool accepting();
+    std::size_t size(time_point_t now = clock_t::now());
+    std::vector<pending_request_t> pending_requests(time_point_t now = clock_t::now());
+
+  private:
+    struct entry_t {
+      std::shared_ptr<pair_session_t> session;
+      std::string source;
+      std::string request_id;
+      time_point_t created_at;
+      std::uint8_t pin_attempts = 0;
+      std::string client_fingerprint;
+    };
+
+    std::size_t cleanup_expired_locked(time_point_t now);
+    void cleanup_pin_submissions_locked(time_point_t now);
+    void erase_locked(std::unordered_map<std::string, entry_t>::iterator entry);
+
+    std::recursive_mutex mutex_;
+    std::unordered_map<std::string, entry_t> sessions_;
+    std::unordered_map<std::string, std::string> request_to_unique_id_;
+    std::unordered_map<std::string, std::deque<time_point_t>> pin_submissions_by_source_;
+    bool accepting_ = true;
   };
 
   /**
@@ -204,6 +378,51 @@ namespace nvhttp {
   bool pin(std::string pin, std::string name);
 
   /**
+   * @brief Submit a PIN for one explicitly identified pending request.
+   * @param pin The user supplied PIN.
+   * @param name The user supplied client name.
+   * @param request_id Cryptographically random request ID returned by the
+   * pairing-request listing endpoint.
+   * @return `true` when the PIN was delivered to that pending request.
+   */
+  bool pin(std::string pin, std::string name, std::string_view request_id);
+
+  /**
+   * @brief Return non-secret IDs for pairing requests awaiting a PIN.
+   */
+  std::vector<pairing_session_manager_t::pending_request_t> pending_pairing_requests();
+
+  /**
+   * @brief Cancel a pending request and release its held client response.
+   */
+  bool cancel_pairing_request(std::string_view request_id);
+
+#ifdef SUNSHINE_TESTS
+  pairing_session_manager_t &pairing_sessions_for_tests();
+
+  std::string legacy_pair_challenge_xml_for_tests();
+  std::string legacy_applist_xml_for_tests(
+    const std::vector<std::pair<std::string, std::string>> &apps,
+    bool hdr_supported
+  );
+  std::string legacy_launch_xml_for_tests(std::string_view session_url);
+  std::string legacy_resume_xml_for_tests(std::string_view session_url);
+  std::string legacy_cancel_xml_for_tests();
+  std::string_view legacy_appasset_content_type_for_tests();
+  std::string legacy_query_log_value_for_tests(std::string_view name, std::string_view value);
+  void reset_paired_clients_for_tests();
+  bool upsert_paired_client_for_tests(
+    std::string name,
+    std::string uuid,
+    std::string certificate,
+    bool enabled
+  );
+  bool paired_client_enabled_for_tests(std::string_view certificate);
+  std::string legacy_pairing_source_xml_for_tests(const boost::asio::ip::address &address);
+  std::string verified_transport_certificate_for_tests(const SunshineHTTPS &transport);
+#endif
+
+  /**
    * @brief Remove single client.
    * @param uuid The UUID of the client to remove.
    * @examples
@@ -213,6 +432,12 @@ namespace nvhttp {
    * @return True when the client entry was found and removed.
    */
   bool unpair_client(std::string_view uuid);
+  /**
+   * @brief Atomically persist and remove one paired client.
+   * @param uuid Paired-client UUID to revoke.
+   * @return Immutable removed certificate, or no value when missing or persistence fails.
+   */
+  std::optional<std::string> revoke_client(std::string_view uuid);
 
   /**
    * @brief Enable or disable a client.
@@ -221,6 +446,13 @@ namespace nvhttp {
    * @return true if the client was found and updated.
    */
   bool set_client_enabled(std::string_view uuid, bool enabled);
+  /**
+   * @brief Atomically persist a client enable state and snapshot its certificate.
+   * @param uuid Paired-client UUID to update.
+   * @param enabled New authorization state.
+   * @return Immutable certificate, or no value when missing or persistence fails.
+   */
+  std::optional<std::string> set_client_enabled_with_certificate(std::string_view uuid, bool enabled);
   /**
    * @brief Get cert by UUID.
    *
@@ -243,6 +475,7 @@ namespace nvhttp {
    * @examples
    * nvhttp::erase_all_clients();
    * @examples_end
+   * @return True only when the removal was committed to persistent state.
    */
-  void erase_all_clients();
+  bool erase_all_clients();
 }  // namespace nvhttp

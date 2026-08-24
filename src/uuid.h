@@ -54,9 +54,9 @@ namespace uuid_util {
     }
 
     /**
-     * @brief Format the UUID using canonical text form.
+     * @brief Format the UUID using the standard text form.
      *
-     * @return Canonical lowercase UUID string.
+     * @return Standard lowercase UUID string.
      */
     [[nodiscard]] std::string string() const {
       std::string result;

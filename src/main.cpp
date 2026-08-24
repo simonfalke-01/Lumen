@@ -26,6 +26,8 @@
 #include "main.h"
 #include "nvhttp.h"
 #include "process.h"
+#include "protocol_v3/runtime.h"
+#include "stream.h"
 #include "system_tray.h"
 #include "upnp.h"
 #include "video.h"
@@ -437,9 +439,51 @@ int main(int argc, char *argv[]) {
     return lifetime::desired_exit_code;
   }
 
-  std::jthread httpThread {nvhttp::start};
+  const auto listener_policy = config::listener_startup_policy(config::protocol_v3);
+
+#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
+  std::unique_ptr<lumen::protocol_v3::runtime::ProtocolV3Service> protocol_v3_service;
+  if (config::protocol_v3.enabled) {
+    protocol_v3_service = std::make_unique<lumen::protocol_v3::runtime::ProtocolV3Service>(
+      stream::make_protocol_v3_session_resource_factory
+    );
+    const auto profile = config::protocol_v3.profile == "latency" ?
+                           lumen::protocol_v3::quic_server::Profile::latency :
+                           lumen::protocol_v3::quic_server::Profile::quality;
+    const auto status = protocol_v3_service->start({
+      .state_file = config::nvhttp.file_state,
+      .certificate_file = config::nvhttp.cert,
+      .private_key_file = config::nvhttp.pkey,
+      .udp_port = config::protocol_v3.port,
+      .profile = profile,
+      .persistent_authorization = !config::sunshine.flags[config::flag::FRESH_STATE],
+      .pairing_permissions = config::protocol_v3.pairing_permissions,
+    });
+    if (!lumen::protocol_v3::quic_server::accepted(status)) {
+      protocol_v3_service.reset();
+      if (listener_policy.v3_failure_is_fatal) {
+        BOOST_LOG(fatal) << "Protocol v3 failed to start on UDP port "sv << config::protocol_v3.port
+                         << " with transport status "sv << static_cast<int>(status);
+        return -1;
+      }
+      BOOST_LOG(error) << "Protocol v3 failed to start on UDP port "sv << config::protocol_v3.port
+                       << " with transport status "sv << static_cast<int>(status)
+                       << "; continuing with Moonlight compatibility listeners"sv;
+    } else {
+      BOOST_LOG(info) << "Protocol v3 listening on UDP port "sv << config::protocol_v3.port;
+    }
+  }
+#endif
+
+  std::optional<std::jthread> httpThread;
+  std::optional<std::jthread> rtspThread;
+  if (listener_policy.start_legacy) {
+    httpThread.emplace(nvhttp::start);
+    rtspThread.emplace(rtsp_stream::start);
+  } else {
+    BOOST_LOG(info) << "Legacy Moonlight HTTP/RTSP compatibility listeners are disabled"sv;
+  }
   std::jthread configThread {confighttp::start};
-  std::jthread rtspThread {rtsp_stream::start};
 
 #ifdef _WIN32
   // If we're using the default port and GameStream is enabled, warn the user
@@ -465,9 +509,18 @@ int main(int argc, char *argv[]) {
 
   mainThreadLoop(shutdown_event);
 
-  httpThread.join();
+#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
+  if (protocol_v3_service) {
+    protocol_v3_service->stop();
+  }
+#endif
+  if (httpThread) {
+    httpThread->join();
+  }
   configThread.join();
-  rtspThread.join();
+  if (rtspThread) {
+    rtspThread->join();
+  }
 
   task_pool.stop();
   task_pool.join();

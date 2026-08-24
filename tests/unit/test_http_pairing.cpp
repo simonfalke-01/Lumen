@@ -5,7 +5,10 @@
 
 #include "../tests_common.h"
 
+#include <atomic>
+#include <Simple-Web-Server/client_http.hpp>
 #include <src/nvhttp.h>
+#include <thread>
 
 using namespace nvhttp;
 
@@ -264,4 +267,369 @@ TEST(PairingTest, OutOfOrderCalls) {
   // Calling it again should fail
   getservercert(sess, tree, "test");
   ASSERT_FALSE(tree.get<int>("root.paired") == 1);
+}
+
+namespace {
+  pair_session_t pending_session(std::string unique_id) {
+    pair_session_t session;
+    session.client.uniqueID = std::move(unique_id);
+    session.async_insert_pin.response = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> {};
+    return session;
+  }
+}  // namespace
+
+TEST(PairingSessionManagerTest, UsesOpaque128BitRequestIdsAndExplicitSelection) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+
+  auto first = manager.add(pending_session("client-a"), "192.0.2.1", {}, now);
+  auto second = manager.add(pending_session("client-b"), "192.0.2.2", {}, now);
+
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(first.request_id.size(), 32U);
+  EXPECT_EQ(second.request_id.size(), 32U);
+  EXPECT_NE(first.request_id, second.request_id);
+  EXPECT_FALSE(manager.find_single_pending(now));
+
+  auto selected = manager.find_pending_by_request_id(second.request_id, now);
+  ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.unique_id(), "client-b");
+}
+
+TEST(PairingSessionManagerTest, LegacyFallbackOnlySelectsOnePendingRequest) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+
+  ASSERT_TRUE(manager.add(pending_session("client-a"), "192.0.2.1", "request-a", now));
+  auto only = manager.find_single_pending(now);
+  ASSERT_TRUE(only);
+  EXPECT_EQ(only.unique_id(), "client-a");
+  only = {};
+
+  ASSERT_TRUE(manager.add(pending_session("client-b"), "192.0.2.2", "request-b", now));
+  EXPECT_FALSE(manager.find_single_pending(now));
+}
+
+TEST(PairingSessionManagerTest, RejectsDuplicateClientAndRequestIds) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+
+  ASSERT_TRUE(manager.add(pending_session("client-a"), "192.0.2.1", "request-a", now));
+  EXPECT_EQ(
+    manager.add(pending_session("client-a"), "192.0.2.2", "request-b", now).status,
+    pairing_session_manager_t::add_status_e::DUPLICATE_UNIQUE_ID
+  );
+  EXPECT_EQ(
+    manager.add(pending_session("client-b"), "192.0.2.2", "request-a", now).status,
+    pairing_session_manager_t::add_status_e::DUPLICATE_REQUEST_ID
+  );
+}
+
+TEST(PairingSessionManagerTest, IdenticalSameSourceRetryReplacesOnlyPrePinLongPoll) {
+  pairing_session_manager_t manager;
+  const auto created = pairing_session_manager_t::time_point_t {};
+  auto first_session = pending_session("client-a");
+  first_session.client.cert = "bounded-certificate";
+  first_session.async_insert_pin.salt = "00112233445566778899AABBCCDDEEFF";
+  ASSERT_TRUE(manager.add(std::move(first_session), "192.0.2.1", "request-a", created));
+
+  auto original = manager.find_pending_by_request_id("request-a", created);
+  ASSERT_TRUE(original);
+  ASSERT_TRUE(original.session().async_insert_pin.response.has_left());
+
+  auto retry_session = pending_session("client-a");
+  retry_session.client.cert = "bounded-certificate";
+  retry_session.async_insert_pin.salt = "00112233445566778899AABBCCDDEEFF";
+  const auto retry = manager.add(std::move(retry_session), "192.0.2.1", "unused-new-request-id", created + std::chrono::seconds {1});
+  EXPECT_EQ(retry.status, pairing_session_manager_t::add_status_e::REPLACED);
+  EXPECT_EQ(retry.request_id, "request-a");
+  EXPECT_FALSE(original.session().async_insert_pin.response.has_left());
+  original = {};
+
+  auto active = manager.find_pending_by_request_id("request-a", created + std::chrono::seconds {1});
+  ASSERT_TRUE(active);
+  active.session().last_phase = PAIR_PHASE::GETSERVERCERT;
+  active = {};
+
+  auto active_retry = pending_session("client-a");
+  active_retry.client.cert = "bounded-certificate";
+  active_retry.async_insert_pin.salt = "00112233445566778899AABBCCDDEEFF";
+  EXPECT_EQ(
+    manager.add(std::move(active_retry), "192.0.2.1", "another-request-id", created + std::chrono::seconds {2}).status,
+    pairing_session_manager_t::add_status_e::DUPLICATE_UNIQUE_ID
+  );
+}
+
+TEST(PairingSessionManagerTest, RejectsOversizedOrMalformedStoredFields) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+
+  auto oversized_id = pending_session(std::string(PAIRING_UNIQUE_ID_MAX_BYTES + 1, 'a'));
+  EXPECT_EQ(
+    manager.add(std::move(oversized_id), "192.0.2.1", "oversized-id", now).status,
+    pairing_session_manager_t::add_status_e::INVALID_FIELDS
+  );
+
+  auto oversized_cert = pending_session("oversized-cert");
+  oversized_cert.client.cert.assign(PAIRING_CLIENT_CERT_MAX_BYTES + 1, 'c');
+  EXPECT_EQ(
+    manager.add(std::move(oversized_cert), "192.0.2.1", "oversized-cert-request", now).status,
+    pairing_session_manager_t::add_status_e::INVALID_FIELDS
+  );
+
+  auto oversized_salt = pending_session("oversized-salt");
+  oversized_salt.async_insert_pin.salt.assign(PAIRING_SALT_HEX_BYTES + 1, '0');
+  EXPECT_EQ(
+    manager.add(std::move(oversized_salt), "192.0.2.1", "oversized-salt-request", now).status,
+    pairing_session_manager_t::add_status_e::INVALID_FIELDS
+  );
+  EXPECT_EQ(manager.size(now), 0U);
+}
+
+TEST(PairingSessionManagerTest, ValidatesWireFieldBoundariesBeforeDecode) {
+  EXPECT_EQ(PAIRING_REQUEST_BUFFER_LIMIT, 64U * 1024U);
+  EXPECT_TRUE(is_valid_pairing_unique_id(std::string(PAIRING_UNIQUE_ID_MAX_BYTES, 'a')));
+  EXPECT_FALSE(is_valid_pairing_unique_id(std::string(PAIRING_UNIQUE_ID_MAX_BYTES + 1, 'a')));
+  EXPECT_FALSE(is_valid_pairing_unique_id(std::string("valid\0invalid", 13)));
+
+  EXPECT_TRUE(is_valid_pairing_hex("00112233445566778899AABBCCDDEEFF", PAIRING_SALT_HEX_BYTES, PAIRING_SALT_HEX_BYTES));
+  EXPECT_FALSE(is_valid_pairing_hex("00112233445566778899AABBCCDDEEF", PAIRING_SALT_HEX_BYTES, PAIRING_SALT_HEX_BYTES));
+  EXPECT_FALSE(is_valid_pairing_hex("00112233445566778899AABBCCDDEEFG", PAIRING_SALT_HEX_BYTES, PAIRING_SALT_HEX_BYTES));
+  EXPECT_TRUE(is_valid_pairing_hex(std::string(PAIRING_CLIENT_CERT_HEX_MAX_BYTES, 'A'), 2, PAIRING_CLIENT_CERT_HEX_MAX_BYTES));
+  EXPECT_FALSE(is_valid_pairing_hex(std::string(PAIRING_CLIENT_CERT_HEX_MAX_BYTES + 2, 'A'), 2, PAIRING_CLIENT_CERT_HEX_MAX_BYTES));
+}
+
+TEST(PairingHttpBoundaryTest, RejectsRequestHeadersBeyondConfiguredCap) {
+  SimpleWeb::Server<SimpleWeb::HTTP> server;
+  server.config.port = 0;
+  server.config.max_request_streambuf_size = PAIRING_REQUEST_BUFFER_LIMIT;
+  server.config.timeout_request = 1;
+  std::atomic<unsigned short> port {0};
+  std::atomic<bool> rejected {false};
+  server.on_error = [&](const auto &, const auto &) {
+    rejected = true;
+  };
+  server.resource["^/pair$"]["GET"] = [](const auto &response, const auto &) {
+    response->write("ok");
+  };
+
+  std::jthread server_thread([&] {
+    server.start([&](unsigned short assigned_port) {
+      port = assigned_port;
+    });
+  });
+  for (int wait = 0; wait < 100 && port == 0; ++wait) {
+    std::this_thread::sleep_for(std::chrono::milliseconds {10});
+  }
+  ASSERT_NE(port.load(), 0);
+
+  SimpleWeb::Client<SimpleWeb::HTTP> client {std::format("localhost:{}", port.load())};
+  client.config.timeout = 2;
+  try {
+    client.request("GET", "/pair?oversized=" + std::string(PAIRING_REQUEST_BUFFER_LIMIT, 'A'));
+  } catch (const std::exception &) {
+  }
+  for (int wait = 0; wait < 100 && !rejected; ++wait) {
+    std::this_thread::sleep_for(std::chrono::milliseconds {10});
+  }
+
+  server.stop();
+  server_thread.join();
+  EXPECT_TRUE(rejected.load());
+}
+
+TEST(PairingSessionManagerTest, ExpiresAtExactlyTwoMinutes) {
+  pairing_session_manager_t manager;
+  const auto created = pairing_session_manager_t::time_point_t {};
+
+  ASSERT_TRUE(manager.add(pending_session("client-a"), "192.0.2.1", "request-a", created));
+  EXPECT_EQ(manager.cleanup_expired(created + pairing_session_manager_t::SESSION_TTL - std::chrono::milliseconds {1}), 0U);
+  EXPECT_EQ(manager.size(created + pairing_session_manager_t::SESSION_TTL - std::chrono::milliseconds {1}), 1U);
+  auto retained = manager.find_pending_by_request_id("request-a", created);
+  ASSERT_TRUE(retained);
+  ASSERT_TRUE(retained.session().async_insert_pin.response.has_left());
+  EXPECT_EQ(manager.cleanup_expired(created + pairing_session_manager_t::SESSION_TTL), 1U);
+  EXPECT_FALSE(retained.session().async_insert_pin.response.has_left());
+  EXPECT_FALSE(retained.session().async_insert_pin.response.has_right());
+  EXPECT_EQ(manager.size(created + pairing_session_manager_t::SESSION_TTL), 0U);
+  EXPECT_FALSE(manager.find_pending_by_request_id("request-a", created + pairing_session_manager_t::SESSION_TTL));
+}
+
+TEST(PairingSessionManagerTest, CancellationReleasesHeldResponse) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+
+  ASSERT_TRUE(manager.add(pending_session("client-a"), "192.0.2.1", "request-a", now));
+  auto retained = manager.find_pending_by_request_id("request-a", now);
+  ASSERT_TRUE(retained);
+  ASSERT_TRUE(retained.session().async_insert_pin.response.has_left());
+
+  EXPECT_TRUE(manager.cancel_by_request_id("request-a"));
+  EXPECT_FALSE(retained.session().async_insert_pin.response.has_left());
+  EXPECT_FALSE(retained.session().async_insert_pin.response.has_right());
+  EXPECT_EQ(manager.size(now), 0U);
+  EXPECT_FALSE(manager.cancel_by_request_id("request-a"));
+}
+
+TEST(PairingSessionManagerTest, EnforcesThreePinAttemptLimit) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+
+  ASSERT_TRUE(manager.add(pending_session("client-a"), "192.0.2.1", "request-a", now));
+  auto stored = manager.find_pending_by_request_id("request-a", now);
+  ASSERT_TRUE(stored);
+  EXPECT_EQ(manager.record_pin_attempt(stored, now), pairing_session_manager_t::pin_attempt_status_e::ACCEPTED);
+  EXPECT_EQ(manager.record_pin_attempt(stored, now), pairing_session_manager_t::pin_attempt_status_e::ACCEPTED);
+  EXPECT_EQ(manager.record_pin_attempt(stored, now), pairing_session_manager_t::pin_attempt_status_e::SESSION_EXHAUSTED);
+  EXPECT_EQ(manager.record_pin_attempt(stored, now), pairing_session_manager_t::pin_attempt_status_e::SOURCE_RATE_LIMITED);
+}
+
+TEST(PairingSessionManagerTest, BindsHandshakeLookupToOriginalSource) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+
+  ASSERT_TRUE(manager.add(pending_session("client-a"), "192.0.2.1", "request-a", now));
+  auto matching = manager.find_by_unique_id("client-a", "192.0.2.1", now);
+  ASSERT_TRUE(matching);
+  EXPECT_EQ(matching.source(), "192.0.2.1");
+  matching = {};
+  EXPECT_FALSE(manager.find_by_unique_id("client-a", "192.0.2.2", now));
+}
+
+TEST(PairingSessionManagerTest, SourceBudgetSurvivesSessionCyclingAndExpires) {
+  pairing_session_manager_t manager;
+  const auto created = pairing_session_manager_t::time_point_t {};
+
+  for (std::size_t index = 0; index < pairing_session_manager_t::MAX_PIN_ATTEMPTS; ++index) {
+    const auto client = "client-" + std::to_string(index);
+    const auto request = "request-" + std::to_string(index);
+    ASSERT_TRUE(manager.add(pending_session(client), "192.0.2.1", request, created));
+    auto stored = manager.find_pending_by_request_id(request, created);
+    ASSERT_TRUE(stored);
+    EXPECT_EQ(manager.record_pin_attempt(stored, created), pairing_session_manager_t::pin_attempt_status_e::ACCEPTED);
+    stored = {};
+    manager.erase(client);
+  }
+
+  EXPECT_EQ(
+    manager.add(
+             pending_session("blocked-client"),
+             "192.0.2.1",
+             "blocked-request",
+             created + pairing_session_manager_t::SESSION_TTL - std::chrono::milliseconds {1}
+    )
+      .status,
+    pairing_session_manager_t::add_status_e::SOURCE_LIMIT
+  );
+  EXPECT_TRUE(manager.add(
+    pending_session("allowed-client"),
+    "192.0.2.1",
+    "allowed-request",
+    created + pairing_session_manager_t::SESSION_TTL
+  ));
+}
+
+TEST(PairingSessionManagerTest, CloseAtomicallyRejectsLateAdmissions) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+  std::vector<std::jthread> threads;
+
+  for (std::size_t index = 0; index < pairing_session_manager_t::MAX_GLOBAL_SESSIONS; ++index) {
+    threads.emplace_back([&, index] {
+      manager.add(
+        pending_session("client-" + std::to_string(index)),
+        "198.51.100." + std::to_string(index),
+        "request-" + std::to_string(index),
+        now
+      );
+    });
+  }
+  threads.emplace_back([&] {
+    manager.close();
+  });
+  threads.clear();
+
+  EXPECT_FALSE(manager.accepting());
+  EXPECT_EQ(manager.size(now), 0U);
+  EXPECT_EQ(
+    manager.add(pending_session("late-client"), "203.0.113.1", "late-request", now).status,
+    pairing_session_manager_t::add_status_e::CLOSED
+  );
+}
+
+TEST(PairingSessionManagerTest, EnforcesPerSourceAndGlobalCaps) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+
+  for (std::size_t index = 0; index < pairing_session_manager_t::MAX_SESSIONS_PER_SOURCE; ++index) {
+    ASSERT_TRUE(manager.add(pending_session("shared-" + std::to_string(index)), "192.0.2.1", "shared-request-" + std::to_string(index), now));
+  }
+  EXPECT_EQ(
+    manager.add(pending_session("source-overflow"), "192.0.2.1", "source-overflow-request", now).status,
+    pairing_session_manager_t::add_status_e::SOURCE_LIMIT
+  );
+
+  for (std::size_t index = pairing_session_manager_t::MAX_SESSIONS_PER_SOURCE; index < pairing_session_manager_t::MAX_GLOBAL_SESSIONS; ++index) {
+    ASSERT_TRUE(manager.add(
+      pending_session("global-" + std::to_string(index)),
+      "198.51.100." + std::to_string(index),
+      "global-request-" + std::to_string(index),
+      now
+    ));
+  }
+  EXPECT_EQ(
+    manager.add(pending_session("global-overflow"), "203.0.113.1", "global-overflow-request", now).status,
+    pairing_session_manager_t::add_status_e::GLOBAL_LIMIT
+  );
+}
+
+TEST(PairingSessionManagerTest, ConcurrentAddsRemainBounded) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+  std::atomic<std::size_t> added {0};
+  std::vector<std::jthread> threads;
+
+  for (std::size_t index = 0; index < pairing_session_manager_t::MAX_GLOBAL_SESSIONS * 2; ++index) {
+    threads.emplace_back([&, index] {
+      if (manager.add(
+            pending_session("client-" + std::to_string(index)),
+            "203.0.113." + std::to_string(index),
+            "request-" + std::to_string(index),
+            now
+          )) {
+        ++added;
+      }
+    });
+  }
+  threads.clear();
+
+  EXPECT_EQ(added.load(), pairing_session_manager_t::MAX_GLOBAL_SESSIONS);
+  EXPECT_EQ(manager.size(now), pairing_session_manager_t::MAX_GLOBAL_SESSIONS);
+}
+
+TEST(PairingSessionManagerTest, ConcurrentMaximumSizeSessionsRemainMemoryBounded) {
+  pairing_session_manager_t manager;
+  const auto now = pairing_session_manager_t::time_point_t {};
+  std::vector<std::jthread> threads;
+
+  for (std::size_t index = 0; index < pairing_session_manager_t::MAX_GLOBAL_SESSIONS * 2; ++index) {
+    threads.emplace_back([&, index] {
+      auto session = pending_session("large-client-" + std::to_string(index));
+      session.client.cert.assign(PAIRING_CLIENT_CERT_MAX_BYTES, 'c');
+      manager.add(
+        std::move(session),
+        "203.0.113." + std::to_string(index),
+        "large-request-" + std::to_string(index),
+        now
+      );
+    });
+  }
+  threads.clear();
+
+  EXPECT_EQ(manager.size(now), pairing_session_manager_t::MAX_GLOBAL_SESSIONS);
+  EXPECT_LE(
+    manager.size(now) * PAIRING_CLIENT_CERT_MAX_BYTES,
+    pairing_session_manager_t::MAX_GLOBAL_SESSIONS * PAIRING_CLIENT_CERT_MAX_BYTES
+  );
 }
