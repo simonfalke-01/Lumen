@@ -4,6 +4,14 @@
  */
 #pragma once
 
+// standard includes
+#include <atomic>
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+
 // platform includes
 #include <d3d11.h>
 #include <d3d11_4.h>
@@ -15,9 +23,11 @@
 #include <winrt/windows.graphics.capture.h>
 
 // local includes
+#include "fused_d3d11_policy.h"
 #include "src/platform/common.h"
 #include "src/utility.h"
 #include "src/video.h"
+#include "virtual_display_frame.h"
 
 namespace platf::dxgi {
   extern const char *format_str[];
@@ -576,7 +586,121 @@ namespace platf::dxgi {
      */
     std::unique_ptr<nvenc_encode_device_t> make_nvenc_encode_device(pix_fmt_e pix_fmt) override;
 
+    /**
+     * @brief Add one encoder that owns the fused same-device capture resource mode.
+     *
+     * @return True when fused ownership is committed and the consumer was recorded.
+     */
+    bool acquire_fused_nvenc() {
+      return encode_resource_ownership->acquire_consumer(fused_d3d11::resource_mode_e::fused);
+    }
+
+    /**
+     * @brief Release one encoder's fused same-device capture resource-mode ownership.
+     */
+    void release_fused_nvenc() {
+      const bool released = encode_resource_ownership->release_consumer(fused_d3d11::resource_mode_e::fused);
+      assert(released);
+      (void) released;
+      if (encode_resource_ownership->reinit_required()) {
+        encode_resource_ownership->reset_after_reinit();
+      }
+    }
+
+    /**
+     * @brief Report whether this display currently has committed fused capture resources.
+     *
+     * @return True when the capture pool must omit legacy cross-device sharing boundaries.
+     */
+    bool fused_nvenc_is_active() const {
+      return encode_resource_ownership->state() == fused_d3d11::resource_state_e::fused;
+    }
+
+    /**
+     * @brief Add one encoder that owns the legacy cross-device capture resource mode.
+     *
+     * @return True when legacy ownership is committed and the consumer was recorded.
+     */
+    bool acquire_legacy_encoder() {
+      return encode_resource_ownership->acquire_consumer(fused_d3d11::resource_mode_e::legacy);
+    }
+
+    /**
+     * @brief Release one encoder's legacy cross-device capture resource-mode ownership.
+     */
+    void release_legacy_encoder() {
+      const bool released = encode_resource_ownership->release_consumer(fused_d3d11::resource_mode_e::legacy);
+      assert(released);
+      (void) released;
+    }
+
+    /**
+     * @brief Report whether this display currently has committed legacy shared capture resources.
+     *
+     * @return True when the capture pool must retain cross-device sharing boundaries.
+     */
+    bool legacy_encoder_is_active() const {
+      return encode_resource_ownership->state() == fused_d3d11::resource_state_e::legacy;
+    }
+
+    /** @brief Report whether frames arrive from the concrete VDD texture/fence channel. */
+    [[nodiscard]] virtual bool direct_vdd_is_active() const noexcept {
+      return false;
+    }
+
+    /** @brief Quarantine a failed direct VDD source before DDA/WGC reinitialization. */
+    virtual void disable_direct_vdd() noexcept {
+    }
+
+    /**
+     * @brief Lock the capture immediate context across ownership transitions and fused rendering.
+     *
+     * @return Owning lock that prevents context use during a resource-mode transition.
+     */
+    std::unique_lock<std::mutex> lock_fused_context() {
+      return std::unique_lock(fused_context_mutex);
+    }
+
+    /** @brief Request capture-pool reinitialization after a fused-path failure. */
+    void request_fused_reinit();
+
+    /** @brief Return whether capture must stop and rebuild its image pool. */
+    bool fused_reinit_required() const {
+      return encode_resource_ownership->reinit_required();
+    }
+
     std::atomic<uint32_t> next_image_id;  ///< Next image ID.
+    std::shared_ptr<fused_d3d11::resource_ownership_t> encode_resource_ownership = std::make_shared<fused_d3d11::resource_ownership_t>();  ///< Shared transition state retained by capture images.
+    std::mutex fused_context_mutex;  ///< Serializes complete immediate-context transactions across capture and encode threads.
+  };
+
+  /** @brief Production one-copy VDD capture backend using driver-owned shared slots. */
+  class display_vdd_vram_t final: public display_vram_t {
+  public:
+    /** @brief Bind the imported VDD source to its exact D3D11 adapter and device. */
+    int init(const ::video::config_t &config, const std::string &display_name);
+    /** @brief Acquire one generation/slot lease and expose its texture directly. */
+    capture_e snapshot(
+      const pull_free_image_cb_t &pull_free_image_cb,
+      std::shared_ptr<platf::img_t> &img_out,
+      std::chrono::milliseconds timeout,
+      bool cursor_visible
+    ) override;
+    /** @brief IddCx owns source acquisition; no DDA/WGC frame remains to release. */
+    capture_e release_snapshot() override;
+    /** @brief Direct-frame v1 is explicitly SDR-only. */
+    bool is_hdr() override;
+    /** @brief Direct-frame v1 has no HDR metadata. */
+    bool get_hdr_metadata(SS_HDR_METADATA &metadata) override;
+    /** @brief Return the sole supported driver surface format. */
+    std::vector<DXGI_FORMAT> get_supported_capture_formats() override;
+    /** @brief Return true for this concrete production direct VDD source. */
+    [[nodiscard]] bool direct_vdd_is_active() const noexcept override;
+    /** @brief Stop the production source so the next display factory pass uses DDA/WGC. */
+    void disable_direct_vdd() noexcept override;
+
+  private:
+    std::shared_ptr<virtual_display::frame_source_t> source_;  ///< Exact generation-owned source.
   };
 
   /**
@@ -820,4 +944,9 @@ namespace platf::dxgi {
      */
     capture_e release_snapshot() override;
   };
+
+  /**
+   * @brief Return the exact adapter, driver, and output opened by the latest successful display initialization.
+   */
+  std::optional<::video::encoder_probe_device_identity_t> encoder_probe_device_identity();
 }  // namespace platf::dxgi

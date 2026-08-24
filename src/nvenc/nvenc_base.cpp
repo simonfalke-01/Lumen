@@ -19,7 +19,12 @@
 #include "nvenc_utils.h"
 #include "src/config.h"
 #include "src/logging.h"
+#include "src/stream_policy.h"
 #include "src/utility.h"
+
+#ifdef _WIN32
+  #include "src/platform/windows/fused_d3d11_policy.h"
+#endif
 
 namespace {
 
@@ -180,6 +185,50 @@ namespace {
     return "Unknown";
   }
 
+  std::string_view fidelity_class_name(const stream_policy::SelectedFidelityClass fidelity) {
+    using enum stream_policy::SelectedFidelityClass;
+    switch (fidelity) {
+      case legacy_rate_controlled:
+        return "legacy-rate-controlled";
+      case latency_rate_controlled:
+        return "latency-rate-controlled";
+      case visually_lossless_rate_controlled:
+        return "visually-lossless-rate-controlled";
+      case codec_lossless_yuv420_8bit:
+        return "codec-lossless-yuv420-8bit";
+      case codec_lossless_yuv420_10bit:
+        return "codec-lossless-yuv420-10bit";
+      case codec_lossless_yuv444_8bit:
+        return "codec-lossless-yuv444-8bit";
+      case codec_lossless_yuv444_10bit:
+        return "codec-lossless-yuv444-10bit";
+      case rejected:
+        return "rejected";
+    }
+    return "unknown";
+  }
+
+  std::string_view fidelity_rejection_name(const stream_policy::FidelityRejectionReason rejection) {
+    using enum stream_policy::FidelityRejectionReason;
+    switch (rejection) {
+      case none:
+        return "none";
+      case quality_mode_required:
+        return "quality-mode-required";
+      case decoder_tuple_unproven:
+        return "decoder-tuple-unproven";
+      case encoder_lossless_unavailable:
+        return "encoder-lossless-unavailable";
+      case bit_depth_unavailable:
+        return "bit-depth-unavailable";
+      case chroma_unavailable:
+        return "chroma-unavailable";
+      case h264_high444_required:
+        return "h264-high444-required";
+    }
+    return "unknown";
+  }
+
 }  // namespace
 
 namespace NVENC_NAMESPACE {
@@ -202,7 +251,12 @@ namespace NVENC_NAMESPACE {
     return 0;
   }
 
-  bool nvenc_base::validate_encoder_capabilities(const GUID &encode_guid, NV_ENC_BUFFER_FORMAT buffer_format) {
+  bool nvenc_base::validate_encoder_capabilities(
+    const GUID &encode_guid,
+    const NV_ENC_BUFFER_FORMAT buffer_format,
+    const ::nvenc::nvenc_config &config,
+    const video::config_t &client_config
+  ) {
     const auto supported_width = get_encoder_cap(encode_guid, NV_ENC_CAPS_WIDTH_MAX);
     const auto supported_height = get_encoder_cap(encode_guid, NV_ENC_CAPS_HEIGHT_MAX);
     if (encoder_params.width > supported_width || encoder_params.height > supported_height) {
@@ -210,14 +264,42 @@ namespace NVENC_NAMESPACE {
                        << ", requested " << encoder_params.width << "x" << encoder_params.height;
       return false;
     }
-    if (buffer_is_10bit(buffer_format) && !get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_10BIT_ENCODE)) {
+    const bool supports_10bit = !buffer_is_10bit(buffer_format) ||
+                                get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_10BIT_ENCODE);
+    if (!supports_10bit) {
       BOOST_LOG(error) << "NvEnc: gpu doesn't support 10-bit encode";
       return false;
     }
-    if (buffer_is_yuv444(buffer_format) && !get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE)) {
+    const bool supports_yuv444 = !buffer_is_yuv444(buffer_format) ||
+                                 get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
+    if (!supports_yuv444) {
       BOOST_LOG(error) << "NvEnc: gpu doesn't support YUV444 encode";
       return false;
     }
+    const bool supports_lossless = get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_LOSSLESS_ENCODE);
+    stream_policy::record_nvenc_lossless_capability(client_config.videoFormat, supports_lossless);
+    const auto *policy = stream_policy::current_thread_policy();
+    const auto request = config.fidelity == ::nvenc::nvenc_fidelity::codec_lossless_required ?
+                           stream_policy::StreamFidelityRequest::codec_lossless_required :
+                           stream_policy::StreamFidelityRequest::unspecified;
+    const auto selection = stream_policy::select_fidelity(
+      policy ? policy->mode : stream_policy::StreamOptimizationMode::legacy,
+      request,
+      stream_policy::FidelityProof {
+        client_config.videoFormat,
+        buffer_is_10bit(buffer_format) ? 10 : 8,
+        buffer_is_yuv444(buffer_format),
+        policy && policy->fidelity_request == stream_policy::StreamFidelityRequest::codec_lossless_required,
+        supports_lossless,
+        supports_10bit,
+        supports_yuv444,
+      }
+    );
+    if (selection.selected == stream_policy::SelectedFidelityClass::rejected) {
+      BOOST_LOG(error) << "NvEnc: codec-lossless request rejected: " << fidelity_rejection_name(selection.rejection);
+      return false;
+    }
+    selected_fidelity_ = selection.selected;
     if (async_event_handle && !get_encoder_cap(encode_guid, NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT)) {
       BOOST_LOG(warning) << "NvEnc: gpu doesn't support async encode";
       async_event_handle = nullptr;
@@ -259,6 +341,17 @@ namespace NVENC_NAMESPACE {
   ) {
     enc_config.gopLength = NVENC_INFINITE_GOPLENGTH;
     enc_config.frameIntervalP = 1;
+
+    if (config.fidelity == ::nvenc::nvenc_fidelity::codec_lossless_required) {
+      ::nvenc::apply_lossless_rate_control(
+        enc_config.rcParams,
+        NV_ENC_RC_PARAMS_VER,
+        NV_ENC_PARAMS_RC_CONSTQP,
+        NV_ENC_MULTI_PASS_DISABLED
+      );
+      return;
+    }
+
     enc_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
     enc_config.rcParams.zeroReorderDelay = 1;
     enc_config.rcParams.enableLookahead = 0;
@@ -366,6 +459,9 @@ namespace NVENC_NAMESPACE {
     format_config.sliceModeData = client_config.slicesPerFrame;
     if (buffer_is_yuv444(buffer_format)) {
       format_config.chromaFormatIDC = 3;
+    }
+    if (config.fidelity == ::nvenc::nvenc_fidelity::codec_lossless_required) {
+      format_config.qpPrimeYZeroTransformBypassFlag = 1;
     }
     format_config.enableFillerDataInsertion = config.insert_filler_data;
     format_config.entropyCodingMode = config.h264_cavlc || !get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_CABAC) ?
@@ -547,6 +643,10 @@ namespace NVENC_NAMESPACE {
     if (config.insert_filler_data) {
       extra += " filler-data";
     }
+    extra += std::format(" fidelity={}", fidelity_class_name(selected_fidelity_));
+    if (config.fidelity == ::nvenc::nvenc_fidelity::codec_lossless_required) {
+      extra += " source-rgb-and-color-conversion-not-proven";
+    }
 #if NVENC_SDK_VERSION >= 1300
     if (client_config.videoFormat > 0 && get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_NUM_ENCODER_ENGINES) > 1) {
       if (init_params.splitEncodeMode == NV_ENC_SPLIT_AUTO_MODE) {
@@ -563,11 +663,13 @@ namespace NVENC_NAMESPACE {
   }
 
   bool nvenc_base::create_encoder(
-    const ::nvenc::nvenc_config &config,
+    const ::nvenc::nvenc_config &configured_nvenc,
     const video::config_t &client_config,
     const video::sunshine_colorspace_t &sunshine_colorspace,
     platf::pix_fmt_e sunshine_buffer_format
   ) {
+    const auto effective_nvenc = stream_policy::current_thread_nvenc_config(configured_nvenc);
+
     if (!nvenc && !init_library()) {
       return false;
     }
@@ -630,15 +732,25 @@ namespace NVENC_NAMESPACE {
       BOOST_LOG(error) << "NvEnc: encoding format is not supported by the gpu";
       return false;
     }
-    if (!validate_encoder_capabilities(init_params.encodeGUID, buffer_format)) {
+    if (!validate_encoder_capabilities(init_params.encodeGUID, buffer_format, effective_nvenc, client_config)) {
       return false;
     }
 
-    init_params.presetGUID = quality_preset_guid_from_number(config.quality_preset);
-    init_params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+    init_params.presetGUID = quality_preset_guid_from_number(effective_nvenc.quality_preset);
+    switch (effective_nvenc.tuning) {
+      case ::nvenc::nvenc_tuning::ultra_low_latency:
+        init_params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+        break;
+      case ::nvenc::nvenc_tuning::high_quality:
+        init_params.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+        break;
+      case ::nvenc::nvenc_tuning::lossless:
+        init_params.tuningInfo = NV_ENC_TUNING_INFO_LOSSLESS;
+        break;
+    }
     init_params.enablePTD = 1;
     init_params.enableEncodeAsync = async_event_handle ? 1 : 0;
-    init_params.enableWeightedPrediction = config.weighted_prediction &&
+    init_params.enableWeightedPrediction = effective_nvenc.weighted_prediction &&
                                            get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_WEIGHTED_PREDICTION);
     init_params.encodeWidth = encoder_params.width;
     init_params.darWidth = encoder_params.width;
@@ -647,7 +759,7 @@ namespace NVENC_NAMESPACE {
     const AVRational fps = video::framerate_to_rational(client_config);
     init_params.frameRateNum = fps.num;
     init_params.frameRateDen = fps.den;
-    configure_split_frame(init_params, config, client_config);
+    configure_split_frame(init_params, effective_nvenc, client_config);
 
     NV_ENC_PRESET_CONFIG preset_config = {
       .version = NV_ENC_PRESET_CONFIG_VER,
@@ -660,8 +772,8 @@ namespace NVENC_NAMESPACE {
 
     NV_ENC_CONFIG enc_config = preset_config.presetCfg;
     enc_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
-    configure_rate_control(enc_config, config, client_config, init_params.encodeGUID);
-    configure_codec(enc_config, config, client_config, colorspace, buffer_format, init_params.encodeGUID);
+    configure_rate_control(enc_config, effective_nvenc, client_config, init_params.encodeGUID);
+    configure_codec(enc_config, effective_nvenc, client_config, colorspace, buffer_format, init_params.encodeGUID);
     init_params.encodeConfig = &enc_config;
     if (!initialize_encoder_resources(init_params)) {
       return false;
@@ -670,7 +782,7 @@ namespace NVENC_NAMESPACE {
     auto frame_size_format = stat_trackers::two_digits_after_decimal();
     BOOST_LOG(debug) << "NvEnc: requested encoded frame size "
                      << frame_size_format % (client_config.bitrate / 8. / client_config.framerate) << " kB";
-    log_created_encoder(init_params, enc_config, config, client_config, buffer_format);
+    log_created_encoder(init_params, enc_config, effective_nvenc, client_config, buffer_format);
 
     encoder_state = {};
     fail_guard.disable();
@@ -678,6 +790,9 @@ namespace NVENC_NAMESPACE {
   }
 
   void nvenc_base::destroy_encoder() {
+#ifdef _WIN32
+    frame_trace_owner_.reset();
+#endif
     if (output_bitstream) {
       if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
         BOOST_LOG(error) << "NvEnc: NvEncDestroyBitstreamBuffer() failed: " << last_nvenc_error_string;
@@ -724,7 +839,25 @@ namespace NVENC_NAMESPACE {
     NV_ENC_MAP_INPUT_RESOURCE mapped_input_buffer = {NV_ENC_MAP_INPUT_RESOURCE_VER};
     mapped_input_buffer.registeredResource = registered_input_buffer;
 
-    if (nvenc_failed(nvenc->nvEncMapInputResource(encoder, &mapped_input_buffer))) {
+#ifdef _WIN32
+    const auto telemetry_map_call_entry_ns = platf::dxgi::fused_d3d11::telemetry_t::now_ns();
+#endif
+    const auto map_status = nvenc->nvEncMapInputResource(encoder, &mapped_input_buffer);
+#ifdef _WIN32
+    const auto explicit_telemetry_token = frame_trace_owner_.token();
+    const auto telemetry_trace = platf::dxgi::fused_d3d11::telemetry().record_nvenc_map_call_entry(
+      explicit_telemetry_token,
+      frame_index,
+      telemetry_map_call_entry_ns
+    );
+    auto telemetry_guard = util::fail_guard([this]() {
+      frame_trace_owner_.reset();
+    });
+#endif
+    if (nvenc_failed(map_status)) {
+#ifdef _WIN32
+      platf::dxgi::fused_d3d11::telemetry().record_nvenc_map_failure(telemetry_trace);
+#endif
       BOOST_LOG(error) << "NvEnc: NvEncMapInputResource() failed: " << last_nvenc_error_string;
       return {};
     }
@@ -749,20 +882,46 @@ namespace NVENC_NAMESPACE {
       BOOST_LOG(error) << "NvEnc: NvEncEncodePicture() failed: " << last_nvenc_error_string;
       return {};
     }
-
     NV_ENC_LOCK_BITSTREAM lock_bitstream = {NV_ENC_LOCK_BITSTREAM_VER};
     lock_bitstream.outputBitstream = output_bitstream;
     lock_bitstream.doNotWait = async_event_handle ? 1 : 0;
 
+#ifdef _WIN32
+    const auto telemetry_wait_lock_begin_ns = platf::dxgi::fused_d3d11::telemetry_t::now_ns();
+#endif
     if (async_event_handle && !wait_for_async_event(100)) {
+#ifdef _WIN32
+      platf::dxgi::fused_d3d11::telemetry().record_nvenc_wait_timeout(telemetry_trace);
+#endif
       BOOST_LOG(error) << "NvEnc: frame " << frame_index << " encode wait timeout";
       return {};
     }
 
-    if (nvenc_failed(nvenc->nvEncLockBitstream(encoder, &lock_bitstream))) {
+    const auto lock_status = nvenc->nvEncLockBitstream(encoder, &lock_bitstream);
+#ifdef _WIN32
+    const auto telemetry_bitstream_locked_ns = platf::dxgi::fused_d3d11::telemetry_t::now_ns();
+    platf::dxgi::fused_d3d11::telemetry().record_nvenc_wait_lock_begin(
+      telemetry_trace,
+      telemetry_wait_lock_begin_ns
+    );
+#endif
+    if (nvenc_failed(lock_status)) {
+#ifdef _WIN32
+      platf::dxgi::fused_d3d11::telemetry().record_nvenc_lock_failure(telemetry_trace);
+#endif
       BOOST_LOG(error) << "NvEnc: NvEncLockBitstream() failed: " << last_nvenc_error_string;
       return {};
     }
+#ifdef _WIN32
+    platf::dxgi::fused_d3d11::telemetry().record_nvenc_bitstream_locked(
+      telemetry_trace,
+      telemetry_bitstream_locked_ns
+    );
+    if (telemetry_trace) {
+      (void) frame_trace_owner_.release();
+      telemetry_guard.disable();
+    }
+#endif
 
     auto data_pointer = (uint8_t *) lock_bitstream.bitstreamBufferPtr;
     ::nvenc::nvenc_encoded_frame encoded_frame {

@@ -8,6 +8,7 @@
 
   // local includes
   #include "nvenc_utils.h"
+  #include "src/platform/windows/fused_d3d11_policy.h"
 
 namespace NVENC_NAMESPACE {
 
@@ -18,6 +19,7 @@ namespace NVENC_NAMESPACE {
   }
 
   nvenc_d3d11_native::~nvenc_d3d11_native() {
+    clear_frame_telemetry_token();
     if (encoder) {
       destroy_encoder();
     }
@@ -26,6 +28,25 @@ namespace NVENC_NAMESPACE {
   ID3D11Texture2D *
     nvenc_d3d11_native::get_input_texture() {
     return d3d_input_texture.GetInterfacePtr();
+  }
+
+  void nvenc_d3d11_native::set_fused_input_enabled(bool enabled) {
+    fused_input_enabled = enabled;
+    if (!enabled) {
+      clear_frame_telemetry_token();
+    }
+  }
+
+  bool nvenc_d3d11_native::set_frame_telemetry_token(std::uint64_t token) {
+    pending_frame_trace = platf::dxgi::fused_d3d11::frame_trace_owner_t {
+      platf::dxgi::fused_d3d11::telemetry(),
+      {token},
+    };
+    return true;
+  }
+
+  void nvenc_d3d11_native::clear_frame_telemetry_token() {
+    pending_frame_trace.reset();
   }
 
   bool nvenc_d3d11_native::create_and_register_input_buffer() {
@@ -67,6 +88,16 @@ namespace NVENC_NAMESPACE {
       registered_input_buffer = register_resource.registeredResource;
     }
 
+    return true;
+  }
+
+  bool nvenc_d3d11_native::synchronize_input_buffer() {
+    // Conversion and encode submission use the same immediate context in fused mode.
+    // D3D11 preserves command order, so no Flush(), keyed mutex, or copy is required here.
+    if (fused_input_enabled && pending_frame_trace) {
+      platf::dxgi::fused_d3d11::telemetry().record_nvenc_map_entry();
+    }
+    set_frame_trace_owner(std::move(pending_frame_trace));
     return true;
   }
 

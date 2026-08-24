@@ -4,6 +4,9 @@
  */
 #pragma once
 
+// standard includes
+#include <utility>
+
 // local includes
 #include "nvenc_colorspace.h"
 #include "nvenc_config.h"
@@ -11,8 +14,13 @@
 #include "nvenc_encoder.h"
 #include "nvenc_sdk.h"
 #include "src/logging.h"
+#include "src/stream_policy.h"
 #include "src/video.h"
 #include "src/video_colorspace.h"
+
+#ifdef _WIN32
+  #include "src/platform/windows/fused_d3d11_policy.h"
+#endif
 
 /**
  * @brief Standalone NVENC encoder
@@ -100,6 +108,14 @@ namespace NVENC_NAMESPACE {
       return true;
     }
 
+#ifdef _WIN32
+    void set_frame_trace_owner(
+      platf::dxgi::fused_d3d11::frame_trace_owner_t owner
+    ) noexcept {
+      frame_trace_owner_ = std::move(owner);
+    }
+#endif
+
     /**
      * @brief Optional. Override if you want to create encoder in async mode.
      *        In this case must also set `async_event_handle` variable.
@@ -157,9 +173,16 @@ namespace NVENC_NAMESPACE {
      *
      * @param encode_guid Selected codec GUID.
      * @param buffer_format Selected NVENC input format.
+     * @param config Effective fidelity and encoder settings.
+     * @param client_config Exact codec tuple requested by the client.
      * @return `true` when the request is supported, otherwise `false`.
      */
-    bool validate_encoder_capabilities(const GUID &encode_guid, NV_ENC_BUFFER_FORMAT buffer_format);
+    bool validate_encoder_capabilities(
+      const GUID &encode_guid,
+      NV_ENC_BUFFER_FORMAT buffer_format,
+      const ::nvenc::nvenc_config &config,
+      const video::config_t &client_config
+    );
 
     /**
      * @brief Configure split-frame encoding for the selected SDK.
@@ -188,6 +211,8 @@ namespace NVENC_NAMESPACE {
       const video::config_t &client_config,
       const GUID &encode_guid
     );
+
+    stream_policy::SelectedFidelityClass selected_fidelity_ = stream_policy::SelectedFidelityClass::legacy_rate_controlled;  ///< Proven fidelity for the active encoder.
 
     /**
      * @brief Configure the requested reference-frame count.
@@ -329,6 +354,10 @@ namespace NVENC_NAMESPACE {
     ) const;
 
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
+
+#ifdef _WIN32
+    platf::dxgi::fused_d3d11::frame_trace_owner_t frame_trace_owner_;
+#endif
 
     struct {
       uint64_t last_encoded_frame_index = 0;

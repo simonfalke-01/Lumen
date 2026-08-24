@@ -3,7 +3,15 @@
  * @brief Definitions for handling video ram.
  */
 // standard includes
+#include <charconv>
 #include <cmath>
+#include <cstdint>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
 
 // platform includes
 #include <d3dcompiler.h>
@@ -20,11 +28,13 @@ extern "C" {
 
 // local includes
 #include "display.h"
+#include "fused_d3d11_policy.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/nvenc/nvenc_config.h"
 #include "src/nvenc/nvenc_dynamic_factory.h"
+#include "src/stream_policy.h"
 #include "src/video.h"
 #include "utf_utils.h"
 
@@ -49,6 +59,239 @@ static void free_frame(AVFrame *frame) {
 using frame_t = util::safe_ptr<AVFrame, free_frame>;
 
 namespace platf::dxgi {
+
+  namespace {
+    /**
+     * @brief Name of the explicit opt-in gate for the experimental fused path.
+     */
+    constexpr auto fused_runtime_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC";
+
+    /**
+     * @brief Name of the RTX 4060 hardware acknowledgement gate.
+     */
+    constexpr auto fused_hardware_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_HARDWARE_VALIDATED";
+
+    /**
+     * @brief Name of the exact validated driver-version gate.
+     */
+    constexpr auto fused_driver_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_VALIDATED_DRIVER";
+    constexpr auto fused_luid_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_ADAPTER_LUID";  ///< Exact validated adapter LUID.
+    constexpr auto fused_vendor_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_VENDOR_ID";  ///< Exact validated PCI vendor ID.
+    constexpr auto fused_device_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_DEVICE_ID";  ///< Exact validated PCI device ID.
+    constexpr auto fused_subsystem_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_SUBSYSTEM_ID";  ///< Exact validated PCI subsystem ID.
+    constexpr auto fused_revision_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_REVISION";  ///< Exact validated PCI revision.
+    constexpr auto fused_model_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_MODEL";  ///< Exact validated adapter description.
+    constexpr auto fused_output_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_OUTPUT";  ///< Exact validated DXGI output name.
+    std::atomic_bool fused_runtime_quarantined {false};  ///< Process-wide fail-closed quarantine after a fused-path failure.
+
+    /** @brief Map the immutable client configuration to an isolated telemetry profile. */
+    fused_d3d11::telemetry_profile_e telemetry_profile(const ::video::config_t &config) noexcept {
+      if (!config.optimization_policy) {
+        return fused_d3d11::telemetry_profile_e::unknown;
+      }
+      return fused_d3d11::telemetry_profile_for(config.optimization_policy->mode);
+    }
+
+    /** @brief Map the exact immutable negotiation/transport source without inference. */
+    fused_d3d11::telemetry_client_e telemetry_client(const ::video::config_t &config) noexcept {
+      return fused_d3d11::telemetry_client_for(config.client_protocol);
+    }
+
+    /**
+     * @brief Read one process environment variable without a fixed-size buffer.
+     *
+     * @param name Environment variable name.
+     * @return Environment value, or an empty optional when absent or unreadable.
+     */
+    std::optional<std::string> environment_value(const char *name) {
+      const auto required = GetEnvironmentVariableA(name, nullptr, 0);
+      if (required == 0) {
+        return std::nullopt;
+      }
+
+      std::string value(required, '\0');
+      const auto written = GetEnvironmentVariableA(name, value.data(), required);
+      if (written == 0 || written >= required) {
+        return std::nullopt;
+      }
+      value.resize(written);
+      return value;
+    }
+
+    /**
+     * @brief Parse an unsigned decimal environment value.
+     *
+     * @param value Decimal string to parse.
+     * @return Parsed integer, or an empty optional when the entire string is not valid decimal.
+     */
+    std::optional<std::uint64_t> parse_decimal_u64(std::string_view value) {
+      std::uint64_t parsed = 0;
+      const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
+      if (result.ec != std::errc {} || result.ptr != value.data() + value.size()) {
+        return std::nullopt;
+      }
+      return parsed;
+    }
+
+    /** @brief Convert a Windows LUID into its stable 64-bit value. */
+    std::uint64_t luid_value(const LUID &luid) {
+      return static_cast<std::uint64_t>(static_cast<std::uint32_t>(luid.HighPart)) << 32 |
+             static_cast<std::uint64_t>(luid.LowPart);
+    }
+
+    /** @brief Match an exact decimal environment value against an actual identity field. */
+    bool environment_decimal_matches(const char *name, std::uint64_t actual) {
+      const auto value = environment_value(name);
+      const auto parsed = value ? parse_decimal_u64(*value) : std::nullopt;
+      return parsed && *parsed == actual;
+    }
+
+    /** @brief Verify that the capture device and immediate context share COM identity. */
+    bool context_matches_device(ID3D11Device *device, ID3D11DeviceContext *context) {
+      ID3D11Device *context_device = nullptr;
+      context->GetDevice(&context_device);
+      if (!context_device) {
+        return false;
+      }
+      auto release_context_device = util::fail_guard([&]() {
+        context_device->Release();
+      });
+      IUnknown *device_identity = nullptr;
+      IUnknown *context_identity = nullptr;
+      if (FAILED(device->QueryInterface(IID_IUnknown, (void **) &device_identity)) ||
+          FAILED(context_device->QueryInterface(IID_IUnknown, (void **) &context_identity))) {
+        if (device_identity) {
+          device_identity->Release();
+        }
+        return false;
+      }
+      const bool matches = device_identity == context_identity;
+      device_identity->Release();
+      context_identity->Release();
+      return matches;
+    }
+
+    /** @brief Map a failed image completion to reinit only when fused rollback requested it. */
+    capture_e capture_completion_failure(const display_vram_t &display) {
+      return fused_d3d11::classify_capture_failure(display.fused_reinit_required()) == fused_d3d11::capture_failure_e::reinitialize ?
+               capture_e::reinit :
+               capture_e::error;
+    }
+
+    /**
+     * @brief Map a Sunshine pixel format to the pure fused-path policy format.
+     *
+     * @param format Sunshine encoder input format.
+     * @return Policy surface format.
+     */
+    fused_d3d11::surface_format_e fused_surface_format(pix_fmt_e format) {
+      switch (format) {
+        case pix_fmt_e::nv12:
+          return fused_d3d11::surface_format_e::nv12;
+        case pix_fmt_e::p010:
+          return fused_d3d11::surface_format_e::p010;
+        default:
+          return fused_d3d11::surface_format_e::unsupported;
+      }
+    }
+
+    /**
+     * @brief Verify that a D3D11 device resolves to the expected adapter LUID.
+     *
+     * @param device D3D11 device whose adapter is queried.
+     * @param expected Expected capture adapter.
+     * @return True when both adapters report the same LUID.
+     */
+    bool device_uses_adapter(ID3D11Device *device, IDXGIAdapter1 *expected) {
+      dxgi_t dxgi_device;
+      if (FAILED(device->QueryInterface(IID_IDXGIDevice, (void **) &dxgi_device))) {
+        return false;
+      }
+
+      IDXGIAdapter *adapter_raw = nullptr;
+      if (FAILED(dxgi_device->GetAdapter(&adapter_raw))) {
+        return false;
+      }
+      auto release_adapter = util::fail_guard([&]() {
+        adapter_raw->Release();
+      });
+
+      DXGI_ADAPTER_DESC actual_desc {};
+      DXGI_ADAPTER_DESC1 expected_desc {};
+      if (FAILED(adapter_raw->GetDesc(&actual_desc)) || FAILED(expected->GetDesc1(&expected_desc))) {
+        return false;
+      }
+
+      return actual_desc.AdapterLuid.HighPart == expected_desc.AdapterLuid.HighPart &&
+             actual_desc.AdapterLuid.LowPart == expected_desc.AdapterLuid.LowPart;
+    }
+
+    /**
+     * @brief Build the fail-closed fused-path request for one display and surface format.
+     *
+     * @param display Capture display whose exact device, adapter, output, HDR, and driver are validated.
+     * @param format Requested encoder input format.
+     * @param active_driver Output receiving the current driver version for diagnostics.
+     * @return Pure eligibility request.
+     */
+    fused_d3d11::eligibility_t fused_eligibility(
+      display_vram_t &display,
+      pix_fmt_e format,
+      std::uint64_t &active_driver
+    ) {
+      const auto runtime_gate = environment_value(fused_runtime_gate_env);
+      const auto hardware_gate = environment_value(fused_hardware_gate_env);
+
+      DXGI_ADAPTER_DESC1 adapter_desc {};
+      const bool adapter_desc_ok = display.adapter && SUCCEEDED(display.adapter->GetDesc1(&adapter_desc));
+      const auto adapter_description = adapter_desc_ok ? utf_utils::to_utf8(adapter_desc.Description) : std::string {};
+
+      LARGE_INTEGER driver_version {};
+      const bool driver_query_ok = display.adapter && SUCCEEDED(display.adapter->CheckInterfaceSupport(IID_IDXGIDevice, &driver_version));
+      active_driver = driver_query_ok ? static_cast<std::uint64_t>(driver_version.QuadPart) : 0;
+
+      DXGI_OUTPUT_DESC output_desc {};
+      const bool output_desc_ok = display.output && SUCCEEDED(display.output->GetDesc(&output_desc)) && output_desc.AttachedToDesktop;
+      const auto output_name = output_desc_ok ? utf_utils::to_utf8(output_desc.DeviceName) : std::string {};
+
+      const ::video::encoder_probe_device_identity_t local_identity {
+        adapter_desc_ok ? luid_value(adapter_desc.AdapterLuid) : 0,
+        adapter_desc_ok ? adapter_desc.VendorId : 0,
+        adapter_desc_ok ? adapter_desc.DeviceId : 0,
+        adapter_desc_ok ? adapter_desc.SubSysId : 0,
+        adapter_desc_ok ? adapter_desc.Revision : 0,
+        active_driver,
+        output_name,
+      };
+      const auto probe_identity = encoder_probe_device_identity();
+
+      const auto model_gate = environment_value(fused_model_gate_env);
+      const auto output_gate = environment_value(fused_output_gate_env);
+      const bool full_adapter_identity_matches = adapter_desc_ok &&
+                                                 environment_decimal_matches(fused_luid_gate_env, local_identity.adapter_luid) &&
+                                                 environment_decimal_matches(fused_vendor_gate_env, local_identity.vendor_id) &&
+                                                 environment_decimal_matches(fused_device_gate_env, local_identity.device_id) &&
+                                                 environment_decimal_matches(fused_subsystem_gate_env, local_identity.subsystem_id) &&
+                                                 environment_decimal_matches(fused_revision_gate_env, local_identity.revision);
+
+      return {
+        runtime_gate && *runtime_gate == "1",
+        hardware_gate && *hardware_gate == "RTX4060",
+        true,
+        display.is_hdr(),
+        adapter_desc_ok && adapter_desc.VendorId == 0x10de,
+        full_adapter_identity_matches,
+        model_gate && *model_gate == adapter_description,
+        driver_query_ok && environment_decimal_matches(fused_driver_gate_env, active_driver),
+        display.device && display.device_ctx && context_matches_device(display.device.get(), display.device_ctx.get()) &&
+          device_uses_adapter(display.device.get(), display.adapter.get()),
+        probe_identity && *probe_identity == local_identity,
+        output_desc_ok && output_gate && *output_gate == output_name,
+        fused_runtime_quarantined.load(std::memory_order_acquire),
+        fused_surface_format(format),
+      };
+    }
+  }  // namespace
 
   /**
    * @brief Create a buffer object or message.
@@ -174,7 +417,22 @@ namespace platf::dxgi {
     // DXGI format of this image texture
     DXGI_FORMAT format;  ///< DXGI format of the captured texture.
 
+    // True when capture and encode use this texture through the same D3D11 device.
+    bool fused_resource = false;  ///< Whether legacy shared-handle and keyed-mutex boundaries are absent.
+    fused_d3d11::frame_trace_token_t telemetry_capture_token;  ///< Image-owned parent trace for bounded encoder children.
+    std::shared_ptr<fused_d3d11::resource_ownership_t> resource_ownership;  ///< Capture-pool transition state retained by this image.
+    bool resource_bound = false;  ///< Whether this image contributes to the bound-image drain count.
+
     virtual ~img_d3d_t() override {
+      fused_d3d11::telemetry().release_capture_frame_token(telemetry_capture_token);
+      if (resource_bound) {
+        const bool released = resource_ownership && resource_ownership->release_image();
+        assert(released);
+        (void) released;
+        if (resource_ownership->reinit_required()) {
+          resource_ownership->reset_after_reinit();
+        }
+      }
       if (encoder_texture_handle) {
         CloseHandle(encoder_texture_handle);
       }
@@ -245,9 +503,13 @@ namespace platf::dxgi {
       if (_locked) {
         return true;
       }
+      if (!_mutex) {
+        return true;
+      }
       HRESULT status = _mutex->AcquireSync(0, INFINITE);
       if (status == S_OK) {
         _locked = true;
+        fused_d3d11::telemetry().record_keyed_mutex_acquire();
       } else {
         BOOST_LOG(error) << "Failed to acquire texture mutex [0x"sv << util::hex(status).to_string_view() << ']';
       }
@@ -470,6 +732,21 @@ namespace platf::dxgi {
    */
   class d3d_base_encode_device final {
   public:
+    ~d3d_base_encode_device() {
+      pending_telemetry_child.reset();
+      fused_d3d11::telemetry().retire_frame_session(telemetry_session);
+    }
+
+    void set_telemetry_session(fused_d3d11::telemetry_session_t session) noexcept {
+      pending_telemetry_child.reset();
+      fused_d3d11::telemetry().retire_frame_session(telemetry_session);
+      telemetry_session = session;
+    }
+
+    [[nodiscard]] fused_d3d11::frame_trace_token_t take_telemetry_child() noexcept {
+      return pending_telemetry_child.release();
+    }
+
     /**
      * @brief Convert a captured D3D image into encoder input textures.
      *
@@ -477,6 +754,7 @@ namespace platf::dxgi {
      * @return Conversion status.
      */
     int convert(platf::img_t &img_base) {
+      pending_telemetry_child.reset();
       // Garbage collect mapped capture images whose weak references have expired
       for (auto it = img_ctx_map.begin(); it != img_ctx_map.end();) {
         if (it->second.img_weak.expired()) {
@@ -488,18 +766,57 @@ namespace platf::dxgi {
 
       auto &img = (img_d3d_t &) img_base;
       if (!img.blank) {
+        auto telemetry_child = fused_d3d11::frame_trace_owner_t {
+          fused_d3d11::telemetry(),
+          fused_d3d11::telemetry().begin_conversion_frame(
+            img.telemetry_capture_token,
+            telemetry_session
+          ),
+        };
+        const auto telemetry_trace = telemetry_child.token();
+        const auto telemetry_conversion_work_begin_ns = fused_d3d11::telemetry_t::now_ns();
+        fused_d3d11::telemetry().record_conversion_work_begin(
+          telemetry_trace,
+          telemetry_conversion_work_begin_ns
+        );
+        std::unique_lock<std::mutex> fused_context_lock;
+        auto fused_transaction_failed = fused;
+        auto fused_failure_guard = util::fail_guard([&]() {
+          if (fused_transaction_failed) {
+            submission_lifetime.fail();
+            if (auto vram_display = std::dynamic_pointer_cast<display_vram_t>(display)) {
+              vram_display->request_fused_reinit();
+            }
+          }
+        });
+
+        if (fused) {
+          auto vram_display = std::dynamic_pointer_cast<display_vram_t>(display);
+          if (!vram_display || !vram_display->fused_nvenc_is_active() || !img.fused_resource ||
+              img.resource_ownership != vram_display->encode_resource_ownership ||
+              !submission_lifetime.begin_conversion()) {
+            BOOST_LOG(error) << "Fused D3D11 conversion resource lifetime violation";
+            return -1;
+          }
+          fused_context_lock = std::unique_lock(*shared_context_mutex);
+          fused_d3d11::telemetry().record_conversion_begin();
+        }
+
         auto &img_ctx = img_ctx_map[img.id];
 
-        // Open the shared capture texture with our ID3D11Device
+        // Open the legacy shared texture or bind the same-device fused texture directly.
         if (initialize_image_context(img, img_ctx)) {
           return -1;
         }
 
-        // Acquire encoder mutex to synchronize with capture code
-        auto status = img_ctx.encoder_mutex->AcquireSync(0, INFINITE);
-        if (status != S_OK) {
-          BOOST_LOG(error) << "Failed to acquire encoder mutex [0x"sv << util::hex(status).to_string_view() << ']';
-          return -1;
+        // Only the legacy cross-device path needs a keyed mutex.
+        if (!fused) {
+          auto status = img_ctx.encoder_mutex->AcquireSync(0, INFINITE);
+          if (status != S_OK) {
+            BOOST_LOG(error) << "Failed to acquire encoder mutex [0x"sv << util::hex(status).to_string_view() << ']';
+            return -1;
+          }
+          fused_d3d11::telemetry().record_keyed_mutex_acquire();
         }
 
         auto draw = [&](auto &input, auto &y_or_yuv_viewports, auto &uv_viewport) {
@@ -537,11 +854,35 @@ namespace platf::dxgi {
         // Draw captured frame
         draw(img_ctx.encoder_input_res, out_Y_or_YUV_viewports, out_UV_viewport);
 
-        // Release encoder mutex to allow capture code to reuse this image
-        img_ctx.encoder_mutex->ReleaseSync(0);
+        // Release the legacy cross-device mutex after source reads are submitted.
+        if (!fused) {
+          img_ctx.encoder_mutex->ReleaseSync(0);
+        }
 
         ID3D11ShaderResourceView *emptyShaderResourceView = nullptr;
         device_ctx->PSSetShaderResources(0, 1, &emptyShaderResourceView);
+
+        if (fused) {
+          if (!submission_lifetime.mark_commands_submitted()) {
+            BOOST_LOG(error) << "Fused D3D11 conversion submission state violation";
+            return -1;
+          }
+          fused_d3d11::telemetry().record_conversion_submitted();
+          fused_context_lock.unlock();
+          if (!submission_lifetime.release_source()) {
+            BOOST_LOG(error) << "Fused D3D11 capture source released before command submission";
+            return -1;
+          }
+          fused_transaction_failed = false;
+          fused_failure_guard.disable();
+        }
+
+        const auto telemetry_conversion_commands_submitted_ns = fused_d3d11::telemetry_t::now_ns();
+        fused_d3d11::telemetry().finish_conversion_frame(
+          telemetry_trace,
+          telemetry_conversion_commands_submitted_ns
+        );
+        pending_telemetry_child = std::move(telemetry_child);
       }
 
       return 0;
@@ -553,6 +894,10 @@ namespace platf::dxgi {
      * @param colorspace Colorimetry information used for conversion or encoding.
      */
     void apply_colorspace(const ::video::sunshine_colorspace_t &colorspace) {
+      std::unique_lock<std::mutex> context_lock;
+      if (fused) {
+        context_lock = std::unique_lock(*shared_context_mutex);
+      }
       auto color_vectors = ::video::color_vectors_from_colorspace(colorspace, true);
 
       if (format == DXGI_FORMAT_AYUV || format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_Y410) {
@@ -584,6 +929,10 @@ namespace platf::dxgi {
      * @return 0 when output resources are initialized; nonzero on D3D failure.
      */
     int init_output(ID3D11Texture2D *frame_texture, int width, int height) {
+      std::unique_lock<std::mutex> context_lock;
+      if (fused) {
+        context_lock = std::unique_lock(*shared_context_mutex);
+      }
       // The underlying frame pool owns the texture, so we must reference it for ourselves
       frame_texture->AddRef();
       output_texture.reset(frame_texture);
@@ -820,9 +1169,15 @@ namespace platf::dxgi {
      * @param display Display object or identifier associated with the operation.
      * @param adapter_p Adapter p.
      * @param pix_fmt Sunshine pixel format to convert or allocate for.
+     * @param use_capture_device Whether conversion reuses the capture D3D11 device and immediate context.
      * @return 0 on success; nonzero or negative platform status on failure.
      */
-    int init(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p, pix_fmt_e pix_fmt) {
+    int init(
+      std::shared_ptr<platf::display_t> display,
+      adapter_t::pointer adapter_p,
+      pix_fmt_e pix_fmt,
+      bool use_capture_device = false
+    ) {
       switch (pix_fmt) {
         case pix_fmt_e::nv12:
           format = DXGI_FORMAT_NV12;
@@ -849,32 +1204,56 @@ namespace platf::dxgi {
           return -1;
       }
 
-      D3D_FEATURE_LEVEL featureLevels[] {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-        D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0,
-        D3D_FEATURE_LEVEL_9_3,
-        D3D_FEATURE_LEVEL_9_2,
-        D3D_FEATURE_LEVEL_9_1
-      };
-
-      HRESULT status = D3D11CreateDevice(
-        adapter_p,
-        D3D_DRIVER_TYPE_UNKNOWN,
-        nullptr,
-        D3D11_CREATE_DEVICE_FLAGS | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-        featureLevels,
-        sizeof(featureLevels) / sizeof(D3D_FEATURE_LEVEL),
-        D3D11_SDK_VERSION,
-        &device,
-        nullptr,
-        &device_ctx
-      );
-
-      if (FAILED(status)) {
-        BOOST_LOG(error) << "Failed to create encoder D3D11 device [0x"sv << util::hex(status).to_string_view() << ']';
+      this->display = std::dynamic_pointer_cast<display_base_t>(display);
+      if (!this->display) {
         return -1;
+      }
+      display = nullptr;
+
+      HRESULT status = S_OK;
+      if (use_capture_device) {
+        auto vram_display = std::dynamic_pointer_cast<display_vram_t>(this->display);
+        if (!vram_display) {
+          return -1;
+        }
+        this->display->device->AddRef();
+        device.reset(this->display->device.get());
+        this->display->device_ctx->AddRef();
+        device_ctx.reset(this->display->device_ctx.get());
+        shared_context_mutex = &vram_display->fused_context_mutex;
+        fused = submission_lifetime.enable();
+        if (!fused) {
+          BOOST_LOG(error) << "Failed to initialize fused D3D11 submission lifetime";
+          return -1;
+        }
+      } else {
+        D3D_FEATURE_LEVEL featureLevels[] {
+          D3D_FEATURE_LEVEL_11_1,
+          D3D_FEATURE_LEVEL_11_0,
+          D3D_FEATURE_LEVEL_10_1,
+          D3D_FEATURE_LEVEL_10_0,
+          D3D_FEATURE_LEVEL_9_3,
+          D3D_FEATURE_LEVEL_9_2,
+          D3D_FEATURE_LEVEL_9_1
+        };
+
+        status = D3D11CreateDevice(
+          adapter_p,
+          D3D_DRIVER_TYPE_UNKNOWN,
+          nullptr,
+          D3D11_CREATE_DEVICE_FLAGS | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+          featureLevels,
+          sizeof(featureLevels) / sizeof(D3D_FEATURE_LEVEL),
+          D3D11_SDK_VERSION,
+          &device,
+          nullptr,
+          &device_ctx
+        );
+
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "Failed to create encoder D3D11 device [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
       }
 
       dxgi::dxgi_t dxgi;
@@ -902,12 +1281,6 @@ namespace platf::dxgi {
       }
       device_ctx->VSSetConstantBuffers(3, 1, &color_matrix);
       device_ctx->PSSetConstantBuffers(0, 1, &color_matrix);
-
-      this->display = std::dynamic_pointer_cast<display_base_t>(display);
-      if (!this->display) {
-        return -1;
-      }
-      display = nullptr;
 
       blend_disable = make_blend(device.get(), false, false);
       if (!blend_disable) {
@@ -969,7 +1342,7 @@ namespace platf::dxgi {
      * @param img_ctx Cached encoder resources associated with the image ID.
      * @return 0 when the shared texture is opened and bound; nonzero on D3D failure.
      */
-    int initialize_image_context(const img_d3d_t &img, encoder_img_ctx_t &img_ctx) {
+    int initialize_image_context(img_d3d_t &img, encoder_img_ctx_t &img_ctx) {
       // If we've already opened the shared texture, we're done
       if (img_ctx.encoder_texture && img.capture_texture.get() == img_ctx.capture_texture_p) {
         return 0;
@@ -978,6 +1351,25 @@ namespace platf::dxgi {
       // Reset this image context in case it was used before with a different texture.
       // Textures can change when transitioning from a dummy image to a real image.
       img_ctx.reset();
+
+      if (fused) {
+        if (!img.fused_resource || !img.capture_texture) {
+          BOOST_LOG(error) << "Fused D3D11 image is not a same-device resource";
+          return -1;
+        }
+
+        img.capture_texture->AddRef();
+        img_ctx.encoder_texture.reset(img.capture_texture.get());
+        auto status = device->CreateShaderResourceView(img_ctx.encoder_texture.get(), nullptr, &img_ctx.encoder_input_res);
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "Failed to create fused capture shader resource view [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
+
+        img_ctx.capture_texture_p = img.capture_texture.get();
+        img_ctx.img_weak = img.weak_from_this();
+        return 0;
+      }
 
       device1_t device1;
       auto status = device->QueryInterface(__uuidof(ID3D11Device1), (void **) &device1);
@@ -992,6 +1384,7 @@ namespace platf::dxgi {
         BOOST_LOG(error) << "Failed to open shared image texture [0x"sv << util::hex(status).to_string_view() << ']';
         return -1;
       }
+      fused_d3d11::telemetry().record_shared_handle_open();
 
       // Get the keyed mutex to synchronize with the capture code
       status = img_ctx.encoder_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &img_ctx.encoder_mutex);
@@ -1092,6 +1485,11 @@ namespace platf::dxgi {
     device_ctx_t device_ctx;  ///< D3D11 device context used to issue conversion commands.
 
     texture2d_t output_texture;  ///< Output texture.
+    bool fused = false;  ///< Whether capture and conversion share the exact D3D11 device and context.
+    std::mutex *shared_context_mutex = nullptr;  ///< Mutex serializing complete operations on the shared immediate context.
+    fused_d3d11::submission_lifetime_t submission_lifetime;  ///< Ordered source-borrow submission state.
+    fused_d3d11::telemetry_session_t telemetry_session;  ///< Immutable mode/client identity for this encoder.
+    fused_d3d11::frame_trace_owner_t pending_telemetry_child;  ///< Converted child awaiting explicit NVENC transfer.
   };
 
   /**
@@ -1099,6 +1497,16 @@ namespace platf::dxgi {
    */
   class d3d_avcodec_encode_device_t: public avcodec_encode_device_t {
   public:
+    /**
+     * @brief Release legacy display resource ownership when the encoder ends.
+     */
+    ~d3d_avcodec_encode_device_t() override {
+      if (auto display = resource_display.lock()) {
+        auto context_lock = std::lock_guard(display->fused_context_mutex);
+        display->release_legacy_encoder();
+      }
+    }
+
     /**
      * @brief Initialize the D3D11 AVCodec encode device.
      *
@@ -1108,7 +1516,35 @@ namespace platf::dxgi {
      * @return 0 on success; nonzero or negative platform status on failure.
      */
     int init(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p, pix_fmt_e pix_fmt) {
-      int result = base.init(display, adapter_p, pix_fmt);
+      auto vram_display = std::dynamic_pointer_cast<display_vram_t>(display);
+      if (!vram_display) {
+        return -1;
+      }
+      int result = -1;
+      {
+        auto context_lock = std::lock_guard(vram_display->fused_context_mutex);
+        const auto transition = vram_display->encode_resource_ownership->begin_transition(fused_d3d11::resource_mode_e::legacy);
+        if (transition == fused_d3d11::transition_result_e::rejected) {
+          BOOST_LOG(error) << "Cannot mix AVCodec legacy and fused NVENC ownership on one capture display";
+          return -1;
+        }
+        result = base.init(display, adapter_p, pix_fmt);
+        if (result != 0) {
+          if (transition == fused_d3d11::transition_result_e::started) {
+            vram_display->encode_resource_ownership->rollback_transition(fused_d3d11::resource_mode_e::legacy);
+          }
+          return result;
+        }
+        if (transition == fused_d3d11::transition_result_e::started &&
+            !vram_display->encode_resource_ownership->commit_transition(fused_d3d11::resource_mode_e::legacy)) {
+          return -1;
+        }
+        if (!vram_display->acquire_legacy_encoder()) {
+          return -1;
+        }
+        resource_display = vram_display;
+      }
+
       data = base.device.get();
       return result;
     }
@@ -1220,6 +1656,65 @@ namespace platf::dxgi {
   private:
     d3d_base_encode_device base;
     frame_t hwframe;
+    std::weak_ptr<display_vram_t> resource_display;  ///< Display whose legacy resource mode is owned by this encoder.
+  };
+
+  /**
+   * @brief NVENC proxy that converts empty encode results into an owning-device failure callback.
+   */
+  class nvenc_failure_proxy_t final: public nvenc::nvenc_encoder {
+  public:
+    /** @brief Function invoked before an empty encoded frame is returned to the session. */
+    using failure_callback_t = void (*)(void *context);
+
+    /**
+     * @brief Bind the concrete encoder and its failure owner.
+     *
+     * @param target Concrete NVENC implementation.
+     * @param context Opaque encode-device owner.
+     * @param callback Failure callback invoked for empty encode output.
+     */
+    void bind(nvenc::nvenc_encoder *target, void *context, failure_callback_t callback) {
+      target_ = target;
+      context_ = context;
+      callback_ = callback;
+    }
+
+    /** @copydoc nvenc::nvenc_encoder::create_encoder() */
+    bool create_encoder(
+      const nvenc::nvenc_config &config,
+      const ::video::config_t &client_config,
+      const ::video::sunshine_colorspace_t &colorspace,
+      platf::pix_fmt_e buffer_format
+    ) override {
+      return target_ && target_->create_encoder(config, client_config, colorspace, buffer_format);
+    }
+
+    /** @copydoc nvenc::nvenc_encoder::destroy_encoder() */
+    void destroy_encoder() override {
+      if (target_) {
+        target_->destroy_encoder();
+      }
+    }
+
+    /** @copydoc nvenc::nvenc_encoder::encode_frame() */
+    nvenc::nvenc_encoded_frame encode_frame(std::uint64_t frame_index, bool force_idr) override {
+      auto result = target_ ? target_->encode_frame(frame_index, force_idr) : nvenc::nvenc_encoded_frame {};
+      if (result.data.empty() && callback_) {
+        callback_(context_);
+      }
+      return result;
+    }
+
+    /** @copydoc nvenc::nvenc_encoder::invalidate_ref_frames() */
+    bool invalidate_ref_frames(std::uint64_t first_frame, std::uint64_t last_frame) override {
+      return target_ && target_->invalidate_ref_frames(first_frame, last_frame);
+    }
+
+  private:
+    nvenc::nvenc_encoder *target_ = nullptr;  ///< Non-owning concrete encoder forwarded by this proxy.
+    void *context_ = nullptr;  ///< Opaque encode-device owner passed to the callback.
+    failure_callback_t callback_ = nullptr;  ///< Callback invoked before empty output escapes.
   };
 
   /**
@@ -1227,6 +1722,34 @@ namespace platf::dxgi {
    */
   class d3d_nvenc_encode_device_t: public nvenc_encode_device_t {
   public:
+    /**
+     * @brief Release fused display ownership when the encoder attempt or session ends.
+     */
+    ~d3d_nvenc_encode_device_t() override {
+      if (auto display = resource_display.lock()) {
+        auto context_lock = std::lock_guard(display->fused_context_mutex);
+        if (fused_path) {
+          if (!fused_healthy) {
+            display->disable_direct_vdd();
+            display->request_fused_reinit();
+          }
+          if (nvenc_d3d) {
+            nvenc_d3d->set_fused_input_enabled(false);
+          }
+          failure_proxy.bind(nullptr, nullptr, nullptr);
+          nvenc = nullptr;
+          nvenc_d3d.reset();
+          base.reset();
+          display->release_fused_nvenc();
+          if (display->fused_reinit_required()) {
+            display->encode_resource_ownership->reset_after_reinit();
+          }
+        } else if (legacy_path) {
+          display->release_legacy_encoder();
+        }
+      }
+    }
+
     /**
      * @brief Create D3D11 and NVENC resources for texture-based encoding.
      *
@@ -1236,8 +1759,108 @@ namespace platf::dxgi {
      * @return True when the D3D11 device resources are initialized.
      */
     bool init_device(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p, pix_fmt_e pix_fmt) {
-      if (base.init(display, adapter_p, pix_fmt)) {
+      auto vram_display = std::dynamic_pointer_cast<display_vram_t>(display);
+      if (!vram_display) {
         return false;
+      }
+
+      if (vram_display->direct_vdd_is_active()) {
+        auto context_lock = std::lock_guard(vram_display->fused_context_mutex);
+        const auto transition = vram_display->encode_resource_ownership->begin_transition(fused_d3d11::resource_mode_e::fused);
+        if (transition != fused_d3d11::transition_result_e::rejected) {
+          auto fused_base = std::make_unique<d3d_base_encode_device>();
+          if (fused_base->init(display, adapter_p, pix_fmt, true) == 0) {
+            if (transition == fused_d3d11::transition_result_e::started &&
+                !vram_display->encode_resource_ownership->commit_transition(fused_d3d11::resource_mode_e::fused)) {
+              return false;
+            }
+            if (!vram_display->acquire_fused_nvenc()) {
+              return false;
+            }
+            resource_display = vram_display;
+            fused_path = true;
+            base = std::move(fused_base);
+            fused_d3d11::telemetry().record_fused_activation();
+            BOOST_LOG(info) << "Lumen VDD direct-frame source bound to same-device conversion/NVENC; one driver copy, no host capture copy";
+          } else {
+            if (transition == fused_d3d11::transition_result_e::started) {
+              vram_display->encode_resource_ownership->rollback_transition(fused_d3d11::resource_mode_e::fused);
+            }
+          }
+        }
+        if (!base) {
+          vram_display->disable_direct_vdd();
+          BOOST_LOG(warning) << "Lumen VDD direct-frame NVENC binding failed; scheduling DDA/WGC fallback";
+        }
+      } else {
+        std::uint64_t active_driver = 0;
+        fused_d3d11::telemetry().record_eligibility_attempt();
+        const auto request = fused_eligibility(*vram_display, pix_fmt, active_driver);
+        const auto decision = fused_d3d11::evaluate(request);
+
+        if (decision.eligible) {
+          auto context_lock = std::lock_guard(vram_display->fused_context_mutex);
+          const auto transition = vram_display->encode_resource_ownership->begin_transition(fused_d3d11::resource_mode_e::fused);
+          if (transition == fused_d3d11::transition_result_e::rejected) {
+            BOOST_LOG(warning) << "Experimental fused D3D11 path cannot join a display using legacy encoder resources";
+          } else {
+            auto fused_base = std::make_unique<d3d_base_encode_device>();
+            if (fused_base->init(display, adapter_p, pix_fmt, true) == 0) {
+              if (transition == fused_d3d11::transition_result_e::started &&
+                  !vram_display->encode_resource_ownership->commit_transition(fused_d3d11::resource_mode_e::fused)) {
+                return false;
+              }
+              if (!vram_display->acquire_fused_nvenc()) {
+                return false;
+              }
+              resource_display = vram_display;
+              fused_path = true;
+              base = std::move(fused_base);
+              fused_d3d11::telemetry().record_fused_activation();
+              BOOST_LOG(info)
+                << "Experimental fused D3D11 capture-to-NVENC path enabled; driver=" << active_driver
+                << ", shared-handle opens and keyed-mutex acquisitions removed";
+            } else {
+              if (transition == fused_d3d11::transition_result_e::started) {
+                vram_display->encode_resource_ownership->rollback_transition(fused_d3d11::resource_mode_e::fused);
+              }
+              BOOST_LOG(warning) << "Experimental fused D3D11 initialization failed; retaining legacy D3D11 path";
+            }
+          }
+        } else if (request.runtime_gate_enabled) {
+          BOOST_LOG(warning)
+            << "Experimental fused D3D11 request rejected: " << fused_d3d11::rejection_string(decision.rejection)
+            << "; active driver=" << active_driver;
+        }
+      }
+
+      if (!base) {
+        fused_d3d11::telemetry().record_legacy_fallback();
+        auto legacy_base = std::make_unique<d3d_base_encode_device>();
+        {
+          auto context_lock = std::lock_guard(vram_display->fused_context_mutex);
+          const auto transition = vram_display->encode_resource_ownership->begin_transition(fused_d3d11::resource_mode_e::legacy);
+          if (transition == fused_d3d11::transition_result_e::rejected) {
+            BOOST_LOG(error) << "Cannot mix legacy and fused D3D11 resource ownership on one capture display";
+            return false;
+          }
+          if (legacy_base->init(display, adapter_p, pix_fmt) != 0) {
+            if (transition == fused_d3d11::transition_result_e::started) {
+              vram_display->encode_resource_ownership->rollback_transition(fused_d3d11::resource_mode_e::legacy);
+            }
+            return false;
+          }
+          if (transition == fused_d3d11::transition_result_e::started &&
+              !vram_display->encode_resource_ownership->commit_transition(fused_d3d11::resource_mode_e::legacy)) {
+            return false;
+          }
+          if (!vram_display->acquire_legacy_encoder()) {
+            return false;
+          }
+          resource_display = vram_display;
+          legacy_path = true;
+        }
+        base = std::move(legacy_base);
       }
 
       auto factory = nvenc::nvenc_dynamic_factory::get();
@@ -1246,16 +1869,18 @@ namespace platf::dxgi {
       }
 
       if (pix_fmt == pix_fmt_e::yuv444p16) {
-        nvenc_d3d = factory->create_nvenc_d3d11_on_cuda(base.device.get());
+        nvenc_d3d = factory->create_nvenc_d3d11_on_cuda(base->device.get());
       } else {
-        nvenc_d3d = factory->create_nvenc_d3d11_native(base.device.get());
+        nvenc_d3d = factory->create_nvenc_d3d11_native(base->device.get());
       }
       if (!nvenc_d3d) {
         return false;
       }
+      nvenc_d3d->set_fused_input_enabled(fused_path);
 
       buffer_format = pix_fmt;
-      nvenc = nvenc_d3d.get();
+      failure_proxy.bind(nvenc_d3d.get(), this, &d3d_nvenc_encode_device_t::handle_nvenc_failure_callback);
+      nvenc = &failure_proxy;
 
       return true;
     }
@@ -1272,12 +1897,29 @@ namespace platf::dxgi {
         return false;
       }
 
+      base->set_telemetry_session(fused_d3d11::telemetry().begin_frame_session(
+        telemetry_profile(client_config),
+        telemetry_client(client_config)
+      ));
+
       if (!nvenc_d3d->create_encoder(config::video.nv, client_config, colorspace, buffer_format)) {
+        if (fused_path) {
+          if (auto display = resource_display.lock()) {
+            display->request_fused_reinit();
+          }
+        }
         return false;
       }
 
-      base.apply_colorspace(colorspace);
-      return base.init_output(nvenc_d3d->get_input_texture(), client_config.width, client_config.height) == 0;
+      base->apply_colorspace(colorspace);
+      const bool initialized = base->init_output(nvenc_d3d->get_input_texture(), client_config.width, client_config.height) == 0;
+      if (!initialized && fused_path) {
+        if (auto display = resource_display.lock()) {
+          display->request_fused_reinit();
+        }
+      }
+      fused_healthy = initialized && fused_path;
+      return initialized;
     }
 
     /**
@@ -1287,13 +1929,47 @@ namespace platf::dxgi {
      * @return Conversion status.
      */
     int convert(platf::img_t &img_base) override {
-      return base.convert(img_base);
+      const auto result = base->convert(img_base);
+      if (result == 0) {
+        const auto child = base->take_telemetry_child();
+        if (child && !nvenc_d3d->set_frame_telemetry_token(child.value)) {
+          fused_d3d11::telemetry().abandon_frame_trace(child);
+        }
+      } else {
+        nvenc_d3d->clear_frame_telemetry_token();
+      }
+      return result;
     }
 
   private:
-    d3d_base_encode_device base;
+    /** @brief Static trampoline used by the SDK-neutral encoder proxy. */
+    static void handle_nvenc_failure_callback(void *context) {
+      static_cast<d3d_nvenc_encode_device_t *>(context)->handle_nvenc_failure();
+    }
+
+    /** @brief Quarantine fused mode and request capture reinitialization before teardown. */
+    void handle_nvenc_failure() {
+      if (!fused_path) {
+        return;
+      }
+      fused_healthy = false;
+      if (nvenc_d3d) {
+        nvenc_d3d->clear_frame_telemetry_token();
+      }
+      if (auto display = resource_display.lock()) {
+        display->disable_direct_vdd();
+        display->request_fused_reinit();
+      }
+    }
+
+    std::unique_ptr<d3d_base_encode_device> base;  ///< Selected fused or legacy D3D11 conversion implementation.
     std::unique_ptr<nvenc::nvenc_d3d11_interface> nvenc_d3d;
+    nvenc_failure_proxy_t failure_proxy;  ///< Instance-local hook for Map/Encode/wait/Lock failures.
     platf::pix_fmt_e buffer_format = platf::pix_fmt_e::unknown;
+    bool fused_path = false;  ///< Whether this encoder removed legacy cross-device resource boundaries.
+    bool fused_healthy = false;  ///< Whether fused encoder initialization completed without requiring rollback.
+    bool legacy_path = false;  ///< Whether this encoder owns legacy cross-device capture resources.
+    std::weak_ptr<display_vram_t> resource_display;  ///< Display whose resource mode is owned by this encoder.
   };
 
   /**
@@ -1350,6 +2026,9 @@ namespace platf::dxgi {
   }
 
   capture_e display_ddup_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    if (fused_reinit_required()) {
+      return capture_e::reinit;
+    }
     HRESULT status;
     DXGI_OUTDUPL_FRAME_INFO frame_info;
 
@@ -1359,6 +2038,13 @@ namespace platf::dxgi {
 
     if (capture_status != capture_e::ok) {
       return capture_status;
+    }
+    const auto telemetry_capture_acquired_ns = fused_d3d11::telemetry_t::now_ns();
+    {
+      auto context_lock = lock_fused_context();
+      if (fused_nvenc_is_active()) {
+        fused_d3d11::telemetry().record_capture_acquired();
+      }
     }
 
     const bool mouse_update_flag = frame_info.LastMouseUpdateTime.QuadPart != 0 || frame_info.PointerShapeBufferSize > 0;
@@ -1576,10 +2262,16 @@ namespace platf::dxgi {
 
           auto [d3d_img, lock] = get_locked_d3d_img(img);
           if (!d3d_img) {
-            return capture_e::error;
+            return capture_completion_failure(*this);
           }
 
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), p_surface->get());
+          {
+            auto context_lock = lock_fused_context();
+            device_ctx->CopyResource(d3d_img->capture_texture.get(), p_surface->get());
+            if (fused_nvenc_is_active()) {
+              fused_d3d11::telemetry().record_capture_copy_submitted();
+            }
+          }
 
           // We delay the destruction of intermediate surface in case the mouse cursor reappears shortly.
           old_surface_delayed_destruction.reset(p_surface->release());
@@ -1598,7 +2290,7 @@ namespace platf::dxgi {
           }
           auto [d3d_img, lock] = get_locked_d3d_img(*p_img);
           if (!d3d_img) {
-            return capture_e::error;
+            return capture_completion_failure(*this);
           }
 
           p_img = nullptr;
@@ -1608,7 +2300,13 @@ namespace platf::dxgi {
             return capture_e::error;
           }
 
-          device_ctx->CopyResource(surface.get(), d3d_img->capture_texture.get());
+          {
+            auto context_lock = lock_fused_context();
+            device_ctx->CopyResource(surface.get(), d3d_img->capture_texture.get());
+            if (fused_nvenc_is_active()) {
+              fused_d3d11::telemetry().record_capture_copy_submitted();
+            }
+          }
           break;
         }
 
@@ -1623,10 +2321,16 @@ namespace platf::dxgi {
 
           auto [d3d_img, lock] = get_locked_d3d_img(img);
           if (!d3d_img) {
-            return capture_e::error;
+            return capture_completion_failure(*this);
           }
 
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+          {
+            auto context_lock = lock_fused_context();
+            device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+            if (fused_nvenc_is_active()) {
+              fused_d3d11::telemetry().record_capture_copy_submitted();
+            }
+          }
           last_frame_variant = img;
           break;
         }
@@ -1641,12 +2345,19 @@ namespace platf::dxgi {
               return capture_e::error;
             }
           }
-          device_ctx->CopyResource(p_surface->get(), src.get());
+          {
+            auto context_lock = lock_fused_context();
+            device_ctx->CopyResource(p_surface->get(), src.get());
+            if (fused_nvenc_is_active()) {
+              fused_d3d11::telemetry().record_capture_copy_submitted();
+            }
+          }
           break;
         }
     }
 
     auto blend_cursor = [&](img_d3d_t &d3d_img) {
+      auto context_lock = lock_fused_context();
       device_ctx->VSSetShader(cursor_vs.get(), nullptr, 0);
       device_ctx->PSSetShader(cursor_ps.get(), nullptr, 0);
       device_ctx->OMSetRenderTargets(1, &d3d_img.capture_rt, nullptr);
@@ -1708,10 +2419,16 @@ namespace platf::dxgi {
 
           auto [d3d_img, lock] = get_locked_d3d_img(img_out);
           if (!d3d_img) {
-            return capture_e::error;
+            return capture_completion_failure(*this);
           }
 
-          device_ctx->CopyResource(d3d_img->capture_texture.get(), p_surface->get());
+          {
+            auto context_lock = lock_fused_context();
+            device_ctx->CopyResource(d3d_img->capture_texture.get(), p_surface->get());
+            if (fused_nvenc_is_active()) {
+              fused_d3d11::telemetry().record_capture_copy_submitted();
+            }
+          }
           blend_cursor(*d3d_img);
           break;
         }
@@ -1729,11 +2446,12 @@ namespace platf::dxgi {
 
           auto [d3d_img, lock] = get_locked_d3d_img(img_out, true);
           if (!d3d_img) {
-            return capture_e::error;
+            return capture_completion_failure(*this);
           }
 
           if (reclear_dummy) {
             const float rgb_black[] = {0.0f, 0.0f, 0.0f, 0.0f};
+            auto context_lock = lock_fused_context();
             device_ctx->ClearRenderTargetView(d3d_img->capture_rt.get(), rgb_black);
           }
 
@@ -1752,6 +2470,22 @@ namespace platf::dxgi {
 
     if (img_out) {
       img_out->frame_timestamp = frame_timestamp;
+      auto d3d_img = std::static_pointer_cast<img_d3d_t>(img_out);
+      auto capture_token = fused_d3d11::frame_trace_token_t {};
+      if (frame_timestamp) {
+        const auto source_timestamp_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(frame_timestamp->time_since_epoch()).count()
+        );
+        capture_token = fused_d3d11::telemetry().begin_capture_frame(
+          source_timestamp_ns,
+          telemetry_capture_acquired_ns,
+          fused_d3d11::telemetry_t::now_ns()
+        );
+      }
+      fused_d3d11::telemetry().replace_capture_frame_token(
+        d3d_img->telemetry_capture_token,
+        capture_token
+      );
     }
 
     return capture_e::ok;
@@ -1844,12 +2578,22 @@ namespace platf::dxgi {
    * Get the next frame from the Windows.Graphics.Capture API and copy it into a new snapshot texture.
    */
   capture_e display_wgc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    if (fused_reinit_required()) {
+      return capture_e::reinit;
+    }
     texture2d_t src;
     uint64_t frame_qpc;
     dup.set_cursor_visible(cursor_visible);
     auto capture_status = dup.next_frame(timeout, &src, frame_qpc);
     if (capture_status != capture_e::ok) {
       return capture_status;
+    }
+    const auto telemetry_capture_acquired_ns = fused_d3d11::telemetry_t::now_ns();
+    {
+      auto context_lock = lock_fused_context();
+      if (fused_nvenc_is_active()) {
+        fused_d3d11::telemetry().record_capture_acquired();
+      }
     }
 
     auto frame_timestamp = std::chrono::steady_clock::now() - qpc_time_difference(qpc_counter(), frame_qpc);
@@ -1880,17 +2624,34 @@ namespace platf::dxgi {
     if (complete_img(d3d_img.get(), false) == 0) {
       texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
       if (lock_helper.lock()) {
+        auto context_lock = lock_fused_context();
         device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+        if (fused_nvenc_is_active()) {
+          fused_d3d11::telemetry().record_capture_copy_submitted();
+        }
       } else {
         BOOST_LOG(error) << "Failed to lock capture texture";
         return capture_e::error;
       }
     } else {
-      return capture_e::error;
+      return capture_completion_failure(*this);
     }
     img_out = img;
     if (img_out) {
       img_out->frame_timestamp = frame_timestamp;
+      auto output = std::static_pointer_cast<img_d3d_t>(img_out);
+      const auto source_timestamp_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(frame_timestamp.time_since_epoch()).count()
+      );
+      const auto capture_token = fused_d3d11::telemetry().begin_capture_frame(
+        source_timestamp_ns,
+        telemetry_capture_acquired_ns,
+        fused_d3d11::telemetry_t::now_ns()
+      );
+      fused_d3d11::telemetry().replace_capture_frame_token(
+        output->telemetry_capture_token,
+        capture_token
+      );
     }
 
     return capture_e::ok;
@@ -1916,16 +2677,233 @@ namespace platf::dxgi {
     img->height = height_before_rotation;
     img->id = next_image_id++;
     img->blank = true;
+    img->resource_ownership = encode_resource_ownership;
 
     return img;
+  }
+
+  int display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    source_ = config.virtual_display_frame_source;
+    if (!source_ || !source_->healthy()) {
+      return -1;
+    }
+    const auto resources = source_->resources();
+    if (resources.width != static_cast<std::uint32_t>(config.width) ||
+        resources.height != static_cast<std::uint32_t>(config.height) ||
+        resources.format != virtual_display::frame_format_e::bgra8) {
+      source_->stop();
+      return -1;
+    }
+
+    auto *native_device = static_cast<ID3D11Device *>(source_->native_device());
+    auto *native_context = static_cast<ID3D11DeviceContext *>(source_->native_context());
+    auto *native_adapter = static_cast<IDXGIAdapter1 *>(source_->native_adapter());
+    if (native_device == nullptr || native_context == nullptr || native_adapter == nullptr) {
+      source_->stop();
+      return -1;
+    }
+    native_device->AddRef();
+    device.reset(native_device);
+    native_context->AddRef();
+    device_ctx.reset(native_context);
+    native_adapter->AddRef();
+    adapter.reset(native_adapter);
+
+    factory1_t::pointer factory_raw = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_IDXGIFactory1, reinterpret_cast<void **>(&factory_raw)))) {
+      source_->stop();
+      return -1;
+    }
+    factory.reset(factory_raw);
+    const auto expected_output = utf_utils::from_utf8(display_name);
+    for (UINT index = 0;; ++index) {
+      output_t::pointer candidate_raw = nullptr;
+      if (adapter->EnumOutputs(index, &candidate_raw) == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      output_t candidate {candidate_raw};
+      DXGI_OUTPUT_DESC description {};
+      if (SUCCEEDED(candidate->GetDesc(&description)) && description.AttachedToDesktop &&
+          expected_output == description.DeviceName) {
+        if (output) {
+          source_->stop();
+          return -1;
+        }
+        output = std::move(candidate);
+      }
+    }
+    if (!output) {
+      source_->stop();
+      return -1;
+    }
+    DXGI_OUTPUT_DESC output_desc {};
+    if (FAILED(output->GetDesc(&output_desc)) ||
+        output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left != config.width ||
+        output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top != config.height) {
+      source_->stop();
+      return -1;
+    }
+
+    width = config.width;
+    height = config.height;
+    width_before_rotation = width;
+    height_before_rotation = height;
+    logical_width = width;
+    logical_height = height;
+    env_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    env_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    env_logical_width = env_width;
+    env_logical_height = env_height;
+    offset_x = output_desc.DesktopCoordinates.left - GetSystemMetrics(SM_XVIRTUALSCREEN);
+    offset_y = output_desc.DesktopCoordinates.top - GetSystemMetrics(SM_YVIRTUALSCREEN);
+    display_rotation = output_desc.Rotation;
+    if (display_rotation != DXGI_MODE_ROTATION_IDENTITY && display_rotation != DXGI_MODE_ROTATION_UNSPECIFIED) {
+      source_->stop();
+      return -1;
+    }
+    capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    feature_level = device->GetFeatureLevel();
+    next_image_id.store(0, std::memory_order_relaxed);
+    display_refresh_rate = {
+      static_cast<UINT>(::video::framerate_to_rational(config).num),
+      static_cast<UINT>(::video::framerate_to_rational(config).den),
+    };
+    display_refresh_rate_rounded = config.framerate;
+    client_frame_rate = config.framerate;
+    client_frame_rate_strict = display_refresh_rate;
+    return timer && *timer ? 0 : -1;
+  }
+
+  capture_e display_vdd_vram_t::snapshot(
+    const pull_free_image_cb_t &pull_free_image_cb,
+    std::shared_ptr<platf::img_t> &img_out,
+    const std::chrono::milliseconds timeout,
+    const bool cursor_visible
+  ) {
+    static_cast<void>(cursor_visible);
+    if (!source_ || !source_->healthy()) {
+      return capture_e::reinit;
+    }
+    auto acquired = source_->acquire(timeout);
+    if (acquired.status == virtual_display::frame_io_e::timeout) {
+      return capture_e::timeout;
+    }
+    if (acquired.status != virtual_display::frame_io_e::ok || !acquired.lease) {
+      source_->stop();
+      return capture_e::reinit;
+    }
+    if (!pull_free_image_cb(img_out) || !img_out) {
+      return capture_e::interrupted;
+    }
+
+    auto d3d_img = std::dynamic_pointer_cast<img_d3d_t>(img_out);
+    auto *texture = static_cast<ID3D11Texture2D *>(acquired.lease->native_texture());
+    if (!d3d_img || texture == nullptr || d3d_img->encode_source_lifetime) {
+      source_->stop();
+      return capture_e::reinit;
+    }
+    const auto resource_mode = encode_resource_ownership->mode();
+    if (resource_mode != fused_d3d11::resource_mode_e::fused) {
+      source_->stop();
+      return capture_e::reinit;
+    }
+
+    d3d_img->capture_texture.reset();
+    d3d_img->capture_rt.reset();
+    d3d_img->capture_mutex.reset();
+    if (d3d_img->encoder_texture_handle != nullptr) {
+      CloseHandle(std::exchange(d3d_img->encoder_texture_handle, nullptr));
+    }
+    texture->AddRef();
+    d3d_img->capture_texture.reset(texture);
+    d3d_img->data = reinterpret_cast<std::uint8_t *>(texture);
+    d3d_img->width = width;
+    d3d_img->height = height;
+    d3d_img->pixel_pitch = 4;
+    d3d_img->row_pitch = width * 4;
+    d3d_img->format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d3d_img->dummy = false;
+    d3d_img->blank = false;
+    d3d_img->fused_resource = true;
+    if (!d3d_img->resource_bound) {
+      if (!d3d_img->resource_ownership ||
+          !d3d_img->resource_ownership->bind_image(fused_d3d11::resource_mode_e::fused)) {
+        source_->stop();
+        return capture_e::reinit;
+      }
+      d3d_img->resource_bound = true;
+    }
+    d3d_img->frame_timestamp = std::chrono::steady_clock::now() - qpc_time_difference(
+      qpc_counter(),
+      acquired.lease->descriptor().capture_qpc
+    );
+    d3d_img->encode_source_lifetime = std::move(acquired.lease);
+    return capture_e::ok;
+  }
+
+  capture_e display_vdd_vram_t::release_snapshot() {
+    return capture_e::ok;
+  }
+
+  bool display_vdd_vram_t::is_hdr() {
+    return false;
+  }
+
+  bool display_vdd_vram_t::get_hdr_metadata(SS_HDR_METADATA &metadata) {
+    std::memset(&metadata, 0, sizeof(metadata));
+    return false;
+  }
+
+  std::vector<DXGI_FORMAT> display_vdd_vram_t::get_supported_capture_formats() {
+    return {DXGI_FORMAT_B8G8R8A8_UNORM};
+  }
+
+  bool display_vdd_vram_t::direct_vdd_is_active() const noexcept {
+    return source_ && source_->healthy();
+  }
+
+  void display_vdd_vram_t::disable_direct_vdd() noexcept {
+    if (source_) {
+      source_->stop();
+    }
+  }
+
+  void display_vram_t::request_fused_reinit() {
+    fused_runtime_quarantined.store(true, std::memory_order_release);
+    virtual_display::quarantine_direct_frame_runtime();
+    if (!encode_resource_ownership->request_reinit()) {
+      BOOST_LOG(error) << "Failed to transition fused D3D11 ownership to reinit-required";
+    }
   }
 
   // This cannot use ID3D11DeviceContext because it can be called concurrently by the encoding thread
   int display_vram_t::complete_img(platf::img_t *img_base, bool dummy) {
     auto img = (img_d3d_t *) img_base;
+    auto context_lock = lock_fused_context();
+    if (fused_reinit_required()) {
+      return -1;
+    }
 
-    // If this already has a capture texture and it's not switching dummy state, nothing to do
-    if (img->capture_texture && img->dummy == dummy) {
+    if (encode_resource_ownership->state() == fused_d3d11::resource_state_e::unset) {
+      if (encode_resource_ownership->begin_transition(fused_d3d11::resource_mode_e::legacy) != fused_d3d11::transition_result_e::started ||
+          !encode_resource_ownership->commit_transition(fused_d3d11::resource_mode_e::legacy)) {
+        BOOST_LOG(error) << "Failed to commit legacy D3D11 capture resource ownership";
+        return -1;
+      }
+    }
+    const auto resource_mode = encode_resource_ownership->mode();
+    const bool fused_resource = resource_mode == fused_d3d11::resource_mode_e::fused;
+    bool fused_completion_failed = fused_resource;
+    auto fused_completion_guard = util::fail_guard([&]() {
+      if (fused_completion_failed) {
+        request_fused_reinit();
+      }
+    });
+
+    // Recreate the image when switching between legacy shared and fused same-device ownership.
+    if (img->capture_texture && img->dummy == dummy && img->fused_resource == fused_resource) {
+      fused_completion_failed = false;
+      fused_completion_guard.disable();
       return 0;
     }
 
@@ -1949,6 +2927,7 @@ namespace platf::dxgi {
     img->pixel_pitch = get_pixel_pitch();
     img->row_pitch = img->pixel_pitch * img->width;
     img->dummy = dummy;
+    img->fused_resource = fused_resource;
     img->format = (capture_format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_B8G8R8A8_UNORM : capture_format;
 
     D3D11_TEXTURE2D_DESC t {};
@@ -1960,7 +2939,7 @@ namespace platf::dxgi {
     t.Usage = D3D11_USAGE_DEFAULT;
     t.Format = img->format;
     t.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    t.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    t.MiscFlags = fused_resource ? 0 : D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
     auto status = device->CreateTexture2D(&t, nullptr, &img->capture_texture);
     if (FAILED(status)) {
@@ -1974,28 +2953,41 @@ namespace platf::dxgi {
       return -1;
     }
 
-    // Get the keyed mutex to synchronize with the encoding code
-    status = img->capture_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &img->capture_mutex);
-    if (FAILED(status)) {
-      BOOST_LOG(error) << "Failed to query IDXGIKeyedMutex [0x"sv << util::hex(status).to_string_view() << ']';
-      return -1;
-    }
+    if (!fused_resource) {
+      // Get the keyed mutex to synchronize with the legacy encoder device.
+      status = img->capture_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &img->capture_mutex);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to query IDXGIKeyedMutex [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
 
-    resource1_t resource;
-    status = img->capture_texture->QueryInterface(__uuidof(IDXGIResource1), (void **) &resource);
-    if (FAILED(status)) {
-      BOOST_LOG(error) << "Failed to query IDXGIResource1 [0x"sv << util::hex(status).to_string_view() << ']';
-      return -1;
-    }
+      resource1_t resource;
+      status = img->capture_texture->QueryInterface(__uuidof(IDXGIResource1), (void **) &resource);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to query IDXGIResource1 [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
 
-    // Create a handle for the encoder device to use to open this texture
-    status = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &img->encoder_texture_handle);
-    if (FAILED(status)) {
-      BOOST_LOG(error) << "Failed to create shared texture handle [0x"sv << util::hex(status).to_string_view() << ']';
-      return -1;
+      // Create a handle for the legacy encoder device to open this texture.
+      status = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &img->encoder_texture_handle);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to create shared texture handle [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
     }
 
     img->data = (std::uint8_t *) img->capture_texture.get();
+
+    if (!img->resource_bound) {
+      if (!img->resource_ownership || !img->resource_ownership->bind_image(resource_mode)) {
+        BOOST_LOG(error) << "Failed to bind capture image to committed D3D11 resource ownership";
+        return -1;
+      }
+      img->resource_bound = true;
+    }
+
+    fused_completion_failed = false;
+    fused_completion_guard.disable();
 
     return 0;
   }
@@ -2102,7 +3094,18 @@ namespace platf::dxgi {
           // QSV doesn't support 4:4:4 in H.264 or AV1
           return false;
         }
-        // TODO: Blacklist HEVC 4:4:4 based on adapter model
+        const auto input_format = config.dynamicRange ? DXGI_FORMAT_Y410 : DXGI_FORMAT_AYUV;
+        UINT format_support = 0;
+        constexpr UINT required_support = D3D11_FORMAT_SUPPORT_TEXTURE2D |
+                                          D3D11_FORMAT_SUPPORT_SHADER_SAMPLE |
+                                          D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+        if (FAILED(device->CheckFormatSupport(input_format, &format_support)) ||
+            (format_support & required_support) != required_support) {
+          return false;
+        }
+        // The later real encoder probe remains authoritative for HEVC RExt
+        // support; this boundary only admits a GPU that can create and render
+        // the exact AYUV/Y410 input surface required by that probe.
       }
     } else if (adapter_desc.VendorId == 0x10de) {  // Nvidia
       // If it's not an NVENC encoder, it's not compatible with an Nvidia GPU

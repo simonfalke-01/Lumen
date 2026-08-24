@@ -4,6 +4,9 @@
  */
 // standard includes
 #include <cmath>
+#include <cstdint>
+#include <mutex>
+#include <optional>
 #include <thread>
 
 // platform includes
@@ -28,7 +31,7 @@ typedef long NTSTATUS;
 /**
  * @brief Enumerates supported d3 DKMT GPU PREFERENCE QUERY STATE options.
  */
-typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE : DWORD {
+typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE: DWORD {
   D3DKMT_GPU_PREFERENCE_STATE_UNINITIALIZED,  ///< The GPU preference isn't initialized.
   D3DKMT_GPU_PREFERENCE_STATE_HIGH_PERFORMANCE,  ///< The highest performing GPU is preferred.
   D3DKMT_GPU_PREFERENCE_STATE_MINIMUM_POWER,  ///< The minimum-powered GPU is preferred.
@@ -51,6 +54,87 @@ namespace platf {
 
 namespace platf::dxgi {
   namespace bp = boost::process::v1;
+
+  namespace {
+    struct encoder_reenumeration_state_t {
+      std::mutex mutex;
+      factory1_t factory;
+      std::optional<::video::encoder_probe_opened_device_baseline_t> opened_device_baseline;
+    };
+
+    encoder_reenumeration_state_t &encoder_reenumeration_state() {
+      static encoder_reenumeration_state_t state;
+      return state;
+    }
+
+    std::uint64_t adapter_luid_value(const LUID &luid) {
+      return static_cast<std::uint64_t>(static_cast<std::uint32_t>(luid.HighPart)) << 32 |
+             static_cast<std::uint64_t>(luid.LowPart);
+    }
+
+    std::optional<::video::encoder_probe_device_identity_t> query_encoder_device_identity(
+      IDXGIAdapter1 &adapter,
+      IDXGIOutput &output
+    ) {
+      DXGI_ADAPTER_DESC1 adapter_desc {};
+      auto status = adapter.GetDesc1(&adapter_desc);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to query encoder adapter identity [0x"sv << util::hex(status).to_string_view() << ']';
+        return std::nullopt;
+      }
+
+      LARGE_INTEGER driver_version {};
+      status = adapter.CheckInterfaceSupport(IID_IDXGIDevice, &driver_version);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to query encoder driver version [0x"sv << util::hex(status).to_string_view() << ']';
+        return std::nullopt;
+      }
+
+      DXGI_OUTPUT_DESC output_desc {};
+      status = output.GetDesc(&output_desc);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to query encoder output identity [0x"sv << util::hex(status).to_string_view() << ']';
+        return std::nullopt;
+      }
+
+      return ::video::encoder_probe_device_identity_t {
+        adapter_luid_value(adapter_desc.AdapterLuid),
+        adapter_desc.VendorId,
+        adapter_desc.DeviceId,
+        adapter_desc.SubSysId,
+        adapter_desc.Revision,
+        static_cast<std::uint64_t>(driver_version.QuadPart),
+        utf_utils::to_utf8(output_desc.DeviceName),
+      };
+    }
+
+    void record_opened_encoder_device_identity(
+      IDXGIAdapter1 &adapter,
+      IDXGIOutput &output,
+      ::video::encoder_probe_selection_intent_t selection_intent
+    ) {
+      auto &state = encoder_reenumeration_state();
+      auto identity = query_encoder_device_identity(adapter, output);
+      auto lock = std::lock_guard(state.mutex);
+      if (!identity) {
+        state.opened_device_baseline.reset();
+        return;
+      }
+      state.opened_device_baseline = ::video::encoder_probe_opened_device_baseline_t {
+        std::move(*identity),
+        std::move(selection_intent),
+      };
+    }
+  }  // namespace
+
+  std::optional<::video::encoder_probe_device_identity_t> encoder_probe_device_identity() {
+    auto &state = encoder_reenumeration_state();
+    auto lock = std::lock_guard(state.mutex);
+    if (!state.opened_device_baseline) {
+      return std::nullopt;
+    }
+    return state.opened_device_baseline->identity;
+  }
 
   /**
    * DDAPI-specific initialization goes here.
@@ -279,6 +363,7 @@ namespace platf::dxgi {
           sleep_overshoot_logger.first_point(sleep_target);
           sleep_overshoot_logger.second_point_now_and_log();
 
+          capture_boundary();
           status = snapshot(pull_free_image_cb, img_out, 0ms, *cursor);
 
           if (status == capture_e::ok && img_out) {
@@ -292,6 +377,7 @@ namespace platf::dxgi {
 
       // Start new frame pacing group if necessary, snapshot() is called with non-zero timeout
       if (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start)) {
+        capture_boundary();
         status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
 
         if (status == capture_e::ok && img_out) {
@@ -487,6 +573,13 @@ namespace platf::dxgi {
 
     auto adapter_name = utf_utils::from_utf8(config::video.adapter_name);
     auto output_name = utf_utils::from_utf8(display_name);
+    ::video::encoder_probe_selection_intent_t selection_intent {
+      config::video.adapter_name,
+      config::video.output_name,
+      display_device::map_output_name(config::video.output_name),
+      config::video.adapter_name.empty(),
+      config::video.output_name.empty(),
+    };
 
     adapter_t::pointer adapter_p;
     for (int tries = 0; tries < 2; ++tries) {
@@ -754,6 +847,14 @@ namespace platf::dxgi {
       return -1;
     }
 
+    // Record only after the display backend has completed initialization so the
+    // encoder cache is bound to the exact adapter/output that actually opened.
+    record_opened_encoder_device_identity(
+      *adapter.get(),
+      *output.get(),
+      std::move(selection_intent)
+    );
+
     return 0;
   }
 
@@ -1014,6 +1115,15 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    if (hwdevice_type == mem_type_e::dxgi && config.virtual_display_frame_source) {
+      auto direct = std::make_shared<dxgi::display_vdd_vram_t>();
+      if (!direct->init(config, display_name)) {
+        return direct;
+      }
+      config.virtual_display_frame_source->stop();
+      BOOST_LOG(warning) << "Lumen VDD direct-frame initialization failed; falling back to DDA/WGC"sv;
+    }
+
     if (config::video.capture == "ddx" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
@@ -1123,28 +1233,196 @@ namespace platf {
    * @return `true` if a change has occurred or if it is unknown whether a change occurred.
    */
   bool needs_encoder_reenumeration() {
-    // Serialize access to the static DXGI factory
-    static std::mutex reenumeration_state_lock;
-    auto lg = std::lock_guard(reenumeration_state_lock);
+    auto &state = dxgi::encoder_reenumeration_state();
+    auto lock = std::lock_guard(state.mutex);
 
-    // Keep a reference to the DXGI factory, which will keep track of changes internally.
-    static dxgi::factory1_t factory;
-    if (!factory || !factory->IsCurrent()) {
-      factory.reset();
+    // Keep a reference to the DXGI factory, which tracks adapter/driver topology changes.
+    const bool factory_was_current = state.factory && state.factory->IsCurrent();
+    if (!factory_was_current) {
+      state.factory.reset();
 
-      auto status = CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory);
+      auto status = CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &state.factory);
       if (FAILED(status)) {
         BOOST_LOG(error) << "Failed to create DXGIFactory1 [0x"sv << util::hex(status).to_string_view() << ']';
-        factory.release();
+        state.factory.release();
+        return true;
+      }
+    }
+
+    // No successful display open has established a trustworthy cache baseline yet.
+    if (!state.opened_device_baseline) {
+      BOOST_LOG(info) << "Encoder reenumeration is required because no opened adapter/output baseline exists"sv;
+      return true;
+    }
+
+    const auto baseline = *state.opened_device_baseline;
+    const auto &expected_identity = baseline.identity;
+    bool matched_adapter = false;
+    bool matched_output = false;
+
+    dxgi::adapter_t::pointer adapter_p;
+    for (int adapter_index = 0;; ++adapter_index) {
+      const auto adapter_status = state.factory->EnumAdapters1(adapter_index, &adapter_p);
+      if (adapter_status == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      if (FAILED(adapter_status)) {
+        BOOST_LOG(error) << "Failed to enumerate adapters while validating the encoder cache [0x"sv
+                         << util::hex(adapter_status).to_string_view() << ']';
+        return true;
       }
 
-      // Always request reenumeration on the first streaming session just to ensure we
-      // can deal with any initialization races that may occur when the system is booting.
-      BOOST_LOG(info) << "Encoder reenumeration is required"sv;
-      return true;
-    } else {
-      // The DXGI factory from last time is still current, so no encoder changes have occurred.
-      return false;
+      dxgi::adapter_t adapter {adapter_p};
+      DXGI_ADAPTER_DESC1 adapter_desc {};
+      const auto adapter_desc_status = adapter->GetDesc1(&adapter_desc);
+      if (FAILED(adapter_desc_status)) {
+        BOOST_LOG(error) << "Failed to query adapter identity while validating the encoder cache [0x"sv
+                         << util::hex(adapter_desc_status).to_string_view() << ']';
+        return true;
+      }
+      if (dxgi::adapter_luid_value(adapter_desc.AdapterLuid) != expected_identity.adapter_luid) {
+        continue;
+      }
+      matched_adapter = true;
+
+      if (adapter_desc.VendorId != expected_identity.vendor_id ||
+          adapter_desc.DeviceId != expected_identity.device_id ||
+          adapter_desc.SubSysId != expected_identity.subsystem_id ||
+          adapter_desc.Revision != expected_identity.revision) {
+        BOOST_LOG(info) << "Encoder reenumeration is required because the opened adapter identity changed"sv;
+        return true;
+      }
+
+      LARGE_INTEGER driver_version {};
+      const auto driver_status = adapter->CheckInterfaceSupport(IID_IDXGIDevice, &driver_version);
+      if (FAILED(driver_status)) {
+        BOOST_LOG(error) << "Failed to query driver version while validating the encoder cache [0x"sv
+                         << util::hex(driver_status).to_string_view() << ']';
+        return true;
+      }
+      if (static_cast<std::uint64_t>(driver_version.QuadPart) != expected_identity.driver_version) {
+        BOOST_LOG(info) << "Encoder reenumeration is required because the encoder driver version changed"sv;
+        return true;
+      }
+
+      dxgi::output_t::pointer output_p;
+      for (int output_index = 0;; ++output_index) {
+        const auto output_status = adapter->EnumOutputs(output_index, &output_p);
+        if (output_status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(output_status)) {
+          BOOST_LOG(error) << "Failed to enumerate outputs while validating the encoder cache [0x"sv
+                           << util::hex(output_status).to_string_view() << ']';
+          return true;
+        }
+
+        dxgi::output_t output {output_p};
+        DXGI_OUTPUT_DESC output_desc {};
+        const auto output_desc_status = output->GetDesc(&output_desc);
+        if (FAILED(output_desc_status)) {
+          BOOST_LOG(error) << "Failed to query output identity while validating the encoder cache [0x"sv
+                           << util::hex(output_desc_status).to_string_view() << ']';
+          return true;
+        }
+        if (utf_utils::to_utf8(output_desc.DeviceName) != expected_identity.output_name) {
+          continue;
+        }
+        matched_output = output_desc.AttachedToDesktop;
+        break;
+      }
+      break;
     }
+
+    if (!matched_adapter || !matched_output) {
+      BOOST_LOG(info) << "Encoder reenumeration is required because the opened adapter/output is no longer active"sv;
+      return true;
+    }
+
+    // Automatic adapter/output selection must be replayed in the same enumeration
+    // order with the same attachment and DDA eligibility checks used by display init.
+    // Merely validating that the old output remains attached is insufficient: a newly
+    // eligible output earlier in enumeration order becomes the new capture target.
+    if (::video::encoder_probe_selection_requires_replay(baseline.selection_intent)) {
+      ::video::encoder_probe_device_selection_t current_selection;
+      dxgi::adapter_t::pointer selection_adapter_p;
+      for (int adapter_index = 0; !current_selection.selected(); ++adapter_index) {
+        const auto adapter_status = state.factory->EnumAdapters1(adapter_index, &selection_adapter_p);
+        if (adapter_status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(adapter_status)) {
+          BOOST_LOG(error) << "Failed to enumerate adapters while resolving the automatic capture target [0x"sv
+                           << util::hex(adapter_status).to_string_view() << ']';
+          return true;
+        }
+
+        dxgi::adapter_t selection_adapter {selection_adapter_p};
+        DXGI_ADAPTER_DESC1 selection_adapter_desc {};
+        const auto adapter_desc_status = selection_adapter->GetDesc1(&selection_adapter_desc);
+        if (FAILED(adapter_desc_status)) {
+          BOOST_LOG(error) << "Failed to query adapter while resolving the automatic capture target [0x"sv
+                           << util::hex(adapter_desc_status).to_string_view() << ']';
+          return true;
+        }
+        if (!baseline.selection_intent.adapter_was_automatic &&
+            utf_utils::to_utf8(selection_adapter_desc.Description) != baseline.selection_intent.raw_adapter_filter) {
+          continue;
+        }
+
+        dxgi::output_t::pointer selection_output_p;
+        for (int output_index = 0; !current_selection.selected(); ++output_index) {
+          const auto output_status = selection_adapter->EnumOutputs(output_index, &selection_output_p);
+          if (output_status == DXGI_ERROR_NOT_FOUND) {
+            break;
+          }
+          if (FAILED(output_status)) {
+            BOOST_LOG(error) << "Failed to enumerate outputs while resolving the automatic capture target [0x"sv
+                             << util::hex(output_status).to_string_view() << ']';
+            return true;
+          }
+
+          dxgi::output_t selection_output {selection_output_p};
+          DXGI_OUTPUT_DESC selection_output_desc {};
+          const auto output_desc_status = selection_output->GetDesc(&selection_output_desc);
+          if (FAILED(output_desc_status)) {
+            BOOST_LOG(error) << "Failed to query output while resolving the automatic capture target [0x"sv
+                             << util::hex(output_desc_status).to_string_view() << ']';
+            return true;
+          }
+          if (!baseline.selection_intent.output_was_automatic &&
+              utf_utils::to_utf8(selection_output_desc.DeviceName) != baseline.selection_intent.resolved_output_filter) {
+            continue;
+          }
+
+          const bool capture_supported = selection_output_desc.AttachedToDesktop &&
+                                         dxgi::test_dxgi_duplication(selection_adapter, selection_output, false);
+          auto candidate_identity = dxgi::query_encoder_device_identity(*selection_adapter.get(), *selection_output.get());
+          if (!candidate_identity) {
+            return true;
+          }
+
+          current_selection.observe(::video::encoder_probe_device_candidate_t {
+            std::move(*candidate_identity),
+            true,
+            true,
+            selection_output_desc.AttachedToDesktop != FALSE,
+            capture_supported,
+          });
+        }
+      }
+
+      if (!current_selection.selected() || *current_selection.selected() != expected_identity) {
+        BOOST_LOG(info) << "Encoder reenumeration is required because the automatic capture target changed"sv;
+        return true;
+      }
+    }
+
+    if (!factory_was_current) {
+      BOOST_LOG(info) << "Encoder reenumeration is required because the DXGI generation changed"sv;
+      return true;
+    }
+
+    return false;
   }
 }  // namespace platf

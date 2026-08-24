@@ -5,6 +5,9 @@
 #pragma once
 #ifdef _WIN32
 
+  // standard includes
+  #include <cstdint>
+
   // lib includes
   #include <d3d11.h>
 
@@ -30,6 +33,25 @@ namespace nvenc {
      * @return Input surface texture.
      */
     virtual ID3D11Texture2D *get_input_texture() = 0;
+
+    /**
+     * @brief Enable or disable instance-local fused input telemetry state.
+     *
+     * @param enabled Whether this encoder consumes same-device fused conversions.
+     */
+    virtual void set_fused_input_enabled(bool enabled) {
+      (void) enabled;
+    }
+
+    /** @brief Transfer one explicit correlated child token into this encoder instance. */
+    virtual bool set_frame_telemetry_token(std::uint64_t token) {
+      (void) token;
+      return false;
+    }
+
+    /** @brief Reclaim a pending child after skipped encode, reinit, or teardown. */
+    virtual void clear_frame_telemetry_token() {
+    }
   };
 
 }  // namespace nvenc

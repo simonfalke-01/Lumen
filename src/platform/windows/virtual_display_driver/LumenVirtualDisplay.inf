@@ -1,0 +1,66 @@
+;
+; LumenVirtualDisplay.inf
+; UMDF2 IddCx 1.2 virtual display for Windows 10 1903 and later.
+;
+
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+Class=Display
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+ClassVer=2.0
+Provider=%ProviderName%
+CatalogFile=LumenVirtualDisplay.cat
+DriverVer=08/24/2026,0.1.0.0
+
+[Manufacturer]
+%ProviderName%=Standard,NTamd64.10.0...18362
+
+[Standard.NTamd64.10.0...18362]
+%DeviceName%=LumenVdd_Install,Root\LumenVirtualDisplay
+
+[SourceDisksFiles]
+LumenVirtualDisplay.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[DestinationDirs]
+LumenVdd_Copy=13
+
+[LumenVdd_Copy]
+LumenVirtualDisplay.dll
+
+[LumenVdd_Install.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+CopyFiles=LumenVdd_Copy
+
+[LumenVdd_Install.NT.HW]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+AddReg=LumenVdd_Hardware
+
+[LumenVdd_Hardware]
+HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+HKR,,"Security",0x00000000,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+HKR,"WUDF","DeviceGroupId",0x00000000,"LumenVirtualDisplayGroup"
+
+[LumenVdd_Install.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[LumenVdd_Install.NT.Wdf]
+UmdfService=LumenVirtualDisplay,LumenVdd_Service
+UmdfServiceOrder=LumenVirtualDisplay
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+
+[LumenVdd_Service]
+UmdfLibraryVersion=2.23.0
+ServiceBinary=%13%\LumenVirtualDisplay.dll
+UmdfExtensions=IddCx0102
+
+[Strings]
+ProviderName="Lumen"
+DiskName="Lumen Virtual Display Driver"
+DeviceName="Lumen Virtual Display"
