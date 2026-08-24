@@ -48,9 +48,9 @@ extern "C" {
   DEFINE_GUID(GUID_DEVINTERFACE_LUMEN_VIRTUAL_HID, 0xaec36f6e, 0x3bb9, 0x47c6, 0xbf, 0x3c, 0x11, 0xa5, 0x62, 0xdd, 0x48, 0x40);
 #endif
 
-/** Canonical root-enumerated hardware identifier used by the driver package. */
+/** Exact root-enumerated hardware identifier used by the driver package. */
 #define LUMEN_VHID_ROOT_HARDWARE_ID_A "ROOT\\LumenVirtualHid"
-/** Wide-character form of the canonical root hardware identifier. */
+/** Wide-character form of the exact root hardware identifier. */
 #define LUMEN_VHID_ROOT_HARDWARE_ID_W L"ROOT\\LumenVirtualHid"
 /** Narrow-character driver service and binary base name. */
 #define LUMEN_VHID_DRIVER_SERVICE_NAME_A "LumenVirtualHid"

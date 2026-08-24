@@ -339,12 +339,12 @@ namespace {
     return static_cast<int>(code);
   }
 
-  /** Compare a device hardware ID with Lumen's canonical root ID. */
+  /** Compare a device hardware ID with Lumen's exact root ID. */
   bool equals_hardware_id(const wchar_t *value) {
     return _wcsicmp(value, LUMEN_VHID_ROOT_HARDWARE_ID_W) == 0;
   }
 
-  /** Check a SetupAPI device node for the exact canonical hardware ID. */
+  /** Check a SetupAPI device node for the expected hardware ID. */
   bool device_has_hardware_id(HDEVINFO set, SP_DEVINFO_DATA &device) {
     DWORD required = 0;
     DWORD type = 0;

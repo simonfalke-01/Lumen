@@ -56,7 +56,53 @@ protected:
 
 public:
     DECLARE_STD_UNKNOWN();
-    DEFINE_STD_CONSTRUCTOR(CMiniportWaveRTStream);
+    CMiniportWaveRTStream(_In_opt_ PUNKNOWN UnknownOuter)
+        : CUnknown(UnknownOuter),
+          m_pPortStream(NULL),
+          m_NotificationList{},
+          m_pNotificationTimer(NULL),
+          m_ulNotificationIntervalMs(0),
+          m_ulCurrentWritePosition(0),
+          m_IsCurrentWritePositionUpdated(0),
+          m_pMiniport(NULL),
+          m_ulPin(0),
+          m_bCapture(FALSE),
+          m_bUnregisterStream(FALSE),
+          m_ulDmaBufferSize(0),
+          m_pDmaBuffer(NULL),
+          m_ulNotificationsPerBuffer(0),
+          m_KsState(KSSTATE_STOP),
+          m_pTimer(NULL),
+          m_pDpc(NULL),
+          m_ullPlayPosition(0),
+          m_ullWritePosition(0),
+          m_ullLinearPosition(0),
+          m_ullPresentationPosition(0),
+          m_ulLastOsReadPacket(0),
+          m_ulLastOsWritePacket(0),
+          m_llPacketCounter(0),
+          m_ullDmaTimeStamp(0),
+          m_ullPerformanceCounterFrequency{},
+          m_hnsElapsedTimeCarryForward(0),
+          m_ullLastDPCTimeStamp(0),
+          m_hnsDPCTimeCarryForward(0),
+          m_byteDisplacementCarryForward(0),
+          m_ulDmaMovementRate(0),
+          m_bLfxEnabled(FALSE),
+          m_pbMuted(NULL),
+          m_plVolumeLevel(NULL),
+          m_plPeakMeter(NULL),
+          m_pWfExt(NULL),
+          m_ulContentId(0),
+          m_SaveData(),
+          m_SignalProcessingMode(GUID_NULL),
+          m_bEoSReceived(FALSE),
+          m_bLastBufferRendered(FALSE),
+          m_PositionSpinLock{}
+    {
+        InitializeListHead(&m_NotificationList);
+        KeInitializeSpinLock(&m_PositionSpinLock);
+    }
     ~CMiniportWaveRTStream();
 
     IMP_IMiniportWaveRTStream;

@@ -121,18 +121,33 @@ public:
         _In_opt_        PVOID                                   DeviceContext
     )
         :CUnknown(0),
+        m_ulSystemAllocated(0),
         m_ulMaxSystemStreams(0),
-        m_DeviceType(MiniportPair->DeviceType),
-        m_DeviceContext(DeviceContext),
-        m_DeviceMaxChannels(MiniportPair->DeviceMaxChannels),
+        m_ulMaxOffloadStreams(0),
+        m_ulMaxLoopbackStreams(0),
+        m_SystemStreams(NULL),
+        m_bGfxEnabled(FALSE),
+        m_pbMuted(NULL),
+        m_plVolumeLevel(NULL),
+        m_pMixFormat(NULL),
+        m_pDeviceFormat(NULL),
+        m_FilterDesc{},
         m_DeviceFormatsAndModes(MiniportPair->PinDeviceFormatsAndModes),
+        m_DeviceFormatsAndModesLock{},
+        m_DeviceFormatsAndModesIrql(PASSIVE_LEVEL),
         m_DeviceFormatsAndModesCount(MiniportPair->PinDeviceFormatsAndModesCount),
+        m_DeviceMaxChannels(MiniportPair->DeviceMaxChannels),
+        m_pDrmPort(NULL),
+        m_MixDrmRights{},
+        m_ulMixDrmContentId(0),
+        m_DeviceContext(DeviceContext),
+        m_pAdapterCommon((PADAPTERCOMMON)UnknownAdapter),
         m_DeviceFlags(MiniportPair->DeviceFlags),
+        m_DeviceType(MiniportPair->DeviceType),
+        m_pPortEvents(NULL),
         m_pMiniportPair(MiniportPair)
     {
         PAGED_CODE();
-
-        m_pAdapterCommon = (PADAPTERCOMMON)UnknownAdapter; // weak ref.
 
         if (MiniportPair->WaveDescriptor)
         {

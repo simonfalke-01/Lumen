@@ -515,7 +515,7 @@ namespace platf {
 
 /**
  * @brief Destructor for AVAudio instances.
- * Performs comprehensive cleanup of both audio capture paths and shared resources.
+ * Cleans up both audio capture paths and their shared resources.
  */
 - (void)dealloc {
   using namespace std::literals;
@@ -729,7 +729,7 @@ namespace platf {
     BOOST_LOG(error) << "Failed to get device sample rate, falling back to client rate (" << clientSampleRate << "Hz): " << ca::Status(sampleRateStatus);
     aggregateDeviceSampleRate = (Float64) clientSampleRate;
   } else if (aggregateDeviceSampleRate <= 0.0) {
-    // API returned noErr but the value is invalid (e.g. 0 from a UInt32→Float64 casting issue).
+    // API returned noErr but the value is invalid (for example, 0 from a UInt32-to-Float64 cast).
     // Treat it as a failure rather than silently proceeding with an invalid rate.
     BOOST_LOG(error) << "getDeviceProperty returned noErr but got invalid sample rate: "sv
                      << aggregateDeviceSampleRate << "Hz - falling back to client rate (" << clientSampleRate << "Hz)"sv;

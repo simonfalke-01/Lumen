@@ -102,9 +102,26 @@ namespace platf::win_audio {
   };
 
   /**
+   * @brief Probe-capable Windows client microphone injection backend.
+   */
+  class virtual_microphone_sink_t: public client_microphone::sink_t {
+  public:
+    /**
+     * @brief Destroy the platform backend.
+     */
+    ~virtual_microphone_sink_t() override = default;
+
+    /**
+     * @brief Prove that the backend can target its secured driver or exact virtual endpoint.
+     * @return `true` only when a usable backend is present.
+     */
+    virtual bool probe() = 0;
+  };
+
+  /**
    * @brief Fixed 48 kHz mono signed-16 PCM sink backed by the Windows driver.
    */
-  class virtual_microphone_t final: public client_microphone::sink_t {
+  class virtual_microphone_t final: public virtual_microphone_sink_t {
   public:
     /**
      * @brief Construct a virtual microphone around an injectable channel.
@@ -127,7 +144,7 @@ namespace platf::win_audio {
      * @brief Probe interface discovery and exact ABI compatibility without claiming a stream.
      * @return `true` only when the compatible interface can be opened and queried.
      */
-    bool probe();
+    bool probe() override;
 
     bool begin(std::uint64_t generation, std::uint32_t sample_rate, std::uint8_t channels) override;
     bool write(std::uint64_t generation, std::span<const std::int16_t> samples) override;
@@ -198,5 +215,5 @@ namespace platf::win_audio {
    * @brief Create the production Windows virtual microphone sink.
    * @return Unprobed sink using the secured system driver channel.
    */
-  std::unique_ptr<virtual_microphone_t> make_virtual_microphone();
+  std::unique_ptr<virtual_microphone_sink_t> make_virtual_microphone();
 }  // namespace platf::win_audio

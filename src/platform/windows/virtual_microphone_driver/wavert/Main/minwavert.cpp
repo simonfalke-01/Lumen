@@ -216,6 +216,12 @@ Arguments:
 
     PAGED_CODE();
 
+    if (ResultantFormatLength == NULL ||
+        (OutputBufferLength != 0 && ResultantFormat == NULL))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (!IsEqualGUIDAligned(ClientDataRange->Specifier, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX))
     {
         return STATUS_NOT_IMPLEMENTED;

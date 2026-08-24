@@ -71,6 +71,7 @@ namespace audio {
     stream_params_t customStreamParams;  ///< Custom Opus layout used when CUSTOM_SURROUND_PARAMS is enabled.
 
     std::bitset<MAX_FLAGS> flags;  ///< Enabled audio feature flags.
+    int bitrate {};  ///< Exact negotiated total Opus bitrate, or zero for legacy tier selection.
   };
 
   /**
@@ -93,7 +94,12 @@ namespace audio {
   /**
    * @brief Encoded audio packet paired with platform channel metadata.
    */
-  using packet_t = std::pair<void *, buffer_t>;
+  struct packet_t {
+    void *channel_data {};  ///< Owning stream/session route.
+    buffer_t payload;  ///< Encoded Opus packet.
+    std::uint64_t sample_position {};  ///< Exact 48 kHz first-sample position.
+    bool discontinuity {};  ///< Reset/flush decoder before this packet.
+  };
   /**
    * @brief Shared mailbox reference to the global audio context.
    */

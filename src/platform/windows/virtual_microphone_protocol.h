@@ -55,9 +55,9 @@ typedef int16_t lumen_vmic_int16_t;
 extern "C" {
 #endif
 
-/** Canonical root-enumerated hardware identifier used by the driver package. */
+/** Exact root-enumerated hardware identifier used by the driver package. */
 #define LUMEN_VMIC_ROOT_HARDWARE_ID_A "ROOT\\LumenVirtualMicrophone"
-/** Wide-character form of the canonical root hardware identifier. */
+/** Wide-character form of the exact root hardware identifier. */
 #define LUMEN_VMIC_ROOT_HARDWARE_ID_W L"ROOT\\LumenVirtualMicrophone"
 /** Narrow-character driver service and binary base name. */
 #define LUMEN_VMIC_DRIVER_SERVICE_NAME_A "LumenVirtualMicrophone"

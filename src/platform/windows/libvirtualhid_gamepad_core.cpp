@@ -92,10 +92,10 @@ namespace platf::win_gamepad::lvh_core {
     }
 
     /**
-     * @brief Check that a caller-provided definition retains its canonical identity.
+     * @brief Check that a caller-provided definition retains its expected identity.
      *
      * @param definition Lumen profile definition to validate.
-     * @param upstream Canonical upstream profile.
+     * @param upstream Reference upstream profile.
      * @return `true` when compatibility-critical fields match.
      */
     bool matches_profile(const profile_definition_t &definition, const lvh::DeviceProfile &upstream) {

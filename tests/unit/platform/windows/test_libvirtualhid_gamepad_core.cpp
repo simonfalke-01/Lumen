@@ -23,7 +23,7 @@ namespace {
   using platf::win_gamepad::profile_kind_e;
 }  // namespace
 
-TEST(LibvirtualhidGamepadCoreTest, UsesCanonicalUsbPlaystationProfiles) {
+TEST(LibvirtualhidGamepadCoreTest, UsesReferenceUsbPlaystationProfiles) {
   const auto dualshock4 = core::profile(profile_kind_e::dualshock4);
   const auto dualsense = core::profile(profile_kind_e::dualsense);
 

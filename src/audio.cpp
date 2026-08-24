@@ -3,6 +3,7 @@
  * @brief Definitions for audio capture and encoding.
  */
 // standard includes
+#include <span>
 #include <thread>
 
 // lib includes
@@ -26,7 +27,12 @@ namespace audio {
   /**
    * @brief Shared queue carrying captured PCM sample buffers to the encoder thread.
    */
-  using sample_queue_t = std::shared_ptr<safe::queue_t<std::vector<float>>>;
+  struct captured_frame_t {
+    std::vector<float> samples;
+    std::uint64_t sample_position {};
+    std::uint32_t gap_frames {};
+  };
+  using sample_queue_t = std::shared_ptr<safe::queue_t<captured_frame_t>>;
 
   static int start_audio_control(audio_ctx_t &ctx);
   static void stop_audio_control(audio_ctx_t &);
@@ -112,6 +118,15 @@ namespace audio {
     if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
       apply_surround_params(stream, config.customStreamParams);
     }
+    if (config.bitrate != 0) {
+      const auto maximum_bitrate = std::min(2'048'000, stream.streams * 512'000);
+      if (config.bitrate < 6'000 || config.bitrate > maximum_bitrate) {
+        BOOST_LOG(error) << "Rejected invalid negotiated Opus bitrate: "sv << config.bitrate;
+        packets->stop();
+        return;
+      }
+      stream.bitrate = config.bitrate;
+    }
 
     // Encoding takes place on this thread
     platf::set_thread_name("audio::encode");
@@ -135,19 +150,41 @@ namespace audio {
                     << stream.bitrate / 1000 << " kbps (total), LOWDELAY"sv;
 
     auto frame_size = config.packetDuration * stream.sampleRate / 1000;
-    while (auto sample = samples->pop()) {
+    auto encode_and_publish = [&](std::span<const float> pcm, const std::uint64_t sample_position,
+                                  const bool discontinuity) {
       buffer_t packet {1400};
-
-      int bytes = opus_multistream_encode_float(opus.get(), sample->data(), frame_size, std::begin(packet), (opus_int32) packet.size());
+      const int bytes = opus_multistream_encode_float(
+        opus.get(), pcm.data(), frame_size, std::begin(packet), static_cast<opus_int32>(packet.size())
+      );
       if (bytes < 0) {
         BOOST_LOG(error) << "Couldn't encode audio: "sv << opus_strerror(bytes);
+        return false;
+      }
+      packet.fake_resize(bytes);
+      return packets->raise(packet_t {
+        .channel_data = channel_data,
+        .payload = std::move(packet),
+        .sample_position = sample_position,
+        .discontinuity = discontinuity,
+      });
+    };
+    std::vector<float> silence(static_cast<std::size_t>(frame_size * stream.channelCount), 0.0f);
+    while (auto sample = samples->pop()) {
+      const auto first_gap_position = sample->sample_position -
+                                      static_cast<std::uint64_t>(sample->gap_frames) * frame_size;
+      for (std::uint32_t gap = 0; gap < sample->gap_frames; ++gap) {
+        if (!encode_and_publish(silence, first_gap_position + static_cast<std::uint64_t>(gap) * frame_size,
+                                gap == 0)) {
+          BOOST_LOG(error) << "Audio packet queue overflow while preserving a capture gap"sv;
+          packets->stop();
+          return;
+        }
+      }
+      if (!encode_and_publish(sample->samples, sample->sample_position, false)) {
+        BOOST_LOG(error) << "Audio packet queue overflow"sv;
         packets->stop();
-
         return;
       }
-
-      packet.fake_resize(bytes);
-      packets->raise(channel_data, std::move(packet));
     }
   }
 
@@ -233,7 +270,10 @@ namespace audio {
     // Capture takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
-    auto samples = std::make_shared<sample_queue_t::element_type>(30);
+    const auto maximum_queue_frames = static_cast<std::uint32_t>(
+      std::max(1, 120 / std::max(config.packetDuration, 1))
+    );
+    auto samples = std::make_shared<sample_queue_t::element_type>(maximum_queue_frames);
     std::jthread thread {encodeThread, samples, config, channel_data};
 
     auto fg = util::fail_guard([&]() {
@@ -245,6 +285,8 @@ namespace audio {
 
     int samples_per_frame = frame_size * stream.channelCount;
 
+    std::uint64_t next_sample_position {};
+    std::uint32_t pending_gap_frames {};
     while (!shutdown_event->peek()) {
       std::vector<float> sample_buffer;
       sample_buffer.resize(samples_per_frame);
@@ -269,7 +311,17 @@ namespace audio {
           return;
       }
 
-      samples->raise(std::move(sample_buffer));
+      captured_frame_t captured {
+        .samples = std::move(sample_buffer),
+        .sample_position = next_sample_position,
+        .gap_frames = pending_gap_frames,
+      };
+      if (samples->raise(std::move(captured))) {
+        pending_gap_frames = 0;
+      } else if (pending_gap_frames != UINT32_MAX) {
+        ++pending_gap_frames;
+      }
+      next_sample_position += static_cast<std::uint64_t>(frame_size);
     }
   }
 

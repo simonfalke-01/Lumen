@@ -81,7 +81,7 @@ namespace platf::win_gamepad {
      *
      * @param session Owning dynamic-gamepad session.
      * @param device Driver-created device metadata.
-     * @param definition Canonical portable profile definition.
+     * @param definition Reference portable profile definition.
      * @param feedback Shared feedback routing state.
      * @param generation Router slot generation.
      */

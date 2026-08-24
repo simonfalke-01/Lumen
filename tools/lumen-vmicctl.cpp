@@ -284,12 +284,12 @@ namespace {
     return static_cast<int>(code);
   }
 
-  /** Compare a hardware identifier with Lumen's canonical microphone root. */
+  /** Compare a hardware identifier with Lumen's exact microphone root. */
   bool equals_hardware_id(const wchar_t *value) {
     return _wcsicmp(value, LUMEN_VMIC_ROOT_HARDWARE_ID_W) == 0;
   }
 
-  /** Check one SetupAPI node for the exact canonical hardware ID. */
+  /** Check one SetupAPI node for the expected hardware ID. */
   bool device_has_hardware_id(HDEVINFO set, SP_DEVINFO_DATA &device) {
     DWORD required = 0;
     DWORD type = 0;
@@ -689,7 +689,7 @@ namespace {
     return true;
   }
 
-  /** Create and register the canonical root device before binding its driver. */
+  /** Create and register the expected root device before binding its driver. */
   bool create_root_device(
     const GUID &class_guid,
     const wchar_t *class_name,
@@ -878,7 +878,7 @@ namespace {
     return static_cast<int>(probe_exit_code(result.state));
   }
 
-  /** Idempotently create the canonical root and force-bind the supplied INF. */
+  /** Idempotently create the expected root and force-bind the supplied INF. */
   int install_or_update(const wchar_t *inf_argument) {
     DWORD error = ERROR_SUCCESS;
     const auto inf_path = absolute_path(inf_argument, error);

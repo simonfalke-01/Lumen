@@ -64,15 +64,21 @@ ULONG CSaveData::m_ulStreamId = 0;
 
 //=============================================================================
 CSaveData::CSaveData()
-:   m_pDataBuffer(NULL),
+:   m_FileName{},
     m_FileHandle(NULL),
-    m_ulFrameCount(DEFAULT_FRAME_COUNT),
+    m_pDataBuffer(NULL),
     m_ulBufferSize(DEFAULT_BUFFER_SIZE),
+    m_ulFrameIndex(0),
+    m_ulFrameCount(DEFAULT_FRAME_COUNT),
     m_ulFrameSize(DEFAULT_FRAME_SIZE),
     m_ulBufferOffset(0),
-    m_ulFrameIndex(0),
     m_fFrameUsed(NULL),
+    m_FrameInUseSpinLock{},
+    m_FileSync{},
+    m_objectAttributes{},
+    m_FileHeader{},
     m_waveFormat(NULL),
+    m_DataHeader{},
     m_pFilePtr(NULL),
     m_fWriteDisabled(FALSE),
     m_bInitialized(FALSE)
@@ -875,22 +881,6 @@ CSaveData::SetMaxWriteSize
 Done:
     return ntStatus;
 } // SetDataFormat
-
-//=============================================================================
-void
-CSaveData::ReadData
-(
-    _Inout_updates_bytes_all_(ulByteCount)  PBYTE   pBuffer,
-    _In_                                    ULONG   ulByteCount
-)
-{
-    UNREFERENCED_PARAMETER(pBuffer);
-    UNREFERENCED_PARAMETER(ulByteCount);
-
-    PAGED_CODE();
-
-    // Not implemented yet.
-} // ReadData
 
 //=============================================================================
 #pragma code_seg()

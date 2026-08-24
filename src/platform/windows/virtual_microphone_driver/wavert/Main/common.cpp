@@ -55,7 +55,19 @@ class CAdapterCommon :
         //=====================================================================
         // Default CUnknown
         DECLARE_STD_UNKNOWN();
-        DEFINE_STD_CONSTRUCTOR(CAdapterCommon);
+        CAdapterCommon(_In_opt_ PUNKNOWN UnknownOuter)
+            : CUnknown(UnknownOuter),
+              m_pServiceGroupWave(NULL),
+              m_pDeviceObject(NULL),
+              m_pPhysicalDeviceObject(NULL),
+              m_WdfDevice(NULL),
+              m_PowerState(PowerDeviceD0),
+              m_pHW(NULL),
+              m_pPortClsEtwHelper(NULL),
+              m_dwIdleRequests(0),
+              m_SubdeviceCache{}
+        {
+        }
         ~CAdapterCommon();
 
         //=====================================================================

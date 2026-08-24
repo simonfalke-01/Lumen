@@ -148,7 +148,7 @@ namespace {
   using expected_consumer_map_t = std::array<std::optional<std::uint16_t>, 256>;
 
   /**
-   * @brief Build the independently specified canonical keyboard-page map.
+   * @brief Build the independently specified reference keyboard-page map.
    * @return Expected usage for every eight-bit Windows virtual key.
    */
   expected_keyboard_map_t expected_keyboard_map() {
@@ -230,7 +230,7 @@ namespace {
   }
 
   /**
-   * @brief Build the independently specified canonical Consumer-page map.
+   * @brief Build the independently specified reference Consumer-page map.
    * @return Expected usage for every eight-bit Windows virtual key.
    */
   expected_consumer_map_t expected_consumer_map() {
@@ -277,7 +277,7 @@ namespace {
   }
 
   /**
-   * @brief Build the canonical Set 1 scan-code to keyboard-page usage map.
+   * @brief Build the reference Set 1 scan-code to keyboard-page usage map.
    * @return Expected maps for unprefixed and `0xE0`-prefixed scan codes.
    */
   std::array<expected_keyboard_map_t, 2> expected_scan_code_map() {
@@ -1083,7 +1083,7 @@ TEST_F(virtual_hid_input_test, PacksGraveAndEscapeIntoDistinctBitmapBits) {
   EXPECT_EQ(escape.key_bitmap[0x35 / 8], 0);
 }
 
-TEST(VirtualHidKeyMappingTest, MapsEveryVirtualKeyToCanonicalKeyboardUsage) {
+TEST(VirtualHidKeyMappingTest, MapsEveryVirtualKeyToExpectedKeyboardUsage) {
   const auto expected = expected_keyboard_map();
 
   for (std::uint16_t key = 0; key < expected.size(); ++key) {
@@ -1096,7 +1096,7 @@ TEST(VirtualHidKeyMappingTest, MapsEveryVirtualKeyToCanonicalKeyboardUsage) {
   EXPECT_FALSE(expected[VK_SLEEP]);
 }
 
-TEST(VirtualHidKeyMappingTest, MapsEveryVirtualKeyToCanonicalConsumerUsage) {
+TEST(VirtualHidKeyMappingTest, MapsEveryVirtualKeyToExpectedConsumerUsage) {
   const auto expected = expected_consumer_map();
 
   for (std::uint16_t key = 0; key < expected.size(); ++key) {
@@ -1105,7 +1105,7 @@ TEST(VirtualHidKeyMappingTest, MapsEveryVirtualKeyToCanonicalConsumerUsage) {
   }
 }
 
-TEST(VirtualHidKeyMappingTest, MapsEverySet1ScanCodeToCanonicalKeyboardUsage) {
+TEST(VirtualHidKeyMappingTest, MapsEverySet1ScanCodeToExpectedKeyboardUsage) {
   const auto expected = expected_scan_code_map();
 
   for (UINT code = 0; code <= 0xFFU; ++code) {

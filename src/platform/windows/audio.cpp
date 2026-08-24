@@ -763,7 +763,8 @@ namespace platf::audio {
       for (
         status = audio_capture->GetNextPacketSize(&packet_size);
         SUCCEEDED(status) && packet_size > 0;
-        status = audio_capture->GetNextPacketSize(&packet_size)) {
+        status = audio_capture->GetNextPacketSize(&packet_size)
+      ) {
         DWORD buffer_flags;
         status = audio_capture->GetBuffer(
           (BYTE **) &sample_aligned.samples,
@@ -956,7 +957,7 @@ namespace platf::audio {
 
     /**
      * If the requested sink is a virtual sink, meaning no speakers attached to
-     * the host, then we can seamlessly set the format to stereo and surround sound.
+     * the host, then we can set the format to stereo and surround sound.
      *
      * Any virtual sink detected will be prefixed by:
      *    virtual-(format name)

@@ -38,6 +38,8 @@ static PDRIVER_DISPATCH g_PortClsDispatch[IRP_MJ_MAXIMUM_FUNCTION + 1] = {};
  * @param Irp Current request.
  * @return Completion status from the selected device path.
  */
+_Dispatch_type_(IRP_MJ_CREATE)
+_Dispatch_type_(IRP_MJ_CREATE_NAMED_PIPE)
 DRIVER_DISPATCH LumenVmicDispatch;
 NTSTATUS LumenVmicDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -522,8 +524,6 @@ InstallEndpointRenderFilters(
 #ifdef _USE_IPortClsRuntimePower
     PPORTCLSRUNTIMEPOWER        pPortClsRuntimePower    = NULL;
 #endif // _USE_IPortClsRuntimePower
-    PPORTCLSStreamResourceManager pPortClsResMgr        = NULL;
-    PPORTCLSStreamResourceManager2 pPortClsResMgr2      = NULL;
 
     PAGED_CODE();
 
@@ -583,60 +583,6 @@ InstallEndpointRenderFilters(
         }
 #endif // _USE_IPortClsRuntimePower
 
-        //
-        // Test: add and remove current thread as streaming audio resource.
-        // In a real driver you should only add interrupts and driver-owned threads
-        // (i.e., do NOT add the current thread as streaming resource).
-        //
-        // testing IPortClsStreamResourceManager:
-        ntStatus = unknownWave->QueryInterface(IID_IPortClsStreamResourceManager, (PVOID *)&pPortClsResMgr);
-        if (NT_SUCCESS(ntStatus))
-        {
-            PCSTREAMRESOURCE_DESCRIPTOR res;
-            PCSTREAMRESOURCE hRes = NULL;
-            PDEVICE_OBJECT pdo = NULL;
-
-            PcGetPhysicalDeviceObject(_pDeviceObject, &pdo);
-            PCSTREAMRESOURCE_DESCRIPTOR_INIT(&res);
-            res.Pdo = pdo;
-            res.Type = ePcStreamResourceThread;
-            res.Resource.Thread = PsGetCurrentThread();
-
-            NTSTATUS ntStatusTest = pPortClsResMgr->AddStreamResource(NULL, &res, &hRes);
-            if (NT_SUCCESS(ntStatusTest))
-            {
-                pPortClsResMgr->RemoveStreamResource(hRes);
-                hRes = NULL;
-            }
-
-            pPortClsResMgr->Release();
-            pPortClsResMgr = NULL;
-        }
-
-        // testing IPortClsStreamResourceManager2:
-        ntStatus = unknownWave->QueryInterface(IID_IPortClsStreamResourceManager2, (PVOID *)&pPortClsResMgr2);
-        if (NT_SUCCESS(ntStatus))
-        {
-            PCSTREAMRESOURCE_DESCRIPTOR res;
-            PCSTREAMRESOURCE hRes = NULL;
-            PDEVICE_OBJECT pdo = NULL;
-
-            PcGetPhysicalDeviceObject(_pDeviceObject, &pdo);
-            PCSTREAMRESOURCE_DESCRIPTOR_INIT(&res);
-            res.Pdo = pdo;
-            res.Type = ePcStreamResourceThread;
-            res.Resource.Thread = PsGetCurrentThread();
-
-            NTSTATUS ntStatusTest = pPortClsResMgr2->AddStreamResource2(pdo, NULL, &res, &hRes);
-            if (NT_SUCCESS(ntStatusTest))
-            {
-                pPortClsResMgr2->RemoveStreamResource(hRes);
-                hRes = NULL;
-            }
-
-            pPortClsResMgr2->Release();
-            pPortClsResMgr2 = NULL;
-        }
     }
 
     SAFE_RELEASE(unknownTopology);

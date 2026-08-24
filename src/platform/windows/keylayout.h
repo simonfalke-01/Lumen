@@ -11,7 +11,7 @@
 
 namespace platf {
   // Virtual Key to Scan Code mapping for the US English layout (00000409).
-  // GameStream uses this as the canonical key layout for scancode conversion.
+  // GameStream uses this as the reference key layout for scancode conversion.
   /**
    * @brief Protocol or platform constant for vk to scancode map.
    */

@@ -4,6 +4,7 @@
  */
 
 #include "virtual_microphone.h"
+#include "wasapi_virtual_microphone.h"
 
 // standard includes
 #include <algorithm>
@@ -108,6 +109,66 @@ namespace platf::win_audio {
       }
 
       HANDLE handle_ {INVALID_HANDLE_VALUE};  ///< Secured control-device handle.
+    };
+
+    /** @brief Driver-first production sink with an existing signed virtual-cable fallback. */
+    class composite_virtual_microphone_t final: public virtual_microphone_sink_t {
+    public:
+      composite_virtual_microphone_t(
+        std::unique_ptr<virtual_microphone_sink_t> driver,
+        std::unique_ptr<virtual_microphone_sink_t> wasapi
+      ):
+          driver_ {std::move(driver)},
+          wasapi_ {std::move(wasapi)} {
+      }
+
+      bool probe() override {
+        return (driver_ && driver_->probe()) || (wasapi_ && wasapi_->probe());
+      }
+
+      bool begin(
+        const std::uint64_t generation,
+        const std::uint32_t sample_rate,
+        const std::uint8_t channels
+      ) override {
+        if (active_ != nullptr) {
+          active_->end(active_generation_);
+          active_ = nullptr;
+          active_generation_ = 0;
+        }
+        if (driver_ && driver_->begin(generation, sample_rate, channels)) {
+          active_ = driver_.get();
+        } else if (wasapi_ && wasapi_->begin(generation, sample_rate, channels)) {
+          active_ = wasapi_.get();
+        } else {
+          return false;
+        }
+        active_generation_ = generation;
+        return true;
+      }
+
+      bool write(
+        const std::uint64_t generation,
+        const std::span<const std::int16_t> samples
+      ) override {
+        return active_ != nullptr && generation == active_generation_ &&
+               active_->write(generation, samples);
+      }
+
+      void end(const std::uint64_t generation) override {
+        if (active_ == nullptr || generation != active_generation_) {
+          return;
+        }
+        active_->end(generation);
+        active_ = nullptr;
+        active_generation_ = 0;
+      }
+
+    private:
+      std::unique_ptr<virtual_microphone_sink_t> driver_;  ///< Preferred secured Lumen driver sink.
+      std::unique_ptr<virtual_microphone_sink_t> wasapi_;  ///< Existing signed virtual-cable sink.
+      virtual_microphone_sink_t *active_ {};  ///< Backend owning the active generation.
+      std::uint64_t active_generation_ {};  ///< Generation routed to `active_`.
     };
   }  // namespace
 
@@ -313,7 +374,10 @@ namespace platf::win_audio {
     failure_status_ = status;
   }
 
-  std::unique_ptr<virtual_microphone_t> make_virtual_microphone() {
-    return std::make_unique<virtual_microphone_t>(std::make_shared<system_virtual_microphone_channel_t>());
+  std::unique_ptr<virtual_microphone_sink_t> make_virtual_microphone() {
+    return std::make_unique<composite_virtual_microphone_t>(
+      std::make_unique<virtual_microphone_t>(std::make_shared<system_virtual_microphone_channel_t>()),
+      make_wasapi_virtual_microphone()
+    );
   }
 }  // namespace platf::win_audio

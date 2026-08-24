@@ -34,6 +34,7 @@ INSTANTIATE_TEST_SUITE_P(
     std::make_tuple("HIGH_STEREO", config_t {5, 2, 0x3, {0}, config_flags(config_t::HIGH_QUALITY)}),
     std::make_tuple("SURROUND51", config_t {5, 6, 0x3F, {0}, config_flags()}),
     std::make_tuple("SURROUND71", config_t {5, 8, 0x63F, {0}, config_flags()}),
+    std::make_tuple("NEGOTIATED_71", config_t {5, 8, 0x63F, {0}, config_flags(), 1'536'000}),
     std::make_tuple("SURROUND51_CUSTOM", config_t {5, 6, 0x3F, {6, 4, 2, {0, 1, 4, 5, 2, 3}}, config_flags(config_t::CUSTOM_SURROUND_PARAMS)})
   ),
   [](const auto &info) {
@@ -57,9 +58,10 @@ TEST_P(AudioTest, TestEncode) {
       if (shutdown_event->peek()) {
         break;
       }
-      if (auto packet_data = packet->second; packet_data.size() == 0) {
+      if (const auto &packet_data = packet->payload; packet_data.size() == 0) {
         FAIL() << "Empty packet data";
       }
+      EXPECT_EQ(packet->sample_position % 240, 0U);
     }
   });
   audio::capture(m_mail, m_config, nullptr);
