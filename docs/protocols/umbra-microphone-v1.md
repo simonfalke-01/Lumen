@@ -1,4 +1,4 @@
-# Umbra → Lumen client microphone protocol, version 1
+# Umbra  to  Lumen client microphone protocol, version 1
 
 This document is the normative client API and wire specification for forwarding a microphone captured by Umbra to Lumen. The direction is always client to host. Version 1 uses the existing GameStream RTSP session for negotiation and a dedicated reverse UDP flow for authenticated, encrypted Opus packets.
 
@@ -20,7 +20,7 @@ Umbra MUST capture or resample microphone audio to the negotiated format before 
 
 ## RTSP capability and setup
 
-The normative handshake order is `DESCRIBE` → optional microphone `SETUP` → `ANNOUNCE`, matching the existing Moonlight RTSP flow.
+The normative handshake order is `DESCRIBE`  to  optional microphone `SETUP`  to  `ANNOUNCE`, matching the existing Moonlight RTSP flow.
 
 ### Lumen `DESCRIBE` capability
 
@@ -88,14 +88,14 @@ Version one derives a dedicated microphone key and nonce prefix using HKDF-SHA-2
 - Salt: the exact 16 decoded bytes from `X-Lumen-Mic-Salt`.
 - Info: the 41 ASCII bytes `lumen/client-microphone/client-to-host/v1`, with no trailing NUL.
 - Output length: 36 bytes.
-- Bytes 0–31: the AES-256-GCM key.
-- Bytes 32–35: the four-byte nonce prefix.
+- Bytes 0-31: the AES-256-GCM key.
+- Bytes 32-35: the four-byte nonce prefix.
 
 Derivation inputs and output are binary bytes. Implementations MUST NOT pass hexadecimal text, append a NUL to `info`, or apply another text encoding.
 
 ## LMC1 UDP datagram
 
-Every multi-byte integer is unsigned and encoded in network byte order (big-endian). The fixed header is exactly 40 bytes and is immediately followed by the declared 0–1,275 bytes of AES-GCM ciphertext and a 16-byte authentication tag. A complete datagram is therefore 56–1,331 bytes.
+Every multi-byte integer is unsigned and encoded in network byte order (big-endian). The fixed header is exactly 40 bytes and is immediately followed by the declared 0-1,275 bytes of AES-GCM ciphertext and a 16-byte authentication tag. A complete datagram is therefore 56-1,331 bytes.
 
 | Offset | Size | Field | Version-one requirement |
 | ---: | ---: | --- | --- |
@@ -106,9 +106,9 @@ Every multi-byte integer is unsigned and encoded in network byte order (big-endi
 | 8 | 16 | Session ID | Exact bytes decoded from `X-Lumen-Mic-Session` |
 | 24 | 8 | Packet sequence | Strictly increasing generation-local counter |
 | 32 | 4 | Timestamp | 48 kHz audio timeline, modulo 2^32 |
-| 36 | 2 | Ciphertext length | Exact ciphertext size, 0–1,275 |
+| 36 | 2 | Ciphertext length | Exact ciphertext size, 0-1,275 |
 | 38 | 2 | Reserved | Zero |
-| 40 | 0–1,275 | Ciphertext | AES-GCM ciphertext; same length as the plaintext |
+| 40 | 0-1,275 | Ciphertext | AES-GCM ciphertext; same length as the plaintext |
 | variable | 16 | Authentication tag | AES-256-GCM tag |
 
 The packet sequence MUST begin at zero and increase by exactly one for every transmitted datagram, including HELLO, RESET, SILENCE, and END. It MUST NOT wrap within a microphone generation.

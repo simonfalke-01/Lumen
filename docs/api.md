@@ -15,7 +15,7 @@ State-changing API endpoints (POST, DELETE) are protected against Cross-Site Req
 
 **For Non-Browser Applications:**
 - Non-browser clients (e.g. `curl`, scripts, custom apps) are **exempt** from CSRF protection
-- CSRF attacks require a browser to silently attach credentials to a cross-origin request — this threat
+- CSRF attacks require a browser to silently attach credentials to a cross-origin request; this threat
   does not apply to non-browser clients that explicitly provide credentials with every request
 - Requests with no `Origin` or `Referer` header (as is typical for non-browser clients) are automatically
   allowed without a CSRF token
@@ -85,8 +85,28 @@ curl -u user:pass -H "X-CSRF-Token: your_token_here" \
 ## POST /api/password
 @copydoc confighttp::savePassword()
 
+## GET /api/pin
+@copydoc confighttp::getPendingPairingRequests()
+
 ## POST /api/pin
 @copydoc confighttp::savePin()
+
+The JSON body accepts `pin`, `name`, and the opaque `requestId` returned by
+`GET /api/pin`. Supplying `requestId` binds approval to one pending legacy
+Moonlight pairing request. Omitting it retains legacy compatibility and should
+be avoided when more than one request may be pending.
+
+## POST /api/pin/cancel
+@copydoc confighttp::cancelPendingPairingRequest()
+
+The JSON body contains the exact opaque `requestId` to cancel. These endpoints
+administer the legacy Moonlight PIN flow; they are not the experimental
+high-entropy QR pairing protocol.
+
+The underlying legacy `/pair` endpoint accepts new pairing handshakes only
+from loopback and private/trusted LAN source addresses. Public/WAN requests are
+rejected with XML status `403` before a pairing session or PIN attempt is
+created. This restriction does not change vanilla Moonlight's LAN transcript.
 
 ## POST /api/reset-display-device-persistence
 @copydoc confighttp::resetDisplayDevicePersistence()

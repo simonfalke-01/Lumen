@@ -37,7 +37,7 @@ The default configuration and log filenames are `lumen.conf` and `lumen.log`.
 
 On Linux and macOS, Lumen checks the legacy `~/.config/sunshine` directory on first start. If the Lumen directory does
 not exist, Lumen copies the complete legacy directory to `~/.config/lumen`, preserving applications, credentials,
-certificates, and pairing state. It then copies `sunshine.conf` to the canonical `lumen.conf` filename. The legacy
+certificates, and pairing state. It then copies `sunshine.conf` to the authoritative `lumen.conf` filename. The legacy
 directory and files are never deleted. If both directories already exist, Lumen uses its own directory and leaves the
 Sunshine directory untouched.
 
@@ -1189,6 +1189,47 @@ The key retains its upstream name for compatibility with existing configuration 
     </tr>
 </table>
 
+### lumen_vdd_policy
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Select whether Lumen's owned virtual display is used for modern or legacy sessions.
+            Lumen only activates a mode when the requested width, height, and reduced refresh rational are applied exactly.
+            SDR and HDR requests must also match the exact negotiated bit depth and display capabilities.
+            The ABI v3 driver can use the explicitly hardware-gated two-slot one-copy path.
+            If its capability, adapter identity, shared handle, fence, timeout, conversion, or NVENC boundary is unavailable, capture falls back to DDA/WGC on the active VDD output.
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            optional
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lumen_vdd_policy = optional
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>disabled</td>
+        <td>Keep the configured physical capture path and do not contact the Lumen VDD.</td>
+    </tr>
+    <tr>
+        <td>optional</td>
+        <td>Prefer an exact VDD mode, but fall back to physical capture only after the VDD transaction has rolled back safely.</td>
+    </tr>
+    <tr>
+        <td>required</td>
+        <td>Reject stream startup unless the exact VDD mode can be established and owned safely.</td>
+    </tr>
+</table>
+
 ### dd_configuration_option
 
 <table>
@@ -1811,7 +1852,7 @@ The key retains its upstream name for compatibility with existing configuration 
         <td>Description</td>
         <td colspan="2">
             This determines when encryption will be used when streaming over your local network.
-            @warning{Encryption can reduce streaming performance, particularly on less powerful hosts and clients.}
+            @warning{Encryption can reduce streaming performance, particularly on hosts and clients with limited CPU capacity.}
         </td>
     </tr>
     <tr>
@@ -1847,20 +1888,20 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            This determines when encryption will be used when streaming over the Internet.
-            @warning{Encryption can reduce streaming performance, particularly on less powerful hosts and clients.}
+            WAN encryption is mandatory by default. Opportunistic mode remains available only as an explicit compatibility downgrade.
+            @warning{Modes 0 and 1 may allow unsupported clients to stream without full media encryption and emit a runtime warning.}
         </td>
     </tr>
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            1
+            2
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            wan_encryption_mode = 1
+            wan_encryption_mode = 2
             @endcode</td>
     </tr>
     <tr>
@@ -1958,6 +1999,121 @@ The key retains its upstream name for compatibility with existing configuration 
         <td>Example</td>
         <td colspan="2">@code{}
             packetsize = 1346
+            @endcode</td>
+    </tr>
+</table>
+
+### protocol_v3_enabled
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">Start the authenticated single-port QUIC listener for Umbra clients.</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Enabled in full Windows builds; disabled in builds without the protocol-v3 runtime.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            protocol_v3_enabled = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### legacy_compatibility
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">Keep the Moonlight HTTP, RTSP, and GameStream listeners active beside protocol v3.</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            legacy_compatibility = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### protocol_v3_port
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">UDP port for the direct Umbra protocol-v3 listener.</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            48030
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">1024-65535</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            protocol_v3_port = 48030
+            @endcode</td>
+    </tr>
+</table>
+
+### protocol_v3_profile
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">Initial protocol-v3 scheduling profile. Each START request still negotiates its exact profile.</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            quality
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Choices</td>
+        <td>latency</td>
+        <td>Prioritize bounded low-latency delivery.</td>
+    </tr>
+    <tr>
+        <td></td>
+        <td>quality</td>
+        <td>Prioritize stable fidelity while keeping queues bounded.</td>
+    </tr>
+</table>
+
+### protocol_v3_pairing_permissions
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">Permission bit mask allowed in new protocol-v3 invitations. Browse, start, input, and stop are always included.</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            23
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">1-255</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            protocol_v3_pairing_permissions = 23
             @endcode</td>
     </tr>
 </table>

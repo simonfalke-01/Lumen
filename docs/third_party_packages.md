@@ -7,7 +7,7 @@ not be treated as Lumen releases.
 
 | Previous                      |                                            Next |
 |:------------------------------|------------------------------------------------:|
-| [Docker](../DOCKER_README.md) | [Gamestream Migration](gamestream_migration.md) |
+| [Changelog](changelog.md) | [GameStream Migration](gamestream_migration.md) |
 
 </div>
 

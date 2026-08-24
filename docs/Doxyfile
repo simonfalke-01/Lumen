@@ -40,15 +40,15 @@ USE_MDFILE_AS_MAINPAGE = ../README.md
 INPUT = ../README.md \
         getting_started.md \
         changelog.md \
-        ../DOCKER_README.md \
         third_party_packages.md \
         gamestream_migration.md \
         legal.md \
         configuration.md \
         app_examples.md \
-        awesome_sunshine.md \
         guides.md \
         protocols/umbra-microphone-v1.md \
+        protocols/umbra-lumen-quic-v3.md \
+        ../src/platform/windows/virtual_display_driver/README.md \
         performance_tuning.md \
         api.md \
         troubleshooting.md \

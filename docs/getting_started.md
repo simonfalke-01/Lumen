@@ -6,6 +6,56 @@ On Windows AMD64, the recommended method for running Lumen is to use the install
 [Pre-releases](https://github.com/simonfalke-01/Lumen/releases) are also available. These should be considered beta,
 and release artifacts may be missing when merging changes on a faster cadence.
 
+## Client and protocol compatibility
+
+Unmodified Moonlight clients use Lumen's production GameStream path. A client
+that does not send Lumen extensions receives legacy policy and wire behavior;
+Lumen does not require Umbra.
+
+Umbra can additionally request one of two per-session policies:
+
+- **Latency** selects the host's P1/ultra-low-latency encoder profile and
+  immediate pacing, plus Umbra's one-frame compressed queue, two decoder
+  submissions, immediate presentation, and no deliberate 1 ms input wait.
+- **Quality** selects the host's P5/high-quality encoder profile and stable
+  pacing, plus Umbra's two-frame compressed queue, five decoder submissions,
+  display-linked presentation, and historical input pacing.
+
+Neither policy is a latency or fidelity guarantee. Resolution, refresh rate,
+codec support, host load, display pacing, and network conditions still apply.
+Both modes preserve legacy Moonlight input ordering and reliability. Codec,
+HDR, and YUV 4:4:4 remain separate explicit preferences.
+Quality mode remains rate-controlled unless Umbra explicitly requests the
+separate fail-closed codec-lossless option.
+
+The repository contains an experimental single-port QUIC protocol for future
+Umbra/Lumen sessions. It is not the current production transport and must not be
+used as a deployment or firewall assumption. See the
+[experimental QUIC v3 specification](protocols/umbra-lumen-quic-v3.md).
+
+## Network exposure
+
+The production Moonlight protocol uses multiple listeners. With the default
+base port `47989`, the relevant service ports are:
+
+| Purpose | Default transport and port |
+| --- | --- |
+| GameStream HTTP APIs | TCP 47989 and TCP 47984 |
+| Local service discovery | mDNS/DNS-SD multicast on the LAN; separate from the GameStream API ports |
+| RTSP setup | TCP 48010 |
+| Video, control, and audio | UDP 47998, 47999, and 48000 |
+| Lumen client microphone extension | UDP 48001 when enabled |
+| Web UI and management API | TCP 47990 |
+
+Changing Lumen's base port shifts these offsets. Use the generated firewall
+rules or current runtime configuration rather than assuming defaults.
+
+Keep TCP 47990 private. Do not forward the Web UI or management API directly to
+the public Internet. Remote streaming should use a trusted VPN/tunnel or tightly
+scoped streaming-port rules; management access is a separate security boundary.
+The future QUIC design can carry Umbra-specific streaming on one UDP port, but
+it cannot collapse unmodified Moonlight clients onto that port.
+
 ## Binaries
 
 This fork currently publishes Windows AMD64 MSI and ZIP artifacts. Versioned assets are available on the

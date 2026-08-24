@@ -1,5 +1,5 @@
 # Building
-Lumen binaries are built using [CMake](https://cmake.org) and requires `cmake` > 3.25.
+Lumen requires [CMake](https://cmake.org) 3.20 or later.
 
 ## Building Locally
 
@@ -262,6 +262,87 @@ files, a non-AMD64 target, or an INF without the exact `ROOT\LumenVirtualMicroph
 package as the optional, default-off **Client Microphone Passthrough** feature. Lite ZIP packages exclude both the
 driver and `lumen-vmicctl.exe`. Automated tagged builds omit this optional driver until the production driver pipeline
 is enabled; normal Windows CI still builds and validates the driver and its MSI feature.
+
+##### Lumen Virtual Display driver source
+
+The repository contains an x64 UMDF2 indirect-display driver under
+`src/platform/windows/virtual_display_driver`. The regular CMake build does not
+build or package it. The complete Windows profile below accepts it only as an
+exact signed package; the lite package continues through existing DDA/WGC
+capture without installing the driver.
+
+Build the driver only from a Visual Studio 2022 Developer Command Prompt with a
+matching Windows 11 SDK and WDK:
+
+```bat
+msbuild src\platform\windows\virtual_display_driver\LumenVirtualDisplay.vcxproj /m /p:Configuration=Release /p:Platform=x64
+```
+
+Portable tests cover mode arithmetic, ABI layouts, generation and lease
+lifecycle, rollback, EDID policy, and exact-one connector selection. ABI 3 adds
+two persistent shared texture/fence slots and a bounded event-driven frame
+channel. The driver performs one GPU `CopyResource` from each accepted IddCx
+surface into a safe slot; this is a one-copy path, not zero-copy. Regular and
+lite packages continue to use DDA/WGC, while only the strict complete profile
+accepts the separately built driver package. Public release still requires
+Windows validation of swap-chain lifetime, first activation, InfVerif, and
+Microsoft-signed catalogs. HDR and latency claims remain outside the portable
+test boundary. See the
+[driver README](../src/platform/windows/virtual_display_driver/README.md) for
+the exact validation boundary.
+
+##### Complete Windows profile
+
+The complete MSI includes the MsQuic ABI 2 runtime and the Virtual HID,
+Virtual Microphone, and Virtual Display packages. Build it with the strict
+PowerShell entry point:
+
+```powershell
+.\scripts\windows\build-full-profile.ps1 `
+  -SourceRoot $PWD `
+  -StagingRoot C:\LumenBuild\full `
+  -Msys2Root C:\msys64 `
+  -MsQuicPackageRoot C:\LumenBuild\msquic-2.6.0 `
+  -PythonPath C:\Python314\python.exe `
+  -DotNetRoot 'C:\Program Files\dotnet' `
+  -NodeRoot 'C:\Program Files\nodejs' `
+  -SignedDriverRoot C:\LumenBuild\signed-drivers `
+  -BuildVersion 0.1.0
+```
+
+The signed-driver root must contain `virtual-hid`, `virtual-microphone`, and
+`virtual-display` subdirectories plus the unchanged
+`full-profile-driver-manifest.json` produced with the raw submission. Each
+driver directory contains exactly its INF, Microsoft-signed catalog, and driver
+binary. The script builds all three raw driver submissions and the MsQuic shim
+first. If signed packages are absent it writes
+`full-profile-driver-manifest.json` and stops before configuring the
+application. The script extracts the frozen archive into a disjoint staging
+tree, verifies every extracted path, byte count, and SHA-256 value against
+`full-profile-files.json`, and builds every driver, shim, test, and package only
+from that immutable snapshot. After signed packages are supplied, it verifies
+the source-freeze identity, kernel signing, and catalog coverage; derives the ABI 2
+DLL/import-library hashes from the actual MSVC outputs; builds with
+`LUMEN_WINDOWS_FULL_PROFILE=ON`; synchronizes the locked Python environment
+without downloading another interpreter; builds with warnings as errors; runs
+the full test executable; creates MSI and lite ZIP packages; and validates the
+MSI tables. `PythonPath`, `DotNetRoot`, and `NodeRoot` may be omitted when the
+tools are on `PATH`, but automation should pass their exact locations.
+
+Release CI requires `full_profile_driver_run_id`; a tag cannot silently omit a
+driver or fall back to the legacy transport. Source bundles can be created with
+`scripts/windows/freeze-full-profile-source.ps1`. The freeze records every
+file hash, archive hash, MsQuic source identity, VDD ABI, and runtime pins still
+waiting for Windows artifacts.
+
+For an isolated local full-system test, run
+`scripts/windows/sign-full-profile-local-test.ps1` on the three raw submission
+directories, then pass its output to the full builder with
+`-AllowTestSignedDrivers`. The resulting MSI contains
+`metadata/LOCAL-TEST-SIGNED.json`; it is not a public release artifact. The test
+certificate must be trusted on the test host before installing its drivers.
+Public release builds reject this marker and require kernel-policy-valid signed
+catalogs.
 
 ### Clone
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:

@@ -383,7 +383,7 @@ UAC prompt.
 
 | Previous                          |                                    Next |
 |:----------------------------------|----------------------------------------:|
-| [Configuration](configuration.md) | [Awesome Sunshine](awesome_sunshine.md) |
+| [Configuration](configuration.md) | [Guides](guides.md) |
 
 </div>
 

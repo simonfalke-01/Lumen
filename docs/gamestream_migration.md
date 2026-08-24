@@ -1,33 +1,54 @@
 # GameStream Migration
-Nvidia announced that their GameStream service for Nvidia Games clients will be discontinued in February 2023.
-Luckily, Lumen performance is now equal to or better than Nvidia GameStream.
 
-## Migration
-The upstream Sunshine project developed a migration tool for GameStream games and apps.
-See [GSMS](https://github.com/LizardByte/GSMS) if you're interested in an automated
-migration option. GSMS offers the ability to migrate your custom and auto-detected games and apps. The
-working directory, command, and image are all set in Lumen's `apps.json` file. The box-art image is also copied
-to a specified directory.
+NVIDIA discontinued the GameStream host feature. Lumen implements a compatible
+host protocol for Moonlight clients, but compatibility does not establish equal
+latency, quality, HDR behavior, or application discovery on every system.
 
-## Internet Streaming
-If you are using the Moonlight Internet Hosting Tool, you can remove it from your system when you migrate to Lumen.
-To stream over the Internet with Lumen and a UPnP-capable router, enable the UPnP option in the Lumen Web UI.
+## Move applications
 
-> [!NOTE]
-> Running Lumen together with versions of the Moonlight Internet Hosting Tool prior to v5.6 will cause UPnP
-> port forwarding to become unreliable. Either uninstall the tool entirely or update it to v5.6 or later.
+The upstream Sunshine project provides the independent
+[GSMS](https://github.com/LizardByte/GSMS) migration tool for custom and
+auto-detected GeForce Experience entries. Review its output before replacing
+your configuration. Lumen reads application working directories, commands, and
+images from `apps.json`.
 
-## Limitations
-Lumen does have some limitations, as compared to Nvidia GameStream.
+Keep a backup of the source configuration and test Desktop first. Application
+launch commands, permissions, service-account access, HDR, and display selection
+can differ from NVIDIA GameStream.
 
-* Automatic game/application list.
-* Changing game settings automatically to optimize streaming.
+## Existing Moonlight clients
+
+Unmodified Moonlight clients can pair with and stream from Lumen through the
+legacy GameStream path. Lumen-specific Latency/Quality and modern protocol
+extensions are optional; a client that does not send them retains legacy
+behavior.
+
+Legacy PIN pairing must be completed from loopback or a private/trusted LAN.
+Lumen rejects public/WAN `/pair` traffic before allocating pairing state because
+the four-digit GameStream transcript is unsuitable for Internet exposure.
+
+## Internet streaming
+
+Remove or disable the Moonlight Internet Hosting Tool before enabling Lumen's
+own UPnP or manual forwarding. Running two hosts or two port-mapping tools can
+produce conflicts. Prefer a trusted VPN or authenticated tunnel when practical.
+
+Do not expose Lumen's Web UI or management API directly to the public Internet.
+Legacy Moonlight streaming requires multiple ports. The repository's one-port
+QUIC protocol is experimental, Umbra-specific, and not a shipped replacement.
+
+## Known migration differences
+
+- Lumen does not reproduce NVIDIA's automatic application catalog exactly.
+- Host-side game-setting changes depend on explicit application configuration.
+- Encoder, HDR, input, audio, and display behavior require validation on the
+  target host and client.
 
 <div class="section_buttons">
 
-| Previous                                        |              Next |
-|:------------------------------------------------|------------------:|
-| [Third-party Packages](third_party_packages.md) | [Legal](legal.md) |
+| Previous | Next |
+|:--|--:|
+| [Third-Party Packages](third_party_packages.md) | [Legal](legal.md) |
 
 </div>
 

@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/test_lumen_branding.cpp
- * @brief Tests for Lumen's canonical runtime identity and compatibility defaults.
+ * @brief Tests for Lumen's authoritative runtime identity and compatibility defaults.
  */
 
 #include "../tests_common.h"
@@ -14,7 +14,7 @@
 /**
  * @brief Verify new installations use Lumen configuration and log filenames.
  */
-TEST(LumenBrandingTest, CanonicalDefaultFileNames) {
+TEST(LumenBrandingTest, UsesAuthoritativeDefaultFileNames) {
   EXPECT_EQ(std::filesystem::path {config::sunshine.config_file}.filename(), "lumen.conf");
   EXPECT_EQ(std::filesystem::path {config::sunshine.log_file}.filename(), "lumen.log");
 }
@@ -22,12 +22,12 @@ TEST(LumenBrandingTest, CanonicalDefaultFileNames) {
 /**
  * @brief Verify GameStream discovery advertises the Lumen service identity.
  */
-TEST(LumenBrandingTest, CanonicalDiscoveryServiceName) {
+TEST(LumenBrandingTest, UsesAuthoritativeDiscoveryServiceName) {
   EXPECT_EQ(platf::SERVICE_NAME, "Lumen");
 }
 
 /**
- * @brief Verify a copied legacy config is preserved and gains a canonical filename.
+ * @brief Verify a copied legacy config is preserved and gains the authoritative filename.
  */
 TEST(LumenBrandingTest, CopiesLegacyConfigFileWithoutDeletingIt) {
   const auto unique_suffix = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -67,9 +67,9 @@ TEST(LumenBrandingTest, LeavesExplicitConfigPathUntouched) {
 }
 
 /**
- * @brief Verify an existing canonical config always wins over legacy state.
+ * @brief Verify an existing authoritative config always wins over legacy state.
  */
-TEST(LumenBrandingTest, KeepsExistingCanonicalConfig) {
+TEST(LumenBrandingTest, KeepsExistingAuthoritativeConfig) {
   const auto unique_suffix = std::chrono::steady_clock::now().time_since_epoch().count();
   const auto test_directory = std::filesystem::temp_directory_path() / ("lumen-existing-config-test-" + std::to_string(unique_suffix));
   const auto legacy_config = test_directory / "sunshine.conf";
@@ -82,20 +82,20 @@ TEST(LumenBrandingTest, KeepsExistingCanonicalConfig) {
   config::migrate_legacy_config_file(selected_config, false);
 
   EXPECT_EQ(selected_config, lumen_config.string());
-  std::ifstream canonical_stream {lumen_config};
-  std::string canonical_contents;
-  std::getline(canonical_stream, canonical_contents);
-  EXPECT_EQ(canonical_contents, "port = 49000");
-  canonical_stream.close();
+  std::ifstream authoritative_stream {lumen_config};
+  std::string authoritative_contents;
+  std::getline(authoritative_stream, authoritative_contents);
+  EXPECT_EQ(authoritative_contents, "port = 49000");
+  authoritative_stream.close();
   std::filesystem::remove_all(test_directory);
 }
 
 /**
- * @brief Verify noncanonical filenames never trigger Sunshine discovery.
+ * @brief Verify nonstandard filenames never trigger Sunshine discovery.
  */
-TEST(LumenBrandingTest, IgnoresNoncanonicalConfigFileName) {
+TEST(LumenBrandingTest, IgnoresNonstandardConfigFileName) {
   const auto unique_suffix = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto test_directory = std::filesystem::temp_directory_path() / ("lumen-noncanonical-config-test-" + std::to_string(unique_suffix));
+  const auto test_directory = std::filesystem::temp_directory_path() / ("lumen-nonstandard-config-test-" + std::to_string(unique_suffix));
   const auto legacy_config = test_directory / "sunshine.conf";
   const auto custom_config = test_directory / "custom.conf";
   std::filesystem::create_directories(test_directory);
@@ -110,7 +110,7 @@ TEST(LumenBrandingTest, IgnoresNoncanonicalConfigFileName) {
 }
 
 /**
- * @brief Verify missing legacy state leaves the canonical destination untouched.
+ * @brief Verify missing legacy state leaves the authoritative destination untouched.
  */
 TEST(LumenBrandingTest, HandlesAbsentLegacyConfig) {
   const auto unique_suffix = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -127,7 +127,7 @@ TEST(LumenBrandingTest, HandlesAbsentLegacyConfig) {
 }
 
 /**
- * @brief Verify migration never writes canonical state into an upstream directory.
+ * @brief Verify migration never writes authoritative state into an upstream directory.
  */
 TEST(LumenBrandingTest, RefusesToWriteIntoSunshineDirectory) {
   const auto unique_suffix = std::chrono::steady_clock::now().time_since_epoch().count();

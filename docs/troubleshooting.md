@@ -3,22 +3,25 @@
 ## General
 
 ### Forgotten Credentials
-If you forgot your credentials to the web UI, try this.
+Reset the Web UI credentials from the matching installation type.
 
-@tabs{
-  @tab{General | ```bash
-    lumen --creds {new-username} {new-password}
-    ```
-  }
-  @tab{AppImage | ```bash
-    ./lumen.AppImage --creds {new-username} {new-password}
-    ```
-  }
-  @tab{Flatpak | ```bash
-    flatpak run --command=lumen io.github.simonfalke.Lumen --creds {new-username} {new-password}
-    ```
-  }
-}
+General installation:
+
+```bash
+lumen --creds {new-username} {new-password}
+```
+
+AppImage:
+
+```bash
+./lumen.AppImage --creds {new-username} {new-password}
+```
+
+Flatpak:
+
+```bash
+flatpak run --command=lumen io.github.simonfalke.Lumen --creds {new-username} {new-password}
+```
 
 > [!TIP]
 > Remember to replace `{new-username}` and `{new-password}` with your new credentials.
@@ -61,8 +64,11 @@ direction (from server to client) at a given bitrate (e.g. 50 Mbps):
 iperf3 -c {HostIpAddress} -t 60 -u -R -b 50M
 ```
 
-Watch the output on the client for packet loss and jitter values. Both should be
-(very) low. Ideally, packet loss remains less than 5% and jitter below 1 ms.
+Watch the output on the client for packet loss and jitter. Both should be close
+to zero for a stable low-latency stream. There is no universal acceptable
+percentage: codec, bitrate, FEC, frame rate, and client buffering change the
+visible result. Compare the exact stream matrix and inspect p95/p99, not only an
+average.
 
 For Android clients use
 [PingMaster](https://play.google.com/store/apps/details?id=com.appplanex.pingmasternetworktools).
@@ -121,7 +127,7 @@ alleviate or even solve this issue (without reducing the NIC speed).
 ### Packet loss (MTU)
 Although unlikely, some guests might work better with a lower
 [MTU](https://en.wikipedia.org/wiki/Maximum_transmission_unit) from the host.
-For example, an LG TV was found to have 30–60% packet loss when the host had MTU
+For example, an LG TV was found to have 30-60% packet loss when the host had MTU
 set to 1500 and 1472, but 0% packet loss with a MTU of 1428 set in the network card
 serving the stream (a Linux PC). It's unclear how that helped precisely, so it's a last
 resort suggestion.
@@ -411,7 +417,10 @@ You will need to modify the security permissions on your disk. Ensure that user/
 permissions on the disk.
 
 ### Stuttering
-If you experience stuttering using NVIDIA, try disabling `vsync:fast` in the NVIDIA Control Panel.
+Return NVIDIA Control Panel overrides to application-controlled defaults before
+investigating Lumen pacing. In particular, disable forced Fast Sync if it causes
+stutter. Treat any driver override as an A/B experiment on the exact display and
+stream matrix; it is not a general latency recommendation.
 
 <div class="section_buttons">
 
