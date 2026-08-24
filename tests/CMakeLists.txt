@@ -79,6 +79,23 @@ if (WIN32)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)  # cmake-lint: disable=C0103
 endif ()
 
+# Keep the video egress scheduler independently buildable so multi-session
+# overflow and lifecycle regressions do not require platform capture backends.
+add_executable(lumen_video_egress_queue_tests
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_video_egress_queue.cpp
+        ${CMAKE_SOURCE_DIR}/src/video_egress_queue.cpp)
+target_include_directories(lumen_video_egress_queue_tests PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(lumen_video_egress_queue_tests PRIVATE
+        gtest_main
+        Threads::Threads
+        ${FFMPEG_LIBRARIES})
+if(WIN32)
+    target_link_libraries(lumen_video_egress_queue_tests PRIVATE bcrypt)
+endif()
+target_compile_options(lumen_video_egress_queue_tests PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_link_options(lumen_video_egress_queue_tests PRIVATE ${SUNSHINE_LINK_OPTIONS})
+add_test(NAME video_egress_queue COMMAND lumen_video_egress_queue_tests)
+
 # modify SUNSHINE_DEFINITIONS
 if (WIN32)
     list(APPEND
@@ -122,6 +139,8 @@ endif()
 file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS
         ${CMAKE_SOURCE_DIR}/tests/*.h
         ${CMAKE_SOURCE_DIR}/tests/*.cpp)
+list(REMOVE_ITEM TEST_SOURCES
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_video_egress_queue.cpp)
 if(SUNSHINE_ENABLE_TRAY AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set(SUNSHINE_TRAY_TEST_ICON_SOURCE_DIR
             "${CMAKE_SOURCE_DIR}/src_assets/common/assets/web/public/images")
@@ -184,6 +203,20 @@ endif ()
 set(SUNSHINE_SOURCES
         ${SUNSHINE_TARGET_FILES})
 
+# The portable facade implementation is always available to the test aggregate;
+# the real MsQuic dependency and native adapter remain Windows-only and opt-in.
+if(NOT (WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC))
+    list(APPEND SUNSHINE_SOURCES
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.cpp
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.h
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.cpp
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.h
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.cpp
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.h
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.cpp
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h)
+endif()
+
 # The Windows gamepad router, dynamic-session state machine, and report adapter
 # are intentionally portable so their fake-channel tests run on every host.
 # Windows builds already receive these sources through PLATFORM_TARGET_FILES.
@@ -191,7 +224,9 @@ if(NOT WIN32)
     list(APPEND SUNSHINE_SOURCES
             ${CMAKE_SOURCE_DIR}/src/platform/windows/gamepad_router.cpp
             ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_gamepad.cpp
-            ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_session.cpp)
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_session.cpp
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.cpp
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_frame.cpp)
 endif()
 
 # remove main.cpp from the list of sources

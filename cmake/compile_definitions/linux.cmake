@@ -283,7 +283,7 @@ if(PIPEWIRE_FOUND AND WAYLAND_FOUND AND ${SUNSHINE_ENABLE_KWIN})
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/kwingrab.cpp")
 elseif(${SUNSHINE_ENABLE_KWIN} AND NOT WAYLAND_FOUND)
-    message(FATAL_ERROR "SUNSHINE_ENABLE_KWIN requires SUNSHINE_ENABLE_WAYLAND — KWin capture disabled")
+    message(FATAL_ERROR "SUNSHINE_ENABLE_KWIN requires SUNSHINE_ENABLE_WAYLAND. KWin capture is disabled")
 endif()
 
 if(NOT ${CUDA_FOUND}

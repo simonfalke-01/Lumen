@@ -1,24 +1,32 @@
-<CPackWiXPatch>
+<CPackWiXPatch xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
   <CPackWiXFragment Id="CM_G_Core">
     <FeatureRef Id="RunLumenInstallScripts"/>
   </CPackWiXFragment>
+  <!-- LUMEN_VHID_FEATURE_START -->
   <CPackWiXFragment Id="CM_C_virtual_hid_driver">
     <Level Value="0" Condition="NOT Installed AND LUMEN_INSTALL_VHID = 0"/>
     <Level Value="1" Condition="LUMEN_INSTALL_VHID = 1"/>
   </CPackWiXFragment>
+  <!-- LUMEN_VHID_FEATURE_END -->
   <!-- LUMEN_VMIC_FEATURE_START -->
   <CPackWiXFragment Id="CM_C_virtual_microphone_driver">
     <Level Value="0" Condition="NOT Installed AND LUMEN_INSTALL_VMIC = 0"/>
     <Level Value="1" Condition="LUMEN_INSTALL_VMIC = 1"/>
   </CPackWiXFragment>
   <!-- LUMEN_VMIC_FEATURE_END -->
+  <!-- LUMEN_VDD_FEATURE_START -->
+  <CPackWiXFragment Id="CM_C_virtual_display_driver">
+    <Level Value="0" Condition="NOT Installed AND LUMEN_INSTALL_VDD = 0"/>
+    <Level Value="1" Condition="LUMEN_INSTALL_VDD = 1"/>
+  </CPackWiXFragment>
+  <!-- LUMEN_VDD_FEATURE_END -->
   <CPackWiXFragment Id="CM_CP_application.tools.lumensvc.exe">
     <ServiceInstall Id="InstallLumenService"
                     Name="LumenService"
                     DisplayName="Lumen Service"
                     Description="Lumen is a self-hosted game stream host for Moonlight."
                     Type="ownProcess"
-                    Start="demand"
+                    Start="auto"
                     ErrorControl="normal"
                     Account="LocalSystem"
                     Vital="yes"/>
@@ -28,5 +36,23 @@
                     Stop="both"
                     Remove="uninstall"
                     Wait="yes"/>
+  </CPackWiXFragment>
+  <CPackWiXFragment Id="CM_FP_application.Lumen.exe">
+    <!-- Keep these rules in MSI tables so install failure restores the
+         pre-install firewall state and uninstall removes only Lumen rules. -->
+    <fw:FirewallException Id="LumenTcpFirewallException"
+                          Name="Lumen TCP"
+                          Description="Allow inbound TCP traffic to Lumen."
+                          Protocol="tcp"
+                          Profile="all"
+                          Scope="any"
+                          IgnoreFailure="no"/>
+    <fw:FirewallException Id="LumenUdpFirewallException"
+                          Name="Lumen UDP"
+                          Description="Allow inbound UDP traffic to Lumen."
+                          Protocol="udp"
+                          Profile="all"
+                          Scope="any"
+                          IgnoreFailure="no"/>
   </CPackWiXFragment>
 </CPackWiXPatch>

@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('install-no-vhid', 'install-vhid', 'install-vmic', 'upgrade', 'legacy-import')]
+    [ValidateSet('install-no-vhid', 'install-vhid', 'install-vmic', 'install-vdd', 'driver-reboot', 'upgrade', 'legacy-import')]
     [string]$Scenario
 )
 
@@ -24,7 +24,8 @@ function Invoke-Msi {
         [Parameter(Mandatory = $true)]
         [string]$LogName,
         [Parameter(Mandatory = $true)]
-        [string]$FailureMessage
+        [string]$FailureMessage,
+        [int[]]$ExpectedExitCodes = @(0, 3010)
     )
 
     $logPath = Join-Path $artifactDirectory $LogName
@@ -38,7 +39,7 @@ function Invoke-Msi {
         }
         throw "$FailureMessage Timed out after 15 minutes."
     }
-    if ($process.ExitCode -notin @(0, 3010)) {
+    if ($process.ExitCode -notin $ExpectedExitCodes) {
         Get-Content $logPath
         throw "$FailureMessage Exit code: $($process.ExitCode)."
     }
@@ -318,11 +319,25 @@ function Get-MsiProperty {
 
 switch ($Scenario) {
     'install-no-vhid' {
+        $upgradeArguments = @('/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=0')
+        if ($env:EXPECT_VDD_FEATURE -eq 'true') {
+            $upgradeArguments += 'LUMEN_INSTALL_VDD=1'
+        }
         [void](Invoke-Msi `
-            -Arguments @('/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=0') `
+            -Arguments $upgradeArguments `
             -LogName 'lumen-msi-install-no-vhid.log' `
             -FailureMessage 'MSI install without Virtual HID failed.')
         Assert-ServiceRunning
+        if ($env:EXPECT_VDD_FEATURE -eq 'true') {
+            $upgradeVdd = @(
+                Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+                    @($_.HardwareID) -contains 'ROOT\LumenVirtualDisplay'
+                }
+            )
+            if ($upgradeVdd.Count -ne 1 -or $upgradeVdd[0].Status -ne 'OK') {
+                throw 'VDD-selected major upgrade did not produce exactly one healthy root device.'
+            }
+        }
         if (Test-Path 'C:\Program Files\Lumen\drivers\virtual-hid') {
             throw 'Virtual HID files were installed despite LUMEN_INSTALL_VHID=0.'
         }
@@ -416,6 +431,108 @@ switch ($Scenario) {
         )
         if ($remainingDevices.Count -ne 0) {
             throw "Virtual Microphone device remains after MSI uninstall: $($remainingDevices.Count)."
+        }
+    }
+    'install-vdd' {
+        [void](Invoke-Msi `
+            -Arguments @(
+                '/i',
+                "`"$msiPath`"",
+                '/qn',
+                '/norestart',
+                'LUMEN_INSTALL_VHID=0',
+                'LUMEN_INSTALL_VMIC=0',
+                'LUMEN_INSTALL_VDD=1'
+            ) `
+            -LogName 'lumen-msi-install-vdd.log' `
+            -FailureMessage 'MSI install with Virtual Display failed.')
+        Assert-ServiceRunning
+        $devices = @(
+            Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+                @($_.HardwareID) -contains 'ROOT\LumenVirtualDisplay'
+            }
+        )
+        if ($devices.Count -ne 1 -or $devices[0].Status -ne 'OK') {
+            Get-Content (Join-Path $artifactDirectory 'lumen-msi-install-vdd.log')
+            throw "Virtual Display did not expose exactly one healthy device."
+        }
+        $driverInf = Get-PnpDeviceProperty `
+            -InstanceId $devices[0].PNPDeviceID `
+            -KeyName 'DEVPKEY_Device_DriverInfPath' `
+            -ErrorAction Stop
+        if ([string]$driverInf.Data -notmatch '^oem\d+\.inf$') {
+            throw "Virtual Display reported an invalid driver INF path: $($driverInf.Data)"
+        }
+        [void](Invoke-Msi `
+            -Arguments @(
+                '/i',
+                "`"$msiPath`"",
+                '/qn',
+                '/norestart',
+                'LUMEN_INSTALL_VHID=0',
+                'LUMEN_INSTALL_VMIC=0',
+                'REMOVE=CM_C_virtual_display_driver'
+            ) `
+            -LogName 'lumen-msi-deselect-vdd.log' `
+            -FailureMessage 'MSI Virtual Display feature deselection failed.')
+        $deselectedDevices = @(
+            Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+                @($_.HardwareID) -contains 'ROOT\LumenVirtualDisplay'
+            }
+        )
+        if ($deselectedDevices.Count -ne 0) {
+            throw 'Virtual Display remained installed after feature deselection.'
+        }
+        [void](Invoke-Msi `
+            -Arguments @('/x', $productCode, '/qn', '/norestart') `
+            -LogName 'lumen-msi-uninstall-vdd.log' `
+            -FailureMessage 'MSI uninstall with Virtual Display failed.')
+        $remainingDevices = @(
+            Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+                @($_.HardwareID) -contains 'ROOT\LumenVirtualDisplay'
+            }
+        )
+        if ($remainingDevices.Count -ne 0) {
+            throw "Virtual Display device remains after MSI uninstall."
+        }
+        $driverStoreText = (& pnputil.exe /enum-drivers /files 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $driverStoreText -match '(?i)LumenVirtualDisplay\.inf') {
+            throw "Virtual Display driver package remains after MSI uninstall."
+        }
+    }
+    'driver-reboot' {
+        $token = $productCode.Trim('{}').Replace('-', '')
+        $marker = "HKLM:\SOFTWARE\Lumen\Installer\PendingReboot\$token\install"
+        try {
+            New-Item -Path $marker -Force | Out-Null
+            New-ItemProperty `
+                -LiteralPath $marker `
+                -Name Pending `
+                -PropertyType DWord `
+                -Value 1 `
+                -Force | Out-Null
+            $exitCode = Invoke-Msi `
+                -Arguments @(
+                    '/i',
+                    "`"$msiPath`"",
+                    '/qn',
+                    '/norestart',
+                    'LUMEN_INSTALL_VHID=0',
+                    'LUMEN_INSTALL_VMIC=0',
+                    'LUMEN_INSTALL_VDD=0'
+                ) `
+                -LogName 'lumen-msi-driver-reboot.log' `
+                -FailureMessage 'MSI ScheduleReboot bridge failed.' `
+                -ExpectedExitCodes @(3010)
+            if ($exitCode -ne 3010) {
+                throw "MSI did not return 3010 for an exact protected pending-driver marker: $exitCode"
+            }
+        } finally {
+            Remove-Item -LiteralPath $marker -Recurse -Force -ErrorAction SilentlyContinue
+            [void](Invoke-Msi `
+                -Arguments @('/x', $productCode, '/qn', '/norestart') `
+                -LogName 'lumen-msi-driver-reboot-uninstall.log' `
+                -FailureMessage 'MSI cleanup after ScheduleReboot validation failed.')
         }
     }
     'upgrade' {

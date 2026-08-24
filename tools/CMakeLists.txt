@@ -77,3 +77,23 @@ target_link_libraries(lumen-vmicctl
         setupapi
         shell32)
 target_compile_options(lumen-vmicctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+# Dedicated root-device installer for the optional UMDF2 indirect display
+# driver. PnPUtil can stage the package, but it cannot create a new root
+# enumerated device on a clean machine.
+add_executable(lumen-vddctl lumen-vddctl.cpp)
+target_link_libraries(lumen-vddctl
+        cfgmgr32
+        setupapi
+        shell32)
+target_compile_options(lumen-vddctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+if(MINGW)
+    target_link_options(lumen-vddctl PRIVATE -static)
+endif()
+
+# Native MSI bridge used after deferred driver work. A child PowerShell
+# process cannot call MsiSetMode on its parent installation session.
+add_library(lumen_msica SHARED lumen-msica.c)
+set_target_properties(lumen_msica PROPERTIES PREFIX "" OUTPUT_NAME "lumen_msica")
+target_link_libraries(lumen_msica msi)
+target_compile_options(lumen_msica PRIVATE ${SUNSHINE_COMPILE_OPTIONS})

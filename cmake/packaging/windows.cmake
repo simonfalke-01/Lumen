@@ -1,6 +1,12 @@
 # windows specific packaging
 install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
 
+option(LUMEN_WINDOWS_FULL_PROFILE
+        "Require the complete MsQuic and Lumen driver package set"
+        OFF)
+set(LUMEN_WINDOWS_LOCAL_TEST_SIGNING_MARKER "" CACHE FILEPATH
+        "Optional local-test-only driver signing marker JSON")
+
 # Hardening: include zlib1.dll (loaded via LoadLibrary() in openssl's libcrypto.a)
 install(FILES "${ZLIB}" DESTINATION "." COMPONENT application)
 
@@ -180,7 +186,7 @@ if(SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR)
         message(FATAL_ERROR
                 "The lumen-vmicctl target is required when packaging the Lumen Virtual Microphone driver")
     endif()
-    install(TARGETS lumen-vmicctl
+install(TARGETS lumen-vmicctl
             RUNTIME DESTINATION "tools"
             COMPONENT virtual_microphone_driver)
     install(FILES ${VIRTUAL_MICROPHONE_DRIVER_FILES}
@@ -191,11 +197,134 @@ else()
             "Lumen Virtual Microphone driver package not supplied; installer generation will not include the driver")
 endif()
 
+if(NOT TARGET lumen_msica)
+    message(FATAL_ERROR "The lumen_msica target is required for MSI driver reboot propagation")
+endif()
+
+# Lumen Virtual Display driver
+#
+# The UMDF2 IddCx driver is built separately with MSBuild/WDK. Packaging accepts
+# one exact x64 driver-store package and never rebuilds it with MinGW.
+set(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR "" CACHE PATH
+        "Directory containing the x64 Lumen Virtual Display INF, CAT, and DLL")
+
+if(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
+        message(FATAL_ERROR
+                "The current Lumen Virtual Display package supports AMD64 packaging only")
+    endif()
+    if(NOT IS_DIRECTORY "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
+        message(FATAL_ERROR
+                "SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR does not exist: "
+                "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
+    endif()
+
+    set(VIRTUAL_DISPLAY_DRIVER_INF
+            "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.inf")
+    set(VIRTUAL_DISPLAY_DRIVER_CAT
+            "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.cat")
+    set(VIRTUAL_DISPLAY_DRIVER_DLL
+            "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.dll")
+    set(VIRTUAL_DISPLAY_DRIVER_FILES
+            "${VIRTUAL_DISPLAY_DRIVER_INF}"
+            "${VIRTUAL_DISPLAY_DRIVER_CAT}"
+            "${VIRTUAL_DISPLAY_DRIVER_DLL}")
+
+    foreach(VIRTUAL_DISPLAY_DRIVER_FILE IN LISTS VIRTUAL_DISPLAY_DRIVER_FILES)
+        if(NOT EXISTS "${VIRTUAL_DISPLAY_DRIVER_FILE}")
+            message(FATAL_ERROR
+                    "The Lumen Virtual Display package is missing: ${VIRTUAL_DISPLAY_DRIVER_FILE}")
+        endif()
+    endforeach()
+
+    file(GLOB VIRTUAL_DISPLAY_DRIVER_PACKAGE_FILES
+            LIST_DIRECTORIES false
+            "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/*")
+    list(LENGTH VIRTUAL_DISPLAY_DRIVER_PACKAGE_FILES VIRTUAL_DISPLAY_DRIVER_PACKAGE_FILE_COUNT)
+    if(NOT VIRTUAL_DISPLAY_DRIVER_PACKAGE_FILE_COUNT EQUAL 3)
+        message(FATAL_ERROR
+                "The Lumen Virtual Display package must contain exactly "
+                "LumenVirtualDisplay.inf, LumenVirtualDisplay.cat, and "
+                "LumenVirtualDisplay.dll: ${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
+    endif()
+
+    file(READ "${VIRTUAL_DISPLAY_DRIVER_INF}" VIRTUAL_DISPLAY_DRIVER_INF_CONTENTS)
+    string(TOLOWER "${VIRTUAL_DISPLAY_DRIVER_INF_CONTENTS}" VIRTUAL_DISPLAY_DRIVER_INF_CONTENTS_LOWER)
+    foreach(VIRTUAL_DISPLAY_INF_IDENTITY IN ITEMS
+            "ROOT\\LumenVirtualDisplay"
+            "NTamd64"
+            "UmdfExtensions=IddCx0102"
+            "ServiceBinary=%13%\\LumenVirtualDisplay.dll")
+        string(TOLOWER "${VIRTUAL_DISPLAY_INF_IDENTITY}" VIRTUAL_DISPLAY_INF_IDENTITY_LOWER)
+        string(FIND
+                "${VIRTUAL_DISPLAY_DRIVER_INF_CONTENTS_LOWER}"
+                "${VIRTUAL_DISPLAY_INF_IDENTITY_LOWER}"
+                VIRTUAL_DISPLAY_INF_IDENTITY_OFFSET)
+        if(VIRTUAL_DISPLAY_INF_IDENTITY_OFFSET EQUAL -1)
+            message(FATAL_ERROR
+                    "The Lumen Virtual Display INF does not match this package: "
+                    "missing ${VIRTUAL_DISPLAY_INF_IDENTITY}")
+        endif()
+    endforeach()
+
+    if(NOT TARGET lumen-vddctl)
+        message(FATAL_ERROR
+                "The lumen-vddctl target is required when packaging the Lumen Virtual Display driver")
+    endif()
+    install(TARGETS lumen-vddctl
+            RUNTIME DESTINATION "tools"
+            COMPONENT application)
+    install(FILES ${VIRTUAL_DISPLAY_DRIVER_FILES}
+            DESTINATION "drivers/virtual-display"
+            COMPONENT virtual_display_driver)
+else()
+    message(STATUS
+            "Lumen Virtual Display driver package not supplied; installer generation will not include the driver")
+endif()
+
+if(LUMEN_WINDOWS_FULL_PROFILE)
+    if(NOT LUMEN_EXPERIMENTAL_MSQUIC)
+        message(FATAL_ERROR "LUMEN_WINDOWS_FULL_PROFILE requires LUMEN_EXPERIMENTAL_MSQUIC=ON")
+    endif()
+    foreach(REQUIRED_FULL_PROFILE_DIRECTORY IN ITEMS
+            SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR
+            SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR
+            SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR
+            LUMEN_MSQUIC_ROOT
+            LUMEN_MSQUIC_SHIM_ROOT)
+        if(NOT IS_DIRECTORY "${${REQUIRED_FULL_PROFILE_DIRECTORY}}")
+            message(FATAL_ERROR
+                    "LUMEN_WINDOWS_FULL_PROFILE requires ${REQUIRED_FULL_PROFILE_DIRECTORY}")
+        endif()
+    endforeach()
+endif()
+
+if(LUMEN_WINDOWS_LOCAL_TEST_SIGNING_MARKER)
+    if(NOT LUMEN_WINDOWS_FULL_PROFILE OR
+       NOT EXISTS "${LUMEN_WINDOWS_LOCAL_TEST_SIGNING_MARKER}")
+        message(FATAL_ERROR
+                "LUMEN_WINDOWS_LOCAL_TEST_SIGNING_MARKER requires a full-profile marker file")
+    endif()
+    file(READ "${LUMEN_WINDOWS_LOCAL_TEST_SIGNING_MARKER}" LOCAL_TEST_SIGNING_MARKER_JSON)
+    string(JSON LOCAL_TEST_SIGNING_MARKER_PURPOSE
+            GET "${LOCAL_TEST_SIGNING_MARKER_JSON}" purpose)
+    if(NOT LOCAL_TEST_SIGNING_MARKER_PURPOSE STREQUAL "local-test-only")
+        message(FATAL_ERROR "Invalid local-test driver signing marker purpose")
+    endif()
+    install(FILES "${LUMEN_WINDOWS_LOCAL_TEST_SIGNING_MARKER}"
+            DESTINATION "metadata"
+            RENAME "LOCAL-TEST-SIGNED.json"
+            COMPONENT application)
+endif()
+
 # Mandatory scripts. The source filename is retained as a build compatibility
 # alias, but new packages expose only the Lumen script name.
 install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sunshine-setup.ps1"
         DESTINATION "scripts"
         RENAME "lumen-setup.ps1"
+        COMPONENT assets)
+install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/virtual-display-setup.ps1"
+        DESTINATION "scripts"
         COMPONENT assets)
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/service/"
         DESTINATION "scripts"
@@ -278,6 +407,14 @@ set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_GROUP "Core")
 set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_DEPENDS application)
 set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_DISABLED true)
 
+# Lumen Virtual Display driver
+set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DISPLAY_NAME "Lumen Virtual Display")
+set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DESCRIPTION
+        "Optional Lumen indirect-display driver for exact session resolution and refresh selection.")
+set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_GROUP "Core")
+set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DEPENDS application)
+set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DISABLED true)
+
 # ZIP packages are intentionally non-privileged. Keep the driver package and
 # its install/remove helper out of the lite archive so unpacked builds use the
 # SendInput fallback unless a matching driver is already installed.
@@ -291,6 +428,7 @@ string(CONCAT SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT
         "  set(CPACK_COMPONENTS_ALL \"${SUNSHINE_WINDOWS_PACKAGE_COMPONENTS}\")\n"
         "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_hid_driver)\n"
         "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_microphone_driver)\n"
+        "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_display_driver)\n"
         "endif()\n")
 file(GENERATE
         OUTPUT "${SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG}"

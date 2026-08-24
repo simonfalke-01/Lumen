@@ -1,6 +1,12 @@
 $ErrorActionPreference = 'Stop'
 
-$msiCandidates = @(Get-ChildItem 'artifacts/Lumen-*-Windows-AMD64-installer.msi' -File)
+$msiCandidates = if ([string]::IsNullOrWhiteSpace($env:LUMEN_MSI_PATH)) {
+    @(Get-ChildItem 'artifacts/Lumen-*-Windows-AMD64-installer.msi' -File)
+} elseif (Test-Path -LiteralPath $env:LUMEN_MSI_PATH -PathType Leaf) {
+    @(Get-Item -LiteralPath $env:LUMEN_MSI_PATH)
+} else {
+    @()
+}
 if ($msiCandidates.Count -ne 1) {
     throw 'Expected exactly one versioned Lumen Windows MSI artifact.'
 }
@@ -38,6 +44,8 @@ $properties = Read-MsiRows `
     'SELECT `Property`,`Value` FROM `Property`' 2
 $files = Read-MsiRows `
     'SELECT `File`,`FileName`,`Component_` FROM `File`' 3
+$firewallExceptions = Read-MsiRows `
+    'SELECT `Name`,`Protocol`,`Program`,`Profile`,`Component_`,`Direction` FROM `Wix4FirewallException`' 6
 
 $requiredActions = @(
     'CA_LumenInstall',
@@ -54,9 +62,41 @@ foreach ($action in $requiredActions) {
         throw "Generated MSI is missing custom action or sequence row: $action"
     }
 }
+$rebootActions = @('CA_LumenReadPendingDriverReboot')
+foreach ($action in $rebootActions) {
+    if ($actionNames -notcontains $action -or $sequenceNames -notcontains $action) {
+        throw "Generated MSI is missing the VDD reboot bridge action: $action"
+    }
+    $row = @($actions | Where-Object { $_[0] -eq $action })
+    if ($row.Count -ne 1 -or
+        $row[0][2] -ne 'LumenMsiCA' -or
+        $row[0][3] -ne 'LumenReadPendingDriverReboot') {
+        throw "Generated MSI has an invalid VDD reboot bridge action: $action"
+    }
+}
 
-if ($services.Count -ne 1 -or $services[0][1] -ne 'LumenService') {
-    throw 'Generated MSI does not contain the declarative LumenService row.'
+if ($services.Count -ne 1 -or
+    $services[0][1] -ne 'LumenService' -or
+    $services[0][2] -ne '2') {
+    throw 'Generated MSI does not contain an automatic declarative LumenService row.'
+}
+$expectedFirewallProtocols = @{
+    'Lumen TCP' = '6'
+    'Lumen UDP' = '17'
+}
+if ($firewallExceptions.Count -ne $expectedFirewallProtocols.Count) {
+    throw 'Generated MSI does not contain exactly two Lumen firewall rules.'
+}
+foreach ($firewallException in $firewallExceptions) {
+    $ruleName = $firewallException[0]
+    if (-not $expectedFirewallProtocols.ContainsKey($ruleName) -or
+        $firewallException[1] -ne $expectedFirewallProtocols[$ruleName] -or
+        $firewallException[2] -ne '[#CM_FP_application.Lumen.exe]' -or
+        $firewallException[3] -ne '2147483647' -or
+        $firewallException[4] -ne 'CM_CP_application.Lumen.exe' -or
+        $firewallException[5] -ne '1') {
+        throw "Generated MSI has an invalid Lumen firewall row: $($firewallException -join ', ')"
+    }
 }
 if ($sequenceNames -notcontains 'RemoveExistingProducts') {
     throw 'Generated MSI is missing RemoveExistingProducts.'
@@ -87,14 +127,15 @@ foreach ($setterName in $setterNames) {
         $command -notmatch ' -ProductCode "\[ProductCode\]" ' -or
         $command -notmatch ' -TransactionKind (install|uninstall) ' -or
         $command -notmatch ' -InstallVirtualHid \[LUMEN_INSTALL_VHID\] ' -or
-        $command -notmatch ' -InstallVirtualMicrophone \[LUMEN_INSTALL_VMIC\]$') {
+        $command -notmatch ' -InstallVirtualMicrophone \[LUMEN_INSTALL_VMIC\] ' -or
+        $command -notmatch ' -InstallVirtualDisplay \[LUMEN_INSTALL_VDD\] ' -or
+        $command -notmatch ' -RemoveVirtualDisplay \[LUMEN_REMOVE_VDD\]$') {
         throw "Generated MSI has an invalid deferred command: $setterName"
     }
     if ($command -match '&(?:amp;)?quot;|\[CustomActionData\]|-MsiData') {
         throw "Generated MSI has escaped or nested deferred command data: $setterName"
     }
 }
-
 $deferredActions = @($actions | Where-Object { $_[0] -in $requiredActions })
 foreach ($deferredAction in $deferredActions) {
     if ($deferredAction[2] -ne 'Wix4UtilCA_X64' -or
@@ -119,14 +160,59 @@ $installDeferred = @($sequence | Where-Object { $_[0] -eq 'CA_LumenInstall' })
 if ([int]$removeExistingProducts[0][2] -le [int]$installDeferred[0][2]) {
     throw 'The new product must finish its install action before removing the old product.'
 }
+$stopServices = @($sequence | Where-Object { $_[0] -eq 'StopServices' })
+$uninstallSetter = @($sequence | Where-Object { $_[0] -eq 'SetLumenUninstallRollbackData' })
+$uninstallDeferred = @($sequence | Where-Object { $_[0] -eq 'CA_LumenUninstall' })
+if ($stopServices.Count -ne 1 -or $uninstallSetter.Count -ne 1 -or $uninstallDeferred.Count -ne 1 -or
+    [int]$uninstallSetter[0][2] -le [int]$stopServices[0][2] -or
+    [int]$uninstallDeferred[0][2] -le [int]$stopServices[0][2]) {
+    throw 'VDD driver uninstall must be sequenced after StopServices.'
+}
+$installExecute = @($sequence | Where-Object { $_[0] -eq 'InstallExecute' })
+$installFinalize = @($sequence | Where-Object { $_[0] -eq 'InstallFinalize' })
+$readReboot = @($sequence | Where-Object { $_[0] -eq 'CA_LumenReadPendingDriverReboot' })
+$scheduleReboot = @($sequence | Where-Object { $_[0] -eq 'ScheduleReboot' })
+if ($installExecute.Count -ne 1 -or $installFinalize.Count -ne 1 -or
+    $readReboot.Count -ne 1 -or $scheduleReboot.Count -ne 1 -or
+    [int]$installDeferred[0][2] -ge [int]$installExecute[0][2] -or
+    [int]$uninstallDeferred[0][2] -ge [int]$installExecute[0][2] -or
+    [int]$readReboot[0][2] -le [int]$installExecute[0][2] -or
+    [int]$readReboot[0][2] -ge [int]$installFinalize[0][2] -or
+    [int]$scheduleReboot[0][2] -le [int]$readReboot[0][2] -or
+    [int]$scheduleReboot[0][2] -ge [int]$installFinalize[0][2] -or
+    $scheduleReboot[0][1] -ne 'LUMEN_DRIVER_REBOOT_REQUIRED = 1') {
+    throw 'Driver reboot detection must bridge InstallExecute to ScheduleReboot before InstallFinalize.'
+}
 
 $vhidFeature = @($features | Where-Object { $_[0] -eq 'CM_C_virtual_hid_driver' })
-if ($vhidFeature.Count -ne 1) {
-    throw 'Generated MSI is missing the Virtual HID feature.'
-}
 $vhidDefault = @($properties | Where-Object { $_[0] -eq 'LUMEN_INSTALL_VHID' })
 if ($vhidDefault.Count -ne 1 -or $vhidDefault[0][1] -ne '0') {
     throw 'The Virtual HID feature must remain explicit opt-in.'
+}
+$vhidFiles = @($files | Where-Object {
+    $_[1] -match '(?i)LumenVirtualHid\.(inf|cat|dll|cer)|lumen-vhidctl\.exe'
+})
+$expectVhidFeature = if ([string]::IsNullOrWhiteSpace($env:EXPECT_VHID_FEATURE)) {
+    $true
+} else {
+    $env:EXPECT_VHID_FEATURE -eq 'true'
+}
+if ($expectVhidFeature) {
+    if ($vhidFeature.Count -ne 1) {
+        throw 'Generated MSI is missing the Virtual HID feature.'
+    }
+    foreach ($requiredVhidFile in @(
+        'LumenVirtualHid.inf',
+        'LumenVirtualHid.cat',
+        'LumenVirtualHid.dll',
+        'lumen-vhidctl.exe'
+    )) {
+        if (-not ($vhidFiles | Where-Object { $_[1] -match "(?i)$([regex]::Escape($requiredVhidFile))" })) {
+            throw "Generated MSI is missing $requiredVhidFile."
+        }
+    }
+} elseif ($vhidFeature.Count -ne 0 -or $vhidFiles.Count -ne 0) {
+    throw 'Generated MSI unexpectedly contains Virtual HID files or features.'
 }
 $vmicFeature = @($features | Where-Object { $_[0] -eq 'CM_C_virtual_microphone_driver' })
 $vmicDefault = @($properties | Where-Object { $_[0] -eq 'LUMEN_INSTALL_VMIC' })
@@ -153,6 +239,67 @@ if ($expectVmicFeature) {
     }
 } elseif ($vmicFeature.Count -ne 0 -or $vmicFiles.Count -ne 0) {
     throw 'Generated tagged MSI unexpectedly contains Virtual Microphone files or features.'
+}
+$vddFeature = @($features | Where-Object { $_[0] -eq 'CM_C_virtual_display_driver' })
+$vddDefault = @($properties | Where-Object { $_[0] -eq 'LUMEN_INSTALL_VDD' })
+$vddRemoveDefault = @($properties | Where-Object { $_[0] -eq 'LUMEN_REMOVE_VDD' })
+if ($vddDefault.Count -ne 1 -or $vddDefault[0][1] -ne '0') {
+    throw 'The Virtual Display feature must remain explicit opt-in.'
+}
+if ($vddRemoveDefault.Count -ne 1 -or $vddRemoveDefault[0][1] -ne '0') {
+    throw 'The Virtual Display removal selector must default to disabled.'
+}
+$vddFiles = @($files | Where-Object {
+    $_[1] -match '(?i)LumenVirtualDisplay\.(inf|cat|dll)|lumen-vddctl\.exe'
+})
+$expectVddFeature = $env:EXPECT_VDD_FEATURE -eq 'true'
+if ($expectVddFeature) {
+    if ($vddFeature.Count -ne 1) {
+        throw 'Generated MSI is missing the Virtual Display feature.'
+    }
+    foreach ($requiredVddFile in @(
+        'LumenVirtualDisplay.inf',
+        'LumenVirtualDisplay.cat',
+        'LumenVirtualDisplay.dll',
+        'lumen-vddctl.exe'
+    )) {
+        if (-not ($vddFiles | Where-Object { $_[1] -match "(?i)$([regex]::Escape($requiredVddFile))" })) {
+            throw "Generated MSI is missing $requiredVddFile."
+        }
+    }
+    if (-not ($files | Where-Object { $_[1] -match '(?i)virtual-display-setup\.ps1' })) {
+        throw 'Generated MSI is missing the Virtual Display transaction helper.'
+    }
+} elseif ($vddFeature.Count -ne 0 -or $vddFiles.Count -ne 0) {
+    throw 'Generated MSI unexpectedly contains Virtual Display files or features.'
+}
+
+$msquicFiles = @($files | Where-Object {
+    $_[1] -match '(?i)(^|\|)(msquic|lumen_msquic_shim)\.dll$|MsQuic-LICENSE\.txt'
+})
+$expectMsQuic = $env:EXPECT_MSQUIC -eq 'true'
+if ($expectMsQuic) {
+    foreach ($requiredMsQuicFile in @(
+        'msquic.dll',
+        'lumen_msquic_shim.dll',
+        'MsQuic-LICENSE.txt'
+    )) {
+        if (-not ($msquicFiles | Where-Object { $_[1] -match "(?i)$([regex]::Escape($requiredMsQuicFile))" })) {
+            throw "Generated MSI is missing $requiredMsQuicFile."
+        }
+    }
+} elseif ($msquicFiles.Count -ne 0) {
+    throw 'Generated MSI unexpectedly contains MsQuic runtime files.'
+}
+$localTestMarkers = @($files | Where-Object {
+    $_[1] -match '(?i)LOCAL-TEST-SIGNED\.json'
+})
+$expectLocalTestMarker = $env:EXPECT_LOCAL_TEST_SIGNED -eq 'true'
+if ($expectLocalTestMarker -and $localTestMarkers.Count -ne 1) {
+    throw 'Local-test full profile is missing its explicit signing marker.'
+}
+if (-not $expectLocalTestMarker -and $localTestMarkers.Count -ne 0) {
+    throw 'Public MSI unexpectedly contains a local-test signing marker.'
 }
 $productCode = @($properties | Where-Object { $_[0] -eq 'ProductCode' })
 if ($productCode.Count -ne 1 -or

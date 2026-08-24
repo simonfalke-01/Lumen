@@ -24,6 +24,16 @@ on:
         required: false
         default: all
         type: string
+      full_profile_driver_run_id:
+        description: Run ID containing Microsoft-signed VHID, VMIC, and VDD packages; required for release_tag
+        required: false
+        default: ''
+        type: string
+      full_profile_driver_artifact_name:
+        description: Signed full-profile driver artifact name
+        required: false
+        default: Lumen-Windows-Signed-Drivers
+        type: string
   workflow_dispatch:
     inputs:
       release_tag:
@@ -54,8 +64,19 @@ on:
           - install-no-vhid
           - install-vhid
           - install-vmic
+          - install-vdd
+          - driver-reboot
           - upgrade
           - legacy-import
+      full_profile_driver_run_id:
+        description: Run ID containing Microsoft-signed VHID, VMIC, and VDD packages; required for release_tag
+        required: false
+        type: string
+      full_profile_driver_artifact_name:
+        description: Signed full-profile driver artifact name
+        required: false
+        default: Lumen-Windows-Signed-Drivers
+        type: string
 
 env:
   PYTHON_VERSION: '3.14'
@@ -89,11 +110,16 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_REF: ${{ inputs.source_ref }}
+          FULL_PROFILE_DRIVER_RUN_ID: ${{ inputs.full_profile_driver_run_id }}
         run: |
           set -euo pipefail
 
           version=$(tr -d '[:space:]' < version.txt)
           if [[ -n "$RELEASE_TAG" ]]; then
+            if [[ -z "$FULL_PROFILE_DRIVER_RUN_ID" ]]; then
+              echo 'full_profile_driver_run_id is required for a release full-profile MSI.' >&2
+              exit 1
+            fi
             cmake \
               -DRELEASE_TAG="$RELEASE_TAG" \
               -P .github/scripts/validate-release-version.cmake
@@ -146,19 +172,42 @@ jobs:
           ref: ${{ inputs.source_ref || github.ref }}
           submodules: recursive
 
+      - name: Download Microsoft-signed full-profile drivers
+        if: inputs.release_tag != ''
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
+        with:
+          name: ${{ inputs.full_profile_driver_artifact_name || 'Lumen-Windows-Signed-Drivers' }}
+          path: ${{ runner.temp }}/lumen-signed-drivers
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.full_profile_driver_run_id }}
+
       - name: Validate installer script
         shell: pwsh
         run: |
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path 'src_assets/windows/misc/sunshine-setup.ps1'),
-            [ref]$null,
-            [ref]$errors
-          ) | Out-Null
-          if ($errors.Count -ne 0) {
-            $errors | ForEach-Object { Write-Error $_.Message }
-            throw 'The Windows installer script contains syntax errors.'
+          foreach ($script in @(
+            'src_assets/windows/misc/sunshine-setup.ps1',
+            'src_assets/windows/misc/virtual-display-setup.ps1',
+            'scripts/windows/build-full-profile.ps1',
+            'scripts/windows/full-profile-source-provenance.ps1',
+            'scripts/windows/sign-full-profile-local-test.ps1',
+            'scripts/windows/freeze-full-profile-source.ps1'
+          )) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$null,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              throw "$script contains syntax errors."
+            }
           }
+
+      - name: Test full-profile source provenance
+        shell: powershell
+        run: .\tests\packaging\test-full-profile-source-provenance.ps1
 
       - name: Cache CMake dependency tree
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -255,6 +304,7 @@ jobs:
           }
 
       - name: Build Virtual HID driver
+        if: inputs.release_tag == ''
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -471,6 +521,7 @@ jobs:
           "DRIVER_PACKAGE_DIR=$driverPackageDir" >> $env:GITHUB_ENV
 
       - name: Build Virtual Microphone driver
+        if: inputs.release_tag == ''
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -731,7 +782,46 @@ jobs:
           git diff --quiet --exit-code
           git diff --cached --quiet --exit-code
 
+      - name: Build complete signed Windows release profile
+        if: inputs.release_tag != ''
+        shell: pwsh
+        env:
+          PYTHON_PATH: ${{ steps.setup-python.outputs.python-path }}
+          SIGNED_DRIVER_ROOT: ${{ runner.temp }}\lumen-signed-drivers
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:RUNNER_TEMP 'lumen-full-profile'
+          $downloads = Join-Path $staging 'downloads'
+          $msquic = Join-Path $staging 'msquic-2.6.0'
+          New-Item -ItemType Directory -Path $downloads, $msquic -Force | Out-Null
+          $nupkg = Join-Path $downloads 'Microsoft.Native.Quic.MsQuic.Schannel.2.6.0.nupkg'
+          Invoke-WebRequest `
+            -UseBasicParsing `
+            -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.native.quic.msquic.schannel/2.6.0/microsoft.native.quic.msquic.schannel.2.6.0.nupkg' `
+            -OutFile $nupkg
+          $expected = '37636DBC4FBB527F7A2F4505893BB2619862AA5879CC65499A048401C44EB590'
+          if ((Get-FileHash $nupkg -Algorithm SHA256).Hash -ne $expected) {
+            throw 'MsQuic 2.6.0 NuGet package hash mismatch.'
+          }
+          $zip = Join-Path $downloads 'msquic-2.6.0.zip'
+          Copy-Item $nupkg $zip -Force
+          Expand-Archive -LiteralPath $zip -DestinationPath $msquic -Force
+
+          & .\scripts\windows\build-full-profile.ps1 `
+            -SourceRoot $env:GITHUB_WORKSPACE `
+            -StagingRoot $staging `
+            -Msys2Root 'C:\msys64' `
+            -MsQuicPackageRoot $msquic `
+            -PythonPath $env:PYTHON_PATH `
+            -DotNetRoot $env:DOTNET_ROOT `
+            -NodeRoot $env:NODEJS_PATH `
+            -SignedDriverRoot $env:SIGNED_DRIVER_ROOT `
+            -BuildVersion $env:LUMEN_BUILD_VERSION
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          Copy-Item (Join-Path $staging 'artifacts\*') artifacts -Force
+
       - name: Build Windows
+        if: inputs.release_tag == ''
         shell: msys2 {0}
         env:
           BRANCH: ${{ github.ref_name }}
@@ -772,24 +862,14 @@ jobs:
           ninja -C cmake-build-windows
 
       - name: Run targeted Windows tests
+        if: inputs.release_tag == ''
         shell: msys2 {0}
         run: |
           cmake-build-windows/tests/test_sunshine.exe \
             --gtest_filter='VirtualHidProtocolTest.*:VirtualHidKeyMappingTest.*:VirtualHidGamepadProtocolTest.*:VirtualHidDriverIsolationTest.*:VirtualHidReportQueueTest.*:DynamicGamepad*.*:GamepadRouterTest.*:VirtualHidGamepadTest.*:VirtualHidSessionTest.*:Libvirtualhid*.*:GamepadBackendValues/*.*:*virtual_hid_input_test.*:*virtual_hid_mouse_button_test.*:*send_input_transport_test.*:*send_input_mouse_button_test.*:InputBatchingTest.*:VirtualMicrophone*.*:ClientMicrophone*.*:client_microphone_test.*'
 
-      - name: Run complete Windows release test suite
-        if: inputs.release_tag != ''
-        shell: msys2 {0}
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          release_test_args=()
-          if [[ "$RELEASE_TAG" == 'v0.1.0-alpha.1' ]]; then
-            release_test_args+=(--gtest_filter=-LumenBrandingTest.KeepsExistingCanonicalConfig)
-          fi
-          cmake-build-windows/tests/test_sunshine.exe "${release_test_args[@]}"
-
       - name: Package Windows
+        if: inputs.release_tag == ''
         shell: msys2 {0}
         run: |
           set -euo pipefail
@@ -884,9 +964,11 @@ jobs:
         scenario: >-
           ${{ fromJSON(
             inputs.validation_scenario == 'release' &&
-            '["install-no-vhid","upgrade","legacy-import"]' ||
+            '["install-no-vhid","install-vdd","driver-reboot","upgrade","legacy-import"]' ||
             (inputs.validation_scenario == '' || inputs.validation_scenario == 'all') &&
-            '["install-no-vhid","install-vhid","install-vmic","upgrade","legacy-import"]' ||
+            (inputs.release_tag != '' &&
+              '["install-no-vhid","install-vhid","install-vmic","install-vdd","driver-reboot","upgrade","legacy-import"]' ||
+              '["install-no-vhid","install-vhid","install-vmic","driver-reboot","upgrade","legacy-import"]') ||
             format('["{0}"]', inputs.validation_scenario)
           ) }}
     steps:
@@ -1053,7 +1135,10 @@ jobs:
       - name: Validate generated MSI tables
         shell: pwsh
         env:
-          EXPECT_VMIC_FEATURE: ${{ inputs.release_tag == '' && 'true' || 'false' }}
+          EXPECT_VHID_FEATURE: 'true'
+          EXPECT_VMIC_FEATURE: 'true'
+          EXPECT_VDD_FEATURE: ${{ inputs.release_tag != '' && 'true' || 'false' }}
+          EXPECT_MSQUIC: ${{ inputs.release_tag != '' && 'true' || 'false' }}
         run: ./.github/scripts/validate-windows-msi.ps1
 
       - name: Run ${{ matrix.scenario }} MSI scenario

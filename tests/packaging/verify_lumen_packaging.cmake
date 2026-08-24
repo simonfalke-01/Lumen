@@ -47,7 +47,7 @@ assert_file_contains_literal(
 assert_file_contains(
     "CMakeLists.txt"
     "LUMEN_VERSION_MAJOR GREATER 255"
-    "Canonical versions must enforce Windows MSI component limits")
+    "Valid versions must enforce Windows MSI component limits")
 assert_file_contains_literal(
     "src_assets/macos/build/Info.plist.in"
     [=[<string>@LUMEN_VERSION_CORE@</string>]=]
@@ -69,10 +69,49 @@ assert_file_contains(
     "cmake/packaging/wix_resources/patch.xml"
     "Name=\"LumenService\""
     "The MSI service must use the Lumen product identity")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/patch.xml"
+    [=[Start="auto"]=]
+    "The MSI service must remain automatic across reboot after silent cutover")
 assert_file_excludes(
     "cmake/packaging/wix_resources/patch.xml"
     "SunshineService"
     "The Lumen MSI must not claim the official Sunshine service")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/patch.xml"
+    [=[CPackWiXFragment Id="CM_FP_application.Lumen.exe"]=]
+    "The MSI firewall rules must be attached to Lumen.exe")
+foreach(lumen_firewall_contract IN ITEMS
+        [=[Name="Lumen TCP"]=]
+        [=[Protocol="tcp"]=]
+        [=[Name="Lumen UDP"]=]
+        [=[Protocol="udp"]=]
+        [=[IgnoreFailure="no"]=])
+    assert_file_contains_literal(
+        "cmake/packaging/wix_resources/patch.xml"
+        "${lumen_firewall_contract}"
+        "The MSI must retain its transactional Lumen firewall contract")
+endforeach()
+assert_file_contains_literal(
+    "cmake/packaging/windows_wix.cmake"
+    [=["WixToolset.Firewall.wixext"]=]
+    "WiX packaging must load the Firewall extension")
+assert_file_contains_literal(
+    "cmake/packaging/windows_wix.cmake"
+    [=["fw=http://wixtoolset.org/schemas/v4/wxs/firewall"]=]
+    "Generated WiX sources must declare the Firewall namespace")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[Windows Installer owns the Lumen firewall rules.]=]
+    "MSI setup must not duplicate declarative firewall rules")
+assert_file_contains_literal(
+    ".github/scripts/validate-windows-msi.ps1"
+    [=[FROM `Wix4FirewallException`]=]
+    "Windows CI must validate the compiled firewall table")
+assert_file_contains_literal(
+    ".github/scripts/validate-windows-msi.ps1"
+    [=[$env:EXPECT_VHID_FEATURE]=]
+    "Compiled MSI validation must support packages without the optional Virtual HID payload")
 assert_file_contains(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
     "Property Id=\"LUMEN_INSTALL_VHID\" Value=\"0\""
@@ -175,6 +214,18 @@ assert_file_contains(
     "cmake/packaging/wix_resources/patch.xml"
     "Condition=\"NOT Installed AND LUMEN_INSTALL_VHID = 0\""
     "Virtual HID opt-out must not suppress removal of an installed feature")
+assert_file_contains_literal(
+    "cmake/packaging/windows_wix.cmake"
+    [=[if(NOT SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)]=]
+    "WiX generation must omit Virtual HID feature references when no package is supplied")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/patch.xml"
+    [=[<!-- LUMEN_VHID_FEATURE_START -->]=]
+    "The optional Virtual HID patch must retain its generation markers")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/sunshine-installer.wxs"
+    [=[<!-- LUMEN_VHID_FEATURE_START -->]=]
+    "The optional Virtual HID MSI state resolvers must retain their generation markers")
 assert_file_excludes(
     "cmake/packaging/wix_resources/patch.xml"
     "Condition=\"LUMEN_INSTALL_VHID = 0\""
@@ -264,7 +315,126 @@ assert_file_contains_literal(
 assert_file_contains_literal(
     "src_assets/windows/misc/sunshine-setup.ps1"
     [=[Invoke-AllPersistedRollbacks]=]
-    "Setup failures must roll back both optional device drivers")
+    "Setup failures must roll back every selected device driver")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[LUMEN_WINDOWS_FULL_PROFILE]=]
+    "Windows packaging must expose one strict full-profile gate")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR]=]
+    "Windows packaging must accept an isolated Virtual Display package")
+foreach(virtual_display_package_file IN ITEMS
+        "LumenVirtualDisplay.inf"
+        "LumenVirtualDisplay.cat"
+        "LumenVirtualDisplay.dll")
+    assert_file_contains_literal(
+        "cmake/packaging/windows.cmake"
+        "${virtual_display_package_file}"
+        "Windows packaging must require ${virtual_display_package_file}")
+endforeach()
+assert_file_contains_literal(
+    "tools/CMakeLists.txt"
+    [=[add_executable(lumen-vddctl lumen-vddctl.cpp)]=]
+    "The Virtual Display package must build its root-device lifecycle helper")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[install(TARGETS lumen-vddctl]=]
+    "The Virtual Display package must install its root-device lifecycle helper")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[DESTINATION "drivers/virtual-display"]=]
+    "The Virtual Display package must use its isolated directory")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_display_driver)]=]
+    "Lite ZIP packages must exclude the Virtual Display component")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/patch.xml"
+    [=[CM_C_virtual_display_driver]=]
+    "WiX must patch the optional Virtual Display feature")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/sunshine-installer.wxs"
+    [=[Property Id="LUMEN_INSTALL_VDD" Value="0"]=]
+    "Virtual Display must remain explicit opt-in")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[[string]$InstallVirtualDisplay]=]
+    "Setup must accept MSI Virtual Display feature ownership")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[LumenVirtualDisplayInstallerV1]=]
+    "Virtual Display setup must persist rollback state before mutation")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[/export-driver]=]
+    "Virtual Display rollback must export the previous driver package")
+foreach(vdd_msi_contract IN ITEMS
+        [=['install-vdd']=]
+        [=[LUMEN_INSTALL_VDD=1]=]
+        [=[ROOT\LumenVirtualDisplay]=]
+        [=[LumenVirtualDisplay\.inf]=])
+    assert_file_contains_literal(
+        ".github/scripts/test-windows-msi.ps1"
+        "${vdd_msi_contract}"
+        "MSI validation must retain the Virtual Display contract ${vdd_msi_contract}")
+endforeach()
+assert_file_contains_literal(
+    "scripts/windows/build-full-profile.ps1"
+    [=[LUMEN_MSQUIC_SHIM_DLL_SHA256]=]
+    "The full-profile builder must pass the built MsQuic DLL pin")
+assert_file_contains_literal(
+    "scripts/windows/build-full-profile.ps1"
+    [=[SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR]=]
+    "The full-profile builder must pass the signed Virtual Display package root")
+assert_file_contains_literal(
+    "scripts/windows/build-full-profile.ps1"
+    [=[Expand-VerifiedFullProfileSource]=]
+    "The full-profile builder must compile from a verified extracted source freeze")
+assert_file_contains_literal(
+    "scripts/windows/build-full-profile.ps1"
+    [=[$SourceRoot = $sourceProvenance.SourceRoot]=]
+    "The full-profile builder must replace the mutable source root before compilation")
+foreach(full_profile_toolchain_contract IN ITEMS
+        [=[[string]$PythonPath]=]
+        [=[[string]$DotNetRoot]=]
+        [=[[string]$NodeRoot]=]
+        [=[export UV_PYTHON=]=]
+        [=[export DOTNET_ROOT=]=]
+        [=[sync --locked --no-python-downloads --no-install-project]=]
+        [=[-DBUILD_WERROR=ON]=]
+        [=[-DDOTNET_EXECUTABLE=]=]
+        [=[-DNPM=]=])
+    assert_file_contains_literal(
+        "scripts/windows/build-full-profile.ps1"
+        "${full_profile_toolchain_contract}"
+        "The full-profile builder must retain toolchain contract ${full_profile_toolchain_contract}")
+endforeach()
+foreach(full_profile_clean_boundary IN ITEMS
+        [=[Remove-Item -LiteralPath $freezeDirectory]=]
+        [=[Remove-Item -LiteralPath $PackageDirectory]=]
+        [=[Remove-Item -LiteralPath $shimOutput]=]
+        [=[Remove-Item -LiteralPath $buildRoot]=]
+        [=[Remove-Item -LiteralPath $artifacts]=])
+    assert_file_contains_literal(
+        "scripts/windows/build-full-profile.ps1"
+        "${full_profile_clean_boundary}"
+        "The full-profile builder must clean generated boundary ${full_profile_clean_boundary}")
+endforeach()
+foreach(full_profile_workflow_contract IN ITEMS
+        [=[steps.setup-python.outputs.python-path]=]
+        [=[-PythonPath $env:PYTHON_PATH]=]
+        [=[-DotNetRoot $env:DOTNET_ROOT]=]
+        [=[-NodeRoot $env:NODEJS_PATH]=])
+    assert_file_contains_literal(
+        ".github/workflows/ci-windows.yml"
+        "${full_profile_workflow_contract}"
+        "Windows CI must pass exact toolchain contract ${full_profile_workflow_contract}")
+endforeach()
+assert_file_contains_literal(
+    "scripts/windows/sign-full-profile-local-test.ps1"
+    [=[purpose = "local-test-only"]=]
+    "Local test signing must emit an explicit non-release marker")
 assert_file_contains(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
     "Target=\"\\[INSTALL_ROOT\\]Lumen.exe\""
@@ -272,7 +442,7 @@ assert_file_contains(
 assert_file_contains(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
     "Software\\\\simonfalke\\\\Lumen"
-    "Installer registry keys must use the canonical publisher identity")
+    "Installer registry keys must use the expected publisher identity")
 assert_file_excludes(
     "tools/sunshinesvc.cpp"
     "Sunshine.exe"

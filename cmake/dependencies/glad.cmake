@@ -5,7 +5,7 @@
 include_guard(GLOBAL)
 
 # glad's generator requires jinja2 at build time.  The Python interpreter must be
-# discovered HERE — before add_subdirectory() — for two reasons:
+# discovered here, before add_subdirectory(), for two reasons:
 #
 #  1. glad's cmake/CMakeLists.txt calls find_package(PythonInterp) (the legacy
 #     CMP0148 API, which reads the PYTHON_EXECUTABLE cache variable).  Whatever

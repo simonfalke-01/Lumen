@@ -1,7 +1,7 @@
 @echo off
 
 rem Get Lumen root directory. sunshine.conf is accepted only as a legacy
-rem compatibility input and is moved to the canonical lumen.conf name.
+rem compatibility input and is moved to the authoritative lumen.conf name.
 for %%I in ("%~dp0\..") do set "OLD_DIR=%%~fI"
 
 rem Create the config directory if it didn't already exist

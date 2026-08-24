@@ -36,6 +36,24 @@ endif()
 target_compile_options(sunshine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SUNSHINE_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
 target_link_options(sunshine PRIVATE ${SUNSHINE_LINK_OPTIONS})
 
+if(WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC)
+    add_custom_command(TARGET sunshine POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LUMEN_MSQUIC_SHIM_RUNTIME}" "$<TARGET_FILE_DIR:sunshine>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LUMEN_MSQUIC_RUNTIME}" "$<TARGET_FILE_DIR:sunshine>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LUMEN_MSQUIC_LICENSE}" "$<TARGET_FILE_DIR:sunshine>/MsQuic-LICENSE.txt"
+            VERBATIM)
+    install(FILES
+            "${LUMEN_MSQUIC_SHIM_RUNTIME}"
+            "${LUMEN_MSQUIC_RUNTIME}"
+            DESTINATION .)
+    install(FILES "${LUMEN_MSQUIC_LICENSE}"
+            DESTINATION .
+            RENAME MsQuic-LICENSE.txt)
+endif()
+
 # Homebrew build fails the vite build if we set these environment variables
 if(${SUNSHINE_BUILD_HOMEBREW})
     set(NPM_SOURCE_ASSETS_DIR "")

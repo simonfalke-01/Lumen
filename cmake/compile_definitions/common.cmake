@@ -137,6 +137,14 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/main.h"
         "${CMAKE_SOURCE_DIR}/src/crypto.cpp"
         "${CMAKE_SOURCE_DIR}/src/crypto.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_common/cbor.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_common/cbor.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_common/crypto.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_common/crypto.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_common/input_state.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_common/input_state.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_common/secure_buffer.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_common/status.h"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.cpp"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.h"
         "${CMAKE_SOURCE_DIR}/src/httpcommon.cpp"
@@ -147,8 +155,14 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/rtsp.h"
         "${CMAKE_SOURCE_DIR}/src/stream.cpp"
         "${CMAKE_SOURCE_DIR}/src/stream.h"
+        "${CMAKE_SOURCE_DIR}/src/video_packetizer.cpp"
+        "${CMAKE_SOURCE_DIR}/src/video_packetizer.h"
+        "${CMAKE_SOURCE_DIR}/src/stream_policy.cpp"
+        "${CMAKE_SOURCE_DIR}/src/stream_policy.h"
         "${CMAKE_SOURCE_DIR}/src/video.cpp"
         "${CMAKE_SOURCE_DIR}/src/video.h"
+        "${CMAKE_SOURCE_DIR}/src/video_egress_queue.cpp"
+        "${CMAKE_SOURCE_DIR}/src/video_egress_queue.h"
         "${CMAKE_SOURCE_DIR}/src/video_colorspace.cpp"
         "${CMAKE_SOURCE_DIR}/src/video_colorspace.h"
         "${CMAKE_SOURCE_DIR}/src/input.cpp"
@@ -175,6 +189,24 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
         ${PLATFORM_TARGET_FILES})
+
+if(WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC)
+    list(APPEND SUNSHINE_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.cpp"
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.h"
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.cpp"
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.h"
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.cpp"
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.h"
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.cpp"
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h")
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES Lumen::MsQuicShim)
+    list(APPEND SUNSHINE_DEFINITIONS
+            LUMEN_EXPERIMENTAL_MSQUIC=1
+            LUMEN_PROTOCOL_V3_DEFAULT_ENABLED=1)
+else()
+    list(APPEND SUNSHINE_DEFINITIONS LUMEN_PROTOCOL_V3_DEFAULT_ENABLED=0)
+endif()
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)
     set(SUNSHINE_ASSETS_DIR_DEF "${SUNSHINE_ASSETS_DIR}")
