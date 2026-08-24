@@ -130,11 +130,25 @@ namespace platf::virtual_display {
     }
   };
 
+  /** @brief Exact adapter and driver identity frozen from one successful encoder probe. */
+  struct render_adapter_identity_t {
+    std::uint64_t adapter_luid {};  ///< Packed DXGI adapter LUID.
+    std::uint32_t vendor_id {};  ///< PCI vendor identifier.
+    std::uint32_t device_id {};  ///< PCI device identifier.
+    std::uint32_t subsystem_id {};  ///< PCI subsystem identifier.
+    std::uint32_t revision {};  ///< PCI revision.
+    std::uint64_t driver_version {};  ///< DXGI UMD driver version.
+
+    bool operator==(const render_adapter_identity_t &) const = default;
+  };
+
   /** @brief Exact mode returned after the driver exposes it. */
   struct prepared_mode_t {
     mode_t mode;  ///< Exact mode exposed to Windows.
     std::string connector_id;  ///< Stable driver connector identifier.
     fidelity_e fidelity {fidelity_e::lossless};  ///< Actual driver fidelity.
+    std::uint64_t preferred_render_adapter_luid {};  ///< Exact encoder adapter requested through IddCx.
+    bool render_adapter_preference_submitted {};  ///< Whether the runtime preference API was available and called.
   };
 
   /** @brief Driver generation and ownership state used for crash recovery. */
@@ -144,6 +158,9 @@ namespace platf::virtual_display {
     bool monitor_started {};  ///< Whether the connector is currently present.
     mode_t mode;  ///< Current mode when active.
     std::uint64_t last_generation {};  ///< Highest generation admitted since driver start.
+    std::uint64_t preferred_render_adapter_luid {};  ///< Exact adapter requested for the active generation.
+    std::uint64_t assigned_render_adapter_luid {};  ///< Actual adapter observed in the latest swap-chain assignment.
+    bool render_adapter_preference_submitted {};  ///< Whether the IddCx preference API was called.
   };
 
   /** @brief Injectable generation-fenced VDD control channel. */
@@ -159,6 +176,7 @@ namespace platf::virtual_display {
       const mode_t &mode,
       delivery_policy_e delivery_policy,
       fidelity_e minimum_fidelity,
+      std::uint64_t preferred_render_adapter_luid,
       prepared_mode_t &prepared
     ) = 0;  ///< Expose an exact mode and shared-surface policy.
     virtual channel_result_t start_monitor(std::uint64_t generation) = 0;  ///< Make the connector present.
@@ -166,10 +184,95 @@ namespace platf::virtual_display {
     virtual void close() noexcept = 0;  ///< Close the interface.
   };
 
+  /** @brief Target-scoped Advanced Color state observed through DisplayConfig. */
+  enum class advanced_color_state_e {
+    api_unavailable,  ///< Downlevel OS does not implement the documented query.
+    unsupported,  ///< Target cannot enter Advanced Color mode.
+    disabled,  ///< Target supports Advanced Color and it is disabled.
+    enabled,  ///< Target supports Advanced Color and it is enabled.
+  };
+
+  /** @brief Exact target identity and its pre-transaction Advanced Color state. */
+  struct target_advanced_color_t {
+    std::uint64_t adapter_luid {};  ///< Packed DisplayConfig target adapter LUID.
+    std::uint32_t target_id {};  ///< DisplayConfig target identifier on that adapter.
+    advanced_color_state_e state {advanced_color_state_e::api_unavailable};  ///< Saved state.
+  };
+
+  /** @brief Portable DisplayConfig path facts used to select snapshot color targets. */
+  struct advanced_color_path_t {
+    std::uint64_t adapter_luid {};  ///< Packed target adapter LUID.
+    std::uint32_t target_id {};  ///< Target identifier on that adapter.
+    bool active {};  ///< Path carries `DISPLAYCONFIG_PATH_ACTIVE`.
+    bool target_available {};  ///< Target is currently available to DisplayConfig.
+  };
+
+  /** Select only unique active, available targets for Advanced Color snapshotting. */
+  [[nodiscard]] std::vector<advanced_color_path_t> active_advanced_color_targets(
+    std::span<const advanced_color_path_t> paths
+  );
+
+  /** @brief Required target-scoped action for one SDR or HDR10 commit. */
+  enum class advanced_color_action_e {
+    none,  ///< Downlevel or unsupported SDR target needs no mutation.
+    enable,  ///< Explicitly enable Advanced Color for HDR10.
+    disable,  ///< Explicitly disable Advanced Color for SDR.
+    reject,  ///< HDR10 cannot be proven on this target.
+  };
+
+  /** Return the documented Advanced Color action for an exact mode and observed target state. */
+  [[nodiscard]] constexpr advanced_color_action_e advanced_color_action(
+    const dynamic_range_e dynamic_range,
+    const advanced_color_state_e state
+  ) noexcept {
+    if (dynamic_range == dynamic_range_e::hdr10) {
+      return state == advanced_color_state_e::enabled ?
+               advanced_color_action_e::none :
+             state == advanced_color_state_e::disabled ?
+               advanced_color_action_e::enable :
+               advanced_color_action_e::reject;
+    }
+    return state == advanced_color_state_e::enabled ? advanced_color_action_e::disable : advanced_color_action_e::none;
+  }
+
+  /** Return whether a settled target exactly satisfies the requested SDR/HDR10 state. */
+  [[nodiscard]] constexpr bool advanced_color_matches(
+    const dynamic_range_e dynamic_range,
+    const advanced_color_state_e state
+  ) noexcept {
+    return dynamic_range == dynamic_range_e::hdr10 ?
+             state == advanced_color_state_e::enabled :
+             state != advanced_color_state_e::enabled;
+  }
+
+  /**
+   * @brief Attempt every saved mutable target and aggregate restoration success.
+   * @tparam RestoreTarget Callable `(target, enabled) -> bool` that applies and verifies one target.
+   */
+  template<typename RestoreTarget>
+  [[nodiscard]] bool restore_all_advanced_color_states(
+    const std::span<const target_advanced_color_t> targets,
+    RestoreTarget restore_target
+  ) {
+    bool restored = true;
+    for (const auto &target : targets) {
+      if (target.state == advanced_color_state_e::api_unavailable ||
+          target.state == advanced_color_state_e::unsupported) {
+        continue;
+      }
+      const bool enabled = target.state == advanced_color_state_e::enabled;
+      if (!restore_target(target, enabled)) {
+        restored = false;
+      }
+    }
+    return restored;
+  }
+
   /** @brief Opaque DisplayConfig snapshot. */
   struct display_snapshot_t {
     std::vector<std::byte> paths;  ///< Platform-owned serialized paths.
     std::vector<std::byte> modes;  ///< Platform-owned serialized modes.
+    std::vector<target_advanced_color_t> advanced_color;  ///< Per-target pre-transaction color state.
   };
 
   /** @brief Exact output selected by the transactional DisplayConfig backend. */
@@ -194,6 +297,7 @@ namespace platf::virtual_display {
     mode_t mode;  ///< Exact client-requested mode.
     delivery_policy_e delivery_policy {delivery_policy_e::latency};  ///< Shared-surface delivery policy.
     fidelity_e minimum_fidelity {fidelity_e::lossless};  ///< Minimum accepted fidelity.
+    std::optional<render_adapter_identity_t> render_adapter;  ///< Exact identity frozen from the active encoder probe.
   };
 
   /** @brief Adapt vanilla GameStream width/height/integer FPS without changing its wire protocol. */
@@ -223,7 +327,12 @@ namespace platf::virtual_display {
     delivery_policy_e delivery_policy {delivery_policy_e::latency};  ///< Applied delivery policy.
     fidelity_e fidelity {fidelity_e::lossless};  ///< Applied fidelity.
     bool adjusted {};  ///< Explicit indication that selected differs from requested.
+    std::optional<render_adapter_identity_t> render_adapter;  ///< Frozen encoder/render adapter identity.
+    bool render_adapter_preference_submitted {};  ///< Whether IddCx received the preference before monitor arrival.
   };
+
+  /** @brief Return whether a frozen adapter identity is usable at the VDD trust boundary. */
+  [[nodiscard]] bool valid_render_adapter_identity(const render_adapter_identity_t &identity) noexcept;
 
   /** @brief Stable transactional start result. */
   enum class start_error_e {

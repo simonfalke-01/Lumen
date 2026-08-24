@@ -13,16 +13,19 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #ifdef _WIN32
   #include <Windows.h>
   #include <initguid.h>
   #include <cfgmgr32.h>
+  #include <devpkey.h>
   #include <SetupAPI.h>
 
   #include "virtual_display_driver/LumenVirtualDisplayProtocol.h"
   #include "virtual_display_driver/LumenVirtualDisplayGuids.h"
+  #include "src/video.h"
 
   #include <memory>
 #endif
@@ -48,6 +51,92 @@ namespace platf::virtual_display {
     bool active_driver_state(const driver_state_t &state) noexcept {
       return state.generation != 0 || state.owner_process_id != 0 || state.monitor_started;
     }
+
+#ifdef _WIN32
+    /** @brief Pack a DisplayConfig adapter LUID without changing its signed high bits. */
+    std::uint64_t pack_display_luid(const LUID &luid) noexcept {
+      return static_cast<std::uint64_t>(static_cast<std::uint32_t>(luid.HighPart)) << 32U |
+             static_cast<std::uint64_t>(luid.LowPart);
+    }
+
+    /** @brief Restore a DisplayConfig adapter LUID from its snapshot representation. */
+    LUID unpack_display_luid(const std::uint64_t packed) noexcept {
+      return {
+        static_cast<DWORD>(packed),
+        static_cast<LONG>(static_cast<std::uint32_t>(packed >> 32U)),
+      };
+    }
+
+    /** @brief Query one exact target's documented Advanced Color state. */
+    std::optional<advanced_color_state_e> query_advanced_color_state(
+      const LUID adapter_id,
+      const std::uint32_t target_id
+    ) noexcept {
+      DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO info {};
+      info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+      info.header.size = sizeof(info);
+      info.header.adapterId = adapter_id;
+      info.header.id = target_id;
+      const auto status = DisplayConfigGetDeviceInfo(&info.header);
+      if (status == ERROR_NOT_SUPPORTED) {
+        return advanced_color_state_e::api_unavailable;
+      }
+      if (status != ERROR_SUCCESS) {
+        return std::nullopt;
+      }
+      if (!info.advancedColorSupported || info.advancedColorForceDisabled) {
+        return advanced_color_state_e::unsupported;
+      }
+      return info.advancedColorEnabled ?
+               advanced_color_state_e::enabled :
+               advanced_color_state_e::disabled;
+    }
+
+    /** @brief Apply one documented target-scoped Advanced Color state. */
+    bool set_advanced_color_state(
+      const LUID adapter_id,
+      const std::uint32_t target_id,
+      const bool enabled
+    ) noexcept {
+      DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE state {};
+      state.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+      state.header.size = sizeof(state);
+      state.header.adapterId = adapter_id;
+      state.header.id = target_id;
+      state.enableAdvancedColor = enabled ? 1U : 0U;
+      return DisplayConfigSetDeviceInfo(&state.header) == ERROR_SUCCESS;
+    }
+
+    /** @brief Match one DisplayConfig monitor interface to its stable PnP container identity. */
+    bool monitor_interface_has_container_id(const std::wstring &path, const GUID &expected) noexcept {
+      constexpr std::wstring_view device_path_prefix {L"\\\\?\\"};
+      if (!path.starts_with(device_path_prefix)) {
+        return false;
+      }
+      const auto class_suffix = path.rfind(L"#{");
+      if (class_suffix == std::wstring::npos || class_suffix <= device_path_prefix.size()) {
+        return false;
+      }
+      std::wstring instance_id = path.substr(device_path_prefix.size(), class_suffix - device_path_prefix.size());
+      std::ranges::replace(instance_id, L'#', L'\\');
+      DEVINST device = 0;
+      if (CM_Locate_DevNodeW(&device, instance_id.data(), CM_LOCATE_DEVNODE_PHANTOM) != CR_SUCCESS) {
+        return false;
+      }
+      GUID observed {};
+      DEVPROPTYPE property_type = 0;
+      ULONG size = sizeof(observed);
+      return CM_Get_DevNode_PropertyW(
+               device,
+               &DEVPKEY_Device_ContainerId,
+               &property_type,
+               reinterpret_cast<PBYTE>(&observed),
+               &size,
+               0
+             ) == CR_SUCCESS &&
+             property_type == DEVPROP_TYPE_GUID && size == sizeof(observed) && IsEqualGUID(observed, expected);
+    }
+#endif
   }  // namespace
 
   std::optional<std::size_t> unique_matching_index(
@@ -64,6 +153,30 @@ namespace platf::virtual_display {
       selected = index;
     }
     return selected;
+  }
+
+  std::vector<advanced_color_path_t> active_advanced_color_targets(
+    const std::span<const advanced_color_path_t> paths
+  ) {
+    std::vector<advanced_color_path_t> selected;
+    selected.reserve(paths.size());
+    for (const auto &path : paths) {
+      if (!path.active || !path.target_available) {
+        continue;
+      }
+      const auto duplicate = std::ranges::find_if(selected, [&](const auto &existing) {
+        return existing.adapter_luid == path.adapter_luid && existing.target_id == path.target_id;
+      });
+      if (duplicate == selected.end()) {
+        selected.push_back(path);
+      }
+    }
+    return selected;
+  }
+
+  bool valid_render_adapter_identity(const render_adapter_identity_t &identity) noexcept {
+    return identity.adapter_luid != 0 && identity.vendor_id != 0 && identity.device_id != 0 &&
+           identity.driver_version != 0;
   }
 
   std::optional<rational_t> rational_t::normalized() const noexcept {
@@ -228,7 +341,8 @@ namespace platf::virtual_display {
       if (active_->selection.session_id == request.session_id &&
           active_->selection.requested_mode == request.mode &&
           active_->selection.delivery_policy == request.delivery_policy &&
-          active_->selection.fidelity == request.minimum_fidelity) {
+          active_->selection.fidelity == request.minimum_fidelity &&
+          active_->selection.render_adapter == request.render_adapter) {
         return {start_error_e::none, validation_error_e::none, active_->selection};
       }
       return {start_error_e::busy, validation_error_e::none, std::nullopt};
@@ -288,10 +402,19 @@ namespace platf::virtual_display {
     next_generation_ = generation == std::numeric_limits<std::uint64_t>::max() ? generation : generation + 1;
 
     prepared_mode_t prepared;
-    if (!channel_->prepare_mode(generation, request.mode, request.delivery_policy, request.minimum_fidelity, prepared)) {
+    const auto preferred_render_adapter_luid = request.render_adapter ? request.render_adapter->adapter_luid : 0;
+    if (!channel_->prepare_mode(
+          generation,
+          request.mode,
+          request.delivery_policy,
+          request.minimum_fidelity,
+          preferred_render_adapter_luid,
+          prepared
+        )) {
       return fail_transaction_locked(start_error_e::driver_prepare_failed, request.session_id, generation, std::move(snapshot));
     }
-    if (prepared.mode != request.mode || prepared.fidelity != request.minimum_fidelity) {
+    if (prepared.mode != request.mode || prepared.fidelity != request.minimum_fidelity ||
+        prepared.preferred_render_adapter_luid != preferred_render_adapter_luid) {
       return fail_transaction_locked(start_error_e::implicit_adjustment_rejected, request.session_id, generation, std::move(snapshot));
     }
     if (!channel_->start_monitor(generation)) {
@@ -318,6 +441,8 @@ namespace platf::virtual_display {
       request.delivery_policy,
       prepared.fidelity,
       committed.mode != request.mode,
+      request.render_adapter,
+      prepared.render_adapter_preference_submitted,
     };
     active_ = active_t {selection, std::move(snapshot)};
     return {start_error_e::none, validation_error_e::none, std::move(selection)};
@@ -833,9 +958,14 @@ namespace platf::virtual_display {
         if (!result) {
           return result;
         }
-        if (response.monitor_started > 1 || response.last_generation < response.generation ||
-            (response.generation == 0 && (response.owner_process_id != 0 || response.monitor_started != 0)) ||
-            (response.generation != 0 && response.owner_process_id == 0)) {
+        if (response.monitor_started > 1 || response.render_adapter_preference_submitted > 1 || response.reserved != 0 ||
+            response.last_generation < response.generation ||
+            (response.generation == 0 &&
+             (response.owner_process_id != 0 || response.monitor_started != 0 ||
+              response.preferred_render_adapter_luid != 0 || response.assigned_render_adapter_luid != 0 ||
+              response.render_adapter_preference_submitted != 0)) ||
+            (response.generation != 0 &&
+             (response.owner_process_id == 0 || response.preferred_render_adapter_luid == 0))) {
           return {false, ERROR_INVALID_DATA};
         }
         mode_t active_mode;
@@ -852,6 +982,9 @@ namespace platf::virtual_display {
           response.monitor_started != 0,
           active_mode,
           response.last_generation,
+          response.preferred_render_adapter_luid,
+          response.assigned_render_adapter_luid,
+          response.render_adapter_preference_submitted != 0,
         };
         return {};
       }
@@ -887,12 +1020,14 @@ namespace platf::virtual_display {
         const mode_t &mode,
         delivery_policy_e delivery_policy,
         fidelity_e minimum_fidelity,
+        const std::uint64_t preferred_render_adapter_luid,
         prepared_mode_t &prepared
       ) override {
         const LUMEN_VDD_PREPARE_MODE_REQUEST request {
           generation,
           GetCurrentProcessId(),
           0,
+          preferred_render_adapter_luid,
           to_abi(mode, delivery_policy, minimum_fidelity),
         };
         LUMEN_VDD_PREPARE_MODE_RESPONSE response {};
@@ -909,7 +1044,9 @@ namespace platf::virtual_display {
         const auto expected_fidelity = minimum_fidelity == fidelity_e::lossless ?
                                          LUMEN_VDD_FIDELITY_LOSSLESS :
                                          LUMEN_VDD_FIDELITY_VISUALLY_LOSSLESS;
-        if (!converted || !valid_reserved || response.mode.delivery_policy != expected_policy ||
+        if (!converted || !valid_reserved || response.render_adapter_preference_submitted > 1 ||
+            response.preferred_render_adapter_luid != preferred_render_adapter_luid ||
+            response.mode.delivery_policy != expected_policy ||
             response.mode.minimum_fidelity != expected_fidelity ||
             (response.fidelity != LUMEN_VDD_FIDELITY_LOSSLESS &&
              response.fidelity != LUMEN_VDD_FIDELITY_VISUALLY_LOSSLESS) ||
@@ -920,6 +1057,8 @@ namespace platf::virtual_display {
           *converted,
           std::string(response.connector_id_utf8, terminator),
           response.fidelity == LUMEN_VDD_FIDELITY_VISUALLY_LOSSLESS ? fidelity_e::visually_lossless : fidelity_e::lossless,
+          response.preferred_render_adapter_luid,
+          response.render_adapter_preference_submitted != 0,
         };
         return {};
       }
@@ -971,6 +1110,25 @@ namespace platf::virtual_display {
         if (!modes.empty()) {
           std::memcpy(snapshot.modes.data(), modes.data(), snapshot.modes.size());
         }
+        snapshot.advanced_color.clear();
+        std::vector<advanced_color_path_t> color_paths;
+        color_paths.reserve(paths.size());
+        for (const auto &path : paths) {
+          color_paths.push_back({
+            pack_display_luid(path.targetInfo.adapterId),
+            path.targetInfo.id,
+            (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0,
+            path.targetInfo.targetAvailable != FALSE,
+          });
+        }
+        for (const auto &target : active_advanced_color_targets(color_paths)) {
+          const auto adapter_id = unpack_display_luid(target.adapter_luid);
+          const auto state = query_advanced_color_state(adapter_id, target.target_id);
+          if (!state) {
+            return false;
+          }
+          snapshot.advanced_color.push_back({target.adapter_luid, target.target_id, *state});
+        }
         return true;
       }
 
@@ -981,6 +1139,9 @@ namespace platf::virtual_display {
           return false;
         }
         const auto matches_connector = [&connector_id](const DISPLAYCONFIG_PATH_INFO &path) {
+          if (connector_id != "LUM0001") {
+            return false;
+          }
           DISPLAYCONFIG_TARGET_DEVICE_NAME target {};
           target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
           target.header.size = sizeof(target);
@@ -989,90 +1150,124 @@ namespace platf::virtual_display {
           if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) {
             return false;
           }
-          const std::wstring target_path {target.monitorDevicePath};
-          const std::string narrow(target_path.begin(), target_path.end());
-          const std::string connector_token = "#" + connector_id + "#";
-          return !narrow.empty() && narrow.find(connector_token) != std::string::npos;
+          return monitor_interface_has_container_id(
+            target.monitorDevicePath,
+            GUID_CONTAINERID_LUMEN_VIRTUAL_DISPLAY_MONITOR
+          );
         };
         std::vector<std::uint8_t> connector_matches;
         connector_matches.reserve(paths.size());
         for (const auto &path : paths) {
           connector_matches.push_back(matches_connector(path) ? 1U : 0U);
         }
-        if (!unique_matching_index(connector_matches)) {
+        const auto connector_index = unique_matching_index(connector_matches);
+        if (!connector_index) {
           return false;
         }
-        for (auto &path : paths) {
-          if (!matches_connector(path)) {
-            continue;
-          }
-
-          path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
-          path.targetInfo.refreshRate.Numerator = mode.refresh.numerator;
-          path.targetInfo.refreshRate.Denominator = mode.refresh.denominator;
-          path.targetInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-          path.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-          path.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-
-          DISPLAYCONFIG_MODE_INFO source_mode {};
-          source_mode.infoType = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
-          source_mode.id = path.sourceInfo.id;
-          source_mode.adapterId = path.sourceInfo.adapterId;
-          source_mode.sourceMode.width = mode.width;
-          source_mode.sourceMode.height = mode.height;
-          source_mode.sourceMode.pixelFormat = DISPLAYCONFIG_PIXELFORMAT_32BPP;
-          source_mode.sourceMode.position = {0, 0};
-          path.sourceInfo.modeInfoIdx = static_cast<UINT32>(modes.size());
-          modes.push_back(source_mode);
-
-          DISPLAYCONFIG_MODE_INFO target_mode {};
-          target_mode.infoType = DISPLAYCONFIG_MODE_INFO_TYPE_TARGET;
-          target_mode.id = path.targetInfo.id;
-          target_mode.adapterId = path.targetInfo.adapterId;
-          target_mode.targetMode.targetVideoSignalInfo.activeSize = {mode.width, mode.height};
-          target_mode.targetMode.targetVideoSignalInfo.totalSize = {mode.width, mode.height};
-          target_mode.targetMode.targetVideoSignalInfo.vSyncFreq = {mode.refresh.numerator, mode.refresh.denominator};
-          const auto scan_lines_per_second =
-            (static_cast<std::uint64_t>(mode.refresh.numerator) * mode.height + mode.refresh.denominator / 2U) /
-            mode.refresh.denominator;
-          target_mode.targetMode.targetVideoSignalInfo.hSyncFreq = {
-            static_cast<UINT32>(scan_lines_per_second),
-            1,
-          };
-          target_mode.targetMode.targetVideoSignalInfo.pixelRate =
-            (static_cast<UINT64>(mode.width) * mode.height * mode.refresh.numerator + mode.refresh.denominator / 2U) /
-            mode.refresh.denominator;
-          target_mode.targetMode.targetVideoSignalInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-          target_mode.targetMode.targetVideoSignalInfo.AdditionalSignalInfo.videoStandard = 255;
-          target_mode.targetMode.targetVideoSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 1;
-          path.targetInfo.modeInfoIdx = static_cast<UINT32>(modes.size());
-          modes.push_back(target_mode);
-
-          if (SetDisplayConfig(
-                static_cast<UINT32>(paths.size()),
-                paths.data(),
-                static_cast<UINT32>(modes.size()),
-                modes.data(),
-                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES
-              ) != ERROR_SUCCESS) {
-            return false;
-          }
-          DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
-          source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-          source.header.size = sizeof(source);
-          source.header.adapterId = path.sourceInfo.adapterId;
-          source.header.id = path.sourceInfo.id;
-          if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) {
-            return false;
-          }
-          const std::wstring capture {source.viewGdiDeviceName};
-          if (capture.empty()) {
-            return false;
-          }
-          applied = {mode, std::string(capture.begin(), capture.end())};
-          return true;
+        std::vector<DISPLAYCONFIG_PATH_INFO> configured_paths;
+        std::vector<DISPLAYCONFIG_MODE_INFO> configured_modes;
+        if (!query(QDC_ONLY_ACTIVE_PATHS, configured_paths, configured_modes)) {
+          return false;
         }
-        return false;
+        auto path = paths[*connector_index];
+        path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+        path.targetInfo.refreshRate = {mode.refresh.numerator, mode.refresh.denominator};
+        path.targetInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+        path.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        path.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+
+        LONG right_edge = 0;
+        for (const auto &active_path : configured_paths) {
+          if (active_path.sourceInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID &&
+              active_path.sourceInfo.modeInfoIdx < configured_modes.size()) {
+            const auto &active_mode = configured_modes[active_path.sourceInfo.modeInfoIdx];
+            if (active_mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+              right_edge = std::max(
+                right_edge,
+                active_mode.sourceMode.position.x + static_cast<LONG>(active_mode.sourceMode.width)
+              );
+            }
+          }
+        }
+
+        DISPLAYCONFIG_MODE_INFO source_mode {};
+        source_mode.infoType = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
+        source_mode.id = path.sourceInfo.id;
+        source_mode.adapterId = path.sourceInfo.adapterId;
+        source_mode.sourceMode.width = mode.width;
+        source_mode.sourceMode.height = mode.height;
+        source_mode.sourceMode.pixelFormat = DISPLAYCONFIG_PIXELFORMAT_32BPP;
+        source_mode.sourceMode.position = {right_edge, 0};
+        path.sourceInfo.modeInfoIdx = static_cast<UINT32>(configured_modes.size());
+        configured_modes.push_back(source_mode);
+
+        DISPLAYCONFIG_MODE_INFO target_mode {};
+        target_mode.infoType = DISPLAYCONFIG_MODE_INFO_TYPE_TARGET;
+        target_mode.id = path.targetInfo.id;
+        target_mode.adapterId = path.targetInfo.adapterId;
+        target_mode.targetMode.targetVideoSignalInfo.activeSize = {mode.width, mode.height};
+        target_mode.targetMode.targetVideoSignalInfo.totalSize = {mode.width, mode.height};
+        target_mode.targetMode.targetVideoSignalInfo.vSyncFreq = {mode.refresh.numerator, mode.refresh.denominator};
+        const auto scan_lines_per_second =
+          (static_cast<std::uint64_t>(mode.refresh.numerator) * mode.height + mode.refresh.denominator / 2U) /
+          mode.refresh.denominator;
+        target_mode.targetMode.targetVideoSignalInfo.hSyncFreq = {
+          static_cast<UINT32>(scan_lines_per_second),
+          1,
+        };
+        target_mode.targetMode.targetVideoSignalInfo.pixelRate =
+          (static_cast<UINT64>(mode.width) * mode.height * mode.refresh.numerator + mode.refresh.denominator / 2U) /
+          mode.refresh.denominator;
+        target_mode.targetMode.targetVideoSignalInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+        target_mode.targetMode.targetVideoSignalInfo.AdditionalSignalInfo.videoStandard = 255;
+        target_mode.targetMode.targetVideoSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 1;
+        path.targetInfo.modeInfoIdx = static_cast<UINT32>(configured_modes.size());
+        configured_modes.push_back(target_mode);
+        configured_paths.push_back(path);
+
+        if (SetDisplayConfig(
+              static_cast<UINT32>(configured_paths.size()),
+              configured_paths.data(),
+              static_cast<UINT32>(configured_modes.size()),
+              configured_modes.data(),
+              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES
+            ) != ERROR_SUCCESS) {
+          return false;
+        }
+        const auto observed_color = query_advanced_color_state(path.targetInfo.adapterId, path.targetInfo.id);
+        if (!observed_color) {
+          return false;
+        }
+        switch (advanced_color_action(mode.dynamic_range, *observed_color)) {
+          case advanced_color_action_e::enable:
+            if (!set_advanced_color_state(path.targetInfo.adapterId, path.targetInfo.id, true)) {
+              return false;
+            }
+            break;
+          case advanced_color_action_e::disable:
+            if (!set_advanced_color_state(path.targetInfo.adapterId, path.targetInfo.id, false)) {
+              return false;
+            }
+            break;
+          case advanced_color_action_e::none:
+            break;
+          case advanced_color_action_e::reject:
+            return false;
+        }
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = path.sourceInfo.adapterId;
+        source.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) {
+          return false;
+        }
+        const std::wstring capture {source.viewGdiDeviceName};
+        if (capture.empty()) {
+          return false;
+        }
+        applied = {mode, std::string(capture.begin(), capture.end())};
+        return true;
       }
 
       bool await_stable(const std::string &capture_name, const mode_t &mode, std::chrono::milliseconds timeout) override {
@@ -1107,7 +1302,10 @@ namespace platf::virtual_display {
               };
               if (signal.activeSize.cx == mode.width && signal.activeSize.cy == mode.height &&
                   observed_refresh.normalized() == mode.refresh) {
-                return true;
+                const auto color = query_advanced_color_state(path.targetInfo.adapterId, path.targetInfo.id);
+                if (color && advanced_color_matches(mode.dynamic_range, *color)) {
+                  return true;
+                }
               }
             }
           }
@@ -1125,13 +1323,30 @@ namespace platf::virtual_display {
         const auto mode_count = static_cast<UINT32>(snapshot.modes.size() / sizeof(DISPLAYCONFIG_MODE_INFO));
         auto *paths = reinterpret_cast<DISPLAYCONFIG_PATH_INFO *>(const_cast<std::byte *>(snapshot.paths.data()));
         auto *modes = reinterpret_cast<DISPLAYCONFIG_MODE_INFO *>(const_cast<std::byte *>(snapshot.modes.data()));
-        return SetDisplayConfig(
-                 path_count,
-                 paths,
-                 mode_count,
-                 modes,
-                 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-               ) == ERROR_SUCCESS;
+        if (SetDisplayConfig(
+              path_count,
+              paths,
+              mode_count,
+              modes,
+              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+            ) != ERROR_SUCCESS) {
+          return false;
+        }
+        return restore_all_advanced_color_states(snapshot.advanced_color, [&](const auto &saved, const bool enabled) {
+          const auto adapter_id = unpack_display_luid(saved.adapter_luid);
+          const auto before = query_advanced_color_state(adapter_id, saved.target_id);
+          if (!before) {
+            return false;
+          }
+          if (*before == saved.state) {
+            return true;
+          }
+          if (!set_advanced_color_state(adapter_id, saved.target_id, enabled)) {
+            return false;
+          }
+          const auto observed = query_advanced_color_state(adapter_id, saved.target_id);
+          return observed && *observed == saved.state;
+        });
       }
 
     private:
@@ -1223,7 +1438,26 @@ namespace platf::virtual_display {
     class system_activation_backend_t final: public activation_backend_t {
     public:
       start_result_t start(const stream_request_t &request, const mode_limits_t &limits) override {
-        auto activated = activate_system_stream(request, limits);
+        auto bound_request = request;
+#ifdef _WIN32
+        const auto probe = ::video::active_encoder_probe_device_identity();
+        if (!probe) {
+          return {start_error_e::driver_unavailable, validation_error_e::none, std::nullopt};
+        }
+        const render_adapter_identity_t identity {
+          probe->adapter_luid,
+          probe->vendor_id,
+          probe->device_id,
+          probe->subsystem_id,
+          probe->revision,
+          probe->driver_version,
+        };
+        if (!valid_render_adapter_identity(identity)) {
+          return {start_error_e::driver_unavailable, validation_error_e::none, std::nullopt};
+        }
+        bound_request.render_adapter = identity;
+#endif
+        auto activated = activate_system_stream(bound_request, limits);
         if (activated.outcome != system_activation_e::active || !activated.selection) {
           return {activated.diagnostic, validation_error_e::none, std::nullopt};
         }

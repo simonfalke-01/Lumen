@@ -2,7 +2,6 @@
  * @file src/platform/windows/virtual_display_driver/Driver.cpp
  * @brief Lumen UMDF2 IddCx virtual display driver.
  */
-#include "LumenEdidModePolicy.h"
 #include "LumenDirectFrameSlotPolicy.h"
 #include "LumenSingleDeleteOwner.h"
 #include "LumenVirtualDisplayProtocol.h"
@@ -29,9 +28,6 @@
 #pragma warning(disable : 4471)
 // clang-format off: IddCx requires WDF declarations first.
 #include <wdf.h>
-#if UMDF_VERSION_MINOR < 25
-typedef size_t *WDF_STRUCT_INFO;  ///< IddCx header metadata type omitted by UMDF 2.23 headers.
-#endif
 #include <iddcx.h>
 // clang-format on
 #pragma warning(pop)
@@ -48,154 +44,9 @@ namespace {
   constexpr WCHAR endpoint_model[] = L"Lumen Virtual Display";
   constexpr WCHAR endpoint_manufacturer[] = L"Lumen";
   constexpr char connector_id[] = "LUM0001";
-
-  // One descriptor identity only; timing is supplied dynamically by the
-  // default-mode and target-mode callbacks. The final byte makes the EDID sum
-  // zero modulo 256.
-  constexpr std::array<BYTE, 128> monitor_edid {
-    0x00,
-    0xFF,
-    0xFF,
-    0xFF,
-    0xFF,
-    0xFF,
-    0xFF,
-    0x00,
-    0x32,
-    0xAD,
-    0x01,
-    0x00,
-    0x01,
-    0x00,
-    0x00,
-    0x00,
-    0x01,
-    0x22,
-    0x01,
-    0x04,
-    0xA5,
-    0x34,
-    0x20,
-    0x78,
-    0x0A,
-    0x00,
-    0x00,
-    0xA0,
-    0x57,
-    0x49,
-    0x9B,
-    0x26,
-    0x10,
-    0x48,
-    0x4C,
-    0x00,
-    0x00,
-    0x00,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x01,
-    0x00,
-    0x00,
-    0x00,
-    0xFC,
-    0x00,
-    0x4C,
-    0x75,
-    0x6D,
-    0x65,
-    0x6E,
-    0x20,
-    0x56,
-    0x44,
-    0x44,
-    0x0A,
-    0x20,
-    0x20,
-    0x20,
-    0x00,
-    0x00,
-    0x00,
-    0xFF,
-    0x00,
-    0x4C,
-    0x55,
-    0x4D,
-    0x30,
-    0x30,
-    0x30,
-    0x31,
-    0x0A,
-    0x20,
-    0x20,
-    0x20,
-    0x20,
-    0x20,
-    0x00,
-    0x00,
-    0x00,
-    0x10,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x10,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0x00,
-    0xF0,
-  };
-
-  constexpr bool valid_edid_checksum() noexcept {
-    unsigned int sum = 0;
-    for (const auto byte : monitor_edid) {
-      sum += byte;
-    }
-    return (sum & 0xFFU) == 0;
-  }
-
-  static_assert(valid_edid_checksum(), "Lumen VDD EDID checksum must be valid");
-  static_assert(
-    lumen::vdd::edid::detailed_timing_count(monitor_edid) == 0,
-    "Identity-only EDID must not advertise descriptor timing modes"
-  );
+  std::uint64_t pack_luid(LUID luid) noexcept;
+  LUID unpack_luid(std::uint64_t packed) noexcept;
+  std::uint64_t current_process_creation_time() noexcept;
 
   struct device_state_t;
 
@@ -269,6 +120,7 @@ namespace {
     frame_slot_t &operator=(const frame_slot_t &) = delete;
 
     ComPtr<ID3D11Texture2D> texture;  ///< Driver-owned shareable copy destination.
+    ComPtr<IDXGIKeyedMutex> keyed_mutex;  ///< Explicit producer/consumer CPU ownership handoff.
     ComPtr<ID3D11Fence> fence;  ///< Per-slot producer/consumer GPU timeline.
     HANDLE texture_handle {};  ///< Unnamed NT shared texture handle in the UMDF host.
     HANDLE fence_handle {};  ///< Unnamed NT shared fence handle in the UMDF host.
@@ -289,17 +141,20 @@ namespace {
       HANDLE frame_event,
       std::uint64_t generation,
       LUMEN_VDD_MODE mode,
-      HANDLE frame_ready_event
+      HANDLE frame_ready_event,
+      bool direct_frames_enabled
     ):
         swap_chain_(swap_chain),
         frame_event_(frame_event),
         generation_(generation),
         mode_(mode),
         frame_ready_event_(frame_ready_event),
-        stop_event_(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
-        worker_([this, adapter_luid]() {
-          run(adapter_luid);
-        }) {}
+        stop_event_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {
+      direct_enabled_.store(direct_frames_enabled, std::memory_order_relaxed);
+      worker_ = std::thread([this, adapter_luid]() {
+        run(adapter_luid);
+      });
+    }
 
     ~swap_chain_processor_t() {
       SetEvent(stop_event_.get());
@@ -311,119 +166,48 @@ namespace {
     swap_chain_processor_t(const swap_chain_processor_t &) = delete;
     swap_chain_processor_t &operator=(const swap_chain_processor_t &) = delete;
 
-    /** @brief Duplicate the exact persistent texture/fence pairs into the owner process. */
-    NTSTATUS open_frame_channel(
-      const std::uint32_t requestor_process_id,
-      LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response
-    ) noexcept {
+    /** @brief Publish exact raw unnamed texture/fence handles for authorized reverse duplication. */
+    NTSTATUS open_frame_channel(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response) noexcept {
       std::lock_guard lock(mutex_);
       if (!resources_ready_ || !direct_enabled_.load(std::memory_order_acquire)) {
         return direct_enabled_.load(std::memory_order_relaxed) ? STATUS_DEVICE_NOT_READY : STATUS_NOT_SUPPORTED;
       }
-      if (requestor_process_id == 0) {
-        return STATUS_ACCESS_DENIED;
-      }
-      HANDLE owner_process = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, requestor_process_id);
-      if (owner_process == nullptr) {
-        return GetLastError() == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
-      }
-      unique_handle_t close_owner_process(owner_process);
-
-      std::array<HANDLE, LUMEN_VDD_FRAME_SLOT_COUNT * 2> duplicated {};
-      std::size_t duplicated_count = 0;
-      auto close_failed_duplicates = [&]() {
-        for (std::size_t index = 0; index < duplicated_count; ++index) {
-          HANDLE local_duplicate = nullptr;
-          if (DuplicateHandle(
-                owner_process,
-                duplicated[index],
-                GetCurrentProcess(),
-                &local_duplicate,
-                0,
-                FALSE,
-                DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE
-              )) {
-            CloseHandle(local_duplicate);
-          }
-        }
-      };
-
-      for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
-        if (!DuplicateHandle(
-              GetCurrentProcess(),
-              slots_[slot].texture_handle,
-              owner_process,
-              &duplicated[duplicated_count],
-              0,
-              FALSE,
-              DUPLICATE_SAME_ACCESS
-            )) {
-          close_failed_duplicates();
-          return STATUS_ACCESS_DENIED;
-        }
-        ++duplicated_count;
-      }
-      for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
-        if (!DuplicateHandle(
-              GetCurrentProcess(),
-              slots_[slot].fence_handle,
-              owner_process,
-              &duplicated[duplicated_count],
-              0,
-              FALSE,
-              DUPLICATE_SAME_ACCESS
-            )) {
-          close_failed_duplicates();
-          return STATUS_ACCESS_DENIED;
-        }
-        ++duplicated_count;
+      const auto source_creation_time = current_process_creation_time();
+      if (source_creation_time == 0) {
+        return STATUS_UNSUCCESSFUL;
       }
 
       response = {};
       response.generation = generation_;
       response.adapter_luid = adapter_luid_;
+      response.source_process_id = GetCurrentProcessId();
+      response.source_process_creation_time = source_creation_time;
       response.width = mode_.width;
       response.height = mode_.height;
       response.texture_format = LUMEN_VDD_FRAME_FORMAT_BGRA8;
       response.slot_count = LUMEN_VDD_FRAME_SLOT_COUNT;
       for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
-        response.texture_handles[slot] = reinterpret_cast<std::uint64_t>(duplicated[slot]);
-        response.fence_handles[slot] = reinterpret_cast<std::uint64_t>(
-          duplicated[LUMEN_VDD_FRAME_SLOT_COUNT + slot]
-        );
+        response.texture_handles[slot] = reinterpret_cast<std::uint64_t>(slots_[slot].texture_handle);
+        response.fence_handles[slot] = reinterpret_cast<std::uint64_t>(slots_[slot].fence_handle);
       }
       return STATUS_SUCCESS;
     }
 
-    /** @brief Lease the oldest ready frame without blocking the driver control queue. */
+    /** @brief Lease the next policy-selected frame without blocking the driver control queue. */
     NTSTATUS dequeue_frame(LUMEN_VDD_DEQUEUE_FRAME_RESPONSE &response) noexcept {
       std::lock_guard lock(mutex_);
       if (!direct_enabled_.load(std::memory_order_acquire)) {
         return STATUS_NOT_SUPPORTED;
       }
-      std::optional<std::size_t> selected;
-      for (std::size_t slot = 0; slot < slots_.size(); ++slot) {
-        if (slots_[slot].state == frame_slot_state_e::ready &&
-            (!selected ||
-             (mode_.delivery_policy == LUMEN_VDD_POLICY_LATENCY ?
-                slots_[slot].sequence > slots_[*selected].sequence :
-                slots_[slot].sequence < slots_[*selected].sequence))) {
-          selected = slot;
-        }
-      }
+      const auto selected = lumen::vdd::frame::dequeue_ready_slot(
+        slots_,
+        mode_.delivery_policy == LUMEN_VDD_POLICY_LATENCY
+      );
       if (!selected) {
         return STATUS_NO_MORE_ENTRIES;
       }
 
       auto &slot = slots_[*selected];
-      slot.state = frame_slot_state_e::acquired;
-      if (mode_.delivery_policy == LUMEN_VDD_POLICY_LATENCY) {
-        for (std::size_t candidate = 0; candidate < slots_.size(); ++candidate) {
-          if (candidate != *selected && slots_[candidate].state == frame_slot_state_e::ready) {
-            slots_[candidate].state = frame_slot_state_e::empty;
-          }
-        }
-      }
       response = {
         generation_,
         slot.sequence,
@@ -501,12 +285,13 @@ namespace {
       texture_desc.SampleDesc.Count = 1;
       texture_desc.Usage = D3D11_USAGE_DEFAULT;
       texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-      texture_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+      texture_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
       for (auto &slot : slots_) {
         ComPtr<IDXGIResource1> resource;
         if (FAILED(device->CreateTexture2D(&texture_desc, nullptr, &slot.texture)) ||
             FAILED(slot.texture.As(&resource)) ||
+            FAILED(slot.texture.As(&slot.keyed_mutex)) ||
             FAILED(resource->CreateSharedHandle(
               nullptr,
               DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
@@ -519,11 +304,29 @@ namespace {
         }
       }
 
+      ComPtr<IUnknown> texture0_identity;
+      ComPtr<IUnknown> texture1_identity;
+      ComPtr<IUnknown> fence0_identity;
+      ComPtr<IUnknown> fence1_identity;
+      if (FAILED(slots_[0].texture.As(&texture0_identity)) ||
+          FAILED(slots_[1].texture.As(&texture1_identity)) ||
+          FAILED(slots_[0].fence.As(&fence0_identity)) ||
+          FAILED(slots_[1].fence.As(&fence1_identity)) ||
+          texture0_identity.Get() == texture1_identity.Get() ||
+          fence0_identity.Get() == fence1_identity.Get() ||
+          !lumen::vdd::frame::published_handles_are_distinct(
+            reinterpret_cast<std::uintptr_t>(slots_[0].texture_handle),
+            reinterpret_cast<std::uintptr_t>(slots_[1].texture_handle),
+            reinterpret_cast<std::uintptr_t>(slots_[0].fence_handle),
+            reinterpret_cast<std::uintptr_t>(slots_[1].fence_handle)
+          )) {
+        return false;
+      }
+
       {
         std::lock_guard lock(mutex_);
         context4_ = context;
-        adapter_luid_ = static_cast<std::uint64_t>(static_cast<std::uint32_t>(adapter_luid.HighPart)) << 32 |
-                        static_cast<std::uint64_t>(adapter_luid.LowPart);
+        adapter_luid_ = pack_luid(adapter_luid);
         resources_ready_ = true;
       }
       SetEvent(frame_ready_event_);
@@ -531,33 +334,19 @@ namespace {
     }
 
     /** @brief Select a safe slot according to the immutable session policy. */
-    std::optional<std::size_t> select_slot(std::uint64_t &consumer_wait) noexcept {
+    std::optional<std::size_t> select_slot(
+      lumen::vdd::frame::producer_acquisition_t &acquisition
+    ) noexcept {
       std::lock_guard lock(mutex_);
-      for (std::size_t slot = 0; slot < slots_.size(); ++slot) {
-        if (lumen::vdd::frame::can_begin_write(slots_[slot].state)) {
-          consumer_wait = slots_[slot].state == frame_slot_state_e::released_pending ?
-                            slots_[slot].consumer_fence_value :
-                            0;
-          slots_[slot].state = frame_slot_state_e::writing;
-          return slot;
-        }
-      }
-      if (mode_.delivery_policy != LUMEN_VDD_POLICY_LATENCY) {
+      const auto selected = lumen::vdd::frame::select_producer_slot(
+        slots_,
+        mode_.delivery_policy == LUMEN_VDD_POLICY_LATENCY
+      );
+      if (!selected.slot) {
         return std::nullopt;
       }
-
-      std::optional<std::size_t> oldest_ready;
-      for (std::size_t slot = 0; slot < slots_.size(); ++slot) {
-        if (slots_[slot].state == frame_slot_state_e::ready &&
-            (!oldest_ready || slots_[slot].sequence < slots_[*oldest_ready].sequence)) {
-          oldest_ready = slot;
-        }
-      }
-      if (oldest_ready) {
-        consumer_wait = 0;
-        slots_[*oldest_ready].state = frame_slot_state_e::writing;
-      }
-      return oldest_ready;
+      acquisition = selected.acquisition;
+      return selected.slot;
     }
 
     void run(LUID adapter_luid) noexcept {
@@ -593,26 +382,33 @@ namespace {
                                   &device,
                                   &feature_level,
                                   &context
-                                ))) {
+                                  ))) {
+        disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
         finish(mmcss);
         return;
       }
 
       ComPtr<IDXGIDevice> dxgi_device;
       if (FAILED(device.As(&dxgi_device))) {
+        disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
         finish(mmcss);
         return;
       }
       IDARG_IN_SWAPCHAINSETDEVICE set_device {};
       set_device.pDevice = dxgi_device.Get();
       if (FAILED(IddCxSwapChainSetDevice(swap_chain, &set_device))) {
+        disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
         finish(mmcss);
         return;
       }
 
       ComPtr<ID3D11DeviceContext4> context4;
-      const bool direct_resources_supported = SUCCEEDED(context.As(&context4)) &&
+      const bool direct_resources_supported = direct_enabled_.load(std::memory_order_acquire) &&
+                                              SUCCEEDED(context.As(&context4)) &&
                                               initialize_resources(device.Get(), context4.Get(), adapter_luid);
+      if (!direct_resources_supported) {
+        disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
+      }
 
       const HANDLE waits[] {frame_event_, stop_event_.get()};
       while (WaitForSingleObject(stop_event_.get(), 0) != WAIT_OBJECT_0) {
@@ -620,12 +416,17 @@ namespace {
         const auto status = IddCxSwapChainReleaseAndAcquireBuffer(swap_chain, &buffer);
         if (status == E_PENDING) {
           const auto wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+          if (wait == WAIT_OBJECT_0) {
+            continue;
+          }
           if (wait == WAIT_OBJECT_0 + 1) {
             break;
           }
-          continue;
+          disable_direct_frames(lumen::vdd::frame::submission_result_e::wait_failed);
+          break;
         }
         if (FAILED(status)) {
+          disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
           break;
         }
 
@@ -643,11 +444,17 @@ namespace {
           if (source && source_desc.Width == mode_.width && source_desc.Height == mode_.height &&
               source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM && source_desc.MipLevels == 1 &&
               source_desc.ArraySize == 1 && source_desc.SampleDesc.Count == 1) {
-            std::uint64_t consumer_wait = 0;
-            const auto selected = select_slot(consumer_wait);
+            lumen::vdd::frame::producer_acquisition_t acquisition;
+            const auto selected = select_slot(acquisition);
             if (selected) {
               auto &slot = slots_[*selected];
-              const bool wait_complete = consumer_wait == 0 || SUCCEEDED(context4_->Wait(slot.fence.Get(), consumer_wait));
+              const bool keyed_acquired = slot.keyed_mutex->AcquireSync(acquisition.keyed_mutex_key, 0) == S_OK;
+              const bool wait_complete = keyed_acquired &&
+                                         (acquisition.consumer_fence_wait == 0 ||
+                                          SUCCEEDED(context4_->Wait(
+                                            slot.fence.Get(),
+                                            acquisition.consumer_fence_wait
+                                          )));
               if (wait_complete && slot.producer_fence_value <= std::numeric_limits<std::uint64_t>::max() - 2) {
                 context->CopyResource(slot.texture.Get(), source.Get());
                 if (FAILED(device->GetDeviceRemovedReason())) {
@@ -661,7 +468,8 @@ namespace {
                 const auto producer_fence = slot.producer_fence_value == 0 ?
                                               1 :
                                               slot.producer_fence_value + 2;
-                if (SUCCEEDED(context4_->Signal(slot.fence.Get(), producer_fence))) {
+                if (SUCCEEDED(context4_->Signal(slot.fence.Get(), producer_fence)) &&
+                    slot.keyed_mutex->ReleaseSync(lumen::vdd::frame::host_acquire_key(producer_fence)) == S_OK) {
                   LARGE_INTEGER producer_signal_qpc {};
                   QueryPerformanceCounter(&producer_signal_qpc);
                   std::lock_guard lock(mutex_);
@@ -680,10 +488,13 @@ namespace {
                 disable_direct_frames(lumen::vdd::frame::submission_result_e::wait_failed);
               }
             }
+          } else {
+            disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
           }
         }
         acquired_surface.Reset();
         if (FAILED(IddCxSwapChainFinishedProcessingFrame(swap_chain))) {
+          disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
           break;
         }
       }
@@ -718,6 +529,7 @@ namespace {
     std::mutex mutex;  ///< Serializes every control and monitor transition.
     WDFDEVICE device {};  ///< Parent WDF device.
     IDDCX_ADAPTER adapter {};  ///< Initialized indirect adapter.
+    NTSTATUS adapter_init_status {STATUS_DEVICE_NOT_READY};  ///< Latest immediate or asynchronous adapter status.
     IDDCX_MONITOR monitor {};  ///< Present monitor, or null.
     WDFFILEOBJECT owner_file {};  ///< Exclusive requestor file.
     WDFFILEOBJECT frame_consumer_file {};  ///< Exact generation-scoped direct-frame consumer.
@@ -726,7 +538,12 @@ namespace {
     LUMEN_VDD_MODE mode {};  ///< Exact prepared mode.
     std::uint64_t generation {};  ///< Active generation.
     std::uint64_t last_generation {};  ///< Highest generation ever admitted.
+    std::uint64_t preferred_render_adapter_luid {};  ///< Exact encoder adapter requested for this generation.
+    std::uint64_t assigned_render_adapter_luid {};  ///< Exact adapter used by the most recent swap chain.
     std::uint32_t owner_process_id {};  ///< Exclusive service PID.
+    bool render_adapter_preference_submitted {};  ///< Whether the runtime preference API was called.
+    bool monitor_starting {};  ///< Arrival is running without the state lock for synchronous IddCx callbacks.
+    bool monitor_stopping {};  ///< Departure is running without the state lock for synchronous IddCx callbacks.
     bool monitor_started {};  ///< Whether arrival completed.
   };
 
@@ -754,6 +571,32 @@ namespace {
              static_cast<std::uint64_t>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT * 480ULL * mode.refresh_denominator;
   }
 
+  /** @brief Pack a Windows adapter LUID without sign extension. */
+  std::uint64_t pack_luid(const LUID luid) noexcept {
+    return static_cast<std::uint64_t>(static_cast<std::uint32_t>(luid.HighPart)) << 32U |
+           static_cast<std::uint64_t>(luid.LowPart);
+  }
+
+  /** @brief Unpack the fixed ABI representation into a Windows adapter LUID. */
+  LUID unpack_luid(const std::uint64_t packed) noexcept {
+    return {
+      static_cast<DWORD>(packed),
+      static_cast<LONG>(static_cast<std::uint32_t>(packed >> 32U)),
+    };
+  }
+
+  /** @brief Return the exact WUDFHost creation FILETIME for PID-reuse-safe reverse duplication. */
+  std::uint64_t current_process_creation_time() noexcept {
+    FILETIME creation {};
+    FILETIME exit {};
+    FILETIME kernel {};
+    FILETIME user {};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+      return 0;
+    }
+    return static_cast<std::uint64_t>(creation.dwHighDateTime) << 32U | creation.dwLowDateTime;
+  }
+
   /** @brief Fill exact signal metadata for a dynamic mode. */
   DISPLAYCONFIG_VIDEO_SIGNAL_INFO signal_info(const LUMEN_VDD_MODE &mode, bool monitor_mode) noexcept {
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO signal {};
@@ -771,6 +614,24 @@ namespace {
     signal.AdditionalSignalInfo.videoStandard = 255;
     signal.AdditionalSignalInfo.vSyncFreqDivider = monitor_mode ? 0 : 1;
     return signal;
+  }
+
+  /** @brief Return whether Windows committed the exact target signal admitted for this generation. */
+  bool target_signal_matches(
+    const DISPLAYCONFIG_VIDEO_SIGNAL_INFO &actual,
+    const LUMEN_VDD_MODE &mode
+  ) noexcept {
+    const auto expected = signal_info(mode, false);
+    return actual.pixelRate == expected.pixelRate &&
+           actual.hSyncFreq.Numerator == expected.hSyncFreq.Numerator &&
+           actual.hSyncFreq.Denominator == expected.hSyncFreq.Denominator &&
+           actual.vSyncFreq.Numerator == expected.vSyncFreq.Numerator &&
+           actual.vSyncFreq.Denominator == expected.vSyncFreq.Denominator &&
+           actual.activeSize.cx == expected.activeSize.cx && actual.activeSize.cy == expected.activeSize.cy &&
+           actual.totalSize.cx == expected.totalSize.cx && actual.totalSize.cy == expected.totalSize.cy &&
+           actual.AdditionalSignalInfo.videoStandard == expected.AdditionalSignalInfo.videoStandard &&
+           actual.scanLineOrdering == expected.scanLineOrdering &&
+           actual.AdditionalSignalInfo.vSyncFreqDivider == expected.AdditionalSignalInfo.vSyncFreqDivider;
   }
 
   IDDCX_MONITOR_MODE monitor_mode(const LUMEN_VDD_MODE &mode, IDDCX_MONITOR_MODE_ORIGIN origin) noexcept {
@@ -818,17 +679,39 @@ namespace {
     return static_cast<T *>(buffer);
   }
 
-  /** @brief Reset one exact owner while holding the state mutex. */
-  NTSTATUS stop_locked(device_state_t &state, std::uint64_t generation, WDFFILEOBJECT file, bool recovery) noexcept {
+  /**
+   * @brief Reset one exact owner, releasing the lock only for synchronous IddCx departure callbacks.
+   * @param state Mutable device state protected by state_lock.
+   * @param state_lock Owned state lock.
+   * @param generation Exact generation being stopped.
+   * @param file Exact owning file, unless recovery is true.
+   * @param recovery Whether stale-owner recovery bypasses the file comparison.
+   * @return Completion status for the complete departure and state reset.
+   */
+  NTSTATUS stop_locked(
+    device_state_t &state,
+    std::unique_lock<std::mutex> &state_lock,
+    std::uint64_t generation,
+    WDFFILEOBJECT file,
+    bool recovery
+  ) noexcept {
     if (state.generation == 0) {
       return STATUS_SUCCESS;
     }
     if (state.generation != generation || (!recovery && state.owner_file != file)) {
       return STATUS_ACCESS_DENIED;
     }
+    if (state.monitor_starting || state.monitor_stopping) {
+      return STATUS_DEVICE_BUSY;
+    }
     state.swap_chain.reset();
     if (state.monitor != nullptr) {
-      const auto status = IddCxMonitorDeparture(state.monitor);
+      state.monitor_stopping = true;
+      const auto monitor = state.monitor;
+      state_lock.unlock();
+      const auto status = IddCxMonitorDeparture(monitor);
+      state_lock.lock();
+      state.monitor_stopping = false;
       if (!NT_SUCCESS(status)) {
         return status;
       }
@@ -838,6 +721,9 @@ namespace {
     state.owner_file = nullptr;
     state.frame_consumer_file = nullptr;
     state.owner_process_id = 0;
+    state.preferred_render_adapter_luid = 0;
+    state.assigned_render_adapter_luid = 0;
+    state.render_adapter_preference_submitted = false;
     if (state.frame_ready_event != nullptr) {
       CloseHandle(state.frame_ready_event);
       state.frame_ready_event = nullptr;
@@ -847,23 +733,34 @@ namespace {
     return STATUS_SUCCESS;
   }
 
-  /** @brief Create and publish the one dynamic connector. */
-  NTSTATUS start_monitor_locked(device_state_t &state) noexcept {
+  /**
+   * @brief Create and publish the one dynamic connector without blocking synchronous IddCx callbacks on the state lock.
+   * @param state Mutable device state protected by state_lock.
+   * @param state_lock Owned state lock.
+   * @return Completion status for monitor creation and arrival.
+   */
+  NTSTATUS start_monitor_locked(device_state_t &state, std::unique_lock<std::mutex> &state_lock) noexcept {
     if (state.monitor_started && state.monitor != nullptr) {
       return STATUS_SUCCESS;
     }
     if (state.adapter == nullptr || state.generation == 0 || !valid_mode(state.mode)) {
       return STATUS_INVALID_DEVICE_STATE;
     }
+    if (state.monitor_starting || state.monitor_stopping) {
+      return STATUS_DEVICE_BUSY;
+    }
+    state.monitor_starting = true;
+    const auto adapter = state.adapter;
 
     IDDCX_MONITOR_INFO info {};
     info.Size = sizeof(info);
     info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
     info.ConnectorIndex = 0;
+    info.MonitorContainerId = GUID_CONTAINERID_LUMEN_VIRTUAL_DISPLAY_MONITOR;
     info.MonitorDescription.Size = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    info.MonitorDescription.DataSize = static_cast<UINT>(monitor_edid.size());
-    info.MonitorDescription.pData = const_cast<BYTE *>(monitor_edid.data());
+    info.MonitorDescription.DataSize = 0;
+    info.MonitorDescription.pData = nullptr;
 
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, monitor_context_t);
@@ -871,15 +768,19 @@ namespace {
     input.ObjectAttributes = &attributes;
     input.pMonitorInfo = &info;
     IDARG_OUT_MONITORCREATE output {};
-    auto status = IddCxMonitorCreate(state.adapter, &input, &output);
-    if (!NT_SUCCESS(status)) {
-      return status;
+    state_lock.unlock();
+    auto status = IddCxMonitorCreate(adapter, &input, &output);
+    if (NT_SUCCESS(status)) {
+      monitor_context(output.MonitorObject)->state = &state;
+      IDARG_OUT_MONITORARRIVAL arrival {};
+      status = IddCxMonitorArrival(output.MonitorObject, &arrival);
+      if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(output.MonitorObject);
+      }
     }
-    monitor_context(output.MonitorObject)->state = &state;
-    IDARG_OUT_MONITORARRIVAL arrival {};
-    status = IddCxMonitorArrival(output.MonitorObject, &arrival);
+    state_lock.lock();
+    state.monitor_starting = false;
     if (!NT_SUCCESS(status)) {
-      WdfObjectDelete(output.MonitorObject);
       return status;
     }
     state.monitor = output.MonitorObject;
@@ -890,6 +791,7 @@ namespace {
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD LumenVddDeviceAdd;
+EVT_WDF_DEVICE_D0_ENTRY LumenVddDeviceD0Entry;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP LumenVddDeviceCleanup;
 EVT_WDF_FILE_CLEANUP LumenVddFileCleanup;
 EVT_IDD_CX_DEVICE_IO_CONTROL LumenVddDeviceIoControl;
@@ -917,6 +819,11 @@ _Use_decl_annotations_
   NTSTATUS
   LumenVddDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init) {
   UNREFERENCED_PARAMETER(driver);
+  WDF_PNPPOWER_EVENT_CALLBACKS power_callbacks;
+  WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&power_callbacks);
+  power_callbacks.EvtDeviceD0Entry = LumenVddDeviceD0Entry;
+  WdfDeviceInitSetPnpPowerEventCallbacks(device_init, &power_callbacks);
+
   WDF_FILEOBJECT_CONFIG file_config;
   WDF_FILEOBJECT_CONFIG_INIT(&file_config, WDF_NO_EVENT_CALLBACK, WDF_NO_EVENT_CALLBACK, LumenVddFileCleanup);
   WdfDeviceInitSetFileObjectConfig(device_init, &file_config, WDF_NO_OBJECT_ATTRIBUTES);
@@ -945,6 +852,10 @@ _Use_decl_annotations_
   if (!NT_SUCCESS(status)) {
     return status;
   }
+  status = IddCxDeviceInitialize(device);
+  if (!NT_SUCCESS(status)) {
+    return status;
+  }
   device_state_t *state = nullptr;
   try {
     state = new device_state_t {};
@@ -957,9 +868,35 @@ _Use_decl_annotations_
   if (!NT_SUCCESS(status)) {
     return status;
   }
-  status = IddCxDeviceInitialize(device);
-  if (!NT_SUCCESS(status)) {
-    return status;
+
+  return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+  NTSTATUS
+  LumenVddParseMonitorDescription(
+    const IDARG_IN_PARSEMONITORDESCRIPTION *input,
+    IDARG_OUT_PARSEMONITORDESCRIPTION *output
+  ) {
+  UNREFERENCED_PARAMETER(input);
+  UNREFERENCED_PARAMETER(output);
+  return STATUS_NOT_SUPPORTED;
+}
+
+_Use_decl_annotations_
+  NTSTATUS
+  LumenVddDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previous_state) {
+  UNREFERENCED_PARAMETER(previous_state);
+  auto *state = device_context(device)->state;
+  if (state == nullptr) {
+    return STATUS_INVALID_DEVICE_STATE;
+  }
+  {
+    std::lock_guard lock(state->mutex);
+    if (state->adapter != nullptr) {
+      return STATUS_SUCCESS;
+    }
+    state->adapter_init_status = STATUS_PENDING;
   }
 
   IDDCX_ADAPTER_CAPS capabilities {};
@@ -969,6 +906,7 @@ _Use_decl_annotations_
   capabilities.EndPointDiagnostics.Size = sizeof(capabilities.EndPointDiagnostics);
   capabilities.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
   capabilities.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
+  capabilities.EndPointDiagnostics.pEndPointFriendlyName = endpoint_model;
   capabilities.EndPointDiagnostics.pEndPointModelName = endpoint_model;
   capabilities.EndPointDiagnostics.pEndPointManufacturerName = endpoint_manufacturer;
   IDDCX_ENDPOINT_VERSION version {};
@@ -981,25 +919,31 @@ _Use_decl_annotations_
   WDF_OBJECT_ATTRIBUTES adapter_attributes;
   WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&adapter_attributes, adapter_context_t);
   IDARG_IN_ADAPTER_INIT adapter_input {};
-  adapter_input.WdfDevice = device;
+  adapter_input.WdfDevice = state->device;
   adapter_input.pCaps = &capabilities;
   adapter_input.ObjectAttributes = &adapter_attributes;
   IDARG_OUT_ADAPTER_INIT adapter_output {};
-  status = IddCxAdapterInitAsync(&adapter_input, &adapter_output);
-  if (NT_SUCCESS(status)) {
-    state->adapter = adapter_output.AdapterObject;
-    adapter_context(adapter_output.AdapterObject)->state = state;
+  const auto status = IddCxAdapterInitAsync(&adapter_input, &adapter_output);
+  {
+    std::lock_guard lock(state->mutex);
+    state->adapter_init_status = status;
+    if (NT_SUCCESS(status)) {
+      state->adapter = adapter_output.AdapterObject;
+      adapter_context(adapter_output.AdapterObject)->state = state;
+    }
   }
-  return status;
+  return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_ void LumenVddDeviceCleanup(WDFOBJECT object) {
   auto *context = device_context(object);
   if (context->state != nullptr) {
     {
-      std::lock_guard lock(context->state->mutex);
+      std::unique_lock lock(context->state->mutex);
       if (context->state->generation != 0) {
-        static_cast<void>(stop_locked(*context->state, context->state->generation, context->state->owner_file, true));
+        static_cast<void>(
+          stop_locked(*context->state, lock, context->state->generation, context->state->owner_file, true)
+        );
       }
     }
     delete context->state;
@@ -1009,9 +953,9 @@ _Use_decl_annotations_ void LumenVddDeviceCleanup(WDFOBJECT object) {
 
 _Use_decl_annotations_ void LumenVddFileCleanup(WDFFILEOBJECT file_object) {
   auto *state = device_context(WdfFileObjectGetDevice(file_object))->state;
-  std::lock_guard lock(state->mutex);
+  std::unique_lock lock(state->mutex);
   if (state->owner_file == file_object && state->generation != 0) {
-    static_cast<void>(stop_locked(*state, state->generation, file_object, false));
+    static_cast<void>(stop_locked(*state, lock, state->generation, file_object, false));
   } else if (state->frame_consumer_file == file_object) {
     state->frame_consumer_file = nullptr;
     if (state->swap_chain != nullptr) {
@@ -1031,7 +975,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
   WDFFILEOBJECT file = WdfRequestGetFileObject(request);
   NTSTATUS status = STATUS_SUCCESS;
   size_t information = 0;
-  std::lock_guard lock(state->mutex);
+  std::unique_lock lock(state->mutex);
 
   switch (control_code) {
     case IOCTL_LUMEN_VDD_QUERY_ABI:
@@ -1044,10 +988,13 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         if (output == nullptr) {
           break;
         }
+        const auto capability_flags =
+          LUMEN_VDD_CAP_DYNAMIC_MODES | LUMEN_VDD_CAP_SDR8 | LUMEN_VDD_CAP_DIRECT_FRAME_V1 |
+          LUMEN_VDD_CAP_LOSSLESS |
+          (IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter) ? LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE : 0U);
         *output = {
           LUMEN_VDD_ABI_VERSION,
-          LUMEN_VDD_CAP_DYNAMIC_MODES | LUMEN_VDD_CAP_SDR8 | LUMEN_VDD_CAP_DIRECT_FRAME_V1 |
-            LUMEN_VDD_CAP_LOSSLESS,
+          capability_flags,
           256,
           LUMEN_VDD_MAX_WIDTH,
           200,
@@ -1076,6 +1023,10 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
             state->monitor_started ? 1U : 0U,
             state->mode,
             state->last_generation,
+            state->preferred_render_adapter_luid,
+            state->assigned_render_adapter_luid,
+            state->render_adapter_preference_submitted ? 1U : 0U,
+            0,
           };
           information = sizeof(*output);
         }
@@ -1094,12 +1045,18 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         if (input == nullptr || output == nullptr) {
           break;
         }
-        if (input->reserved != 0 || input->owner_process_id != requestor_pid || input->generation == 0 || !valid_mode(input->mode)) {
+        if (input->reserved != 0 || input->owner_process_id != requestor_pid || input->generation == 0 ||
+            input->preferred_render_adapter_luid == 0 || !valid_mode(input->mode)) {
           status = STATUS_INVALID_PARAMETER;
+          break;
+        }
+        if (state->adapter == nullptr || !NT_SUCCESS(state->adapter_init_status)) {
+          status = STATUS_DEVICE_NOT_READY;
           break;
         }
         if (state->generation != 0) {
           if (state->generation != input->generation || state->owner_file != file ||
+              state->preferred_render_adapter_luid != input->preferred_render_adapter_luid ||
               std::memcmp(&state->mode, &input->mode, sizeof(input->mode)) != 0) {
             status = STATUS_DEVICE_BUSY;
             break;
@@ -1120,10 +1077,22 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           state->owner_file = file;
           state->frame_ready_event = frame_ready_event;
           state->mode = input->mode;
+          state->preferred_render_adapter_luid = input->preferred_render_adapter_luid;
+          state->assigned_render_adapter_luid = 0;
+          state->render_adapter_preference_submitted = false;
+          if (IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)) {
+            const IDARG_IN_ADAPTERSETRENDERADAPTER render_adapter {
+              unpack_luid(state->preferred_render_adapter_luid),
+            };
+            IddCxAdapterSetRenderAdapter(state->adapter, &render_adapter);
+            state->render_adapter_preference_submitted = true;
+          }
         }
         *output = {};
         output->mode = state->mode;
         output->fidelity = LUMEN_VDD_FIDELITY_LOSSLESS;
+        output->render_adapter_preference_submitted = state->render_adapter_preference_submitted ? 1U : 0U;
+        output->preferred_render_adapter_luid = state->preferred_render_adapter_luid;
         std::memcpy(output->connector_id_utf8, connector_id, sizeof(connector_id));
         information = sizeof(*output);
         break;
@@ -1139,7 +1108,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           status = STATUS_ACCESS_DENIED;
           break;
         }
-        status = start_monitor_locked(*state);
+        status = start_monitor_locked(*state, lock);
         break;
       }
     case IOCTL_LUMEN_VDD_STOP_MONITOR:
@@ -1149,7 +1118,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           status = STATUS_INFO_LENGTH_MISMATCH;
           break;
         }
-        status = stop_locked(*state, input->generation, file, false);
+        status = stop_locked(*state, lock, input->generation, file, false);
         break;
       }
     case IOCTL_LUMEN_VDD_RECOVER_STALE:
@@ -1182,7 +1151,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
             break;
           }
         }
-        status = stop_locked(*state, input->generation, state->owner_file, true);
+        status = stop_locked(*state, lock, input->generation, state->owner_file, true);
         break;
       }
     case IOCTL_LUMEN_VDD_OPEN_FRAME_CHANNEL:
@@ -1220,7 +1189,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           status = STATUS_DEVICE_NOT_READY;
           break;
         }
-        status = state->swap_chain->open_frame_channel(requestor_pid, *output);
+        status = state->swap_chain->open_frame_channel(*output);
         if (NT_SUCCESS(status)) {
           information = sizeof(*output);
         }
@@ -1321,28 +1290,17 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           break;
         }
         state->frame_consumer_file = file;
-        HANDLE owner_process = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, requestor_pid);
-        if (owner_process == nullptr) {
-          status = GetLastError() == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
-          break;
-        }
-        unique_handle_t close_owner_process(owner_process);
-        HANDLE duplicated = nullptr;
-        if (!DuplicateHandle(
-              GetCurrentProcess(),
-              state->frame_ready_event,
-              owner_process,
-              &duplicated,
-              SYNCHRONIZE,
-              FALSE,
-              0
-            )) {
-          status = STATUS_ACCESS_DENIED;
+        const auto source_creation_time = current_process_creation_time();
+        if (source_creation_time == 0) {
+          status = STATUS_UNSUCCESSFUL;
           break;
         }
         *output = {
           state->generation,
-          reinterpret_cast<std::uint64_t>(duplicated),
+          GetCurrentProcessId(),
+          0,
+          source_creation_time,
+          reinterpret_cast<std::uint64_t>(state->frame_ready_event),
           0,
         };
         information = sizeof(*output);
@@ -1359,8 +1317,9 @@ _Use_decl_annotations_
   NTSTATUS
   LumenVddAdapterInitFinished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED *input) {
   auto *state = adapter_context(adapter)->state;
-  if (!NT_SUCCESS(input->AdapterInitStatus)) {
-    std::lock_guard lock(state->mutex);
+  std::lock_guard lock(state->mutex);
+  state->adapter_init_status = input->AdapterInitStatus;
+  if (!NT_SUCCESS(state->adapter_init_status)) {
     state->adapter = nullptr;
   }
   return STATUS_SUCCESS;
@@ -1369,29 +1328,27 @@ _Use_decl_annotations_
 _Use_decl_annotations_
   NTSTATUS
   LumenVddAdapterCommitModes(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES *input) {
-  UNREFERENCED_PARAMETER(adapter);
-  UNREFERENCED_PARAMETER(input);
-  return STATUS_SUCCESS;
-}
-
-_Use_decl_annotations_
-  NTSTATUS
-  LumenVddParseMonitorDescription(
-    const IDARG_IN_PARSEMONITORDESCRIPTION *input,
-    IDARG_OUT_PARSEMONITORDESCRIPTION *output
-  ) {
-  if (input->MonitorDescription.Type != IDDCX_MONITOR_DESCRIPTION_TYPE_EDID ||
-      input->MonitorDescription.DataSize != monitor_edid.size() ||
-      std::memcmp(input->MonitorDescription.pData, monitor_edid.data(), monitor_edid.size()) != 0) {
+  auto *state = adapter_context(adapter)->state;
+  std::lock_guard lock(state->mutex);
+  if (input->PathCount != 0 && input->pPaths == nullptr) {
     return STATUS_INVALID_PARAMETER;
   }
-  // The identity-only EDID contains no detailed timing descriptors. Dynamic
-  // session timing is exposed exclusively through GetDefaultModes with DRIVER
-  // origin; fabricating a MONITORDESCRIPTOR mode here is incorrect.
-  output->MonitorModeBufferOutputCount = 0;
-  output->PreferredMonitorModeIdx = 0;
-  UNREFERENCED_PARAMETER(input->MonitorModeBufferInputCount);
-  UNREFERENCED_PARAMETER(input->pMonitorModes);
+  std::uint32_t active_paths = 0;
+  for (std::uint32_t index = 0; index < input->PathCount; ++index) {
+    const auto &path = input->pPaths[index];
+    if (path.Size != sizeof(path) || path.MonitorObject == nullptr ||
+        monitor_context(path.MonitorObject)->state != state) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    if ((path.Flags & IDDCX_PATH_FLAGS_ACTIVE) == IDDCX_PATH_FLAGS_NONE) {
+      continue;
+    }
+    ++active_paths;
+    if (active_paths > 1 || state->generation == 0 || !valid_mode(state->mode) ||
+        !target_signal_matches(path.TargetVideoSignalInfo, state->mode)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+  }
   return STATUS_SUCCESS;
 }
 
@@ -1448,6 +1405,11 @@ _Use_decl_annotations_
   auto *state = monitor_context(monitor)->state;
   std::lock_guard lock(state->mutex);
   state->swap_chain.reset();
+  state->assigned_render_adapter_luid = pack_luid(input->RenderAdapterLuid);
+  const bool direct_frames_enabled = lumen::vdd::frame::render_adapter_matches(
+    state->preferred_render_adapter_luid,
+    state->assigned_render_adapter_luid
+  );
   lumen::vdd::single_delete_owner_t<IDDCX_SWAPCHAIN, swap_chain_deleter_t> pending_swap_chain(input->hSwapChain);
   try {
     state->swap_chain.reset(new swap_chain_processor_t(
@@ -1456,7 +1418,8 @@ _Use_decl_annotations_
       input->hNextSurfaceAvailable,
       state->generation,
       state->mode,
-      state->frame_ready_event
+      state->frame_ready_event,
+      direct_frames_enabled
     ));
   } catch (...) {
     return STATUS_INSUFFICIENT_RESOURCES;

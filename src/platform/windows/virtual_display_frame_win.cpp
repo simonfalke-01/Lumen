@@ -8,13 +8,10 @@
   // standard includes
   #include <algorithm>
   #include <atomic>
-  #include <charconv>
   #include <cstdint>
   #include <limits>
   #include <mutex>
   #include <optional>
-  #include <string>
-  #include <string_view>
   #include <thread>
   #include <utility>
   #include <vector>
@@ -35,9 +32,9 @@
   #include "src/logging.h"
   #include "src/utility.h"
   #include "src/video.h"
-  #include "utf_utils.h"
   #include "virtual_display_driver/LumenVirtualDisplayProtocol.h"
   #include "virtual_display_driver/LumenVirtualDisplayGuids.h"
+  #include "virtual_display_driver/LumenDirectFrameSlotPolicy.h"
   #include "virtual_display_frame.h"
 
 using Microsoft::WRL::ComPtr;
@@ -47,19 +44,23 @@ using namespace std::literals;
 namespace platf::virtual_display {
   namespace {
     std::atomic_bool runtime_quarantined {false};  ///< Process-wide sticky direct-frame failure state.
-    constexpr auto runtime_gate_env = "LUMEN_EXPERIMENTAL_VDD_DIRECT_FRAME";  ///< Explicit direct-frame enable gate.
-    constexpr auto hardware_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_HARDWARE_VALIDATED";  ///< RTX 4060 acknowledgement.
-    constexpr auto driver_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_VALIDATED_DRIVER";  ///< Exact validated UMD version.
-    constexpr auto model_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_MODEL";  ///< Exact adapter description.
-    constexpr auto luid_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_ADAPTER_LUID";  ///< Exact packed adapter LUID.
-    constexpr auto device_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_DEVICE_ID";  ///< Exact PCI device ID.
-    constexpr auto subsystem_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_SUBSYSTEM_ID";  ///< Exact PCI subsystem ID.
-    constexpr auto revision_gate_env = "LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_REVISION";  ///< Exact PCI revision.
 
     /** @brief Pack a Windows LUID without changing its signed high-part bits. */
     std::uint64_t packed_luid(const LUID &luid) noexcept {
       return static_cast<std::uint64_t>(static_cast<std::uint32_t>(luid.HighPart)) << 32 |
              static_cast<std::uint64_t>(luid.LowPart);
+    }
+
+    /** @brief Pack a process creation FILETIME for PID-reuse-safe source validation. */
+    std::uint64_t packed_process_creation_time(HANDLE process) noexcept {
+      FILETIME creation {};
+      FILETIME exit {};
+      FILETIME kernel {};
+      FILETIME user {};
+      if (process == nullptr || !GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
+        return 0;
+      }
+      return static_cast<std::uint64_t>(creation.dwHighDateTime) << 32U | creation.dwLowDateTime;
     }
 
     /** @brief Convert a nonnegative QPC delta to nanoseconds without overflow. */
@@ -76,30 +77,6 @@ namespace platf::virtual_display {
       }
       return seconds * 1'000'000'000ULL +
              remainder * 1'000'000'000ULL / static_cast<std::uint64_t>(frequency.QuadPart);
-    }
-
-    /** @brief Read one complete environment value. */
-    std::optional<std::string> environment_value(const char *name) {
-      const auto required = GetEnvironmentVariableA(name, nullptr, 0);
-      if (required == 0) {
-        return std::nullopt;
-      }
-      std::string value(required, '\0');
-      const auto written = GetEnvironmentVariableA(name, value.data(), required);
-      if (written == 0 || written >= required) {
-        return std::nullopt;
-      }
-      value.resize(written);
-      return value;
-    }
-
-    /** @brief Parse a complete unsigned decimal value. */
-    std::optional<std::uint64_t> decimal_u64(std::string_view value) {
-      std::uint64_t parsed = 0;
-      const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
-      return result.ec == std::errc {} && result.ptr == value.data() + value.size() ?
-               std::optional {parsed} :
-               std::nullopt;
     }
 
     /** @brief Map one Win32 device-IO failure into the stable frame contract. */
@@ -190,12 +167,50 @@ namespace platf::virtual_display {
     }
   }  // namespace
 
+  direct_frame_handle_identity_e compare_direct_frame_handle_identity(
+    const std::uintptr_t first,
+    const std::uintptr_t second
+  ) noexcept {
+    using compare_object_handles_fn = BOOL(WINAPI *)(HANDLE, HANDLE);
+    static const auto compare_handles = []() -> compare_object_handles_fn {
+      const auto kernel32 = GetModuleHandleW(L"kernel32.dll");
+      return kernel32 == nullptr ?
+               nullptr :
+               reinterpret_cast<compare_object_handles_fn>(GetProcAddress(kernel32, "CompareObjectHandles"));
+    }();
+
+    if (first == 0 || second == 0 || compare_handles == nullptr) {
+      return direct_frame_handle_identity_e::unavailable_or_error;
+    }
+    if (first == second) {
+      return direct_frame_handle_identity_e::alias;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    if (compare_handles(reinterpret_cast<HANDLE>(first), reinterpret_cast<HANDLE>(second))) {
+      return direct_frame_handle_identity_e::alias;
+    }
+    return GetLastError() == ERROR_NOT_SAME_OBJECT ?
+             direct_frame_handle_identity_e::distinct :
+             direct_frame_handle_identity_e::unavailable_or_error;
+  }
+
   /** @brief Concrete production state hidden from the platform-neutral video configuration. */
   class frame_source_t::impl_t {
   public:
     explicit impl_t(const stream_selection_t &selection):
         generation {selection.generation},
         mode {selection.selected_mode} {
+      if (selection.render_adapter) {
+        frozen_probe_identity = direct_frame_adapter_identity_t {
+          selection.render_adapter->adapter_luid,
+          selection.render_adapter->vendor_id,
+          selection.render_adapter->device_id,
+          selection.render_adapter->subsystem_id,
+          selection.render_adapter->revision,
+          selection.render_adapter->driver_version,
+        };
+      }
     }
 
     ~impl_t() {
@@ -209,28 +224,8 @@ namespace platf::virtual_display {
     }
 
     frame_io_e initialize(const std::chrono::milliseconds timeout) {
-      if (runtime_quarantined.load(std::memory_order_acquire)) {
-        return frame_io_e::unsupported;
-      }
-      const auto runtime_gate = environment_value(runtime_gate_env);
-      const auto hardware_gate = environment_value(hardware_gate_env);
-      const auto model_gate = environment_value(model_gate_env);
-      const auto driver_gate = environment_value(driver_gate_env);
-      const auto luid_gate = environment_value(luid_gate_env);
-      const auto device_gate = environment_value(device_gate_env);
-      const auto subsystem_gate = environment_value(subsystem_gate_env);
-      const auto revision_gate = environment_value(revision_gate_env);
-      const auto expected_driver = driver_gate ? decimal_u64(*driver_gate) : std::nullopt;
-      const auto expected_luid = luid_gate ? decimal_u64(*luid_gate) : std::nullopt;
-      const auto expected_device = device_gate ? decimal_u64(*device_gate) : std::nullopt;
-      const auto expected_subsystem = subsystem_gate ? decimal_u64(*subsystem_gate) : std::nullopt;
-      const auto expected_revision = revision_gate ? decimal_u64(*revision_gate) : std::nullopt;
-      if (!runtime_gate || *runtime_gate != "1" || !hardware_gate || *hardware_gate != "RTX4060" ||
-          !model_gate || !expected_driver || !expected_luid || !expected_device || !expected_subsystem ||
-          !expected_revision || *expected_device > std::numeric_limits<std::uint32_t>::max() ||
-          *expected_subsystem > std::numeric_limits<std::uint32_t>::max() ||
-          *expected_revision > std::numeric_limits<std::uint8_t>::max() ||
-          !::video::active_encoder_is_nvenc()) {
+      const bool nvenc_active = ::video::active_encoder_is_nvenc();
+      if (runtime_quarantined.load(std::memory_order_acquire) || !nvenc_active) {
         return frame_io_e::unsupported;
       }
 
@@ -266,14 +261,17 @@ namespace platf::virtual_display {
         sizeof(event_response)
       );
       if (event_status != frame_io_e::ok || event_response.generation != generation ||
-          event_response.event_handle == 0 || event_response.reserved != 0) {
-        if (event_response.event_handle != 0) {
-          CloseHandle(reinterpret_cast<HANDLE>(event_response.event_handle));
-        }
+          event_response.source_process_id == 0 || event_response.source_reserved != 0 ||
+          event_response.source_process_creation_time == 0 || event_response.event_handle == 0 ||
+          event_response.reserved != 0 ||
+          !bind_source_process(
+            event_response.source_process_id,
+            event_response.source_process_creation_time
+          ) ||
+          !duplicate_source_handle(event_response.event_handle, availability_event)) {
         stop();
         return event_status == frame_io_e::ok ? frame_io_e::invalid_data : event_status;
       }
-      availability_event = reinterpret_cast<HANDLE>(event_response.event_handle);
 
       const auto deadline = std::chrono::steady_clock::now() + std::max(timeout, 0ms);
       LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE response {};
@@ -304,14 +302,19 @@ namespace platf::virtual_display {
         }
       }
 
-      if (response.slot_count != LUMEN_VDD_FRAME_SLOT_COUNT ||
+      if (response.generation != generation || response.source_process_id != source_process_id ||
+          response.source_reserved != 0 || response.source_process_creation_time != source_process_creation_time ||
+          response.slot_count != LUMEN_VDD_FRAME_SLOT_COUNT ||
           response.texture_format != LUMEN_VDD_FRAME_FORMAT_BGRA8 ||
           !std::ranges::all_of(response.reserved, [](const std::uint64_t value) {
             return value == 0;
           })) {
-        close_response_handles(response);
         stop();
         return frame_io_e::invalid_data;
+      }
+      if (!duplicate_response_handles(response)) {
+        stop();
+        return frame_io_e::transport_error;
       }
       resources = {
         response.generation,
@@ -333,6 +336,27 @@ namespace platf::virtual_display {
         close_response_handles(response);
         stop();
         return frame_io_e::invalid_data;
+      }
+      const auto texture_identity = compare_direct_frame_handle_identity(
+        resources.texture_handles[0],
+        resources.texture_handles[1]
+      );
+      const auto fence_identity = compare_direct_frame_handle_identity(
+        resources.fence_handles[0],
+        resources.fence_handles[1]
+      );
+      if (texture_identity == direct_frame_handle_identity_e::alias ||
+          fence_identity == direct_frame_handle_identity_e::alias) {
+        runtime_quarantined.store(true, std::memory_order_release);
+        close_response_handles(response);
+        stop();
+        return frame_io_e::invalid_data;
+      }
+      if (texture_identity == direct_frame_handle_identity_e::unavailable_or_error ||
+          fence_identity == direct_frame_handle_identity_e::unavailable_or_error) {
+        BOOST_LOG(warning)
+          << "Windows cannot compare one or more VDD shared kernel-handle types; "sv
+             "relying on driver-side resource identity validation"sv;
       }
 
       ComPtr<IDXGIFactory1> factory;
@@ -360,17 +384,22 @@ namespace platf::virtual_display {
 
       DXGI_ADAPTER_DESC1 description {};
       LARGE_INTEGER driver_version {};
-      const auto probe = platf::dxgi::encoder_probe_device_identity();
-      if (!adapter || FAILED(adapter->GetDesc1(&description)) || description.VendorId != 0x10de ||
-          resources.adapter_luid != *expected_luid || description.DeviceId != *expected_device ||
-          description.SubSysId != *expected_subsystem || description.Revision != *expected_revision ||
-          utf_utils::to_utf8(description.Description) != *model_gate ||
-          FAILED(adapter->CheckInterfaceSupport(IID_IDXGIDevice, &driver_version)) ||
-          static_cast<std::uint64_t>(driver_version.QuadPart) != *expected_driver || !probe ||
-          probe->adapter_luid != resources.adapter_luid ||
-          probe->vendor_id != description.VendorId || probe->device_id != description.DeviceId ||
-          probe->subsystem_id != description.SubSysId || probe->revision != description.Revision ||
-          probe->driver_version != static_cast<std::uint64_t>(driver_version.QuadPart)) {
+      if (!adapter || FAILED(adapter->GetDesc1(&description)) ||
+          FAILED(adapter->CheckInterfaceSupport(IID_IDXGIDevice, &driver_version))) {
+        close_response_handles(response);
+        stop();
+        return frame_io_e::unsupported;
+      }
+      const direct_frame_adapter_identity_t imported_identity {
+        packed_luid(description.AdapterLuid),
+        description.VendorId,
+        description.DeviceId,
+        description.SubSysId,
+        description.Revision,
+        static_cast<std::uint64_t>(driver_version.QuadPart),
+      };
+      if (resources.adapter_luid != imported_identity.adapter_luid ||
+          !valid_direct_frame_adapter_binding(nvenc_active, imported_identity, frozen_probe_identity)) {
         close_response_handles(response);
         stop();
         return frame_io_e::unsupported;
@@ -412,6 +441,7 @@ namespace platf::virtual_display {
               reinterpret_cast<HANDLE>(resources.texture_handles[slot]),
               IID_PPV_ARGS(&textures[slot])
             )) ||
+            FAILED(textures[slot].As(&keyed_mutexes[slot])) ||
             FAILED(device5->OpenSharedFence(
               reinterpret_cast<HANDLE>(resources.fence_handles[slot]),
               IID_PPV_ARGS(&fences[slot])
@@ -424,7 +454,12 @@ namespace platf::virtual_display {
         if (texture_desc.Width != resources.width || texture_desc.Height != resources.height ||
             texture_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
             texture_desc.MipLevels != 1 || texture_desc.ArraySize != 1 ||
-            texture_desc.SampleDesc.Count != 1) {
+            texture_desc.SampleDesc.Count != 1 || texture_desc.Usage != D3D11_USAGE_DEFAULT ||
+            (texture_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
+            texture_desc.CPUAccessFlags != 0 ||
+            (texture_desc.MiscFlags &
+             (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) !=
+              (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) {
           stop();
           return frame_io_e::invalid_data;
         }
@@ -468,7 +503,19 @@ namespace platf::virtual_display {
               fail_locked(true);
               return {frame_io_e::invalid_data, {}};
             }
+            if (keyed_mutexes[frame.slot]->AcquireSync(
+                  lumen::vdd::frame::host_acquire_key(frame.producer_fence_value),
+                  0
+                ) != S_OK) {
+              fail_locked(true);
+              return {frame_io_e::unsupported, {}};
+            }
+            keyed_owned[frame.slot] = true;
             if (FAILED(context4->Wait(fences[frame.slot].Get(), frame.producer_fence_value))) {
+              static_cast<void>(keyed_mutexes[frame.slot]->ReleaseSync(
+                lumen::vdd::frame::producer_return_key(frame.producer_fence_value)
+              ));
+              keyed_owned[frame.slot] = false;
               fail_locked(true);
               return {frame_io_e::unsupported, {}};
             }
@@ -512,11 +559,18 @@ namespace platf::virtual_display {
         fail_locked(true);
         return;
       }
-      const auto consumer_fence = frame.producer_fence_value + 1;
+      const auto consumer_fence = lumen::vdd::frame::producer_return_key(frame.producer_fence_value);
       if (FAILED(context4->Signal(fences[frame.slot].Get(), consumer_fence))) {
+        static_cast<void>(keyed_mutexes[frame.slot]->ReleaseSync(consumer_fence));
+        keyed_owned[frame.slot] = false;
         fail_locked(true);
         return;
       }
+      if (keyed_mutexes[frame.slot]->ReleaseSync(consumer_fence) != S_OK) {
+        fail_locked(true);
+        return;
+      }
+      keyed_owned[frame.slot] = false;
       const LUMEN_VDD_RELEASE_FRAME_REQUEST request {
         frame.generation,
         frame.sequence,
@@ -589,6 +643,70 @@ namespace platf::virtual_display {
       return transferred == output_size ? frame_io_e::ok : frame_io_e::invalid_data;
     }
 
+    bool bind_source_process(const std::uint32_t process_id, const std::uint64_t creation_time) noexcept {
+      if (source_process != nullptr) {
+        return process_id == source_process_id && creation_time == source_process_creation_time &&
+               WaitForSingleObject(source_process, 0) == WAIT_TIMEOUT;
+      }
+      HANDLE process = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+      if (process == nullptr || WaitForSingleObject(process, 0) != WAIT_TIMEOUT ||
+          packed_process_creation_time(process) != creation_time) {
+        if (process != nullptr) {
+          CloseHandle(process);
+        }
+        return false;
+      }
+      source_process = process;
+      source_process_id = process_id;
+      source_process_creation_time = creation_time;
+      return true;
+    }
+
+    bool duplicate_source_handle(const std::uint64_t raw_source, HANDLE &duplicate) const noexcept {
+      duplicate = nullptr;
+      return source_process != nullptr && raw_source != 0 && WaitForSingleObject(source_process, 0) == WAIT_TIMEOUT &&
+             DuplicateHandle(
+               source_process,
+               reinterpret_cast<HANDLE>(raw_source),
+               GetCurrentProcess(),
+               &duplicate,
+               0,
+               FALSE,
+               DUPLICATE_SAME_ACCESS
+             );
+    }
+
+    bool duplicate_response_handles(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response) const noexcept {
+      std::array<HANDLE, LUMEN_VDD_FRAME_SLOT_COUNT * 2> duplicates {};
+      std::size_t count = 0;
+      const auto close_partial = [&]() {
+        for (std::size_t index = 0; index < count; ++index) {
+          CloseHandle(duplicates[index]);
+        }
+      };
+      for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
+        if (!duplicate_source_handle(response.texture_handles[slot], duplicates[count])) {
+          close_partial();
+          return false;
+        }
+        ++count;
+      }
+      for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
+        if (!duplicate_source_handle(response.fence_handles[slot], duplicates[count])) {
+          close_partial();
+          return false;
+        }
+        ++count;
+      }
+      for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
+        response.texture_handles[slot] = reinterpret_cast<std::uint64_t>(duplicates[slot]);
+        response.fence_handles[slot] = reinterpret_cast<std::uint64_t>(
+          duplicates[LUMEN_VDD_FRAME_SLOT_COUNT + slot]
+        );
+      }
+      return true;
+    }
+
     static void close_response_handles(const LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response) noexcept {
       for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
         if (response.texture_handles[slot] != 0) {
@@ -605,18 +723,33 @@ namespace platf::virtual_display {
         runtime_quarantined.store(true, std::memory_order_release);
       }
       healthy = false;
+      for (std::size_t slot = 0; slot < direct_frame_slot_count; ++slot) {
+        if (keyed_owned[slot] && keyed_mutexes[slot] && last_fence[slot] != std::numeric_limits<std::uint64_t>::max()) {
+          static_cast<void>(keyed_mutexes[slot]->ReleaseSync(
+            lumen::vdd::frame::producer_return_key(last_fence[slot])
+          ));
+          keyed_owned[slot] = false;
+        }
+      }
       if (cancel_event != nullptr) {
         SetEvent(cancel_event);
       }
       if (device_handle != INVALID_HANDLE_VALUE) {
         CloseHandle(std::exchange(device_handle, INVALID_HANDLE_VALUE));
       }
+      if (source_process != nullptr) {
+        CloseHandle(std::exchange(source_process, nullptr));
+      }
     }
 
     std::uint64_t generation {};  ///< Exact active driver generation.
     mode_t mode;  ///< Exact selected mode.
+    std::optional<direct_frame_adapter_identity_t> frozen_probe_identity;  ///< Encoder identity frozen at selection.
     mutable std::mutex mutex;  ///< Serializes IOCTLs and slot ownership.
     HANDLE device_handle {INVALID_HANDLE_VALUE};  ///< Concrete secured VDD device interface.
+    HANDLE source_process {};  ///< Validated live WUDFHost source for reverse handle duplication.
+    std::uint32_t source_process_id {};  ///< Exact source PID retained with its process handle.
+    std::uint64_t source_process_creation_time {};  ///< Exact source creation FILETIME preventing PID reuse.
     HANDLE availability_event {};  ///< Driver-published resource/frame availability event.
     HANDLE cancel_event {};  ///< Host cancellation event for bounded waits.
     frame_resources_t resources;  ///< Validated imported resource metadata.
@@ -627,8 +760,10 @@ namespace platf::virtual_display {
     ComPtr<ID3D11DeviceContext> context;  ///< Multithread-protected immediate context.
     ComPtr<ID3D11DeviceContext4> context4;  ///< Fence wait/signal interface.
     std::array<ComPtr<ID3D11Texture2D>, direct_frame_slot_count> textures;  ///< Imported slots.
+    std::array<ComPtr<IDXGIKeyedMutex>, direct_frame_slot_count> keyed_mutexes;  ///< Imported ownership handoffs.
     std::array<ComPtr<ID3D11Fence>, direct_frame_slot_count> fences;  ///< Imported slot fences.
     std::array<bool, direct_frame_slot_count> in_use {};  ///< Host-owned slots.
+    std::array<bool, direct_frame_slot_count> keyed_owned {};  ///< Host currently owns each keyed mutex.
     std::array<std::uint64_t, direct_frame_slot_count> leased_sequence {};  ///< Exact active slot sequences.
     std::array<std::uint64_t, direct_frame_slot_count> last_fence {};  ///< Last producer value per slot.
     std::uint64_t last_sequence {};  ///< Last globally dequeued sequence.

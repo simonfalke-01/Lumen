@@ -1,6 +1,7 @@
 ;
 ; LumenVirtualDisplay.inf
-; UMDF2 IddCx 1.2 virtual display for Windows 10 1903 and later.
+; UMDF 2.25 virtual display built with IddCx 1.10 headers, minimum 1.4,
+; and downlevel IddCx0102 extension binding for Windows 10 1903 and later.
 ;
 
 [Version]
@@ -56,7 +57,7 @@ UmdfServiceOrder=LumenVirtualDisplay
 UmdfKernelModeClientPolicy=AllowKernelModeClients
 
 [LumenVdd_Service]
-UmdfLibraryVersion=2.23.0
+UmdfLibraryVersion=2.25.0
 ServiceBinary=%13%\LumenVirtualDisplay.dll
 UmdfExtensions=IddCx0102
 

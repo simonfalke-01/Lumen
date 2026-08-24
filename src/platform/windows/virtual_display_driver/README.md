@@ -13,16 +13,18 @@ handoff, not to the encoded, transported, decoded, or displayed stream.
 
 - Windows 10 version 1903 (build 18362) or later, x64.
 - Visual Studio 2022 with Windows SDK/WDK 10.0.26100.0.
-- UMDF 2.23 and IddCx 1.2 (`IddCx0102`).
+- UMDF 2.25 with IddCx 1.10 headers, a minimum required IddCx version of 1.4,
+  and the downlevel `IddCx0102` extension binding.
 - `IddCxAdapterInitAsync`, `IddCxMonitorCreate`, `IddCxMonitorArrival`,
-  `IddCxMonitorDeparture`, the default/target mode callbacks, and the IddCx
-  swap-chain acquire/finish APIs.
+  `IddCxMonitorDeparture`, `IddCxAdapterSetRenderAdapter`, the default/target
+  mode callbacks, and the IddCx swap-chain acquire/finish APIs.
 - `QueryDisplayConfig`, `SetDisplayConfig`, and
   `DisplayConfigGetDeviceInfo` are used by the host coordinator, not by the
   driver.
 
-IddCx 1.2 is available throughout Lumen's supported Windows version range. The
-driver requires 1.4 rather than using untested runtime down-level shims.
+IddCx 1.4 is available throughout Lumen's supported Windows version range and
+is the production minimum. Newer IddCx-only features remain gated until their
+separate Windows and hardware validation is complete.
 
 ## Exact mode contract
 
@@ -31,6 +33,8 @@ The current baseline accepts practical even modes from 256x200 through
 bounded by total pixels, pixel rate, the active GPU, and the selected encoder.
 It reports exactly one dynamic monitor/target mode per generation. The host
 rejects any driver or DisplayConfig adjustment; it never silently clamps.
+The permanent connector is EDID-less by design so IddCx obtains the exact
+session mode exclusively through the default and target-mode callbacks.
 
 The baseline handoff is explicitly SDR, 8-bit BGRA with no format loss inside
 the VDD surface boundary. This is not an end-to-end lossless-stream claim. IddCx 1.10
@@ -44,7 +48,8 @@ clear and HDR requests fall back before VDD mutation.
   open the control interface.
 - All mutating IOCTLs require write access, exact packed sizes, the real
   requestor PID, the owning WDF file object, and a nonzero monotonic generation.
-- ABI v3 reports the driver's retained generation floor, so a restarted Lumen
+- ABI v4 reports the driver's retained generation floor and requested/actual
+  render-adapter LUIDs, so a restarted Lumen
   service continues above it instead of reusing a fenced generation.
 - One process/file/generation owns the driver. Same-request retries are
   idempotent; other sessions receive busy/access-denied.
@@ -55,7 +60,7 @@ clear and HDR requests fall back before VDD mutation.
 
 ## Direct-frame contract
 
-ABI v3 implements one concrete, hardware-gated capture path. After IddCx assigns
+ABI v4 implements one concrete, hardware-gated capture path. After IddCx assigns
 the swap chain, the driver creates exactly two persistent BGRA8 shared textures
 and one shared D3D11 fence per texture on the IddCx render adapter. For each
 accepted desktop surface the driver performs at most one `CopyResource` into a
@@ -63,35 +68,45 @@ safe slot, signals that slot's odd producer fence value, and finishes the IddCx
 frame. This is a one-copy path, not zero-copy.
 
 The Lumen service opens the secured device as the exact prepared owner process.
-The driver duplicates only unnamed texture/fence handles directly into that
-process. The host validates ABI generation, mode, adapter LUID, unique handles,
-texture descriptors, and the exact validated RTX 4060/NVIDIA driver identity
-before importing either slot. A driver-published auto-reset event wakes bounded
-resource and frame waits; the Latency path performs no millisecond polling.
-The host GPU-waits the producer fence, passes the
-imported texture through same-device conversion and NVENC, then signals the even
-consumer fence and releases the exact generation/sequence/slot. The driver never
-overwrites an acquired slot. A failed GPU wait, copy-device health check, or
-fence signal quarantines every direct slot for that generation and wakes the
-host so capture can fall back without reusing unproven memory.
+After exact requestor PID/file/generation authorization, the driver publishes
+raw unnamed WUDFHost event, texture, and fence handles with the source PID and
+process creation time. The LocalSystem host pins that live source process,
+checks its creation time to prevent PID-reuse substitution, and reverse-
+duplicates each handle into itself. The host validates ABI generation, mode,
+adapter LUID, unique handles, texture descriptors, and the exact validated RTX
+4060/NVIDIA driver identity before importing either slot. A driver-published
+auto-reset event wakes bounded resource and frame waits; the Latency path
+performs no millisecond polling.
+For each slot, the driver acquires the current even keyed-mutex value, submits
+the copy and odd producer fence, then releases that odd key to the host. The
+host acquires the odd key, GPU-waits the producer fence, passes the imported
+texture through same-device conversion and NVENC, signals the next even
+consumer fence, and releases the same even key back to the producer on exact
+lease release. The driver never overwrites an acquired or ready slot. Any
+keyed-mutex, GPU wait, copy-device health, fence, descriptor, or terminal IddCx
+failure quarantines every direct slot for that generation and wakes the host so
+capture can fall back without reusing unproven memory.
 
-The production host keeps this path disabled unless all of the following are
-present and exact: `LUMEN_EXPERIMENTAL_VDD_DIRECT_FRAME=1`,
-`LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_HARDWARE_VALIDATED=RTX4060`,
-`LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_MODEL`, and
-`LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_VALIDATED_DRIVER`. The packed adapter
-LUID, PCI device ID, PCI subsystem ID, and PCI revision must also exactly match
-the `LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_ADAPTER_LUID`,
-`LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_DEVICE_ID`,
-`LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_SUBSYSTEM_ID`, and
-`LUMEN_EXPERIMENTAL_FUSED_D3D11_NVENC_REVISION` decimal values. The current committed
-NVENC probe must also match the driver render-adapter LUID, PCI identity, and
-UMD driver version. These gates prevent a successful build from being treated
-as hardware validation.
+The textures use the NT-handle and keyed-mutex creation flags required by
+`IDXGIResource1::CreateSharedHandle`. The keyed mutex provides bounded CPU-side
+slot ownership; the explicit shared D3D11 fence provides GPU ordering and timing
+telemetry.
 
-Latency mode may replace only the oldest ready, unleased slot. Quality mode
-preserves ready FIFO order and drops a new IddCx surface when both slots are
-occupied. If any capability, identity, handle, fence, import, timeout, conversion,
+PREPARE carries the exact adapter identity frozen by the active encoder probe.
+Before monitor arrival the driver submits that LUID through
+`IddCxAdapterSetRenderAdapter`. The API is a preference, so the actual
+`EvtIddCxMonitorAssignSwapChain.RenderAdapterLuid` remains authoritative. A
+mismatch disables direct-frame publication for that generation while leaving
+the VDD available to the established DDA/WGC fallback.
+
+Direct-frame activation requires an active NVENC encoder and exact agreement
+between the frozen encoder identity and the imported VDD adapter LUID, PCI
+identity, revision, and UMD driver version. Missing or mismatched identity data
+fails closed to DDA/WGC; there are no manual environment-variable gates.
+
+Latency and Quality modes both preserve keyed-mutex ownership and ready-slot
+order, dropping a new IddCx surface when both slots are occupied. If any
+capability, identity, handle, fence, import, timeout, conversion,
 or NVENC boundary fails, Lumen quarantines the direct source and reinitializes on
 the existing DDA/WGC path for the already-active virtual display.
 

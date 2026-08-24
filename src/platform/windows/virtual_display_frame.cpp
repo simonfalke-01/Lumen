@@ -17,6 +17,17 @@ namespace platf::virtual_display {
     std::atomic_bool portable_runtime_quarantined {false};  ///< Mirrors sticky host behavior in portable tests.
   }
 #endif
+  bool valid_direct_frame_adapter_binding(
+    const bool nvenc_active,
+    const direct_frame_adapter_identity_t &imported,
+    const std::optional<direct_frame_adapter_identity_t> &encoder_probe
+  ) noexcept {
+    constexpr std::uint32_t nvidia_vendor_id = 0x10de;
+    return nvenc_active && imported.adapter_luid != 0 && imported.vendor_id == nvidia_vendor_id &&
+           imported.device_id != 0 && imported.driver_version != 0 && encoder_probe &&
+           imported == *encoder_probe;
+  }
+
   bool valid_frame_resources(
     const frame_resources_t &resources,
     const std::uint64_t generation,

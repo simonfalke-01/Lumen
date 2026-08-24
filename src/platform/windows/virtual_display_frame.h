@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 // local includes
 #include "src/platform/common.h"
@@ -46,6 +47,51 @@ namespace platf::virtual_display {
     std::array<std::uintptr_t, direct_frame_slot_count> texture_handles {};  ///< Duplicated texture handles.
     std::array<std::uintptr_t, direct_frame_slot_count> fence_handles {};  ///< Duplicated fence handles.
   };
+
+  /** @brief Adapter identity required at the VDD-import and active-NVENC boundary. */
+  struct direct_frame_adapter_identity_t {
+    std::uint64_t adapter_luid {};  ///< Packed DXGI adapter LUID.
+    std::uint32_t vendor_id {};  ///< PCI vendor identifier.
+    std::uint32_t device_id {};  ///< PCI device identifier.
+    std::uint32_t subsystem_id {};  ///< PCI subsystem identifier.
+    std::uint32_t revision {};  ///< PCI revision.
+    std::uint64_t driver_version {};  ///< DXGI UMD driver version.
+
+    bool operator==(const direct_frame_adapter_identity_t &) const = default;
+  };
+
+  /**
+   * @brief Validate the imported VDD adapter against the active encoder probe.
+   * @param nvenc_active Whether the committed active encoder backend is NVENC.
+   * @param imported Exact identity queried from the adapter named by the ABI v4 response.
+   * @param encoder_probe Exact adapter identity retained by the active encoder probe.
+   * @return True only for one complete NVIDIA identity with exact LUID/PCI/driver agreement.
+   */
+  [[nodiscard]] bool valid_direct_frame_adapter_binding(
+    bool nvenc_active,
+    const direct_frame_adapter_identity_t &imported,
+    const std::optional<direct_frame_adapter_identity_t> &encoder_probe
+  ) noexcept;
+
+#if defined(_WIN32)
+  /** @brief Kernel-object comparison result for two direct-frame handles. */
+  enum class direct_frame_handle_identity_e {
+    distinct,  ///< Handles are valid and name different kernel objects.
+    alias,  ///< Handles name the same underlying kernel object.
+    unavailable_or_error,  ///< Comparator is unavailable or cannot decide for this kernel-object type.
+  };
+
+  /**
+   * @brief Compare two still-open direct-frame handles by kernel-object identity.
+   * @param first First duplicated texture or fence handle.
+   * @param second Second duplicated texture or fence handle.
+   * @return Alias, proven distinct, or an indeterminate unavailable/error state.
+   */
+  [[nodiscard]] direct_frame_handle_identity_e compare_direct_frame_handle_identity(
+    std::uintptr_t first,
+    std::uintptr_t second
+  ) noexcept;
+#endif
 
   /** @brief One completed driver copy leased through conversion and NVENC completion. */
   struct frame_descriptor_t {

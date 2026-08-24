@@ -1198,7 +1198,7 @@ The key retains its upstream name for compatibility with existing configuration 
             Select whether Lumen's owned virtual display is used for modern or legacy sessions.
             Lumen only activates a mode when the requested width, height, and reduced refresh rational are applied exactly.
             SDR and HDR requests must also match the exact negotiated bit depth and display capabilities.
-            The ABI v3 driver can use the explicitly hardware-gated two-slot one-copy path.
+            The ABI v4 driver can use the explicitly hardware-gated two-slot one-copy path.
             If its capability, adapter identity, shared handle, fence, timeout, conversion, or NVENC boundary is unavailable, capture falls back to DDA/WGC on the active VDD output.
             @note{Applies to Windows only.}
         </td>

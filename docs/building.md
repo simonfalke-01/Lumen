@@ -279,21 +279,21 @@ msbuild src\platform\windows\virtual_display_driver\LumenVirtualDisplay.vcxproj 
 ```
 
 Portable tests cover mode arithmetic, ABI layouts, generation and lease
-lifecycle, rollback, EDID policy, and exact-one connector selection. ABI 3 adds
-two persistent shared texture/fence slots and a bounded event-driven frame
-channel. The driver performs one GPU `CopyResource` from each accepted IddCx
-surface into a safe slot; this is a one-copy path, not zero-copy. Regular and
-lite packages continue to use DDA/WGC, while only the strict complete profile
-accepts the separately built driver package. Public release still requires
-Windows validation of swap-chain lifetime, first activation, InfVerif, and
-Microsoft-signed catalogs. HDR and latency claims remain outside the portable
-test boundary. See the
+lifecycle, rollback, stable-container selection, and render-adapter binding.
+ABI 4 adds two persistent shared texture/fence slots, PID-reuse-safe reverse
+handle duplication, and a bounded event-driven frame channel. The driver
+performs one GPU `CopyResource` from each accepted IddCx surface into a safe
+slot; this is a one-copy path, not zero-copy. Regular and lite packages continue
+to use DDA/WGC, while only the strict complete profile accepts the separately
+built driver package. Public release still requires Microsoft-signed catalogs
+and full MSI lifecycle validation. HDR and latency claims remain separate
+hardware gates. See the
 [driver README](../src/platform/windows/virtual_display_driver/README.md) for
 the exact validation boundary.
 
 ##### Complete Windows profile
 
-The complete MSI includes the MsQuic ABI 2 runtime and the Virtual HID,
+The complete MSI includes the MsQuic ABI 3 runtime and the Virtual HID,
 Virtual Microphone, and Virtual Display packages. Build it with the strict
 PowerShell entry point:
 
@@ -321,7 +321,7 @@ application. The script extracts the frozen archive into a disjoint staging
 tree, verifies every extracted path, byte count, and SHA-256 value against
 `full-profile-files.json`, and builds every driver, shim, test, and package only
 from that immutable snapshot. After signed packages are supplied, it verifies
-the source-freeze identity, kernel signing, and catalog coverage; derives the ABI 2
+the source-freeze identity, kernel signing, and catalog coverage; derives the ABI 3
 DLL/import-library hashes from the actual MSVC outputs; builds with
 `LUMEN_WINDOWS_FULL_PROFILE=ON`; synchronizes the locked Python environment
 without downloading another interpreter; builds with warnings as errors; runs

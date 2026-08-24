@@ -587,7 +587,7 @@ namespace platf::dxgi::fused_d3d11 {
     latency_percentiles_t nvenc_wait_and_bitstream_lock;  ///< Post-encode call return through async wait and lock return.
     latency_percentiles_t bitstream_lock_to_sender_dequeue;  ///< Successful lock return to sender-thread queue dequeue.
     latency_percentiles_t capture_acquired_to_sender_dequeue;  ///< Host software proxy; not scanout or input-to-photon.
-    std::uint64_t vdd_generation = 0;  ///< Exact ABI3 generation for direct-frame stage samples.
+    std::uint64_t vdd_generation = 0;  ///< Exact ABI v4 generation for direct-frame stage samples.
     latency_percentiles_t vdd_acquire_to_producer_signal;  ///< IddCx acquisition to producer fence submission.
     latency_percentiles_t vdd_producer_signal_to_host_wait;  ///< Producer fence submission to completed host GPU wait.
   };
@@ -805,7 +805,7 @@ namespace platf::dxgi::fused_d3d11 {
       last_capture_copy_submitted_ns_.store(now_ns(), std::memory_order_relaxed);
     }
 
-    /** @brief Record one exact ABI3 driver copy/fence-submission duration. */
+    /** @brief Record one exact ABI v4 driver copy/fence-submission duration. */
     void record_vdd_driver_copy(std::uint64_t generation, std::uint64_t duration_ns) noexcept {
       if (generation == 0) {
         return;
@@ -814,7 +814,7 @@ namespace platf::dxgi::fused_d3d11 {
       vdd_acquire_to_producer_signal_.record(generation, duration_ns);
     }
 
-    /** @brief Record one exact ABI3 producer-signal to host-wait duration. */
+    /** @brief Record one exact ABI v4 producer-signal to host-wait duration. */
     void record_vdd_host_wait(std::uint64_t generation, std::uint64_t duration_ns) noexcept {
       if (generation == 0) {
         return;
@@ -1587,7 +1587,7 @@ namespace platf::dxgi::fused_d3d11 {
     bounded_latency_window_t<frame_capacity> nvenc_wait_and_bitstream_lock_;
     bounded_latency_window_t<frame_capacity> bitstream_lock_to_sender_dequeue_;
     bounded_latency_window_t<frame_capacity> capture_acquired_to_sender_dequeue_;
-    std::atomic<std::uint64_t> vdd_generation_ {0};  ///< Active ABI3 direct-frame generation.
+    std::atomic<std::uint64_t> vdd_generation_ {0};  ///< Active ABI v4 direct-frame generation.
     bounded_latency_window_t<frame_capacity> vdd_acquire_to_producer_signal_;
     bounded_latency_window_t<frame_capacity> vdd_producer_signal_to_host_wait_;
   };

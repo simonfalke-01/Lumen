@@ -1639,6 +1639,22 @@ namespace video {
     return chosen_encoder != nullptr && chosen_encoder->name == "nvenc"sv;
   }
 
+  std::optional<encoder_probe_device_identity_t> active_encoder_probe_device_identity() {
+    const auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    const auto current_identity = current_encoder_probe_identity();
+    const bool valid_generation = chosen_encoder_probe_cache.can_reuse(
+      chosen_encoder != nullptr,
+      chosen_encoder && (chosen_encoder->flags & ALWAYS_REPROBE),
+      platf::needs_encoder_reenumeration(),
+      current_identity
+    );
+    const auto &committed_identity = chosen_encoder_probe_cache.identity();
+    if (!valid_generation || !committed_identity || !committed_identity->device_identity) {
+      return std::nullopt;
+    }
+    return committed_identity->device_identity;
+  }
+
   /**
    * @brief Recreate a display capture object after a capture failure.
    *

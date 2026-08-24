@@ -748,6 +748,12 @@ namespace video {
   [[nodiscard]] bool active_encoder_is_nvenc();
 
   /**
+   * @brief Return the exact device identity from the committed active encoder probe generation.
+   * @return Frozen adapter/output/driver identity only while the chosen probe cache is current.
+   */
+  [[nodiscard]] std::optional<encoder_probe_device_identity_t> active_encoder_probe_device_identity();
+
+  /**
    * @brief Extract the decoder initialization bytes from one encoded key frame.
    *
    * H.264 and HEVC return Annex-B parameter-set NAL units. AV1 returns the

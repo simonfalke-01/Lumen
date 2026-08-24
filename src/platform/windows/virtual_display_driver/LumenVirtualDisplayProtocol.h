@@ -20,7 +20,7 @@ extern "C" {
 #endif
 
 /** Fixed driver ABI version. */
-#define LUMEN_VDD_ABI_VERSION 3u
+#define LUMEN_VDD_ABI_VERSION 4u
 /** Maximum supported width in the baseline SDR driver. */
 #define LUMEN_VDD_MAX_WIDTH 8192u
 /** Maximum supported height in the baseline SDR driver. */
@@ -41,6 +41,8 @@ extern "C" {
 #define LUMEN_VDD_CAP_LOSSLESS 0x00000020u
 /** Driver capability: explicit validated visually-lossless conversion. */
 #define LUMEN_VDD_CAP_VISUALLY_LOSSLESS 0x00000040u
+/** Driver capability: runtime IddCx render-adapter preference submission. */
+#define LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE 0x00000080u
 
 /** Dynamic range values in the fixed control ABI. */
 #define LUMEN_VDD_DYNAMIC_RANGE_SDR 0u
@@ -106,6 +108,10 @@ extern "C" {
     uint32_t monitor_started;  ///< One when present.
     LUMEN_VDD_MODE mode;  ///< Current exact mode.
     uint64_t last_generation;  ///< Highest generation admitted since driver start.
+    uint64_t preferred_render_adapter_luid;  ///< Exact packed encoder adapter requested for this generation.
+    uint64_t assigned_render_adapter_luid;  ///< Exact packed adapter from the most recent swap-chain assignment.
+    uint32_t render_adapter_preference_submitted;  ///< One when IddCx accepted the preference API call.
+    uint32_t reserved;  ///< Must be zero.
   } LUMEN_VDD_QUERY_STATE_RESPONSE;
 
   /** Prepare an exact mode for a new or idempotent generation. */
@@ -113,6 +119,7 @@ extern "C" {
     uint64_t generation;  ///< Nonzero strictly newer generation, or exact idempotent retry.
     uint32_t owner_process_id;  ///< Calling service PID.
     uint32_t reserved;  ///< Must be zero.
+    uint64_t preferred_render_adapter_luid;  ///< Nonzero packed LUID from the active encoder probe.
     LUMEN_VDD_MODE mode;  ///< Exact requested mode.
   } LUMEN_VDD_PREPARE_MODE_REQUEST;
 
@@ -120,7 +127,9 @@ extern "C" {
   typedef struct LUMEN_VDD_PREPARE_MODE_RESPONSE {
     LUMEN_VDD_MODE mode;  ///< Exact mode exposed by IddCx.
     uint8_t fidelity;  ///< LUMEN_VDD_FIDELITY_*.
-    uint8_t reserved[7];  ///< Must be zero.
+    uint8_t render_adapter_preference_submitted;  ///< One when the runtime preference API was called.
+    uint8_t reserved[6];  ///< Must be zero.
+    uint64_t preferred_render_adapter_luid;  ///< Exact requested packed LUID.
     char connector_id_utf8[128];  ///< NUL-terminated stable connector ID.
   } LUMEN_VDD_PREPARE_MODE_RESPONSE;
 
@@ -136,23 +145,29 @@ extern "C" {
     uint32_t reserved;  ///< Must be zero.
   } LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST;
 
-  /** Two persistent driver-owned texture/fence pairs duplicated into the owner process. */
+  /** Two persistent driver-owned texture/fence pairs published for authorized reverse duplication. */
   typedef struct LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE {
     uint64_t generation;  ///< Exact active generation.
     uint64_t adapter_luid;  ///< Packed render-adapter LUID used by the IddCx swap chain.
+    uint32_t source_process_id;  ///< WUDFHost process that owns the raw unnamed handles.
+    uint32_t source_reserved;  ///< Must be zero.
+    uint64_t source_process_creation_time;  ///< Exact packed FILETIME preventing PID-reuse confusion.
     uint32_t width;  ///< Exact texture width.
     uint32_t height;  ///< Exact texture height.
     uint32_t texture_format;  ///< LUMEN_VDD_FRAME_FORMAT_*.
     uint32_t slot_count;  ///< Must equal LUMEN_VDD_FRAME_SLOT_COUNT.
-    uint64_t texture_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Owner-process NT handles for shared textures.
-    uint64_t fence_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Owner-process NT handles for shared D3D11 fences.
+    uint64_t texture_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Raw WUDFHost NT handles for shared textures.
+    uint64_t fence_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Raw WUDFHost NT handles for shared D3D11 fences.
     uint64_t reserved[2];  ///< Must be zero.
   } LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE;
 
-  /** Driver-published auto-reset event duplicated into the exact owner process. */
+  /** Driver-published auto-reset event exposed for authorized reverse duplication. */
   typedef struct LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE {
     uint64_t generation;  ///< Exact active generation.
-    uint64_t event_handle;  ///< Owner-process handle signaled for resource/frame availability.
+    uint32_t source_process_id;  ///< WUDFHost process that owns the raw unnamed event handle.
+    uint32_t source_reserved;  ///< Must be zero.
+    uint64_t source_process_creation_time;  ///< Exact packed FILETIME preventing PID-reuse confusion.
+    uint64_t event_handle;  ///< Raw WUDFHost handle duplicated by the authorized caller.
     uint64_t reserved;  ///< Must be zero.
   } LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE;
 
@@ -187,13 +202,13 @@ extern "C" {
 #define LUMEN_VDD_STATIC_ASSERT(expression, name) typedef char lumen_vdd_static_assert_##name[(expression) ? 1 : -1]
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_MODE) == 20, mode_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_ABI_RESPONSE) == 56, query_abi_size);
-  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_STATE_RESPONSE) == 44, query_state_size);
-  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_PREPARE_MODE_REQUEST) == 36, prepare_request_size);
-  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_PREPARE_MODE_RESPONSE) == 156, prepare_response_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_STATE_RESPONSE) == 68, query_state_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_PREPARE_MODE_REQUEST) == 44, prepare_request_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_PREPARE_MODE_RESPONSE) == 164, prepare_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_GENERATION_REQUEST) == 8, generation_request_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST) == 16, open_frame_request_size);
-  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE) == 80, open_frame_response_size);
-  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE) == 24, open_frame_event_response_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE) == 96, open_frame_response_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE) == 40, open_frame_event_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_DEQUEUE_FRAME_REQUEST) == 8, dequeue_frame_request_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_DEQUEUE_FRAME_RESPONSE) == 48, dequeue_frame_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_RELEASE_FRAME_REQUEST) == 40, release_frame_request_size);
