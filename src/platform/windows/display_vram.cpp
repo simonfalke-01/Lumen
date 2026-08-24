@@ -3,6 +3,7 @@
  * @brief Definitions for handling video ram.
  */
 // standard includes
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -34,6 +35,7 @@ extern "C" {
 #include "src/logging.h"
 #include "src/nvenc/nvenc_config.h"
 #include "src/nvenc/nvenc_dynamic_factory.h"
+#include "src/nvenc/nvenc_hdr_metadata.h"
 #include "src/stream_policy.h"
 #include "src/video.h"
 #include "utf_utils.h"
@@ -95,6 +97,29 @@ namespace platf::dxgi {
     /** @brief Map the exact immutable negotiation/transport source without inference. */
     fused_d3d11::telemetry_client_e telemetry_client(const ::video::config_t &config) noexcept {
       return fused_d3d11::telemetry_client_for(config.client_protocol);
+    }
+
+    /** @brief Read and validate the exact HDR10 static block from the active capture display. */
+    std::optional<nvenc::hdr_static_metadata_t> active_hdr_static_metadata(display_vram_t &display) {
+      SS_HDR_METADATA metadata {};
+      if (!display.is_hdr() || !display.get_hdr_metadata(metadata)) {
+        return std::nullopt;
+      }
+      const nvenc::hdr_static_metadata_t converted {
+        std::array<nvenc::hdr_chromaticity_t, 3> {{
+          {metadata.displayPrimaries[0].x, metadata.displayPrimaries[0].y},
+          {metadata.displayPrimaries[1].x, metadata.displayPrimaries[1].y},
+          {metadata.displayPrimaries[2].x, metadata.displayPrimaries[2].y},
+        }},
+        {metadata.whitePoint.x, metadata.whitePoint.y},
+        metadata.maxDisplayLuminance,
+        metadata.minDisplayLuminance,
+        metadata.maxContentLightLevel,
+        metadata.maxFrameAverageLightLevel,
+      };
+      return nvenc::valid_hdr_static_metadata(converted) ?
+               std::optional {converted} :
+               std::nullopt;
     }
 
     /**
@@ -1685,9 +1710,15 @@ namespace platf::dxgi {
       const nvenc::nvenc_config &config,
       const ::video::config_t &client_config,
       const ::video::sunshine_colorspace_t &colorspace,
-      platf::pix_fmt_e buffer_format
+      platf::pix_fmt_e buffer_format,
+      const std::optional<nvenc::hdr_static_metadata_t> &hdr_metadata
     ) override {
-      return target_ && target_->create_encoder(config, client_config, colorspace, buffer_format);
+      return target_ && target_->create_encoder(config, client_config, colorspace, buffer_format, hdr_metadata);
+    }
+
+    /** @copydoc nvenc::nvenc_encoder::update_hdr_metadata() */
+    bool update_hdr_metadata(const nvenc::hdr_static_metadata_t &metadata) override {
+      return target_ && target_->update_hdr_metadata(metadata);
     }
 
     /** @copydoc nvenc::nvenc_encoder::destroy_encoder() */
@@ -1897,12 +1928,38 @@ namespace platf::dxgi {
         return false;
       }
 
+      std::optional<nvenc::hdr_static_metadata_t> hdr_metadata;
+      const auto transfer = colorspace.colorspace == ::video::colorspace_e::bt2020 ?
+                              nvenc::hdr_transfer_e::hdr10_pq :
+                            colorspace.colorspace == ::video::colorspace_e::bt2020hlg ?
+                              nvenc::hdr_transfer_e::hlg :
+                              nvenc::hdr_transfer_e::sdr;
+      if (transfer == nvenc::hdr_transfer_e::hdr10_pq) {
+        const auto display = resource_display.lock();
+        hdr_metadata = display ? active_hdr_static_metadata(*display) : std::nullopt;
+      }
+      const auto hdr_policy = nvenc::evaluate_hdr_metadata_policy(
+        client_config.videoFormat,
+        transfer,
+        hdr_metadata
+      );
+      if (!hdr_policy.accepted) {
+        BOOST_LOG(error) << "NVENC rejected the codec/transfer/static-metadata tuple"sv;
+        return false;
+      }
+
       base->set_telemetry_session(fused_d3d11::telemetry().begin_frame_session(
         telemetry_profile(client_config),
         telemetry_client(client_config)
       ));
 
-      if (!nvenc_d3d->create_encoder(config::video.nv, client_config, colorspace, buffer_format)) {
+      if (!nvenc_d3d->create_encoder(
+            config::video.nv,
+            client_config,
+            colorspace,
+            buffer_format,
+            hdr_metadata
+          )) {
         if (fused_path) {
           if (auto display = resource_display.lock()) {
             display->request_fused_reinit();

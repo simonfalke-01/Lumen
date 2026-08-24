@@ -6,10 +6,12 @@
 
 // standard includes
 #include <cstdint>
+#include <optional>
 
 // local includes
 #include "nvenc_config.h"
 #include "nvenc_encoded_frame.h"
+#include "nvenc_hdr_metadata.h"
 
 namespace platf {
   enum class pix_fmt_e;
@@ -39,14 +41,23 @@ namespace nvenc {
      * @param client_config Stream configuration requested by the client.
      * @param colorspace Sunshine colorspace metadata.
      * @param buffer_format Platform-agnostic input surface format.
+     * @param hdr_metadata Validated HDR10 static metadata, or empty for SDR.
      * @return `true` on success, `false` on error.
      */
     virtual bool create_encoder(
       const nvenc_config &config,
       const video::config_t &client_config,
       const video::sunshine_colorspace_t &colorspace,
-      platf::pix_fmt_e buffer_format
+      platf::pix_fmt_e buffer_format,
+      const std::optional<hdr_static_metadata_t> &hdr_metadata
     ) = 0;
+
+    /**
+     * @brief Update the validated HDR10 static block for the next encoded picture.
+     * @param metadata Complete validated mastering-display and content-light values.
+     * @return True when unchanged or queued; false when unsupported or malformed.
+     */
+    virtual bool update_hdr_metadata(const hdr_static_metadata_t &metadata) = 0;
 
     /**
      * @brief Destroy the encoder.

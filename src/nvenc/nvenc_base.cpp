@@ -666,7 +666,8 @@ namespace NVENC_NAMESPACE {
     const ::nvenc::nvenc_config &configured_nvenc,
     const video::config_t &client_config,
     const video::sunshine_colorspace_t &sunshine_colorspace,
-    platf::pix_fmt_e sunshine_buffer_format
+    platf::pix_fmt_e sunshine_buffer_format,
+    const std::optional<::nvenc::hdr_static_metadata_t> &hdr_metadata
   ) {
     const auto effective_nvenc = stream_policy::current_thread_nvenc_config(configured_nvenc);
 
@@ -679,6 +680,33 @@ namespace NVENC_NAMESPACE {
     auto fail_guard = util::fail_guard([this] {
       destroy_encoder();
     });
+
+    const auto transfer = sunshine_colorspace.colorspace == video::colorspace_e::bt2020 ?
+                            ::nvenc::hdr_transfer_e::hdr10_pq :
+                          sunshine_colorspace.colorspace == video::colorspace_e::bt2020hlg ?
+                            ::nvenc::hdr_transfer_e::hlg :
+                            ::nvenc::hdr_transfer_e::sdr;
+    const auto hdr_policy = ::nvenc::evaluate_hdr_metadata_policy(
+      client_config.videoFormat,
+      transfer,
+      hdr_metadata
+    );
+    if (!hdr_policy.accepted) {
+      BOOST_LOG(error) << "NvEnc: invalid codec/transfer/static-metadata tuple";
+      return false;
+    }
+    if (hdr_policy.attach_static_metadata) {
+#if NVENC_SDK_VERSION < 1300
+      BOOST_LOG(error) << "NvEnc: HDR10 static metadata requires NVENC SDK 13";
+      return false;
+#else
+      hdr_codec_ = client_config.videoFormat == 1 ?
+                     ::nvenc::hdr_codec_e::hevc :
+                     ::nvenc::hdr_codec_e::av1;
+      hdr_static_metadata_ = hdr_metadata;
+      hdr_static_metadata_changed_ = true;
+#endif
+    }
 
     const auto colorspace = nvenc_colorspace_from_sunshine_colorspace(sunshine_colorspace);
     const auto buffer_format = nvenc_format_from_sunshine_format(sunshine_buffer_format);
@@ -774,6 +802,11 @@ namespace NVENC_NAMESPACE {
     enc_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
     configure_rate_control(enc_config, effective_nvenc, client_config, init_params.encodeGUID);
     configure_codec(enc_config, effective_nvenc, client_config, colorspace, buffer_format, init_params.encodeGUID);
+#if NVENC_SDK_VERSION >= 1300
+    if (hdr_codec_) {
+      ::nvenc::enable_hdr_static_metadata_output(*hdr_codec_, enc_config);
+    }
+#endif
     init_params.encodeConfig = &enc_config;
     if (!initialize_encoder_resources(init_params)) {
       return false;
@@ -787,6 +820,23 @@ namespace NVENC_NAMESPACE {
     encoder_state = {};
     fail_guard.disable();
     return true;
+  }
+
+  bool nvenc_base::update_hdr_metadata(const ::nvenc::hdr_static_metadata_t &metadata) {
+#if NVENC_SDK_VERSION < 1300
+    (void) metadata;
+    return false;
+#else
+    if (!encoder || !hdr_codec_ || !::nvenc::valid_hdr_static_metadata(metadata)) {
+      return false;
+    }
+    if (hdr_static_metadata_ == metadata) {
+      return true;
+    }
+    hdr_static_metadata_ = metadata;
+    hdr_static_metadata_changed_ = true;
+    return true;
+#endif
   }
 
   void nvenc_base::destroy_encoder() {
@@ -821,6 +871,13 @@ namespace NVENC_NAMESPACE {
 
     encoder_state = {};
     encoder_params = {};
+    hdr_static_metadata_.reset();
+    hdr_codec_.reset();
+    hdr_static_metadata_changed_ = false;
+#if NVENC_SDK_VERSION >= 1300
+    mastering_display_info_ = {};
+    content_light_level_ = {};
+#endif
   }
 
   ::nvenc::nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
@@ -867,16 +924,31 @@ namespace NVENC_NAMESPACE {
       }
     });
 
+    const bool encode_idr = force_idr || hdr_static_metadata_changed_;
     NV_ENC_PIC_PARAMS pic_params = {NV_ENC_PIC_PARAMS_VER};
     pic_params.inputWidth = encoder_params.width;
     pic_params.inputHeight = encoder_params.height;
-    pic_params.encodePicFlags = force_idr ? NV_ENC_PIC_FLAG_FORCEIDR : 0;
+    pic_params.encodePicFlags = encode_idr ? NV_ENC_PIC_FLAG_FORCEIDR : 0;
     pic_params.inputTimeStamp = frame_index;
     pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     pic_params.inputBuffer = mapped_input_buffer.mappedResource;
     pic_params.bufferFmt = mapped_input_buffer.mappedBufferFmt;
     pic_params.outputBitstream = output_bitstream;
     pic_params.completionEvent = async_event_handle;
+
+#if NVENC_SDK_VERSION >= 1300
+    if (encode_idr && hdr_codec_ && hdr_static_metadata_ &&
+        !::nvenc::attach_hdr_static_metadata(
+          *hdr_codec_,
+          *hdr_static_metadata_,
+          mastering_display_info_,
+          content_light_level_,
+          pic_params
+        )) {
+      BOOST_LOG(error) << "NvEnc: refusing malformed HDR10 static metadata at picture submission";
+      return {};
+    }
+#endif
 
     if (nvenc_failed(nvenc->nvEncEncodePicture(encoder, &pic_params))) {
       BOOST_LOG(error) << "NvEnc: NvEncEncodePicture() failed: " << last_nvenc_error_string;
@@ -939,6 +1011,7 @@ namespace NVENC_NAMESPACE {
     encoder_state.last_encoded_frame_index = frame_index;
 
     if (encoded_frame.idr) {
+      hdr_static_metadata_changed_ = false;
       BOOST_LOG(debug) << "NvEnc: idr frame " << encoded_frame.frame_index;
     }
 

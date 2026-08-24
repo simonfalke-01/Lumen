@@ -43,8 +43,13 @@ namespace {
       const nvenc::nvenc_config &,
       const video::config_t &,
       const video::sunshine_colorspace_t &,
-      platf::pix_fmt_e
+      platf::pix_fmt_e,
+      const std::optional<nvenc::hdr_static_metadata_t> &
     ) override {
+      return true;
+    }
+
+    bool update_hdr_metadata(const nvenc::hdr_static_metadata_t &) override {
       return true;
     }
 

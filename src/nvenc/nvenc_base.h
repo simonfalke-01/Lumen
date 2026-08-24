@@ -49,14 +49,19 @@ namespace NVENC_NAMESPACE {
      * @param client_config Stream configuration requested by the client.
      * @param colorspace YUV colorspace.
      * @param buffer_format Platform-agnostic input surface format.
+     * @param hdr_metadata Validated HDR10 static metadata, or empty for SDR.
      * @return `true` on success, `false` on error
      */
     bool create_encoder(
       const ::nvenc::nvenc_config &config,
       const video::config_t &client_config,
       const video::sunshine_colorspace_t &colorspace,
-      platf::pix_fmt_e buffer_format
+      platf::pix_fmt_e buffer_format,
+      const std::optional<::nvenc::hdr_static_metadata_t> &hdr_metadata
     ) override;
+
+    /** @copydoc ::nvenc::nvenc_encoder::update_hdr_metadata() */
+    bool update_hdr_metadata(const ::nvenc::hdr_static_metadata_t &metadata) override;
 
     /**
      * @brief Destroy the encoder.
@@ -213,6 +218,13 @@ namespace NVENC_NAMESPACE {
     );
 
     stream_policy::SelectedFidelityClass selected_fidelity_ = stream_policy::SelectedFidelityClass::legacy_rate_controlled;  ///< Proven fidelity for the active encoder.
+    std::optional<::nvenc::hdr_static_metadata_t> hdr_static_metadata_;  ///< Current validated HDR10 block.
+    std::optional<::nvenc::hdr_codec_e> hdr_codec_;  ///< SDK 13 codec metadata destination.
+    bool hdr_static_metadata_changed_ {};  ///< Force an IDR before publishing a changed static block.
+#if NVENC_SDK_VERSION >= 1300
+    MASTERING_DISPLAY_INFO mastering_display_info_ {};  ///< SDK-owned pointer target for IDR submission.
+    CONTENT_LIGHT_LEVEL content_light_level_ {};  ///< SDK-owned pointer target for IDR submission.
+#endif
 
     /**
      * @brief Configure the requested reference-frame count.
