@@ -17,7 +17,22 @@
 // local includes
 #include "audio.h"
 #include "crypto.h"
+#include "stream_policy.h"
 #include "video.h"
+
+namespace platf::virtual_display {
+  class session_lease_t;
+}
+
+#if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
+  namespace lumen::protocol_v3::media {
+    class TransportSink;
+  }
+
+  namespace lumen::protocol_v3::runtime {
+    class SessionResourceFactory;
+  }
+#endif
 
 namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;  ///< GameStream base-port offset used for the video UDP stream.
@@ -26,6 +41,18 @@ namespace stream {
   constexpr auto MICROPHONE_STREAM_PORT = 12;  ///< Lumen base-port offset used for authenticated client microphone UDP input.
 
   struct session_t;
+
+#ifdef SUNSHINE_TESTS
+  namespace session {
+    /**
+     * @brief Copy the session's video configuration for integration tests.
+     *
+     * @param session Allocated test session, or `nullptr`.
+     * @return Session video configuration, or a default configuration for `nullptr`.
+     */
+    [[nodiscard]] video::config_t video_config_for_test(const std::shared_ptr<session_t> &session);
+  }  // namespace session
+#endif
 
   /**
    * @brief Test whether the platform client-microphone backend is usable.
@@ -131,16 +158,21 @@ namespace stream {
     audio::config_t audio;  ///< Audio capture configuration for the stream.
     video::config_t monitor;  ///< Video capture and encoder configuration for the selected monitor.
 
+    std::shared_ptr<const stream_policy::EffectiveStreamPolicy> optimization_policy;  ///< Immutable policy resolved once during RTSP ANNOUNCE.
+    stream_policy::ClientProtocol client_protocol {stream_policy::ClientProtocol::vanilla};  ///< Exact negotiated client family.
+
     int packetsize;  ///< Maximum payload size for network packets.
     int minRequiredFecPackets;  ///< Minimum recovery packets required before FEC is emitted.
     int mlFeatureFlags;  ///< Moonlight feature flags negotiated for this session.
     int controlProtocolType;  ///< GameStream control protocol variant selected by the client.
     int audioQosType;  ///< Audio QoS type.
     int videoQosType;  ///< Video QoS type.
+    std::uint64_t video_path_budget_bps {};  ///< Declared or measured per-session wire-rate ceiling.
 
     uint32_t encryptionFlagsEnabled;  ///< Bitmask of GameStream encryption features enabled for the session.
 
     bool client_microphone;  ///< Whether this session negotiated authenticated client microphone input.
+    std::shared_ptr<platf::virtual_display::session_lease_t> virtual_display_lease;  ///< Exactly-once ownership of an active Lumen VDD generation.
 
     std::optional<int> gcmap;  ///< Optional game-controller mapping override from the launch request.
   };
@@ -214,4 +246,20 @@ namespace stream {
      */
     void release_client_microphone(std::uint32_t launch_session_id);
   }  // namespace session
+
+#if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
+  /**
+   * @brief Create the native START-owned protocol-v3 capture/input/media factory.
+   *
+   * The factory uses the existing capture, encoder, audio, input, and virtual
+   * microphone primitives without entering RTSP or legacy UDP transport.
+   *
+   * @param transport Authenticated QUIC media sink retained by the runtime.
+   * @return Owned factory used by the production v3 SessionBackend.
+   */
+  std::unique_ptr<lumen::protocol_v3::runtime::SessionResourceFactory>
+    make_protocol_v3_session_resource_factory(
+      lumen::protocol_v3::media::TransportSink &transport
+    );
+#endif
 }  // namespace stream

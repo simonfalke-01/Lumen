@@ -388,8 +388,8 @@ const KeyCodeMap kKeyCodesMap[] = {
     BOOST_LOG(info) << "gamepad: Gamepad not yet implemented for MacOS."sv;
   }
 
-  // returns current mouse location:
-  util::point_t get_mouse_loc(input_t &input) {
+  /** @brief Return the current CoreGraphics cursor location in logical display points. */
+  util::point_t get_mouse_loc_points(input_t &input) {
     // Creating a new event every time to avoid any reuse risk
     const auto macos_input = static_cast<macos_input_t *>(input.get());
     const auto snapshot_event = CGEventCreate(macos_input->source);
@@ -398,6 +398,17 @@ const KeyCodeMap kKeyCodesMap[] = {
     return util::point_t {
       current.x,
       current.y
+    };
+  }
+
+  // returns current mouse location in capture-pixel coordinates:
+  util::point_t get_mouse_loc(input_t &input) {
+    const auto macos_input = static_cast<macos_input_t *>(input.get());
+    const auto scaling = macos_input->displayScaling > 0 ? macos_input->displayScaling : 1.0;
+    const auto current = get_mouse_loc_points(input);
+    return util::point_t {
+      current.x / scaling,
+      current.y / scaling
     };
   }
 
@@ -410,6 +421,7 @@ const KeyCodeMap kKeyCodesMap[] = {
    * @param raw_location Requested mouse location.
    * @param previous_location Previous mouse location.
    * @param click_count Click count for the event.
+   * @param constrain_to_display Whether to clamp to the configured capture display.
    */
   void post_mouse(
     input_t &input,
@@ -417,7 +429,8 @@ const KeyCodeMap kKeyCodesMap[] = {
     const CGEventType type,
     const util::point_t raw_location,
     const util::point_t previous_location,
-    const int click_count
+    const int click_count,
+    const bool constrain_to_display
   ) {
     BOOST_LOG(debug) << "mouse_event: "sv << button << ", type: "sv << type << ", location:"sv << raw_location.x << ":"sv << raw_location.y << " click_count: "sv << click_count;
 
@@ -429,10 +442,12 @@ const KeyCodeMap kKeyCodesMap[] = {
     const CGRect display_bounds = CGDisplayBounds(display);
 
     // limit mouse to current display bounds
-    const auto location = CGPoint {
-      std::clamp(raw_location.x, display_bounds.origin.x, display_bounds.origin.x + display_bounds.size.width - 1),
-      std::clamp(raw_location.y, display_bounds.origin.y, display_bounds.origin.y + display_bounds.size.height - 1)
-    };
+    const auto location = constrain_to_display ?
+                            CGPoint {
+                              std::clamp(raw_location.x, display_bounds.origin.x, display_bounds.origin.x + display_bounds.size.width - 1),
+                              std::clamp(raw_location.y, display_bounds.origin.y, display_bounds.origin.y + display_bounds.size.height - 1)
+                            } :
+                            CGPoint {raw_location.x, raw_location.y};
 
     CGEventSetType(event, type);
     CGEventSetLocation(event, location);
@@ -479,10 +494,12 @@ const KeyCodeMap kKeyCodesMap[] = {
     const int deltaX,
     const int deltaY
   ) {
-    const auto current = get_mouse_loc(input);
+    const auto macos_input = static_cast<macos_input_t *>(input.get());
+    const auto scaling = macos_input->displayScaling > 0 ? macos_input->displayScaling : 1.0;
+    const auto current = get_mouse_loc_points(input);
 
-    const auto location = util::point_t {current.x + deltaX, current.y + deltaY};
-    post_mouse(input, kCGMouseButtonLeft, event_type_mouse(input), location, current, 0);
+    const auto location = util::point_t {current.x + deltaX * scaling, current.y + deltaY * scaling};
+    post_mouse(input, kCGMouseButtonLeft, event_type_mouse(input), location, current, 0, false);
   }
 
   void abs_mouse(
@@ -501,7 +518,7 @@ const KeyCodeMap kKeyCodesMap[] = {
     location.x += display_bounds.origin.x;
     location.y += display_bounds.origin.y;
 
-    post_mouse(input, kCGMouseButtonLeft, event_type_mouse(input), location, get_mouse_loc(input), 0);
+    post_mouse(input, kCGMouseButtonLeft, event_type_mouse(input), location, get_mouse_loc_points(input), 0, true);
   }
 
   void button_mouse(input_t &input, const int button, const bool release) {
@@ -532,12 +549,12 @@ const KeyCodeMap kKeyCodesMap[] = {
 
     // if the last mouse down was less than MULTICLICK_DELAY_MS, we send a double click event
     const auto now = std::chrono::steady_clock::now();
-    const auto mouse_position = get_mouse_loc(input);
+    const auto mouse_position = get_mouse_loc_points(input);
 
     if (now < macos_input->last_mouse_event[mac_button][release] + MULTICLICK_DELAY_MS) {
-      post_mouse(input, mac_button, event, mouse_position, mouse_position, 2);
+      post_mouse(input, mac_button, event, mouse_position, mouse_position, 2, false);
     } else {
-      post_mouse(input, mac_button, event, mouse_position, mouse_position, 1);
+      post_mouse(input, mac_button, event, mouse_position, mouse_position, 1, false);
     }
 
     macos_input->last_mouse_event[mac_button][release] = now;

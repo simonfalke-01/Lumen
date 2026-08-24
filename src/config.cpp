@@ -590,6 +590,21 @@ namespace config {
 
   namespace dd {
     /**
+     * @brief Parse the Lumen virtual-display activation policy.
+     * @param value Configuration value.
+     * @return Parsed policy, defaulting safely to disabled for unknown values.
+     */
+    video_t::dd_t::virtual_display_policy_e virtual_display_policy_from_view(const std::string_view value) {
+      if (value == "optional"sv) {
+        return video_t::dd_t::virtual_display_policy_e::optional;
+      }
+      if (value == "required"sv) {
+        return video_t::dd_t::virtual_display_policy_e::required;
+      }
+      return video_t::dd_t::virtual_display_policy_e::disabled;
+    }
+
+    /**
      * @brief Parse display-device preparation mode from configuration text.
      *
      * @param value Configuration text from the display-device preparation setting.
@@ -777,6 +792,7 @@ namespace config {
     {},  // output_name
 
     {
+      video_t::dd_t::virtual_display_policy_e::optional,  // virtual_display_policy
       video_t::dd_t::config_option_e::disabled,  // configuration_option
       video_t::dd_t::resolution_option_e::automatic,  // resolution_option
       {},  // manual_resolution
@@ -815,9 +831,31 @@ namespace config {
     20,  // fecPercentage
 
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
-    ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
+    ENCRYPTION_MODE_MANDATORY,  // wan_encryption_mode
     0,  // packetsize
   };
+
+  /**
+   * @brief Default direct protocol-v3 listener configuration.
+   */
+  protocol_v3_t protocol_v3 {
+#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
+    true,  // enabled in full Windows feature builds
+#else
+    false,  // unavailable in legacy and non-MsQuic builds
+#endif
+    true,  // retain legacy Moonlight listeners by default
+    48030,  // single QUIC UDP port
+    "quality",  // stable bounded-fidelity policy
+    0x17,  // browse, start, input, and stop; mic/quit require explicit configuration
+  };
+
+  listener_startup_policy_t listener_startup_policy(const protocol_v3_t &settings) noexcept {
+    return {
+      .start_legacy = settings.legacy_compatibility,
+      .v3_failure_is_fatal = !settings.legacy_compatibility,
+    };
+  }
 
   /**
    * @brief Default NVHTTP server configuration values used before file and CLI overrides.
@@ -1676,6 +1714,7 @@ namespace config {
     string_f(vars, "adapter_name", video.adapter_name);
     string_f(vars, "output_name", video.output_name);
 
+    generic_f(vars, "lumen_vdd_policy", video.dd.virtual_display_policy, dd::virtual_display_policy_from_view);
     generic_f(vars, "dd_configuration_option", video.dd.configuration_option, dd::config_option_from_view);
     generic_f(vars, "dd_resolution_option", video.dd.resolution_option, dd::resolution_option_from_view);
     string_f(vars, "dd_manual_resolution", video.dd.manual_resolution);
@@ -1756,7 +1795,34 @@ namespace config {
 
     int_between_f(vars, "lan_encryption_mode", stream.lan_encryption_mode, {0, 2});
     int_between_f(vars, "wan_encryption_mode", stream.wan_encryption_mode, {0, 2});
+    if (vars.contains("wan_encryption_mode") && stream.wan_encryption_mode != ENCRYPTION_MODE_MANDATORY) {
+      BOOST_LOG(warning) << "WAN encryption was explicitly downgraded; unsupported clients may stream without full media encryption"sv;
+    }
     int_between_f(vars, "packetsize", stream.packetsize, {0, PACKETSIZE_MAX});
+
+    bool_f(vars, "protocol_v3_enabled", protocol_v3.enabled);
+    bool_f(vars, "legacy_compatibility", protocol_v3.legacy_compatibility);
+    {
+      int protocol_v3_port = protocol_v3.port;
+      int_between_f(vars, "protocol_v3_port", protocol_v3_port, {1024, 65535});
+      protocol_v3.port = static_cast<std::uint16_t>(protocol_v3_port);
+    }
+    string_restricted_f(vars, "protocol_v3_profile", protocol_v3.profile, {"latency"sv, "quality"sv});
+    {
+      int pairing_permissions = static_cast<int>(protocol_v3.pairing_permissions);
+      int_between_f(vars, "protocol_v3_pairing_permissions", pairing_permissions, {1, 255});
+      protocol_v3.pairing_permissions = static_cast<std::uint64_t>(pairing_permissions) | 0x17U;
+    }
+#if !LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
+    if (protocol_v3.enabled) {
+      BOOST_LOG(warning) << "Protocol v3 was requested but is unavailable in this build profile"sv;
+      protocol_v3.enabled = false;
+    }
+    if (!protocol_v3.legacy_compatibility) {
+      BOOST_LOG(warning) << "Legacy compatibility cannot be disabled when protocol v3 is unavailable"sv;
+      protocol_v3.legacy_compatibility = true;
+    }
+#endif
 
     path_f(vars, "file_apps", stream.file_apps);
 #ifndef __ANDROID__
@@ -1934,7 +2000,7 @@ namespace config {
     }
 
     if (fs::path {config_file}.parent_path().filename() == "sunshine"sv) {
-      // Never write canonical Lumen state into an upstream-owned directory.
+      // Never write authoritative Lumen state into an upstream-owned directory.
       return;
     }
 
@@ -1959,7 +2025,7 @@ namespace config {
       return false;
     }
     if (fs::exists(destination, ec) || ec) {
-      error_message = ec ? ec.message() : "canonical destination already exists";
+      error_message = ec ? ec.message() : "authoritative destination already exists";
       return false;
     }
 
@@ -2081,7 +2147,7 @@ namespace config {
       // Create appdata folder if it does not exist
       file_handler::make_directory(platf::appdata().string());
 
-      // A copied legacy directory contains sunshine.conf. Seed the new canonical
+      // A copied legacy directory contains sunshine.conf. Seed the authoritative
       // filename from it without modifying or deleting the legacy file.
       migrate_legacy_config_file(sunshine.config_file, custom_config_file);
 

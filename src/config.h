@@ -128,6 +128,15 @@ namespace config {
      */
     struct dd_t {
       /**
+       * @brief Selects whether Lumen's owned virtual display participates in legacy sessions.
+       */
+      enum class virtual_display_policy_e {
+        disabled,  ///< Never mutate topology; retain the configured physical capture path.
+        optional,  ///< Prefer an exact VDD mode and fall back only after a proven rollback.
+        required  ///< Require an exact VDD mode and reject startup when it cannot be established safely.
+      };
+
+      /**
        * @brief Compatibility workarounds for display-device control.
        */
       struct workarounds_t {
@@ -190,6 +199,7 @@ namespace config {
         std::vector<mode_remapping_entry_t> refresh_rate_only;  ///< To be use when only `refresh_rate_option` is set to `automatic`.
       };
 
+      virtual_display_policy_e virtual_display_policy;  ///< Lumen VDD activation and fallback policy.
       config_option_e configuration_option;  ///< Display-preparation mode selected by configuration.
       resolution_option_e resolution_option;  ///< Resolution-selection mode selected by configuration.
       std::string manual_resolution;  ///< Manual resolution in case `resolution_option == resolution_option_e::manual`.
@@ -247,6 +257,33 @@ namespace config {
     // Limit the packetsize to avoid fragmentation on a low MTU link
     int packetsize;  ///< Maximum payload size for network packets.
   };
+
+  /**
+   * @brief Direct Umbra/Lumen protocol-v3 listener settings.
+   */
+  struct protocol_v3_t {
+    bool enabled;  ///< Start the authenticated QUIC listener when compiled into this build.
+    bool legacy_compatibility;  ///< Keep the Moonlight HTTP/RTSP listeners alongside protocol v3.
+    std::uint16_t port;  ///< UDP port used by the single protocol-v3 QUIC listener.
+    std::string profile;  ///< Default transport policy: `latency` or `quality`.
+    std::uint64_t pairing_permissions;  ///< Maximum permissions granted by new QR invitations.
+  };
+
+  /**
+   * @brief Decide which streaming listeners must remain available at startup.
+   */
+  struct listener_startup_policy_t {
+    bool start_legacy;  ///< Start the Moonlight HTTP and RTSP listeners.
+    bool v3_failure_is_fatal;  ///< Abort only when no legacy listener is allowed to recover service.
+  };
+
+  /**
+   * @brief Resolve listener availability from the current protocol settings.
+   *
+   * @param settings Parsed protocol-v3 settings.
+   * @return Startup policy shared by production startup and focused tests.
+   */
+  [[nodiscard]] listener_startup_policy_t listener_startup_policy(const protocol_v3_t &settings) noexcept;
 
   /**
    * @brief HTTP and HTTPS settings used by the GameStream pairing server.
@@ -383,6 +420,7 @@ namespace config {
   extern video_t video;
   extern audio_t audio;
   extern stream_t stream;
+  extern protocol_v3_t protocol_v3;
   extern nvhttp_t nvhttp;
   extern input_t input;
   extern sunshine_t sunshine;
@@ -415,7 +453,7 @@ namespace config {
   /**
    * @brief Select or copy a legacy Sunshine configuration for Lumen startup.
    *
-   * @param config_file Path to the canonical configuration file; never
+   * @param config_file Path to the authoritative configuration file; never
    * redirected into the legacy Sunshine directory.
    * @param custom_config_file Whether the user supplied the path explicitly.
    */
@@ -428,7 +466,7 @@ namespace config {
    * atomically publishes the completed tree without modifying the source.
    *
    * @param legacy_directory Legacy Sunshine directory to read.
-   * @param lumen_directory Canonical Lumen directory to create.
+   * @param lumen_directory Authoritative Lumen directory to create.
    * @param error_message Receives a diagnostic when the copy is rejected.
    * @return `true` only when the complete tree is published.
    */

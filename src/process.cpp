@@ -166,7 +166,7 @@ namespace proc {
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
 
-    // Add stream-specific environment variables. LUMEN_* is canonical while
+    // Add stream-specific environment variables. LUMEN_* is authoritative while
     // SUNSHINE_* remains available for existing application scripts.
     _env["LUMEN_APP_ID"] = std::to_string(_app_id);
     _env["LUMEN_APP_NAME"] = _app.name;

@@ -6,11 +6,20 @@
 
 // standard includes
 #include <chrono>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 // local includes
+#include "encoder_probe_cache.h"
 #include "input.h"
 #include "platform/common.h"
+#include "stream_policy.h"
 #include "thread_safe.h"
 #include "video_colorspace.h"
 
@@ -21,7 +30,14 @@ extern "C" {
 
 struct AVPacket;
 
+namespace platf::virtual_display {
+  class frame_source_t;
+}
+
 namespace video {
+
+  class egress_queue_t;
+  using input_watermark_t = std::pair<std::uint64_t, std::uint64_t>;  ///< Applied state and edge sampled at capture acquisition.
 
   /**
    * @brief Encoding configuration requested by a remote client.
@@ -39,6 +55,25 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    bool protocolV3Colorimetry {};  ///< Use exact protocol-v3 colorimetry instead of legacy inference.
+    std::uint8_t colorPrimaries {};  ///< Exact H.273 primaries code for protocol v3.
+    std::uint8_t colorTransfer {};  ///< Exact H.273 transfer code: SDR, PQ, or HLG.
+    std::uint8_t colorMatrix {};  ///< Exact H.273 matrix code.
+    std::uint8_t colorRange {};  ///< Zero limited or one full range.
+    bool hasStaticHDRMetadata {};  ///< Whether exact selected static HDR metadata applies.
+    std::array<std::uint16_t, 6> staticHDRDisplayPrimaries {};  ///< R/G/B x/y code values.
+    std::array<std::uint16_t, 2> staticHDRWhitePoint {};  ///< White-point x/y code values.
+    std::uint32_t staticHDRMaximumMasteringLuminance {};  ///< 0.0001-nit units.
+    std::uint32_t staticHDRMinimumMasteringLuminance {};  ///< 0.0001-nit units.
+    std::uint16_t staticHDRMaximumContentLightLevel {};  ///< MaxCLL in nits.
+    std::uint16_t staticHDRMaximumFrameAverageLightLevel {};  ///< MaxFALL in nits.
+    int refreshNumerator {};  ///< Optional exact protocol-v3 refresh numerator.
+    int refreshDenominator {};  ///< Optional exact protocol-v3 refresh denominator.
+    std::string output_name;  ///< Per-session capture output, or empty for the configured default.
+    std::shared_ptr<const stream_policy::EffectiveStreamPolicy> optimization_policy;  ///< Immutable resolved session policy.
+    stream_policy::ClientProtocol client_protocol {stream_policy::ClientProtocol::vanilla};  ///< Exact negotiated client family.
+    std::shared_ptr<platf::virtual_display::frame_source_t> virtual_display_frame_source;  ///< Production VDD direct-frame source, or empty for DDA/WGC.
+    std::function<std::pair<std::uint64_t, std::uint64_t>()> capture_input_watermark;  ///< Applied input watermark sampled at capture submission.
   };
 
   namespace amf {
@@ -114,10 +149,18 @@ namespace video {
    * @brief Owning pointer for an FFmpeg software-scaling context.
    */
   using sws_t = util::safe_ptr<SwsContext, sws_freeContext>;
+
   /**
-   * @brief Shared event that transports captured images between capture and encode threads.
+   * @brief Per-session capture envelope preserving the input watermark at submission.
    */
-  using img_event_t = std::shared_ptr<safe::event_t<std::shared_ptr<platf::img_t>>>;
+  struct captured_frame_t {
+    std::shared_ptr<platf::img_t> image;  ///< Captured image shared with the encoder.
+    std::uint64_t applied_input_state_sequence {};  ///< State watermark sampled at capture submission.
+    std::uint64_t applied_input_edge_id {};  ///< Edge watermark sampled at capture submission.
+  };
+
+  /** @brief Shared event transporting per-session capture envelopes to encode threads. */
+  using img_event_t = std::shared_ptr<safe::event_t<captured_frame_t>>;
 
   /**
    * @brief FFmpeg software encode device used when no hardware frames are required.
@@ -527,6 +570,9 @@ namespace video {
     void *channel_data = nullptr;  ///< Platform or protocol state carried with this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
+    std::optional<std::chrono::steady_clock::time_point> encoder_submit_timestamp;  ///< Actual encoder submission time.
+    std::uint64_t applied_input_state_sequence {};  ///< Input state watermark sampled at capture submission.
+    std::uint64_t applied_input_edge_id {};  ///< Input edge watermark sampled at capture submission.
   };
 
   /**
@@ -679,10 +725,72 @@ namespace video {
   extern bool last_encoder_probe_supported_ref_frames_invalidation;
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
 
+  /**
+   * @brief Return lossless support only while the committed encoder identity generation is current.
+   * @param video_format 0 H.264, 1 HEVC, or 2 AV1.
+   * @return True only for the final native NVENC backend and exact current adapter/output/driver identity.
+   */
+  [[nodiscard]] bool current_nvenc_lossless_capability(int video_format);
+
+  /**
+   * @brief Read authoritative HDR metadata from the active capture display.
+   *
+   * @param config Exact selected capture/codec configuration.
+   * @return Host display metadata only when the active display is HDR and reports it.
+   */
+  [[nodiscard]] std::optional<SS_HDR_METADATA> active_hdr_metadata(const config_t &config);
+
+  /**
+   * @brief Report whether the committed active encoder backend is native NVENC.
+   *
+   * @return True only while the current probe generation selects NVENC.
+   */
+  [[nodiscard]] bool active_encoder_is_nvenc();
+
+  /**
+   * @brief Extract the decoder initialization bytes from one encoded key frame.
+   *
+   * H.264 and HEVC return Annex-B parameter-set NAL units. AV1 returns the
+   * complete low-overhead sequence-header OBU. Empty output means the key frame
+   * did not contain the exact initialization required by a decoder.
+   *
+   * @param access_unit Encoded key-frame bytes.
+   * @param video_format 0 H.264, 1 HEVC, or 2 AV1.
+   * @return Bounded codec initialization bytes, or an empty vector on failure.
+   */
+  [[nodiscard]] std::vector<std::uint8_t> extract_codec_initialization(
+    std::span<const std::uint8_t> access_unit,
+    int video_format
+  );
+
+  /**
+   * @brief Produce exact decoder initialization for the active encoder tuple.
+   *
+   * The first exact adapter/driver/output/configuration tuple performs one bounded
+   * dummy-frame key-frame encode before protocol-v3 VIDEO_CONFIG is sent. Repeated
+   * sessions reuse only an identity-bound initialization entry and otherwise fail
+   * closed, so a cache hit never creates a throwaway encoder.
+   *
+   * @param config Exact negotiated stream configuration.
+   * @return Codec initialization bytes, or std::nullopt when probing fails.
+   */
+  [[nodiscard]] std::optional<std::vector<std::uint8_t>> codec_initialization(
+    const config_t &config
+  );
+
+  /**
+   * @brief Capture and encode video for one registered streaming session.
+   *
+   * @param mail Session mailbox carrying shutdown and encoder-recovery events.
+   * @param config Video capture and encode configuration.
+   * @param channel_data Opaque session identity stored on encoded packets.
+   * @param egress Per-session scheduler receiving encoded frames.
+   */
   void capture(
     safe::mail_t mail,
     config_t config,
-    void *channel_data
+    void *channel_data,
+    egress_queue_t &egress
   );
 
   /**
@@ -741,6 +849,9 @@ namespace video {
    * @return Requested frame rate as a rational.
    */
   inline AVRational framerate_to_rational(const config_t &config) {
+    if (config.refreshNumerator > 0 && config.refreshDenominator > 0) {
+      return AVRational {config.refreshNumerator, config.refreshDenominator};
+    }
     if (config.framerateX100 > 0) {
       return framerateX100_to_rational(config.framerateX100);
     }

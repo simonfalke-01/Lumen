@@ -528,7 +528,7 @@ namespace kwin {
         kde_output_order_v1_add_listener(self->kde_output_order, &output_order_listener, self);
         BOOST_LOG(debug) << "[kwingrab] bound kde_output_order_v1 version "sv << bind_ver;
       } else if (!std::strcmp(interface, zkde_screencast_unstable_v1_interface.name)) {
-        // Bind version 1 to 6 — We use stream_output from v1 for node_id (deprecated but good as a fall-back)
+        // Bind versions 1 through 6. Version 1 supplies the deprecated stream_output node_id fallback.
         //                       but also try to get the newer (re-use safe) pipewire objectserial from v6
         uint32_t bind_ver = std::min(version, static_cast<uint32_t>(6));
         self->kde_screencast_v1_ = static_cast<struct zkde_screencast_unstable_v1 *>(

@@ -10,9 +10,11 @@ extern "C" {
 }
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <format>
+#include <limits>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -31,6 +33,11 @@ extern "C" {
 #include "stream.h"
 #include "sync.h"
 #include "video.h"
+
+#ifdef _WIN32
+  #include "platform/windows/virtual_display.h"
+  #include "platform/windows/virtual_display_frame.h"
+#endif
 
 namespace asio = boost::asio;
 
@@ -681,6 +688,13 @@ namespace rtsp_stream {
       return (int) _session_slots->size();
     }
 
+    bool has_session_or_pending_launch() {
+      if (launch_event.view(0s)) {
+        return true;
+      }
+      return session_count() > 0;
+    }
+
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
 
     /**
@@ -711,18 +725,30 @@ namespace rtsp_stream {
      *
      * @param cert Certificate data or object used by the operation.
      */
-    void clear_by_cert(std::string_view cert) {
+    std::size_t clear_by_cert(std::string_view cert) {
+      if (cert.empty()) {
+        return 0;
+      }
+      std::size_t cleared {};
+      auto pending = launch_event.view(0s);
+      if (pending && session_owned_by_certificate(pending->client_cert, cert)) {
+        raised_timer.cancel();
+        launch_event.pop();
+        ++cleared;
+      }
       auto lg = _session_slots.lock();
       for (auto i = _session_slots->begin(); i != _session_slots->end();) {
         auto &slot = *(*i);
-        if (stream::session::client_cert(slot) == cert) {
+        if (session_owned_by_certificate(stream::session::client_cert(slot), cert)) {
           stream::session::stop(slot);
           stream::session::join(slot);
           i = _session_slots->erase(i);
+          ++cleared;
         } else {
           i++;
         }
       }
+      return cleared;
     }
 
     /**
@@ -798,6 +824,11 @@ namespace rtsp_stream {
     return server.session_count();
   }
 
+  bool has_session_or_pending_launch() {
+    server.clear(false);
+    return server.has_session_or_pending_launch();
+  }
+
   void terminate_sessions() {
     server.clear(true);
   }
@@ -805,8 +836,8 @@ namespace rtsp_stream {
   /**
    * @brief Terminate active sessions associated with a client certificate.
    */
-  void terminate_sessions_by_cert(std::string_view cert) {
-    server.clear_by_cert(cert);
+  std::size_t terminate_sessions_by_cert(std::string_view cert) {
+    return server.clear_by_cert(cert);
   }
 
   /**
@@ -1206,10 +1237,14 @@ namespace rtsp_stream {
       } else if (type == "a=") {
         auto pos = line.find(':');
 
+        if (pos == std::string_view::npos) {
+          continue;
+        }
+
         auto name = line.substr(2, pos - 2);
         auto val = line.substr(pos + 1);
 
-        if (val[val.size() - 1] == ' ') {
+        if (!val.empty() && val[val.size() - 1] == ' ') {
           val = val.substr(0, val.size() - 1);
         }
         args.emplace(name, val);
@@ -1235,6 +1270,55 @@ namespace rtsp_stream {
 
     stream::config_t config;
 
+    const auto parsed_optimization_mode = stream_policy::parse_rtsp_announce_optimization_mode(payload);
+    const auto parsed_fidelity = stream_policy::parse_rtsp_announce_fidelity_request(payload);
+    const auto parsed_client_protocol = stream_policy::parse_rtsp_announce_client_protocol(payload);
+    if (parsed_optimization_mode.status == stream_policy::ParsedOptimizationMode::Status::invalid ||
+        parsed_fidelity.status == stream_policy::ParsedFidelityRequest::Status::invalid ||
+        parsed_client_protocol.status == stream_policy::ParsedClientProtocol::Status::invalid) {
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+
+    const auto explicitly_configured = [](const std::string_view name) {
+      return config::modified_config_settings.contains(std::string {name});
+    };
+    const auto advanced_overrides = stream_policy::capture_advanced_overrides(
+      config::video.nv,
+      config::stream.fec_percentage,
+      stream_policy::AdvancedOverridePresence {
+        explicitly_configured("nvenc_preset"sv),
+        explicitly_configured("nvenc_twopass"sv),
+        explicitly_configured("nvenc_spatial_aq"sv),
+        explicitly_configured("nvenc_vbv_increase"sv),
+        explicitly_configured("fec_percentage"sv),
+      }
+    );
+    const auto requested_optimization_mode =
+      parsed_optimization_mode.status == stream_policy::ParsedOptimizationMode::Status::valid ?
+        std::optional {parsed_optimization_mode.mode} :
+        std::nullopt;
+    const auto requested_fidelity =
+      parsed_fidelity.status == stream_policy::ParsedFidelityRequest::Status::valid ?
+        std::optional {parsed_fidelity.request} :
+        std::nullopt;
+    if (requested_fidelity &&
+        (!requested_optimization_mode || *requested_optimization_mode != stream_policy::StreamOptimizationMode::quality)) {
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+    config.optimization_policy = std::make_shared<const stream_policy::EffectiveStreamPolicy>(
+      stream_policy::resolve_policy(
+        requested_optimization_mode,
+        stream_policy::StreamOptimizationMode::legacy,
+        config::video.nv,
+        config::stream.fec_percentage,
+        advanced_overrides,
+        requested_fidelity
+      )
+    );
+    config.client_protocol = parsed_client_protocol.protocol;
+
     std::int64_t configuredBitrateKbps;
     config.audio.flags[audio::config_t::HOST_AUDIO] = session.host_audio;
     try {
@@ -1246,12 +1330,21 @@ namespace rtsp_stream {
         util::from_view(args.at("x-nv-audio.surround.AudioQuality"sv));
 
       config.controlProtocolType = (int) util::from_view(args.at("x-nv-general.useReliableUdp"sv));
-      config.packetsize = (int) util::from_view(args.at("x-nv-video[0].packetSize"sv));
       config.minRequiredFecPackets = (int) util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
       config.mlFeatureFlags = (int) util::from_view(args.at("x-ml-general.featureFlags"sv));
       config.audioQosType = (int) util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));
       config.videoQosType = (int) util::from_view(args.at("x-nv-vqos[0].qosTrafficType"sv));
       config.encryptionFlagsEnabled = (uint32_t) util::from_view(args.at("x-ss-general.encryptionEnabled"sv));
+      const auto announced_packet_size = parse_video_packet_size(
+        args.at("x-nv-video[0].packetSize"sv),
+        config.encryptionFlagsEnabled & SS_ENC_VIDEO
+      );
+      if (!announced_packet_size) {
+        BOOST_LOG(warning) << "Rejected malformed or unsafe client video packet size"sv;
+        respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+        return;
+      }
+      config.packetsize = *announced_packet_size;
 
       // Legacy clients use nvFeatureFlags to indicate support for audio encryption
       if (util::from_view(args.at("x-nv-general.featureFlags"sv)) & 0x20) {
@@ -1300,6 +1393,14 @@ namespace rtsp_stream {
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+
+    if (requested_fidelity == stream_policy::StreamFidelityRequest::codec_lossless_required &&
+        (!video::current_nvenc_lossless_capability(config.monitor.videoFormat) ||
+         (config.monitor.videoFormat == 0 && config.monitor.chromaSamplingType != 1))) {
+      BOOST_LOG(warning) << "Rejected codec-lossless request without an exact codec-specific NVENC proof"sv;
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return;
     }
@@ -1359,12 +1460,14 @@ namespace rtsp_stream {
     // down to nearly nothing.
     if (configuredBitrateKbps) {
       BOOST_LOG(debug) << "Client configured bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
+      config.video_path_budget_bps = static_cast<std::uint64_t>(configuredBitrateKbps) * 1'000U;
 
       // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
       // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
-      if (config::stream.fec_percentage <= 80) {
-        configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
-      }
+      configuredBitrateKbps = stream_policy::reserve_bitrate_for_fec(
+        configuredBitrateKbps,
+        *config.optimization_policy
+      );
 
       // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
       // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
@@ -1393,6 +1496,17 @@ namespace rtsp_stream {
       return;
     }
 
+    if (config.monitor.width < 256 || config.monitor.width > 8192 ||
+        config.monitor.height < 200 || config.monitor.height > 8192 ||
+        (config.monitor.width & 1) != 0 || (config.monitor.height & 1) != 0 ||
+        config.monitor.framerate < 10 || config.monitor.framerate > 480 ||
+        config.monitor.videoFormat < 0 || config.monitor.videoFormat > 2 ||
+        config.monitor.dynamicRange < 0 || config.monitor.dynamicRange > 1) {
+      BOOST_LOG(warning) << "Rejected unsupported legacy stream mode before display mutation"sv;
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+
     // Check that any required encryption is enabled
     auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());
     if (encryption_mode == config::ENCRYPTION_MODE_MANDATORY && (config.encryptionFlagsEnabled & (SS_ENC_VIDEO | SS_ENC_AUDIO)) != (SS_ENC_VIDEO | SS_ENC_AUDIO)) {
@@ -1401,6 +1515,94 @@ namespace rtsp_stream {
       respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});
       return;
     }
+
+#ifdef _WIN32
+    {
+      const auto refresh = video::framerate_to_rational(config.monitor);
+      if (refresh.num <= 0 || refresh.den <= 0 ||
+          static_cast<std::uint64_t>(refresh.num) > std::numeric_limits<std::uint32_t>::max() ||
+          static_cast<std::uint64_t>(refresh.den) > std::numeric_limits<std::uint32_t>::max()) {
+        BOOST_LOG(warning) << "Rejected unrepresentable legacy refresh rate before display mutation"sv;
+        respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+        return;
+      }
+      const auto reduced_refresh = platf::virtual_display::rational_t {
+        static_cast<std::uint32_t>(refresh.num),
+        static_cast<std::uint32_t>(refresh.den),
+      }
+                                     .normalized();
+      if (!reduced_refresh) {
+        BOOST_LOG(warning) << "Rejected unreduced legacy refresh rate before display mutation"sv;
+        respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+        return;
+      }
+      const platf::virtual_display::mode_t requested_mode {
+        static_cast<std::uint32_t>(config.monitor.width),
+        static_cast<std::uint32_t>(config.monitor.height),
+        *reduced_refresh,
+        config.monitor.dynamicRange != 0 ?
+          platf::virtual_display::dynamic_range_e::hdr10 :
+          platf::virtual_display::dynamic_range_e::sdr,
+        static_cast<std::uint8_t>(config.monitor.dynamicRange != 0 ? 10 : 8),
+      };
+      auto encoder_limits = platf::virtual_display::mode_limits_t {};
+      if (config.monitor.videoFormat == 0) {
+        // NVIDIA's H.264 NVENC path is bounded to 4096 active pixels per axis.
+        encoder_limits.maximum_width = 4096;
+        encoder_limits.maximum_height = 4096;
+        encoder_limits.maximum_pixels = 4096ULL * 4096ULL;
+      }
+      const auto delivery_policy = config.optimization_policy->mode == stream_policy::StreamOptimizationMode::quality ?
+                                     platf::virtual_display::delivery_policy_e::quality :
+                                     platf::virtual_display::delivery_policy_e::latency;
+      const auto activation_policy = [&]() {
+        switch (config::video.dd.virtual_display_policy) {
+          case config::video_t::dd_t::virtual_display_policy_e::optional:
+            return platf::virtual_display::activation_policy_e::optional;
+          case config::video_t::dd_t::virtual_display_policy_e::required:
+            return platf::virtual_display::activation_policy_e::required;
+          case config::video_t::dd_t::virtual_display_policy_e::disabled:
+          default:
+            return platf::virtual_display::activation_policy_e::disabled;
+        }
+      }();
+      auto prepared = platf::virtual_display::prepare_system_stream_session(
+        activation_policy,
+        {session.id, requested_mode, delivery_policy, platf::virtual_display::fidelity_e::lossless},
+        encoder_limits,
+        config.monitor.output_name
+      );
+      if (prepared.outcome == platf::virtual_display::session_prepare_e::rejected) {
+        BOOST_LOG(error) << "Lumen VDD policy rejected legacy stream startup [diagnostic="sv
+                         << static_cast<int>(prepared.diagnostic) << ", validation="sv
+                         << static_cast<int>(prepared.validation_error) << ']';
+        respond(sock, session, &option, 503, "Service Unavailable", req->sequenceNumber, {});
+        return;
+      }
+      config.monitor.output_name = std::move(prepared.capture_name);
+      config.virtual_display_lease = std::move(prepared.lease);
+      if (prepared.outcome == platf::virtual_display::session_prepare_e::virtual_display && prepared.selection) {
+        config.monitor.width = static_cast<int>(prepared.selection->selected_mode.width);
+        config.monitor.height = static_cast<int>(prepared.selection->selected_mode.height);
+        config.monitor.virtual_display_frame_source = platf::virtual_display::make_system_frame_source(
+          *prepared.selection,
+          std::chrono::milliseconds {250}
+        );
+        if (!config.monitor.virtual_display_frame_source) {
+          BOOST_LOG(info) << "Lumen VDD direct-frame boundary unavailable; using proven DDA/WGC capture on the active VDD output"sv;
+        }
+        BOOST_LOG(info) << "Lumen VDD selected exact legacy mode "sv
+                        << prepared.selection->selected_mode.width << 'x'
+                        << prepared.selection->selected_mode.height << '@'
+                        << prepared.selection->selected_mode.refresh.numerator << '/'
+                        << prepared.selection->selected_mode.refresh.denominator
+                        << " on "sv << config.monitor.output_name;
+      } else if (activation_policy != platf::virtual_display::activation_policy_e::disabled) {
+        BOOST_LOG(info) << "Lumen VDD safely fell back to the configured physical capture path [diagnostic="sv
+                        << static_cast<int>(prepared.diagnostic) << ']';
+      }
+    }
+#endif
 
     if (config.client_microphone && !stream::session::claim_client_microphone(session.id)) {
       respond(sock, session, &option, 409, "Conflict", req->sequenceNumber, {});
@@ -1414,6 +1616,10 @@ namespace rtsp_stream {
     });
 
     auto stream_session = stream::session::alloc(config, session);
+    if (!stream_session) {
+      respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
+      return;
+    }
     server->insert(stream_session);
 
     if (stream::session::start(stream_session, sock.remote_endpoint().address().to_string())) {
@@ -1425,7 +1631,6 @@ namespace rtsp_stream {
     }
 
     microphone_claim_guard.disable();
-
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 

@@ -18,6 +18,7 @@ namespace video {
     rec709,  ///< Rec. 709
     bt2020sdr,  ///< Rec. 2020 SDR
     bt2020,  ///< Rec. 2020 HDR
+    bt2020hlg,  ///< Rec. 2020 HLG HDR
   };
 
   /**

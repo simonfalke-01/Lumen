@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <optional>
 #include <tuple>
@@ -21,9 +22,406 @@ extern "C" {
 
 // local includes
 #include <src/config.h>
+#include <src/stream_policy.h>
 #include <src/video.h>
 
 using namespace std::literals;
+
+namespace {
+  video::encoder_probe_device_identity_t device_identity(std::uint64_t adapter_luid = 2) {
+    return {
+      adapter_luid,
+      0x10DE,
+      0x2882,
+      0,
+      1,
+      0x0000000100000002,
+      "\\\\.\\DISPLAY1",
+    };
+  }
+
+  video::encoder_probe_identity_t probe_identity() {
+    return {
+      "NVIDIA GeForce RTX 4060",
+      "{configured-display-id}",
+      "\\\\.\\DISPLAY1",
+      "ddx",
+      "nvenc",
+      3,
+      2,
+      false,
+      true,
+      device_identity(),
+    };
+  }
+}  // namespace
+
+TEST(VideoCodecInitializationTest, ExtractsOnlyH264ParameterSets) {
+  const std::vector<std::uint8_t> access_unit {
+    0, 0, 0, 1, 0x09, 0xf0,
+    0, 0, 1, 0x67, 0x64, 0x00, 0x1f,
+    0, 0, 1, 0x68, 0xee, 0x3c,
+    0, 0, 1, 0x65, 0x88, 0x84,
+  };
+  EXPECT_EQ(
+    video::extract_codec_initialization(access_unit, 0),
+    (std::vector<std::uint8_t> {
+      0, 0, 1, 0x67, 0x64, 0x00, 0x1f,
+      0, 0, 1, 0x68, 0xee, 0x3c,
+    })
+  );
+}
+
+TEST(VideoCodecInitializationTest, ExtractsAllHEVCParameterSets) {
+  const std::vector<std::uint8_t> access_unit {
+    0, 0, 1, 0x40, 0x01, 0xaa,
+    0, 0, 1, 0x42, 0x01, 0xbb,
+    0, 0, 1, 0x44, 0x01, 0xcc,
+    0, 0, 1, 0x26, 0x01, 0xdd,
+  };
+  EXPECT_EQ(
+    video::extract_codec_initialization(access_unit, 1),
+    (std::vector<std::uint8_t> {
+      0, 0, 1, 0x40, 0x01, 0xaa,
+      0, 0, 1, 0x42, 0x01, 0xbb,
+      0, 0, 1, 0x44, 0x01, 0xcc,
+    })
+  );
+}
+
+TEST(VideoCodecInitializationTest, ExtractsTheAV1SequenceHeaderOBU) {
+  const std::vector<std::uint8_t> access_unit {
+    0x12, 0x01, 0,
+    0x0a, 0x03, 0x20, 0x11, 0x22,
+    0x32, 0x02, 0x33, 0x44,
+  };
+  EXPECT_EQ(
+    video::extract_codec_initialization(access_unit, 2),
+    (std::vector<std::uint8_t> {0x0a, 0x03, 0x20, 0x11, 0x22})
+  );
+}
+
+TEST(VideoCodecInitializationTest, RejectsIncompleteOrMalformedInitialization) {
+  const std::array<std::uint8_t, 5> incomplete_h264 {0, 0, 1, 0x67, 1};
+  const std::array<std::uint8_t, 3> malformed_av1 {0x0a, 0x80, 0x80};
+  EXPECT_TRUE(video::extract_codec_initialization(incomplete_h264, 0).empty());
+  EXPECT_TRUE(video::extract_codec_initialization(malformed_av1, 2).empty());
+  EXPECT_TRUE(video::extract_codec_initialization(std::span<const std::uint8_t> {}, 3).empty());
+}
+
+TEST(VideoCodecInitializationCacheTest, RepeatedExactTupleSkipsSecondPrewarm) {
+  video::codec_initialization_cache_t cache;
+  const video::codec_initialization_cache_key_t key {
+    probe_identity(),
+    "nvenc",
+    "hevc_nvenc",
+    "exact-quality-hevc-10bit-444-hdr-lossless",
+  };
+  const std::vector<std::uint8_t> expected {0, 0, 1, 0x40, 0, 0, 1, 0x42, 0, 0, 1, 0x44};
+  int prewarm_encoder_constructions = 0;
+  const auto initialization = [&]() -> std::optional<std::vector<std::uint8_t>> {
+    if (auto cached = cache.lookup(key)) {
+      return cached;
+    }
+    ++prewarm_encoder_constructions;
+    if (!cache.commit(key, expected)) {
+      return std::nullopt;
+    }
+    return expected;
+  };
+
+  EXPECT_EQ(initialization(), expected);
+  EXPECT_EQ(initialization(), expected);
+  EXPECT_EQ(prewarm_encoder_constructions, 1);
+}
+
+TEST(VideoCodecInitializationCacheTest, FailsClosedAndBindsEveryIdentityDimension) {
+  video::codec_initialization_cache_t cache;
+  const video::codec_initialization_cache_key_t key {
+    probe_identity(),
+    "nvenc",
+    "hevc_nvenc",
+    "exact-quality-hevc-10bit-444-hdr-lossless",
+  };
+  const std::vector<std::uint8_t> initialization {0, 0, 1, 0x40};
+
+  EXPECT_FALSE(cache.commit(key, {}));
+  EXPECT_FALSE(cache.lookup(key));
+  ASSERT_TRUE(cache.commit(key, initialization));
+  ASSERT_EQ(cache.lookup(key), initialization);
+
+  const auto expect_miss = [&](auto mutate) {
+    auto changed = key;
+    mutate(changed);
+    EXPECT_FALSE(cache.lookup(changed));
+  };
+  expect_miss([](auto &changed) {
+    changed.probe_identity.device_identity->adapter_luid++;
+  });
+  expect_miss([](auto &changed) {
+    changed.probe_identity.device_identity->driver_version++;
+  });
+  expect_miss([](auto &changed) {
+    changed.probe_identity.device_identity->output_name = "\\\\.\\DISPLAY2";
+  });
+  expect_miss([](auto &changed) {
+    changed.encoder_name = "software";
+  });
+  expect_miss([](auto &changed) {
+    changed.codec_name = "av1_nvenc";
+  });
+  expect_miss([](auto &changed) {
+    changed.configuration_fingerprint += ":latency";
+  });
+}
+
+TEST(EncoderProbeCacheTest, ReusesOnlyMatchingCurrentIdentity) {
+  const auto current = probe_identity();
+  const std::optional<video::encoder_probe_identity_t> cached {current};
+
+  EXPECT_TRUE(video::can_reuse_encoder_probe(true, false, false, current, cached));
+  EXPECT_FALSE(video::can_reuse_encoder_probe(false, false, false, current, cached));
+  EXPECT_FALSE(video::can_reuse_encoder_probe(true, true, false, current, cached));
+  EXPECT_FALSE(video::can_reuse_encoder_probe(true, false, true, current, cached));
+  EXPECT_FALSE(video::can_reuse_encoder_probe(true, false, false, current, std::nullopt));
+}
+
+TEST(EncoderProbeCacheTest, InvalidatesOnCaptureTargetOrPolicyChanges) {
+  const auto cached_identity = probe_identity();
+  const std::optional<video::encoder_probe_identity_t> cached {cached_identity};
+
+  auto expect_invalid = [&](auto mutate) {
+    auto current = cached_identity;
+    mutate(current);
+    EXPECT_FALSE(video::can_reuse_encoder_probe(true, false, false, current, cached));
+  };
+
+  expect_invalid([](auto &identity) {
+    identity.adapter_name = "Microsoft Basic Render Driver";
+  });
+  expect_invalid([](auto &identity) {
+    identity.raw_output_name = "{different-display-id}";
+  });
+  expect_invalid([](auto &identity) {
+    identity.resolved_output_name = "\\\\.\\DISPLAY2";
+  });
+  expect_invalid([](auto &identity) {
+    identity.capture = "wgc";
+  });
+  expect_invalid([](auto &identity) {
+    identity.encoder = "software";
+  });
+  expect_invalid([](auto &identity) {
+    identity.hevc_mode = 0;
+  });
+  expect_invalid([](auto &identity) {
+    identity.av1_mode = 0;
+  });
+  expect_invalid([](auto &identity) {
+    identity.force_video_header_replace = true;
+  });
+  expect_invalid([](auto &identity) {
+    identity.device_identity = device_identity(1);
+  });
+  expect_invalid([](auto &identity) {
+    identity.device_identity->driver_version += 1;
+  });
+  expect_invalid([](auto &identity) {
+    identity.device_identity->output_name = "\\\\.\\DISPLAY2";
+  });
+}
+
+TEST(EncoderProbeCacheTest, HybridGpuBindingUsesActuallyOpenedAdapter) {
+  auto opened_on_discrete_gpu = probe_identity();
+  opened_on_discrete_gpu.adapter_name.clear();
+  opened_on_discrete_gpu.raw_output_name.clear();
+  opened_on_discrete_gpu.resolved_output_name.clear();
+
+  video::encoder_probe_cache_t cache;
+  ASSERT_TRUE(cache.commit(opened_on_discrete_gpu));
+  EXPECT_TRUE(cache.can_reuse(true, false, false, opened_on_discrete_gpu));
+
+  auto independently_enumerated_integrated_gpu = opened_on_discrete_gpu;
+  independently_enumerated_integrated_gpu.device_identity = device_identity(1);
+  EXPECT_FALSE(cache.can_reuse(true, false, false, independently_enumerated_integrated_gpu));
+}
+
+TEST(EncoderProbeCacheTest, InactiveConfiguredDisplayIsNeverCacheable) {
+  auto unresolved = probe_identity();
+  unresolved.raw_output_name = "{inactive-display-id}";
+  unresolved.resolved_output_name.clear();
+
+  video::encoder_probe_cache_t cache;
+  EXPECT_FALSE(video::encoder_probe_identity_is_cacheable(unresolved));
+  EXPECT_FALSE(cache.commit(unresolved));
+  EXPECT_FALSE(cache.can_reuse(true, false, false, unresolved));
+}
+
+TEST(EncoderProbeCacheTest, AutomaticSelectionReusesExactOpenedBinding) {
+  auto automatic = probe_identity();
+  automatic.adapter_name.clear();
+  automatic.raw_output_name.clear();
+  automatic.resolved_output_name.clear();
+
+  video::encoder_probe_cache_t cache;
+  ASSERT_TRUE(cache.commit(automatic));
+  EXPECT_TRUE(cache.can_reuse(true, false, false, automatic));
+}
+
+TEST(EncoderProbeCacheTest, AutomaticIntentSurvivesConcreteStreamOpenAndInvalidatesEarlierNewTarget) {
+  auto integrated = device_identity(1);
+  integrated.output_name = "\\\\.\\DISPLAY1";
+  auto discrete = device_identity(2);
+  discrete.output_name = "\\\\.\\DISPLAY2";
+
+  const video::encoder_probe_selection_intent_t automatic_intent {
+    "",
+    "",
+    "",
+    true,
+    true,
+  };
+
+  video::encoder_probe_device_selection_t boot_selection;
+  boot_selection.observe({integrated, true, true, false, false});
+  boot_selection.observe({discrete, true, true, true, true});
+  ASSERT_TRUE(boot_selection.selected());
+  ASSERT_EQ(*boot_selection.selected(), discrete);
+
+  const video::encoder_probe_opened_device_baseline_t boot_probe_baseline {
+    *boot_selection.selected(),
+    automatic_intent,
+  };
+
+  // The real capture path opens the concrete output by name. Recording that exact
+  // binding must not turn the original automatic selection policy into an explicit one.
+  const video::encoder_probe_opened_device_baseline_t real_stream_baseline {
+    discrete,
+    boot_probe_baseline.selection_intent,
+  };
+  ASSERT_TRUE(video::encoder_probe_selection_requires_replay(real_stream_baseline.selection_intent));
+
+  auto cached = probe_identity();
+  cached.adapter_name.clear();
+  cached.raw_output_name.clear();
+  cached.resolved_output_name.clear();
+  cached.device_identity = real_stream_baseline.identity;
+  video::encoder_probe_cache_t cache;
+  ASSERT_TRUE(cache.commit(cached));
+
+  video::encoder_probe_device_selection_t launch_selection;
+  launch_selection.observe({integrated, true, true, true, true});
+  launch_selection.observe({discrete, true, true, true, true});
+  ASSERT_TRUE(launch_selection.selected());
+  ASSERT_EQ(*launch_selection.selected(), integrated);
+
+  auto current = cached;
+  current.device_identity = *launch_selection.selected();
+  EXPECT_FALSE(cache.can_reuse(true, false, false, current));
+}
+
+TEST(EncoderProbeCacheTest, ExplicitSelectionIgnoresUnmatchedEarlierOutput) {
+  auto integrated = device_identity(1);
+  auto discrete = device_identity(2);
+  discrete.output_name = "\\\\.\\DISPLAY2";
+
+  video::encoder_probe_device_selection_t selection;
+  selection.observe({integrated, true, false, true, true});
+  selection.observe({discrete, true, true, true, true});
+
+  ASSERT_TRUE(selection.selected());
+  EXPECT_EQ(*selection.selected(), discrete);
+
+  const video::encoder_probe_selection_intent_t explicit_intent {
+    "NVIDIA GeForce RTX 4060",
+    "{configured-display-id}",
+    "\\\\.\\DISPLAY2",
+    false,
+    false,
+  };
+  EXPECT_FALSE(video::encoder_probe_selection_requires_replay(explicit_intent));
+}
+
+TEST(EncoderProbeCacheTest, BootCommitAndLaunchGenerationLifecycle) {
+  const auto identity = probe_identity();
+  video::encoder_probe_cache_t cache;
+
+  EXPECT_FALSE(cache.can_reuse(false, false, true, identity));
+  ASSERT_TRUE(cache.commit(identity));
+  EXPECT_TRUE(cache.can_reuse(true, false, false, identity));
+  EXPECT_FALSE(cache.can_reuse(true, false, true, identity));
+
+  cache.clear();
+  EXPECT_FALSE(cache.can_reuse(true, false, false, identity));
+}
+
+TEST(EncoderProbeCacheTest, LosslessPublicationRequiresCompletedMatchingIdentityCommit) {
+  EXPECT_TRUE(video::can_publish_nvenc_lossless_capabilities(true, false, true, true));
+  EXPECT_FALSE(video::can_publish_nvenc_lossless_capabilities(false, false, true, true));
+  EXPECT_FALSE(video::can_publish_nvenc_lossless_capabilities(true, true, true, true));
+  EXPECT_FALSE(video::can_publish_nvenc_lossless_capabilities(true, false, false, true));
+  EXPECT_FALSE(video::can_publish_nvenc_lossless_capabilities(true, false, true, false));
+
+  stream_policy::reset_nvenc_lossless_capabilities();
+  stream_policy::record_nvenc_lossless_capability(1, true);
+  stream_policy::publish_nvenc_lossless_capabilities(
+    video::can_publish_nvenc_lossless_capabilities(true, true, true, true)
+  );
+  EXPECT_FALSE(stream_policy::nvenc_lossless_capability(1));
+  const auto topology_rejected = stream_policy::select_fidelity(
+    stream_policy::StreamOptimizationMode::quality,
+    stream_policy::StreamFidelityRequest::codec_lossless_required,
+    {1, 10, true, true, stream_policy::nvenc_lossless_capability(1), true, true}
+  );
+  EXPECT_EQ(topology_rejected.selected, stream_policy::SelectedFidelityClass::rejected);
+  EXPECT_EQ(
+    topology_rejected.rejection,
+    stream_policy::FidelityRejectionReason::encoder_lossless_unavailable
+  );
+
+  stream_policy::record_nvenc_lossless_capability(1, true);
+  stream_policy::publish_nvenc_lossless_capabilities(
+    video::can_publish_nvenc_lossless_capabilities(true, false, true, false)
+  );
+  EXPECT_FALSE(stream_policy::nvenc_lossless_capability(1));
+}
+
+TEST(EncoderProbeCacheTest, StableRequestAcceptsBindingDiscoveredDuringBootProbe) {
+  auto before_probe = probe_identity();
+  before_probe.device_identity.reset();
+  const auto after_probe = probe_identity();
+
+  EXPECT_TRUE(video::same_encoder_probe_request(before_probe, after_probe));
+  EXPECT_FALSE(video::encoder_probe_identity_is_cacheable(before_probe));
+  EXPECT_TRUE(video::encoder_probe_identity_is_cacheable(after_probe));
+}
+
+TEST(EncoderProbeCacheTest, RequiredDeviceObservationFailsClosedWhenUnavailable) {
+  auto unavailable = probe_identity();
+  unavailable.device_identity.reset();
+
+  video::encoder_probe_cache_t cache;
+  EXPECT_FALSE(cache.commit(unavailable));
+
+  unavailable.device_identity_required = false;
+  EXPECT_TRUE(cache.commit(unavailable));
+}
+
+TEST(DisplayReadyEventTest, ResetRaiseStopLifecycle) {
+  safe::signal_t display_ready;
+
+  EXPECT_FALSE(display_ready.view(1ms));
+  display_ready.raise(true);
+  ASSERT_TRUE(display_ready.view(1ms));
+
+  display_ready.reset();
+  EXPECT_FALSE(display_ready.view(1ms));
+  display_ready.raise(true);
+  ASSERT_TRUE(display_ready.view(1ms));
+
+  display_ready.stop();
+  EXPECT_FALSE(display_ready.view(1ms));
+}
 
 struct EncoderTest: PlatformTestSuite, testing::WithParamInterface<video::encoder_t *> {
   void SetUp() override {

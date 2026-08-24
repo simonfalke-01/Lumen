@@ -1,0 +1,99 @@
+{
+  "provenance": {
+    "moonlightQtCommit": "d2f6990be699197385a6458e1231d070da83e665",
+    "moonlightCommonCommit": "874ac9548f1bd6f095ef2b435c42cdde460e7821",
+    "generator": "moonlight-qt-source-derived-v1",
+    "lineEndings": "CRLF",
+    "attributeOrder": "moonlight-common-c SdpGenerator.c append order; parser tests are order-insensitive",
+    "sourceFiles": {
+      "app/backend/identitymanager.cpp": "81cc5e276635524e65d4cf26887c6052e5e19a2cbb200f68202f2bc26c7e8c52",
+      "app/backend/nvhttp.cpp": "3ea8beeee68a38b8f189522275181d2cc9960de55505667c4c0003816ee0ad35",
+      "app/backend/nvpairingmanager.cpp": "e0ce6136d0b2133e1fe5282dbe7a262ac7094893572ebe4d9e225c2b9f1de6ae",
+      "moonlight-common-c/moonlight-common-c/src/RtspConnection.c": "44cfd110f637c64c1108a10e1c0efbc4dd2c938613979a645a61346d1979e75f",
+      "moonlight-common-c/moonlight-common-c/src/SdpGenerator.c": "c0ef395dd701b9f30defc9ae94ba2333c0cf7cdaa7108f7fb1b9300241f1a6aa"
+    }
+  },
+  "http": {
+    "uniqueId": "0123456789abcdef",
+    "paths": [
+      "/serverinfo",
+      "/pair",
+      "/applist",
+      "/appasset",
+      "/launch",
+      "/resume",
+      "/cancel"
+    ],
+    "launchArguments": {
+      "uniqueid": "0123456789ABCDEF",
+      "uuid": "00112233445566778899aabbccddeeff",
+      "appid": "881",
+      "mode": "2560x1440x120",
+      "additionalStates": "1",
+      "sops": "1",
+      "rikey": "000102030405060708090a0b0c0d0e0f",
+      "rikeyid": "16909060",
+      "hdrMode": "1",
+      "clientHdrCapVersion": "0",
+      "clientHdrCapSupportedFlagsInUint32": "0",
+      "clientHdrCapMetaDataId": "NV_STATIC_METADATA_TYPE_1",
+      "clientHdrCapDisplayData": "0x0x0x0x0x0x0x0x0x0x0",
+      "localAudioPlayMode": "0",
+      "surroundAudioInfo": "196610",
+      "remoteControllersBitmap": "5",
+      "gcmap": "5",
+      "gcpersist": "1",
+      "corever": "1"
+    }
+  },
+  "rtsp": {
+    "clientVersion": 14,
+    "target": "rtsp://127.0.0.1:48010",
+    "setupTargets": [
+      "streamid=audio/0/0",
+      "streamid=video/0/0",
+      "streamid=control/0/0"
+    ],
+    "announceTarget": "streamid=control/13/0",
+    "playTarget": "/",
+    "announceAttributes": {
+      "x-ml-general.featureFlags": "3",
+      "x-ss-general.encryptionEnabled": "0",
+      "x-ss-video[0].chromaSamplingType": "0",
+      "x-nv-video[0].clientViewportWd": "2560",
+      "x-nv-video[0].clientViewportHt": "1440",
+      "x-nv-video[0].maxFPS": "120",
+      "x-nv-video[0].clientRefreshRateX100": "12000",
+      "x-nv-video[0].packetSize": "1392",
+      "x-nv-video[0].rateControlMode": "4",
+      "x-nv-video[0].timeoutLengthMs": "7000",
+      "x-nv-video[0].framesWithInvalidRefThreshold": "0",
+      "x-nv-video[0].initialBitrateKbps": "80000",
+      "x-nv-video[0].initialPeakBitrateKbps": "80000",
+      "x-nv-vqos[0].bw.minimumBitrateKbps": "80000",
+      "x-nv-vqos[0].bw.maximumBitrateKbps": "80000",
+      "x-ml-video.configuredBitrateKbps": "100000",
+      "x-nv-vqos[0].fec.enable": "1",
+      "x-nv-vqos[0].videoQualityScoreUpdateTime": "5000",
+      "x-nv-vqos[0].qosTrafficType": "5",
+      "x-nv-aqos.qosTrafficType": "4",
+      "x-nv-general.featureFlags": "135",
+      "x-nv-general.useReliableUdp": "13",
+      "x-nv-vqos[0].fec.minRequiredFecPackets": "2",
+      "x-nv-vqos[0].bllFec.enable": "0",
+      "x-nv-vqos[0].drc.enable": "0",
+      "x-nv-general.enableRecoveryMode": "0",
+      "x-nv-video[0].videoEncoderSlicesPerFrame": "1",
+      "x-nv-clientSupportHevc": "1",
+      "x-nv-vqos[0].bitStreamFormat": "1",
+      "x-nv-video[0].dynamicRangeMode": "1",
+      "x-nv-video[0].maxNumReferenceFrames": "1",
+      "x-nv-audio.surround.numChannels": "2",
+      "x-nv-audio.surround.channelMask": "3",
+      "x-nv-audio.surround.enable": "0",
+      "x-nv-audio.surround.AudioQuality": "0",
+      "x-nv-aqos.packetDuration": "5",
+      "x-nv-video[0].encoderCscMode": "0"
+    }
+  }
+}

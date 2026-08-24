@@ -67,7 +67,7 @@ using frame_t = util::safe_ptr<AVFrame, free_frame>;
 namespace gl {
   extern GladGLContext ctx;
 
-  // glEGLImageTargetTexture2DOES (GL_OES_EGL_image) is not part of desktop GL —
+  // glEGLImageTargetTexture2DOES (GL_OES_EGL_image) is not part of desktop GL;
   // it is a GLES extension that must be loaded manually via eglGetProcAddress.
   // GLeglImageOES is typedef void* per the Khronos spec (gl.xml).
   /**

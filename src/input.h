@@ -7,6 +7,7 @@
 // standard includes
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 // local includes
 #include "platform/common.h"
@@ -14,11 +15,19 @@
 
 namespace input {
   struct input_t;
+  using ordered_injector_t =
+    std::function<bool(std::vector<std::uint8_t> &&)>;  ///< Checked direct consumer-thread packet injector.
+  using ordered_state_operation_t =
+    std::function<bool(const ordered_injector_t &)>;  ///< One complete v3 state operation.
 
   /**
    * @brief Internal input helpers exposed for focused unit testing.
    */
   namespace detail {
+#ifdef SUNSHINE_TESTS
+    /** @brief Run one packet through the production checked dispatcher for focused tests. */
+    bool passthrough_packet_for_test(input_t *input, std::vector<std::uint8_t> packet);
+#endif
     /**
      * @brief Platform-independent actions selected by the delayed left-button state machine.
      */
@@ -143,8 +152,37 @@ namespace input {
 
   /**
    * @brief Queue a raw input message for platform passthrough.
+   * @return True when the ordered consumer accepted or coalesced the packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data);
+  bool passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data);
+
+  /**
+   * @brief Queue one protocol-v3 state operation on the ordered input consumer.
+   *
+   * Edge-free operations may supersede a consecutive stale state and expire
+   * under the normal motion-age bound. Operations containing a new edge are
+   * non-droppable and preserve strict FIFO ordering. Completion runs only after
+   * every packet emitted by the operation has returned from platform injection.
+   *
+   * @param input Shared stream input state.
+   * @param operation Consumer-thread operation using the direct ordered injector.
+   * @param supersedable Whether a newer consecutive state may replace this work.
+   * @param completion Callback run after actual platform injection.
+   * @return True when accepted, coalesced, or safely pressure-dropped; false when closed.
+   */
+  bool passthrough_state(
+    std::shared_ptr<input_t> &input,
+    ordered_state_operation_t operation,
+    bool supersedable,
+    std::function<void()> completion = {}
+  );
+
+  /**
+   * @brief Seal input producers before waiting for the control stream to terminate.
+   *
+   * @param input Shared stream input state whose blocked producers must be released.
+   */
+  void begin_close(std::shared_ptr<input_t> &input);
 
   /**
    * @brief Initialize global input resources and platform backends.

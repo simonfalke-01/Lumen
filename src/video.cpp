@@ -8,6 +8,8 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <limits>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -33,8 +35,14 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
+#include "stream_policy.h"
 #include "sync.h"
 #include "video.h"
+#include "video_egress_queue.h"
+
+#ifdef _WIN32
+  #include "platform/windows/display.h"
+#endif
 
 #ifdef _WIN32
 extern "C" {
@@ -74,6 +82,188 @@ namespace video {
 
       BOOST_LOG(error) << "No display devices are active at the moment! Cannot probe the encoders.";
       return false;
+    }
+
+    encoder_probe_identity_t current_encoder_probe_identity() {
+      encoder_probe_identity_t identity {
+        config::video.adapter_name,
+        config::video.output_name,
+        display_device::map_output_name(config::video.output_name),
+        config::video.capture,
+        config::video.encoder,
+        config::video.hevc_mode,
+        config::video.av1_mode,
+        config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE],
+        false,
+        std::nullopt,
+      };
+
+#ifdef _WIN32
+      identity.device_identity_required = true;
+      identity.device_identity = platf::dxgi::encoder_probe_device_identity();
+#endif
+
+      return identity;
+    }
+
+    void append_codec_cache_string(std::string &output, const std::string_view value) {
+      output += std::to_string(value.size());
+      output.push_back(':');
+      output.append(value);
+      output.push_back(';');
+    }
+
+    template<typename Value>
+    void append_codec_cache_integer(std::string &output, const Value value) {
+      append_codec_cache_string(output, std::to_string(static_cast<std::int64_t>(value)));
+    }
+
+    void append_codec_cache_optional(std::string &output, const std::optional<int> &value) {
+      append_codec_cache_integer(output, value.has_value());
+      if (value) {
+        append_codec_cache_integer(output, *value);
+      }
+    }
+
+    void append_codec_cache_nvenc(std::string &output, const nvenc::nvenc_config &config) {
+      append_codec_cache_integer(output, config.quality_preset);
+      append_codec_cache_integer(output, config.tuning);
+      append_codec_cache_integer(output, config.fidelity);
+      append_codec_cache_integer(output, config.two_pass);
+      append_codec_cache_integer(output, config.vbv_percentage_increase);
+      append_codec_cache_integer(output, config.weighted_prediction);
+      append_codec_cache_integer(output, config.adaptive_quantization);
+      append_codec_cache_integer(output, config.enable_min_qp);
+      append_codec_cache_integer(output, config.min_qp_h264);
+      append_codec_cache_integer(output, config.min_qp_hevc);
+      append_codec_cache_integer(output, config.min_qp_av1);
+      append_codec_cache_integer(output, config.h264_cavlc);
+      append_codec_cache_integer(output, config.insert_filler_data);
+      append_codec_cache_integer(output, config.split_frame_encoding);
+    }
+
+    void append_codec_cache_option(
+      std::string &output,
+      const encoder_t::option_t &option,
+      const config_t &config
+    ) {
+      append_codec_cache_string(output, option.name);
+      append_codec_cache_integer(output, option.value.index());
+      std::visit(
+        util::overloaded {
+          [&](const int value) {
+            append_codec_cache_integer(output, value);
+          },
+          [&](const int *value) {
+            append_codec_cache_integer(output, *value);
+          },
+          [&](const std::optional<int> *value) {
+            append_codec_cache_optional(output, *value);
+          },
+          [&](const std::function<int()> &value) {
+            append_codec_cache_integer(output, value());
+          },
+          [&](const std::string &value) {
+            append_codec_cache_string(output, value);
+          },
+          [&](const std::string *value) {
+            append_codec_cache_string(output, *value);
+          },
+          [&](const std::function<const std::string(const config_t &)> &value) {
+            append_codec_cache_string(output, value(config));
+          }
+        },
+        option.value
+      );
+    }
+
+    std::string codec_initialization_configuration_fingerprint(
+      const config_t &config,
+      const encoder_t &encoder
+    ) {
+      std::string fingerprint;
+      fingerprint.reserve(1024);
+      const auto append = [&](const auto value) {
+        append_codec_cache_integer(fingerprint, value);
+      };
+
+      append(config.width);
+      append(config.height);
+      append(config.framerate);
+      append(config.framerateX100);
+      append(config.bitrate);
+      append(config.slicesPerFrame);
+      append(config.numRefFrames);
+      append(config.encoderCscMode);
+      append(config.videoFormat);
+      append(config.dynamicRange);
+      append(config.chromaSamplingType);
+      append(config.enableIntraRefresh);
+      append(config.protocolV3Colorimetry);
+      append(config.colorPrimaries);
+      append(config.colorTransfer);
+      append(config.colorMatrix);
+      append(config.colorRange);
+      append(config.hasStaticHDRMetadata);
+      for (const auto coordinate : config.staticHDRDisplayPrimaries) {
+        append(coordinate);
+      }
+      for (const auto coordinate : config.staticHDRWhitePoint) {
+        append(coordinate);
+      }
+      append(config.staticHDRMaximumMasteringLuminance);
+      append(config.staticHDRMinimumMasteringLuminance);
+      append(config.staticHDRMaximumContentLightLevel);
+      append(config.staticHDRMaximumFrameAverageLightLevel);
+      append(config.refreshNumerator);
+      append(config.refreshDenominator);
+      append_codec_cache_string(fingerprint, config.output_name);
+      append(config.client_protocol);
+      append(static_cast<bool>(config.virtual_display_frame_source));
+
+      append(config::video.qp);
+      append(config::video.min_threads);
+      append(config::video.max_bitrate);
+      append_codec_cache_nvenc(fingerprint, config::video.nv);
+      append(config::video.nv_legacy.preset);
+      append(config::video.nv_legacy.multipass);
+      append(config::video.nv_legacy.h264_coder);
+      append(config::video.nv_legacy.aq);
+      append(config::video.nv_legacy.vbv_percentage_increase);
+
+      append(static_cast<bool>(config.optimization_policy));
+      if (config.optimization_policy) {
+        const auto &policy = *config.optimization_policy;
+        append(policy.mode);
+        append_codec_cache_nvenc(fingerprint, policy.nvenc);
+        append(policy.static_profile_fec.minimum_percentage);
+        append(policy.static_profile_fec.maximum_percentage);
+        append(policy.static_profile_fec.ordinary_percentage);
+        append(policy.static_profile_fec.recovery_percentage);
+        append(policy.packet_pacing);
+        append(policy.client_negotiated_mode);
+        append(policy.fidelity_request);
+        append(policy.selected_fidelity);
+      }
+
+      append_codec_cache_string(fingerprint, encoder.name);
+      append(encoder.flags);
+      const auto &codec = encoder.codec_from_config(config);
+      append_codec_cache_string(fingerprint, codec.name);
+      append(codec.capabilities.to_ullong());
+      const auto append_options = [&](const std::vector<encoder_t::option_t> &options) {
+        append(options.size());
+        for (const auto &option : options) {
+          append_codec_cache_option(fingerprint, option, config);
+        }
+      };
+      append_options(codec.common_options);
+      append_options(codec.sdr_options);
+      append_options(codec.hdr_options);
+      append_options(codec.sdr444_options);
+      append_options(codec.hdr444_options);
+      append_options(codec.fallback_options);
+      return fingerprint;
     }
   }  // namespace
 
@@ -516,7 +706,12 @@ namespace video {
       if (!device) {
         return -1;
       }
-      return device->convert(img);
+      pending_source_lifetime.reset();
+      const auto result = device->convert(img);
+      if (result == 0) {
+        pending_source_lifetime = std::move(img.encode_source_lifetime);
+      }
+      return result;
     }
 
     /**
@@ -560,6 +755,9 @@ namespace video {
         return {};
       }
 
+      auto release_source = util::fail_guard([this]() {
+        pending_source_lifetime.reset();
+      });
       auto result = device->nvenc->encode_frame(frame_index, force_idr);
       force_idr = false;
       return result;
@@ -567,6 +765,7 @@ namespace video {
 
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
+    std::shared_ptr<platf::deinit_t> pending_source_lifetime;  ///< Direct VDD slot retained through NVENC completion.
     bool force_idr = false;
   };
 
@@ -576,8 +775,9 @@ namespace video {
   struct sync_session_ctx_t {
     safe::signal_t *join_event;  ///< Signal raised when the capture and encode workers should join.
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
-    safe::mail_raw_t::queue_t<packet_t> packets;  ///< Queue receiving encoded video packets for the stream sender.
+    egress_queue_t *egress;  ///< Per-session scheduler receiving encoded video packets for the stream sender.
     safe::mail_raw_t::event_t<bool> idr_events;  ///< Event raised when an IDR frame is requested.
+    safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Reference ranges requiring encoder recovery.
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;  ///< Event carrying updated HDR metadata.
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;  ///< Event carrying updated touch viewport metadata.
 
@@ -592,6 +792,7 @@ namespace video {
   struct sync_session_t {
     sync_session_ctx_t *ctx;  ///< Shared capture/encode synchronization context.
     std::unique_ptr<encode_session_t> session;  ///< Active encoder session used by the capture thread.
+    std::pair<std::uint64_t, std::uint64_t> input_watermark;  ///< Watermark sampled with the last captured image.
   };
 
   /**
@@ -609,6 +810,7 @@ namespace video {
   struct capture_ctx_t {
     img_event_t images;  ///< Queue of captured images waiting for encode.
     config_t config;  ///< Stream or encoder configuration captured for the worker.
+    input_watermark_t input_watermark;  ///< Applied input sampled immediately before backend acquisition.
   };
 
   /**
@@ -619,6 +821,7 @@ namespace video {
     std::jthread capture_thread;  ///< Capture thread.
 
     safe::signal_t reinit_event;  ///< Reinit event.
+    safe::signal_t display_ready_event;  ///< Raised when the capture display is available to encoder threads.
     const encoder_t *encoder_p;  ///< Encoder p.
     sync_util::sync_t<std::weak_ptr<platf::display_t>> display_wp;  ///< Display wp.
   };
@@ -1393,10 +1596,48 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
+  static encoder_probe_cache_t chosen_encoder_probe_cache;
+  static codec_initialization_cache_t chosen_codec_initialization_cache;
+  static std::mutex encoder_probe_mutex;
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
+
+  bool current_nvenc_lossless_capability(const int video_format) {
+    const auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    const auto current_identity = current_encoder_probe_identity();
+    const bool valid_generation = chosen_encoder_probe_cache.can_reuse(
+      chosen_encoder != nullptr,
+      chosen_encoder && (chosen_encoder->flags & ALWAYS_REPROBE),
+      platf::needs_encoder_reenumeration(),
+      current_identity
+    );
+    if (!valid_generation || !chosen_encoder || chosen_encoder->name != "nvenc"sv) {
+      stream_policy::publish_nvenc_lossless_capabilities(false);
+      return false;
+    }
+    return stream_policy::nvenc_lossless_capability(video_format);
+  }
+
+  std::optional<SS_HDR_METADATA> active_hdr_metadata(const config_t &config) {
+    const auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    if (!chosen_encoder || !chosen_encoder->platform_formats) {
+      return std::nullopt;
+    }
+    const auto output_name = display_device::map_output_name(config.output_name);
+    auto display = platf::display(chosen_encoder->platform_formats->dev_type, output_name, config);
+    if (!display || !display->is_hdr()) {
+      return std::nullopt;
+    }
+    SS_HDR_METADATA metadata {};
+    return display->get_hdr_metadata(metadata) ? std::optional {metadata} : std::nullopt;
+  }
+
+  bool active_encoder_is_nvenc() {
+    const auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    return chosen_encoder != nullptr && chosen_encoder->name == "nvenc"sv;
+  }
 
   /**
    * @brief Recreate a display capture object after a capture failure.
@@ -1426,10 +1667,18 @@ namespace video {
    * @param dev_type The encoder device type used for display lookup.
    * @param display_names The list of display names to repopulate.
    * @param current_display_index The current display index or -1 if not yet known.
+   * @param stream_config Per-session capture configuration.
    */
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
+  void refresh_displays(
+    platf::mem_type_e dev_type,
+    std::vector<std::string> &display_names,
+    int &current_display_index,
+    const config_t &stream_config
+  ) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
-    const auto output_name {display_device::map_output_name(config::video.output_name)};
+    const auto output_name = stream_config.output_name.empty() ?
+                               display_device::map_output_name(config::video.output_name) :
+                               stream_config.output_name;
     std::string current_display_name;
 
     // If we have a current display index, let's start with that
@@ -1480,12 +1729,14 @@ namespace video {
    * @param capture_ctx_queue Capture context queue.
    * @param display_wp Weak pointer holder for the active display.
    * @param reinit_event Signal raised while the display is being reinitialized.
+   * @param display_ready_event Signal raised when a display is ready for encoder setup.
    * @param encoder Selected encoder.
    */
   void captureThread(
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
     sync_util::sync_t<std::weak_ptr<platf::display_t>> &display_wp,
     safe::signal_t &reinit_event,
+    safe::signal_t &display_ready_event,
     const encoder_t &encoder
   ) {
     std::vector<capture_ctx_t> capture_ctxs;
@@ -1500,6 +1751,7 @@ namespace video {
       for (auto &capture_ctx : capture_ctx_queue->unsafe()) {
         capture_ctx.images->stop();
       }
+      display_ready_event.stop();
     });
 
     auto switch_display_event = mail::man->event<int>(mail::switch_display);
@@ -1509,18 +1761,36 @@ namespace video {
     if (!initial_capture_ctx) {
       return;
     }
+    const auto capture_start = std::chrono::steady_clock::now();
     capture_ctxs.emplace_back(std::move(*initial_capture_ctx));
 
     // Get all the monitor names now, rather than at boot, to
     // get the most up-to-date list available monitors
     std::vector<std::string> display_names;
     int display_p = -1;
-    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, capture_ctxs.front().config);
+    const auto display_enumeration_complete = std::chrono::steady_clock::now();
     auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
     if (!disp) {
       return;
     }
+    const auto sample_input_watermarks = [&capture_ctxs]() {
+      for (auto &capture_ctx : capture_ctxs) {
+        capture_ctx.input_watermark = capture_ctx.config.capture_input_watermark ?
+                                        capture_ctx.config.capture_input_watermark() :
+                                        input_watermark_t {};
+      }
+    };
     display_wp = disp;
+    display_ready_event.raise(true);
+    disp->set_capture_boundary_callback(sample_input_watermarks);
+    const auto display_ready = std::chrono::steady_clock::now();
+    BOOST_LOG(info)
+      << "Stream startup stage timings: display enumeration="sv
+      << std::chrono::duration_cast<std::chrono::milliseconds>(display_enumeration_complete - capture_start).count()
+      << " ms, capture display ready="sv
+      << std::chrono::duration_cast<std::chrono::milliseconds>(display_ready - capture_start).count()
+      << " ms"sv;
 
     constexpr auto capture_buffer_size = 12;
     std::list<std::shared_ptr<platf::img_t>> imgs(capture_buffer_size);
@@ -1635,7 +1905,11 @@ namespace video {
           }
 
           if (frame_captured) {
-            capture_ctx->images->raise(img);
+            capture_ctx->images->raise(captured_frame_t {
+              img,
+              capture_ctx->input_watermark.first,
+              capture_ctx->input_watermark.second,
+            });
           }
 
           ++capture_ctx;
@@ -1668,6 +1942,7 @@ namespace video {
       switch (status) {
         case platf::capture_e::reinit:
           {
+            display_ready_event.reset();
             reinit_event.raise(true);
 
             // Some classes of images contain references to the display --> display won't delete unless img is deleted
@@ -1704,7 +1979,7 @@ namespace video {
               disp.reset();
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, capture_ctxs.front().config);
 
               // Process any pending display switch with the new list of displays
               if (switch_display_event->peek()) {
@@ -1722,6 +1997,8 @@ namespace video {
             }
 
             display_wp = disp;
+            display_ready_event.raise(true);
+            disp->set_capture_boundary_callback(sample_input_watermarks);
 
             reinit_event.reset();
             continue;
@@ -1743,12 +2020,19 @@ namespace video {
    *
    * @param frame_nr Monotonic frame index assigned by the video pipeline.
    * @param session Active FFmpeg encoder session.
-   * @param packets Output queue that receives encoded packets.
+   * @param egress Per-session scheduler that receives encoded packets.
    * @param channel_data Platform or protocol state attached to each packet.
    * @param frame_timestamp Capture timestamp associated with the encoded frame.
    * @return 0 when packets are queued; nonzero when encoding or packetization fails.
    */
-  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode_avcodec(
+    int64_t frame_nr,
+    avcodec_encode_session_t &session,
+    egress_queue_t &egress,
+    void *channel_data,
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
+    const std::pair<std::uint64_t, std::uint64_t> input_watermark
+  ) {
     auto &frame = session.device->frame;
     frame->pts = frame_nr;
 
@@ -1758,6 +2042,7 @@ namespace video {
     auto &vps = session.vps;
 
     // send the frame to the encoder
+    const auto encoder_submit_timestamp = std::chrono::steady_clock::now();
     auto ret = avcodec_send_frame(ctx.get(), frame);
     if (ret < 0) {
       char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
@@ -1812,11 +2097,16 @@ namespace video {
 
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
+        packet->encoder_submit_timestamp = encoder_submit_timestamp;
       }
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
-      packets->raise(std::move(packet));
+      packet->applied_input_state_sequence = input_watermark.first;
+      packet->applied_input_edge_id = input_watermark.second;
+      if (egress.push(channel_data, std::move(packet)) == egress_queue_t::enqueue_e::recovery_callback_failed) {
+        BOOST_LOG(error) << "Video egress overflow recovery callback failed"sv;
+      }
     }
 
     return 0;
@@ -1827,12 +2117,20 @@ namespace video {
    *
    * @param frame_nr Monotonic frame index assigned by the video pipeline.
    * @param session Active NVENC encoder session.
-   * @param packets Output queue that receives the encoded packet.
+   * @param egress Per-session scheduler that receives the encoded packet.
    * @param channel_data Platform or protocol state attached to the packet.
    * @param frame_timestamp Capture timestamp associated with the encoded frame.
    * @return 0 when packets are queued; nonzero when NVENC encoding fails.
    */
-  int encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode_nvenc(
+    int64_t frame_nr,
+    nvenc_encode_session_t &session,
+    egress_queue_t &egress,
+    void *channel_data,
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
+    const std::pair<std::uint64_t, std::uint64_t> input_watermark
+  ) {
+    const auto encoder_submit_timestamp = std::chrono::steady_clock::now();
     auto encoded_frame = session.encode_frame(frame_nr);
     if (encoded_frame.data.empty()) {
       BOOST_LOG(error) << "NvENC returned empty packet";
@@ -1847,7 +2145,12 @@ namespace video {
     packet->channel_data = channel_data;
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
     packet->frame_timestamp = frame_timestamp;
-    packets->raise(std::move(packet));
+    packet->encoder_submit_timestamp = encoder_submit_timestamp;
+    packet->applied_input_state_sequence = input_watermark.first;
+    packet->applied_input_edge_id = input_watermark.second;
+    if (egress.push(channel_data, std::move(packet)) == egress_queue_t::enqueue_e::recovery_callback_failed) {
+      BOOST_LOG(error) << "Video egress overflow recovery callback failed"sv;
+    }
 
     return 0;
   }
@@ -1857,16 +2160,23 @@ namespace video {
    *
    * @param frame_nr Frame nr.
    * @param session Active streaming or pairing session for the request.
-   * @param packets Packets queued or emitted by the stream.
+   * @param egress Per-session scheduler that receives encoded packets.
    * @param channel_data Channel data.
    * @param frame_timestamp Frame timestamp.
    * @return 0 when the frame is encoded and queued; nonzero on encoder failure.
    */
-  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode(
+    int64_t frame_nr,
+    encode_session_t &session,
+    egress_queue_t &egress,
+    void *channel_data,
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
+    const std::pair<std::uint64_t, std::uint64_t> input_watermark
+  ) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
-      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
+      return encode_avcodec(frame_nr, *avcodec_session, egress, channel_data, frame_timestamp, input_watermark);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
-      return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
+      return encode_nvenc(frame_nr, *nvenc_session, egress, channel_data, frame_timestamp, input_watermark);
     }
 
     return -1;
@@ -2209,7 +2519,20 @@ namespace video {
     // Attach HDR metadata to the AVFrame
     if (colorspace_is_hdr(colorspace)) {
       SS_HDR_METADATA hdr_metadata;
-      if (disp->get_hdr_metadata(hdr_metadata)) {
+      if (config.protocolV3Colorimetry && config.hasStaticHDRMetadata) {
+        for (std::size_t index = 0; index < 3; ++index) {
+          hdr_metadata.displayPrimaries[index].x = config.staticHDRDisplayPrimaries[index * 2];
+          hdr_metadata.displayPrimaries[index].y = config.staticHDRDisplayPrimaries[index * 2 + 1];
+        }
+        hdr_metadata.whitePoint.x = config.staticHDRWhitePoint[0];
+        hdr_metadata.whitePoint.y = config.staticHDRWhitePoint[1];
+        hdr_metadata.maxDisplayLuminance = config.staticHDRMaximumMasteringLuminance / 10'000U;
+        hdr_metadata.minDisplayLuminance = config.staticHDRMinimumMasteringLuminance;
+        hdr_metadata.maxContentLightLevel = config.staticHDRMaximumContentLightLevel;
+        hdr_metadata.maxFrameAverageLightLevel = config.staticHDRMaximumFrameAverageLightLevel;
+      }
+      if ((config.protocolV3Colorimetry && config.hasStaticHDRMetadata) ||
+          (!config.protocolV3Colorimetry && disp->get_hdr_metadata(hdr_metadata))) {
         auto mdm = av_mastering_display_metadata_create_side_data(frame.get());
 
         mdm->display_primaries[0][0] = av_make_q(hdr_metadata.displayPrimaries[0].x, 50000);
@@ -2234,7 +2557,7 @@ namespace video {
           clm->MaxCLL = hdr_metadata.maxContentLightLevel;
           clm->MaxFALL = hdr_metadata.maxFrameAverageLightLevel;
         }
-      } else {
+      } else if (!config.protocolV3Colorimetry) {
         BOOST_LOG(error) << "Couldn't get display hdr metadata when colorspace selection indicates it should have one";
       }
     }
@@ -2298,6 +2621,12 @@ namespace video {
    * @return Constructed encode session object.
    */
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
+    const auto *policy = stream_policy::current_thread_policy();
+    const bool native_nvenc = dynamic_cast<platf::nvenc_encode_device_t *>(encode_device.get());
+    if (policy && !stream_policy::permits_encoder_backend(*policy, native_nvenc)) {
+      BOOST_LOG(error) << "Codec-lossless session rejected an alternate or fallback encoder"sv;
+      return nullptr;
+    }
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
       return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
@@ -2321,6 +2650,7 @@ namespace video {
    * @param reinit_event Signal raised while the encoder/display is reinitializing.
    * @param encoder Selected encoder.
    * @param channel_data Opaque channel data passed to packets.
+   * @param egress Per-session scheduler receiving encoded frames.
    */
   void encode_run(
     int &frame_nr,  // Store progress of the frame number
@@ -2331,7 +2661,8 @@ namespace video {
     std::unique_ptr<platf::encode_device_t> encode_device,
     safe::signal_t &reinit_event,
     const encoder_t &encoder,
-    void *channel_data
+    void *channel_data,
+    egress_queue_t &egress
   ) {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
@@ -2361,7 +2692,6 @@ namespace video {
     BOOST_LOG(info) << "Minimum FPS target set to ~"sv << minimum_fps_target << "fps ("sv << max_frametime.count() << "ms)"sv;
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
-    auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
 
@@ -2376,6 +2706,7 @@ namespace video {
       }
     }
 
+    std::pair<std::uint64_t, std::uint64_t> input_watermark;
     while (true) {
       bool requested_idr_frame = false;
 
@@ -2398,9 +2729,13 @@ namespace video {
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
-        if (auto img = images->pop(max_frametime)) {
-          frame_timestamp = img->frame_timestamp;
-          if (session->convert(*img)) {
+        if (auto captured = images->pop(max_frametime)) {
+          frame_timestamp = captured->image->frame_timestamp;
+          input_watermark = {
+            captured->applied_input_state_sequence,
+            captured->applied_input_edge_id,
+          };
+          if (session->convert(*captured->image)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
           }
@@ -2423,7 +2758,7 @@ namespace video {
         break;
       }
 
-      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
+      if (encode(frame_nr++, *session, egress, channel_data, frame_timestamp, input_watermark)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
@@ -2524,6 +2859,7 @@ namespace video {
       BOOST_LOG(info) << "Creating encoder " << logging::bracket(encoder_name);
 
       auto color_coding = colorspace.colorspace == colorspace_e::bt2020    ? "HDR (Rec. 2020 + SMPTE 2084 PQ)" :
+                          colorspace.colorspace == colorspace_e::bt2020hlg ? "HDR (Rec. 2020 + ARIB STD-B67 HLG)" :
                           colorspace.colorspace == colorspace_e::rec601    ? "SDR (Rec. 601)" :
                           colorspace.colorspace == colorspace_e::rec709    ? "SDR (Rec. 709)" :
                           colorspace.colorspace == colorspace_e::bt2020sdr ? "SDR (Rec. 2020)" :
@@ -2628,7 +2964,7 @@ namespace video {
 
     while (encode_session_ctx_queue.running()) {
       // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, synced_session_ctxs.front()->config);
 
       // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {
@@ -2660,6 +2996,15 @@ namespace video {
 
       synced_sessions.emplace_back(std::move(*synced_session));
     }
+
+    disp->set_capture_boundary_callback([&synced_sessions]() {
+      for (auto &synced_session : synced_sessions) {
+        const auto &config = synced_session.ctx->config;
+        synced_session.input_watermark = config.capture_input_watermark ?
+                                           config.capture_input_watermark() :
+                                           input_watermark_t {};
+      }
+    });
 
     auto ec = platf::capture_e::ok;
     while (encode_session_ctx_queue.running()) {
@@ -2699,16 +3044,24 @@ namespace video {
             continue;
           }
 
+          while (ctx->invalidate_ref_frames_events->peek()) {
+            if (auto frames = ctx->invalidate_ref_frames_events->pop(0ms)) {
+              pos->session->invalidate_ref_frames(frames->first, frames->second);
+            }
+          }
+
           if (ctx->idr_events->peek()) {
             pos->session->request_idr_frame();
             ctx->idr_events->pop();
           }
 
-          if (frame_captured && pos->session->convert(*img)) {
-            BOOST_LOG(error) << "Could not convert image"sv;
-            ctx->shutdown_event->raise(true);
+          if (frame_captured) {
+            if (pos->session->convert(*img)) {
+              BOOST_LOG(error) << "Could not convert image"sv;
+              ctx->shutdown_event->raise(true);
 
-            continue;
+              continue;
+            }
           }
 
           std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
@@ -2716,7 +3069,14 @@ namespace video {
             frame_timestamp = img->frame_timestamp;
           }
 
-          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
+          if (encode(
+                ctx->frame_nr++,
+                *pos->session,
+                *ctx->egress,
+                ctx->channel_data,
+                frame_timestamp,
+                pos->input_watermark
+              )) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
 
@@ -2794,11 +3154,13 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Video configuration.
    * @param channel_data Opaque channel data passed to packets.
+   * @param egress Per-session scheduler receiving encoded frames.
    */
   void capture_async(
     safe::mail_t mail,
     config_t &config,
-    void *channel_data
+    void *channel_data,
+    egress_queue_t &egress
   ) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
@@ -2813,7 +3175,7 @@ namespace video {
       return;
     }
 
-    ref->capture_ctx_queue->raise(capture_ctx_t {images, config});
+    ref->capture_ctx_queue->raise(capture_ctx_t {images, config, {}});
 
     if (!ref->capture_ctx_queue->running()) {
       return;
@@ -2827,29 +3189,47 @@ namespace video {
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
+    auto wait_for_display_ready = [&]() {
+      while (!shutdown_event->peek() && images->running()) {
+        if (ref->display_ready_event.view(50ms)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
     while (!shutdown_event->peek() && images->running()) {
       // Wait for the main capture event when the display is being reinitialized
       if (ref->reinit_event.peek()) {
-        std::this_thread::sleep_for(20ms);
+        if (!wait_for_display_ready()) {
+          return;
+        }
         continue;
       }
       // Wait for the display to be ready
       std::shared_ptr<platf::display_t> display;
       {
         auto lg = ref->display_wp.lock();
-        if (ref->display_wp->expired()) {
-          continue;
-        }
-
         display = ref->display_wp->lock();
+      }
+      if (!display) {
+        if (!wait_for_display_ready()) {
+          return;
+        }
+        continue;
       }
 
       auto &encoder = *chosen_encoder;
 
+      const auto encoder_ready_start = std::chrono::steady_clock::now();
       auto encode_device = make_encode_device(*display, encoder, config);
       if (!encode_device) {
         return;
       }
+      BOOST_LOG(info)
+        << "Stream startup stage timing: encoder device ready="sv
+        << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - encoder_ready_start).count()
+        << " ms"sv;
 
       // absolute mouse coordinates require that the dimensions of the screen are known
       touch_port_event->raise(make_port(display.get(), config));
@@ -2874,7 +3254,8 @@ namespace video {
         std::move(encode_device),
         ref->reinit_event,
         *ref->encoder_p,
-        channel_data
+        channel_data,
+        egress
       );
     }
   }
@@ -2885,25 +3266,28 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Video configuration.
    * @param channel_data Opaque channel data passed to packets.
+   * @param egress Per-session scheduler receiving encoded frames.
    */
   void capture(
     safe::mail_t mail,
     config_t config,
-    void *channel_data
+    void *channel_data,
+    egress_queue_t &egress
   ) {
     auto idr_events = mail->event<bool>(mail::idr);
 
     idr_events->raise(true);
     if (chosen_encoder->flags & PARALLEL_ENCODING) {
-      capture_async(std::move(mail), config, channel_data);
+      capture_async(std::move(mail), config, channel_data, egress);
     } else {
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();
       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
         &join_event,
         mail->event<bool>(mail::shutdown),
-        mail::man->queue<packet_t>(mail::video_packets),
+        &egress,
         std::move(idr_events),
+        mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames),
         mail->event<hdr_info_t>(mail::hdr),
         mail->event<input::touch_port_t>(mail::touch_port),
         config,
@@ -2952,16 +3336,22 @@ namespace video {
 
     session->request_idr_frame();
 
-    auto packets = mail::man->queue<packet_t>(mail::video_packets);
-    while (!packets->peek()) {
-      if (encode(1, *session, packets, nullptr, {})) {
-        return -1;
-      }
+    egress_queue_t egress {1};
+    if (!egress.register_session(
+          nullptr,
+          egress_queue_t::behavior_e::fifo,
+          {1, std::chrono::nanoseconds::zero()},
+          {}
+        )) {
+      return -1;
+    }
+    if (encode(1, *session, egress, nullptr, {}, {})) {
+      return -1;
     }
 
-    auto packet = packets->pop();
-    if (!packet->is_idr()) {
-      BOOST_LOG(error) << "First packet type is not an IDR frame"sv;
+    auto dequeued = egress.pop_for(2s);
+    if (!dequeued || !dequeued->packet->is_idr()) {
+      BOOST_LOG(error) << "Encoder validation timed out or the first packet was not an IDR frame"sv;
 
       return -1;
     }
@@ -2970,7 +3360,7 @@ namespace video {
 
     // This check only applies for H.264 and HEVC
     if (config.videoFormat <= 1) {
-      if (auto packet_avcodec = dynamic_cast<packet_raw_avcodec *>(packet.get())) {
+      if (auto packet_avcodec = dynamic_cast<packet_raw_avcodec *>(dequeued->packet.get())) {
         if (cbs::validate_sps(packet_avcodec->av_packet, config.videoFormat ? AV_CODEC_ID_H265 : AV_CODEC_ID_H264)) {
           flag |= VUI_PARAMS;
         }
@@ -2981,6 +3371,254 @@ namespace video {
     }
 
     return flag;
+  }
+
+  std::vector<std::uint8_t> extract_codec_initialization(
+    const std::span<const std::uint8_t> access_unit,
+    const int video_format
+  ) {
+    constexpr std::size_t maximum_initialization_bytes = 1'048'576U;
+    if (access_unit.empty() || video_format < 0 || video_format > 2) {
+      return {};
+    }
+
+    if (video_format == 2) {
+      std::size_t offset = 0;
+      while (offset < access_unit.size()) {
+        const auto obu_start = offset;
+        const auto header = access_unit[offset++];
+        if ((header & 0x81U) != 0) {
+          return {};
+        }
+        const auto type = static_cast<std::uint8_t>((header >> 3U) & 0x0fU);
+        if ((header & 0x04U) != 0) {
+          if (offset >= access_unit.size()) {
+            return {};
+          }
+          ++offset;
+        }
+        if ((header & 0x02U) == 0) {
+          return {};
+        }
+        std::size_t payload_size = 0;
+        std::size_t shift = 0;
+        bool terminated = false;
+        for (std::size_t byte_index = 0; byte_index < 8; ++byte_index) {
+          if (offset >= access_unit.size()) {
+            return {};
+          }
+          const auto byte = access_unit[offset++];
+          const auto value = static_cast<std::size_t>(byte & 0x7fU);
+          if (shift >= std::numeric_limits<std::size_t>::digits ||
+              value > (std::numeric_limits<std::size_t>::max() >> shift)) {
+            return {};
+          }
+          payload_size |= value << shift;
+          if ((byte & 0x80U) == 0) {
+            terminated = true;
+            break;
+          }
+          shift += 7;
+        }
+        if (!terminated || payload_size > access_unit.size() - offset) {
+          return {};
+        }
+        const auto obu_end = offset + payload_size;
+        if (type == 1) {
+          const auto byte_count = obu_end - obu_start;
+          if (byte_count == 0 || byte_count > maximum_initialization_bytes) {
+            return {};
+          }
+          return {access_unit.begin() + static_cast<std::ptrdiff_t>(obu_start),
+                  access_unit.begin() + static_cast<std::ptrdiff_t>(obu_end)};
+        }
+        offset = obu_end;
+      }
+      return {};
+    }
+
+    const auto find_start_code = [&](const std::size_t begin) -> std::pair<std::size_t, std::size_t> {
+      for (auto index = begin; index + 3 <= access_unit.size(); ++index) {
+        if (access_unit[index] != 0 || access_unit[index + 1] != 0) {
+          continue;
+        }
+        if (access_unit[index + 2] == 1) {
+          return {index, 3};
+        }
+        if (index + 4 <= access_unit.size() && access_unit[index + 2] == 0 && access_unit[index + 3] == 1) {
+          return {index, 4};
+        }
+      }
+      return {access_unit.size(), 0};
+    };
+
+    const std::uint8_t required_mask = video_format == 0 ? 0x03U : 0x07U;
+    std::uint8_t found_mask = 0;
+    std::vector<std::uint8_t> output;
+    auto current = find_start_code(0);
+    while (current.second != 0) {
+      const auto payload_start = current.first + current.second;
+      const auto next = find_start_code(payload_start);
+      auto unit_end = next.second == 0 ? access_unit.size() : next.first;
+      while (unit_end > payload_start && access_unit[unit_end - 1] == 0) {
+        --unit_end;
+      }
+      if (payload_start < unit_end) {
+        const auto header = access_unit[payload_start];
+        const auto nal_type = video_format == 0 ? header & 0x1fU : (header >> 1U) & 0x3fU;
+        std::uint8_t bit = 0;
+        if (video_format == 0) {
+          bit = nal_type == 7 ? 0x01U : nal_type == 8 ? 0x02U : 0;
+        } else {
+          bit = nal_type == 32 ? 0x01U : nal_type == 33 ? 0x02U : nal_type == 34 ? 0x04U : 0;
+        }
+        if (bit != 0 && (found_mask & bit) == 0) {
+          const auto byte_count = unit_end - current.first;
+          if (byte_count > maximum_initialization_bytes - output.size()) {
+            return {};
+          }
+          output.insert(
+            output.end(),
+            access_unit.begin() + static_cast<std::ptrdiff_t>(current.first),
+            access_unit.begin() + static_cast<std::ptrdiff_t>(unit_end)
+          );
+          found_mask |= bit;
+        }
+      }
+      current = next;
+    }
+    return found_mask == required_mask ? output : std::vector<std::uint8_t> {};
+  }
+
+  std::optional<std::vector<std::uint8_t>> codec_initialization(const config_t &config) {
+    const auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    const auto initialization_start = std::chrono::steady_clock::now();
+    if (!chosen_encoder || !chosen_encoder->platform_formats) {
+      return std::nullopt;
+    }
+
+    const auto make_cache_key = [&](encoder_probe_identity_t identity) {
+      return codec_initialization_cache_key_t {
+        std::move(identity),
+        std::string {chosen_encoder->name},
+        chosen_encoder->codec_from_config(config).name,
+        codec_initialization_configuration_fingerprint(config, *chosen_encoder),
+      };
+    };
+    if (platf::needs_encoder_reenumeration()) {
+      chosen_codec_initialization_cache.clear();
+    } else {
+      const auto cache_key = make_cache_key(current_encoder_probe_identity());
+      if (auto cached = chosen_codec_initialization_cache.lookup(cache_key)) {
+        BOOST_LOG(info)
+          << "Protocol-v3 codec initialization cache hit; throwaway encoder skipped in "sv
+          << std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - initialization_start
+             )
+               .count()
+          << " ms"sv;
+        return cached;
+      }
+    }
+
+    const auto output_name = display_device::map_output_name(config.output_name);
+    auto display = platf::display(chosen_encoder->platform_formats->dev_type, output_name, config);
+    if (!display) {
+      return std::nullopt;
+    }
+    auto encode_device = make_encode_device(*display, *chosen_encoder, config);
+    if (!encode_device) {
+      return std::nullopt;
+    }
+    auto session = make_encode_session(
+      display.get(),
+      *chosen_encoder,
+      config,
+      display->width,
+      display->height,
+      std::move(encode_device)
+    );
+    if (!session) {
+      return std::nullopt;
+    }
+    {
+      auto image = display->alloc_img();
+      if (!image || display->dummy_img(image.get()) || session->convert(*image)) {
+        return std::nullopt;
+      }
+    }
+    session->request_idr_frame();
+    egress_queue_t egress {1};
+    if (!egress.register_session(
+          nullptr,
+          egress_queue_t::behavior_e::fifo,
+          {1, std::chrono::nanoseconds::zero()},
+          {}
+        ) ||
+        encode(1, *session, egress, nullptr, {}, {})) {
+      return std::nullopt;
+    }
+    auto dequeued = egress.pop_for(2s);
+    if (!dequeued || !dequeued->packet || !dequeued->packet->is_idr()) {
+      return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> payload {
+      dequeued->packet->data(),
+      dequeued->packet->data() + dequeued->packet->data_size()
+    };
+    if (dequeued->packet->replacements) {
+      for (const auto &replacement : *dequeued->packet->replacements) {
+        if (replacement.old.empty()) {
+          continue;
+        }
+        const std::span<const std::uint8_t> old_bytes {
+          reinterpret_cast<const std::uint8_t *>(replacement.old.data()),
+          replacement.old.size()
+        };
+        const std::span<const std::uint8_t> new_bytes {
+          reinterpret_cast<const std::uint8_t *>(replacement._new.data()),
+          replacement._new.size()
+        };
+        const auto match = std::search(payload.begin(), payload.end(), old_bytes.begin(), old_bytes.end());
+        if (match == payload.end()) {
+          return std::nullopt;
+        }
+        const auto match_offset = static_cast<std::size_t>(std::distance(payload.begin(), match));
+        std::vector<std::uint8_t> replaced;
+        replaced.reserve(payload.size() - old_bytes.size() + new_bytes.size());
+        replaced.insert(replaced.end(), payload.begin(), match);
+        replaced.insert(replaced.end(), new_bytes.begin(), new_bytes.end());
+        replaced.insert(
+          replaced.end(),
+          payload.begin() + static_cast<std::ptrdiff_t>(match_offset + old_bytes.size()),
+          payload.end()
+        );
+        payload = std::move(replaced);
+      }
+    }
+    auto initialization = extract_codec_initialization(payload, config.videoFormat);
+    if (initialization.empty()) {
+      return std::nullopt;
+    }
+
+    const auto final_identity = current_encoder_probe_identity();
+    if (platf::needs_encoder_reenumeration() ||
+        !chosen_codec_initialization_cache.commit(
+          make_cache_key(final_identity),
+          initialization
+        )) {
+      chosen_codec_initialization_cache.clear();
+      BOOST_LOG(debug) << "Protocol-v3 codec initialization was not cached because its device identity changed or was incomplete"sv;
+    }
+    BOOST_LOG(info)
+      << "Protocol-v3 codec initialization prewarm completed in "sv
+      << std::chrono::duration_cast<std::chrono::milliseconds>(
+           std::chrono::steady_clock::now() - initialization_start
+         )
+           .count()
+      << " ms"sv;
+    return initialization;
   }
 
   /**
@@ -3003,8 +3641,8 @@ namespace video {
     encoder.av1.capabilities.set();
 
     // First, test encoder viability
-    config_t config_max_ref_frames {1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0};
-    config_t config_autoselect {1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0};
+    config_t config_max_ref_frames {1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0, {}};
+    config_t config_autoselect {1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0, {}};
 
     // If the encoder isn't supported at all (not even H.264), bail early
     reset_display(disp, encoder.platform_formats->dev_type, output_name, config_autoselect);
@@ -3185,6 +3823,33 @@ namespace video {
   }
 
   int probe_encoders() {
+    auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    const auto probe_start = std::chrono::steady_clock::now();
+    const auto probe_identity = current_encoder_probe_identity();
+
+    // Prime the platform tracker during the boot probe. Previously this call was
+    // short-circuited while chosen_encoder was null, so the first stream always
+    // initialized the DXGI tracker and forced a second exhaustive capability probe.
+    const bool platform_reenumeration_required = platf::needs_encoder_reenumeration();
+
+    // If we already have a good encoder, check to see if another probe is required
+    if (chosen_encoder_probe_cache.can_reuse(
+          chosen_encoder != nullptr,
+          chosen_encoder && (chosen_encoder->flags & ALWAYS_REPROBE),
+          platform_reenumeration_required,
+          probe_identity
+        )) {
+      BOOST_LOG(info)
+        << "Encoder probe cache hit for adapter/output ["sv
+        << probe_identity.adapter_name << "/"sv << probe_identity.resolved_output_name
+        << "] in "sv
+        << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - probe_start).count()
+        << " ms"sv;
+      return 0;
+    }
+
+    // The display-device safety check is only required before an actual probe.
+    // Keeping it out of the cache-hit path avoids another device enumeration on launch.
     if (!allow_encoder_probing()) {
       // Error already logged
       return -1;
@@ -3192,14 +3857,12 @@ namespace video {
 
     auto encoder_list = encoders;
 
-    // If we already have a good encoder, check to see if another probe is required
-    if (chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration()) {
-      return 0;
-    }
-
     // Restart encoder selection
     auto previous_encoder = chosen_encoder;
     chosen_encoder = nullptr;
+    chosen_encoder_probe_cache.clear();
+    chosen_codec_initialization_cache.clear();
+    stream_policy::reset_nvenc_lossless_capabilities();
     active_hevc_mode = config::video.hevc_mode;
     active_av1_mode = config::video.av1_mode;
     last_encoder_probe_supported_ref_frames_invalidation = false;
@@ -3226,12 +3889,12 @@ namespace video {
       if (active_av1_mode == 5 && !encoder->av1[encoder_t::DYNAMIC_RANGE] && !encoder->av1[encoder_t::DYNAMIC_RANGE_YUV444]) {
         BOOST_LOG(warning) << "Encoder ["sv << encoder->name << "] does not support AV1 Main10 Rext10_444 on this system"sv;
         active_av1_mode = 0;
-      } else if (active_hevc_mode == 4 && !encoder->av1[encoder_t::DYNAMIC_RANGE_YUV444]) {
+      } else if (active_av1_mode == 4 && !encoder->av1[encoder_t::DYNAMIC_RANGE_YUV444]) {
         BOOST_LOG(warning) << "Encoder ["sv << encoder->name << "] does not support AV1 Rext10_444 on this system"sv;
-        active_hevc_mode = 0;
-      } else if (active_hevc_mode == 3 && !encoder->hevc[encoder_t::DYNAMIC_RANGE]) {
+        active_av1_mode = 0;
+      } else if (active_av1_mode == 3 && !encoder->av1[encoder_t::DYNAMIC_RANGE]) {
         BOOST_LOG(warning) << "Encoder ["sv << encoder->name << "] does not support AV1 Main10 on this system"sv;
-        active_hevc_mode = 0;
+        active_av1_mode = 0;
       } else if (active_av1_mode == 2 && !encoder->av1[encoder_t::PASSED]) {
         BOOST_LOG(warning) << "Encoder ["sv << encoder->name << "] does not support AV1 on this system"sv;
         active_av1_mode = 0;
@@ -3359,6 +4022,29 @@ namespace video {
                                                        encoder.hevc[encoder_t::YUV444];
     last_encoder_probe_supported_yuv444_for_codec[2] = encoder.av1[encoder_t::PASSED] &&
                                                        encoder.av1[encoder_t::YUV444];
+
+    const auto completed_probe_identity = current_encoder_probe_identity();
+    const bool platform_changed_during_probe = platf::needs_encoder_reenumeration();
+    const bool request_matches = same_encoder_probe_request(completed_probe_identity, probe_identity);
+    const bool cache_committed = !platform_changed_during_probe &&
+                                 request_matches &&
+                                 chosen_encoder_probe_cache.commit(completed_probe_identity);
+    stream_policy::publish_nvenc_lossless_capabilities(
+      can_publish_nvenc_lossless_capabilities(
+        encoder.name == "nvenc"sv,
+        platform_changed_during_probe,
+        request_matches,
+        cache_committed
+      )
+    );
+    if (!cache_committed) {
+      BOOST_LOG(debug) << "Encoder probe cache was not retained because the platform or probe identity requires fresh validation"sv;
+    }
+
+    BOOST_LOG(info)
+      << "Encoder exhaustive probe completed in "sv
+      << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - probe_start).count()
+      << " ms"sv;
 
     BOOST_LOG(debug) << "------  h264 ------"sv;
     for (int x = 0; x < encoder_t::MAX_FLAGS; ++x) {
@@ -3574,6 +4260,7 @@ namespace video {
   int start_capture_async(capture_thread_async_ctx_t &capture_thread_ctx) {
     capture_thread_ctx.encoder_p = chosen_encoder;
     capture_thread_ctx.reinit_event.reset();
+    capture_thread_ctx.display_ready_event.reset();
 
     capture_thread_ctx.capture_ctx_queue = std::make_shared<safe::queue_t<capture_ctx_t>>(30);
 
@@ -3582,6 +4269,7 @@ namespace video {
       capture_thread_ctx.capture_ctx_queue,
       std::ref(capture_thread_ctx.display_wp),
       std::ref(capture_thread_ctx.reinit_event),
+      std::ref(capture_thread_ctx.display_ready_event),
       std::ref(*capture_thread_ctx.encoder_p)
     };
 

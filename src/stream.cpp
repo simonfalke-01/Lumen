@@ -5,6 +5,7 @@
 
 // standard includes
 #include <array>
+#include <atomic>
 #include <fstream>
 #include <future>
 #include <mutex>
@@ -31,17 +32,28 @@ extern "C" {
 #include "display_device.h"
 #include "globals.h"
 #include "input.h"
+#include "input_state.h"
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
+  #include "protocol_common/input_state.h"
+  #include "protocol_v3/media_pipeline.h"
+  #include "protocol_v3/runtime.h"
+#endif
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#include "video_egress_queue.h"
+#include "video_packetizer.h"
 
 #ifdef _WIN32
+  #include "platform/windows/fused_d3d11_policy.h"
+  #include "platform/windows/virtual_display.h"
+  #include "platform/windows/virtual_display_frame.h"
   #include "platform/windows/virtual_microphone.h"
 #endif
 
@@ -187,76 +199,6 @@ namespace stream {
   };
 
 #pragma pack(push, 1)
-
-  /**
-   * @brief Packed short video frame header sent before video payload bytes.
-   */
-  struct video_short_frame_header_t {
-    /**
-     * @brief Return a pointer to the protocol payload following the packet header.
-     *
-     * @return Parsed or serialized payload data.
-     */
-    uint8_t *payload() {
-      return (uint8_t *) (this + 1);
-    }
-
-    std::uint8_t headerType;  ///< Always 0x01 for short headers.
-
-    // Sunshine extension
-    // Frame processing latency, in 1/10 ms units
-    //     zero when the frame is repeated or there is no backend implementation
-    boost::endian::little_uint16_at frame_processing_latency;  ///< Frame processing latency.
-
-    // Currently known values:
-    // 1 = Normal P-frame
-    // 2 = IDR-frame
-    // 4 = P-frame with intra-refresh blocks
-    // 5 = P-frame after reference frame invalidation
-    std::uint8_t frameType;  ///< Frame type.
-
-    // Length of the final packet payload for codecs that cannot handle
-    // zero padding, such as AV1 (Sunshine extension).
-    boost::endian::little_uint16_at lastPayloadLen;  ///< Last payload len.
-
-    std::uint8_t unknown[2];  ///< Reserved bytes with no known client-visible meaning.
-  };
-
-  static_assert(
-    sizeof(video_short_frame_header_t) == 8,
-    "Short frame header must be 8 bytes"
-  );
-
-  /**
-   * @brief Packed RTP and video headers for an unencrypted video packet.
-   */
-  struct video_packet_raw_t {
-    /**
-     * @brief Return a pointer to the protocol payload following the packet header.
-     *
-     * @return Parsed or serialized payload data.
-     */
-    uint8_t *payload() {
-      return (uint8_t *) (this + 1);
-    }
-
-    RTP_PACKET rtp;  ///< RTP header that prefixes this payload.
-    char reserved[4];  ///< Reserved protocol padding bytes.
-
-    NV_VIDEO_PACKET packet;  ///< GameStream video packet header.
-  };
-
-  /**
-   * @brief AES-GCM prefix written before encrypted video packet payloads.
-   */
-  struct video_packet_enc_prefix_t {
-    /**
-     * @brief IV.
-     */
-    std::uint8_t iv[12];  // 12-byte IV is ideal for AES-GCM
-    std::uint32_t frameNumber;  ///< Frame number.
-    std::uint8_t tag[16];  ///< Authentication tag appended to the encrypted payload.
-  };
 
   /**
    * @brief Packed RTP header for an audio packet.
@@ -588,6 +530,8 @@ namespace stream {
     udp::socket audio_sock {io_context};  ///< UDP socket bound for audio packet transmission.
     udp::socket microphone_sock {io_context};  ///< UDP socket bound for client microphone input.
 
+    video::egress_queue_t video_egress;  ///< Fair bounded per-session encoded-video scheduler.
+
     sync_util::sync_t<std::unordered_map<std::string, std::weak_ptr<session_t>>> microphone_routes;  ///< Session-ID routes for reverse microphone UDP traffic.
     std::atomic_bool microphone_bound {};  ///< Whether the optional microphone UDP socket is bound and accepting datagrams.
 
@@ -625,6 +569,10 @@ namespace stream {
 
       safe::mail_raw_t::event_t<bool> idr_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
+
+      stream_policy::SessionPacingState pacing;  ///< Per-session packet pacing and duplicate timestamp basis.
+
+      video_packetizer::Workspace packetizer;  ///< Per-session reusable packetization and FEC workspace.
 
       std::unique_ptr<platf::deinit_t> qos;
     } video;  ///< Video worker thread state for the active stream.
@@ -900,130 +848,6 @@ namespace stream {
     using rs_t = util::safe_ptr<reed_solomon, [](reed_solomon *rs) {
       reed_solomon_release(rs);
     }>;
-
-    /**
-     * @brief Reed-Solomon FEC encoder state for video packets.
-     */
-    struct fec_t {
-      size_t data_shards;  ///< Number of original packet shards in each FEC block.
-      size_t nr_shards;  ///< Total data and recovery shards generated for each FEC block.
-      size_t percentage;  ///< Recovery-shard percentage requested for the stream.
-
-      size_t blocksize;  ///< Bytes reserved for the payload portion of each shard.
-      size_t prefixsize;  ///< Bytes reserved before each shard payload for protocol headers.
-      util::buffer_t<char> shards;  ///< Contiguous backing storage for all encoded FEC shards.
-      util::buffer_t<char> headers;  ///< Backing storage for the RTP/FEC headers attached to shards.
-      util::buffer_t<uint8_t *> shards_p;  ///< Pointer table passed to the Reed-Solomon encoder.
-
-      std::vector<platf::buffer_descriptor_t> payload_buffers;  ///< Platform send descriptors for FEC payload buffers.
-
-      /**
-       * @brief Return the FEC shard data pointer for a packet-group element.
-       *
-       * @param el Packet-group element index.
-       * @return Pointer to the shard bytes for the requested element.
-       */
-      char *data(size_t el) {
-        return (char *) shards_p[el];
-      }
-
-      /**
-       * @brief Return the FEC prefix bytes for the current packet group.
-       *
-       * @param el Packet-group element index.
-       * @return Pointer to the element's prefix bytes, or nullptr when no prefix is used.
-       */
-      char *prefix(size_t el) {
-        return prefixsize ? &headers[el * prefixsize] : nullptr;
-      }
-
-      /**
-       * @brief Return the serialized size of the current object.
-       *
-       * @return Number of elements currently stored.
-       */
-      size_t size() const {
-        return nr_shards;
-      }
-    };
-
-    static fec_t encode(const std::string_view &payload, size_t blocksize, size_t fecpercentage, size_t minparityshards, size_t prefixsize) {
-      auto payload_size = payload.size();
-
-      auto pad = payload_size % blocksize != 0;
-
-      auto aligned_data_shards = payload_size / blocksize;
-      auto data_shards = aligned_data_shards + (pad ? 1 : 0);
-      auto parity_shards = (data_shards * fecpercentage + 99) / 100;
-
-      // increase the FEC percentage for this frame if the parity shard minimum is not met
-      if (parity_shards < minparityshards && fecpercentage != 0) {
-        parity_shards = minparityshards;
-        fecpercentage = (100 * parity_shards) / data_shards;
-
-        BOOST_LOG(verbose) << "Increasing FEC percentage to "sv << fecpercentage << " to meet parity shard minimum"sv << std::endl;
-      }
-
-      auto nr_shards = data_shards + parity_shards;
-
-      // If we need to store a zero-padded data shard, allocate that first to
-      // to keep the shards in order and reduce buffer fragmentation
-      auto parity_shard_offset = pad ? 1 : 0;
-      util::buffer_t<char> shards {(parity_shard_offset + parity_shards) * blocksize};
-      util::buffer_t<uint8_t *> shards_p {nr_shards};
-      std::vector<platf::buffer_descriptor_t> payload_buffers;
-      payload_buffers.reserve(2);
-
-      // Point into the payload buffer for all except the final padded data shard
-      auto next = std::begin(payload);
-      for (auto x = 0; x < aligned_data_shards; ++x) {
-        shards_p[x] = (uint8_t *) next;
-        next += blocksize;
-      }
-      payload_buffers.emplace_back(std::begin(payload), aligned_data_shards * blocksize);
-
-      // If the last data shard needs to be zero-padded, we must use the shards buffer
-      if (pad) {
-        shards_p[aligned_data_shards] = (uint8_t *) &shards[0];
-
-        // GCC doesn't figure out that std::copy_n() can be replaced with memcpy() here
-        // and ends up compiling a horribly slow element-by-element copy loop, so we
-        // help it by using memcpy()/memset() directly.
-        auto copy_len = std::min<size_t>(blocksize, std::end(payload) - next);
-        std::memcpy(shards_p[aligned_data_shards], next, copy_len);
-        if (copy_len < blocksize) {
-          // Zero any additional space after the end of the payload
-          std::memset(shards_p[aligned_data_shards] + copy_len, 0, blocksize - copy_len);
-        }
-      }
-
-      // Add a payload buffer describing the shard buffer
-      payload_buffers.emplace_back(std::begin(shards), shards.size());
-
-      if (fecpercentage != 0) {
-        // Point into our allocated buffer for the parity shards
-        for (auto x = 0; x < parity_shards; ++x) {
-          shards_p[data_shards + x] = (uint8_t *) &shards[(parity_shard_offset + x) * blocksize];
-        }
-
-        // packets = parity_shards + data_shards
-        rs_t rs {reed_solomon_new((int) data_shards, (int) parity_shards)};
-
-        reed_solomon_encode(rs.get(), shards_p.begin(), (int) nr_shards, (int) blocksize);
-      }
-
-      return {
-        data_shards,
-        nr_shards,
-        fecpercentage,
-        blocksize,
-        prefixsize,
-        std::move(shards),
-        util::buffer_t<char> {nr_shards * prefixsize},
-        std::move(shards_p),
-        std::move(payload_buffers),
-      };
-    }
   }  // namespace fec
 
   /**
@@ -1608,10 +1432,10 @@ namespace stream {
    * @brief Run the broadcast video sender thread.
    *
    * @param sock Socket used to read or write the protocol message.
+   * @param egress Per-session scheduler supplying fair encoded-frame leases.
    */
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoBroadcastThread(udp::socket &sock, video::egress_queue_t &egress) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
-    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
     auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread
@@ -1619,6 +1443,8 @@ namespace stream {
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
     logging::min_max_avg_periodic_logger<double> frame_processing_latency_logger(debug, "Frame processing latency", "ms");
+    logging::min_max_avg_periodic_logger<double> video_egress_age_logger(debug, "Video egress queue age", "ms");
+    logging::min_max_avg_periodic_logger<std::size_t> video_egress_depth_logger(debug, "Video egress session depth", " frames");
 
     logging::time_delta_periodic_logger frame_send_batch_latency_logger(debug, "Network: each send_batch() latency");
     logging::time_delta_periodic_logger frame_fec_latency_logger(debug, "Network: each FEC block latency");
@@ -1632,121 +1458,133 @@ namespace stream {
       return;
     }
 
-    auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
-
-    while (auto packet = packets->pop()) {
+    while (auto dequeued = egress.pop()) {
+      auto &packet = dequeued->packet;
+#ifdef _WIN32
+      const auto telemetry_sender_dequeue_ns = platf::dxgi::fused_d3d11::telemetry_t::now_ns();
+#endif
       if (shutdown_event->peek()) {
         break;
       }
 
-      frame_network_latency_logger.first_point_now();
-
-      auto session = (session_t *) packet->channel_data;
-      auto lowseq = session->video.lowseq;
-
-      std::string_view payload {(char *) packet->data(), packet->data_size()};
-      std::vector<uint8_t> payload_with_replacements;
-
-      // Apply replacements on the packet payload before performing any other operations.
-      // We need to know the final frame size to calculate the last packet size, and we
-      // must avoid matching replacements against the frame header or any other non-video
-      // part of the payload.
-      if (packet->is_idr() && packet->replacements) {
-        for (auto &replacement : *packet->replacements) {
-          auto frame_old = replacement.old;
-          auto frame_new = replacement._new;
-
-          payload_with_replacements = replace(payload, frame_old, frame_new);
-          payload = {(char *) payload_with_replacements.data(), payload_with_replacements.size()};
-        }
-      }
-
-      video_short_frame_header_t frame_header = {};
-      frame_header.headerType = 0x01;  // Short header type
-      frame_header.frameType = packet->is_idr()                     ? 2 :
-                               packet->after_ref_frame_invalidation ? 5 :
-                                                                      1;
-      frame_header.lastPayloadLen = (payload.size() + sizeof(frame_header)) % (session->config.packetsize - sizeof(NV_VIDEO_PACKET));
-      if (frame_header.lastPayloadLen == 0) {
-        frame_header.lastPayloadLen = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
-      }
-
+#ifdef _WIN32
       if (packet->frame_timestamp) {
-        auto duration_to_latency = [](const std::chrono::steady_clock::duration &duration) {
-          const auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-          return (uint16_t) std::clamp<decltype(duration_us)>((duration_us + 50) / 100, 0, std::numeric_limits<uint16_t>::max());
-        };
-
-        uint16_t latency = duration_to_latency(std::chrono::steady_clock::now() - *packet->frame_timestamp);
-        frame_header.frame_processing_latency = latency;
-        frame_processing_latency_logger.collect_and_log(latency / 10.);
-      } else {
-        frame_header.frame_processing_latency = 0;
+        const auto source_timestamp_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(packet->frame_timestamp->time_since_epoch()).count()
+        );
+        (void) platf::dxgi::fused_d3d11::telemetry().record_sender_dequeue(
+          static_cast<std::uint64_t>(packet->frame_index()),
+          source_timestamp_ns,
+          telemetry_sender_dequeue_ns
+        );
       }
+#endif
 
-      auto fecPercentage = config::stream.fec_percentage;
+      video_egress_age_logger.collect_and_log(
+        std::chrono::duration<double, std::milli> {dequeued->queue_age}.count()
+      );
+      video_egress_depth_logger.collect_and_log(dequeued->depth_after_dequeue);
 
-      // Insert space for packet headers
-      auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
-      auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
-
-      payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
-
-      // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
-      constexpr auto MAX_FEC_BLOCKS = 4;
-
-      // The max number of data shards per block is found by solving this system of equations for D:
-      // D = 255 - P
-      // P = D * F
-      // which results in the solution:
-      // D = 255 / (1 + F)
-      // multiplied by 100 since F is the percentage as an integer:
-      // D = (255 * 100) / (100 + F)
-      auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
-
-      // Compute the number of FEC blocks needed for this frame using the block size and max shards
-      auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
-      auto fec_blocks_needed = (payload.size() + (max_data_per_fec_block - 1)) / max_data_per_fec_block;
-
-      // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
-      // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
-      if (fec_blocks_needed > MAX_FEC_BLOCKS) {
-        BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
-        fecPercentage = 0;
-        fec_blocks_needed = MAX_FEC_BLOCKS;
-      }
-
-      std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
-      auto fec_blocks_begin = std::begin(fec_blocks);
-      auto fec_blocks_end = std::begin(fec_blocks) + fec_blocks_needed;
-
-      BOOST_LOG(verbose) << "Generating "sv << fec_blocks_needed << " FEC blocks"sv;
-
-      // Align individual FEC blocks to blocksize
-      auto unaligned_size = payload.size() / fec_blocks_needed;
-      auto aligned_size = ((unaligned_size + (blocksize - 1)) / blocksize) * blocksize;
-
-      // If we exceed the 10-bit FEC packet index (which means our frame exceeded 4096 packets),
-      // the frame will be unrecoverable. Log an error for this case.
-      if (aligned_size / blocksize >= 1024) {
-        BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << (aligned_size / blocksize) << " packets)"sv;
-      }
-
-      // Split the data into aligned FEC blocks
-      for (int x = 0; x < fec_blocks_needed; ++x) {
-        if (x == fec_blocks_needed - 1) {
-          // The last block must extend to the end of the payload
-          fec_blocks[x] = payload.substr(x * aligned_size);
-        } else {
-          // Earlier blocks just extend to the next block offset
-          fec_blocks[x] = payload.substr(x * aligned_size, aligned_size);
-        }
-      }
-
+      auto session = static_cast<session_t *>(dequeued->session);
       try {
-        // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
-        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+        frame_network_latency_logger.first_point_now();
+
+        auto lowseq = session->video.lowseq;
+
+        std::string_view payload {(char *) packet->data(), packet->data_size()};
+        std::vector<uint8_t> payload_with_replacements;
+
+        // Apply replacements on the packet payload before performing any other operations.
+        // We need to know the final frame size to calculate the last packet size, and we
+        // must avoid matching replacements against the frame header or any other non-video
+        // part of the payload.
+        if (packet->is_idr() && packet->replacements) {
+          for (auto &replacement : *packet->replacements) {
+            auto frame_old = replacement.old;
+            auto frame_new = replacement._new;
+
+            payload_with_replacements = replace(payload, frame_old, frame_new);
+            payload = {(char *) payload_with_replacements.data(), payload_with_replacements.size()};
+          }
+        }
+
+        std::uint16_t frame_processing_latency {};
+        if (packet->frame_timestamp) {
+          auto duration_to_latency = [](const std::chrono::steady_clock::duration &duration) {
+            const auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+            return (uint16_t) std::clamp<decltype(duration_us)>((duration_us + 50) / 100, 0, std::numeric_limits<uint16_t>::max());
+          };
+
+          frame_processing_latency = duration_to_latency(std::chrono::steady_clock::now() - *packet->frame_timestamp);
+          frame_processing_latency_logger.collect_and_log(frame_processing_latency / 10.);
+        }
+
+        const auto recovery_critical = packet->is_idr() || packet->after_ref_frame_invalidation;
+        const auto fecPercentage = stream_policy::maximum_fec_percentage(*session->config.optimization_policy);
+        const auto blocksize = static_cast<std::size_t>(session->config.packetsize + MAX_RTP_HEADER_SIZE);
+        const auto payload_blocksize = blocksize - video_packetizer::raw_packet_header_size;
+        const auto frame_kind = packet->is_idr()                     ? video_packetizer::FrameKind::idr :
+                                packet->after_ref_frame_invalidation ? video_packetizer::FrameKind::reference_recovery :
+                                                                       video_packetizer::FrameKind::normal;
+        const auto frame_header = video_packetizer::make_short_frame_header(
+          frame_kind,
+          frame_processing_latency,
+          payload.size(),
+          payload_blocksize
+        );
+        auto &packetizer = session->video.packetizer;
+        const auto frame_header_bytes = std::span<const std::uint8_t> {frame_header};
+        const auto zero_fec_plan = packetizer.plan_frame(
+          frame_header.size(),
+          payload.size(),
+          video_packetizer::raw_packet_header_size,
+          blocksize,
+          0
+        );
+        const auto zero_fec_selection = stream_policy::select_frame_fec(
+          *session->config.optimization_policy,
+          recovery_critical,
+          zero_fec_plan.packet_count,
+          session->config.minRequiredFecPackets
+        );
+        const auto frame_plan = zero_fec_selection.percentage == 0 ?
+                                  zero_fec_plan :
+                                  packetizer.plan_frame(
+                                    frame_header.size(),
+                                    payload.size(),
+                                    video_packetizer::raw_packet_header_size,
+                                    blocksize,
+                                    fecPercentage
+                                  );
+        const bool use_segmented_zero_fec =
+          session->config.optimization_policy->mode == stream_policy::StreamOptimizationMode::latency &&
+          session->config.optimization_policy->client_negotiated_mode &&
+          !session->video.cipher &&
+          zero_fec_selection.percentage == 0;
+        std::span<std::uint8_t> interleaved_payload;
+        std::vector<platf::buffer_descriptor_t> *segmented_payload_buffers {};
+        if (use_segmented_zero_fec) {
+          segmented_payload_buffers = &packetizer.prepare_segmented_frame(frame_header_bytes, payload, video_packetizer::raw_packet_header_size, blocksize);
+        } else {
+          interleaved_payload = packetizer.prepare_interleaved_frame(frame_header_bytes, payload, video_packetizer::raw_packet_header_size, blocksize);
+        }
+
+        const auto fec_blocks_needed = frame_plan.block_count;
+        const bool skip_fec_for_frame = frame_plan.exceeded_fec_block_limit;
+        if (skip_fec_for_frame) {
+          BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame"sv;
+        }
+        BOOST_LOG(verbose) << "Generating "sv << fec_blocks_needed << " FEC blocks"sv;
+
+        const auto pacing_bitrate_bps = stream_policy::video_pacing_bitrate_bps(
+          session->config.monitor.bitrate,
+          *session->config.optimization_policy,
+          session->config.video_path_budget_bps
+        );
+        const auto ratecontrol_packets_in_1ms = std::max<std::size_t>(
+          1,
+          pacing_bitrate_bps / 1'000U / blocksize / 8U
+        );
 
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
@@ -1759,172 +1597,263 @@ namespace stream {
         send_batch_size = std::min<size_t>(64, send_batch_size);
 
         // Don't ignore the last ratecontrol group of the previous frame
-        auto ratecontrol_frame_start = std::max(ratecontrol_next_frame_start, std::chrono::steady_clock::now());
+        auto ratecontrol_frame_start = stream_policy::begin_paced_frame(
+          session->video.pacing,
+          std::chrono::steady_clock::now()
+        );
 
         size_t ratecontrol_frame_packets_sent = 0;
         size_t ratecontrol_group_packets_sent = 0;
 
-        auto blockIndex = 0;
-        std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
-          auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
-
-          for (int x = 0; x < packets; ++x) {
-            auto *inspect = (video_packet_raw_t *) &current_payload[x * blocksize];
-
-            inspect->packet.frameIndex = (uint32_t) packet->frame_index();
-            inspect->packet.streamPacketIndex = ((uint32_t) lowseq + x) << 8;
-
-            // Match multiFecFlags with Moonlight
-            inspect->packet.multiFecFlags = 0x10;
-            inspect->packet.multiFecBlocks = (blockIndex << 4) | ((fec_blocks_needed - 1) << 6);
-
-            inspect->packet.flags = FLAG_CONTAINS_PIC_DATA;
-            if (x == 0) {
-              inspect->packet.flags |= FLAG_SOF;
+        auto pace_before_batch = [&]() {
+          // Do pacing within the frame. The first batch also accounts for the
+          // final pacing group of the preceding frame.
+          if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms || ratecontrol_frame_packets_sent == 0) {
+            auto due = ratecontrol_frame_start +
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
+                         ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+            auto now = std::chrono::steady_clock::now();
+            const auto packet_pacing = session->config.optimization_policy->packet_pacing;
+            if (packet_pacing != stream_policy::PacketPacingMode::immediate && now < due) {
+              timer->sleep_for(due - now);
             }
-            if (x == packets - 1) {
-              inspect->packet.flags |= FLAG_EOF;
-            }
+            ratecontrol_group_packets_sent = 0;
           }
+        };
 
-          frame_fec_latency_logger.first_point_now();
-          // If video encryption is enabled, we allocate space for the encryption header before each shard
-          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
-          frame_fec_latency_logger.second_point_now_and_log();
+        for (std::size_t block_index = 0; block_index < fec_blocks_needed; ++block_index) {
+          const auto &block = frame_plan.blocks[block_index];
+          const auto packets = block.packet_count;
+          const auto frame_fec = skip_fec_for_frame ?
+                                   stream_policy::FrameFecSelection {0, 0} :
+                                   stream_policy::select_frame_fec(
+                                     *session->config.optimization_policy,
+                                     recovery_critical,
+                                     packets,
+                                     session->config.minRequiredFecPackets
+                                   );
 
-          auto peer_address = session->video.peer.address();
-          auto batch_info = platf::batched_send_info_t {
-            shards.headers.begin(),
-            shards.prefixsize,
-            shards.payload_buffers,
-            shards.blocksize,
-            0,
-            0,
-            (uintptr_t) sock.native_handle(),
-            peer_address,
-            session->video.peer.port(),
-            session->localAddress,
-          };
-
-          size_t next_shard_to_send = 0;
-
-          // RTP video timestamps use a 90 KHz clock and the frame_timestamp from when the frame was captured
-          // When a timestamp isn't available (duplicate frames), the timestamp from rate control is used instead.
+          // RTP video timestamps use a 90 KHz clock and the frame timestamp from capture.
           bool frame_is_dupe = false;
           if (!packet->frame_timestamp) {
-            packet->frame_timestamp = ratecontrol_next_frame_start;
+            packet->frame_timestamp = stream_policy::duplicate_frame_timestamp(session->video.pacing);
             frame_is_dupe = true;
           }
           using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
-          uint32_t timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
+          const uint32_t timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
+          auto peer_address = session->video.peer.address();
+          std::size_t sent_shards {};
+          std::size_t advertised_fec_percentage {};
 
-          // set FEC info now that we know for sure what our percentage will be for this frame
-          for (auto x = 0; x < shards.size(); ++x) {
-            auto *inspect = (video_packet_raw_t *) shards.data(x);
-
-            inspect->packet.fecInfo =
-              (uint32_t) (x << 12 |
-                          shards.data_shards << 22 |
-                          shards.percentage << 4);
-
-            inspect->rtp.header = 0x80 | FLAG_EXTENSION;
-            inspect->rtp.sequenceNumber = util::endian::big<uint16_t>(lowseq + x);
-            inspect->rtp.timestamp = util::endian::big<uint32_t>(timestamp);
-
-            inspect->packet.multiFecBlocks = (blockIndex << 4) | ((fec_blocks_needed - 1) << 6);
-            inspect->packet.frameIndex = (uint32_t) packet->frame_index();
-
-            // Encrypt this shard if video encryption is enabled
-            if (session->video.cipher) {
-              // We use the deterministic IV construction algorithm specified in NIST SP 800-38D
-              // Section 8.2.1. The sequence number is our "invocation" field and the 'V' in the
-              // high bytes is the "fixed" field. Because each client provides their own unique
-              // key, our values in the fixed field need only uniquely identify each independent
-              // use of the client's key with AES-GCM in our code.
-              //
-              // The IV counter is 64 bits long which allows for 2^64 encrypted video packets
-              // to be sent to each client before the IV repeats.
-              std::copy_n((uint8_t *) &session->video.gcm_iv_counter, sizeof(session->video.gcm_iv_counter), std::begin(iv));
-              iv[11] = 'V';  // Video stream
-              session->video.gcm_iv_counter++;
-
-              // Encrypt the target buffer in place
-              auto *prefix = (video_packet_enc_prefix_t *) shards.prefix(x);
-              prefix->frameNumber = (std::uint32_t) packet->frame_index();
-              std::copy(std::begin(iv), std::end(iv), prefix->iv);
-              session->video.cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
+          if (use_segmented_zero_fec) {
+            if (frame_fec.percentage != 0 || segmented_payload_buffers == nullptr) {
+              throw std::logic_error("segmented video path requires zero FEC");
             }
 
-            if (x - next_shard_to_send + 1 >= send_batch_size || x + 1 == shards.size()) {
-              // Do pacing within the frame.
-              // Also trigger pacing before the first send_batch() of the frame
-              // to account for the last send_batch() of the previous frame.
-              if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms || ratecontrol_frame_packets_sent == 0) {
-                auto due = ratecontrol_frame_start +
-                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
-
-                auto now = std::chrono::steady_clock::now();
-                if (now < due) {
-                  timer->sleep_for(due - now);
-                }
-
-                ratecontrol_group_packets_sent = 0;
+            std::size_t next_packet_to_send {};
+            while (next_packet_to_send < packets) {
+              const auto current_batch_size = std::min(send_batch_size, packets - next_packet_to_send);
+              const auto frame_packet_offset = block.packet_offset + next_packet_to_send;
+              (void) packetizer.prepare_segmented_headers(frame_packet_offset, current_batch_size, video_packetizer::raw_packet_header_size);
+              for (std::size_t batch_index = 0; batch_index < current_batch_size; ++batch_index) {
+                const auto packet_index = next_packet_to_send + batch_index;
+                auto *header = packetizer.segmented_header(
+                  frame_packet_offset + batch_index,
+                  video_packetizer::raw_packet_header_size
+                );
+                const auto header_bytes = std::span<std::uint8_t> {header, video_packetizer::raw_packet_header_size};
+                const auto fields = video_packetizer::PacketHeaderFields {
+                  static_cast<std::uint32_t>(packet->frame_index()),
+                  static_cast<std::uint32_t>(lowseq) + static_cast<std::uint32_t>(packet_index),
+                  static_cast<std::uint16_t>(lowseq + packet_index),
+                  timestamp,
+                  packet_index,
+                  packets,
+                  0,
+                  block_index,
+                  fec_blocks_needed,
+                  packet_index == 0,
+                  packet_index + 1 == packets,
+                };
+                video_packetizer::serialize_data_packet_header(header_bytes, fields);
               }
 
-              size_t current_batch_size = x - next_shard_to_send + 1;
-              batch_info.block_offset = next_shard_to_send;
-              batch_info.block_count = current_batch_size;
+              if (!packetizer.first_batch_ready()) {
+                packetizer.mark_first_batch_ready();
+              }
+              pace_before_batch();
+              auto batch_info = platf::batched_send_info_t {
+                reinterpret_cast<const char *>(packetizer.segmented_header(0, video_packetizer::raw_packet_header_size)),
+                video_packetizer::raw_packet_header_size,
+                *segmented_payload_buffers,
+                payload_blocksize,
+                frame_packet_offset,
+                current_batch_size,
+                (uintptr_t) sock.native_handle(),
+                peer_address,
+                session->video.peer.port(),
+                session->localAddress,
+              };
 
               frame_send_batch_latency_logger.first_point_now();
-              // Use a batched send if it's supported on this platform
               if (!platf::send_batch(batch_info)) {
-                // Batched send is not available, so send each packet individually
                 BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
-                for (auto y = 0; y < current_batch_size; y++) {
+                for (std::size_t batch_index = 0; batch_index < current_batch_size; ++batch_index) {
+                  const auto frame_packet_index = frame_packet_offset + batch_index;
                   auto send_info = platf::send_info_t {
-                    shards.prefix(next_shard_to_send + y),
-                    shards.prefixsize,
-                    shards.data(next_shard_to_send + y),
-                    shards.blocksize,
+                    reinterpret_cast<const char *>(packetizer.segmented_header(frame_packet_index, video_packetizer::raw_packet_header_size)),
+                    video_packetizer::raw_packet_header_size,
+                    packetizer.segmented_payload(frame_packet_index, payload_blocksize),
+                    payload_blocksize,
                     (uintptr_t) sock.native_handle(),
                     peer_address,
                     session->video.peer.port(),
                     session->localAddress,
                   };
-
                   platf::send(send_info);
                 }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
-
               ratecontrol_group_packets_sent += current_batch_size;
               ratecontrol_frame_packets_sent += current_batch_size;
-              next_shard_to_send = x + 1;
+              next_packet_to_send += current_batch_size;
             }
+            sent_shards = packets;
+          } else {
+            auto current_payload = interleaved_payload.subspan(block.byte_offset, block.byte_size);
+            for (std::size_t packet_index = 0; packet_index < packets; ++packet_index) {
+              const auto header = std::span<std::uint8_t> {
+                current_payload.data() + packet_index * blocksize,
+                video_packetizer::raw_packet_header_size,
+              };
+              video_packetizer::prepare_data_packet_header(
+                header,
+                video_packetizer::PacketHeaderFields {
+                  static_cast<std::uint32_t>(packet->frame_index()),
+                  static_cast<std::uint32_t>(lowseq) + static_cast<std::uint32_t>(packet_index),
+                  static_cast<std::uint16_t>(lowseq + packet_index),
+                  timestamp,
+                  packet_index,
+                  packets,
+                  frame_fec.percentage,
+                  block_index,
+                  fec_blocks_needed,
+                  packet_index == 0,
+                  packet_index + 1 == packets,
+                }
+              );
+            }
+
+            frame_fec_latency_logger.first_point_now();
+            auto shards = packetizer.encode_block(
+              current_payload,
+              blocksize,
+              frame_fec.percentage,
+              frame_fec.minimum_fec_packets,
+              session->video.cipher ? video_packetizer::encrypted_packet_prefix_size : 0
+            );
+            frame_fec_latency_logger.second_point_now_and_log();
+            auto batch_info = platf::batched_send_info_t {
+              shards.prefix(0),
+              shards.prefix_size,
+              *shards.payload_buffers,
+              shards.block_size,
+              0,
+              0,
+              (uintptr_t) sock.native_handle(),
+              peer_address,
+              session->video.peer.port(),
+              session->localAddress,
+            };
+
+            std::size_t next_shard_to_send {};
+            for (std::size_t shard_index = 0; shard_index < shards.size(); ++shard_index) {
+              auto *packet_bytes = reinterpret_cast<std::uint8_t *>(shards.data(shard_index));
+              video_packetizer::finalize_packet_header(
+                std::span<std::uint8_t> {packet_bytes, video_packetizer::raw_packet_header_size},
+                video_packetizer::PacketHeaderFields {
+                  static_cast<std::uint32_t>(packet->frame_index()),
+                  static_cast<std::uint32_t>(lowseq) + static_cast<std::uint32_t>(shard_index),
+                  static_cast<std::uint16_t>(lowseq + shard_index),
+                  timestamp,
+                  shard_index,
+                  shards.data_shards,
+                  static_cast<int>(shards.percentage),
+                  block_index,
+                  fec_blocks_needed,
+                  false,
+                  false,
+                }
+              );
+
+              if (session->video.cipher) {
+                video_packetizer::encrypt_packet(
+                  *session->video.cipher,
+                  std::span<std::uint8_t> {packet_bytes, blocksize},
+                  static_cast<std::uint32_t>(packet->frame_index()),
+                  session->video.gcm_iv_counter,
+                  iv,
+                  std::span<std::uint8_t> {
+                    reinterpret_cast<std::uint8_t *>(shards.prefix(shard_index)),
+                    video_packetizer::encrypted_packet_prefix_size,
+                  }
+                );
+              }
+
+              if (shard_index - next_shard_to_send + 1 >= send_batch_size || shard_index + 1 == shards.size()) {
+                pace_before_batch();
+                const auto current_batch_size = shard_index - next_shard_to_send + 1;
+                batch_info.block_offset = next_shard_to_send;
+                batch_info.block_count = current_batch_size;
+                frame_send_batch_latency_logger.first_point_now();
+                if (!platf::send_batch(batch_info)) {
+                  BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
+                  for (std::size_t batch_index = 0; batch_index < current_batch_size; ++batch_index) {
+                    auto send_info = platf::send_info_t {
+                      shards.prefix(next_shard_to_send + batch_index),
+                      shards.prefix_size,
+                      shards.data(next_shard_to_send + batch_index),
+                      shards.block_size,
+                      (uintptr_t) sock.native_handle(),
+                      peer_address,
+                      session->video.peer.port(),
+                      session->localAddress,
+                    };
+                    platf::send(send_info);
+                  }
+                }
+                frame_send_batch_latency_logger.second_point_now_and_log();
+                ratecontrol_group_packets_sent += current_batch_size;
+                ratecontrol_frame_packets_sent += current_batch_size;
+                next_shard_to_send = shard_index + 1;
+              }
+            }
+            sent_shards = shards.size();
+            advertised_fec_percentage = shards.percentage;
           }
 
-          // remember this in case the next frame comes immediately
-          ratecontrol_next_frame_start = ratecontrol_frame_start +
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                                           ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
-
+          stream_policy::complete_paced_frame(
+            session->video.pacing,
+            ratecontrol_frame_start,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
+              ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms
+          );
           frame_network_latency_logger.second_point_now_and_log();
-
           BOOST_LOG(verbose) << "Sent Frame seq ["sv << packet->frame_index() << "] pts ["sv << timestamp
-                             << "] shards ["sv << shards.size() << "/"sv << shards.percentage << "%]"sv
+                             << "] shards ["sv << sent_shards << "/"sv << advertised_fec_percentage << "%]"sv
                              << (frame_is_dupe ? " Dupe" : "")
                              << (packet->is_idr() ? " Key" : "")
                              << (packet->after_ref_frame_invalidation ? " RFI" : "");
-
-          ++blockIndex;
-          lowseq += shards.size();
-        });
+          lowseq += sent_shards;
+        }
 
         session->video.lowseq = lowseq;
       } catch (const std::exception &e) {
-        BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
-        std::this_thread::sleep_for(100ms);
+        BOOST_LOG(error) << "Broadcast video dropped frame and requested recovery: "sv << e.what();
+        session->video.idr_events->raise(true);
+      } catch (...) {
+        BOOST_LOG(error) << "Broadcast video dropped frame after an unknown packetization failure and requested recovery"sv;
+        session->video.idr_events->raise(true);
       }
     }
 
@@ -1965,8 +1894,8 @@ namespace stream {
         break;
       }
 
-      TUPLE_2D_REF(channel_data, packet_data, *packet);
-      auto session = (session_t *) channel_data;
+      auto session = static_cast<session_t *>(packet->channel_data);
+      auto &packet_data = packet->payload;
 
       auto sequenceNumber = session->audio.sequenceNumber;
       auto timestamp = session->audio.timestamp;
@@ -2271,6 +2200,11 @@ namespace stream {
    * @brief Bind the GameStream UDP and control sockets used for a streaming session.
    */
   int start_broadcast(broadcast_ctx_t &ctx) {
+    if (!ctx.video_egress.reset()) {
+      BOOST_LOG(error) << "Cannot restart video egress while a session is still registered"sv;
+      return -1;
+    }
+
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
     auto protocol = address_family == net::IPV4 ? udp::v4() : udp::v6();
     auto control_port = net::map_port(CONTROL_PORT);
@@ -2346,7 +2280,7 @@ namespace stream {
 
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
-    ctx.video_thread = std::jthread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    ctx.video_thread = std::jthread {videoBroadcastThread, std::ref(ctx.video_sock), std::ref(ctx.video_egress)};
     ctx.audio_thread = std::jthread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::jthread {controlBroadcastThread, &ctx.control_server};
 
@@ -2363,11 +2297,10 @@ namespace stream {
 
     broadcast_shutdown_event->raise(true);
 
-    auto video_packets = mail::man->queue<video::packet_t>(mail::video_packets);
     auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
 
     // Minimize delay stopping video/audio threads
-    video_packets->stop();
+    ctx.video_egress.stop();
     audio_packets->stop();
 
     ctx.message_queue_queue->stop();
@@ -2380,7 +2313,6 @@ namespace stream {
       ctx.microphone_sock.close(error);
     }
 
-    video_packets.reset();
     audio_packets.reset();
 
     BOOST_LOG(debug) << "Waiting for main listening thread to end..."sv;
@@ -2478,8 +2410,8 @@ namespace stream {
     while_starting_do_nothing(session->state);
 
     auto ref = broadcast.ref();
-    auto error = recv_ping(session, ref, socket_e::video, session->video.ping_payload, session->video.peer, config::stream.ping_timeout);
-    if (error < 0) {
+    auto ping_error = recv_ping(session, ref, socket_e::video, session->video.ping_payload, session->video.peer, config::stream.ping_timeout);
+    if (ping_error < 0) {
       return;
     }
 
@@ -2487,8 +2419,62 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
+    const bool explicit_latency =
+      session->config.optimization_policy->mode == stream_policy::StreamOptimizationMode::latency &&
+      session->config.optimization_policy->client_negotiated_mode;
+    const auto egress_behavior = explicit_latency ?
+                                   video::egress_queue_t::behavior_e::latency :
+                                   video::egress_queue_t::behavior_e::fifo;
+    const video::egress_queue_t::registration_policy_t egress_policy {
+      explicit_latency ? 1U : ref->video_egress.capacity_per_session(),
+      explicit_latency ? video::capture_frame_interval(session->config.monitor) : std::chrono::nanoseconds::zero(),
+    };
+    const auto registered = ref->video_egress.register_session(
+      session,
+      egress_behavior,
+      egress_policy,
+      [session](const video::egress_queue_t::recovery_request_t &request) {
+        BOOST_LOG(warning) << "Video egress pressure dropped "sv << request.dropped_frames
+                           << " frame(s) for session "sv << session->launch_session_id
+                           << ", depth="sv << request.depth_after_drop
+                           << ", requesting RFI/IDR for encoded frames "sv
+                           << request.first_frame << '-' << request.last_frame;
+        session->video.invalidate_ref_frames_events->raise(
+          std::make_pair(request.first_frame, request.last_frame)
+        );
+      }
+    );
+    if (!registered) {
+      BOOST_LOG(error) << "Could not register session with the video egress scheduler"sv;
+      return;
+    }
+    auto unregister_egress = util::fail_guard([&]() {
+      const auto telemetry = ref->video_egress.unregister_session(session);
+      if (!telemetry) {
+        BOOST_LOG(error) << "Video egress session registration disappeared before capture ended"sv;
+        return;
+      }
+
+      BOOST_LOG(info) << "Video egress session "sv << session->launch_session_id
+                      << " telemetry: queued="sv << telemetry->queued_frames
+                      << " dequeued="sv << telemetry->dequeued_frames
+                      << " dropped="sv << telemetry->dropped_frames
+                      << " overflow="sv << telemetry->overflow_events
+                      << " age_expirations="sv << telemetry->age_expiration_events
+                      << " expired="sv << telemetry->expired_frames
+                      << " gated="sv << telemetry->gated_drops
+                      << " recovery_requests="sv << telemetry->recovery_requests
+                      << " peak_depth="sv << telemetry->peak_depth
+                      << " capacity="sv << telemetry->configured_capacity
+                      << " deadline_ms="sv
+                      << std::chrono::duration<double, std::milli> {telemetry->configured_max_queue_age}.count()
+                      << " max_age_ms="sv
+                      << std::chrono::duration<double, std::milli> {telemetry->max_queue_age}.count();
+    });
+
+    const stream_policy::ScopedPolicyBinding policy_binding {*session->config.optimization_policy};
     BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+    video::capture(session->mail, session->config.monitor, session, ref->video_egress);
   }
 
   /**
@@ -2557,6 +2543,7 @@ namespace stream {
         return;
       }
 
+      input::begin_close(session.input);
       session.shutdown_event->raise(true);
     }
 
@@ -2599,11 +2586,19 @@ namespace stream {
       session.videoThread.join();
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
+      input::begin_close(session.input);
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
+
+#ifdef _WIN32
+      if (session.config.virtual_display_lease && !session.config.virtual_display_lease->release()) {
+        BOOST_LOG(error) << "Failed to restore Lumen virtual-display topology for session "sv << session.launch_session_id;
+      }
+      session.config.virtual_display_lease.reset();
+#endif
 
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
@@ -2690,6 +2685,11 @@ namespace stream {
      * @brief Allocate and initialize platform input state for a stream.
      */
     std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session) {
+      if (!config.optimization_policy) {
+        BOOST_LOG(error) << "Cannot allocate stream session without an explicitly resolved optimization policy"sv;
+        return nullptr;
+      }
+
       auto session = std::make_shared<session_t>();
 
       auto mail = std::make_shared<safe::mail_raw_t>();
@@ -2699,6 +2699,8 @@ namespace stream {
       session->client_cert = launch_session.client_cert;
 
       session->config = config;
+      session->config.monitor.optimization_policy = session->config.optimization_policy;
+      session->config.monitor.client_protocol = session->config.client_protocol;
 
       if (session->config.client_microphone) {
         session->microphone.session_id = launch_session.client_microphone_session_id;
@@ -2756,6 +2758,7 @@ namespace stream {
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.lowseq = 0;
+      session->video.pacing = stream_policy::initialize_pacing(std::chrono::steady_clock::now());
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
         BOOST_LOG(info) << "Video encryption enabled"sv;
@@ -2805,5 +2808,1243 @@ namespace stream {
 
       return session;
     }
+
+#ifdef SUNSHINE_TESTS
+    video::config_t video_config_for_test(const std::shared_ptr<session_t> &session) {
+      return session ? session->config.monitor : video::config_t {};
+    }
+#endif
   }  // namespace session
+
+#if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
+  namespace {
+    namespace v3_media = lumen::protocol_v3::media;
+    namespace v3_runtime = lumen::protocol_v3::runtime;
+
+    template<class Integer>
+    Integer v3_read_be(const std::span<const std::uint8_t> bytes, const std::size_t offset) {
+      Integer value {};
+      for (std::size_t index = 0; index < sizeof(Integer); ++index) {
+        value = static_cast<Integer>((value << 8U) | bytes[offset + index]);
+      }
+      return value;
+    }
+
+    template<class Packet>
+    std::vector<std::uint8_t> v3_packet_bytes(const Packet &packet) {
+      const auto *begin = reinterpret_cast<const std::uint8_t *>(&packet);
+      return {begin, begin + sizeof(Packet)};
+    }
+
+    std::uint64_t v3_microseconds(const std::chrono::steady_clock::time_point value) {
+      return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          value.time_since_epoch()
+      )
+                                          .count());
+    }
+
+    void v3_netfloat(const float value, std::uint8_t (&output)[4]) {
+      static_assert(sizeof(value) == sizeof(output));
+      std::memcpy(output, &value, sizeof(value));
+    }
+
+    class native_v3_session_resources final:
+        public v3_runtime::SessionResources,
+        private v3_media::InputSink,
+        private v3_media::MicrophoneSink,
+        private v3_media::VideoFeedbackSink {
+    public:
+      native_v3_session_resources(
+        v3_media::NegotiatedMediaConfig selection,
+        const std::uint64_t connection_id,
+        v3_media::TransportSink &transport,
+        std::function<void()> terminal_failure
+      ):
+          selection_ {std::move(selection)},
+          session_owner_id_ {connection_id},
+          terminal_failure_ {std::move(terminal_failure)},
+          mail_ {std::make_shared<safe::mail_raw_t>()},
+          input_ {input::alloc(mail_)},
+          audio_packets_ {mail_->queue<audio::packet_t>(mail::audio_packets)},
+          video_egress_ {selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ? 1U : 2U},
+          pipeline_ {selection_, transport, *this, *this, *this} {
+        if (!terminal_failure_ || !input_ || !pipeline_.bind_connection(connection_id)) {
+          throw std::runtime_error {"protocol-v3 native resource allocation"};
+        }
+        if (selection_.fidelity == 3 &&
+            !video::current_nvenc_lossless_capability(selection_.codec_id - 1)) {
+          throw std::runtime_error {"protocol-v3 NVENC lossless proof unavailable"};
+        }
+        const auto behavior = selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ?
+                                video::egress_queue_t::behavior_e::latency :
+                                video::egress_queue_t::behavior_e::fifo;
+        const auto latency_deadline = std::chrono::nanoseconds {
+          static_cast<std::int64_t>(selection_.refresh_denominator) * 1'000'000'000LL /
+          selection_.refresh_numerator
+        };
+        const video::egress_queue_t::registration_policy_t egress_policy {
+          behavior == video::egress_queue_t::behavior_e::latency ? 1U : video_egress_.capacity_per_session(),
+          behavior == video::egress_queue_t::behavior_e::latency ? latency_deadline : std::chrono::nanoseconds::zero(),
+        };
+        if (!video_egress_.register_session(this, behavior, egress_policy, [this](const auto &) {
+              mail_->event<bool>(mail::idr)->raise(true);
+            })) {
+          throw std::runtime_error {"protocol-v3 video egress registration"};
+        }
+        configure_stream();
+        const stream_policy::ScopedPolicyBinding binding {*stream_config_.optimization_policy};
+        auto codec_initialization = video::codec_initialization(stream_config_.monitor);
+        if (!codec_initialization || codec_initialization->empty()) {
+          throw std::runtime_error {"protocol-v3 codec initialization unavailable"};
+        }
+        codec_initialization_ = std::move(*codec_initialization);
+      }
+
+      ~native_v3_session_resources() override {
+        stop();
+      }
+
+      std::span<const std::uint8_t> video_codec_initialization() const noexcept override {
+        return codec_initialization_;
+      }
+
+      bool reset_input(const std::span<const std::uint8_t> state_block) override {
+        input::reset(input_);
+        input_ = input::alloc(mail_);
+        if (!input_) {
+          return false;
+        }
+        input_causality_.reset();
+        prior_input_initialized_ = false;
+        prior_controller_mask_ = 0;
+        arrived_controller_mask_ = 0;
+        controller_states_.fill(controller_state_t {});
+        touch_points_.clear();
+        if (!validate_state(state_block)) {
+          return false;
+        }
+        return input::passthrough_state(
+          input_,
+          [this, state = std::vector<std::uint8_t> {state_block.begin(), state_block.end()}](
+            const input::ordered_injector_t &injector
+          ) {
+            return apply_state(state, injector);
+          },
+          false
+        );
+      }
+
+      bool apply_text(const lumen::protocol_v3::control_session::cbor::Value::Map &fields) override {
+        const auto text = std::ranges::find_if(fields, [](const auto &entry) {
+          return std::holds_alternative<std::string>(entry.second.storage);
+        });
+        if (text == fields.end()) {
+          return false;
+        }
+        const auto &value = std::get<std::string>(text->second.storage);
+        for (std::size_t offset = 0; offset < value.size();) {
+          NV_UNICODE_PACKET packet {};
+          packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+          packet.header.magic = util::endian::little<std::uint32_t>(UTF8_TEXT_EVENT_MAGIC);
+          const auto count = std::min<std::size_t>(sizeof(packet.text), value.size() - offset);
+          std::copy_n(value.data() + static_cast<std::ptrdiff_t>(offset), count, packet.text);
+          if (!inject(packet)) {
+            return false;
+          }
+          offset += count;
+        }
+        return true;
+      }
+
+      v3_media::ReceiveResult datagram(
+        const lumen::protocol_v3::quic_server::DatagramRecord &record
+      ) override {
+        return pipeline_.receive(record);
+      }
+
+      bool start_media() override {
+        std::call_once(start_once_, [this] {
+          try {
+            start_microphone();
+            video_sender_ = std::jthread {[this] {
+              consume_video();
+            }};
+            audio_sender_ = std::jthread {[this] {
+              consume_audio();
+            }};
+            video_capture_ = std::jthread {[this] {
+              try {
+                const stream_policy::ScopedPolicyBinding binding {*stream_config_.optimization_policy};
+                video::capture(mail_, stream_config_.monitor, this, video_egress_);
+              } catch (...) {
+              }
+              report_terminal_failure();
+            }};
+            audio_capture_ = std::jthread {[this] {
+              try {
+                audio::capture(mail_, stream_config_.audio, this);
+              } catch (...) {
+              }
+              report_terminal_failure();
+            }};
+            media_started_ = true;
+          } catch (...) {
+            explicit_stop_.store(true, std::memory_order_release);
+            media_started_ = false;
+          }
+        });
+        if (!media_started_) {
+          stop();
+        }
+        return media_started_;
+      }
+
+      void detach_connection() noexcept override {
+        pipeline_.detach_connection();
+        input::begin_close(input_);
+        input::reset(input_);
+        if (microphone_receiver_) {
+          microphone_receiver_->stop();
+        }
+        prior_input_initialized_ = false;
+        prior_controller_mask_ = 0;
+        arrived_controller_mask_ = 0;
+        controller_states_.fill(controller_state_t {});
+        touch_points_.clear();
+      }
+
+      bool attach_connection(const std::uint64_t connection_id) override {
+        if (connection_id == 0 || !pipeline_.bind_connection(connection_id)) {
+          return false;
+        }
+        try {
+          input_ = input::alloc(mail_);
+          if (!input_) {
+            return false;
+          }
+          if (microphone_receiver_ && !microphone_receiver_->reset(
+                                        selection_.microphone_generation,
+                                        client_microphone::clock_t::now()
+                                      )) {
+            input::begin_close(input_);
+            input::reset(input_);
+            pipeline_.detach_connection();
+            return false;
+          }
+          mail_->event<bool>(mail::idr)->raise(true);
+          return true;
+        } catch (...) {
+          pipeline_.detach_connection();
+          return false;
+        }
+      }
+
+      void stop() noexcept override {
+        std::call_once(stop_once_, [this] {
+          explicit_stop_.store(true, std::memory_order_release);
+          pipeline_.stop();
+          input::begin_close(input_);
+          input::reset(input_);
+          mail_->event<bool>(mail::shutdown)->raise(true);
+          audio_packets_->stop();
+          video_egress_.stop();
+          if (video_capture_.joinable()) {
+            video_capture_.join();
+          }
+          if (audio_capture_.joinable()) {
+            audio_capture_.join();
+          }
+          if (video_sender_.joinable()) {
+            video_sender_.join();
+          }
+          if (audio_sender_.joinable()) {
+            audio_sender_.join();
+          }
+          if (microphone_receiver_) {
+            microphone_receiver_->stop();
+          }
+          microphone_receiver_.reset();
+          microphone_sink_.reset();
+#ifdef _WIN32
+          if (stream_config_.monitor.virtual_display_frame_source) {
+            stream_config_.monitor.virtual_display_frame_source->stop();
+            stream_config_.monitor.virtual_display_frame_source.reset();
+          }
+          if (stream_config_.virtual_display_lease && !stream_config_.virtual_display_lease->release()) {
+            BOOST_LOG(error) << "Protocol-v3 failed to restore Lumen virtual-display topology"sv;
+          }
+          stream_config_.virtual_display_lease.reset();
+#endif
+        });
+      }
+
+    private:
+      void configure_stream() {
+        const auto requested_mode = selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ?
+                                      stream_policy::StreamOptimizationMode::latency :
+                                      stream_policy::StreamOptimizationMode::quality;
+        stream_config_.optimization_policy = std::make_shared<const stream_policy::EffectiveStreamPolicy>(
+          stream_policy::resolve_policy(
+            requested_mode,
+            requested_mode,
+            config::video.nv,
+            0,
+            stream_policy::AdvancedOverrides {},
+            selection_.fidelity == 3 ?
+              stream_policy::StreamFidelityRequest::codec_lossless_required :
+            selection_.fidelity == 2 ?
+              stream_policy::StreamFidelityRequest::visually_lossless_allowed :
+              stream_policy::StreamFidelityRequest::unspecified
+          )
+        );
+        stream_config_.client_protocol = stream_policy::ClientProtocol::umbra_v3;
+        stream_config_.packetsize = selection_.semantic_datagram_bytes;
+        stream_config_.minRequiredFecPackets = 0;
+        stream_config_.mlFeatureFlags = 0;
+        stream_config_.controlProtocolType = 0;
+        stream_config_.audioQosType = 0;
+        stream_config_.videoQosType = 0;
+        stream_config_.video_path_budget_bps = static_cast<std::uint64_t>(selection_.video_bitrate_kbps) * 1'000U;
+        stream_config_.encryptionFlagsEnabled = 0;
+        stream_config_.client_microphone = selection_.microphone_enabled;
+        stream_config_.monitor.width = static_cast<int>(selection_.width);
+        stream_config_.monitor.height = static_cast<int>(selection_.height);
+        stream_config_.monitor.framerate = static_cast<int>(
+          selection_.refresh_numerator / selection_.refresh_denominator
+        );
+        stream_config_.monitor.framerateX100 = 0;
+        stream_config_.monitor.refreshNumerator = static_cast<int>(selection_.refresh_numerator);
+        stream_config_.monitor.refreshDenominator = static_cast<int>(selection_.refresh_denominator);
+        stream_config_.monitor.bitrate = static_cast<int>(selection_.video_bitrate_kbps);
+        stream_config_.monitor.slicesPerFrame = 1;
+        stream_config_.monitor.numRefFrames = 0;
+        stream_config_.monitor.encoderCscMode = selection_.matrix_code == 9 ?
+                                                  (4 | selection_.range) :
+                                                selection_.matrix_code == 1 ?
+                                                  (2 | selection_.range) :
+                                                  selection_.range;
+        stream_config_.monitor.videoFormat = selection_.codec_id - 1;
+        stream_config_.monitor.dynamicRange = selection_.bit_depth == 10 ? 1 : 0;
+        stream_config_.monitor.chromaSamplingType = selection_.chroma_layout == 2 ? 1 : 0;
+        stream_config_.monitor.enableIntraRefresh = 0;
+        stream_config_.monitor.protocolV3Colorimetry = true;
+        stream_config_.monitor.colorPrimaries = selection_.primaries;
+        stream_config_.monitor.colorTransfer = selection_.transfer;
+        stream_config_.monitor.colorMatrix = selection_.matrix_code;
+        stream_config_.monitor.colorRange = selection_.range;
+        stream_config_.monitor.hasStaticHDRMetadata = selection_.static_hdr_metadata.has_value();
+        if (selection_.static_hdr_metadata) {
+          const auto &metadata = *selection_.static_hdr_metadata;
+          stream_config_.monitor.staticHDRDisplayPrimaries = metadata.display_primaries;
+          stream_config_.monitor.staticHDRWhitePoint = metadata.white_point;
+          stream_config_.monitor.staticHDRMaximumMasteringLuminance = metadata.maximum_mastering_luminance;
+          stream_config_.monitor.staticHDRMinimumMasteringLuminance = metadata.minimum_mastering_luminance;
+          stream_config_.monitor.staticHDRMaximumContentLightLevel = metadata.maximum_content_light_level;
+          stream_config_.monitor.staticHDRMaximumFrameAverageLightLevel = metadata.maximum_frame_average_light_level;
+        }
+        stream_config_.monitor.output_name = config::video.output_name;
+        stream_config_.monitor.optimization_policy = stream_config_.optimization_policy;
+        stream_config_.monitor.client_protocol = stream_policy::ClientProtocol::umbra_v3;
+        stream_config_.monitor.capture_input_watermark = [this]() {
+          const auto watermark = input_causality_.capture();
+          return std::make_pair(watermark.state_sequence, watermark.edge_id);
+        };
+        stream_config_.audio.packetDuration = static_cast<int>(
+          selection_.audio.frame_samples * 1'000U / selection_.audio.sample_rate
+        );
+        stream_config_.audio.channels = selection_.audio.channels;
+        stream_config_.audio.mask = selection_.audio.channels == 2 ? 0x3 :
+                                    selection_.audio.channels == 6 ? 0x3f :
+                                                                     0x63f;
+        stream_config_.audio.bitrate = static_cast<int>(selection_.audio.bitrate_bps);
+        stream_config_.audio.flags.reset();
+        stream_config_.audio.flags[audio::config_t::CONTINUOUS_AUDIO] = true;
+        stream_config_.audio.flags[audio::config_t::CUSTOM_SURROUND_PARAMS] = true;
+        stream_config_.audio.customStreamParams.channelCount = selection_.audio.channels;
+        stream_config_.audio.customStreamParams.streams = selection_.audio.streams;
+        stream_config_.audio.customStreamParams.coupledStreams = selection_.audio.coupled_streams;
+        std::ranges::copy(selection_.audio.mapping, stream_config_.audio.customStreamParams.mapping);
+
+#ifdef _WIN32
+        const platf::virtual_display::mode_t requested_display_mode {
+          selection_.width,
+          selection_.height,
+          {selection_.refresh_numerator, selection_.refresh_denominator},
+          selection_.transfer == 1 ?
+            platf::virtual_display::dynamic_range_e::sdr :
+            platf::virtual_display::dynamic_range_e::hdr10,
+          selection_.bit_depth,
+        };
+        auto display_limits = platf::virtual_display::mode_limits_t {};
+        if (selection_.codec_id == 1) {
+          display_limits.maximum_width = 4096;
+          display_limits.maximum_height = 4096;
+          display_limits.maximum_pixels = 4096ULL * 4096ULL;
+        }
+        const auto activation_policy = []() {
+          switch (config::video.dd.virtual_display_policy) {
+            case config::video_t::dd_t::virtual_display_policy_e::optional:
+              return platf::virtual_display::activation_policy_e::optional;
+            case config::video_t::dd_t::virtual_display_policy_e::required:
+              return platf::virtual_display::activation_policy_e::required;
+            case config::video_t::dd_t::virtual_display_policy_e::disabled:
+            default:
+              return platf::virtual_display::activation_policy_e::disabled;
+          }
+        }();
+        const auto minimum_fidelity = selection_.fidelity == 2 ?
+                                        platf::virtual_display::fidelity_e::visually_lossless :
+                                        platf::virtual_display::fidelity_e::lossless;
+        auto prepared = platf::virtual_display::prepare_system_stream_session(
+          activation_policy,
+          {
+            session_owner_id_,
+            requested_display_mode,
+            selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ?
+              platf::virtual_display::delivery_policy_e::latency :
+              platf::virtual_display::delivery_policy_e::quality,
+            minimum_fidelity,
+          },
+          display_limits,
+          stream_config_.monitor.output_name
+        );
+        if (prepared.outcome == platf::virtual_display::session_prepare_e::rejected) {
+          throw std::runtime_error {"protocol-v3 virtual-display policy rejection"};
+        }
+        stream_config_.monitor.output_name = std::move(prepared.capture_name);
+        stream_config_.virtual_display_lease = std::move(prepared.lease);
+        if (prepared.outcome == platf::virtual_display::session_prepare_e::virtual_display &&
+            prepared.selection) {
+          stream_config_.monitor.virtual_display_frame_source =
+            platf::virtual_display::make_system_frame_source(*prepared.selection, 250ms);
+          if (!stream_config_.monitor.virtual_display_frame_source) {
+            BOOST_LOG(info) << "Protocol-v3 VDD direct-frame boundary unavailable; using DDA/WGC"sv;
+          }
+        }
+#endif
+      }
+
+      void start_microphone() {
+        if (!selection_.microphone_enabled) {
+          return;
+        }
+#ifdef _WIN32
+        microphone_sink_ = platf::win_audio::make_virtual_microphone();
+        microphone_receiver_ = std::make_unique<client_microphone::receiver_t>(
+          std::make_unique<client_microphone::opus_decoder_t>(),
+          *microphone_sink_
+        );
+        if (!microphone_receiver_->reset(selection_.microphone_generation, client_microphone::clock_t::now())) {
+          throw std::runtime_error {"protocol-v3 virtual microphone start"};
+        }
+#else
+        throw std::runtime_error {"protocol-v3 virtual microphone unavailable"};
+#endif
+      }
+
+      void consume_video() {
+        while (auto lease = video_egress_.pop()) {
+          auto packet = std::shared_ptr<video::packet_raw_t> {std::move(lease->packet)};
+          if (!packet) {
+            continue;
+          }
+          const auto completed = std::chrono::steady_clock::now();
+          const auto captured = packet->frame_timestamp.value_or(completed);
+          const auto delta = std::chrono::duration_cast<std::chrono::microseconds>(completed - captured).count();
+          const auto submit_delta = packet->encoder_submit_timestamp ?
+                                      std::optional<std::uint32_t> {static_cast<std::uint32_t>(
+                                        std::clamp<std::int64_t>(
+                                          std::chrono::duration_cast<std::chrono::microseconds>(
+                                            *packet->encoder_submit_timestamp - captured
+                                          )
+                                            .count(),
+                                          0,
+                                          UINT32_MAX
+                                        )
+                                      )} :
+                                      std::nullopt;
+          const input::detail::causal_watermark_value_t captured_watermark {
+            packet->applied_input_state_sequence,
+            packet->applied_input_edge_id,
+          };
+          const auto result = pipeline_.submit_video({
+            .frame_id = static_cast<std::uint64_t>(packet->frame_index()),
+            .capture_time_microseconds = v3_microseconds(captured),
+            .encoder_submit_delta_microseconds = submit_delta,
+            .encoder_complete_delta_microseconds = static_cast<std::uint32_t>(std::clamp<std::int64_t>(delta, 0, UINT32_MAX)),
+            .applied_input_state_sequence = captured_watermark.state_sequence,
+            .applied_input_edge_id = captured_watermark.edge_id,
+            .storage = packet,
+            .bytes = {packet->data(), packet->data_size()},
+            .request_recovery = [session_mail = mail_]() {
+              session_mail->event<bool>(mail::idr)->raise(true);
+            },
+            .key_frame = packet->is_idr(),
+            .discardable = false,
+            .static_hdr_metadata = selection_.static_hdr_metadata.has_value(),
+          });
+          if (result != v3_media::PublishResult::accepted) {
+            mail_->event<bool>(mail::idr)->raise(true);
+            if (result == v3_media::PublishResult::invalid ||
+                result == v3_media::PublishResult::stopped) {
+              report_terminal_failure();
+              return;
+            }
+          } else {
+            const auto frame_id = static_cast<std::uint64_t>(packet->frame_index());
+            if (!input_causality_.mark_captured(frame_id, captured_watermark)) {
+              report_terminal_failure();
+              return;
+            }
+            const auto acknowledgement = pipeline_.submit_input_acknowledgement({
+              .host_receive_time_microseconds = v3_microseconds(completed),
+              .applied_state_sequence = captured_watermark.state_sequence,
+              .applied_edge_id = captured_watermark.edge_id,
+              .received_edge_bitmap = 0,
+              .captured_frame_id = frame_id,
+            });
+            if (acknowledgement != v3_media::PublishResult::accepted &&
+                acknowledgement != v3_media::PublishResult::detached) {
+              report_terminal_failure();
+              return;
+            }
+          }
+        }
+      }
+
+      void consume_audio() {
+        while (const auto packet = audio_packets_->pop()) {
+          if (packet->channel_data != this) {
+            continue;
+          }
+          const auto result = pipeline_.submit_audio({
+            .capture_time_microseconds = v3_microseconds(std::chrono::steady_clock::now()),
+            .first_sample_position = packet->sample_position,
+            .opus = {std::begin(packet->payload), packet->payload.size()},
+            .discontinuity = packet->discontinuity,
+          });
+          if (result == v3_media::PublishResult::detached) {
+            continue;
+          }
+          if (result != v3_media::PublishResult::accepted) {
+            report_terminal_failure();
+            break;
+          }
+        }
+      }
+
+      bool submit(const v3_media::InputBatch &batch) override {
+        if (!validate_state(batch.state_block) || batch.edge_records.size() % 32 != 0) {
+          return false;
+        }
+        auto applied_edge = input_causality_.queued_edge();
+        std::vector<std::uint8_t> pending_edges;
+        for (std::size_t offset = 0; offset < batch.edge_records.size(); offset += 32) {
+          const auto edge = batch.edge_records.subspan(offset, 32);
+          const auto edge_id = v3_read_be<std::uint64_t>(edge, 0);
+          if (edge_id <= applied_edge) {
+            continue;
+          }
+          if (edge_id != applied_edge + 1 || !validate_edge(edge)) {
+            return false;
+          }
+          pending_edges.insert(pending_edges.end(), edge.begin(), edge.end());
+          applied_edge = edge_id;
+        }
+        if (!input_causality_.reserve(batch.state_sequence, applied_edge)) {
+          return false;
+        }
+        const auto supersedable = pending_edges.empty();
+        return input::passthrough_state(
+          input_,
+          [this,
+           state = std::vector<std::uint8_t> {batch.state_block.begin(), batch.state_block.end()},
+           edges = std::move(pending_edges)](const input::ordered_injector_t &injector) {
+            for (std::size_t offset = 0; offset < edges.size(); offset += 32) {
+              const auto edge = std::span<const std::uint8_t> {edges.data() + offset, 32};
+              if (edge[16] == 4 && !apply_edge(edge, injector)) {
+                return false;
+              }
+            }
+            if (!apply_state(state, edges, injector)) {
+              return false;
+            }
+            for (std::size_t offset = 0; offset < edges.size(); offset += 32) {
+              const auto edge = std::span<const std::uint8_t> {edges.data() + offset, 32};
+              if (edge[16] != 4 && !apply_edge(edge, injector)) {
+                return false;
+              }
+            }
+            return true;
+          },
+          supersedable,
+          [this, state_sequence = batch.state_sequence, applied_edge]() {
+            if (!input_causality_.mark_applied(state_sequence, applied_edge)) {
+              report_terminal_failure();
+              return;
+            }
+            const input::detail::causal_watermark_value_t watermark {state_sequence, applied_edge};
+            const auto acknowledgement = pipeline_.submit_input_acknowledgement({
+              .host_receive_time_microseconds = v3_microseconds(std::chrono::steady_clock::now()),
+              .applied_state_sequence = state_sequence,
+              .applied_edge_id = applied_edge,
+              .received_edge_bitmap = 0,
+              .captured_frame_id = input_causality_.captured_frame(watermark),
+            });
+            if (acknowledgement != v3_media::PublishResult::accepted &&
+                acknowledgement != v3_media::PublishResult::detached) {
+              report_terminal_failure();
+            }
+          }
+        );
+      }
+
+      void reset() noexcept override {
+        input::reset(input_);
+        prior_input_initialized_ = false;
+        prior_controller_mask_ = 0;
+        arrived_controller_mask_ = 0;
+        controller_states_.fill(controller_state_t {});
+        touch_points_.clear();
+      }
+
+      bool submit(const v3_media::MicrophonePacket &packet) override {
+        if (!microphone_receiver_) {
+          return false;
+        }
+        const auto now = client_microphone::clock_t::now();
+        if ((packet.flags & 0x04U) != 0) {
+          microphone_receiver_->stop();
+          return true;
+        }
+        if ((packet.flags & 0x02U) != 0 &&
+            !microphone_receiver_->reset(packet.generation, now)) {
+          return false;
+        }
+        client_microphone::packet_t native {
+          .generation = packet.generation,
+          .sequence = packet.first_sample_position / selection_.microphone.frame_samples,
+          .timestamp = static_cast<std::uint32_t>(packet.first_sample_position),
+          .kind = (packet.flags & 0x01U) != 0 ?
+                    client_microphone::packet_kind_e::silence :
+                    client_microphone::packet_kind_e::opus,
+          .payload = {packet.opus.begin(), packet.opus.end()},
+        };
+        if (microphone_receiver_->submit(std::move(native), now) != client_microphone::submit_result_e::accepted) {
+          return false;
+        }
+        microphone_receiver_->poll(now + client_microphone::JITTER_WINDOW);
+        return true;
+      }
+
+      void submit(const v3_media::VideoFeedback &feedback) override {
+        if (feedback.action == 5) {
+          mail_->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames)->raise(std::pair<int64_t, int64_t> {
+            static_cast<std::int64_t>(feedback.last_decoded_frame_id),
+            static_cast<std::int64_t>(feedback.affected_frame_id),
+          });
+        } else if (feedback.action >= 2 && feedback.action <= 4) {
+          mail_->event<bool>(mail::idr)->raise(true);
+        }
+      }
+
+      /** @brief Queue one standalone input packet on the production ordered dispatcher. */
+      template<class Packet>
+      bool inject(const Packet &packet) {
+        return input::passthrough(input_, v3_packet_bytes(packet));
+      }
+
+      struct controller_state_t {
+        std::uint8_t type {};
+        std::uint16_t capabilities {};
+        std::uint32_t supported_buttons {};
+        std::uint64_t buttons {};
+        std::uint16_t left_trigger {};
+        std::uint16_t right_trigger {};
+        std::int16_t left_x {};
+        std::int16_t left_y {};
+        std::int16_t right_x {};
+        std::int16_t right_y {};
+      };
+
+      struct touch_point_t {
+        std::optional<std::uint8_t> controller;
+        std::uint8_t touchpad {};
+        std::uint32_t pointer {};
+        float x {};
+        float y {};
+        float pressure {};
+      };
+
+      static float v3_q16_16(const std::span<const std::uint8_t> bytes, const std::size_t offset) {
+        return static_cast<float>(static_cast<std::int32_t>(v3_read_be<std::uint32_t>(bytes, offset))) /
+               65'536.0f;
+      }
+
+      static touch_point_t v3_touch_point(
+        const std::uint32_t encoded_pointer,
+        const float x,
+        const float y,
+        const float pressure
+      ) {
+        const auto encoded_controller = static_cast<std::uint8_t>(encoded_pointer >> 24U);
+        if (encoded_controller >= 1 && encoded_controller <= 16) {
+          return {
+            .controller = static_cast<std::uint8_t>(encoded_controller - 1),
+            .touchpad = static_cast<std::uint8_t>((encoded_pointer >> 16U) & 0xffU),
+            .pointer = encoded_pointer & 0xffffU,
+            .x = x,
+            .y = y,
+            .pressure = pressure,
+          };
+        }
+        return {.pointer = encoded_pointer, .x = x, .y = y, .pressure = pressure};
+      }
+
+      template<class Inject>
+      bool inject_controller_arrival(
+        const std::uint8_t controller,
+        const std::uint8_t type,
+        const std::uint16_t capabilities,
+        const std::uint32_t supported_buttons,
+        const Inject &inject
+      ) {
+        if (controller >= controller_states_.size() || type < 1 || type > 5 ||
+            (capabilities & ~std::uint16_t {0x01ff}) != 0 ||
+            (supported_buttons & ~std::uint32_t {0x003fffff}) != 0) {
+          return false;
+        }
+        SS_CONTROLLER_ARRIVAL_PACKET packet {};
+        packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+        packet.header.magic = util::endian::little<std::uint32_t>(SS_CONTROLLER_ARRIVAL_MAGIC);
+        packet.controllerNumber = controller;
+        packet.type = type;
+        packet.capabilities = util::endian::little(capabilities);
+        packet.supportedButtonFlags = util::endian::little(supported_buttons);
+        if (!inject(packet)) {
+          return false;
+        }
+        arrived_controller_mask_ |= static_cast<std::uint16_t>(1U << controller);
+        return true;
+      }
+
+      template<class Inject>
+      bool inject_controller_state(
+        const std::uint8_t controller,
+        const std::uint16_t active_mask,
+        const controller_state_t &state,
+        const Inject &inject
+      ) const {
+        NV_MULTI_CONTROLLER_PACKET packet {};
+        packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+        packet.header.magic = util::endian::little<std::uint32_t>(MULTI_CONTROLLER_MAGIC_GEN5);
+        packet.headerB = util::endian::little<std::int16_t>(MC_HEADER_B);
+        packet.controllerNumber = util::endian::little<std::int16_t>(controller);
+        packet.activeGamepadMask = util::endian::little<std::int16_t>(active_mask);
+        packet.midB = util::endian::little<std::int16_t>(MC_MID_B);
+        packet.buttonFlags = util::endian::little<std::int16_t>(static_cast<std::int16_t>(state.buttons));
+        packet.leftTrigger = static_cast<std::uint8_t>(state.left_trigger >> 8U);
+        packet.rightTrigger = static_cast<std::uint8_t>(state.right_trigger >> 8U);
+        packet.leftStickX = util::endian::little(state.left_x);
+        packet.leftStickY = util::endian::little(state.left_y);
+        packet.rightStickX = util::endian::little(state.right_x);
+        packet.rightStickY = util::endian::little(state.right_y);
+        packet.tailA = util::endian::little<std::int16_t>(MC_TAIL_A);
+        packet.buttonFlags2 = util::endian::little<std::int16_t>(static_cast<std::int16_t>(state.buttons >> 16U));
+        packet.tailB = util::endian::little<std::int16_t>(MC_TAIL_B);
+        return inject(packet);
+      }
+
+      bool validate_state(const std::span<const std::uint8_t> state) const {
+        return !lumen::protocol_common::input_state::validate(state);
+      }
+
+      bool validate_edge(const std::span<const std::uint8_t> edge) const {
+        if (edge.size() != 32) {
+          return false;
+        }
+        const auto kind = edge[16];
+        const auto device = edge[17];
+        const auto code = v3_read_be<std::uint16_t>(edge, 18);
+        const auto value = static_cast<std::int32_t>(v3_read_be<std::uint32_t>(edge, 20));
+        const auto auxiliary = v3_read_be<std::uint32_t>(edge, 24);
+        if (v3_read_be<std::uint32_t>(edge, 28) != 0) {
+          return false;
+        }
+        if (kind == 1) return device == 0 && code <= 255 && (value == 0 || value == 1) && auxiliary == 0;
+        if (kind == 2) return device == 0 && code >= 1 && code <= 5 && (value == 0 || value == 1) && auxiliary == 0;
+        if (kind == 3) return device < 16 && code < 32 && (value == 0 || value == 1) && auxiliary == 0;
+        if (kind == 4) {
+          return device < 16 && code <= 0x01ff && value >= 1 && value <= 5 &&
+                 (auxiliary & ~std::uint32_t {0x003fffff}) == 0;
+        }
+        return device == 0 && (kind == 5 || kind == 6) && (code == 2 || code == 4 || code == 5);
+      }
+
+      bool apply_state(
+        const std::span<const std::uint8_t> state,
+        const input::ordered_injector_t &ordered_injector
+      ) {
+        return apply_state(state, {}, ordered_injector);
+      }
+
+      bool apply_state(
+        const std::span<const std::uint8_t> state,
+        const std::span<const std::uint8_t> edges,
+        const input::ordered_injector_t &ordered_injector
+      ) {
+        if (!validate_state(state)) {
+          return false;
+        }
+        const auto inject = [&ordered_injector]<class Packet>(const Packet &packet) {
+          return ordered_injector(v3_packet_bytes(packet));
+        };
+        const auto flags = v3_read_be<std::uint32_t>(state, 0);
+        const auto relative = (flags & 0x03U) == 2;
+        const auto absolute = (flags & 0x03U) == 1;
+        const auto x = static_cast<std::int64_t>(v3_read_be<std::uint64_t>(state, 8));
+        const auto y = static_cast<std::int64_t>(v3_read_be<std::uint64_t>(state, 16));
+        const auto wheel = static_cast<std::int64_t>(v3_read_be<std::uint64_t>(state, 24));
+        const auto horizontal = static_cast<std::int64_t>(v3_read_be<std::uint64_t>(state, 32));
+        const auto controller_count = state[84];
+        const auto touch_count = state[85];
+        if (!prior_input_initialized_) {
+          const auto mouse_buttons = v3_read_be<std::uint32_t>(state, 4);
+          for (std::uint16_t button = 1; button <= 5; ++button) {
+            if ((mouse_buttons & (1U << (button - 1))) == 0) {
+              continue;
+            }
+            NV_MOUSE_BUTTON_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5);
+            packet.button = static_cast<std::uint8_t>(button);
+            if (!inject(packet)) {
+              return false;
+            }
+          }
+          for (std::uint16_t key = 0; key < 256; ++key) {
+            if ((state[48 + key / 8] & (1U << (key % 8))) == 0) {
+              continue;
+            }
+            NV_KEYBOARD_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(KEY_DOWN_EVENT_MAGIC);
+            packet.keyCode = util::endian::little<std::int16_t>(static_cast<std::int16_t>(key | 0x8000U));
+            if (!inject(packet)) {
+              return false;
+            }
+          }
+        }
+        if (prior_input_initialized_) {
+          if (relative && (x != prior_relative_x_ || y != prior_relative_y_)) {
+            NV_REL_MOUSE_MOVE_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(MOUSE_MOVE_REL_MAGIC_GEN5);
+            packet.deltaX = util::endian::big<std::int16_t>(static_cast<std::int16_t>(
+              std::clamp<std::int64_t>(x - prior_relative_x_, INT16_MIN, INT16_MAX)
+            ));
+            packet.deltaY = util::endian::big<std::int16_t>(static_cast<std::int16_t>(
+              std::clamp<std::int64_t>(y - prior_relative_y_, INT16_MIN, INT16_MAX)
+            ));
+            if (!inject(packet)) {
+              return false;
+            }
+          }
+          if (wheel != prior_wheel_) {
+            NV_SCROLL_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(SCROLL_MAGIC_GEN5);
+            packet.scrollAmt1 = packet.scrollAmt2 = util::endian::big<std::int16_t>(static_cast<std::int16_t>(
+              std::clamp<std::int64_t>(wheel - prior_wheel_, INT16_MIN, INT16_MAX)
+            ));
+            if (!inject(packet)) {
+              return false;
+            }
+          }
+          if (horizontal != prior_horizontal_wheel_) {
+            SS_HSCROLL_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(SS_HSCROLL_MAGIC);
+            packet.scrollAmount = util::endian::big<std::int16_t>(static_cast<std::int16_t>(
+              std::clamp<std::int64_t>(horizontal - prior_horizontal_wheel_, INT16_MIN, INT16_MAX)
+            ));
+            if (!inject(packet)) {
+              return false;
+            }
+          }
+        }
+        if (absolute) {
+          NV_ABS_MOUSE_MOVE_PACKET packet {};
+          packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+          packet.header.magic = util::endian::little<std::uint32_t>(MOUSE_MOVE_ABS_MAGIC);
+          packet.x = util::endian::big<std::int16_t>(static_cast<std::int16_t>(
+            v3_read_be<std::uint32_t>(state, 40) >> 17U
+          ));
+          packet.y = util::endian::big<std::int16_t>(static_cast<std::int16_t>(
+            v3_read_be<std::uint32_t>(state, 44) >> 17U
+          ));
+          packet.width = util::endian::big<std::int16_t>(INT16_MAX);
+          packet.height = util::endian::big<std::int16_t>(INT16_MAX);
+          if (!inject(packet)) {
+            return false;
+          }
+        }
+        const auto active_mask = static_cast<std::uint16_t>(v3_read_be<std::uint32_t>(state, 80));
+        for (std::size_t index = 0; index < controller_count; ++index) {
+          const auto offset = 112U + index * 64U;
+          const auto controller = state[offset];
+          if (controller >= 16) {
+            return false;
+          }
+          auto &controller_state = controller_states_[controller];
+          const controller_state_t parsed_controller {
+            .type = state[offset + 1],
+            .capabilities = v3_read_be<std::uint16_t>(state, offset + 2),
+            .supported_buttons = v3_read_be<std::uint32_t>(state, offset + 52),
+            .buttons = v3_read_be<std::uint64_t>(state, offset + 4),
+            .left_trigger = v3_read_be<std::uint16_t>(state, offset + 12),
+            .right_trigger = v3_read_be<std::uint16_t>(state, offset + 14),
+            .left_x = static_cast<std::int16_t>(v3_read_be<std::uint16_t>(state, offset + 16)),
+            .left_y = static_cast<std::int16_t>(v3_read_be<std::uint16_t>(state, offset + 18)),
+            .right_x = static_cast<std::int16_t>(v3_read_be<std::uint16_t>(state, offset + 20)),
+            .right_y = static_cast<std::int16_t>(v3_read_be<std::uint16_t>(state, offset + 22)),
+          };
+          if ((arrived_controller_mask_ & (1U << controller)) != 0 &&
+              (controller_state.type != parsed_controller.type ||
+               controller_state.capabilities != parsed_controller.capabilities ||
+               controller_state.supported_buttons != parsed_controller.supported_buttons)) {
+            return false;
+          }
+          controller_state = parsed_controller;
+          if ((arrived_controller_mask_ & (1U << controller)) == 0 &&
+              !inject_controller_arrival(
+                controller,
+                controller_state.type,
+                controller_state.capabilities,
+                controller_state.supported_buttons,
+                inject
+              )) {
+            return false;
+          }
+          if (!inject_controller_state(controller, active_mask, controller_state, inject)) {
+            return false;
+          }
+          if ((controller_state.capabilities & 0x20U) != 0) {
+            SS_CONTROLLER_MOTION_PACKET motion {};
+            motion.header.size = util::endian::big<std::uint32_t>(sizeof(motion) - sizeof(std::uint32_t));
+            motion.header.magic = util::endian::little<std::uint32_t>(SS_CONTROLLER_MOTION_MAGIC);
+            motion.controllerNumber = controller;
+            motion.motionType = LI_MOTION_TYPE_GYRO;
+            v3_netfloat(v3_q16_16(state, offset + 24), motion.x);
+            v3_netfloat(v3_q16_16(state, offset + 28), motion.y);
+            v3_netfloat(v3_q16_16(state, offset + 32), motion.z);
+            if (!inject(motion)) return false;
+          }
+          if ((controller_state.capabilities & 0x10U) != 0) {
+            SS_CONTROLLER_MOTION_PACKET motion {};
+            motion.header.size = util::endian::big<std::uint32_t>(sizeof(motion) - sizeof(std::uint32_t));
+            motion.header.magic = util::endian::little<std::uint32_t>(SS_CONTROLLER_MOTION_MAGIC);
+            motion.controllerNumber = controller;
+            motion.motionType = LI_MOTION_TYPE_ACCEL;
+            v3_netfloat(v3_q16_16(state, offset + 36), motion.x);
+            v3_netfloat(v3_q16_16(state, offset + 40), motion.y);
+            v3_netfloat(v3_q16_16(state, offset + 44), motion.z);
+            if (!inject(motion)) return false;
+          }
+          const auto battery = v3_read_be<std::uint16_t>(state, offset + 48);
+          if ((controller_state.capabilities & 0x40U) != 0 && battery != UINT16_MAX) {
+            SS_CONTROLLER_BATTERY_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(SS_CONTROLLER_BATTERY_MAGIC);
+            packet.controllerNumber = controller;
+            packet.batteryState = state[offset + 50];
+            packet.batteryPercentage = static_cast<std::uint8_t>(std::min<std::uint16_t>(battery / 100U, 100U));
+            if (!inject(packet)) return false;
+          }
+        }
+        for (std::uint8_t controller = 0; controller < 16; ++controller) {
+          if ((prior_controller_mask_ & (1U << controller)) == 0 ||
+              (active_mask & (1U << controller)) != 0) {
+            continue;
+          }
+          NV_MULTI_CONTROLLER_PACKET packet {};
+          packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+          packet.header.magic = util::endian::little<std::uint32_t>(MULTI_CONTROLLER_MAGIC_GEN5);
+          packet.headerB = util::endian::little<std::int16_t>(MC_HEADER_B);
+          packet.controllerNumber = util::endian::little<std::int16_t>(controller);
+          packet.activeGamepadMask = util::endian::little<std::int16_t>(active_mask);
+          packet.midB = util::endian::little<std::int16_t>(MC_MID_B);
+          packet.tailA = util::endian::little<std::int16_t>(MC_TAIL_A);
+          packet.tailB = util::endian::little<std::int16_t>(MC_TAIL_B);
+          if (!inject(packet)) {
+            return false;
+          }
+          arrived_controller_mask_ &= static_cast<std::uint16_t>(~(1U << controller));
+          controller_states_[controller] = {};
+        }
+        prior_controller_mask_ = active_mask;
+        const auto touch_base = 112U + static_cast<std::size_t>(controller_count) * 64U;
+        for (std::size_t index = 0; index < touch_count; ++index) {
+          const auto offset = touch_base + index * 32U;
+          const auto scale = static_cast<double>(UINT32_MAX);
+          const auto pointer_id = v3_read_be<std::uint32_t>(state, offset);
+          const auto touch_x = static_cast<float>(v3_read_be<std::uint32_t>(state, offset + 8) / scale);
+          const auto touch_y = static_cast<float>(v3_read_be<std::uint32_t>(state, offset + 12) / scale);
+          const auto pressure = static_cast<float>(v3_read_be<std::uint16_t>(state, offset + 6)) / UINT16_MAX;
+          const auto point = v3_touch_point(pointer_id, touch_x, touch_y, pressure);
+          const auto has_down_edge = [&]() {
+            for (std::size_t edge_offset = 0; edge_offset < edges.size(); edge_offset += 32) {
+              const auto edge = edges.subspan(edge_offset, 32);
+              if (edge[16] == 5 && v3_read_be<std::uint16_t>(edge, 18) == 2 &&
+                  v3_read_be<std::uint32_t>(edge, 24) == pointer_id) {
+                return true;
+              }
+            }
+            return false;
+          }();
+          if (has_down_edge && !touch_points_.contains(pointer_id)) {
+            touch_points_[pointer_id] = point;
+            continue;
+          }
+          const auto event_type = touch_points_.contains(pointer_id) ? LI_TOUCH_EVENT_MOVE : LI_TOUCH_EVENT_DOWN;
+          if (point.controller) {
+            const auto controller = *point.controller;
+            const auto capabilities = controller_states_[controller].capabilities;
+            if ((arrived_controller_mask_ & (1U << controller)) == 0 ||
+                (capabilities & 0x08U) == 0 || point.touchpad > 1 ||
+                (point.touchpad == 1 && (capabilities & 0x100U) == 0)) {
+              return false;
+            }
+            SS_CONTROLLER_TOUCH_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(SS_CONTROLLER_TOUCH_MAGIC);
+            packet.controllerNumber = controller;
+            packet.eventType = event_type;
+            packet.touchpadIndex = point.touchpad;
+            packet.pointerId = util::endian::little(point.pointer);
+            v3_netfloat(point.x, packet.x);
+            v3_netfloat(point.y, packet.y);
+            v3_netfloat(point.pressure, packet.pressure);
+            if (!inject(packet)) return false;
+          } else {
+            SS_TOUCH_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(SS_TOUCH_MAGIC);
+            packet.eventType = event_type;
+            packet.pointerId = util::endian::little(point.pointer);
+            packet.rotation = LI_ROT_UNKNOWN;
+            v3_netfloat(point.x, packet.x);
+            v3_netfloat(point.y, packet.y);
+            v3_netfloat(point.pressure, packet.pressureOrDistance);
+            if (!inject(packet)) return false;
+          }
+          touch_points_[pointer_id] = point;
+        }
+        prior_relative_x_ = x;
+        prior_relative_y_ = y;
+        prior_wheel_ = wheel;
+        prior_horizontal_wheel_ = horizontal;
+        prior_input_initialized_ = true;
+        return true;
+      }
+
+      bool apply_edge(
+        const std::span<const std::uint8_t> edge,
+        const input::ordered_injector_t &ordered_injector
+      ) {
+        if (!validate_edge(edge)) {
+          return false;
+        }
+        const auto inject = [&ordered_injector]<class Packet>(const Packet &packet) {
+          return ordered_injector(v3_packet_bytes(packet));
+        };
+        const auto kind = edge[16];
+        const auto device = edge[17];
+        const auto code = v3_read_be<std::uint16_t>(edge, 18);
+        const auto value = static_cast<std::int32_t>(v3_read_be<std::uint32_t>(edge, 20));
+        if (kind == 1) {
+          NV_KEYBOARD_PACKET packet {};
+          packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+          packet.header.magic = util::endian::little<std::uint32_t>(
+            value != 0 ? KEY_DOWN_EVENT_MAGIC : KEY_UP_EVENT_MAGIC
+          );
+          packet.keyCode = util::endian::little<std::int16_t>(static_cast<std::int16_t>(code | 0x8000U));
+          if (!inject(packet)) {
+            return false;
+          }
+          return true;
+        }
+        if (kind == 2 && code >= 1 && code <= 5) {
+          NV_MOUSE_BUTTON_PACKET packet {};
+          packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+          packet.header.magic = util::endian::little<std::uint32_t>(
+            value != 0 ? MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5 : MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5
+          );
+          packet.button = static_cast<std::uint8_t>(code);
+          if (!inject(packet)) {
+            return false;
+          }
+          return true;
+        }
+        if (kind == 3) {
+          if ((prior_controller_mask_ & (1U << device)) == 0 ||
+              (arrived_controller_mask_ & (1U << device)) == 0) {
+            return false;
+          }
+          auto &state = controller_states_[device];
+          const auto mask = std::uint64_t {1} << code;
+          state.buttons = value != 0 ? state.buttons | mask : state.buttons & ~mask;
+          return inject_controller_state(device, prior_controller_mask_, state, inject);
+        }
+        if (kind == 4) {
+          if ((arrived_controller_mask_ & (1U << device)) != 0 ||
+              !inject_controller_arrival(
+                device,
+                static_cast<std::uint8_t>(value),
+                code,
+                v3_read_be<std::uint32_t>(edge, 24),
+                inject
+              )) {
+            return false;
+          }
+          controller_states_[device].type = static_cast<std::uint8_t>(value);
+          controller_states_[device].capabilities = code;
+          controller_states_[device].supported_buttons = v3_read_be<std::uint32_t>(edge, 24);
+          return true;
+        }
+        if (kind == 5 && (code == 2 || code == 4 || code == 5)) {
+          const auto pointer_id = v3_read_be<std::uint32_t>(edge, 24);
+          const auto point = touch_points_.find(pointer_id);
+          if (point == touch_points_.end()) {
+            return false;
+          }
+          const auto event_type = code == 2 ? LI_TOUCH_EVENT_DOWN :
+                                  code == 4 ? LI_TOUCH_EVENT_UP :
+                                              LI_TOUCH_EVENT_CANCEL;
+          const auto &touch = point->second;
+          if (touch.controller) {
+            SS_CONTROLLER_TOUCH_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(SS_CONTROLLER_TOUCH_MAGIC);
+            packet.controllerNumber = *touch.controller;
+            packet.eventType = event_type;
+            packet.touchpadIndex = touch.touchpad;
+            packet.pointerId = util::endian::little(touch.pointer);
+            v3_netfloat(touch.x, packet.x);
+            v3_netfloat(touch.y, packet.y);
+            v3_netfloat(touch.pressure, packet.pressure);
+            if (!inject(packet)) return false;
+          } else {
+            SS_TOUCH_PACKET packet {};
+            packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+            packet.header.magic = util::endian::little<std::uint32_t>(SS_TOUCH_MAGIC);
+            packet.eventType = event_type;
+            packet.pointerId = util::endian::little(touch.pointer);
+            packet.rotation = LI_ROT_UNKNOWN;
+            v3_netfloat(touch.x, packet.x);
+            v3_netfloat(touch.y, packet.y);
+            v3_netfloat(touch.pressure, packet.pressureOrDistance);
+            if (!inject(packet)) return false;
+          }
+          if (code == 4 || code == 5) {
+            touch_points_.erase(pointer_id);
+          }
+          return true;
+        }
+        if (kind == 6 && (code == 2 || code == 4 || code == 5)) {
+          SS_PEN_PACKET packet {};
+          packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
+          packet.header.magic = util::endian::little<std::uint32_t>(SS_PEN_MAGIC);
+          packet.eventType = static_cast<std::uint8_t>(code);
+          packet.toolType = LI_TOOL_TYPE_PEN;
+          if (!inject(packet)) {
+            return false;
+          }
+          return true;
+        }
+        return false;
+      }
+
+      void report_terminal_failure() noexcept {
+        if (explicit_stop_.load(std::memory_order_acquire)) {
+          return;
+        }
+        bool expected = false;
+        if (!failure_reported_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+          return;
+        }
+        try {
+          terminal_failure_();
+        } catch (...) {
+        }
+      }
+
+      v3_media::NegotiatedMediaConfig selection_;
+      [[maybe_unused]] std::uint64_t session_owner_id_ {};  ///< Nonzero exact owner for VDD and runtime resources.
+      std::function<void()> terminal_failure_;
+      std::vector<std::uint8_t> codec_initialization_;
+      safe::mail_t mail_;
+      std::shared_ptr<input::input_t> input_;
+      safe::mail_raw_t::queue_t<audio::packet_t> audio_packets_;
+      video::egress_queue_t video_egress_;
+      v3_media::SessionPipeline pipeline_;
+      config_t stream_config_ {};
+      std::jthread video_capture_;
+      std::jthread audio_capture_;
+      std::jthread video_sender_;
+      std::jthread audio_sender_;
+      std::once_flag stop_once_;
+      std::once_flag start_once_;
+      bool media_started_ {};
+      std::atomic_bool explicit_stop_ {};
+      std::atomic_bool failure_reported_ {};
+      input::detail::causal_watermark_t input_causality_;  ///< Queued, injected, and captured input causality.
+      bool prior_input_initialized_ {};
+      std::int64_t prior_relative_x_ {};
+      std::int64_t prior_relative_y_ {};
+      std::int64_t prior_wheel_ {};
+      std::int64_t prior_horizontal_wheel_ {};
+      std::uint16_t prior_controller_mask_ {};
+      std::uint16_t arrived_controller_mask_ {};
+      std::array<controller_state_t, 16> controller_states_ {};
+      std::unordered_map<std::uint32_t, touch_point_t> touch_points_;
+      std::unique_ptr<client_microphone::sink_t> microphone_sink_;
+      std::unique_ptr<client_microphone::receiver_t> microphone_receiver_;
+    };
+
+    class native_v3_session_resource_factory final: public v3_runtime::SessionResourceFactory {
+    public:
+      explicit native_v3_session_resource_factory(v3_media::TransportSink &transport):
+          transport_ {transport} {
+      }
+
+      std::expected<std::unique_ptr<v3_runtime::SessionResources>, std::uint8_t> create(
+        const v3_media::NegotiatedMediaConfig &config,
+        const std::uint64_t connection_id,
+        std::function<void()> terminal_failure
+      ) override {
+        try {
+          return std::make_unique<native_v3_session_resources>(
+            config,
+            connection_id,
+            transport_,
+            std::move(terminal_failure)
+          );
+        } catch (...) {
+          return std::unexpected(std::uint8_t {8});
+        }
+      }
+
+    private:
+      v3_media::TransportSink &transport_;
+    };
+  }  // namespace
+
+  std::unique_ptr<lumen::protocol_v3::runtime::SessionResourceFactory>
+    make_protocol_v3_session_resource_factory(
+      lumen::protocol_v3::media::TransportSink &transport
+    ) {
+    return std::make_unique<native_v3_session_resource_factory>(transport);
+  }
+#endif
 }  // namespace stream

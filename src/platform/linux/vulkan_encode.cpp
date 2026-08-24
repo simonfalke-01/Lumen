@@ -1,7 +1,7 @@
 /**
  * @file src/platform/linux/vulkan_encode.cpp
  * @brief Vulkan-native encoder: DMA-BUF -> Vulkan compute (RGB->YUV) -> Vulkan Video encode.
- *        No EGL/GL dependency — all GPU work stays in a single Vulkan queue.
+ *        No EGL/GL dependency; all GPU work stays in a single Vulkan queue.
  */
 #include <algorithm>
 #include <array>
@@ -296,7 +296,7 @@ namespace vk {
 
       // Import new DMA-BUF as VkImage when capture sequence changes
       if (descriptor.sequence == 0) {
-        // Dummy frame — clear the target
+        // Clear the target for a dummy frame.
         return 0;
       }
 
@@ -720,7 +720,7 @@ namespace vk {
       }
 
       if (num_imgs == 1) {
-        // Single multiplane image — create plane views
+        // Create plane views for one multiplane image.
         VkImageViewCreateInfo view_ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_ci.image = vk_frame->img[0];
         view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -774,7 +774,7 @@ namespace vk {
 
       // Rotate to next command buffer. With CMD_RING_SIZE slots, the buffer
       // we're about to reuse was submitted CMD_RING_SIZE frames ago.
-      // At 60fps that's ~50ms for a <1ms compute dispatch — always complete.
+      // At 60 fps, this is about 50 ms for a sub-1-ms compute dispatch, which is always complete.
       // No fences, no semaphore waits, no CPU blocking.
       auto cmd_buf = cmd.ring[cmd.ring_idx];
       cmd.ring_idx = (cmd.ring_idx + 1) % CMD_RING_SIZE;
@@ -912,7 +912,7 @@ namespace vk {
 
     void destroy_src_image() {
       if (src.image) {
-        // Defer destruction — the GPU may still be using this image.
+        // Defer destruction because the GPU may still be using this image.
         // By the time we wrap around (4 frames later), it's guaranteed done.
         auto &slot = defer_ring[defer_idx];
         if (slot.view) {
@@ -1018,7 +1018,7 @@ namespace vk {
 
     compute_pipeline_t compute = {};
 
-    // Command submission — ring of buffers to avoid reuse while in-flight.
+    // Use a buffer ring for command submission to avoid reuse while in flight.
     // No CPU waits: by the time we wrap around, the old submission is long done.
     static constexpr int CMD_RING_SIZE = 3;
 

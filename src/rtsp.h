@@ -7,16 +7,62 @@
 // standard includes
 #include <array>
 #include <atomic>
+#include <charconv>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 
+extern "C" {
+#include <moonlight-common-c/src/Video.h>
+}
+
 // local includes
+#include "config.h"
 #include "crypto.h"
 #include "thread_safe.h"
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
+
+  /**
+   * @brief Validate a client-announced GameStream video packet size.
+   *
+   * The complete UDP datagram must fit both the packetizer's 64-KiB block cap
+   * and the conservative IPv4 UDP payload limit after RTP and optional video
+   * encryption prefixes are included.
+   *
+   * @param packet_size Client-announced `x-nv-video[0].packetSize` value.
+   * @param video_encryption Whether a GameStream video encryption prefix is enabled.
+   * @return `true` only when the announced value is safe for packetization and transport.
+   */
+  [[nodiscard]] inline bool validate_video_packet_size(const std::int64_t packet_size, const bool video_encryption) {
+    constexpr auto maximum_packetizer_block_size = std::int64_t {64U * 1024U};
+    constexpr auto maximum_ipv4_udp_payload = std::int64_t {65507};
+    const auto encryption_prefix_size = video_encryption ? static_cast<std::int64_t>(sizeof(ENC_VIDEO_HEADER)) : 0;
+    return packet_size >= config::PACKETSIZE_MIN &&
+           packet_size <= config::PACKETSIZE_MAX &&
+           packet_size <= maximum_packetizer_block_size - MAX_RTP_HEADER_SIZE &&
+           packet_size <= maximum_ipv4_udp_payload - MAX_RTP_HEADER_SIZE - encryption_prefix_size;
+  }
+
+  /**
+   * @brief Strictly parse and validate a client-announced video packet size.
+   * @param value Complete decimal SDP attribute value.
+   * @param video_encryption Whether video encryption is enabled for the session.
+   * @return Safe packet size, or `std::nullopt` for malformed, overflowing, or unsafe input.
+   */
+  [[nodiscard]] inline std::optional<int> parse_video_packet_size(
+    const std::string_view value,
+    const bool video_encryption
+  ) {
+    std::int64_t parsed {};
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc {} || result.ptr != value.data() + value.size() || !validate_video_packet_size(parsed, video_encryption)) {
+      return std::nullopt;
+    }
+    return static_cast<int>(parsed);
+  }
 
   /**
    * @brief Exact SDP attributes advertising Lumen client-microphone version one.
@@ -108,6 +154,11 @@ namespace rtsp_stream {
    * @return Count of active sessions.
    */
   int session_count();
+  /**
+   * @brief Check whether any active or not-yet-attached launch session exists.
+   * @return True when process/display teardown would affect another session.
+   */
+  bool has_session_or_pending_launch();
 
   /**
    * @brief Terminates all running streaming sessions.
@@ -118,7 +169,14 @@ namespace rtsp_stream {
    *
    * @param cert Certificate data or object used by the operation.
    */
-  void terminate_sessions_by_cert(std::string_view cert);
+  std::size_t terminate_sessions_by_cert(std::string_view cert);
+
+  [[nodiscard]] inline bool session_owned_by_certificate(
+    std::string_view session_certificate,
+    std::string_view requester_certificate
+  ) {
+    return !requester_certificate.empty() && session_certificate == requester_certificate;
+  }
 
   /**
    * @brief Runs the RTSP server loop.

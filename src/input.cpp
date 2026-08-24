@@ -10,16 +10,22 @@ extern "C" {
 
 // standard includes
 #include <algorithm>
-#include <bitset>
+#include <array>
 #include <chrono>
 #include <cmath>
-#include <future>
+#include <exception>
 #include <limits>
-#include <list>
 #include <mutex>
-#include <thread>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _WIN32
+  // clang-format off: avrt.h depends on the Windows base types.
+  #include <windows.h>
+  #include <avrt.h>
+  // clang-format on
+#endif
 
 // lib includes
 #include <boost/endian/buffers.hpp>
@@ -28,9 +34,10 @@ extern "C" {
 #include "config.h"
 #include "globals.h"
 #include "input.h"
+#include "input_state.h"
 #include "logging.h"
+#include "ordered_input_dispatcher.h"
 #include "platform/common.h"
-#include "thread_pool.h"
 #include "utility.h"
 
 // Win32 WHEEL_DELTA constant
@@ -127,12 +134,12 @@ namespace input {
  * @def DISABLE_LEFT_BUTTON_DELAY
  * @brief Macro for DISABLE LEFT BUTTON DELAY.
  */
-#define DISABLE_LEFT_BUTTON_DELAY ((thread_pool_util::ThreadPool::task_id_t) 0x01)
+#define DISABLE_LEFT_BUTTON_DELAY (std::numeric_limits<std::uint64_t>::max())
 /**
  * @def ENABLE_LEFT_BUTTON_DELAY
  * @brief Macro for ENABLE LEFT BUTTON DELAY.
  */
-#define ENABLE_LEFT_BUTTON_DELAY nullptr
+#define ENABLE_LEFT_BUTTON_DELAY 0
 
   constexpr auto VKEY_SHIFT = 0x10;  ///< Windows virtual-key code for shift.
   constexpr auto VKEY_LSHIFT = 0xA0;  ///< Windows virtual-key code for lshift.
@@ -152,35 +159,6 @@ namespace input {
     DOWN,  ///< Button is down
     UP  ///< Button is up
   };
-
-  /**
-   * @brief Allocate an available input slot identifier.
-   *
-   * @param gamepad_mask Gamepad mask.
-   * @return Allocated ID object, or null when unavailable.
-   */
-  template<std::size_t N>
-  int alloc_id(std::bitset<N> &gamepad_mask) {
-    for (int x = 0; x < gamepad_mask.size(); ++x) {
-      if (!gamepad_mask[x]) {
-        gamepad_mask[x] = true;
-        return x;
-      }
-    }
-
-    return -1;
-  }
-
-  /**
-   * @brief Release ID resources.
-   *
-   * @param gamepad_mask Gamepad mask.
-   * @param id Identifier for the controller, session, display, or resource.
-   */
-  template<std::size_t N>
-  void free_id(std::bitset<N> &gamepad_mask, int id) {
-    gamepad_mask[id] = false;
-  }
 
   /**
    * @brief Packed identifier for a pressed key and its modifier flags.
@@ -238,29 +216,29 @@ namespace input {
     return std::clamp(from_netfloat(f), min, max);
   }
 
-  static task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
-  static std::unordered_map<key_press_id_t, bool> key_press {};
-  static std::array<std::uint8_t, BUTTON_X2 + 1> mouse_press {};  ///< Pressed state indexed by Moonlight button ID.
-  static_assert(mouse_press.size() > BUTTON_X2, "Mouse state must include every Moonlight button ID");
-  static std::mutex mouse_press_mutex;  ///< Serializes mouse state with delayed left-button releases.
-  static std::mutex reset_tasks_mutex;
-  static std::vector<std::future<void>> reset_tasks;
-  static bool input_shutting_down {false};
-
   static platf::input_t platf_input;
-  static std::bitset<platf::MAX_GAMEPADS> gamepadMask {};
+  static std::mutex platform_input_mutex;  ///< Serializes shared keyboard and mouse platform transitions.
+  static detail::held_state_counts_t<key_press_id_t> global_key_holds;  ///< Cross-session held-key contributions.
+  static detail::held_state_counts_t<int> global_mouse_holds;  ///< Cross-session held-button contributions.
+  using gamepad_slot_allocator_t = detail::synchronized_slot_allocator_t<platf::MAX_GAMEPADS>;  ///< Global gamepad slot allocator type.
+  static gamepad_slot_allocator_t gamepad_slots;  ///< Generation-qualified slots shared by session consumers.
+  static detail::input_session_reset_gate_t input_session_gate;  ///< Shared transport reset serialization gate.
 
   /**
    * @brief Release all platform resources associated with a virtual gamepad.
    *
    * @param platf_input Platf input.
-   * @param id Identifier for the controller, session, display, or resource.
+   * @param reservation Generation-qualified gamepad slot reservation.
    */
-  void free_gamepad(platf::input_t &platf_input, int id) {
-    platf::gamepad_update(platf_input, id, platf::gamepad_state_t {});
-    platf::free_gamepad(platf_input, id);
-
-    free_id(gamepadMask, id);
+  void free_gamepad(platf::input_t &platf_input, gamepad_slot_allocator_t::reservation_t reservation) {
+    if (!reservation) {
+      return;
+    }
+    const auto id = reservation.id;
+    gamepad_slots.release(reservation, [&platf_input, id]() {
+      platf::gamepad_update(platf_input, id, platf::gamepad_state_t {});
+      platf::free_gamepad(platf_input, id);
+    });
   }
 
   /**
@@ -269,22 +247,20 @@ namespace input {
   struct gamepad_t {
     gamepad_t():
         gamepad_state {},
-        back_timeout_id {},
         id {-1},
         back_button_state {button_state_e::NONE} {
     }
 
     ~gamepad_t() {
       if (id >= 0) {
-        task_pool.push([id = this->id]() {
-          free_gamepad(platf_input, id);
-        });
+        free_gamepad(platf_input, reservation);
       }
     }
 
     platf::gamepad_state_t gamepad_state;  ///< Gamepad state.
 
-    thread_pool_util::ThreadPool::task_id_t back_timeout_id;  ///< Back timeout ID.
+    detail::controller_timer_generation_t timers;  ///< Connection generation and cancellable delayed work.
+    gamepad_slot_allocator_t::reservation_t reservation;  ///< Generation-qualified global slot ownership.
 
     int id;  ///< Global gamepad slot assigned to this client controller.
 
@@ -296,10 +272,14 @@ namespace input {
     button_state_e back_button_state;  ///< Back button state.
   };
 
+  void neutralize_input(input_t &input);
+
   /**
    * @brief Input emulation settings loaded from configuration.
    */
   struct input_t {
+    using dispatcher_t = detail::ordered_input_dispatcher_t<std::vector<std::uint8_t>>;  ///< Per-session ordered input dispatcher.
+
     /**
      * @brief Enumerates supported shortkey options.
      */
@@ -331,6 +311,18 @@ namespace input {
         accumulated_hscroll_delta {} {
     }
 
+    /**
+     * @brief Stop any remaining dispatch work before dependent session fields are destroyed.
+     */
+    ~input_t() {
+      if (dispatcher) {
+        dispatcher->close(false);
+      }
+      if (session_registration != 0) {
+        neutralize_input(*this);
+      }
+    }
+
     // Keep track of alt+ctrl+shift key combo
     int shortcutFlags;  ///< Shortcut flags.
 
@@ -343,17 +335,87 @@ namespace input {
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
 
-    std::list<std::vector<uint8_t>> input_queue;  ///< Pending raw input packets waiting for processing.
-    std::mutex input_queue_lock;  ///< Input queue lock.
-
-    thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
+    std::unordered_map<key_press_id_t, bool> key_press;  ///< Pressed keyboard state local to this stream.
+    std::array<std::uint8_t, BUTTON_X2 + 1> mouse_press {};  ///< Logical mouse-button state local to this stream.
+    std::array<std::uint8_t, BUTTON_X2 + 1> mouse_platform_press {};  ///< Physical held contributions owned by this stream.
+    static_assert(std::tuple_size_v<std::array<std::uint8_t, BUTTON_X2 + 1>> > BUTTON_X2, "Mouse state must include every Moonlight button ID");
+    dispatcher_t::task_id_t key_press_repeat_id {};  ///< Ordered key-repeat timer.
+    dispatcher_t::task_id_t mouse_left_button_timeout {};  ///< Ordered mouse left-button timeout.
     detail::delayed_left_state_t delayed_left_button;  ///< Portable delayed left-button decision state.
 
     input::touch_port_t touch_port;  ///< Touch coordinate bounds for the current stream.
 
     int32_t accumulated_vscroll_delta;  ///< Accumulated vscroll delta.
     int32_t accumulated_hscroll_delta;  ///< Accumulated hscroll delta.
+    detail::input_session_reset_gate_t::session_id_t session_registration {};  ///< Shared transport reset-gate registration.
+    std::unique_ptr<dispatcher_t> dispatcher;  ///< Dedicated FIFO consumer destroyed before session state.
   };
+
+  short map_keycode(short keycode);
+
+  /**
+   * @brief Invalidate and cancel delayed callbacks owned by one controller instance.
+   *
+   * @param input Session dispatcher that owns the timers.
+   * @param gamepad Controller state whose generation is invalidated.
+   */
+  void disconnect_controller_timers(input_t &input, gamepad_t &gamepad) {
+    const auto cancellations = gamepad.timers.disconnect();
+    if (input.dispatcher) {
+      input.dispatcher->cancel(cancellations.timeout);
+      input.dispatcher->cancel(cancellations.release);
+    }
+  }
+
+  /**
+   * @brief Apply one reference-counted platform mouse-button transition.
+   *
+   * The caller must hold platform_input_mutex.
+   *
+   * @param input Session contributing the held state.
+   * @param button Moonlight mouse-button identifier.
+   * @param release Whether to release the session's physical contribution.
+   */
+  void update_platform_mouse_locked(input_t &input, int button, bool release) {
+    if (button < BUTTON_LEFT || button > BUTTON_X2) {
+      platf::button_mouse(platf_input, button, release);
+      return;
+    }
+
+    auto &session_pressed = input.mouse_platform_press[button];
+    if (session_pressed == !release) {
+      return;
+    }
+    session_pressed = !release;
+    if (!release) {
+      if (global_mouse_holds.acquire(button)) {
+        platf::button_mouse(platf_input, button, false);
+      }
+    } else if (global_mouse_holds.release(button)) {
+      platf::button_mouse(platf_input, button, true);
+    }
+  }
+
+  /**
+   * @brief Apply one reference-counted platform keyboard transition.
+   *
+   * The caller must hold platform_input_mutex.
+   *
+   * @param key_code Moonlight virtual key code.
+   * @param release Whether to release the session's held contribution.
+   * @param flags Keyboard packet flags.
+   */
+  void update_platform_keyboard_locked(uint16_t key_code, bool release, uint8_t flags) {
+    const auto mapped_key = map_keycode(key_code);
+    const auto identity = make_kpid(mapped_key, flags);
+    if (!release) {
+      if (global_key_holds.acquire(identity)) {
+        platf::keyboard_update(platf_input, mapped_key, false, flags);
+      }
+    } else if (global_key_holds.release(identity)) {
+      platf::keyboard_update(platf_input, mapped_key, true, flags);
+    }
+  }
 
   /**
    * @brief Apply shortcut based on VKEY
@@ -361,13 +423,13 @@ namespace input {
    * @return 0 if no shortcut applied, > 0 if shortcut applied.
    */
   inline int apply_shortcut(short keyCode) {
-    constexpr auto VK_F1 = 0x70;
-    constexpr auto VK_F13 = 0x7C;
+    constexpr auto shortcut_key_first = 0x70;
+    constexpr auto shortcut_key_last = 0x7C;
 
     BOOST_LOG(debug) << "Apply Shortcut: 0x"sv << util::hex((std::uint8_t) keyCode).to_string_view();
 
-    if (keyCode >= VK_F1 && keyCode <= VK_F13) {
-      mail::man->event<int>(mail::switch_display)->raise(keyCode - VK_F1);
+    if (keyCode >= shortcut_key_first && keyCode <= shortcut_key_last) {
+      mail::man->event<int>(mail::switch_display)->raise(keyCode - shortcut_key_first);
       return 1;
     }
 
@@ -650,23 +712,20 @@ namespace input {
    * @param input Platform input backend that receives the event.
    * @param packet Protocol packet being processed.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PNV_REL_MOUSE_MOVE_PACKET packet) {
+  void passthrough(input_t *input, PNV_REL_MOUSE_MOVE_PACKET packet) {
     if (!config::input.mouse) {
       return;
     }
 
-    {
-      std::lock_guard lock(mouse_press_mutex);
-      const auto decision = input->delayed_left_button.on_relative_move();
-      if (decision.cancel_timer) {
-        task_pool.cancel(input->mouse_left_button_timeout);
-      }
-      if (decision.emit_left_release) {
-        platf::button_mouse(platf_input, BUTTON_LEFT, true);
-        mouse_press[BUTTON_LEFT] = false;
-      }
-      input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
+    std::lock_guard lock(platform_input_mutex);
+    const auto decision = input->delayed_left_button.on_relative_move();
+    if (decision.cancel_timer) {
+      input->dispatcher->cancel(input->mouse_left_button_timeout);
     }
+    if (decision.emit_left_release) {
+      update_platform_mouse_locked(*input, BUTTON_LEFT, true);
+    }
+    input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
     platf::move_mouse(platf_input, util::endian::big(packet->deltaX), util::endian::big(packet->deltaY));
   }
 
@@ -677,7 +736,7 @@ namespace input {
    * @param size The size of the client's surface containing the value.
    * @return The host-relative coordinate pair if a touchport is available.
    */
-  std::optional<std::pair<float, float>> client_to_touchport(std::shared_ptr<input_t> &input, const std::pair<float, float> &val, const std::pair<float, float> &size) {
+  std::optional<std::pair<float, float>> client_to_touchport(input_t *input, const std::pair<float, float> &val, const std::pair<float, float> &size) {
     auto &touch_port_event = input->touch_port_event;
     auto &touch_port = input->touch_port;
     if (touch_port_event->peek()) {
@@ -764,13 +823,13 @@ namespace input {
    * @param input Platform input backend that receives the event.
    * @param packet Protocol packet being processed.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PNV_ABS_MOUSE_MOVE_PACKET packet) {
+  void passthrough(input_t *input, PNV_ABS_MOUSE_MOVE_PACKET packet) {
     if (!config::input.mouse) {
       return;
     }
 
     {
-      std::lock_guard lock(mouse_press_mutex);
+      std::lock_guard lock(platform_input_mutex);
       input->delayed_left_button.on_absolute_move();
       if (input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
         input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
@@ -815,6 +874,7 @@ namespace input {
       touch_port_dim_y
     };
 
+    std::lock_guard lock(platform_input_mutex);
     platf::abs_mouse(platf_input, abs_port, tpcoords->first, tpcoords->second);
   }
 
@@ -824,32 +884,32 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The mouse button packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PNV_MOUSE_BUTTON_PACKET packet) {
+  void passthrough(input_t *input, PNV_MOUSE_BUTTON_PACKET packet) {
     if (!config::input.mouse) {
       return;
     }
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
     auto button = util::endian::big(packet->button);
-    std::lock_guard lock(mouse_press_mutex);
+    std::lock_guard lock(platform_input_mutex);
 
     if (button == BUTTON_LEFT && !release) {
       const auto decision = input->delayed_left_button.on_left_down();
       if (decision.cancel_timer) {
-        task_pool.cancel(input->mouse_left_button_timeout);
+        input->dispatcher->cancel(input->mouse_left_button_timeout);
       }
       if (decision.emit_left_release) {
-        platf::button_mouse(platf_input, BUTTON_LEFT, true);
+        update_platform_mouse_locked(*input, BUTTON_LEFT, true);
       }
       input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
     }
     if (button >= BUTTON_LEFT && button <= BUTTON_X2) {
-      if (mouse_press[button] != release) {
+      if (input->mouse_press[button] != release) {
         // button state is already what we want
         return;
       }
 
-      mouse_press[button] = !release;
+      input->mouse_press[button] = !release;
     }
     /**
      * When Moonlight sends mouse input through absolute coordinates,
@@ -867,39 +927,37 @@ namespace input {
     if (button == BUTTON_LEFT && release) {
       const auto decision = input->delayed_left_button.on_left_up();
       if (!decision.schedule_timer) {
-        platf::button_mouse(platf_input, button, release);
+        update_platform_mouse_locked(*input, button, release);
         return;
       }
       const auto generation = decision.generation;
-      auto f = [=]() {
-        std::lock_guard lock(mouse_press_mutex);
+      auto f = [input, generation]() {
+        std::lock_guard lock(platform_input_mutex);
         const auto timer_decision = input->delayed_left_button.on_timer(
           generation,
-          mouse_press[BUTTON_LEFT]
+          input->mouse_press[BUTTON_LEFT]
         );
         if (timer_decision.consume_timer) {
           input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
         }
         if (timer_decision.emit_left_release) {
-          platf::button_mouse(platf_input, BUTTON_LEFT, true);
-          mouse_press[BUTTON_LEFT] = false;
+          update_platform_mouse_locked(*input, BUTTON_LEFT, true);
         }
       };
 
-      input->mouse_left_button_timeout = task_pool.pushDelayed(std::move(f), 10ms).task_id;
+      input->mouse_left_button_timeout = input->dispatcher->schedule(std::move(f), 10ms);
 
       return;
     }
     if (button == BUTTON_RIGHT && !release && input->delayed_left_button.on_right_down().synthesize_right_click) {
-      platf::button_mouse(platf_input, BUTTON_RIGHT, false);
-      platf::button_mouse(platf_input, BUTTON_RIGHT, true);
-
-      mouse_press[BUTTON_RIGHT] = false;
+      update_platform_mouse_locked(*input, BUTTON_RIGHT, false);
+      update_platform_mouse_locked(*input, BUTTON_RIGHT, true);
+      input->mouse_press[BUTTON_RIGHT] = false;
 
       return;
     }
 
-    platf::button_mouse(platf_input, button, release);
+    update_platform_mouse_locked(*input, button, release);
   }
 
   /**
@@ -988,46 +1046,80 @@ namespace input {
    * @param synthetic_modifiers Synthetic modifiers.
    */
   void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, uint8_t synthetic_modifiers) {
+    std::lock_guard lock(platform_input_mutex);
     if (!release) {
       // Press any synthetic modifiers required for this key
       if (synthetic_modifiers & MODIFIER_SHIFT) {
-        platf::keyboard_update(platf_input, VKEY_SHIFT, false, flags);
+        update_platform_keyboard_locked(VKEY_SHIFT, false, flags);
       }
       if (synthetic_modifiers & MODIFIER_CTRL) {
-        platf::keyboard_update(platf_input, VKEY_CONTROL, false, flags);
+        update_platform_keyboard_locked(VKEY_CONTROL, false, flags);
       }
       if (synthetic_modifiers & MODIFIER_ALT) {
-        platf::keyboard_update(platf_input, VKEY_MENU, false, flags);
+        update_platform_keyboard_locked(VKEY_MENU, false, flags);
       }
     }
 
-    platf::keyboard_update(platf_input, map_keycode(key_code), release, flags);
+    update_platform_keyboard_locked(key_code, release, flags);
 
     if (!release) {
       // Raise any synthetic modifier keys we pressed
       if (synthetic_modifiers & MODIFIER_SHIFT) {
-        platf::keyboard_update(platf_input, VKEY_SHIFT, true, flags);
+        update_platform_keyboard_locked(VKEY_SHIFT, true, flags);
       }
       if (synthetic_modifiers & MODIFIER_CTRL) {
-        platf::keyboard_update(platf_input, VKEY_CONTROL, true, flags);
+        update_platform_keyboard_locked(VKEY_CONTROL, true, flags);
       }
       if (synthetic_modifiers & MODIFIER_ALT) {
-        platf::keyboard_update(platf_input, VKEY_MENU, true, flags);
+        update_platform_keyboard_locked(VKEY_MENU, true, flags);
       }
+    }
+  }
+
+  /**
+   * @brief Emit one repeat pulse without changing held-state reference counts.
+   *
+   * @param key_code Moonlight keyboard packet key code.
+   * @param flags Bit flags that modify the requested operation.
+   * @param synthetic_modifiers Synthetic modifiers required for the repeat pulse.
+   */
+  void send_key_repeat(uint16_t key_code, uint8_t flags, uint8_t synthetic_modifiers) {
+    std::lock_guard lock(platform_input_mutex);
+    if (synthetic_modifiers & MODIFIER_SHIFT) {
+      update_platform_keyboard_locked(VKEY_SHIFT, false, flags);
+    }
+    if (synthetic_modifiers & MODIFIER_CTRL) {
+      update_platform_keyboard_locked(VKEY_CONTROL, false, flags);
+    }
+    if (synthetic_modifiers & MODIFIER_ALT) {
+      update_platform_keyboard_locked(VKEY_MENU, false, flags);
+    }
+
+    platf::keyboard_update(platf_input, map_keycode(key_code), false, flags);
+
+    if (synthetic_modifiers & MODIFIER_SHIFT) {
+      update_platform_keyboard_locked(VKEY_SHIFT, true, flags);
+    }
+    if (synthetic_modifiers & MODIFIER_CTRL) {
+      update_platform_keyboard_locked(VKEY_CONTROL, true, flags);
+    }
+    if (synthetic_modifiers & MODIFIER_ALT) {
+      update_platform_keyboard_locked(VKEY_MENU, true, flags);
     }
   }
 
   /**
    * @brief Re-emit a held key until its repeat task is cancelled.
    *
+   * @param input Session whose dispatcher and held state own the repeat.
    * @param key_code Moonlight keyboard packet key code.
    * @param flags Bit flags that modify the requested operation.
    * @param synthetic_modifiers Synthetic modifiers.
    */
-  void repeat_key(uint16_t key_code, uint8_t flags, uint8_t synthetic_modifiers) {
+  void repeat_key(input_t *input, uint16_t key_code, uint8_t flags, uint8_t synthetic_modifiers) {
     // If key no longer pressed, stop repeating
-    if (!key_press[make_kpid(key_code, flags)]) {
-      key_press_repeat_id = nullptr;
+    if (!input->key_press[make_kpid(key_code, flags)]) {
+      input->key_press_repeat_id = 0;
       return;
     }
 
@@ -1036,13 +1128,18 @@ namespace input {
     // one-way runtime fallback can resume the portable cadence without a second task.
 #ifdef _WIN32
     if (!platf::uses_native_keyboard_repeat(platf_input)) {
-      send_key_and_modifiers(key_code, false, flags, synthetic_modifiers);
+      send_key_repeat(key_code, flags, synthetic_modifiers);
     }
 #else
-    send_key_and_modifiers(key_code, false, flags, synthetic_modifiers);
+    send_key_repeat(key_code, flags, synthetic_modifiers);
 #endif
 
-    key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, key_code, flags, synthetic_modifiers).task_id;
+    input->key_press_repeat_id = input->dispatcher->schedule(
+      [input, key_code, flags, synthetic_modifiers]() {
+        repeat_key(input, key_code, flags, synthetic_modifiers);
+      },
+      config::input.key_repeat_period
+    );
   }
 
   /**
@@ -1051,7 +1148,7 @@ namespace input {
    * @param input Platform input backend that receives the event.
    * @param packet Protocol packet being processed.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PNV_KEYBOARD_PACKET packet) {
+  void passthrough(input_t *input, PNV_KEYBOARD_PACKET packet) {
     if (!config::input.keyboard) {
       return;
     }
@@ -1086,7 +1183,7 @@ namespace input {
       }
     }
 
-    auto &pressed = key_press[make_kpid(keyCode, packet->flags)];
+    auto &pressed = input->key_press[make_kpid(keyCode, packet->flags)];
     if (!pressed) {
       if (!release) {
         // A new key has been pressed down, we need to check for key combo's
@@ -1095,12 +1192,17 @@ namespace input {
           return;
         }
 
-        if (key_press_repeat_id) {
-          task_pool.cancel(key_press_repeat_id);
+        if (input->key_press_repeat_id) {
+          input->dispatcher->cancel(input->key_press_repeat_id);
         }
 
         if (config::input.key_repeat_delay.count() > 0) {
-          key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, keyCode, packet->flags, synthetic_modifiers).task_id;
+          input->key_press_repeat_id = input->dispatcher->schedule(
+            [input, keyCode, flags = packet->flags, synthetic_modifiers]() {
+              repeat_key(input, keyCode, flags, synthetic_modifiers);
+            },
+            config::input.key_repeat_delay
+          );
         }
       } else {
         // Already released
@@ -1123,18 +1225,20 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The scroll packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PNV_SCROLL_PACKET packet) {
+  void passthrough(input_t *input, PNV_SCROLL_PACKET packet) {
     if (!config::input.mouse) {
       return;
     }
 
     if (config::input.high_resolution_scrolling) {
+      std::lock_guard lock(platform_input_mutex);
       platf::scroll(platf_input, util::endian::big(packet->scrollAmt1));
     } else {
       input->accumulated_vscroll_delta += util::endian::big(packet->scrollAmt1);
       auto full_ticks = input->accumulated_vscroll_delta / WHEEL_DELTA;
       if (full_ticks) {
         // Send any full ticks that have accumulated and store the rest
+        std::lock_guard lock(platform_input_mutex);
         platf::scroll(platf_input, full_ticks * WHEEL_DELTA);
         input->accumulated_vscroll_delta -= full_ticks * WHEEL_DELTA;
       }
@@ -1146,18 +1250,20 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The scroll packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PSS_HSCROLL_PACKET packet) {
+  void passthrough(input_t *input, PSS_HSCROLL_PACKET packet) {
     if (!config::input.mouse) {
       return;
     }
 
     if (config::input.high_resolution_scrolling) {
+      std::lock_guard lock(platform_input_mutex);
       platf::hscroll(platf_input, util::endian::big(packet->scrollAmount));
     } else {
       input->accumulated_hscroll_delta += util::endian::big(packet->scrollAmount);
       auto full_ticks = input->accumulated_hscroll_delta / WHEEL_DELTA;
       if (full_ticks) {
         // Send any full ticks that have accumulated and store the rest
+        std::lock_guard lock(platform_input_mutex);
         platf::hscroll(platf_input, full_ticks * WHEEL_DELTA);
         input->accumulated_hscroll_delta -= full_ticks * WHEEL_DELTA;
       }
@@ -1175,6 +1281,7 @@ namespace input {
     }
 
     int size = util::endian::big(packet->header.size) - sizeof(packet->header.magic);
+    std::lock_guard lock(platform_input_mutex);
     platf::unicode(platf_input, packet->text, size);
   }
 
@@ -1183,19 +1290,19 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The controller arrival packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_ARRIVAL_PACKET packet) {
+  bool passthrough(input_t *input, PSS_CONTROLLER_ARRIVAL_PACKET packet) {
     if (!config::input.controller) {
-      return;
+      return false;
     }
 
     if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
-      return;
+      return false;
     }
 
     if (input->gamepads[packet->controllerNumber].id >= 0) {
       BOOST_LOG(warning) << "ControllerNumber already allocated ["sv << packet->controllerNumber << ']';
-      return;
+      return false;
     }
 
     platf::gamepad_arrival_t arrival {
@@ -1204,18 +1311,22 @@ namespace input {
       util::endian::little(packet->supportedButtonFlags),
     };
 
-    auto id = alloc_id(gamepadMask);
-    if (id < 0) {
-      return;
+    const auto reservation = gamepad_slots.allocate();
+    if (!reservation) {
+      return false;
     }
 
     // Allocate a new gamepad
-    if (platf::alloc_gamepad(platf_input, {id, packet->controllerNumber}, arrival, input->feedback_queue)) {
-      free_id(gamepadMask, id);
-      return;
+    if (platf::alloc_gamepad(platf_input, {reservation.id, packet->controllerNumber}, arrival, input->feedback_queue)) {
+      gamepad_slots.release(reservation);
+      return false;
     }
 
-    input->gamepads[packet->controllerNumber].id = id;
+    auto &gamepad = input->gamepads[packet->controllerNumber];
+    gamepad.reservation = reservation;
+    gamepad.id = reservation.id;
+    gamepad.timers.connect();
+    return true;
   }
 
   /**
@@ -1248,7 +1359,7 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The touch packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PSS_TOUCH_PACKET packet) {
+  void passthrough(input_t *input, PSS_TOUCH_PACKET packet) {
     if (!config::input.mouse) {
       return;
     }
@@ -1299,7 +1410,7 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The pen packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PSS_PEN_PACKET packet) {
+  void passthrough(input_t *input, PSS_PEN_PACKET packet) {
     if (!config::input.mouse) {
       return;
     }
@@ -1352,20 +1463,20 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The controller touch packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_TOUCH_PACKET packet) {
+  bool passthrough(input_t *input, PSS_CONTROLLER_TOUCH_PACKET packet) {
     if (!config::input.controller) {
-      return;
+      return false;
     }
 
     if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
-      return;
+      return false;
     }
 
     auto &gamepad = input->gamepads[packet->controllerNumber];
     if (gamepad.id < 0) {
       BOOST_LOG(warning) << "ControllerNumber ["sv << packet->controllerNumber << "] not allocated"sv;
-      return;
+      return false;
     }
 
     platf::gamepad_touch_t touch {
@@ -1378,6 +1489,7 @@ namespace input {
     };
 
     platf::gamepad_touch(platf_input, touch);
+    return true;
   }
 
   /**
@@ -1385,20 +1497,20 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The controller motion packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_MOTION_PACKET packet) {
+  bool passthrough(input_t *input, PSS_CONTROLLER_MOTION_PACKET packet) {
     if (!config::input.controller) {
-      return;
+      return false;
     }
 
     if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
-      return;
+      return false;
     }
 
     auto &gamepad = input->gamepads[packet->controllerNumber];
     if (gamepad.id < 0) {
       BOOST_LOG(warning) << "ControllerNumber ["sv << packet->controllerNumber << "] not allocated"sv;
-      return;
+      return false;
     }
 
     platf::gamepad_motion_t motion {
@@ -1410,6 +1522,7 @@ namespace input {
     };
 
     platf::gamepad_motion(platf_input, motion);
+    return true;
   }
 
   /**
@@ -1417,20 +1530,20 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The controller battery packet.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_BATTERY_PACKET packet) {
+  bool passthrough(input_t *input, PSS_CONTROLLER_BATTERY_PACKET packet) {
     if (!config::input.controller) {
-      return;
+      return false;
     }
 
     if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
-      return;
+      return false;
     }
 
     auto &gamepad = input->gamepads[packet->controllerNumber];
     if (gamepad.id < 0) {
       BOOST_LOG(warning) << "ControllerNumber ["sv << packet->controllerNumber << "] not allocated"sv;
-      return;
+      return false;
     }
 
     platf::gamepad_battery_t battery {
@@ -1440,6 +1553,7 @@ namespace input {
     };
 
     platf::gamepad_battery(platf_input, battery);
+    return true;
   }
 
   /**
@@ -1448,15 +1562,15 @@ namespace input {
    * @param input Platform input backend that receives the event.
    * @param packet Protocol packet being processed.
    */
-  void passthrough(std::shared_ptr<input_t> &input, PNV_MULTI_CONTROLLER_PACKET packet) {
+  bool passthrough(input_t *input, PNV_MULTI_CONTROLLER_PACKET packet) {
     if (!config::input.controller) {
-      return;
+      return false;
     }
 
     if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
 
-      return;
+      return false;
     }
 
     auto &gamepad = input->gamepads[packet->controllerNumber];
@@ -1464,29 +1578,35 @@ namespace input {
     // If this is an event for a new gamepad, create the gamepad now. Ideally, the client would
     // send a controller arrival instead of this but it's still supported for legacy clients.
     if ((packet->activeGamepadMask & (1 << packet->controllerNumber)) && gamepad.id < 0) {
-      auto id = alloc_id(gamepadMask);
-      if (id < 0) {
-        return;
+      const auto reservation = gamepad_slots.allocate();
+      if (!reservation) {
+        return false;
       }
 
-      if (platf::alloc_gamepad(platf_input, {id, (uint8_t) packet->controllerNumber}, {}, input->feedback_queue)) {
-        free_id(gamepadMask, id);
-        return;
+      if (platf::alloc_gamepad(platf_input, {reservation.id, (uint8_t) packet->controllerNumber}, {}, input->feedback_queue)) {
+        gamepad_slots.release(reservation);
+        return false;
       }
 
-      gamepad.id = id;
+      gamepad.reservation = reservation;
+      gamepad.id = reservation.id;
+      gamepad.timers.connect();
     } else if (!(packet->activeGamepadMask & (1 << packet->controllerNumber)) && gamepad.id >= 0) {
       // If this is the final event for a gamepad being removed, free the gamepad and return.
-      free_gamepad(platf_input, gamepad.id);
+      disconnect_controller_timers(*input, gamepad);
+      free_gamepad(platf_input, gamepad.reservation);
+      gamepad.reservation = {};
       gamepad.id = -1;
-      return;
+      gamepad.gamepad_state = {};
+      gamepad.back_button_state = button_state_e::NONE;
+      return true;
     }
 
     // If this gamepad has not been initialized, ignore it.
     // This could happen when platf::alloc_gamepad fails
     if (gamepad.id < 0) {
       BOOST_LOG(warning) << "ControllerNumber ["sv << packet->controllerNumber << "] not allocated"sv;
-      return;
+      return false;
     }
 
     std::uint16_t bf = packet->buttonFlags;
@@ -1526,8 +1646,12 @@ namespace input {
       if (platf::BACK & bf_new) {
         // Don't emulate home button if timeout < 0
         if (config::input.back_button_timeout >= 0ms) {
-          auto f = [input, controller = packet->controllerNumber]() {
+          const auto controller_generation = gamepad.timers.generation();
+          auto f = [input, controller = packet->controllerNumber, controller_generation]() {
             auto &gamepad = input->gamepads[controller];
+            if (gamepad.id < 0 || !gamepad.timers.is_current(controller_generation)) {
+              return;
+            }
 
             auto &state = gamepad.gamepad_state;
 
@@ -1540,27 +1664,31 @@ namespace input {
             state.buttonFlags |= platf::HOME;
             platf::gamepad_update(platf_input, gamepad.id, state);
 
-            // Sleep for a short time to allow the input to be detected
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            // Release Home button
-            state.buttonFlags &= ~platf::HOME;
-            platf::gamepad_update(platf_input, gamepad.id, state);
-
-            gamepad.back_timeout_id = nullptr;
+            gamepad.timers.set_timeout(0);
+            gamepad.timers.set_release(input->dispatcher->schedule([input, controller, controller_generation]() {
+              auto &gamepad = input->gamepads[controller];
+              if (gamepad.id < 0 || !gamepad.timers.is_current(controller_generation)) {
+                return;
+              }
+              gamepad.gamepad_state.buttonFlags &= ~platf::HOME;
+              platf::gamepad_update(platf_input, gamepad.id, gamepad.gamepad_state);
+              gamepad.timers.set_release(0);
+            },
+                                                                   100ms));
           };
 
-          gamepad.back_timeout_id = task_pool.pushDelayed(std::move(f), config::input.back_button_timeout).task_id;
+          gamepad.timers.set_timeout(input->dispatcher->schedule(std::move(f), config::input.back_button_timeout));
         }
-      } else if (gamepad.back_timeout_id) {
-        task_pool.cancel(gamepad.back_timeout_id);
-        gamepad.back_timeout_id = nullptr;
+      } else if (gamepad.timers.timeout()) {
+        input->dispatcher->cancel(gamepad.timers.timeout());
+        gamepad.timers.set_timeout(0);
       }
     }
 
     platf::gamepad_update(platf_input, gamepad.id, gamepad_state);
 
     gamepad.gamepad_state = gamepad_state;
+    return true;
   }
 
   /**
@@ -1885,49 +2013,132 @@ namespace input {
 #endif
 
   /**
-   * @brief Called on a thread pool thread to process an input message.
-   * @param input The input context pointer.
+   * @brief Check whether a packet contains state-neutral pointer motion.
+   *
+   * @param entry Raw input packet.
+   * @return True only for relative or absolute mouse motion.
    */
-  void passthrough_next_message(std::shared_ptr<input_t> input) {
-    // 'entry' backs the 'payload' pointer, so they must remain in scope together
-    std::vector<uint8_t> entry;
-    PNV_INPUT_HEADER payload;
+  bool is_mouse_motion_packet(const std::vector<std::uint8_t> &entry) {
+    if (entry.size() < sizeof(NV_INPUT_HEADER)) {
+      return false;
+    }
+    const auto payload = reinterpret_cast<const NV_INPUT_HEADER *>(entry.data());
+    const auto magic = util::endian::little(payload->magic);
+    return magic == MOUSE_MOVE_REL_MAGIC_GEN5 || magic == MOUSE_MOVE_ABS_MAGIC;
+  }
 
-    // Lock the input queue while batching, but release it before sending
-    // the input to the OS. This avoids potentially lengthy lock contention
-    // in the control stream thread while input is being processed by the OS.
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
+  /**
+   * @brief Preserve every accepted legacy input packet under backpressure.
+   *
+   * Relative and absolute pointer motion can determine the target of a following
+   * button edge, so legacy packets are coalesced consecutively but never dropped.
+   *
+   * @param entry Raw input packet.
+   * @return Always false.
+   */
+  bool is_droppable_legacy_input_packet(const std::vector<std::uint8_t> &entry) {
+    (void) entry;
+    return false;
+  }
 
-      // If all entries have already been processed, nothing to do
-      if (input->input_queue.empty()) {
+  /**
+   * @brief Coalesce only consecutive compatible mouse-motion packets.
+   *
+   * @param destination Existing FIFO tail packet.
+   * @param source Newly received packet.
+   * @return True when source was safely merged into destination.
+   */
+  bool coalesce_mouse_motion(std::vector<std::uint8_t> &destination, std::vector<std::uint8_t> &source) {
+    if (!is_mouse_motion_packet(destination) || !is_mouse_motion_packet(source)) {
+      return false;
+    }
+    auto destination_header = reinterpret_cast<PNV_INPUT_HEADER>(destination.data());
+    auto source_header = reinterpret_cast<PNV_INPUT_HEADER>(source.data());
+    if (destination_header->magic != source_header->magic) {
+      return false;
+    }
+
+    switch (util::endian::little(destination_header->magic)) {
+      case MOUSE_MOVE_REL_MAGIC_GEN5:
+        if (destination.size() < sizeof(NV_REL_MOUSE_MOVE_PACKET) || source.size() < sizeof(NV_REL_MOUSE_MOVE_PACKET)) {
+          return false;
+        }
+        return batch(
+                 reinterpret_cast<PNV_REL_MOUSE_MOVE_PACKET>(destination.data()),
+                 reinterpret_cast<PNV_REL_MOUSE_MOVE_PACKET>(source.data())
+               ) == batch_result_e::batched;
+      case MOUSE_MOVE_ABS_MAGIC:
+        if (destination.size() < sizeof(NV_ABS_MOUSE_MOVE_PACKET) || source.size() < sizeof(NV_ABS_MOUSE_MOVE_PACKET)) {
+          return false;
+        }
+        return batch(
+                 reinterpret_cast<PNV_ABS_MOUSE_MOVE_PACKET>(destination.data()),
+                 reinterpret_cast<PNV_ABS_MOUSE_MOVE_PACKET>(source.data())
+               ) == batch_result_e::batched;
+      default:
+        return false;
+    }
+  }
+
+#ifdef _WIN32
+  /**
+   * @brief MMCSS Games registration retained for the lifetime of one input consumer thread.
+   */
+  class input_mmcss_guard_t {
+  public:
+    /**
+     * @brief Register the current thread with the MMCSS Games task at high priority.
+     */
+    input_mmcss_guard_t() {
+      DWORD task_index = 0;
+      handle_ = AvSetMmThreadCharacteristicsW(L"Games", &task_index);
+      if (!handle_) {
+        BOOST_LOG(warning) << "Unable to register ordered input thread with MMCSS Games: "sv << GetLastError();
         return;
       }
-
-      // Pop off the first entry, which we will send
-      entry = input->input_queue.front();
-      payload = (PNV_INPUT_HEADER) entry.data();
-      input->input_queue.pop_front();
-
-      // Try to batch with remaining items on the queue
-      auto i = input->input_queue.begin();
-      while (i != input->input_queue.end()) {
-        auto batchable_entry = *i;
-        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
-
-        auto batch_result = batch(payload, batchable_payload);
-        if (batch_result == batch_result_e::terminate_batch) {
-          // Stop batching
-          break;
-        } else if (batch_result == batch_result_e::batched) {
-          // Erase this entry since it was batched
-          i = input->input_queue.erase(i);
-        } else {
-          // We couldn't batch this entry, but try to batch later entries.
-          i++;
-        }
+      if (!AvSetMmThreadPriority(handle_, AVRT_PRIORITY_HIGH)) {
+        BOOST_LOG(warning) << "Unable to raise ordered input MMCSS priority: "sv << GetLastError();
       }
     }
+
+    /**
+     * @brief Revert MMCSS registration on consumer-thread exit.
+     */
+    ~input_mmcss_guard_t() {
+      if (handle_) {
+        AvRevertMmThreadCharacteristics(handle_);
+      }
+    }
+
+  private:
+    HANDLE handle_ {nullptr};  ///< MMCSS registration handle.
+  };
+#endif
+
+  /**
+   * @brief Configure the dedicated input consumer for latency-sensitive scheduling.
+   */
+  void configure_input_dispatch_thread() {
+    platf::set_thread_name("input::ordered");
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
+#ifdef _WIN32
+    static thread_local input_mmcss_guard_t mmcss_guard;
+    (void) mmcss_guard;
+#endif
+  }
+
+  /**
+   * @brief Process one raw message on its session's ordered consumer.
+   *
+   * @param input The input context pointer.
+   * @param entry Raw packet owning the payload storage.
+   */
+  bool passthrough_next_message(input_t *input, std::vector<std::uint8_t> entry) {
+    if (entry.size() < sizeof(NV_INPUT_HEADER)) {
+      BOOST_LOG(warning) << "Ignoring undersized input packet"sv;
+      return false;
+    }
+    auto payload = reinterpret_cast<PNV_INPUT_HEADER>(entry.data());
 
     // Print the final input packet
     input::print((void *) payload);
@@ -1936,113 +2147,202 @@ namespace input {
     switch (util::endian::little(payload->magic)) {
       case MOUSE_MOVE_REL_MAGIC_GEN5:
         passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET) payload);
-        break;
+        return true;
       case MOUSE_MOVE_ABS_MAGIC:
         passthrough(input, (PNV_ABS_MOUSE_MOVE_PACKET) payload);
-        break;
+        return true;
       case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
       case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
         passthrough(input, (PNV_MOUSE_BUTTON_PACKET) payload);
-        break;
+        return true;
       case SCROLL_MAGIC_GEN5:
         passthrough(input, (PNV_SCROLL_PACKET) payload);
-        break;
+        return true;
       case SS_HSCROLL_MAGIC:
         passthrough(input, (PSS_HSCROLL_PACKET) payload);
-        break;
+        return true;
       case KEY_DOWN_EVENT_MAGIC:
       case KEY_UP_EVENT_MAGIC:
         passthrough(input, (PNV_KEYBOARD_PACKET) payload);
-        break;
+        return true;
       case UTF8_TEXT_EVENT_MAGIC:
         passthrough((PNV_UNICODE_PACKET) payload);
-        break;
+        return true;
       case MULTI_CONTROLLER_MAGIC_GEN5:
-        passthrough(input, (PNV_MULTI_CONTROLLER_PACKET) payload);
-        break;
+        return passthrough(input, (PNV_MULTI_CONTROLLER_PACKET) payload);
       case SS_TOUCH_MAGIC:
         passthrough(input, (PSS_TOUCH_PACKET) payload);
-        break;
+        return true;
       case SS_PEN_MAGIC:
         passthrough(input, (PSS_PEN_PACKET) payload);
-        break;
+        return true;
       case SS_CONTROLLER_ARRIVAL_MAGIC:
-        passthrough(input, (PSS_CONTROLLER_ARRIVAL_PACKET) payload);
-        break;
+        return passthrough(input, (PSS_CONTROLLER_ARRIVAL_PACKET) payload);
       case SS_CONTROLLER_TOUCH_MAGIC:
-        passthrough(input, (PSS_CONTROLLER_TOUCH_PACKET) payload);
-        break;
+        return passthrough(input, (PSS_CONTROLLER_TOUCH_PACKET) payload);
       case SS_CONTROLLER_MOTION_MAGIC:
-        passthrough(input, (PSS_CONTROLLER_MOTION_PACKET) payload);
-        break;
+        return passthrough(input, (PSS_CONTROLLER_MOTION_PACKET) payload);
       case SS_CONTROLLER_BATTERY_MAGIC:
-        passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
-        break;
+        return passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
+      default:
+        return false;
     }
   }
+
+#ifdef SUNSHINE_TESTS
+  bool detail::passthrough_packet_for_test(input_t *input, std::vector<std::uint8_t> packet) {
+    return passthrough_next_message(input, std::move(packet));
+  }
+#endif
 
   /**
    * @brief Called on the control stream thread to queue an input message.
    * @param input The input context pointer.
    * @param input_data The input message.
    */
-  void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data) {
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
-      input->input_queue.push_back(std::move(input_data));
+  bool passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data) {
+    if (!input || !input->dispatcher) {
+      return false;
     }
-    task_pool.push(passthrough_next_message, input);
+    const auto result = input->dispatcher->enqueue(std::move(input_data));
+    if (result == input_t::dispatcher_t::enqueue_result_e::closed) {
+      BOOST_LOG(debug) << "Ignoring input packet after ordered dispatcher shutdown"sv;
+    }
+    return result == input_t::dispatcher_t::enqueue_result_e::queued ||
+           result == input_t::dispatcher_t::enqueue_result_e::coalesced;
+  }
+
+  bool passthrough_state(
+    std::shared_ptr<input_t> &input,
+    ordered_state_operation_t operation,
+    bool supersedable,
+    std::function<void()> completion
+  ) {
+    if (!input || !input->dispatcher || !operation) {
+      return false;
+    }
+    auto *const raw_input = input.get();
+    const auto result = input->dispatcher->enqueue_operation(
+      [raw_input, operation = std::move(operation), completion = std::move(completion)]() mutable {
+        const ordered_injector_t injector {[raw_input](std::vector<std::uint8_t> &&packet) {
+          return passthrough_next_message(raw_input, std::move(packet));
+        }};
+        if (!operation(injector)) {
+          throw std::runtime_error {"protocol-v3 ordered input operation failed"};
+        }
+        if (completion) {
+          completion();
+        }
+      },
+      supersedable
+    );
+    if (result == input_t::dispatcher_t::enqueue_result_e::closed) {
+      BOOST_LOG(debug) << "Ignoring protocol-v3 input state after ordered dispatcher shutdown"sv;
+      return false;
+    }
+    return true;
   }
 
   /**
-   * @brief Reset the object to its initial empty state.
+   * @brief Seal a session dispatcher early so blocked control-stream producers wake for shutdown.
+   *
+   * @param input Shared stream input state to seal.
    */
-  void reset(std::shared_ptr<input_t> &input) {
-    task_pool.cancel(key_press_repeat_id);
-    bool flush_pending_left_release = false;
+  void begin_close(std::shared_ptr<input_t> &input) {
+    if (input && input->dispatcher) {
+      input->dispatcher->begin_close();
+    }
+  }
+
+  /**
+   * @brief Neutralize all state after the ordered packet fence is reached.
+   *
+   * @param input Session input state to neutralize.
+   */
+  void neutralize_input(input_t &input) {
     {
-      std::lock_guard lock(mouse_press_mutex);
-      const auto decision = input->delayed_left_button.on_reset();
-      if (decision.cancel_timer) {
-        task_pool.cancel(input->mouse_left_button_timeout);
-      }
-      flush_pending_left_release = decision.emit_left_release;
-      input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
-    }
-
-    // Ensure input is synchronous, by using the task_pool
-    std::lock_guard lock(reset_tasks_mutex);
-    if (input_shutting_down) {
-      return;
-    }
-    std::erase_if(reset_tasks, [](std::future<void> &reset) {
-      return reset.wait_for(0s) == std::future_status::ready;
-    });
-    reset_tasks.emplace_back(task_pool.push([flush_pending_left_release]() {
-      {
-        std::lock_guard mouse_lock(mouse_press_mutex);
-        for (int button = BUTTON_LEFT; button <= BUTTON_X2; ++button) {
-          if (mouse_press[button] || (button == BUTTON_LEFT && flush_pending_left_release)) {
-            platf::button_mouse(platf_input, button, true);
-            mouse_press[button] = false;
-          }
+      std::lock_guard lock(platform_input_mutex);
+      input.delayed_left_button.on_reset();
+      for (int button = BUTTON_LEFT; button <= BUTTON_X2; ++button) {
+        input.mouse_press[button] = false;
+        if (input.mouse_platform_press[button]) {
+          update_platform_mouse_locked(input, button, true);
         }
       }
+      input.mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
 
-      for (auto &kp : key_press) {
-        if (!kp.second) {
-          // already released
-          continue;
+      for (auto &[key, pressed] : input.key_press) {
+        if (pressed) {
+          update_platform_keyboard_locked(vk_from_kpid(key), true, flags_from_kpid(key));
+          pressed = false;
         }
-        platf::keyboard_update(platf_input, vk_from_kpid(kp.first) & 0x00FF, true, flags_from_kpid(kp.first));
-        key_press[kp.first] = false;
       }
+    }
+    input.key_press_repeat_id = 0;
+    input.shortcutFlags = 0;
+    input.left_alt_pressed = false;
+    input.right_alt_pressed = false;
+
+    for (auto &gamepad : input.gamepads) {
+      disconnect_controller_timers(input, gamepad);
+      if (gamepad.id >= 0) {
+        gamepad.gamepad_state = {};
+        gamepad.back_button_state = button_state_e::NONE;
+        platf::gamepad_update(platf_input, gamepad.id, gamepad.gamepad_state);
+      }
+    }
+    const auto registration = input.session_registration;
+    input.session_registration = 0;
+    input_session_gate.unregister_session(registration, []() {
 #ifdef _WIN32
-      // The platform reset is deliberately last: Virtual HID recovery is safe
-      // only after every higher-level pressed-state map has been cleared.
+      // Shared Virtual HID reset is safe only after the final input session
+      // has released every higher-level held-state contribution.
       platf::reset_input_session(platf_input);
 #endif
-    }));
+    });
+  }
+
+  /**
+   * @brief Log an ordered-dispatch failure and neutralize its session exactly once.
+   *
+   * @param input Session that failed closed.
+   * @param failure Captured setup or injection exception.
+   */
+  void handle_input_dispatch_failure(input_t *input, std::exception_ptr failure) noexcept {
+    try {
+      try {
+        if (failure) {
+          std::rethrow_exception(failure);
+        }
+        BOOST_LOG(error) << "Ordered input dispatcher failed without an exception"sv;
+      } catch (const std::exception &failure_error) {
+        BOOST_LOG(error) << "Ordered input dispatcher failed closed: "sv << failure_error.what();
+      } catch (...) {
+        BOOST_LOG(error) << "Ordered input dispatcher failed closed with an unknown exception"sv;
+      }
+    } catch (...) {
+      // Logging must not escape the dedicated thread failure boundary.
+    }
+
+    try {
+      neutralize_input(*input);
+    } catch (...) {
+      try {
+        BOOST_LOG(error) << "Ordered input dispatcher neutralization failed"sv;
+      } catch (...) {
+        // Logging must not escape the dedicated thread failure boundary.
+      }
+    }
+  }
+
+  /**
+   * @brief Reset the object after all already-accepted packets, then join its consumer.
+   */
+  void reset(std::shared_ptr<input_t> &input) {
+    auto *const raw_input = input.get();
+    input->dispatcher->close_after_fence([raw_input]() {
+      neutralize_input(*raw_input);
+    });
   }
 
   /**
@@ -2054,15 +2354,6 @@ namespace input {
      * @brief Destroy the input subsystem deinitializer.
      */
     ~deinit_t() override {
-      std::vector<std::future<void>> pending_resets;
-      {
-        std::lock_guard lock(reset_tasks_mutex);
-        input_shutting_down = true;
-        pending_resets.swap(reset_tasks);
-      }
-      for (auto &reset : pending_resets) {
-        reset.wait();
-      }
       platf_input.reset();
     }
   };
@@ -2071,11 +2362,6 @@ namespace input {
    * @brief Initialize the platform input backend.
    */
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init() {
-    {
-      std::lock_guard lock(reset_tasks_mutex);
-      input_shutting_down = false;
-      reset_tasks.clear();
-    }
     platf_input = platf::input();
 
     return std::make_unique<deinit_t>();
@@ -2103,13 +2389,35 @@ namespace input {
       mail->event<input::touch_port_t>(mail::touch_port),
       mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
     );
+    auto *const raw_input = input.get();
+    input->session_registration = input_session_gate.register_session();
+    input->dispatcher = std::make_unique<input_t::dispatcher_t>(
+      [raw_input](std::vector<std::uint8_t> &&entry) {
+        passthrough_next_message(raw_input, std::move(entry));
+      },
+      coalesce_mouse_motion,
+      is_droppable_legacy_input_packet,
+      configure_input_dispatch_thread,
+      input_t::dispatcher_t::limits_t {
+        .max_packets = 256,
+        .max_timers = 64,
+        .max_droppable_age = 4ms,
+      },
+      [raw_input](std::exception_ptr failure) {
+        handle_input_dispatch_failure(raw_input, failure);
+      },
+      false
+    );
+    input->dispatcher->start();
 
-    // Workaround to ensure new frames will be captured when a client connects
-    task_pool.pushDelayed([]() {
+    // Workaround to ensure new frames will be captured when a client connects.
+    // Keep this synthetic injection on the same session consumer as client input.
+    input->dispatcher->schedule([]() {
+      std::lock_guard lock(platform_input_mutex);
       platf::move_mouse(platf_input, 1, 1);
       platf::move_mouse(platf_input, -1, -1);
     },
-                          100ms);
+                                100ms);
 
     return input;
   }

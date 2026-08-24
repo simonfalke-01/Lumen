@@ -516,6 +516,7 @@ namespace platf {
     std::int32_t row_pitch {};  ///< Bytes between consecutive image rows.
 
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
+    std::shared_ptr<deinit_t> encode_source_lifetime;  ///< Optional capture-source lease released only after synchronous encode completion.
 
     /**
      * @brief Destroy the image.
@@ -676,6 +677,11 @@ namespace platf {
      */
     using pull_free_image_cb_t = std::function<bool(std::shared_ptr<img_t> &img_out)>;
 
+    /** @brief Install a callback sampled immediately before each backend frame acquisition. */
+    void set_capture_boundary_callback(std::function<void()> callback) {
+      capture_boundary_callback_ = std::move(callback);
+    }
+
     display_t() noexcept = default;
 
     /**
@@ -772,6 +778,14 @@ namespace platf {
     int logical_height {0};  ///< Height of the captured display after display scaling.
 
   protected:
+    /** @brief Snapshot per-session causal metadata immediately before backend acquisition. */
+    void capture_boundary() {
+      if (capture_boundary_callback_) {
+        capture_boundary_callback_();
+      }
+    }
+
+    std::function<void()> capture_boundary_callback_;  ///< Pre-acquire causal snapshot callback.
     // collect capture timing data (at loglevel debug)
     logging::time_delta_periodic_logger sleep_overshoot_logger = {debug, "Frame capture sleep overshoot"};  ///< Periodic logger for capture sleep overshoot measurements.
   };

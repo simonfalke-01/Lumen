@@ -410,20 +410,21 @@ namespace safe {
      * @param args Arguments forwarded to the callable or parser.
      */
     template<class... Args>
-    void raise(Args &&...args) {
+    bool raise(Args &&...args) {
       std::lock_guard ul {_lock};
 
       if (!_continue) {
-        return;
+        return false;
       }
 
       if (_queue.size() == _max_elements) {
-        _queue.clear();
+        return false;
       }
 
       _queue.emplace_back(std::forward<Args>(args)...);
 
       _cv.notify_all();
+      return true;
     }
 
     /**
