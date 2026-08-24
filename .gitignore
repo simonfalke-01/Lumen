@@ -52,8 +52,17 @@ node_modules/
 # Dummy macOS files
 .DS_Store
 
+# Test artifacts
+/sunshine_state.json
+/test_sunshine.log*
+/write_file_test_*.txt
+
 # Python
 *.egg-info/
 *.pyc
+.ruff_cache/
 .venv/
 venv/
+
+# Local Windows packaging tools
+/.wix/
