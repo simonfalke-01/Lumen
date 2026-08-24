@@ -25,8 +25,8 @@ import { AlertCircle, AlertTriangle, CheckCircle, Info } from '@lucide/vue'
 
 /**
  * Singleton reactive notification state shared across the app instance.
- * Using reactive() at module scope means all consumers — including plain JS
- * modules like fetch_utils.js — mutate the same reactive object, and any
+ * Using reactive() at module scope means all consumers, including plain JS
+ * modules such as fetch_utils.js, mutate the same reactive object, and any
  * mounted Notification component will update automatically.
  */
 export const state = reactive({

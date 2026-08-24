@@ -15,6 +15,11 @@ const defaultMoonlightPort = 47989
 
 const config = ref(props.config)
 const effectivePort = computed(() => +config.value?.port ?? defaultMoonlightPort)
+const protocolV3Permissions = computed(() => Number(config.value?.protocol_v3_pairing_permissions ?? 0x17) | 0x17)
+const protocolV3PermissionEnabled = bit => (protocolV3Permissions.value & (1 << bit)) !== 0
+const toggleProtocolV3Permission = bit => {
+  config.value.protocol_v3_pairing_permissions = protocolV3Permissions.value ^ (1 << bit)
+}
 </script>
 
 <template>
@@ -179,6 +184,60 @@ const effectivePort = computed(() => +config.value?.port ?? defaultMoonlightPort
       <input type="number" min="0" max="65535" class="form-control" id="packetsize" placeholder="0" v-model="config.packetsize" />
       <div class="form-text">{{ $t('config.packetsize_desc') }}</div>
     </div>
+
+    <hr class="my-4" />
+    <h3 class="h5">{{ $t('config.protocol_v3') }}</h3>
+    <p class="text-body-secondary">{{ $t('config.protocol_v3_desc') }}</p>
+
+    <Checkbox class="mb-3"
+              id="protocol_v3_enabled"
+              locale-prefix="config"
+              v-model="config.protocol_v3_enabled"
+              default="true"
+    ></Checkbox>
+
+    <Checkbox class="mb-3"
+              id="legacy_compatibility"
+              locale-prefix="config"
+              v-model="config.legacy_compatibility"
+              default="true"
+    ></Checkbox>
+
+    <div class="row g-3 mb-3">
+      <div class="col-12 col-md-6">
+        <label for="protocol_v3_port" class="form-label">{{ $t('config.protocol_v3_port') }}</label>
+        <input id="protocol_v3_port" v-model="config.protocol_v3_port" class="form-control"
+               type="number" min="1024" max="65535" placeholder="48030" />
+        <div class="form-text">{{ $t('config.protocol_v3_port_desc') }}</div>
+      </div>
+      <div class="col-12 col-md-6">
+        <label for="protocol_v3_profile" class="form-label">{{ $t('config.protocol_v3_profile') }}</label>
+        <select id="protocol_v3_profile" v-model="config.protocol_v3_profile" class="form-select">
+          <option value="latency">{{ $t('config.protocol_v3_profile_latency') }}</option>
+          <option value="quality">{{ $t('config.protocol_v3_profile_quality') }}</option>
+        </select>
+        <div class="form-text">{{ $t('config.protocol_v3_profile_desc') }}</div>
+      </div>
+    </div>
+
+    <fieldset class="mb-3">
+      <legend class="h6">{{ $t('config.protocol_v3_optional_permissions') }}</legend>
+      <div class="form-check">
+        <input id="protocol_v3_permission_microphone" class="form-check-input" type="checkbox"
+               :checked="protocolV3PermissionEnabled(3)" @change="toggleProtocolV3Permission(3)" />
+        <label for="protocol_v3_permission_microphone" class="form-check-label">
+          {{ $t('config.protocol_v3_permission_microphone') }}
+        </label>
+      </div>
+      <div class="form-check mt-2">
+        <input id="protocol_v3_permission_quit" class="form-check-input" type="checkbox"
+               :checked="protocolV3PermissionEnabled(5)" @change="toggleProtocolV3Permission(5)" />
+        <label for="protocol_v3_permission_quit" class="form-check-label">
+          {{ $t('config.protocol_v3_permission_quit') }}
+        </label>
+      </div>
+      <div class="form-text">{{ $t('config.protocol_v3_optional_permissions_desc') }}</div>
+    </fieldset>
 
   </div>
 </template>

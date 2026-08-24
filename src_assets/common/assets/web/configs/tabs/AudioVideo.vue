@@ -72,6 +72,13 @@ const config = ref(props.config)
                   v-model="config.client_microphone"
                   default="false"
         ></Checkbox>
+        <div class="form-text mb-3">
+          {{ $t('config.client_microphone_vb_cable_help') }}
+          <a href="https://vb-audio.com/Cable/" target="_blank" rel="noopener noreferrer">
+            {{ $t('config.client_microphone_vb_cable_link') }}
+          </a>
+          {{ $t('config.client_microphone_vb_cable_note') }}
+        </div>
       </template>
     </PlatformLayout>
 

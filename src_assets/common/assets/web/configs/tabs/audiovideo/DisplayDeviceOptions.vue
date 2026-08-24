@@ -63,6 +63,19 @@ function addRemappingEntry() {
                aria-labelledby="panelsStayOpen-headingOne">
             <div class="accordion-body">
 
+              <!-- Lumen virtual display policy -->
+              <div class="mb-3">
+                <label for="lumen_vdd_policy" class="form-label">
+                  {{ $t('config.lumen_vdd_policy') }}
+                </label>
+                <select id="lumen_vdd_policy" class="form-select" v-model="config.lumen_vdd_policy">
+                  <option value="disabled">{{ $t('_common.disabled_def') }}</option>
+                  <option value="optional">{{ $t('config.lumen_vdd_policy_optional') }}</option>
+                  <option value="required">{{ $t('config.lumen_vdd_policy_required') }}</option>
+                </select>
+                <div class="form-text">{{ $t('config.lumen_vdd_policy_desc') }}</div>
+              </div>
+
               <!-- Configuration option -->
               <div class="mb-3">
                 <label for="dd_configuration_option" class="form-label">

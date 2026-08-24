@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="auto">
+
+<head>
+  <%- header %>
+  <style>
+    .v3-pairing-layout { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2rem; align-items: start; }
+    .v3-qr-frame { padding: 1rem; background: var(--bs-white); border-radius: var(--bs-border-radius); }
+    .v3-qr-frame canvas { display: block; width: min(17.25rem, 68vw); height: auto; }
+    .v3-uri { min-height: 5.5rem; overflow-wrap: anywhere; resize: vertical; }
+    .v3-client-id { max-width: 16rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .v3-permissions { display: grid; grid-template-columns: repeat(3, minmax(7.5rem, 1fr)); gap: .5rem 1rem; }
+    @media (max-width: 767.98px) {
+      .v3-pairing-layout { grid-template-columns: 1fr; }
+      .v3-qr-frame { justify-self: center; }
+      .v3-permissions { grid-template-columns: repeat(2, minmax(7.5rem, 1fr)); }
+    }
+  </style>
+</head>
+
+<body id="app" v-cloak>
+  <Navbar></Navbar>
+  <main id="content" class="container py-4">
+    <header class="mb-4">
+      <h1>{{ $t('clients.title') }}</h1>
+      <p class="text-body-secondary mb-0">{{ $t('clients.description') }}</p>
+    </header>
+
+    <section class="card mb-4" aria-labelledby="v3-pairing-title">
+      <div class="card-body p-4">
+        <div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
+          <div>
+            <h2 id="v3-pairing-title" class="h4 mb-1">{{ $t('clients.direct_pairing') }}</h2>
+            <p class="text-body-secondary mb-0">{{ $t('clients.direct_pairing_desc') }}</p>
+          </div>
+          <button v-if="invitation" class="btn btn-outline-danger" type="button"
+                  :disabled="invitationBusy" @click="revokeInvitation">
+            <trash-2 :size="17" class="icon"></trash-2>
+            {{ $t('clients.revoke_invitation') }}
+          </button>
+        </div>
+
+        <div v-if="invitation" class="v3-pairing-layout">
+          <div>
+            <label for="v3InvitationUri" class="form-label">{{ $t('clients.invitation_uri') }}</label>
+            <textarea id="v3InvitationUri" class="form-control font-monospace v3-uri" readonly
+                      :value="invitation"></textarea>
+            <div class="d-flex flex-wrap gap-2 mt-3">
+              <button class="btn btn-primary" type="button" @click="copyInvitation">
+                <copy :size="17" class="icon"></copy>
+                {{ copied ? $t('clients.copied') : $t('clients.copy_invitation') }}
+              </button>
+              <span class="align-self-center text-body-secondary small">{{ $t('clients.expires_five_minutes') }}</span>
+            </div>
+          </div>
+          <div class="v3-qr-frame" role="img" :aria-label="$t('clients.qr_label')">
+            <canvas ref="qrCanvas"></canvas>
+          </div>
+        </div>
+
+        <form v-else @submit.prevent="issueInvitation">
+          <div class="row g-3">
+            <div class="col-12 col-lg-7">
+              <label for="v3Hostname" class="form-label">{{ $t('clients.hostname') }}</label>
+              <input id="v3Hostname" v-model.trim="hostname" class="form-control" maxlength="39" required
+                     autocomplete="off" :placeholder="$t('clients.hostname_placeholder')" />
+              <div class="form-text">{{ $t('clients.hostname_help') }}</div>
+            </div>
+            <div class="col-12 col-lg-5 d-flex align-items-end">
+              <div class="form-check mb-2">
+                <input id="v3HostnameIp" v-model="hostnameIsIP" class="form-check-input" type="checkbox" />
+                <label for="v3HostnameIp" class="form-check-label">{{ $t('clients.hostname_is_ip') }}</label>
+              </div>
+            </div>
+          </div>
+          <fieldset class="mt-4">
+            <legend class="h6">{{ $t('clients.permissions') }}</legend>
+            <div class="v3-permissions">
+              <div v-for="permission in permissionOptions" :key="permission.bit" class="form-check">
+                <input :id="'invitePermission' + permission.bit" class="form-check-input" type="checkbox"
+                       :checked="hasPermission(invitationPermissions, permission.bit)"
+                       :disabled="permission.required || !hasPermission(allowedPermissions, permission.bit)"
+                       @change="toggleInvitationPermission(permission.bit)" />
+                <label class="form-check-label" :for="'invitePermission' + permission.bit">
+                  {{ $t(permission.label) }}
+                </label>
+              </div>
+            </div>
+          </fieldset>
+          <div class="mt-4 d-flex align-items-center gap-3">
+            <button class="btn btn-primary" type="submit" :disabled="invitationBusy || !hostname">
+              <qr-code :size="18" class="icon"></qr-code>
+              {{ invitationBusy ? $t('_common.loading') : $t('clients.issue_invitation') }}
+            </button>
+            <span v-if="invitationError" class="text-danger" role="alert">{{ invitationError }}</span>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section aria-labelledby="v3-clients-title">
+      <div class="d-flex justify-content-between align-items-end gap-3 mb-3">
+        <div>
+          <h2 id="v3-clients-title" class="h4 mb-1">{{ $t('clients.paired_clients') }}</h2>
+          <p class="text-body-secondary mb-0">{{ $t('clients.paired_clients_desc') }}</p>
+        </div>
+        <button class="btn btn-outline-secondary" type="button" :disabled="clientsLoading" @click="loadClients">
+          <refresh-cw :size="17" class="icon"></refresh-cw>
+          {{ $t('clients.refresh') }}
+        </button>
+      </div>
+
+      <div v-if="clientsLoading" class="card"><div class="card-body py-5 text-center text-body-secondary">{{ $t('_common.loading') }}</div></div>
+      <div v-else-if="clientsError" class="alert alert-danger" role="alert">{{ clientsError }}</div>
+      <div v-else-if="clients.length === 0" class="card"><div class="card-body py-5 text-center text-body-secondary">{{ $t('clients.empty') }}</div></div>
+      <div v-else class="table-responsive card">
+        <table class="table align-middle mb-0">
+          <thead>
+            <tr>
+              <th scope="col">{{ $t('clients.client') }}</th>
+              <th scope="col">{{ $t('clients.permissions') }}</th>
+              <th scope="col">{{ $t('clients.access') }}</th>
+              <th scope="col" class="text-end">{{ $t('clients.actions') }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="client in clients" :key="client.clientId">
+              <td>
+                <div class="fw-semibold">{{ client.name }}</div>
+                <div class="small text-body-secondary font-monospace v3-client-id" :title="client.clientId">{{ client.clientId }}</div>
+              </td>
+              <td>
+                <div class="v3-permissions">
+                  <div v-for="permission in permissionOptions" :key="permission.bit" class="form-check">
+                    <input :id="client.clientId + permission.bit" class="form-check-input" type="checkbox"
+                           :checked="hasPermission(client.permissions, permission.bit)"
+                           :disabled="client.pending"
+                           @change="toggleClientPermission(client, permission.bit)" />
+                    <label class="form-check-label small" :for="client.clientId + permission.bit">
+                      {{ $t(permission.label) }}
+                    </label>
+                  </div>
+                </div>
+              </td>
+              <td>
+                <div class="form-check form-switch">
+                  <input :id="client.clientId + 'enabled'" class="form-check-input" type="checkbox"
+                         :checked="client.enabled" :disabled="client.pending"
+                         @change="setClientEnabled(client, !client.enabled)" />
+                  <label class="form-check-label" :for="client.clientId + 'enabled'">
+                    {{ client.enabled ? $t('_common.enabled') : $t('_common.disabled') }}
+                  </label>
+                </div>
+              </td>
+              <td class="text-end">
+                <template v-if="pendingRevokeId === client.clientId">
+                  <button class="btn btn-sm btn-outline-secondary me-2" type="button" @click="pendingRevokeId = null">{{ $t('_common.cancel') }}</button>
+                  <button class="btn btn-sm btn-danger" type="button" :disabled="client.pending" @click="revokeClient(client)">{{ $t('clients.confirm_revoke') }}</button>
+                </template>
+                <button v-else class="btn btn-sm btn-outline-danger" type="button" @click="pendingRevokeId = client.clientId">
+                  <trash-2 :size="16" class="icon"></trash-2>
+                  {{ $t('clients.revoke_client') }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+
+<script type="module">
+  import { createApp, nextTick } from 'vue'
+  import { initApp } from './init'
+  import Navbar from './Navbar.vue'
+  import { apiFetch } from './fetch_utils'
+  import { drawInvitationQr } from './qr_v3'
+  import { Copy, QrCode, RefreshCw, Trash2 } from '@lucide/vue'
+
+  const permissionOptions = [
+    { bit: 0, label: 'clients.permission_browse', required: true },
+    { bit: 1, label: 'clients.permission_start', required: true },
+    { bit: 2, label: 'clients.permission_input', required: true },
+    { bit: 4, label: 'clients.permission_stop', required: true },
+    { bit: 3, label: 'clients.permission_microphone', required: false },
+    { bit: 5, label: 'clients.permission_quit', required: false },
+  ]
+
+  const app = createApp({
+    components: { Navbar, Copy, QrCode, RefreshCw, Trash2 },
+    data() {
+      return {
+        permissionOptions,
+        hostname: window.location.hostname || '',
+        hostnameIsIP: /^[\d.:]+$/.test(window.location.hostname),
+        invitationPermissions: 0x17,
+        allowedPermissions: 0x17,
+        invitation: null,
+        invitationBusy: false,
+        invitationError: '',
+        copied: false,
+        clients: [],
+        clientsLoading: true,
+        clientsError: '',
+        pendingRevokeId: null,
+      }
+    },
+    mounted() {
+      this.loadInvitation()
+      this.loadClients()
+    },
+    methods: {
+      hasPermission(mask, bit) { return (Number(mask) & (1 << bit)) !== 0 },
+      toggleInvitationPermission(bit) { this.invitationPermissions ^= 1 << bit },
+      async json(url, options) {
+        const response = await apiFetch(url, options)
+        if (!response.ok) throw new Error(this.$t('clients.request_failed'))
+        return response.json()
+      },
+      async loadInvitation() {
+        try {
+          const result = await this.json('./api/protocol-v3/invitation')
+          this.allowedPermissions = Number(result.approvedPermissions || 0x17)
+          this.invitationPermissions &= this.allowedPermissions
+          this.invitation = result.status ? result.invitation : null
+          if (this.invitation) await nextTick(() => drawInvitationQr(this.$refs.qrCanvas, this.invitation))
+        } catch (error) {
+          this.invitationError = error.message
+        }
+      },
+      async issueInvitation() {
+        this.invitationBusy = true
+        this.invitationError = ''
+        try {
+          const result = await this.json('./api/protocol-v3/invitation', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hostname: this.hostname, hostnameIsIP: this.hostnameIsIP, permissions: this.invitationPermissions }),
+          })
+          this.invitation = result.invitation
+          await nextTick(() => drawInvitationQr(this.$refs.qrCanvas, this.invitation))
+        } catch (error) {
+          this.invitationError = error.message
+        } finally {
+          this.invitationBusy = false
+        }
+      },
+      async revokeInvitation() {
+        this.invitationBusy = true
+        try {
+          await this.json('./api/protocol-v3/invitation', { method: 'DELETE' })
+          this.invitation = null
+          this.copied = false
+        } finally {
+          this.invitationBusy = false
+        }
+      },
+      async copyInvitation() {
+        await navigator.clipboard.writeText(this.invitation)
+        this.copied = true
+        window.setTimeout(() => { this.copied = false }, 1800)
+      },
+      async loadClients() {
+        this.clientsLoading = true
+        this.clientsError = ''
+        try {
+          const result = await this.json('./api/protocol-v3/clients')
+          this.clients = (result.clients || []).map(client => ({ ...client, pending: false }))
+        } catch (error) {
+          this.clientsError = error.message
+        } finally {
+          this.clientsLoading = false
+        }
+      },
+      async updateClient(client, patch) {
+        client.pending = true
+        try {
+          const result = await this.json('./api/protocol-v3/clients', {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ clientId: client.clientId, ...patch }),
+          })
+          if (!result.status) throw new Error(this.$t('clients.request_failed'))
+          Object.assign(client, patch)
+        } catch (error) {
+          this.clientsError = error.message
+        } finally {
+          client.pending = false
+        }
+      },
+      setClientEnabled(client, enabled) { return this.updateClient(client, { enabled }) },
+      toggleClientPermission(client, bit) { return this.updateClient(client, { permissions: Number(client.permissions) ^ (1 << bit) }) },
+      async revokeClient(client) {
+        client.pending = true
+        try {
+          const result = await this.json('./api/protocol-v3/clients', {
+            method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ clientId: client.clientId }),
+          })
+          if (!result.status) throw new Error(this.$t('clients.request_failed'))
+          this.clients = this.clients.filter(item => item.clientId !== client.clientId)
+          this.pendingRevokeId = null
+        } catch (error) {
+          this.clientsError = error.message
+          client.pending = false
+        }
+      },
+    },
+  })
+  initApp(app)
+</script>
+</html>
