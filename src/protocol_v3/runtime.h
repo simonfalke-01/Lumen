@@ -374,6 +374,8 @@ namespace lumen::protocol_v3::runtime {
     void stop() noexcept;
     /** @brief Return whether the QUIC listener is accepting connections. */
     [[nodiscard]] bool running() const noexcept;
+    /** @brief Return the last synchronous QUIC listener startup stage attempted. */
+    [[nodiscard]] quic_server::StartupStage startup_stage() const noexcept;
 
     /** @brief Issue and persist one exact ULI3 QR invitation URI. */
     std::expected<std::string, std::uint8_t> issue_invitation(

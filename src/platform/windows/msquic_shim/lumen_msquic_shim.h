@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define LUMEN_MSQUIC_SHIM_ABI_VERSION 2u
+#define LUMEN_MSQUIC_SHIM_ABI_VERSION 3u
 
   typedef uintptr_t lumen_msquic_handle;
   typedef struct lumen_msquic_shim lumen_msquic_shim;
@@ -38,6 +38,7 @@ extern "C" {
     LUMEN_MSQUIC_NOT_SUPPORTED = 4,
     LUMEN_MSQUIC_ABORTED = 5,
     LUMEN_MSQUIC_TRANSPORT_ERROR = 6,
+    LUMEN_MSQUIC_CLEANUP_ERROR = 7,
   } lumen_msquic_status;
 
   typedef struct lumen_msquic_buffer {
@@ -136,7 +137,7 @@ extern "C" {
     uint32_t requested_abi,
     lumen_msquic_shim **shim
   );
-  LUMEN_MSQUIC_EXPORT void LUMEN_MSQUIC_CALL lumen_msquic_close(lumen_msquic_shim *shim);
+  LUMEN_MSQUIC_EXPORT lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_close(lumen_msquic_shim *shim);
   LUMEN_MSQUIC_EXPORT int LUMEN_MSQUIC_CALL lumen_msquic_is_schannel(lumen_msquic_shim *shim);
   LUMEN_MSQUIC_EXPORT lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_registration_open(
     lumen_msquic_shim *shim,

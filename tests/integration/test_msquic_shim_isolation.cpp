@@ -21,7 +21,7 @@ TEST(MsQuicShimIsolation, PortableHeaderHasNoWindowsOrMsQuicDependency) {
   const auto header = source("src/platform/windows/msquic_shim/lumen_msquic_shim.h");
   EXPECT_EQ(header.find("#include <windows.h>"), std::string::npos);
   EXPECT_EQ(header.find("#include <msquic.h>"), std::string::npos);
-  EXPECT_NE(header.find("LUMEN_MSQUIC_SHIM_ABI_VERSION 2u"), std::string::npos);
+  EXPECT_NE(header.find("LUMEN_MSQUIC_SHIM_ABI_VERSION 3u"), std::string::npos);
   EXPECT_NE(header.find("lumen_msquic_connection_event"), std::string::npos);
   EXPECT_NE(header.find("lumen_msquic_stream_event"), std::string::npos);
 }

@@ -288,25 +288,25 @@ New-Item -ItemType Directory -Path $shimOutput -Force | Out-Null
     /p:MsQuicRoot="$MsQuicPackageRoot" `
     /p:OutDir="$shimOutput\"
 if ($LASTEXITCODE -ne 0) {
-    throw "MsQuic ABI2 shim build failed with exit code $LASTEXITCODE."
+    throw "MsQuic ABI3 shim build failed with exit code $LASTEXITCODE."
 }
 $shimDll = Join-Path $shimOutput "lumen_msquic_shim.dll"
 $shimLib = Join-Path $shimOutput "lumen_msquic_shim.lib"
 $shimManifest = Join-Path $shimOutput "manifest.json"
 foreach ($path in @($shimDll, $shimLib, $shimManifest)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "MsQuic ABI2 shim output is incomplete: $path"
+        throw "MsQuic ABI3 shim output is incomplete: $path"
     }
 }
 $manifest = Get-Content -LiteralPath $shimManifest -Raw | ConvertFrom-Json
 $shimDllHash = (Get-FileHash $shimDll -Algorithm SHA256).Hash.ToLowerInvariant()
 $shimLibHash = (Get-FileHash $shimLib -Algorithm SHA256).Hash.ToLowerInvariant()
-if ([int]$manifest.abi -ne 2 -or
+if ([int]$manifest.abi -ne 3 -or
     [string]$manifest.architecture -cne "x64" -or
     [string]$manifest.toolset -cne "v143" -or
     [string]$manifest.shim_dll_sha256 -cne $shimDllHash -or
     [string]$manifest.shim_import_library_sha256 -cne $shimLibHash) {
-    throw "MsQuic ABI2 shim manifest does not match the built artifacts."
+    throw "MsQuic ABI3 shim manifest does not match the built artifacts."
 }
 
 $pendingManifest = [ordered]@{
@@ -317,7 +317,7 @@ $pendingManifest = [ordered]@{
     sourceArchiveSha256 = $sourceProvenance.ArchiveSha256
     sourceFreezeManifestSha256 = $sourceProvenance.FreezeManifestSha256
     msquicShim = @{
-        abi = 2
+        abi = 3
         dllSha256 = $shimDllHash
         libSha256 = $shimLibHash
     }

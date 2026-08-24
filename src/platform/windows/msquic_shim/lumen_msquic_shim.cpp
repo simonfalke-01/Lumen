@@ -10,6 +10,7 @@
 #include <array>
 #include <windows.h>
 #include <bcrypt.h>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <msquic.h>
@@ -18,6 +19,7 @@
 #include <new>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 #include <wincrypt.h>
 
@@ -102,18 +104,311 @@ namespace {
     void *context {};
   };
 
+  /** @brief Emit a bounded service-log diagnostic for one failed key rollback. */
+  void report_cleanup_failure(const SECURITY_STATUS status) noexcept {
+    std::fprintf(
+      stderr,
+      "Lumen MsQuic temporary CNG key cleanup failed with status 0x%08lx\n",
+      static_cast<unsigned long>(status)
+    );
+  }
+
+  /** @brief Move-only owner that deletes one exact persisted CNG key. */
+  class PersistedCngKey {
+  public:
+    PersistedCngKey() = default;
+
+    /** @brief Take immediate cleanup ownership of one caller-owned CNG key handle. */
+    explicit PersistedCngKey(const NCRYPT_KEY_HANDLE handle) noexcept:
+        handle_ {handle} {
+    }
+
+    PersistedCngKey(const PersistedCngKey &) = delete;
+    PersistedCngKey &operator=(const PersistedCngKey &) = delete;
+
+    /** @brief Transfer cleanup ownership without duplicating the key handle. */
+    PersistedCngKey(PersistedCngKey &&other) noexcept:
+        provider {std::move(other.provider)},
+        container {std::move(other.container)},
+        unique_name {std::move(other.unique_name)},
+        handle_ {std::exchange(other.handle_, 0)} {
+    }
+
+    /** @brief Replace cleanup ownership after deleting the previously held key. */
+    PersistedCngKey &operator=(PersistedCngKey &&other) noexcept {
+      if (this != &other) {
+        static_cast<void>(cleanup_with_report());
+        provider = std::move(other.provider);
+        container = std::move(other.container);
+        unique_name = std::move(other.unique_name);
+        handle_ = std::exchange(other.handle_, 0);
+      }
+      return *this;
+    }
+
+    ~PersistedCngKey() {
+      static_cast<void>(cleanup_with_report());
+    }
+
+    /**
+     * @brief Delete the exact owned key and release its handle.
+     * @return True when no key remained or deletion succeeded.
+     */
+    bool cleanup() noexcept {
+      if (!handle_) {
+        return true;
+      }
+      last_cleanup_status_ = NCryptDeleteKey(handle_, 0);
+      if (last_cleanup_status_ == ERROR_SUCCESS) {
+        handle_ = 0;
+        return true;
+      }
+      NCryptFreeObject(handle_);
+      handle_ = 0;
+      return false;
+    }
+
+    /** @brief Delete the owned key and emit one bounded diagnostic on failure. */
+    bool cleanup_with_report() noexcept {
+      const auto cleaned = cleanup();
+      if (!cleaned) {
+        report_cleanup_failure(last_cleanup_status_);
+      }
+      return cleaned;
+    }
+
+    /** @brief Return the exact owned key handle for read-only property queries. */
+    NCRYPT_KEY_HANDLE handle() const noexcept {
+      return handle_;
+    }
+
+    std::wstring provider;  ///< CNG storage provider recorded by the imported certificate.
+    std::wstring container;  ///< Provider-local key container recorded by the imported certificate.
+    std::wstring unique_name;  ///< Provider-issued unique key name retained for diagnostics.
+
+  private:
+    NCRYPT_KEY_HANDLE handle_ {};  ///< Caller-owned handle retained until cleanup.
+    SECURITY_STATUS last_cleanup_status_ {ERROR_SUCCESS};  ///< Most recent deletion result.
+  };
+
+  /**
+   * @brief Read one nonempty null-terminated CNG string property.
+   * @param key Live CNG key handle.
+   * @param property Property name.
+   * @param output Destination string.
+   * @return True when the property was read without truncation.
+   */
+  bool read_ncrypt_string_property(
+    const NCRYPT_KEY_HANDLE key,
+    const wchar_t *const property,
+    std::wstring &output
+  ) {
+    DWORD byte_count {};
+    if (NCryptGetProperty(key, property, nullptr, 0, &byte_count, 0) != ERROR_SUCCESS ||
+        byte_count < sizeof(wchar_t) || byte_count % sizeof(wchar_t) != 0) {
+      return false;
+    }
+    std::vector<wchar_t> value(byte_count / sizeof(wchar_t));
+    if (NCryptGetProperty(
+          key,
+          property,
+          reinterpret_cast<PBYTE>(value.data()),
+          byte_count,
+          &byte_count,
+          0
+        ) != ERROR_SUCCESS) {
+      return false;
+    }
+    const auto terminator = std::ranges::find(value, L'\0');
+    if (terminator == value.end() || terminator == value.begin()) {
+      return false;
+    }
+    output.assign(value.begin(), terminator);
+    return true;
+  }
+
+  /** @brief Result of inspecting one imported certificate for a private key. */
+  struct PersistedCngKeyAcquisition {
+    bool private_key_present {};  ///< The certificate carried a provider-backed private key.
+    bool rollback_complete {true};  ///< Any partially acquired key was deleted.
+    std::optional<PersistedCngKey> key;  ///< Exact cleanup owner on success.
+  };
+
+  /**
+   * @brief Acquire cleanup ownership for one imported certificate private key.
+   * @param certificate Imported certificate context.
+   * @return Key presence, rollback status, and move-only key owner.
+   */
+  PersistedCngKeyAcquisition acquire_persisted_cng_key(const PCCERT_CONTEXT certificate) noexcept {
+    DWORD property_bytes {};
+    if (!CertGetCertificateContextProperty(
+          certificate,
+          CERT_KEY_PROV_INFO_PROP_ID,
+          nullptr,
+          &property_bytes
+        )) {
+      return {};
+    }
+    PersistedCngKeyAcquisition result {
+      .private_key_present = true,
+    };
+    std::array<std::uint8_t, 4'096> property {};
+    if (property_bytes < sizeof(CRYPT_KEY_PROV_INFO) || property_bytes > property.size()) {
+      result.rollback_complete = false;
+      return result;
+    }
+    if (!CertGetCertificateContextProperty(
+          certificate,
+          CERT_KEY_PROV_INFO_PROP_ID,
+          property.data(),
+          &property_bytes
+        )) {
+      result.rollback_complete = false;
+      return result;
+    }
+    const auto *const provider_info = reinterpret_cast<const CRYPT_KEY_PROV_INFO *>(property.data());
+    if (!provider_info->pwszProvName || !provider_info->pwszContainerName ||
+        *provider_info->pwszProvName == L'\0' || *provider_info->pwszContainerName == L'\0' ||
+        provider_info->dwProvType != 0) {
+      result.rollback_complete = false;
+      return result;
+    }
+
+    const auto reopen_key = [&]() noexcept {
+      NCRYPT_PROV_HANDLE storage_provider {};
+      if (NCryptOpenStorageProvider(&storage_provider, provider_info->pwszProvName, 0) != ERROR_SUCCESS) {
+        return NCRYPT_KEY_HANDLE {};
+      }
+      NCRYPT_KEY_HANDLE reopened_key {};
+      auto open_flags = (provider_info->dwFlags & CRYPT_MACHINE_KEYSET) != 0 ?
+                          static_cast<DWORD>(NCRYPT_MACHINE_KEY_FLAG) :
+                          DWORD {};
+      const auto open_status = NCryptOpenKey(
+        storage_provider,
+        &reopened_key,
+        provider_info->pwszContainerName,
+        provider_info->dwKeySpec,
+        NCRYPT_SILENT_FLAG | open_flags
+      );
+      NCryptFreeObject(storage_provider);
+      return open_status == ERROR_SUCCESS ? reopened_key : NCRYPT_KEY_HANDLE {};
+    };
+
+    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key {};
+    DWORD key_spec {};
+    BOOL caller_frees {};
+    std::optional<PersistedCngKey> owned_key;
+    if (CryptAcquireCertificatePrivateKey(
+          certificate,
+          CRYPT_ACQUIRE_SILENT_FLAG | CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG,
+          nullptr,
+          &key,
+          &key_spec,
+          &caller_frees
+        )) {
+      if (key_spec != CERT_NCRYPT_KEY_SPEC) {
+        if (caller_frees) {
+          CryptReleaseContext(key, 0);
+        }
+        result.rollback_complete = false;
+        return result;
+      }
+      if (caller_frees) {
+        owned_key.emplace(static_cast<NCRYPT_KEY_HANDLE>(key));
+      } else {
+        const auto reopened_key = reopen_key();
+        if (!reopened_key) {
+          result.rollback_complete = false;
+          return result;
+        }
+        owned_key.emplace(reopened_key);
+      }
+    } else {
+      const auto reopened_key = reopen_key();
+      if (!reopened_key) {
+        result.rollback_complete = false;
+        return result;
+      }
+      owned_key.emplace(reopened_key);
+    }
+    try {
+      owned_key->provider = provider_info->pwszProvName;
+      owned_key->container = provider_info->pwszContainerName;
+      if (!read_ncrypt_string_property(
+            owned_key->handle(),
+            NCRYPT_UNIQUE_NAME_PROPERTY,
+            owned_key->unique_name
+          )) {
+        result.rollback_complete = owned_key->cleanup();
+        return result;
+      }
+      result.key.emplace(std::move(*owned_key));
+    } catch (...) {
+      result.rollback_complete = owned_key->cleanup();
+    }
+    return result;
+  }
+
+  /** @brief Cursor that frees the current store-owned enumerated certificate on every exit. */
+  class CertificateEnumeration {
+  public:
+    /** @brief Begin a certificate-store enumeration. */
+    explicit CertificateEnumeration(const HCERTSTORE store) noexcept:
+        store_ {store} {
+    }
+
+    CertificateEnumeration(const CertificateEnumeration &) = delete;
+    CertificateEnumeration &operator=(const CertificateEnumeration &) = delete;
+
+    ~CertificateEnumeration() {
+      if (current_) {
+        CertFreeCertificateContext(current_);
+      }
+    }
+
+    /** @brief Advance while transferring the previous context back to Crypt32. */
+    PCCERT_CONTEXT next() noexcept {
+      const auto previous = std::exchange(current_, nullptr);
+      current_ = CertEnumCertificatesInStore(store_, previous);
+      return current_;
+    }
+
+  private:
+    HCERTSTORE store_ {};  ///< Store being enumerated.
+    PCCERT_CONTEXT current_ {};  ///< Current store-owned context.
+  };
+
   struct CredentialContext {
-    HCERTSTORE store {};
-    PCCERT_CONTEXT certificate {};
-    std::array<uint8_t, 32> spki {};
+    HCERTSTORE store {};  ///< In-memory certificate store returned by PFXImportCertStore.
+    PCCERT_CONTEXT certificate {};  ///< Leaf context retained for the Schannel credential.
+    std::array<uint8_t, 32> spki {};  ///< Exact DER-SPKI SHA-256 for invitation pinning.
+    std::vector<PersistedCngKey> persisted_keys;  ///< Every imported private key, each with exact cleanup ownership.
 
     ~CredentialContext() {
+      static_cast<void>(release());
+    }
+
+    /**
+     * @brief Release certificate references before deleting every imported key.
+     * @return True when every temporary CNG key was deleted.
+     */
+    bool release() noexcept {
       if (certificate) {
         CertFreeCertificateContext(certificate);
+        certificate = nullptr;
       }
       if (store) {
         CertCloseStore(store, 0);
+        store = nullptr;
       }
+      bool cleaned = true;
+      for (auto &key : persisted_keys) {
+        if (!key.cleanup_with_report()) {
+          cleaned = false;
+        }
+      }
+      persisted_keys.clear();
+      return cleaned;
     }
   };
 
@@ -141,30 +436,6 @@ namespace {
       }
     }
   };
-
-  bool has_private_key(const PCCERT_CONTEXT certificate) {
-    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key {};
-    DWORD key_spec {};
-    BOOL caller_frees {};
-    if (!CryptAcquireCertificatePrivateKey(
-          certificate,
-          CRYPT_ACQUIRE_SILENT_FLAG | CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG,
-          nullptr,
-          &key,
-          &key_spec,
-          &caller_frees
-        )) {
-      return false;
-    }
-    if (caller_frees) {
-      if (key_spec == CERT_NCRYPT_KEY_SPEC) {
-        NCryptFreeObject(key);
-      } else {
-        CryptReleaseContext(key, 0);
-      }
-    }
-    return true;
-  }
 
   struct SendContext {
     static constexpr size_t maximum_buffers = 4;
@@ -450,14 +721,23 @@ extern "C" {
     return LUMEN_MSQUIC_SUCCESS;
   }
 
-  void LUMEN_MSQUIC_CALL lumen_msquic_close(lumen_msquic_shim *shim) {
+  lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_close(lumen_msquic_shim *shim) {
     if (shim == nullptr) {
-      return;
+      return LUMEN_MSQUIC_SUCCESS;
     }
     if (shim->api != nullptr) {
       MsQuicClose(shim->api);
     }
+    auto cleanup_status = LUMEN_MSQUIC_SUCCESS;
+    for (auto &[configuration, credential] : shim->configuration_credentials) {
+      static_cast<void>(configuration);
+      if (credential && !credential->release()) {
+        cleanup_status = LUMEN_MSQUIC_CLEANUP_ERROR;
+      }
+    }
+    shim->configuration_credentials.clear();
     delete shim;
+    return cleanup_status;
   }
 
   int LUMEN_MSQUIC_CALL lumen_msquic_is_schannel(lumen_msquic_shim *shim) {
@@ -542,51 +822,82 @@ extern "C" {
     if (!s || !pkcs12 || pkcs12_size == 0 || pkcs12_size > UINT32_MAX || !password) {
       return LUMEN_MSQUIC_INVALID_STATE;
     }
-    try {
-    SecureWide import_password {wide(password)};
-    if (import_password.value.empty()) {
-      return LUMEN_MSQUIC_INVALID_STATE;
-    }
-    CRYPT_DATA_BLOB blob {
-      static_cast<DWORD>(pkcs12_size),
-      const_cast<BYTE *>(pkcs12),
+    std::shared_ptr<CredentialContext> credential;
+    bool rollback_complete = true;
+    const auto fail = [&](const lumen_msquic_status status) {
+      const auto cleaned = !credential || credential->release();
+      return rollback_complete && cleaned ? status : LUMEN_MSQUIC_CLEANUP_ERROR;
     };
-    auto credential = std::make_shared<CredentialContext>();
-    DWORD import_flags = PKCS12_NO_PERSIST_KEY | CRYPT_USER_KEYSET;
-#ifdef PKCS12_ALWAYS_CNG_KSP
-    import_flags |= PKCS12_ALWAYS_CNG_KSP;
-#endif
-    credential->store = PFXImportCertStore(
-      &blob,
-      import_password.value.c_str(),
-      import_flags
-    );
-    if (!credential->store) {
-      return LUMEN_MSQUIC_TRANSPORT_ERROR;
-    }
-    PCCERT_CONTEXT candidate {};
-    while ((candidate = CertEnumCertificatesInStore(credential->store, candidate)) != nullptr) {
-      if (has_private_key(candidate)) {
-        credential->certificate = CertDuplicateCertificateContext(candidate);
-        break;
+    try {
+      SecureWide import_password {wide(password)};
+      if (import_password.value.empty()) {
+        return LUMEN_MSQUIC_INVALID_STATE;
       }
-    }
-    if (!credential->certificate || !leaf_spki_sha256(credential->certificate, credential->spki)) {
-      return LUMEN_MSQUIC_TRANSPORT_ERROR;
-    }
-    QUIC_CREDENTIAL_CONFIG config {};
-    config.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
-    config.CertificateContext = reinterpret_cast<QUIC_CERTIFICATE *>(
-      const_cast<CERT_CONTEXT *>(credential->certificate)
-    );
-    const auto result = status(s->api->ConfigurationLoadCredential(native(h), &config));
-    if (result == LUMEN_MSQUIC_SUCCESS || result == LUMEN_MSQUIC_PENDING) {
-      std::lock_guard lock {s->mutex};
-      s->configuration_credentials[native(h)] = std::move(credential);
-    }
-    return result;
+      CRYPT_DATA_BLOB blob {
+        static_cast<DWORD>(pkcs12_size),
+        const_cast<BYTE *>(pkcs12),
+      };
+      credential = std::make_shared<CredentialContext>();
+      DWORD import_flags = CRYPT_USER_KEYSET;
+#ifdef PKCS12_ALWAYS_CNG_KSP
+      import_flags |= PKCS12_ALWAYS_CNG_KSP;
+#endif
+      credential->store = PFXImportCertStore(
+        &blob,
+        import_password.value.c_str(),
+        import_flags
+      );
+      if (!credential->store) {
+        return LUMEN_MSQUIC_TRANSPORT_ERROR;
+      }
+      std::size_t private_key_certificates = 0;
+      bool discovery_failed = false;
+      {
+        CertificateEnumeration certificates {credential->store};
+        while (const auto candidate = certificates.next()) {
+          auto acquisition = acquire_persisted_cng_key(candidate);
+          if (!acquisition.private_key_present) {
+            continue;
+          }
+          ++private_key_certificates;
+          rollback_complete = rollback_complete && acquisition.rollback_complete;
+          if (!acquisition.key) {
+            discovery_failed = true;
+            continue;
+          }
+          if (private_key_certificates == 1) {
+            credential->certificate = CertDuplicateCertificateContext(candidate);
+            if (!credential->certificate) {
+              discovery_failed = true;
+            }
+          }
+          try {
+            credential->persisted_keys.push_back(std::move(*acquisition.key));
+          } catch (...) {
+            rollback_complete = acquisition.key->cleanup() && rollback_complete;
+            discovery_failed = true;
+          }
+        }
+      }
+      if (discovery_failed || private_key_certificates != 1 ||
+          credential->persisted_keys.size() != 1 || !credential->certificate ||
+          !leaf_spki_sha256(credential->certificate, credential->spki)) {
+        return fail(LUMEN_MSQUIC_TRANSPORT_ERROR);
+      }
+      QUIC_CREDENTIAL_CONFIG config {};
+      config.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
+      config.CertificateContext = reinterpret_cast<QUIC_CERTIFICATE *>(
+        const_cast<CERT_CONTEXT *>(credential->certificate)
+      );
+      const auto result = status(s->api->ConfigurationLoadCredential(native(h), &config));
+      if (result == LUMEN_MSQUIC_SUCCESS || result == LUMEN_MSQUIC_PENDING) {
+        std::lock_guard lock {s->mutex};
+        s->configuration_credentials[native(h)] = std::move(credential);
+        return result;
+      }
+      return fail(result);
     } catch (...) {
-      return LUMEN_MSQUIC_OUT_OF_MEMORY;
+      return fail(LUMEN_MSQUIC_OUT_OF_MEMORY);
     }
   }
 
@@ -610,8 +921,6 @@ extern "C" {
   void LUMEN_MSQUIC_CALL lumen_msquic_configuration_close(lumen_msquic_shim *s, lumen_msquic_handle h) {
     const auto handle = native(h);
     s->api->ConfigurationClose(handle);
-    std::lock_guard lock {s->mutex};
-    s->configuration_credentials.erase(handle);
   }
 
   lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_listener_open(

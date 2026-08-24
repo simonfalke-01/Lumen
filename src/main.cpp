@@ -459,14 +459,17 @@ int main(int argc, char *argv[]) {
       .persistent_authorization = !config::sunshine.flags[config::flag::FRESH_STATE],
       .pairing_permissions = config::protocol_v3.pairing_permissions,
     });
+    const auto startup_stage = protocol_v3_service->startup_stage();
     if (!lumen::protocol_v3::quic_server::accepted(status)) {
       protocol_v3_service.reset();
       if (listener_policy.v3_failure_is_fatal) {
         BOOST_LOG(fatal) << "Protocol v3 failed to start on UDP port "sv << config::protocol_v3.port
+                         << " at stage "sv << lumen::protocol_v3::quic_server::startup_stage_name(startup_stage)
                          << " with transport status "sv << static_cast<int>(status);
         return -1;
       }
       BOOST_LOG(error) << "Protocol v3 failed to start on UDP port "sv << config::protocol_v3.port
+                       << " at stage "sv << lumen::protocol_v3::quic_server::startup_stage_name(startup_stage)
                        << " with transport status "sv << static_cast<int>(status)
                        << "; continuing with Moonlight compatibility listeners"sv;
     } else {

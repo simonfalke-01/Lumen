@@ -207,7 +207,23 @@ namespace lumen::protocol_v3::quic_server {
     not_supported,
     aborted,
     transport_error,
+    cleanup_error,
   };
+
+  /** @brief Last synchronous stage attempted while opening the QUIC listener. */
+  enum class StartupStage {
+    validation,
+    registration,
+    configuration,
+    credential,
+    certificate_fingerprint,
+    listener_open,
+    listener_bind,
+    ready,
+  };
+
+  /** @brief Return the stable diagnostic label for one listener startup stage. */
+  std::string_view startup_stage_name(StartupStage stage) noexcept;
 
   /**
    * @brief Return whether an asynchronous MsQuic operation was accepted.
@@ -814,6 +830,9 @@ namespace lumen::protocol_v3::quic_server {
 
     /** @brief Whether the listener is accepting. */
     bool running() const noexcept;
+
+    /** @brief Return the last synchronous listener startup stage attempted. */
+    StartupStage startup_stage() const noexcept;
 
     /** @brief Return the live configured leaf DER-SPKI SHA-256 while running. */
     std::optional<std::array<std::uint8_t, 32>> leaf_spki_sha256() const noexcept;

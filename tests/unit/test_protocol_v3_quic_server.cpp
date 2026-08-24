@@ -8,11 +8,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <gtest/gtest.h>
 #include <map>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -192,7 +196,7 @@ i2j7w5vhA66Ep18oU6mfswVI
       std::span<const std::uint8_t>,
       std::string_view
     ) override {
-      return quic::ApiStatus::success;
+      return configuration_load_status;
     }
 
     quic::ApiStatus configuration_leaf_spki_sha256(
@@ -221,6 +225,18 @@ i2j7w5vhA66Ep18oU6mfswVI
     }
 
     void listener_stop(quic::Handle) noexcept override {
+      const auto call = listener_stop_calls.fetch_add(1) + 1;
+      if (block_first_listener_stop && call == 1) {
+        std::unique_lock lock {listener_stop_mutex};
+        first_listener_stop_entered = true;
+        listener_stop_condition.notify_all();
+        listener_stop_condition.wait(lock, [&] {
+          return release_first_listener_stop;
+        });
+      }
+      if (complete_listener_stop_synchronously) {
+        static_cast<void>(listener_callback({.kind = quic::ListenerEvent::Kind::stop_complete}));
+      }
     }
 
     void listener_close(quic::Handle) noexcept override {
@@ -325,12 +341,33 @@ i2j7w5vhA66Ep18oU6mfswVI
       return stream_callbacks.at(stream)(event);
     }
 
+    void wait_for_first_listener_stop() {
+      std::unique_lock lock {listener_stop_mutex};
+      listener_stop_condition.wait(lock, [&] {
+        return first_listener_stop_entered;
+      });
+    }
+
+    void release_listener_stop() {
+      std::lock_guard lock {listener_stop_mutex};
+      release_first_listener_stop = true;
+      listener_stop_condition.notify_all();
+    }
+
     ListenerCallback listener_callback;
     ConnectionCallback connection_callback;
     std::map<quic::Handle, StreamCallback> stream_callbacks;
     std::vector<std::pair<quic::Handle, std::uint64_t>> connection_shutdowns;
     std::vector<std::pair<quic::Handle, std::uint64_t>> stream_shutdowns;
     quic::Handle next_stream {100};
+    std::atomic_size_t listener_stop_calls {};
+    bool complete_listener_stop_synchronously {};
+    quic::ApiStatus configuration_load_status {quic::ApiStatus::success};
+    std::mutex listener_stop_mutex;
+    std::condition_variable listener_stop_condition;
+    bool block_first_listener_stop {};
+    bool first_listener_stop_entered {};
+    bool release_first_listener_stop {};
   };
 
   quic::Config test_config() {
@@ -499,6 +536,48 @@ i2j7w5vhA66Ep18oU6mfswVI
     EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::abuse_limit), 0x106U);
     EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::internal_failure), 0x109U);
     EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::normal_shutdown), 0x10AU);
+  }
+
+  TEST(ProtocolV3Security, SynchronousListenerStopCompletionDoesNotReenterTheServerLock) {
+    TestMsQuicApi api;
+    api.complete_listener_stop_synchronously = true;
+    TestSessionFactory factory;
+    quic::QuicServer server {api, test_config(), factory};
+    ASSERT_EQ(server.start(), quic::ApiStatus::success);
+
+    server.stop();
+
+    EXPECT_EQ(api.listener_stop_calls.load(), 1U);
+    EXPECT_FALSE(server.running());
+  }
+
+  TEST(ProtocolV3Security, ConcurrentStopCallersSubmitListenerStopExactlyOnce) {
+    TestMsQuicApi api;
+    api.block_first_listener_stop = true;
+    api.complete_listener_stop_synchronously = true;
+    TestSessionFactory factory;
+    quic::QuicServer server {api, test_config(), factory};
+    ASSERT_EQ(server.start(), quic::ApiStatus::success);
+
+    std::jthread first {[&] {
+      server.stop();
+    }};
+    api.wait_for_first_listener_stop();
+    server.stop();
+    EXPECT_EQ(api.listener_stop_calls.load(), 1U);
+    api.release_listener_stop();
+    first.join();
+  }
+
+  TEST(ProtocolV3Security, StartupFailureReportsTheExactTransportStage) {
+    TestMsQuicApi api;
+    api.configuration_load_status = quic::ApiStatus::transport_error;
+    TestSessionFactory factory;
+    quic::QuicServer server {api, test_config(), factory};
+
+    EXPECT_EQ(server.start(), quic::ApiStatus::transport_error);
+    EXPECT_EQ(server.startup_stage(), quic::StartupStage::credential);
+    EXPECT_EQ(quic::startup_stage_name(server.startup_stage()), "credential");
   }
 
   TEST(ProtocolV3Security, PreAuthDatagramAndBulkStreamCloseTheConnectionImmediately) {

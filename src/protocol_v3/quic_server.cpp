@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <limits>
 #include <map>
@@ -40,6 +41,7 @@ namespace lumen::protocol_v3::quic_server {
     constexpr auto shutdown_connection_replaced = static_cast<std::uint64_t>(ApplicationCloseCode::connection_replaced);
     constexpr auto shutdown_abuse_limit = static_cast<std::uint64_t>(ApplicationCloseCode::abuse_limit);
     constexpr auto force_close_send_drain_timeout = std::chrono::milliseconds {250};
+    constexpr auto listener_stop_timeout = std::chrono::seconds {5};
     constexpr auto congestion_sample_interval = std::chrono::milliseconds {5};
     constexpr std::size_t maximum_packet_bytes = 16U * 1024U * 1024U;
     constexpr std::array<Lane, 6> all_lanes {
@@ -343,6 +345,28 @@ namespace lumen::protocol_v3::quic_server {
 
   bool accepted(const ApiStatus status) noexcept {
     return status == ApiStatus::success || status == ApiStatus::pending;
+  }
+
+  std::string_view startup_stage_name(const StartupStage stage) noexcept {
+    switch (stage) {
+      case StartupStage::validation:
+        return "validation";
+      case StartupStage::registration:
+        return "registration";
+      case StartupStage::configuration:
+        return "configuration";
+      case StartupStage::credential:
+        return "credential";
+      case StartupStage::certificate_fingerprint:
+        return "certificate-fingerprint";
+      case StartupStage::listener_open:
+        return "listener-open";
+      case StartupStage::listener_bind:
+        return "listener-bind";
+      case StartupStage::ready:
+        return "ready";
+    }
+    return "unknown";
   }
 
   SendSlotPool::SendSlotPool(const std::size_t capacity) noexcept:
@@ -708,7 +732,9 @@ namespace lumen::protocol_v3::quic_server {
 
     ApiStatus start() {
       std::lock_guard lock {mutex_};
+      startup_stage_ = StartupStage::validation;
       if (running_) {
+        startup_stage_ = StartupStage::ready;
         return ApiStatus::success;
       }
       if (!valid_config(config_) || !api_.is_schannel()) {
@@ -716,6 +742,7 @@ namespace lumen::protocol_v3::quic_server {
       }
 
       Handle registration = invalid_handle;
+      startup_stage_ = StartupStage::registration;
       auto status = api_.registration_open("Lumen protocol v3", registration);
       if (!accepted(status) || registration == invalid_handle) {
         return accepted(status) ? ApiStatus::invalid_state : status;
@@ -723,6 +750,7 @@ namespace lumen::protocol_v3::quic_server {
       registration_ = registration;
 
       Handle configuration = invalid_handle;
+      startup_stage_ = StartupStage::configuration;
       status = api_.configuration_open(
         registration_,
         required_alpn,
@@ -738,6 +766,7 @@ namespace lumen::protocol_v3::quic_server {
       }
       configuration_ = configuration;
 
+      startup_stage_ = StartupStage::credential;
       status = api_.configuration_load_pkcs12(
         configuration_,
         config_.certificate->pkcs12,
@@ -747,6 +776,7 @@ namespace lumen::protocol_v3::quic_server {
         close_roots_locked();
         return status;
       }
+      startup_stage_ = StartupStage::certificate_fingerprint;
       status = api_.configuration_leaf_spki_sha256(configuration_, leaf_spki_sha256_);
       if (!accepted(status) ||
           std::ranges::all_of(leaf_spki_sha256_, [](const std::uint8_t byte) {
@@ -758,6 +788,7 @@ namespace lumen::protocol_v3::quic_server {
 
       const std::weak_ptr<Impl> weak = weak_from_this();
       Handle listener = invalid_handle;
+      startup_stage_ = StartupStage::listener_open;
       status = api_.listener_open(
         registration_,
         [weak](const ListenerEvent &event) {
@@ -775,7 +806,9 @@ namespace lumen::protocol_v3::quic_server {
       listener_ = listener;
       running_ = true;
       stopping_ = false;
+      listener_stop_complete_ = false;
 
+      startup_stage_ = StartupStage::listener_bind;
       status = api_.listener_start(listener_, required_alpn, config_.udp_port);
       if (!accepted(status)) {
         running_ = false;
@@ -786,27 +819,50 @@ namespace lumen::protocol_v3::quic_server {
         stopping_ = false;
         return status;
       }
+      startup_stage_ = StartupStage::ready;
       emit_locked(Event::Kind::listener_started, nullptr, 0, Lane::control, 0);
       return status;
     }
 
     void stop() noexcept {
-      std::lock_guard lock {mutex_};
-      if (!running_ && !stopping_) {
-        return;
+      Handle listener_to_stop = invalid_handle;
+      {
+        std::lock_guard lock {mutex_};
+        if (stopping_ || !running_) {
+          return;
+        }
+        running_ = false;
+        stopping_ = true;
+        listener_to_stop = listener_;
+        for (auto &[id, connection] : connections_) {
+          static_cast<void>(id);
+          begin_shutdown_locked(*connection, shutdown_server_stopping);
+        }
+        if (listener_ == invalid_handle && connections_.empty()) {
+          close_roots_locked();
+          stopping_ = false;
+        }
       }
-      running_ = false;
-      stopping_ = true;
-      if (listener_ != invalid_handle) {
-        api_.listener_stop(listener_);
+      if (listener_to_stop != invalid_handle) {
+        api_.listener_stop(listener_to_stop);
       }
-      for (auto &[id, connection] : connections_) {
-        static_cast<void>(id);
-        begin_shutdown_locked(*connection, shutdown_server_stopping);
+      Handle listener_to_close = invalid_handle;
+      {
+        std::unique_lock lock {mutex_};
+        static_cast<void>(listener_stop_condition_.wait_for(lock, listener_stop_timeout, [&] {
+          return listener_stop_complete_;
+        }));
+        listener_to_close = std::exchange(listener_, invalid_handle);
       }
-      if (listener_ == invalid_handle && connections_.empty()) {
-        close_roots_locked();
-        stopping_ = false;
+      if (listener_to_close != invalid_handle) {
+        api_.listener_close(listener_to_close);
+      }
+      {
+        std::lock_guard lock {mutex_};
+        if (connections_.empty()) {
+          close_roots_locked();
+          stopping_ = false;
+        }
       }
     }
 
@@ -1228,6 +1284,11 @@ namespace lumen::protocol_v3::quic_server {
       return running_;
     }
 
+    StartupStage startup_stage() const noexcept {
+      std::lock_guard lock {mutex_};
+      return startup_stage_;
+    }
+
     std::optional<std::array<std::uint8_t, 32>> leaf_spki_sha256() const noexcept {
       std::lock_guard lock {mutex_};
       return running_ ? std::optional {leaf_spki_sha256_} : std::nullopt;
@@ -1236,15 +1297,9 @@ namespace lumen::protocol_v3::quic_server {
     ApiStatus on_listener_event(const ListenerEvent &event) {
       std::lock_guard lock {mutex_};
       if (event.kind == ListenerEvent::Kind::stop_complete) {
-        if (listener_ != invalid_handle) {
-          api_.listener_close(listener_);
-          listener_ = invalid_handle;
-        }
+        listener_stop_complete_ = true;
+        listener_stop_condition_.notify_all();
         emit_locked(Event::Kind::listener_stopped, nullptr, 0, Lane::control, 0);
-        if (connections_.empty()) {
-          close_roots_locked();
-          stopping_ = false;
-        }
         return ApiStatus::success;
       }
 
@@ -2709,6 +2764,7 @@ namespace lumen::protocol_v3::quic_server {
     Observer *observer_;
     CongestionObserver *congestion_observer_;
     mutable std::mutex mutex_;
+    std::condition_variable listener_stop_condition_;
     std::condition_variable send_drain_condition_;
     Handle registration_ {invalid_handle};
     Handle configuration_ {invalid_handle};
@@ -2716,6 +2772,8 @@ namespace lumen::protocol_v3::quic_server {
     std::array<std::uint8_t, 32> leaf_spki_sha256_ {};
     bool running_ {};
     bool stopping_ {};
+    bool listener_stop_complete_ {};
+    StartupStage startup_stage_ {StartupStage::validation};
     std::uint64_t next_connection_id_ {1};
     std::uint64_t next_send_token_ {1};
     std::map<std::uint64_t, std::shared_ptr<Connection>> connections_;
@@ -2798,6 +2856,10 @@ namespace lumen::protocol_v3::quic_server {
     return impl_ && impl_->running();
   }
 
+  StartupStage QuicServer::startup_stage() const noexcept {
+    return impl_ ? impl_->startup_stage() : StartupStage::validation;
+  }
+
   std::optional<std::array<std::uint8_t, 32>> QuicServer::leaf_spki_sha256() const noexcept {
     if (!impl_ || !impl_->running()) {
       return std::nullopt;
@@ -2814,6 +2876,7 @@ namespace lumen::protocol_v3::quic_server {
     static_assert(static_cast<int>(ApiStatus::not_supported) == LUMEN_MSQUIC_NOT_SUPPORTED);
     static_assert(static_cast<int>(ApiStatus::aborted) == LUMEN_MSQUIC_ABORTED);
     static_assert(static_cast<int>(ApiStatus::transport_error) == LUMEN_MSQUIC_TRANSPORT_ERROR);
+    static_assert(static_cast<int>(ApiStatus::cleanup_error) == LUMEN_MSQUIC_CLEANUP_ERROR);
 
     ApiStatus shim_status(const lumen_msquic_status value) noexcept {
       return static_cast<ApiStatus>(value);
@@ -2829,7 +2892,10 @@ namespace lumen::protocol_v3::quic_server {
 
       ~ShimMsQuicApi() override {
         if (shim_) {
-          lumen_msquic_close(shim_);
+          const auto status = lumen_msquic_close(shim_);
+          if (status == LUMEN_MSQUIC_CLEANUP_ERROR) {
+            std::fputs("Lumen MsQuic shim close reported temporary-key cleanup failure\n", stderr);
+          }
         }
       }
 

@@ -2442,6 +2442,7 @@ namespace lumen::protocol_v3::runtime {
     std::unique_ptr<ProductionSessionBackend> backend;
     std::unique_ptr<control::SessionFactory> session_factory;
     std::unique_ptr<quic_server::QuicServer> server;
+    quic_server::StartupStage startup_stage {quic_server::StartupStage::validation};
     mutable std::mutex invitation_mutex;
     std::optional<ActiveInvitation> active_invitation;
     std::uint16_t udp_port {};
@@ -2458,6 +2459,7 @@ namespace lumen::protocol_v3::runtime {
 
   quic_server::ApiStatus ProtocolV3Service::start(const ServiceConfig &config) {
     impl_->clear();
+    impl_->startup_stage = quic_server::StartupStage::validation;
     if (config.state_file.empty() || config.certificate_file.empty() || config.private_key_file.empty() ||
         config.udp_port == 0 || !impl_->resources || config.pairing_permissions == 0 ||
         (config.pairing_permissions & ~control::defined_permission_mask) != 0 ||
@@ -2532,6 +2534,7 @@ namespace lumen::protocol_v3::runtime {
       return quic_server::ApiStatus::out_of_memory;
     }
     const auto status = impl_->server->start();
+    impl_->startup_stage = impl_->server->startup_stage();
     if (!quic_server::accepted(status)) {
       impl_->clear();
     } else {
@@ -2553,6 +2556,10 @@ namespace lumen::protocol_v3::runtime {
 
   bool ProtocolV3Service::running() const noexcept {
     return impl_->server && impl_->server->running();
+  }
+
+  quic_server::StartupStage ProtocolV3Service::startup_stage() const noexcept {
+    return impl_->startup_stage;
   }
 
   std::expected<std::string, std::uint8_t> ProtocolV3Service::issue_invitation(

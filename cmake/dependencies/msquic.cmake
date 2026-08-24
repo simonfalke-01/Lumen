@@ -9,9 +9,9 @@ set(LUMEN_MSQUIC_PINNED_VERSION "2.6.0")
 set(LUMEN_MSQUIC_NUGET_SHA256
     "37636dbc4fbb527f7a2f4505893bb2619862aa5879cc65499a048401c44eb590")
 set(LUMEN_MSQUIC_SHIM_DLL_SHA256 "" CACHE STRING
-    "SHA-256 of the approved ABI2 lumen_msquic_shim.dll Release artifact")
+    "SHA-256 of the approved ABI3 lumen_msquic_shim.dll Release artifact")
 set(LUMEN_MSQUIC_SHIM_LIB_SHA256 "" CACHE STRING
-    "SHA-256 of the approved ABI2 lumen_msquic_shim.lib Release artifact")
+    "SHA-256 of the approved ABI3 lumen_msquic_shim.lib Release artifact")
 
 set(LUMEN_MSQUIC_ROOT "" CACHE PATH
     "Extracted Microsoft.Native.Quic.MsQuic.Schannel 2.6.0 NuGet package root")
@@ -67,7 +67,7 @@ if(NOT EXISTS "${_lumen_msquic_shim_library}" OR NOT EXISTS "${_lumen_msquic_shi
 endif()
 if(LUMEN_MSQUIC_SHIM_DLL_SHA256 STREQUAL "" OR LUMEN_MSQUIC_SHIM_LIB_SHA256 STREQUAL "")
     message(FATAL_ERROR
-        "Lumen MsQuic ABI2 bulk-stream artifact pins are pending the next approved MSVC Release build.")
+        "Lumen MsQuic ABI3 bulk-stream artifact pins are pending the next approved MSVC Release build.")
 endif()
 
 file(SHA256 "${CMAKE_SOURCE_DIR}/src/platform/windows/msquic_shim/lumen_msquic_shim.h"
@@ -77,9 +77,9 @@ file(SHA256 "${CMAKE_SOURCE_DIR}/src/platform/windows/msquic_shim/lumen_msquic_s
 file(SHA256 "${CMAKE_SOURCE_DIR}/src/platform/windows/msquic_shim/LumenMsQuicShim.vcxproj"
      _lumen_msquic_shim_project_sha256)
 if(NOT _lumen_msquic_shim_header_sha256 STREQUAL
-       "efbfbea09628819908d48de90e24aeca0adcad75b540d69f80d586e9654692e3" OR
+       "ca7512a2827a33085415e9e6d5ba2c5236fa4fabcf63098bc08aab563712de23" OR
    NOT _lumen_msquic_shim_source_sha256 STREQUAL
-       "6d8d8bbb6e44f04bdc781ab08470c32b4a8f8802dfee3dd7307b245b1e0439d9" OR
+       "aed4d27590ae2746e35cf61465f6ddd26b44507be8a38cd2d0dced463239c16a" OR
    NOT _lumen_msquic_shim_project_sha256 STREQUAL
        "0032cc4545fbf146bc5c0f2899e042a1a54387b6dd4d4a9c31edb425c4b3d40b")
     message(FATAL_ERROR "Lumen MsQuic shim ABI/source/toolset manifest validation failed.")
@@ -95,7 +95,7 @@ string(JSON _lumen_msquic_manifest_dll GET "${_lumen_msquic_manifest_json}" shim
 string(JSON _lumen_msquic_manifest_lib GET "${_lumen_msquic_manifest_json}" shim_import_library_sha256)
 file(SHA256 "${_lumen_msquic_shim_runtime}" _lumen_msquic_shim_runtime_sha256)
 file(SHA256 "${_lumen_msquic_shim_library}" _lumen_msquic_shim_library_sha256)
-if(NOT _lumen_msquic_manifest_abi EQUAL 2 OR
+if(NOT _lumen_msquic_manifest_abi EQUAL 3 OR
    NOT _lumen_msquic_manifest_arch STREQUAL "x64" OR
    NOT _lumen_msquic_manifest_toolset STREQUAL "v143" OR
    NOT _lumen_msquic_manifest_header STREQUAL _lumen_msquic_shim_header_sha256 OR
