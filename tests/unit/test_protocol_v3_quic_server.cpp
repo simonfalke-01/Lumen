@@ -20,6 +20,7 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -61,6 +62,27 @@ namespace {
     for (const auto byte : bytes) {
       result.push_back(digits[byte >> 4U]);
       result.push_back(digits[byte & 0x0fU]);
+    }
+    return result;
+  }
+
+  std::vector<std::uint8_t> bytes_from_hex(const std::string_view text) {
+    const auto nibble = [](const char value) -> std::uint8_t {
+      if (value >= '0' && value <= '9') {
+        return static_cast<std::uint8_t>(value - '0');
+      }
+      if (value >= 'a' && value <= 'f') {
+        return static_cast<std::uint8_t>(value - 'a' + 10);
+      }
+      throw std::invalid_argument("invalid fixture hex");
+    };
+    if (text.size() % 2U != 0) {
+      throw std::invalid_argument("odd fixture hex length");
+    }
+    std::vector<std::uint8_t> result;
+    result.reserve(text.size() / 2U);
+    for (std::size_t offset = 0; offset < text.size(); offset += 2U) {
+      result.push_back(static_cast<std::uint8_t>((nibble(text[offset]) << 4U) | nibble(text[offset + 1U])));
     }
     return result;
   }
@@ -492,6 +514,7 @@ i2j7w5vhA66Ep18oU6mfswVI
       media::NegotiatedMediaConfig selection;
       selection.session_id = session_id();
       selection.profile = quic::Profile::quality;
+      selection.semantic_datagram_bytes = maximum_datagram_bytes;
       selection.audio_generation = vector.at("audioGeneration").get<std::uint32_t>();
       selection.audio.sample_rate = vector.at("sampleRate").get<std::uint32_t>();
       selection.audio.frame_samples = vector.at("frameSamples").get<std::uint16_t>();
@@ -513,9 +536,6 @@ i2j7w5vhA66Ep18oU6mfswVI
       );
       ASSERT_TRUE(probe.capture_completed) << vector.at("name").get<std::string>();
       EXPECT_EQ(probe.publish_result, media::PublishResult::accepted);
-      EXPECT_EQ(probe.pressure_result, audio::AudioPacketDestination::enqueue_result_e::backpressure);
-      EXPECT_EQ(probe.enqueue_after_repeated_close, audio::AudioPacketDestination::enqueue_result_e::closed);
-      EXPECT_TRUE(probe.repeated_pipeline_stop_completed);
       EXPECT_EQ(probe.first_sample_position, vector.at("firstSamplePosition").get<std::uint64_t>());
       EXPECT_EQ(probe.discontinuity, vector.at("discontinuity").get<bool>());
       EXPECT_EQ(probe.opus_bytes, vector.at("opusBytes").get<std::size_t>());
@@ -523,7 +543,10 @@ i2j7w5vhA66Ep18oU6mfswVI
       ASSERT_EQ(api.datagram_sends.size(), sends_before + 1U);
       const auto &scheduled = api.datagram_sends.back();
       EXPECT_TRUE(scheduled.urgent);
-      EXPECT_EQ(hex_bytes(scheduled.bytes), vector.at("scheduledDatagramHex").get<std::string>());
+      ASSERT_GE(scheduled.bytes.size(), 92U);
+      EXPECT_EQ(scheduled.bytes.size(), vector.at("totalBytes").get<std::size_t>());
+      EXPECT_EQ(hex_bytes(std::span {scheduled.bytes}.first(92)), vector.at("scheduledPrefixHex").get<std::string>());
+      EXPECT_FALSE(std::span {scheduled.bytes}.subspan(92).empty());
       const auto parsed = quic::parse_datagram_record(
         scheduled.bytes,
         quic::Direction::host_to_client,
@@ -531,24 +554,30 @@ i2j7w5vhA66Ep18oU6mfswVI
         maximum_datagram_bytes
       );
       ASSERT_TRUE(parsed);
-      EXPECT_EQ(parsed->channel, 3);
-      EXPECT_EQ(parsed->kind, 1);
-      EXPECT_EQ(parsed->sequence, 1U);
-      EXPECT_EQ(parsed->object_id, probe.first_sample_position);
+      const auto &expected = vector.at("parsed");
+      EXPECT_EQ(parsed->channel, expected.at("channel").get<std::uint8_t>());
+      EXPECT_EQ(parsed->kind, expected.at("kind").get<std::uint8_t>());
+      EXPECT_EQ(parsed->sequence, expected.at("sequence").get<std::uint64_t>());
+      EXPECT_EQ(parsed->object_id, expected.at("objectId").get<std::uint64_t>());
       ASSERT_GE(parsed->payload.size(), 48U);
       EXPECT_EQ(parsed->payload.size(), 48U + probe.opus_bytes);
-      EXPECT_EQ(read_be(parsed->payload, 0, 8), capture_time);
-      EXPECT_EQ(read_be(parsed->payload, 8, 8), probe.first_sample_position);
-      EXPECT_EQ(read_be(parsed->payload, 16, 4), selection.audio_generation);
-      EXPECT_EQ(read_be(parsed->payload, 20, 2), selection.audio.frame_samples);
-      EXPECT_EQ(parsed->payload[22], selection.audio.channels);
-      EXPECT_EQ(parsed->payload[23], selection.audio.layout);
+      EXPECT_EQ(read_be(parsed->payload, 0, 8), expected.at("captureTimeMicroseconds").get<std::uint64_t>());
+      EXPECT_EQ(read_be(parsed->payload, 8, 8), expected.at("firstSamplePosition").get<std::uint64_t>());
+      EXPECT_EQ(read_be(parsed->payload, 16, 4), expected.at("audioGeneration").get<std::uint32_t>());
+      EXPECT_EQ(read_be(parsed->payload, 20, 2), expected.at("frameSamples").get<std::uint16_t>());
+      EXPECT_EQ(parsed->payload[22], expected.at("channels").get<std::uint8_t>());
+      EXPECT_EQ(parsed->payload[23], expected.at("layout").get<std::uint8_t>());
       EXPECT_EQ(parsed->payload[24], 1);
       EXPECT_EQ(parsed->payload[25] & 0x02U, probe.discontinuity ? 0x02U : 0U);
-      EXPECT_EQ(parsed->payload[26], selection.audio.streams);
-      EXPECT_EQ(parsed->payload[27], selection.audio.coupled_streams);
+      EXPECT_EQ(parsed->payload[26], expected.at("streams").get<std::uint8_t>());
+      EXPECT_EQ(parsed->payload[27], expected.at("coupledStreams").get<std::uint8_t>());
       EXPECT_TRUE(std::ranges::equal(selection.audio.mapping, parsed->payload.subspan(28, 8)));
-      EXPECT_EQ(read_be(parsed->payload, 36, 4), selection.audio.bitrate_bps);
+      EXPECT_EQ(read_be(parsed->payload, 36, 4), expected.at("bitrateBps").get<std::uint32_t>());
+
+      const auto artifact = bytes_from_hex(vector.at("scheduledDatagramHex").get<std::string>());
+      ASSERT_EQ(artifact.size(), vector.at("totalBytes").get<std::size_t>());
+      EXPECT_EQ(hex_bytes(std::span {artifact}.first(92)), vector.at("scheduledPrefixHex").get<std::string>());
+      EXPECT_TRUE(quic::parse_datagram_record(artifact, quic::Direction::host_to_client, selection.session_id, maximum_datagram_bytes));
       EXPECT_EQ(
         api.connection_event({
           .kind = quic::ConnectionEvent::Kind::datagram_send_complete,

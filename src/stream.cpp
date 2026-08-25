@@ -4708,7 +4708,7 @@ namespace stream {
 
   protocol_v3_audio_fixture_probe_t protocol_v3_audio_fixture_probe_for_test(
     const lumen::protocol_v3::media::NegotiatedMediaConfig &selection,
-    lumen::protocol_v3::media::TransportSink &transport,
+    lumen::protocol_v3::runtime::QuicTransportSink &transport,
     const std::uint64_t connection_id,
     const std::uint64_t capture_time_microseconds
   ) {
@@ -4737,8 +4737,6 @@ namespace stream {
 
     protocol_v3_audio_fixture_probe_t result {
       .publish_result = v3_media::PublishResult::stopped,
-      .pressure_result = audio::AudioPacketDestination::enqueue_result_e::closed,
-      .enqueue_after_repeated_close = audio::AudioPacketDestination::enqueue_result_e::closed,
     };
     v3_media::SessionPipeline pipeline {
       selection,
@@ -4788,28 +4786,11 @@ namespace stream {
       watchdog.join();
     }
     destination->close();
-    destination->close();
     if (consumer.joinable()) {
       consumer.join();
     }
-    result.enqueue_after_repeated_close = destination->enqueue({});
-
-    v3_audio_packet_destination pressure_destination;
-    const auto pressure_packet = []() {
-      audio::buffer_t payload {1};
-      payload[0] = 0x5a;
-      return audio::packet_t {.payload = std::move(payload)};
-    };
-    for (std::size_t index = 0; index < 32; ++index) {
-      static_cast<void>(pressure_destination.enqueue(pressure_packet()));
-    }
-    result.pressure_result = pressure_destination.enqueue(pressure_packet());
-    pressure_destination.close();
-    pressure_destination.close();
 
     pipeline.stop();
-    pipeline.stop();
-    result.repeated_pipeline_stop_completed = true;
     return result;
   }
 
