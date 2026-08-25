@@ -122,6 +122,30 @@ namespace platf::dxgi {
                std::nullopt;
     }
 
+    std::optional<nvenc::hdr_static_metadata_t> frame_hdr_static_metadata(
+      const virtual_display::frame_color_metadata_t &metadata
+    ) {
+      if (metadata.hdr_metadata_type == virtual_display::hdr_metadata_type_e::none) {
+        return std::nullopt;
+      }
+      const auto &source = metadata.hdr10_metadata;
+      const nvenc::hdr_static_metadata_t converted {
+        std::array<nvenc::hdr_chromaticity_t, 3> {{
+          {source.red_primary[0], source.red_primary[1]},
+          {source.green_primary[0], source.green_primary[1]},
+          {source.blue_primary[0], source.blue_primary[1]},
+        }},
+        {source.white_point[0], source.white_point[1]},
+        source.maximum_mastering_luminance,
+        source.minimum_mastering_luminance,
+        source.maximum_content_light_level,
+        source.maximum_frame_average_light_level,
+      };
+      return nvenc::valid_hdr_static_metadata(converted) ?
+               std::optional {converted} :
+               std::nullopt;
+    }
+
     /**
      * @brief Read one process environment variable without a fixed-size buffer.
      *
@@ -394,24 +418,30 @@ namespace platf::dxgi {
   blob_t convert_yuv420_packed_uv_type0_ps_hlsl;  ///< Convert yuv420 packed uv type0 ps hlsl.
   blob_t convert_yuv420_packed_uv_type0_ps_linear_hlsl;  ///< Convert yuv420 packed uv type0 ps linear hlsl.
   blob_t convert_yuv420_packed_uv_type0_ps_perceptual_quantizer_hlsl;  ///< Convert yuv420 packed uv type0 ps perceptual quantizer hlsl.
+  blob_t convert_yuv420_packed_uv_type0_ps_vdd_color_transform_hlsl;  ///< ABI5 VDD color-transform UV shader.
   blob_t convert_yuv420_packed_uv_type0_vs_hlsl;  ///< Convert yuv420 packed uv type0 vs hlsl.
   blob_t convert_yuv420_packed_uv_type0s_ps_hlsl;  ///< Convert yuv420 packed uv type0s ps hlsl.
   blob_t convert_yuv420_packed_uv_type0s_ps_linear_hlsl;  ///< Convert yuv420 packed uv type0s ps linear hlsl.
   blob_t convert_yuv420_packed_uv_type0s_ps_perceptual_quantizer_hlsl;  ///< Convert yuv420 packed uv type0s ps perceptual quantizer hlsl.
+  blob_t convert_yuv420_packed_uv_type0s_ps_vdd_color_transform_hlsl;  ///< ABI5 downscaled VDD color-transform UV shader.
   blob_t convert_yuv420_packed_uv_type0s_vs_hlsl;  ///< Convert yuv420 packed uv type0s vs hlsl.
   blob_t convert_yuv420_planar_y_ps_hlsl;  ///< Convert yuv420 planar y ps hlsl.
   blob_t convert_yuv420_planar_y_ps_linear_hlsl;  ///< Convert yuv420 planar y ps linear hlsl.
   blob_t convert_yuv420_planar_y_ps_perceptual_quantizer_hlsl;  ///< Convert yuv420 planar y ps perceptual quantizer hlsl.
+  blob_t convert_yuv420_planar_y_ps_vdd_color_transform_hlsl;  ///< ABI5 VDD color-transform luma shader.
   blob_t convert_yuv420_planar_y_vs_hlsl;  ///< Convert yuv420 planar y vs hlsl.
   blob_t convert_yuv444_packed_ayuv_ps_hlsl;  ///< Convert YUV444 packed ayuv ps hlsl.
   blob_t convert_yuv444_packed_ayuv_ps_linear_hlsl;  ///< Convert YUV444 packed ayuv ps linear hlsl.
+  blob_t convert_yuv444_packed_ayuv_ps_vdd_color_transform_hlsl;  ///< ABI5 VDD color-transform AYUV shader.
   blob_t convert_yuv444_packed_vs_hlsl;  ///< Convert YUV444 packed vs hlsl.
   blob_t convert_yuv444_planar_ps_hlsl;  ///< Convert YUV444 planar ps hlsl.
   blob_t convert_yuv444_planar_ps_linear_hlsl;  ///< Convert YUV444 planar ps linear hlsl.
   blob_t convert_yuv444_planar_ps_perceptual_quantizer_hlsl;  ///< Convert YUV444 planar ps perceptual quantizer hlsl.
+  blob_t convert_yuv444_planar_ps_vdd_color_transform_hlsl;  ///< ABI5 VDD color-transform planar shader.
   blob_t convert_yuv444_packed_y410_ps_hlsl;  ///< Convert YUV444 packed y410 ps hlsl.
   blob_t convert_yuv444_packed_y410_ps_linear_hlsl;  ///< Convert YUV444 packed y410 ps linear hlsl.
   blob_t convert_yuv444_packed_y410_ps_perceptual_quantizer_hlsl;  ///< Convert YUV444 packed y410 ps perceptual quantizer hlsl.
+  blob_t convert_yuv444_packed_y410_ps_vdd_color_transform_hlsl;  ///< ABI5 VDD color-transform Y410 shader.
   blob_t convert_yuv444_planar_vs_hlsl;  ///< Convert YUV444 planar vs hlsl.
   blob_t cursor_ps_hlsl;  ///< Cursor ps hlsl.
   blob_t cursor_ps_normalize_white_hlsl;  ///< Cursor ps normalize white hlsl.
@@ -444,6 +474,8 @@ namespace platf::dxgi {
 
     // True when capture and encode use this texture through the same D3D11 device.
     bool fused_resource = false;  ///< Whether legacy shared-handle and keyed-mutex boundaries are absent.
+    std::shared_ptr<const virtual_display::color_transform_t> color_transform;  ///< ABI5 transform retained with the slot lease.
+    virtual_display::frame_color_metadata_t color_metadata;  ///< ABI5 resolved frame color/HDR state.
     fused_d3d11::frame_trace_token_t telemetry_capture_token;  ///< Image-owned parent trace for bounded encoder children.
     std::shared_ptr<fused_d3d11::resource_ownership_t> resource_ownership;  ///< Capture-pool transition state retained by this image.
     bool resource_bound = false;  ///< Whether this image contributes to the bound-image drain count.
@@ -757,6 +789,22 @@ namespace platf::dxgi {
    */
   class d3d_base_encode_device final {
   public:
+    struct alignas(16) vdd_color_shader_params_t {
+      std::array<float, 12> matrix {};
+      std::uint32_t transform_type {};
+      std::uint32_t input_linear {};
+      std::uint32_t output_transfer {};  ///< Zero SDR, one PQ, or two HLG.
+      std::uint32_t lut_size {};
+    };
+    static_assert(sizeof(vdd_color_shader_params_t) == 64);
+
+    struct vdd_gpu_color_transform_t {
+      std::shared_ptr<const virtual_display::color_transform_t> source;
+      buf_t parameters;
+      texture1d_t lut_texture;
+      shader_res_t lut_view;
+    };
+
     ~d3d_base_encode_device() {
       pending_telemetry_child.reset();
       fused_d3d11::telemetry().retire_frame_session(telemetry_session);
@@ -770,6 +818,104 @@ namespace platf::dxgi {
 
     [[nodiscard]] fused_d3d11::frame_trace_token_t take_telemetry_child() noexcept {
       return pending_telemetry_child.release();
+    }
+
+    std::shared_ptr<vdd_gpu_color_transform_t> create_vdd_gpu_color_transform(const img_d3d_t &img) {
+      if (!img.color_transform || img.color_transform->type == virtual_display::color_transform_type_e::default_) {
+        return {};
+      }
+      auto gpu = std::make_shared<vdd_gpu_color_transform_t>();
+      gpu->source = img.color_transform;
+      vdd_color_shader_params_t parameters;
+      parameters.transform_type = static_cast<std::uint32_t>(img.color_transform->type);
+      parameters.input_linear = img.color_metadata.surface_color_space == virtual_display::frame_color_space_e::scrgb ? 1U : 0U;
+      parameters.output_transfer = vdd_output_transfer;
+
+      std::vector<std::array<float, 4>> lut;
+      if (img.color_transform->type == virtual_display::color_transform_type_e::rgb256x3x16) {
+        const auto &source = std::get<virtual_display::color_transform_rgb256_t>(img.color_transform->payload);
+        parameters.lut_size = static_cast<std::uint32_t>(source.red.size());
+        lut.resize(source.red.size());
+        for (std::size_t index = 0; index < source.red.size(); ++index) {
+          constexpr float normalization = 1.0f / 65'535.0f;
+          lut[index] = {
+            source.red[index] * normalization,
+            source.green[index] * normalization,
+            source.blue[index] * normalization,
+            0.0f,
+          };
+        }
+      } else {
+        const auto &source = std::get<virtual_display::color_transform_3x4_t>(img.color_transform->payload);
+        parameters.matrix = parameters.output_transfer != 0 ?
+                              source.wire_rec2020_matrix_3x4 :
+                              source.wire_rec709_matrix_3x4;
+        if (source.lut_enabled) {
+          parameters.lut_size = static_cast<std::uint32_t>(source.lookup_table_1d.size());
+          lut.resize(source.lookup_table_1d.size());
+          for (std::size_t index = 0; index < source.lookup_table_1d.size(); ++index) {
+            lut[index] = {
+              source.lookup_table_1d[index].red,
+              source.lookup_table_1d[index].green,
+              source.lookup_table_1d[index].blue,
+              0.0f,
+            };
+          }
+        }
+      }
+
+      gpu->parameters = make_buffer(device.get(), parameters);
+      if (!gpu->parameters) {
+        return {};
+      }
+      if (!lut.empty()) {
+        D3D11_TEXTURE1D_DESC texture_desc {};
+        texture_desc.Width = static_cast<UINT>(lut.size());
+        texture_desc.MipLevels = 1;
+        texture_desc.ArraySize = 1;
+        texture_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        texture_desc.Usage = D3D11_USAGE_IMMUTABLE;
+        texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const D3D11_SUBRESOURCE_DATA initial_data {
+          lut.data(),
+          static_cast<UINT>(lut.size() * sizeof(lut.front())),
+          0,
+        };
+        if (FAILED(device->CreateTexture1D(&texture_desc, &initial_data, &gpu->lut_texture)) ||
+            FAILED(device->CreateShaderResourceView(gpu->lut_texture.get(), nullptr, &gpu->lut_view))) {
+          return {};
+        }
+      }
+      return gpu;
+    }
+
+    bool apply_vdd_color_transform(const img_d3d_t &img) {
+      vdd_color_transform_active = false;
+      if (!img.color_transform || img.color_transform->type == virtual_display::color_transform_type_e::default_) {
+        return true;
+      }
+      auto selected = vdd_gpu_transform_current;
+      if (!selected || selected->source != img.color_transform) {
+        selected = vdd_gpu_transform_previous;
+      }
+      if (!selected || selected->source != img.color_transform) {
+        try {
+          selected = create_vdd_gpu_color_transform(img);
+        } catch (...) {
+          return false;
+        }
+        if (!selected) {
+          return false;
+        }
+        vdd_gpu_transform_previous = std::move(vdd_gpu_transform_current);
+        vdd_gpu_transform_current = selected;
+      }
+      auto *parameters = selected->parameters.get();
+      auto *lut_view = selected->lut_view.get();
+      device_ctx->PSSetConstantBuffers(1, 1, &parameters);
+      device_ctx->PSSetShaderResources(1, 1, &lut_view);
+      vdd_color_transform_active = true;
+      return true;
     }
 
     /**
@@ -833,6 +979,10 @@ namespace platf::dxgi {
         if (initialize_image_context(img, img_ctx)) {
           return -1;
         }
+        if (!apply_vdd_color_transform(img)) {
+          BOOST_LOG(error) << "Failed to prepare ABI5 VDD color transform"sv;
+          return -1;
+        }
 
         // Only the legacy cross-device path needs a keyed mutex.
         if (!fused) {
@@ -850,7 +1000,13 @@ namespace platf::dxgi {
           // Draw Y/YUV
           device_ctx->OMSetRenderTargets(1, &out_Y_or_YUV_rtv, nullptr);
           device_ctx->VSSetShader(convert_Y_or_YUV_vs.get(), nullptr, 0);
-          device_ctx->PSSetShader(img.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? convert_Y_or_YUV_fp16_ps.get() : convert_Y_or_YUV_ps.get(), nullptr, 0);
+          device_ctx->PSSetShader(
+            vdd_color_transform_active ? convert_Y_or_YUV_vdd_ps.get() :
+            img.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? convert_Y_or_YUV_fp16_ps.get() :
+                                                           convert_Y_or_YUV_ps.get(),
+            nullptr,
+            0
+          );
           auto viewport_count = (format == DXGI_FORMAT_R16_UINT) ? 3 : 1;
           assert(viewport_count <= y_or_yuv_viewports.size());
           device_ctx->RSSetViewports(viewport_count, y_or_yuv_viewports.data());
@@ -861,7 +1017,13 @@ namespace platf::dxgi {
             assert(format == DXGI_FORMAT_NV12 || format == DXGI_FORMAT_P010);
             device_ctx->OMSetRenderTargets(1, &out_UV_rtv, nullptr);
             device_ctx->VSSetShader(convert_UV_vs.get(), nullptr, 0);
-            device_ctx->PSSetShader(img.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? convert_UV_fp16_ps.get() : convert_UV_ps.get(), nullptr, 0);
+            device_ctx->PSSetShader(
+              vdd_color_transform_active ? convert_UV_vdd_ps.get() :
+              img.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? convert_UV_fp16_ps.get() :
+                                                             convert_UV_ps.get(),
+              nullptr,
+              0
+            );
             device_ctx->RSSetViewports(1, &uv_viewport);
             device_ctx->Draw(3, 0);
           }
@@ -923,6 +1085,9 @@ namespace platf::dxgi {
       if (fused) {
         context_lock = std::unique_lock(*shared_context_mutex);
       }
+      vdd_output_transfer = colorspace.colorspace == ::video::colorspace_e::bt2020 ? 1U :
+                            colorspace.colorspace == ::video::colorspace_e::bt2020hlg ? 2U :
+                                                                                       0U;
       auto color_vectors = ::video::color_vectors_from_colorspace(colorspace, true);
 
       if (format == DXGI_FORMAT_AYUV || format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_Y410) {
@@ -987,14 +1152,23 @@ namespace platf::dxgi {
           create_vertex_shader_helper(convert_yuv420_planar_y_vs_hlsl, convert_Y_or_YUV_vs);
           create_pixel_shader_helper(convert_yuv420_planar_y_ps_hlsl, convert_Y_or_YUV_ps);
           create_pixel_shader_helper(convert_yuv420_planar_y_ps_linear_hlsl, convert_Y_or_YUV_fp16_ps);
+          if (display->direct_vdd_is_active()) {
+            create_pixel_shader_helper(convert_yuv420_planar_y_ps_vdd_color_transform_hlsl, convert_Y_or_YUV_vdd_ps);
+          }
           if (downscaling) {
             create_vertex_shader_helper(convert_yuv420_packed_uv_type0s_vs_hlsl, convert_UV_vs);
             create_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_hlsl, convert_UV_ps);
             create_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_linear_hlsl, convert_UV_fp16_ps);
+            if (display->direct_vdd_is_active()) {
+              create_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_vdd_color_transform_hlsl, convert_UV_vdd_ps);
+            }
           } else {
             create_vertex_shader_helper(convert_yuv420_packed_uv_type0_vs_hlsl, convert_UV_vs);
             create_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_hlsl, convert_UV_ps);
             create_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_linear_hlsl, convert_UV_fp16_ps);
+            if (display->direct_vdd_is_active()) {
+              create_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_vdd_color_transform_hlsl, convert_UV_vdd_ps);
+            }
           }
           break;
 
@@ -1007,6 +1181,9 @@ namespace platf::dxgi {
           } else {
             create_pixel_shader_helper(convert_yuv420_planar_y_ps_linear_hlsl, convert_Y_or_YUV_fp16_ps);
           }
+          if (display->direct_vdd_is_active()) {
+            create_pixel_shader_helper(convert_yuv420_planar_y_ps_vdd_color_transform_hlsl, convert_Y_or_YUV_vdd_ps);
+          }
           if (downscaling) {
             create_vertex_shader_helper(convert_yuv420_packed_uv_type0s_vs_hlsl, convert_UV_vs);
             create_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_hlsl, convert_UV_ps);
@@ -1015,6 +1192,9 @@ namespace platf::dxgi {
             } else {
               create_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_linear_hlsl, convert_UV_fp16_ps);
             }
+            if (display->direct_vdd_is_active()) {
+              create_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_vdd_color_transform_hlsl, convert_UV_vdd_ps);
+            }
           } else {
             create_vertex_shader_helper(convert_yuv420_packed_uv_type0_vs_hlsl, convert_UV_vs);
             create_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_hlsl, convert_UV_ps);
@@ -1022,6 +1202,9 @@ namespace platf::dxgi {
               create_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_perceptual_quantizer_hlsl, convert_UV_fp16_ps);
             } else {
               create_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_linear_hlsl, convert_UV_fp16_ps);
+            }
+            if (display->direct_vdd_is_active()) {
+              create_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_vdd_color_transform_hlsl, convert_UV_vdd_ps);
             }
           }
           break;
@@ -1035,6 +1218,9 @@ namespace platf::dxgi {
           } else {
             create_pixel_shader_helper(convert_yuv444_planar_ps_linear_hlsl, convert_Y_or_YUV_fp16_ps);
           }
+          if (display->direct_vdd_is_active()) {
+            create_pixel_shader_helper(convert_yuv444_planar_ps_vdd_color_transform_hlsl, convert_Y_or_YUV_vdd_ps);
+          }
           break;
 
         case DXGI_FORMAT_AYUV:
@@ -1042,6 +1228,9 @@ namespace platf::dxgi {
           create_vertex_shader_helper(convert_yuv444_packed_vs_hlsl, convert_Y_or_YUV_vs);
           create_pixel_shader_helper(convert_yuv444_packed_ayuv_ps_hlsl, convert_Y_or_YUV_ps);
           create_pixel_shader_helper(convert_yuv444_packed_ayuv_ps_linear_hlsl, convert_Y_or_YUV_fp16_ps);
+          if (display->direct_vdd_is_active()) {
+            create_pixel_shader_helper(convert_yuv444_packed_ayuv_ps_vdd_color_transform_hlsl, convert_Y_or_YUV_vdd_ps);
+          }
           break;
 
         case DXGI_FORMAT_Y410:
@@ -1052,6 +1241,9 @@ namespace platf::dxgi {
             create_pixel_shader_helper(convert_yuv444_packed_y410_ps_perceptual_quantizer_hlsl, convert_Y_or_YUV_fp16_ps);
           } else {
             create_pixel_shader_helper(convert_yuv444_packed_y410_ps_linear_hlsl, convert_Y_or_YUV_fp16_ps);
+          }
+          if (display->direct_vdd_is_active()) {
+            create_pixel_shader_helper(convert_yuv444_packed_y410_ps_vdd_color_transform_hlsl, convert_Y_or_YUV_vdd_ps);
           }
           break;
 
@@ -1475,6 +1667,10 @@ namespace platf::dxgi {
 
     buf_t subsample_offset;  ///< Subsample offset.
     buf_t color_matrix;  ///< Color matrix.
+    std::shared_ptr<vdd_gpu_color_transform_t> vdd_gpu_transform_current;  ///< Current GPU transform resources.
+    std::shared_ptr<vdd_gpu_color_transform_t> vdd_gpu_transform_previous;  ///< Previous retained GPU transform resources.
+    bool vdd_color_transform_active {};  ///< Select ABI5 transform shaders for this conversion.
+    std::uint32_t vdd_output_transfer {};  ///< Zero SDR, one PQ, or two HLG from negotiated colorimetry.
 
     blend_t blend_disable;  ///< Blend disable.
     sampler_state_t sampler_linear;  ///< Sampler linear.
@@ -1494,10 +1690,12 @@ namespace platf::dxgi {
     vs_t convert_Y_or_YUV_vs;  ///< Convert y or YUV vs.
     ps_t convert_Y_or_YUV_ps;  ///< Convert y or YUV ps.
     ps_t convert_Y_or_YUV_fp16_ps;  ///< Convert y or YUV fp16 ps.
+    ps_t convert_Y_or_YUV_vdd_ps;  ///< Convert y or YUV with ABI5 VDD transform.
 
     vs_t convert_UV_vs;  ///< Convert UV vs.
     ps_t convert_UV_ps;  ///< Convert UV ps.
     ps_t convert_UV_fp16_ps;  ///< Convert UV fp16 ps.
+    ps_t convert_UV_vdd_ps;  ///< Convert UV with ABI5 VDD transform.
 
     std::array<D3D11_VIEWPORT, 3> out_Y_or_YUV_viewports;  ///< Out y or YUV viewports.
     std::array<D3D11_VIEWPORT, 3> out_Y_or_YUV_viewports_for_clear;  ///< Out y or YUV viewports for clear.
@@ -1761,8 +1959,8 @@ namespace platf::dxgi {
         auto context_lock = std::lock_guard(display->fused_context_mutex);
         if (fused_path) {
           if (!fused_healthy) {
-            display->disable_direct_vdd();
             display->request_fused_reinit();
+            display->disable_direct_vdd();
           }
           if (nvenc_d3d) {
             nvenc_d3d->set_fused_input_enabled(false);
@@ -1820,6 +2018,12 @@ namespace platf::dxgi {
           }
         }
         if (!base) {
+          if (vram_display->direct_vdd_is_required()) {
+            vram_display->request_fused_reinit();
+            vram_display->disable_direct_vdd();
+            BOOST_LOG(error) << "Required Lumen VDD direct-frame NVENC binding failed; refusing legacy encode fallback";
+            return false;
+          }
           vram_display->disable_direct_vdd();
           BOOST_LOG(warning) << "Lumen VDD direct-frame NVENC binding failed; scheduling DDA/WGC fallback";
         }
@@ -1976,6 +2180,8 @@ namespace platf::dxgi {
         }
       }
       fused_healthy = initialized && fused_path;
+      current_hdr_transfer = initialized ? transfer : nvenc::hdr_transfer_e::sdr;
+      current_hdr_static_metadata = initialized ? hdr_metadata : std::nullopt;
       return initialized;
     }
 
@@ -1986,6 +2192,27 @@ namespace platf::dxgi {
      * @return Conversion status.
      */
     int convert(platf::img_t &img_base) override {
+      const auto &img = static_cast<const img_d3d_t &>(img_base);
+      if (img.color_transform) {
+        if (current_hdr_transfer == nvenc::hdr_transfer_e::hdr10_pq) {
+          const auto metadata = frame_hdr_static_metadata(img.color_metadata);
+          if (!metadata) {
+            BOOST_LOG(error) << "ABI5 PQ frame omitted valid resolved static metadata"sv;
+            return -1;
+          }
+          if (!current_hdr_static_metadata || *metadata != *current_hdr_static_metadata) {
+            if (!nvenc_d3d->update_hdr_metadata(*metadata)) {
+              BOOST_LOG(error) << "NVENC rejected changed ABI5 PQ static metadata"sv;
+              return -1;
+            }
+            current_hdr_static_metadata = metadata;
+          }
+        } else if (current_hdr_transfer == nvenc::hdr_transfer_e::sdr &&
+                   img.color_metadata.hdr_metadata_type != virtual_display::hdr_metadata_type_e::none) {
+          BOOST_LOG(error) << "ABI5 SDR frame unexpectedly carried HDR metadata"sv;
+          return -1;
+        }
+      }
       const auto result = base->convert(img_base);
       if (result == 0) {
         const auto child = base->take_telemetry_child();
@@ -2014,8 +2241,8 @@ namespace platf::dxgi {
         nvenc_d3d->clear_frame_telemetry_token();
       }
       if (auto display = resource_display.lock()) {
-        display->disable_direct_vdd();
         display->request_fused_reinit();
+        display->disable_direct_vdd();
       }
     }
 
@@ -2026,6 +2253,8 @@ namespace platf::dxgi {
     bool fused_path = false;  ///< Whether this encoder removed legacy cross-device resource boundaries.
     bool fused_healthy = false;  ///< Whether fused encoder initialization completed without requiring rollback.
     bool legacy_path = false;  ///< Whether this encoder owns legacy cross-device capture resources.
+    std::optional<nvenc::hdr_static_metadata_t> current_hdr_static_metadata;  ///< Last ABI5 block accepted by NVENC.
+    nvenc::hdr_transfer_e current_hdr_transfer {nvenc::hdr_transfer_e::sdr};  ///< Negotiated wire transfer for ABI5 conversion.
     std::weak_ptr<display_vram_t> resource_display;  ///< Display whose resource mode is owned by this encoder.
   };
 
@@ -2553,6 +2782,13 @@ namespace platf::dxgi {
   }
 
   int display_ddup_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    if (virtual_display::requires_direct_frame_for_vdd_hdr(
+          config.dynamicRange != 0,
+          config.virtual_display_active
+        )) {
+      BOOST_LOG(error) << "HDR VDD requires the ABI5 direct FP16 transform path; refusing DDA fallback"sv;
+      return -1;
+    }
     if (display_base_t::init(config, display_name) || dup.init(this, config)) {
       return -1;
     }
@@ -2719,6 +2955,13 @@ namespace platf::dxgi {
   }
 
   int display_wgc_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    if (virtual_display::requires_direct_frame_for_vdd_hdr(
+          config.dynamicRange != 0,
+          config.virtual_display_active
+        )) {
+      BOOST_LOG(error) << "HDR VDD requires the ABI5 direct FP16 transform path; refusing WGC fallback"sv;
+      return -1;
+    }
     if (display_base_t::init(config, display_name) || dup.init(this, config)) {
       return -1;
     }
@@ -2741,13 +2984,16 @@ namespace platf::dxgi {
 
   int display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
     source_ = config.virtual_display_frame_source;
+    direct_required_ = config.virtual_display_direct_required;
     if (!source_ || !source_->healthy()) {
       return -1;
     }
-    const auto resources = source_->resources();
-    if (resources.width != static_cast<std::uint32_t>(config.width) ||
-        resources.height != static_cast<std::uint32_t>(config.height) ||
-        resources.format != virtual_display::frame_format_e::bgra8) {
+    resources_ = source_->resources();
+    if (resources_.width != static_cast<std::uint32_t>(config.width) ||
+        resources_.height != static_cast<std::uint32_t>(config.height) ||
+        resources_.dynamic_range != (config.dynamicRange ?
+                                      virtual_display::dynamic_range_e::hdr10 :
+                                      virtual_display::dynamic_range_e::sdr)) {
       source_->stop();
       return -1;
     }
@@ -2818,7 +3064,9 @@ namespace platf::dxgi {
       source_->stop();
       return -1;
     }
-    capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    capture_format = resources_.format == virtual_display::frame_format_e::rgba16_float ?
+                       DXGI_FORMAT_R16G16B16A16_FLOAT :
+                       DXGI_FORMAT_B8G8R8A8_UNORM;
     feature_level = device->GetFeatureLevel();
     next_image_id.store(0, std::memory_order_relaxed);
     display_refresh_rate = {
@@ -2855,7 +3103,8 @@ namespace platf::dxgi {
 
     auto d3d_img = std::dynamic_pointer_cast<img_d3d_t>(img_out);
     auto *texture = static_cast<ID3D11Texture2D *>(acquired.lease->native_texture());
-    if (!d3d_img || texture == nullptr || d3d_img->encode_source_lifetime) {
+    if (!d3d_img || texture == nullptr || d3d_img->encode_source_lifetime ||
+        !acquired.lease->color_transform()) {
       source_->stop();
       return capture_e::reinit;
     }
@@ -2876,9 +3125,9 @@ namespace platf::dxgi {
     d3d_img->data = reinterpret_cast<std::uint8_t *>(texture);
     d3d_img->width = width;
     d3d_img->height = height;
-    d3d_img->pixel_pitch = 4;
-    d3d_img->row_pitch = width * 4;
-    d3d_img->format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d3d_img->pixel_pitch = static_cast<std::int32_t>(virtual_display::frame_format_pixel_pitch(resources_.format));
+    d3d_img->row_pitch = width * d3d_img->pixel_pitch;
+    d3d_img->format = capture_format;
     d3d_img->dummy = false;
     d3d_img->blank = false;
     d3d_img->fused_resource = true;
@@ -2894,6 +3143,8 @@ namespace platf::dxgi {
       qpc_counter(),
       acquired.lease->descriptor().capture_qpc
     );
+    d3d_img->color_transform = acquired.lease->color_transform();
+    d3d_img->color_metadata = acquired.lease->descriptor().color_metadata;
     d3d_img->encode_source_lifetime = std::move(acquired.lease);
     return capture_e::ok;
   }
@@ -2903,20 +3154,36 @@ namespace platf::dxgi {
   }
 
   bool display_vdd_vram_t::is_hdr() {
-    return false;
+    return resources_.dynamic_range == virtual_display::dynamic_range_e::hdr10;
   }
 
   bool display_vdd_vram_t::get_hdr_metadata(SS_HDR_METADATA &metadata) {
     std::memset(&metadata, 0, sizeof(metadata));
-    return false;
+    if (!is_hdr()) {
+      return false;
+    }
+    const auto &source = resources_.initial_color_metadata.hdr10_metadata;
+    metadata.displayPrimaries[0] = {source.red_primary[0], source.red_primary[1]};
+    metadata.displayPrimaries[1] = {source.green_primary[0], source.green_primary[1]};
+    metadata.displayPrimaries[2] = {source.blue_primary[0], source.blue_primary[1]};
+    metadata.whitePoint = {source.white_point[0], source.white_point[1]};
+    metadata.maxDisplayLuminance = source.maximum_mastering_luminance;
+    metadata.minDisplayLuminance = source.minimum_mastering_luminance;
+    metadata.maxContentLightLevel = source.maximum_content_light_level;
+    metadata.maxFrameAverageLightLevel = source.maximum_frame_average_light_level;
+    return true;
   }
 
   std::vector<DXGI_FORMAT> display_vdd_vram_t::get_supported_capture_formats() {
-    return {DXGI_FORMAT_B8G8R8A8_UNORM};
+    return {capture_format};
   }
 
   bool display_vdd_vram_t::direct_vdd_is_active() const noexcept {
     return source_ && source_->healthy();
+  }
+
+  bool display_vdd_vram_t::direct_vdd_is_required() const noexcept {
+    return direct_required_;
   }
 
   void display_vdd_vram_t::disable_direct_vdd() noexcept {
@@ -3218,24 +3485,30 @@ namespace platf::dxgi {
     compile_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps);
     compile_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_linear);
     compile_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_perceptual_quantizer);
+    compile_pixel_shader_helper(convert_yuv420_packed_uv_type0_ps_vdd_color_transform);
     compile_vertex_shader_helper(convert_yuv420_packed_uv_type0_vs);
     compile_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps);
     compile_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_linear);
     compile_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_perceptual_quantizer);
+    compile_pixel_shader_helper(convert_yuv420_packed_uv_type0s_ps_vdd_color_transform);
     compile_vertex_shader_helper(convert_yuv420_packed_uv_type0s_vs);
     compile_pixel_shader_helper(convert_yuv420_planar_y_ps);
     compile_pixel_shader_helper(convert_yuv420_planar_y_ps_linear);
     compile_pixel_shader_helper(convert_yuv420_planar_y_ps_perceptual_quantizer);
+    compile_pixel_shader_helper(convert_yuv420_planar_y_ps_vdd_color_transform);
     compile_vertex_shader_helper(convert_yuv420_planar_y_vs);
     compile_pixel_shader_helper(convert_yuv444_packed_ayuv_ps);
     compile_pixel_shader_helper(convert_yuv444_packed_ayuv_ps_linear);
+    compile_pixel_shader_helper(convert_yuv444_packed_ayuv_ps_vdd_color_transform);
     compile_vertex_shader_helper(convert_yuv444_packed_vs);
     compile_pixel_shader_helper(convert_yuv444_planar_ps);
     compile_pixel_shader_helper(convert_yuv444_planar_ps_linear);
     compile_pixel_shader_helper(convert_yuv444_planar_ps_perceptual_quantizer);
+    compile_pixel_shader_helper(convert_yuv444_planar_ps_vdd_color_transform);
     compile_pixel_shader_helper(convert_yuv444_packed_y410_ps);
     compile_pixel_shader_helper(convert_yuv444_packed_y410_ps_linear);
     compile_pixel_shader_helper(convert_yuv444_packed_y410_ps_perceptual_quantizer);
+    compile_pixel_shader_helper(convert_yuv444_packed_y410_ps_vdd_color_transform);
     compile_vertex_shader_helper(convert_yuv444_planar_vs);
     compile_pixel_shader_helper(cursor_ps);
     compile_pixel_shader_helper(cursor_ps_normalize_white);

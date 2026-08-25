@@ -729,16 +729,6 @@ namespace platf::virtual_display {
                physical(start_error_e::invalid_mode, validation_error_e::unsupported_delivery_policy) :
                rejected(start_error_e::invalid_mode, validation_error_e::unsupported_delivery_policy);
     }
-    if (request.mode.dynamic_range != dynamic_range_e::sdr) {
-      return policy == activation_policy_e::optional ?
-               physical(start_error_e::invalid_mode, validation_error_e::unsupported_dynamic_range) :
-               rejected(start_error_e::invalid_mode, validation_error_e::unsupported_dynamic_range);
-    }
-    if (request.mode.bits_per_channel != 8) {
-      return policy == activation_policy_e::optional ?
-               physical(start_error_e::invalid_mode, validation_error_e::unsupported_bit_depth) :
-               rejected(start_error_e::invalid_mode, validation_error_e::unsupported_bit_depth);
-    }
     const auto validation = validate_mode(request.mode, limits, request.minimum_fidelity);
     if (validation != validation_error_e::none) {
       return policy == activation_policy_e::optional ?
@@ -969,12 +959,16 @@ namespace platf::virtual_display {
           return {false, ERROR_INVALID_DATA};
         }
         mode_t active_mode;
+        std::optional<delivery_policy_e> active_delivery_policy;
         if (response.generation != 0) {
           const auto converted = from_abi(response.mode);
           if (!converted) {
             return {false, ERROR_INVALID_DATA};
           }
           active_mode = *converted;
+          active_delivery_policy = response.mode.delivery_policy == LUMEN_VDD_POLICY_LATENCY ?
+                                     delivery_policy_e::latency :
+                                     delivery_policy_e::quality;
         }
         state = {
           response.generation,
@@ -985,6 +979,7 @@ namespace platf::virtual_display {
           response.preferred_render_adapter_luid,
           response.assigned_render_adapter_luid,
           response.render_adapter_preference_submitted != 0,
+          active_delivery_policy,
         };
         return {};
       }

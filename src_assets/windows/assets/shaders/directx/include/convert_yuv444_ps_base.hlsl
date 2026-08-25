@@ -1,6 +1,10 @@
 Texture2D image : register(t0);
 SamplerState def_sampler : register(s0);
 
+#if defined(VDD_COLOR_TRANSFORM)
+#include "include/convert_vdd_color_transform_base.hlsl"
+#endif
+
 #ifndef PLANAR_VIEWPORTS
 cbuffer color_matrix_cbuffer : register(b0) {
     float4 color_vec_y;

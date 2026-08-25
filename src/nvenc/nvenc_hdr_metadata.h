@@ -52,8 +52,7 @@ namespace nvenc {
   /** Return whether one chromaticity coordinate is finite in normalized CIE space. */
   [[nodiscard]] constexpr bool valid_hdr_chromaticity(const hdr_chromaticity_t &point) noexcept {
     constexpr std::uint32_t normalized_one = 50'000U;
-    return point.x != 0 && point.y != 0 && point.x <= normalized_one && point.y <= normalized_one &&
-           static_cast<std::uint32_t>(point.x) + point.y <= normalized_one;
+    return point.x != 0 && point.y != 0 && point.x <= normalized_one && point.y <= normalized_one;
   }
 
   /** Return whether a complete static block can be serialized without inventing values. */

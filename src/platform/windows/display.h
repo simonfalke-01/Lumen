@@ -320,6 +320,20 @@ namespace platf::dxgi {
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override;
 
+    /** @brief Report whether frames arrive from the concrete VDD texture/fence channel. */
+    [[nodiscard]] virtual bool direct_vdd_is_active() const noexcept {
+      return false;
+    }
+
+    /** @brief Report whether this session forbids every non-direct capture/encode fallback. */
+    [[nodiscard]] virtual bool direct_vdd_is_required() const noexcept {
+      return false;
+    }
+
+    /** @brief Quarantine a failed direct VDD source before DDA/WGC reinitialization. */
+    virtual void disable_direct_vdd() noexcept {
+    }
+
     factory1_t factory;  ///< DXGI factory used to enumerate adapters and outputs.
     adapter_t adapter;  ///< DXGI adapter containing the selected output.
     output_t output;  ///< DXGI output duplicated for capture.
@@ -643,15 +657,6 @@ namespace platf::dxgi {
       return encode_resource_ownership->state() == fused_d3d11::resource_state_e::legacy;
     }
 
-    /** @brief Report whether frames arrive from the concrete VDD texture/fence channel. */
-    [[nodiscard]] virtual bool direct_vdd_is_active() const noexcept {
-      return false;
-    }
-
-    /** @brief Quarantine a failed direct VDD source before DDA/WGC reinitialization. */
-    virtual void disable_direct_vdd() noexcept {
-    }
-
     /**
      * @brief Lock the capture immediate context across ownership transitions and fused rendering.
      *
@@ -688,19 +693,23 @@ namespace platf::dxgi {
     ) override;
     /** @brief IddCx owns source acquisition; no DDA/WGC frame remains to release. */
     capture_e release_snapshot() override;
-    /** @brief Direct-frame v1 is explicitly SDR-only. */
+    /** @brief Report the exact prepared SDR/HDR10 range. */
     bool is_hdr() override;
-    /** @brief Direct-frame v1 has no HDR metadata. */
+    /** @brief Return initial resolved ABI5 HDR10 metadata before first dequeue. */
     bool get_hdr_metadata(SS_HDR_METADATA &metadata) override;
     /** @brief Return the sole supported driver surface format. */
     std::vector<DXGI_FORMAT> get_supported_capture_formats() override;
     /** @brief Return true for this concrete production direct VDD source. */
     [[nodiscard]] bool direct_vdd_is_active() const noexcept override;
+    /** @brief Return whether this session must retain the direct source through NVENC. */
+    [[nodiscard]] bool direct_vdd_is_required() const noexcept override;
     /** @brief Stop the production source so the next display factory pass uses DDA/WGC. */
     void disable_direct_vdd() noexcept override;
 
   private:
     std::shared_ptr<virtual_display::frame_source_t> source_;  ///< Exact generation-owned source.
+    virtual_display::frame_resources_t resources_;  ///< Immutable imported format and initial color state.
+    bool direct_required_ {};  ///< Fail closed instead of entering legacy encode resources.
   };
 
   /**

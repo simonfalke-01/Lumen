@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <variant>
 
 // local includes
 #include "src/platform/common.h"
@@ -18,11 +19,132 @@
 
 namespace platf::virtual_display {
   inline constexpr std::size_t direct_frame_slot_count {2};  ///< Fixed persistent VDD slot count.
+  inline constexpr std::size_t color_transform_lut_entry_count {4096};  ///< Fixed ABI5 3x4 LUT size.
 
   /** @brief Pixel format exported by the VDD direct-frame channel. */
   enum class frame_format_e : std::uint32_t {
     bgra8 = 1,  ///< DXGI_FORMAT_B8G8R8A8_UNORM.
+    rgba16_float = 2,  ///< DXGI_FORMAT_R16G16B16A16_FLOAT.
   };
+
+  /** Return the exact byte pitch for one ABI5 direct-frame pixel. */
+  [[nodiscard]] constexpr std::uint32_t frame_format_pixel_pitch(const frame_format_e format) noexcept {
+    return format == frame_format_e::rgba16_float ? 8U : 4U;
+  }
+
+  /** Return whether an active HDR VDD forbids untransformed DDA/WGC capture. */
+  [[nodiscard]] constexpr bool requires_direct_frame_for_vdd_hdr(
+    const bool hdr_requested,
+    const bool virtual_display_active
+  ) noexcept {
+    return hdr_requested && virtual_display_active;
+  }
+
+  /** Return whether a required VDD session may enter the exact DXGI direct-frame branch. */
+  [[nodiscard]] constexpr bool valid_required_direct_capture_request(
+    const bool direct_required,
+    const bool dxgi_capture,
+    const bool has_vdd_source
+  ) noexcept {
+    return !direct_required || (dxgi_capture && has_vdd_source);
+  }
+
+  /** @brief Resolved surface color space carried with each leased frame. */
+  enum class frame_color_space_e : std::uint32_t {
+    srgb = 1,
+    scrgb = 2,
+    hdr10 = 3,
+  };
+
+  /** @brief Resolved HDR10 metadata source state from IddCx. */
+  enum class hdr_metadata_type_e : std::uint32_t {
+    none = 0,
+    default_ = 1,
+    unchanged = 2,
+    new_ = 3,
+  };
+
+  /** @brief Exact resolved HDR10 static metadata carried by ABI5. */
+  struct frame_hdr10_metadata_t {
+    std::array<std::uint16_t, 2> red_primary {};
+    std::array<std::uint16_t, 2> green_primary {};
+    std::array<std::uint16_t, 2> blue_primary {};
+    std::array<std::uint16_t, 2> white_point {};
+    std::uint16_t maximum_mastering_luminance {};
+    std::uint16_t minimum_mastering_luminance {};
+    std::uint16_t maximum_content_light_level {};
+    std::uint16_t maximum_frame_average_light_level {};
+
+    bool operator==(const frame_hdr10_metadata_t &) const = default;
+  };
+
+  /** @brief Exact frame-scoped color metadata resolved before encoder creation or dequeue. */
+  struct frame_color_metadata_t {
+    frame_color_space_e surface_color_space {frame_color_space_e::srgb};
+    std::uint32_t sdr_white_level_nits {};
+    hdr_metadata_type_e hdr_metadata_type {hdr_metadata_type_e::none};
+    frame_hdr10_metadata_t hdr10_metadata {};
+
+    bool operator==(const frame_color_metadata_t &) const = default;
+  };
+
+  /** @brief Immutable gamma/color-transform payload kind. */
+  enum class color_transform_type_e : std::uint32_t {
+    default_ = 1,
+    rgb256x3x16 = 2,
+    colorspace_3x4 = 3,
+  };
+
+  /** @brief Exact legacy 256-entry RGB gamma ramp. */
+  struct color_transform_rgb256_t {
+    std::array<std::uint16_t, 256> red {};
+    std::array<std::uint16_t, 256> green {};
+    std::array<std::uint16_t, 256> blue {};
+  };
+
+  /** @brief One exact ABI5 floating-point RGB lookup-table entry. */
+  struct color_transform_rgb_t {
+    float red {};
+    float green {};
+    float blue {};
+  };
+
+  /** @brief Exact normalized ABI5 3x4 matrix/scalar/4096-entry LUT payload. */
+  struct color_transform_3x4_t {
+    bool matrix_enabled {};
+    std::array<float, 12> color_matrix_3x4 {};
+    float scalar_multiplier {};
+    bool lut_enabled {};
+    std::array<color_transform_rgb_t, color_transform_lut_entry_count> lookup_table_1d {};
+    std::array<float, 12> wire_rec709_matrix_3x4 {};  ///< CPU-precomposed linear Rec.709 wire transform.
+    std::array<float, 12> wire_rec2020_matrix_3x4 {};  ///< CPU-precomposed linear Rec.2020 wire transform.
+  };
+
+  /** @brief One immutable generation/version transform shared through slot ownership. */
+  struct color_transform_t {
+    std::uint64_t generation {};
+    std::uint64_t version {};
+    color_transform_type_e type {color_transform_type_e::default_};
+    std::variant<std::monostate, color_transform_rgb256_t, color_transform_3x4_t> payload;
+  };
+
+  /** @brief Two-version immutable transform cache matching the driver's retained window. */
+  class color_transform_cache_t {
+  public:
+    [[nodiscard]] std::shared_ptr<const color_transform_t> find(
+      std::uint64_t generation,
+      std::uint64_t version
+    ) const noexcept;
+    bool commit(std::shared_ptr<const color_transform_t> transform) noexcept;
+    void clear() noexcept;
+
+  private:
+    std::shared_ptr<const color_transform_t> current_;
+    std::shared_ptr<const color_transform_t> previous_;
+  };
+
+  /** Validate finite payload values and precompose both supported wire-primary matrices. */
+  [[nodiscard]] bool prepare_color_transform(color_transform_t &transform) noexcept;
 
   /** @brief Stable result for one production direct-frame operation. */
   enum class frame_io_e {
@@ -43,9 +165,12 @@ namespace platf::virtual_display {
     std::uint32_t width {};  ///< Texture width.
     std::uint32_t height {};  ///< Texture height.
     frame_format_e format {frame_format_e::bgra8};  ///< Shared texture format.
+    dynamic_range_e dynamic_range {dynamic_range_e::sdr};  ///< Exact prepared stream range.
     std::uint32_t slot_count {};  ///< Must equal `direct_frame_slot_count`.
     std::array<std::uintptr_t, direct_frame_slot_count> texture_handles {};  ///< Duplicated texture handles.
     std::array<std::uintptr_t, direct_frame_slot_count> fence_handles {};  ///< Duplicated fence handles.
+    std::uint64_t initial_color_transform_version {};  ///< Version required before encoder creation.
+    frame_color_metadata_t initial_color_metadata;  ///< Initial resolved color/white/HDR state.
   };
 
   /** @brief Adapter identity required at the VDD-import and active-NVENC boundary. */
@@ -63,7 +188,7 @@ namespace platf::virtual_display {
   /**
    * @brief Validate the imported VDD adapter against the active encoder probe.
    * @param nvenc_active Whether the committed active encoder backend is NVENC.
-   * @param imported Exact identity queried from the adapter named by the ABI v4 response.
+   * @param imported Exact identity queried from the adapter named by the ABI5 response.
    * @param encoder_probe Exact adapter identity retained by the active encoder probe.
    * @return True only for one complete NVIDIA identity with exact LUID/PCI/driver agreement.
    */
@@ -101,6 +226,8 @@ namespace platf::virtual_display {
     std::int64_t capture_qpc {};  ///< QPC sampled after IddCx acquisition.
     std::int64_t producer_signal_qpc {};  ///< QPC sampled after producer fence submission.
     std::uint32_t slot {};  ///< Persistent slot index.
+    std::uint64_t color_transform_version {};  ///< Exact transform retained while this slot is leased.
+    frame_color_metadata_t color_metadata;  ///< Frame-scoped resolved surface and HDR state.
   };
 
   /**
@@ -108,7 +235,7 @@ namespace platf::virtual_display {
    * @param resources Driver response.
    * @param generation Expected active generation.
    * @param mode Exact selected mode.
-   * @return True only for the fixed two-slot BGRA8 contract.
+   * @return True only for the exact two-slot SDR/FP16 HDR contract.
    */
   [[nodiscard]] bool valid_frame_resources(
     const frame_resources_t &resources,
@@ -127,6 +254,13 @@ namespace platf::virtual_display {
     const frame_resources_t &resources
   ) noexcept;
 
+  /** Return whether one initial or dequeued color block matches the exact SDR/HDR mode. */
+  [[nodiscard]] bool valid_frame_color_metadata(
+    const frame_color_metadata_t &metadata,
+    dynamic_range_e dynamic_range,
+    frame_format_e format
+  ) noexcept;
+
   class frame_source_t;
 
   /** @brief RAII ownership of one concrete driver slot through NVENC completion. */
@@ -141,6 +275,8 @@ namespace platf::virtual_display {
     [[nodiscard]] const frame_descriptor_t &descriptor() const noexcept;
     /** @brief Return the imported ID3D11Texture2D pointer for this slot. */
     [[nodiscard]] void *native_texture() const noexcept;
+    /** @brief Return the immutable transform retained with this slot. */
+    [[nodiscard]] const std::shared_ptr<const color_transform_t> &color_transform() const noexcept;
 
   private:
     friend class frame_source_t;
@@ -148,12 +284,14 @@ namespace platf::virtual_display {
     frame_lease_t(
       std::shared_ptr<frame_source_t> source,
       frame_descriptor_t descriptor,
-      void *native_texture
+      void *native_texture,
+      std::shared_ptr<const color_transform_t> color_transform
     );
 
     std::shared_ptr<frame_source_t> source_;  ///< Source retained until exact release completes.
     frame_descriptor_t descriptor_;  ///< Exact generation/sequence/slot ownership.
     void *native_texture_ {};  ///< Non-owning imported texture retained by `source_`.
+    std::shared_ptr<const color_transform_t> color_transform_;  ///< Immutable transform retained through release.
   };
 
   /** @brief Result of waiting for one production VDD frame. */

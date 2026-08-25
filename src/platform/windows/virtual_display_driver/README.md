@@ -1,127 +1,127 @@
 # Lumen Virtual Display Driver
 
-`LumenVirtualDisplay` is Lumen's source-built UMDF2 indirect display driver. It
-exposes one exact, session-scoped resolution and rational refresh rate through
-Microsoft IddCx and is controlled only by the elevated Lumen host service.
+`LumenVirtualDisplay` is Lumen's x64 UMDF2 indirect-display driver. The elevated
+Lumen service owns one generation-fenced virtual monitor with an exact
+resolution, reduced rational refresh rate, dynamic range, and bit depth.
 
-Regular and lite packages do not include this driver. The strict complete
-Windows profile includes the separately built, signed package and its lifecycle
-helper. Surface-fidelity and copy descriptions apply only to the driver/capture
-handoff, not to the encoded, transported, decoded, or displayed stream.
+Lite packages do not include the driver. An MSI includes and selects the VDD
+component by default only when its build receives the exact signed package. The
+complete Windows profile requires that package and its lifecycle helper.
 
-## Supported platform and APIs
+## Platform and API contract
 
 - Windows 10 version 1903 (build 18362) or later, x64.
 - Visual Studio 2022 with Windows SDK/WDK 10.0.26100.0.
-- UMDF 2.25 with IddCx 1.10 headers, a minimum required IddCx version of 1.4,
-  and the downlevel `IddCx0102` extension binding.
-- `IddCxAdapterInitAsync`, `IddCxMonitorCreate`, `IddCxMonitorArrival`,
-  `IddCxMonitorDeparture`, `IddCxAdapterSetRenderAdapter`, the default/target
-  mode callbacks, and the IddCx swap-chain acquire/finish APIs.
-- `QueryDisplayConfig`, `SetDisplayConfig`, and
-  `DisplayConfigGetDeviceInfo` are used by the host coordinator, not by the
-  driver.
+- UMDF 2.25 with IddCx 1.10 headers and IddCx 1.4 as the SDR runtime minimum.
+- `IddCxAdapterSetRenderAdapter`, monitor arrival/departure, dynamic mode, and
+  swap-chain acquire/finish APIs.
+- Host-side `QueryDisplayConfig`, `SetDisplayConfig`, and Advanced Color APIs.
 
-IddCx 1.4 is available throughout Lumen's supported Windows version range and
-is the production minimum. Newer IddCx-only features remain gated until their
-separate Windows and hardware validation is complete.
+ABI 5 advertises HDR only when every required IddCx 1.10 function, callback
+field, structure, and `IDDCX_METADATA2` field is available at runtime. Missing
+HDR API support returns `STATUS_NOT_SUPPORTED`; it is never inferred from an OS
+version string.
 
-## Exact mode contract
+## Exact mode and color contract
 
-The current baseline accepts practical even modes from 256x200 through
-8192x8192 and reduced rational refresh rates from 10 through 480 Hz, further
-bounded by total pixels, pixel rate, the active GPU, and the selected encoder.
-It reports exactly one dynamic monitor/target mode per generation. The host
-rejects any driver or DisplayConfig adjustment; it never silently clamps.
-The permanent connector is EDID-less by design so IddCx obtains the exact
-session mode exclusively through the default and target-mode callbacks.
+The driver accepts even modes from 256x200 through 8192x8192 and reduced
+rational refresh rates from 10 through 480 Hz, further bounded by pixel count,
+pixel rate, the active GPU, and the selected encoder. It publishes exactly one
+mode per generation. The host rejects silent driver or DisplayConfig changes.
 
-The baseline handoff is explicitly SDR, 8-bit BGRA with no format loss inside
-the VDD surface boundary. This is not an end-to-end lossless-stream claim. IddCx 1.10
-`IddCxMonitorUpdateModes2` is required for a proven HDR/WCG path. Until a
-separate Windows 11 hardware gate exists, HDR10 and 10-bit capability bits stay
-clear and HDR requests fall back before VDD mutation.
+ABI 5 admits only these color-mode pairs:
 
-## Security and lifecycle
+- SDR: 8-bit wire mode, BGRA8 direct-frame texture, sRGB surface color space.
+- HDR: 10-bit wire mode, FP16 direct-frame texture, linear scRGB surface color
+  space.
 
-- The device object uses `SDDL_DEVOBJ_SYS_ALL_ADM_ALL`; standard users cannot
-  open the control interface.
-- All mutating IOCTLs require write access, exact packed sizes, the real
-  requestor PID, the owning WDF file object, and a nonzero monotonic generation.
-- ABI v4 reports the driver's retained generation floor and requested/actual
-  render-adapter LUIDs, so a restarted Lumen
-  service continues above it instead of reusing a fenced generation.
-- One process/file/generation owns the driver. Same-request retries are
-  idempotent; other sessions receive busy/access-denied.
-- File cleanup removes the monitor after a service crash. Explicit stale
-  recovery additionally verifies that the former process is no longer alive.
-- Host DisplayConfig state is snapshotted before arrival and restored on every
-  failure and normal stop.
+HDR uses the driver's PQ/BT.2020 EDID, exact `IddCxMonitorUpdateModes2` target,
+and target-scoped Advanced Color state. The FP16/scRGB capture source remains
+linear; downstream stream negotiation preserves the selected PQ or HLG transfer
+instead of deriving it from static metadata.
 
-## Direct-frame contract
+## ABI 5 direct frames
 
-ABI v4 implements one concrete, hardware-gated capture path. After IddCx assigns
-the swap chain, the driver creates exactly two persistent BGRA8 shared textures
-and one shared D3D11 fence per texture on the IddCx render adapter. For each
-accepted desktop surface the driver performs at most one `CopyResource` into a
-safe slot, signals that slot's odd producer fence value, and finishes the IddCx
-frame. This is a one-copy path, not zero-copy.
+The driver creates two persistent shared textures and one shared D3D11 fence
+per slot on the assigned IddCx render adapter. It performs at most one GPU
+`CopyResource` from each accepted IddCx surface into a free slot. This is a
+one-copy path, not zero-copy.
 
-The Lumen service opens the secured device as the exact prepared owner process.
-After exact requestor PID/file/generation authorization, the driver publishes
-raw unnamed WUDFHost event, texture, and fence handles with the source PID and
-process creation time. The LocalSystem host pins that live source process,
-checks its creation time to prevent PID-reuse substitution, and reverse-
-duplicates each handle into itself. The host validates ABI generation, mode,
-adapter LUID, unique handles, texture descriptors, and the exact validated RTX
-4060/NVIDIA driver identity before importing either slot. A driver-published
-auto-reset event wakes bounded resource and frame waits; the Latency path
-performs no millisecond polling.
-For each slot, the driver acquires the current even keyed-mutex value, submits
-the copy and odd producer fence, then releases that odd key to the host. The
-host acquires the odd key, GPU-waits the producer fence, passes the imported
-texture through same-device conversion and NVENC, signals the next even
-consumer fence, and releases the same even key back to the producer on exact
-lease release. The driver never overwrites an acquired or ready slot. Any
-keyed-mutex, GPU wait, copy-device health, fence, descriptor, or terminal IddCx
-failure quarantines every direct slot for that generation and wakes the host so
-capture can fall back without reusing unproven memory.
+For each slot:
 
-The textures use the NT-handle and keyed-mutex creation flags required by
-`IDXGIResource1::CreateSharedHandle`. The keyed mutex provides bounded CPU-side
-slot ownership; the explicit shared D3D11 fence provides GPU ordering and timing
-telemetry.
+1. The driver acquires the even keyed-mutex value.
+2. It copies the surface, signals the odd producer fence, and releases the odd
+   keyed-mutex value to Lumen.
+3. Lumen acquires the odd value, waits on the producer fence, converts and
+   encodes on the same device, then signals and releases the next even value.
+4. The driver reuses the slot only after the exact host release.
 
-PREPARE carries the exact adapter identity frozen by the active encoder probe.
-Before monitor arrival the driver submits that LUID through
-`IddCxAdapterSetRenderAdapter`. The API is a preference, so the actual
-`EvtIddCxMonitorAssignSwapChain.RenderAdapterLuid` remains authoritative. A
-mismatch disables direct-frame publication for that generation while leaving
-the VDD available to the established DDA/WGC fallback.
+When both slots are occupied, the driver drops the newly acquired surface. It
+never overwrites an acquired or ready slot. Latency and Quality sessions use the
+same ownership contract.
 
-Direct-frame activation requires an active NVENC encoder and exact agreement
-between the frozen encoder identity and the imported VDD adapter LUID, PCI
-identity, revision, and UMD driver version. Missing or mismatched identity data
-fails closed to DDA/WGC; there are no manual environment-variable gates.
+Each frame descriptor includes:
 
-Latency and Quality modes both preserve keyed-mutex ownership and ready-slot
-order, dropping a new IddCx surface when both slots are occupied. If any
-capability, identity, handle, fence, import, timeout, conversion,
-or NVENC boundary fails, Lumen quarantines the direct source and reinitializes on
-the existing DDA/WGC path for the already-active virtual display.
+- validated surface color space and SDR white level;
+- resolved HDR metadata type (`DEFAULT`, `UNCHANGED`, or `NEW`) and effective
+  HDR10 static metadata; and
+- the exact immutable color-transform version retained for the frame lease.
+
+Color-transform queries support the default state, a 256-entry per-channel RGB
+gamma table, or a 3x4 matrix with scalar and a 4,096-entry one-dimensional RGB
+LUT. Unknown, malformed, stale, protected, or non-finite metadata and transforms
+disable direct frames for that generation. HDR surfaces must be exact FP16/scRGB
+input; already-PQ surfaces are rejected rather than interpreted heuristically.
+
+## Security and adapter binding
+
+- Standard users cannot open the secured device interface.
+- Mutating IOCTLs require exact packed sizes, write access, the real requestor
+  PID, the owning WDF file, and a nonzero monotonic generation.
+- ABI 5 reports the retained generation floor and requested/assigned adapter
+  LUIDs, preventing generation reuse after a service restart.
+- Same-request retries are idempotent. Another process, file, or generation is
+  rejected.
+- WUDFHost event, texture, and fence handles carry the source PID and creation
+  time. The LocalSystem host pins that process before reverse-duplicating them,
+  preventing PID-reuse substitution.
+- Direct frames require exact agreement between the assigned adapter and the
+  active NVIDIA encoder probe: LUID, PCI identity, revision, and UMD driver
+  version.
+- Display topology and Advanced Color state are restored after failure and
+  normal stop. Crash cleanup removes the monitor; stale recovery verifies the
+  former process is dead.
+
+## Fail-closed behavior and compatibility
+
+Umbra v3 treats the default `optional` runtime policy as required: unless VDD is
+explicitly disabled, startup requires the exact VDD mode and a healthy ABI 5
+direct-frame channel. Direct-frame or NVENC failure ends/reinitializes the v3
+session; it does not switch capture backends mid-session.
+
+Legacy Moonlight keeps its compatibility behavior. With `optional`, a VDD
+activation failure may return to the configured physical display only after a
+proven-safe rollback. If an SDR VDD is already active and its direct channel is
+unavailable or quarantined, Lumen may capture that VDD through DDA/WGC.
+
+An active HDR VDD always requires the ABI 5 FP16/metadata/transform path.
+Startup or runtime failure is terminal for that attempt; untransformed DDA/WGC
+HDR fallback is forbidden.
+
+Surface preservation at this boundary is not a claim that capture-to-display is
+lossless or indistinguishable from a direct cable.
 
 ## Build and validation
 
-Build the project from a Developer Command Prompt:
+Build from a Visual Studio Developer Command Prompt:
 
 ```powershell
 msbuild LumenVirtualDisplay.vcxproj /m /p:Configuration=Release /p:Platform=x64
 ```
 
-Portable tests validate only pure mode and ABI metadata rules. They do not prove
-driver production, resource sharing, or frame flow. Required evidence for the
-direct path is a clean WDK build with `/W4 /WX`, Code Analysis/PREfast, InfVerif,
-then installation and first-activation frame-flow testing on the explicitly
-validated Windows RTX 4060 host. Installation must not occur until every build
-and package gate is green. HDR and latency percentiles remain separate hardware
-validation gates.
+Portable tests validate mode, ABI, metadata, transform, generation, and slot
+ownership rules. Release evidence additionally requires `/W4 /WX`, Code
+Analysis/PREfast, InfVerif, a Microsoft-signed package, MSI lifecycle tests, and
+live first-activation plus failure-injection tests on every declared Windows/GPU
+matrix. HDR correctness and latency percentiles require separate end-to-end
+hardware evidence.

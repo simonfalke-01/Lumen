@@ -226,6 +226,7 @@ if(NOT WIN32)
             ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_gamepad.cpp
             ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_session.cpp
             ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.cpp
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_status.cpp
             ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_frame.cpp)
 endif()
 

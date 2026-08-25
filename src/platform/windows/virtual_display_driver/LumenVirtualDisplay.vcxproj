@@ -65,6 +65,9 @@
     <ClCompile Include="Driver.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="LumenColorTransformPolicy.h" />
+    <ClInclude Include="LumenHdrModePolicy.h" />
+    <ClInclude Include="LumenModeValidationPolicy.h" />
     <ClInclude Include="LumenSingleDeleteOwner.h" />
     <ClInclude Include="LumenVirtualDisplayProtocol.h" />
     <ClInclude Include="LumenVirtualDisplayGuids.h" />

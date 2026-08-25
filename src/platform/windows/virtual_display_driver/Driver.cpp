@@ -2,7 +2,10 @@
  * @file src/platform/windows/virtual_display_driver/Driver.cpp
  * @brief Lumen UMDF2 IddCx virtual display driver.
  */
+#include "LumenColorTransformPolicy.h"
 #include "LumenDirectFrameSlotPolicy.h"
+#include "LumenHdrModePolicy.h"
+#include "LumenModeValidationPolicy.h"
 #include "LumenSingleDeleteOwner.h"
 #include "LumenVirtualDisplayProtocol.h"
 
@@ -11,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -31,12 +35,12 @@
 #include <iddcx.h>
 // clang-format on
 #pragma warning(pop)
+#include "LumenVirtualDisplayGuids.h"
+
 #include <avrt.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
-
-#include "LumenVirtualDisplayGuids.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -49,6 +53,87 @@ namespace {
   std::uint64_t current_process_creation_time() noexcept;
 
   struct device_state_t;
+
+  /** @brief Immutable versioned gamma/color-transform payload. */
+  struct color_transform_blob_t {
+    std::uint64_t version {};  ///< Nonzero generation-local version.
+    std::uint32_t type {LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT};  ///< LUMEN_VDD_GAMMA_RAMP_TYPE_*.
+    std::uint32_t payload_size {};  ///< Exact size for type.
+    LUMEN_VDD_COLOR_TRANSFORM_PAYLOAD payload {};  ///< Exact normalized payload.
+  };
+
+  /** @brief Generation-scoped color and default HDR metadata shared with the swap-chain worker. */
+  struct color_state_t {
+    std::mutex mutex;  ///< Serializes immutable publication and metadata snapshots.
+    std::uint64_t generation {};  ///< Exact owning generation.
+    std::uint64_t next_transform_version {2};  ///< DEFAULT is always version 1.
+    std::shared_ptr<const color_transform_blob_t> current_transform;  ///< Current immutable transform.
+    std::optional<LUMEN_VDD_HDR10_METADATA> default_hdr10_metadata;  ///< Latest copied OS default block.
+  };
+
+  /** @brief Immutable prepared mode published for context-free descriptor callbacks. */
+  struct monitor_descriptor_snapshot_t {
+    std::uint64_t generation {};  ///< Exact prepared generation.
+    LUMEN_VDD_MODE mode {};  ///< Exact prepared mode.
+  };
+
+  /** @brief Ref-counted single-device monitor-description callback context. */
+  struct monitor_descriptor_context_t {
+    std::mutex mutex;  ///< Serializes snapshot replacement and acquisition.
+    std::optional<monitor_descriptor_snapshot_t> snapshot;  ///< Active immutable generation snapshot.
+  };
+
+  /** @brief Resolved per-frame metadata copied from IddCx metadata2. */
+  struct resolved_frame_metadata_t {
+    std::uint32_t surface_color_space {};  ///< LUMEN_VDD_COLOR_SPACE_*.
+    std::uint32_t sdr_white_level_nits {};  ///< Validated 80..480 nits.
+    std::uint32_t hdr_metadata_type {};  ///< LUMEN_VDD_HDR_METADATA_*.
+    LUMEN_VDD_HDR10_METADATA hdr10_metadata {};  ///< Resolved effective block.
+  };
+
+  std::mutex monitor_descriptor_registry_mutex;  ///< Serializes the sole registered device context.
+  std::weak_ptr<monitor_descriptor_context_t> monitor_descriptor_registry;  ///< Sole registered descriptor context.
+
+  /** Return whether every IddCx 1.10 function required by the HDR/metadata contract is available. */
+  bool hdr_runtime_available() noexcept {
+    return IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorUpdateModes2) &&
+           IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2) &&
+           IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxAdapterCommitModes2) &&
+           IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxAdapterQueryTargetInfo) &&
+           IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxParseMonitorDescription2) &&
+           IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxMonitorSetDefaultHdrMetaData) &&
+           IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxMonitorQueryTargetModes2) &&
+           IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxMonitorSetGammaRamp) &&
+           IDD_IS_STRUCTURE_AVAILABLE(IDDCX_METADATA2) &&
+           IDD_IS_FIELD_AVAILABLE(IDDCX_METADATA2, ValidFlags) &&
+           IDD_IS_FIELD_AVAILABLE(IDDCX_METADATA2, HwProtectedSurface) &&
+           IDD_IS_FIELD_AVAILABLE(IDDCX_METADATA2, pSurface) &&
+           IDD_IS_FIELD_AVAILABLE(IDDCX_METADATA2, SurfaceColorSpace) &&
+           IDD_IS_FIELD_AVAILABLE(IDDCX_METADATA2, SdrWhiteLevel) &&
+           IDD_IS_FIELD_AVAILABLE(IDDCX_METADATA2, Hdr10FrameMetaData);
+  }
+
+  /** Copy one IddCx HDR10 block into the stable private ABI representation. */
+  LUMEN_VDD_HDR10_METADATA copy_hdr10_metadata(const IDDCX_HDR10_METADATA &input) noexcept {
+    LUMEN_VDD_HDR10_METADATA output {};
+    std::copy(std::begin(input.RedPrimary), std::end(input.RedPrimary), std::begin(output.red_primary));
+    std::copy(std::begin(input.GreenPrimary), std::end(input.GreenPrimary), std::begin(output.green_primary));
+    std::copy(std::begin(input.BluePrimary), std::end(input.BluePrimary), std::begin(output.blue_primary));
+    std::copy(std::begin(input.WhitePoint), std::end(input.WhitePoint), std::begin(output.white_point));
+    output.maximum_mastering_luminance = input.MaxMasteringLuminance;
+    output.minimum_mastering_luminance = input.MinMasteringLuminance;
+    output.maximum_content_light_level = input.MaxContentLightLevel;
+    output.maximum_frame_average_light_level = input.MaxFrameAverageLightLevel;
+    return output;
+  }
+
+  /** Create generation-local DEFAULT identity transform version 1. */
+  std::shared_ptr<const color_transform_blob_t> default_color_transform() {
+    auto transform = std::make_shared<color_transform_blob_t>();
+    transform->version = 1;
+    transform->type = LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT;
+    return transform;
+  }
 
   /** @brief Heap-owned context attached to the WDF device. */
   struct device_context_t {
@@ -104,7 +189,7 @@ namespace {
   /** @brief Driver-side ownership state for one persistent direct-frame slot. */
   using frame_slot_state_e = lumen::vdd::frame::slot_state_e;
 
-  /** @brief One persistent shared BGRA8 texture and per-slot shared fence. */
+  /** @brief One persistent shared mode-native texture and per-slot shared fence. */
   struct frame_slot_t {
     ~frame_slot_t() {
       if (texture_handle != nullptr) {
@@ -130,6 +215,8 @@ namespace {
     std::uint64_t consumer_fence_value {};  ///< Even host value required before reuse.
     std::int64_t capture_qpc {};  ///< QPC sampled after IddCx acquisition.
     std::int64_t producer_signal_qpc {};  ///< QPC sampled after producer fence submission.
+    std::shared_ptr<const color_transform_blob_t> color_transform;  ///< Immutable transform retained for this lease.
+    resolved_frame_metadata_t metadata;  ///< Resolved IddCx metadata retained for this lease.
   };
 
   /** @brief IddCx swap-chain consumer and concrete two-slot direct-frame producer. */
@@ -142,6 +229,7 @@ namespace {
       std::uint64_t generation,
       LUMEN_VDD_MODE mode,
       HANDLE frame_ready_event,
+      std::shared_ptr<color_state_t> color_state,
       bool direct_frames_enabled
     ):
         swap_chain_(swap_chain),
@@ -149,6 +237,7 @@ namespace {
         generation_(generation),
         mode_(mode),
         frame_ready_event_(frame_ready_event),
+        color_state_(std::move(color_state)),
         stop_event_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {
       direct_enabled_.store(direct_frames_enabled, std::memory_order_relaxed);
       worker_ = std::thread([this, adapter_luid]() {
@@ -177,19 +266,65 @@ namespace {
         return STATUS_UNSUCCESSFUL;
       }
 
-      response = {};
+      std::memset(&response, 0, sizeof(response));
       response.generation = generation_;
       response.adapter_luid = adapter_luid_;
       response.source_process_id = GetCurrentProcessId();
       response.source_process_creation_time = source_creation_time;
       response.width = mode_.width;
       response.height = mode_.height;
-      response.texture_format = LUMEN_VDD_FRAME_FORMAT_BGRA8;
+      response.texture_format = mode_.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 ?
+                                  LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT :
+                                  LUMEN_VDD_FRAME_FORMAT_BGRA8;
       response.slot_count = LUMEN_VDD_FRAME_SLOT_COUNT;
       for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
         response.texture_handles[slot] = reinterpret_cast<std::uint64_t>(slots_[slot].texture_handle);
         response.fence_handles[slot] = reinterpret_cast<std::uint64_t>(slots_[slot].fence_handle);
       }
+      {
+        std::lock_guard color_lock(color_state_->mutex);
+        if (!color_state_->current_transform) {
+          return STATUS_INVALID_DEVICE_STATE;
+        }
+        response.color_transform_version = color_state_->current_transform->version;
+      }
+      response.initial_surface_color_space = initial_metadata_.surface_color_space;
+      response.initial_sdr_white_level_nits = initial_metadata_.sdr_white_level_nits;
+      response.initial_hdr_metadata_type = initial_metadata_.hdr_metadata_type;
+      response.initial_hdr10_metadata = initial_metadata_.hdr10_metadata;
+      return STATUS_SUCCESS;
+    }
+
+    /** @brief Copy one current or slot-retained immutable transform version. */
+    NTSTATUS query_color_transform(
+      const std::uint64_t version,
+      LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE &response
+    ) noexcept {
+      std::shared_ptr<const color_transform_blob_t> selected;
+      {
+        std::lock_guard color_lock(color_state_->mutex);
+        if (color_state_->current_transform && color_state_->current_transform->version == version) {
+          selected = color_state_->current_transform;
+        }
+      }
+      if (!selected) {
+        std::lock_guard lock(mutex_);
+        for (const auto &slot : slots_) {
+          if (slot.color_transform && slot.color_transform->version == version) {
+            selected = slot.color_transform;
+            break;
+          }
+        }
+      }
+      if (!selected) {
+        return STATUS_REVISION_MISMATCH;
+      }
+      std::memset(&response, 0, sizeof(response));
+      response.generation = generation_;
+      response.transform_version = selected->version;
+      response.gamma_ramp_type = selected->type;
+      response.payload_size = selected->payload_size;
+      std::memcpy(&response.payload, &selected->payload, sizeof(response.payload));
       return STATUS_SUCCESS;
     }
 
@@ -208,15 +343,21 @@ namespace {
       }
 
       auto &slot = slots_[*selected];
-      response = {
-        generation_,
-        slot.sequence,
-        slot.producer_fence_value,
-        slot.capture_qpc,
-        slot.producer_signal_qpc,
-        static_cast<std::uint32_t>(*selected),
-        0,
-      };
+      if (!slot.color_transform) {
+        return STATUS_INVALID_DEVICE_STATE;
+      }
+      response = {};
+      response.generation = generation_;
+      response.sequence = slot.sequence;
+      response.producer_fence_value = slot.producer_fence_value;
+      response.capture_qpc = slot.capture_qpc;
+      response.producer_signal_qpc = slot.producer_signal_qpc;
+      response.slot = static_cast<std::uint32_t>(*selected);
+      response.color_transform_version = slot.color_transform->version;
+      response.surface_color_space = slot.metadata.surface_color_space;
+      response.sdr_white_level_nits = slot.metadata.sdr_white_level_nits;
+      response.hdr_metadata_type = slot.metadata.hdr_metadata_type;
+      response.hdr10_metadata = slot.metadata.hdr10_metadata;
       if (std::any_of(slots_.begin(), slots_.end(), [](const frame_slot_t &candidate) {
             return candidate.state == frame_slot_state_e::ready;
           })) {
@@ -265,6 +406,82 @@ namespace {
     }
 
   private:
+    /** @brief Validate and resolve metadata2 plus the current immutable transform for one frame. */
+    bool resolve_frame_metadata(
+      const IDDCX_METADATA2 &metadata,
+      resolved_frame_metadata_t &resolved,
+      std::shared_ptr<const color_transform_blob_t> &transform
+    ) noexcept {
+      resolved = {};
+      const auto metadata_size = IDD_STRUCTURE_SIZE(IDDCX_METADATA2);
+      constexpr auto required_metadata_end =
+        FIELD_OFFSET(IDDCX_METADATA2, Hdr10FrameMetaData) + sizeof(IDDCX_HDR10_FRAME_METADATA);
+      if (!lumen::vdd::color::valid_compatible_prefix(
+            metadata.Size,
+            metadata_size,
+            sizeof(IDDCX_METADATA2),
+            required_metadata_end
+          ) ||
+          metadata.HwProtectedSurface != FALSE ||
+          metadata.SdrWhiteLevel < 80 || metadata.SdrWhiteLevel > 480) {
+        return false;
+      }
+      if ((static_cast<UINT>(metadata.ValidFlags) &
+           ~static_cast<UINT>(IDDCX_METADATA2_VALID_FLAGS_HDR10METADATA)) != 0) {
+        return false;
+      }
+      resolved.sdr_white_level_nits = metadata.SdrWhiteLevel;
+      if (mode_.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10) {
+        if (metadata.SurfaceColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ||
+            (metadata.ValidFlags & IDDCX_METADATA2_VALID_FLAGS_HDR10METADATA) == 0) {
+          return false;
+        }
+        resolved.surface_color_space = LUMEN_VDD_COLOR_SPACE_SCRGB;
+      } else {
+        if (metadata.SurfaceColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ||
+            (metadata.ValidFlags & IDDCX_METADATA2_VALID_FLAGS_HDR10METADATA) != 0) {
+          return false;
+        }
+        resolved.surface_color_space = LUMEN_VDD_COLOR_SPACE_SRGB;
+      }
+
+      std::lock_guard color_lock(color_state_->mutex);
+      if (color_state_->generation != generation_ || !color_state_->current_transform) {
+        return false;
+      }
+      transform = color_state_->current_transform;
+      if (mode_.dynamic_range != LUMEN_VDD_DYNAMIC_RANGE_HDR10) {
+        return true;
+      }
+      switch (metadata.Hdr10FrameMetaData.Type) {
+        case IDDCX_HDR10_FRAME_METADATA_TYPE_DEFAULT:
+          if (!color_state_->default_hdr10_metadata) {
+            return false;
+          }
+          resolved.hdr_metadata_type = LUMEN_VDD_HDR_METADATA_DEFAULT;
+          resolved.hdr10_metadata = *color_state_->default_hdr10_metadata;
+          break;
+        case IDDCX_HDR10_FRAME_METADATA_TYPE_UNCHANGED:
+          if (!last_hdr10_metadata_) {
+            return false;
+          }
+          resolved.hdr_metadata_type = LUMEN_VDD_HDR_METADATA_UNCHANGED;
+          resolved.hdr10_metadata = *last_hdr10_metadata_;
+          break;
+        case IDDCX_HDR10_FRAME_METADATA_TYPE_NEW:
+          resolved.hdr_metadata_type = LUMEN_VDD_HDR_METADATA_NEW;
+          resolved.hdr10_metadata = copy_hdr10_metadata(metadata.Hdr10FrameMetaData.NewMetaData);
+          if (!lumen::vdd::hdr::valid_hdr10_metadata(resolved.hdr10_metadata)) {
+            return false;
+          }
+          break;
+        default:
+          return false;
+      }
+      last_hdr10_metadata_ = resolved.hdr10_metadata;
+      return true;
+    }
+
     /** @brief Create the fixed shareable slots after the IddCx D3D device is established. */
     bool initialize_resources(
       ID3D11Device *device,
@@ -281,7 +498,9 @@ namespace {
       texture_desc.Height = mode_.height;
       texture_desc.MipLevels = 1;
       texture_desc.ArraySize = 1;
-      texture_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      texture_desc.Format = mode_.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 ?
+                              DXGI_FORMAT_R16G16B16A16_FLOAT :
+                              DXGI_FORMAT_B8G8R8A8_UNORM;
       texture_desc.SampleDesc.Count = 1;
       texture_desc.Usage = D3D11_USAGE_DEFAULT;
       texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -327,9 +546,8 @@ namespace {
         std::lock_guard lock(mutex_);
         context4_ = context;
         adapter_luid_ = pack_luid(adapter_luid);
-        resources_ready_ = true;
+        resources_created_ = true;
       }
-      SetEvent(frame_ready_event_);
       return true;
     }
 
@@ -382,7 +600,7 @@ namespace {
                                   &device,
                                   &feature_level,
                                   &context
-                                  ))) {
+                                ))) {
         disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
         finish(mmcss);
         return;
@@ -412,8 +630,29 @@ namespace {
 
       const HANDLE waits[] {frame_event_, stop_event_.get()};
       while (WaitForSingleObject(stop_event_.get(), 0) != WAIT_OBJECT_0) {
-        IDARG_OUT_RELEASEANDACQUIREBUFFER buffer {};
-        const auto status = IddCxSwapChainReleaseAndAcquireBuffer(swap_chain, &buffer);
+        ComPtr<IDXGIResource> acquired_surface;
+        IDDCX_METADATA2 frame_metadata {};
+        HRESULT status = E_FAIL;
+        if (hdr_runtime_available()) {
+          IDARG_IN_RELEASEANDACQUIREBUFFER2 input {};
+          input.Size = sizeof(input);
+          input.AcquireSystemMemoryBuffer = FALSE;
+          IDARG_OUT_RELEASEANDACQUIREBUFFER2 output {};
+          status = IddCxSwapChainReleaseAndAcquireBuffer2(swap_chain, &input, &output);
+          if (SUCCEEDED(status)) {
+            frame_metadata = output.MetaData;
+            acquired_surface.Attach(output.MetaData.pSurface);
+          }
+        } else {
+          IDARG_OUT_RELEASEANDACQUIREBUFFER output {};
+          status = IddCxSwapChainReleaseAndAcquireBuffer(swap_chain, &output);
+          if (SUCCEEDED(status)) {
+            frame_metadata.Size = sizeof(frame_metadata);
+            frame_metadata.SurfaceColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            frame_metadata.SdrWhiteLevel = 80;
+            acquired_surface.Attach(output.MetaData.pSurface);
+          }
+        }
         if (status == E_PENDING) {
           const auto wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
           if (wait == WAIT_OBJECT_0) {
@@ -430,19 +669,24 @@ namespace {
           break;
         }
 
-        ComPtr<IDXGIResource> acquired_surface;
-        acquired_surface.Attach(buffer.MetaData.pSurface);
         LARGE_INTEGER capture_qpc {};
         QueryPerformanceCounter(&capture_qpc);
 
         if (direct_resources_supported && direct_enabled_.load(std::memory_order_acquire)) {
           ComPtr<ID3D11Texture2D> source;
           D3D11_TEXTURE2D_DESC source_desc {};
+          resolved_frame_metadata_t resolved_metadata;
+          std::shared_ptr<const color_transform_blob_t> frame_transform;
+          const bool metadata_valid =
+            resolve_frame_metadata(frame_metadata, resolved_metadata, frame_transform);
           if (SUCCEEDED(acquired_surface.As(&source))) {
             source->GetDesc(&source_desc);
           }
+          const auto expected_format = mode_.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 ?
+                                         DXGI_FORMAT_R16G16B16A16_FLOAT :
+                                         DXGI_FORMAT_B8G8R8A8_UNORM;
           if (source && source_desc.Width == mode_.width && source_desc.Height == mode_.height &&
-              source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM && source_desc.MipLevels == 1 &&
+              source_desc.Format == expected_format && source_desc.MipLevels == 1 && metadata_valid &&
               source_desc.ArraySize == 1 && source_desc.SampleDesc.Count == 1) {
             lumen::vdd::frame::producer_acquisition_t acquisition;
             const auto selected = select_slot(acquisition);
@@ -477,9 +721,15 @@ namespace {
                   slot.producer_fence_value = producer_fence;
                   slot.capture_qpc = capture_qpc.QuadPart;
                   slot.producer_signal_qpc = producer_signal_qpc.QuadPart;
+                  slot.color_transform = std::move(frame_transform);
+                  slot.metadata = resolved_metadata;
                   slot.state = lumen::vdd::frame::complete_write(
                     lumen::vdd::frame::submission_result_e::success
                   );
+                  if (!resources_ready_) {
+                    initial_metadata_ = resolved_metadata;
+                    resources_ready_ = resources_created_;
+                  }
                   SetEvent(frame_ready_event_);
                 } else {
                   disable_direct_frames(lumen::vdd::frame::submission_result_e::signal_failed);
@@ -513,6 +763,7 @@ namespace {
     std::uint64_t generation_ {};  ///< Immutable active generation.
     LUMEN_VDD_MODE mode_ {};  ///< Immutable exact mode and delivery policy.
     HANDLE frame_ready_event_ {};  ///< Borrowed generation event for resource/frame availability.
+    std::shared_ptr<color_state_t> color_state_;  ///< Shared immutable transform/default metadata state.
     unique_handle_t stop_event_;  ///< Constructor-safe local termination event.
     std::thread worker_;  ///< Single measured-purpose swap-chain consumer.
     std::mutex mutex_;  ///< Serializes slot state and handle publication.
@@ -520,13 +771,18 @@ namespace {
     std::array<frame_slot_t, LUMEN_VDD_FRAME_SLOT_COUNT> slots_;  ///< Persistent shared slots.
     std::uint64_t adapter_luid_ {};  ///< Packed exact IddCx render-adapter LUID.
     std::uint64_t next_sequence_ {};  ///< Strictly increasing copied-frame sequence.
-    bool resources_ready_ {};  ///< Whether every shareable texture/fence was created.
+    std::optional<LUMEN_VDD_HDR10_METADATA> last_hdr10_metadata_;  ///< Effective metadata for UNCHANGED frames.
+    resolved_frame_metadata_t initial_metadata_;  ///< First validated frame metadata for encoder creation.
+    bool resources_created_ {};  ///< Whether every shareable texture/fence was created.
+    bool resources_ready_ {};  ///< Whether first validated metadata and resources are publishable.
     std::atomic_bool direct_enabled_ {true};  ///< Sticky fail-closed state for this generation.
   };
 
   /** @brief Generation-fenced mutable driver state. */
   struct device_state_t {
     std::mutex mutex;  ///< Serializes every control and monitor transition.
+    std::shared_ptr<monitor_descriptor_context_t> descriptor_context;  ///< Registered context-free parse state.
+    std::shared_ptr<color_state_t> color_state;  ///< Generation color transform and default metadata.
     WDFDEVICE device {};  ///< Parent WDF device.
     IDDCX_ADAPTER adapter {};  ///< Initialized indirect adapter.
     NTSTATUS adapter_init_status {STATUS_DEVICE_NOT_READY};  ///< Latest immediate or asynchronous adapter status.
@@ -541,6 +797,7 @@ namespace {
     std::uint64_t preferred_render_adapter_luid {};  ///< Exact encoder adapter requested for this generation.
     std::uint64_t assigned_render_adapter_luid {};  ///< Exact adapter used by the most recent swap chain.
     std::uint32_t owner_process_id {};  ///< Exclusive service PID.
+    std::atomic_bool exact_modes_published {false};  ///< Whether post-arrival target modes are exact.
     bool render_adapter_preference_submitted {};  ///< Whether the runtime preference API was called.
     bool monitor_starting {};  ///< Arrival is running without the state lock for synchronous IddCx callbacks.
     bool monitor_stopping {};  ///< Departure is running without the state lock for synchronous IddCx callbacks.
@@ -549,26 +806,24 @@ namespace {
 
   /** @brief Return true for a supported baseline mode. */
   bool valid_mode(const LUMEN_VDD_MODE &mode) noexcept {
-    if (mode.width < 256 || mode.width > LUMEN_VDD_MAX_WIDTH ||
-        mode.height < 200 || mode.height > LUMEN_VDD_MAX_HEIGHT ||
-        (mode.width & 1U) != 0 || (mode.height & 1U) != 0 ||
-        mode.refresh_numerator == 0 || mode.refresh_denominator == 0 ||
-        mode.refresh_numerator > LUMEN_VDD_MAX_RATIONAL_COMPONENT ||
-        mode.refresh_denominator > LUMEN_VDD_MAX_RATIONAL_COMPONENT ||
-        std::gcd(mode.refresh_numerator, mode.refresh_denominator) != 1 ||
-        mode.dynamic_range != LUMEN_VDD_DYNAMIC_RANGE_SDR || mode.bits_per_channel != 8 ||
-        (mode.delivery_policy != LUMEN_VDD_POLICY_LATENCY && mode.delivery_policy != LUMEN_VDD_POLICY_QUALITY) ||
-        mode.minimum_fidelity != LUMEN_VDD_FIDELITY_LOSSLESS) {
-      return false;
+    return lumen::vdd::mode::valid(mode);
+  }
+
+  /** Acquire the immutable prepared mode for context-free monitor-description callbacks. */
+  std::optional<LUMEN_VDD_MODE> prepared_descriptor_mode() noexcept {
+    std::shared_ptr<monitor_descriptor_context_t> context;
+    {
+      std::lock_guard lock(monitor_descriptor_registry_mutex);
+      context = monitor_descriptor_registry.lock();
     }
-    const auto minimum = static_cast<std::uint64_t>(10) * mode.refresh_denominator;
-    const auto maximum = static_cast<std::uint64_t>(480) * mode.refresh_denominator;
-    const auto refresh = static_cast<std::uint64_t>(mode.refresh_numerator);
-    const auto pixels = static_cast<std::uint64_t>(mode.width) * mode.height;
-    return refresh >= minimum && refresh <= maximum &&
-           pixels <= static_cast<std::uint64_t>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT &&
-           pixels * mode.refresh_numerator <=
-             static_cast<std::uint64_t>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT * 480ULL * mode.refresh_denominator;
+    if (!context) {
+      return std::nullopt;
+    }
+    std::lock_guard lock(context->mutex);
+    if (!context->snapshot || context->snapshot->generation == 0 || !valid_mode(context->snapshot->mode)) {
+      return std::nullopt;
+    }
+    return context->snapshot->mode;
   }
 
   /** @brief Pack a Windows adapter LUID without sign extension. */
@@ -601,6 +856,17 @@ namespace {
   DISPLAYCONFIG_VIDEO_SIGNAL_INFO signal_info(const LUMEN_VDD_MODE &mode, bool monitor_mode) noexcept {
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO signal {};
     signal.activeSize = {mode.width, mode.height};
+    if (mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 &&
+        lumen::vdd::hdr::modes_equal(mode, lumen::vdd::hdr::baseline_mode)) {
+      signal.totalSize = {2200, 1125};
+      signal.vSyncFreq = {60, 1};
+      signal.hSyncFreq = {67500, 1};
+      signal.pixelRate = 148500000;
+      signal.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+      signal.AdditionalSignalInfo.videoStandard = 16;
+      signal.AdditionalSignalInfo.vSyncFreqDivider = monitor_mode ? 0 : 1;
+      return signal;
+    }
     signal.totalSize = signal.activeSize;
     signal.vSyncFreq = {mode.refresh_numerator, mode.refresh_denominator};
     const auto scan_lines_per_second =
@@ -647,6 +913,33 @@ namespace {
     output.Size = sizeof(output);
     output.TargetVideoSignalInfo.targetVideoSignalInfo = signal_info(mode, false);
     output.RequiredBandwidth = output.TargetVideoSignalInfo.targetVideoSignalInfo.pixelRate;
+    return output;
+  }
+
+  /** Build one IddCx 1.10 monitor mode with exact RGB wire precision. */
+  IDDCX_MONITOR_MODE2 monitor_mode2(
+    const LUMEN_VDD_MODE &mode,
+    const IDDCX_MONITOR_MODE_ORIGIN origin
+  ) noexcept {
+    IDDCX_MONITOR_MODE2 output {};
+    output.Size = sizeof(output);
+    output.Origin = origin;
+    output.MonitorVideoSignalInfo = signal_info(mode, true);
+    output.BitsPerComponent.Rgb = mode.bits_per_channel == 10 ?
+                                    IDDCX_BITS_PER_COMPONENT_10 :
+                                    IDDCX_BITS_PER_COMPONENT_8;
+    return output;
+  }
+
+  /** Build one IddCx 1.10 target mode with exact RGB wire precision. */
+  IDDCX_TARGET_MODE2 target_mode2(const LUMEN_VDD_MODE &mode) noexcept {
+    IDDCX_TARGET_MODE2 output {};
+    output.Size = sizeof(output);
+    output.TargetVideoSignalInfo.targetVideoSignalInfo = signal_info(mode, false);
+    output.RequiredBandwidth = output.TargetVideoSignalInfo.targetVideoSignalInfo.pixelRate;
+    output.BitsPerComponent.Rgb = mode.bits_per_channel == 10 ?
+                                    IDDCX_BITS_PER_COMPONENT_10 :
+                                    IDDCX_BITS_PER_COMPONENT_8;
     return output;
   }
 
@@ -724,9 +1017,25 @@ namespace {
     state.preferred_render_adapter_luid = 0;
     state.assigned_render_adapter_luid = 0;
     state.render_adapter_preference_submitted = false;
+    state.exact_modes_published.store(false, std::memory_order_release);
     if (state.frame_ready_event != nullptr) {
       CloseHandle(state.frame_ready_event);
       state.frame_ready_event = nullptr;
+    }
+    {
+      std::lock_guard descriptor_lock(state.descriptor_context->mutex);
+      if (state.descriptor_context->snapshot &&
+          state.descriptor_context->snapshot->generation == generation) {
+        state.descriptor_context->snapshot.reset();
+      }
+    }
+    {
+      std::lock_guard color_lock(state.color_state->mutex);
+      if (state.color_state->generation == generation) {
+        state.color_state->generation = 0;
+        state.color_state->current_transform.reset();
+        state.color_state->default_hdr10_metadata.reset();
+      }
     }
     state.generation = 0;
     state.mode = {};
@@ -751,6 +1060,11 @@ namespace {
     }
     state.monitor_starting = true;
     const auto adapter = state.adapter;
+    const auto mode = state.mode;
+    if (mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 && !hdr_runtime_available()) {
+      state.monitor_starting = false;
+      return STATUS_NOT_SUPPORTED;
+    }
 
     IDDCX_MONITOR_INFO info {};
     info.Size = sizeof(info);
@@ -759,8 +1073,10 @@ namespace {
     info.MonitorContainerId = GUID_CONTAINERID_LUMEN_VIRTUAL_DISPLAY_MONITOR;
     info.MonitorDescription.Size = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    info.MonitorDescription.DataSize = 0;
-    info.MonitorDescription.pData = nullptr;
+    if (mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10) {
+      info.MonitorDescription.DataSize = static_cast<UINT>(lumen::vdd::hdr::edid.size());
+      info.MonitorDescription.pData = const_cast<std::uint8_t *>(lumen::vdd::hdr::edid.data());
+    }
 
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, monitor_context_t);
@@ -769,12 +1085,33 @@ namespace {
     input.pMonitorInfo = &info;
     IDARG_OUT_MONITORCREATE output {};
     state_lock.unlock();
+    bool arrived = false;
     auto status = IddCxMonitorCreate(adapter, &input, &output);
     if (NT_SUCCESS(status)) {
       monitor_context(output.MonitorObject)->state = &state;
       IDARG_OUT_MONITORARRIVAL arrival {};
       status = IddCxMonitorArrival(output.MonitorObject, &arrival);
+      arrived = NT_SUCCESS(status);
+    }
+    if (NT_SUCCESS(status) && mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10) {
+      auto exact_target = target_mode2(mode);
+      IDARG_IN_UPDATEMODES2 update {};
+      update.Reason = IDDCX_UPDATE_REASON_CONFIGURATION_CONSTRAINTS;
+      update.TargetModeCount = 1;
+      update.pTargetModes = &exact_target;
+      state.exact_modes_published.store(true, std::memory_order_release);
+      status = IddCxMonitorUpdateModes2(output.MonitorObject, &update);
       if (!NT_SUCCESS(status)) {
+        state.exact_modes_published.store(false, std::memory_order_release);
+      }
+    }
+    if (!NT_SUCCESS(status) && output.MonitorObject != nullptr) {
+      if (arrived) {
+        const auto departure_status = IddCxMonitorDeparture(output.MonitorObject);
+        if (!NT_SUCCESS(departure_status)) {
+          status = departure_status;
+        }
+      } else {
         WdfObjectDelete(output.MonitorObject);
       }
     }
@@ -797,9 +1134,15 @@ EVT_WDF_FILE_CLEANUP LumenVddFileCleanup;
 EVT_IDD_CX_DEVICE_IO_CONTROL LumenVddDeviceIoControl;
 EVT_IDD_CX_ADAPTER_INIT_FINISHED LumenVddAdapterInitFinished;
 EVT_IDD_CX_ADAPTER_COMMIT_MODES LumenVddAdapterCommitModes;
+EVT_IDD_CX_ADAPTER_COMMIT_MODES2 LumenVddAdapterCommitModes2;
+EVT_IDD_CX_ADAPTER_QUERY_TARGET_INFO LumenVddAdapterQueryTargetInfo;
 EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION LumenVddParseMonitorDescription;
+EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION2 LumenVddParseMonitorDescription2;
 EVT_IDD_CX_MONITOR_GET_DEFAULT_DESCRIPTION_MODES LumenVddMonitorGetDefaultModes;
+EVT_IDD_CX_MONITOR_SET_DEFAULT_HDR_METADATA LumenVddMonitorSetDefaultHdrMetadata;
+EVT_IDD_CX_MONITOR_SET_GAMMA_RAMP LumenVddMonitorSetGammaRamp;
 EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES LumenVddMonitorQueryTargetModes;
+EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES2 LumenVddMonitorQueryTargetModes2;
 EVT_IDD_CX_MONITOR_ASSIGN_SWAPCHAIN LumenVddMonitorAssignSwapChain;
 EVT_IDD_CX_MONITOR_UNASSIGN_SWAPCHAIN LumenVddMonitorUnassignSwapChain;
 
@@ -839,6 +1182,14 @@ _Use_decl_annotations_
   idd_config.EvtIddCxMonitorQueryTargetModes = LumenVddMonitorQueryTargetModes;
   idd_config.EvtIddCxMonitorAssignSwapChain = LumenVddMonitorAssignSwapChain;
   idd_config.EvtIddCxMonitorUnassignSwapChain = LumenVddMonitorUnassignSwapChain;
+  if (hdr_runtime_available()) {
+    idd_config.EvtIddCxAdapterCommitModes2 = LumenVddAdapterCommitModes2;
+    idd_config.EvtIddCxAdapterQueryTargetInfo = LumenVddAdapterQueryTargetInfo;
+    idd_config.EvtIddCxParseMonitorDescription2 = LumenVddParseMonitorDescription2;
+    idd_config.EvtIddCxMonitorSetDefaultHdrMetaData = LumenVddMonitorSetDefaultHdrMetadata;
+    idd_config.EvtIddCxMonitorSetGammaRamp = LumenVddMonitorSetGammaRamp;
+    idd_config.EvtIddCxMonitorQueryTargetModes2 = LumenVddMonitorQueryTargetModes2;
+  }
   status = IddCxDeviceInitConfig(device_init, &idd_config);
   if (!NT_SUCCESS(status)) {
     return status;
@@ -858,7 +1209,19 @@ _Use_decl_annotations_
   }
   device_state_t *state = nullptr;
   try {
-    state = new device_state_t {};
+    auto pending_state = std::make_unique<device_state_t>();
+    auto descriptor_context = std::make_shared<monitor_descriptor_context_t>();
+    auto color_state = std::make_shared<color_state_t>();
+    {
+      std::lock_guard lock(monitor_descriptor_registry_mutex);
+      if (!monitor_descriptor_registry.expired()) {
+        return STATUS_DEVICE_BUSY;
+      }
+      monitor_descriptor_registry = descriptor_context;
+    }
+    pending_state->descriptor_context = std::move(descriptor_context);
+    pending_state->color_state = std::move(color_state);
+    state = pending_state.release();
   } catch (const std::bad_alloc &) {
     return STATUS_INSUFFICIENT_RESOURCES;
   }
@@ -878,9 +1241,68 @@ _Use_decl_annotations_
     const IDARG_IN_PARSEMONITORDESCRIPTION *input,
     IDARG_OUT_PARSEMONITORDESCRIPTION *output
   ) {
-  UNREFERENCED_PARAMETER(input);
-  UNREFERENCED_PARAMETER(output);
-  return STATUS_NOT_SUPPORTED;
+  if (input->MonitorDescription.Type != IDDCX_MONITOR_DESCRIPTION_TYPE_EDID ||
+      input->MonitorDescription.DataSize != lumen::vdd::hdr::edid.size() ||
+      input->MonitorDescription.pData == nullptr ||
+      std::memcmp(input->MonitorDescription.pData, lumen::vdd::hdr::edid.data(), lumen::vdd::hdr::edid.size()) != 0) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  const auto exact = prepared_descriptor_mode();
+  if (!exact || exact->dynamic_range != LUMEN_VDD_DYNAMIC_RANGE_HDR10) {
+    return STATUS_INVALID_DEVICE_STATE;
+  }
+  const auto modes = lumen::vdd::hdr::descriptor_modes(*exact);
+  output->MonitorModeBufferOutputCount = static_cast<UINT>(modes.count);
+  output->PreferredMonitorModeIdx = static_cast<UINT>(modes.preferred_index);
+  if (input->MonitorModeBufferInputCount == 0) {
+    return STATUS_SUCCESS;
+  }
+  if (input->MonitorModeBufferInputCount < modes.count || input->pMonitorModes == nullptr) {
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+  input->pMonitorModes[0] = monitor_mode(
+    modes.modes[0],
+    IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
+  );
+  if (modes.count == 2) {
+    input->pMonitorModes[1] = monitor_mode(modes.modes[1], IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
+  }
+  return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+  NTSTATUS
+  LumenVddParseMonitorDescription2(
+    const IDARG_IN_PARSEMONITORDESCRIPTION2 *input,
+    IDARG_OUT_PARSEMONITORDESCRIPTION *output
+  ) {
+  if (input->MonitorDescription.Type != IDDCX_MONITOR_DESCRIPTION_TYPE_EDID ||
+      input->MonitorDescription.DataSize != lumen::vdd::hdr::edid.size() ||
+      input->MonitorDescription.pData == nullptr ||
+      std::memcmp(input->MonitorDescription.pData, lumen::vdd::hdr::edid.data(), lumen::vdd::hdr::edid.size()) != 0) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  const auto exact = prepared_descriptor_mode();
+  if (!exact || exact->dynamic_range != LUMEN_VDD_DYNAMIC_RANGE_HDR10) {
+    return STATUS_INVALID_DEVICE_STATE;
+  }
+  const auto modes = lumen::vdd::hdr::descriptor_modes(*exact);
+  output->MonitorModeBufferOutputCount = static_cast<UINT>(modes.count);
+  output->PreferredMonitorModeIdx = static_cast<UINT>(modes.preferred_index);
+  if (input->MonitorModeBufferInputCount == 0) {
+    return STATUS_SUCCESS;
+  }
+  if (input->MonitorModeBufferInputCount < modes.count || input->pMonitorModes == nullptr) {
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+  input->pMonitorModes[0] = monitor_mode2(
+    modes.modes[0],
+    IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
+  );
+  if (modes.count == 2) {
+    input->pMonitorModes[1] = monitor_mode2(modes.modes[1], IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
+  }
+  return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -901,10 +1323,15 @@ _Use_decl_annotations_
 
   IDDCX_ADAPTER_CAPS capabilities {};
   capabilities.Size = sizeof(capabilities);
+  if (hdr_runtime_available()) {
+    capabilities.Flags = IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
+  }
   capabilities.MaxMonitorsSupported = 1;
   capabilities.MaxDisplayPipelineRate = static_cast<UINT64>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT * 480ULL;
   capabilities.EndPointDiagnostics.Size = sizeof(capabilities.EndPointDiagnostics);
-  capabilities.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
+  capabilities.EndPointDiagnostics.GammaSupport = hdr_runtime_available() ?
+                                                    IDDCX_FEATURE_IMPLEMENTATION_SOFTWARE :
+                                                    IDDCX_FEATURE_IMPLEMENTATION_NONE;
   capabilities.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
   capabilities.EndPointDiagnostics.pEndPointFriendlyName = endpoint_model;
   capabilities.EndPointDiagnostics.pEndPointModelName = endpoint_model;
@@ -944,6 +1371,12 @@ _Use_decl_annotations_ void LumenVddDeviceCleanup(WDFOBJECT object) {
         static_cast<void>(
           stop_locked(*context->state, lock, context->state->generation, context->state->owner_file, true)
         );
+      }
+    }
+    {
+      std::lock_guard lock(monitor_descriptor_registry_mutex);
+      if (monitor_descriptor_registry.lock() == context->state->descriptor_context) {
+        monitor_descriptor_registry.reset();
       }
     }
     delete context->state;
@@ -991,7 +1424,11 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         const auto capability_flags =
           LUMEN_VDD_CAP_DYNAMIC_MODES | LUMEN_VDD_CAP_SDR8 | LUMEN_VDD_CAP_DIRECT_FRAME_V1 |
           LUMEN_VDD_CAP_LOSSLESS |
-          (IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter) ? LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE : 0U);
+          (IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter) ? LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE : 0U) |
+          (hdr_runtime_available() ?
+             LUMEN_VDD_CAP_HDR10 | LUMEN_VDD_CAP_10BIT | LUMEN_VDD_CAP_DIRECT_FRAME_FP16 |
+               LUMEN_VDD_CAP_FRAME_METADATA_V2 | LUMEN_VDD_CAP_COLOR_TRANSFORM_V1 :
+             0U);
         *output = {
           LUMEN_VDD_ABI_VERSION,
           capability_flags,
@@ -1050,6 +1487,10 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           status = STATUS_INVALID_PARAMETER;
           break;
         }
+        if (input->mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 && !hdr_runtime_available()) {
+          status = STATUS_NOT_SUPPORTED;
+          break;
+        }
         if (state->adapter == nullptr || !NT_SUCCESS(state->adapter_init_status)) {
           status = STATUS_DEVICE_NOT_READY;
           break;
@@ -1071,6 +1512,14 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
             status = STATUS_INSUFFICIENT_RESOURCES;
             break;
           }
+          std::shared_ptr<const color_transform_blob_t> default_transform;
+          try {
+            default_transform = default_color_transform();
+          } catch (const std::bad_alloc &) {
+            CloseHandle(frame_ready_event);
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+          }
           state->generation = input->generation;
           state->last_generation = input->generation;
           state->owner_process_id = requestor_pid;
@@ -1079,7 +1528,22 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           state->mode = input->mode;
           state->preferred_render_adapter_luid = input->preferred_render_adapter_luid;
           state->assigned_render_adapter_luid = 0;
+          state->exact_modes_published.store(false, std::memory_order_release);
           state->render_adapter_preference_submitted = false;
+          {
+            std::lock_guard descriptor_lock(state->descriptor_context->mutex);
+            state->descriptor_context->snapshot = monitor_descriptor_snapshot_t {
+              state->generation,
+              state->mode,
+            };
+          }
+          {
+            std::lock_guard color_lock(state->color_state->mutex);
+            state->color_state->generation = state->generation;
+            state->color_state->next_transform_version = 2;
+            state->color_state->current_transform = std::move(default_transform);
+            state->color_state->default_hdr10_metadata.reset();
+          }
           if (IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)) {
             const IDARG_IN_ADAPTERSETRENDERADAPTER render_adapter {
               unpack_luid(state->preferred_render_adapter_luid),
@@ -1258,6 +1722,42 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         status = state->swap_chain->release_frame(*input);
         break;
       }
+    case IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM:
+      {
+        if (input_buffer_length != sizeof(LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST) ||
+            output_buffer_length != sizeof(LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE)) {
+          status = STATUS_INFO_LENGTH_MISMATCH;
+          break;
+        }
+        auto *input = request_input<LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST>(
+          request,
+          sizeof(LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST),
+          status
+        );
+        auto *output = request_output<LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE>(
+          request,
+          sizeof(LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE),
+          status
+        );
+        const auto requestor_pid = static_cast<std::uint32_t>(WdfRequestGetRequestorProcessId(request));
+        if (input == nullptr || output == nullptr) {
+          break;
+        }
+        if (input->generation != state->generation || input->transform_version == 0 ||
+            requestor_pid != state->owner_process_id || state->frame_consumer_file != file) {
+          status = STATUS_REVISION_MISMATCH;
+          break;
+        }
+        if (state->swap_chain == nullptr) {
+          status = STATUS_DEVICE_NOT_READY;
+          break;
+        }
+        status = state->swap_chain->query_color_transform(input->transform_version, *output);
+        if (NT_SUCCESS(status)) {
+          information = sizeof(*output);
+        }
+        break;
+      }
     case IOCTL_LUMEN_VDD_OPEN_FRAME_EVENT:
       {
         if (input_buffer_length != sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST) ||
@@ -1330,6 +1830,9 @@ _Use_decl_annotations_
   LumenVddAdapterCommitModes(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES *input) {
   auto *state = adapter_context(adapter)->state;
   std::lock_guard lock(state->mutex);
+  if (state->mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10) {
+    return STATUS_NOT_SUPPORTED;
+  }
   if (input->PathCount != 0 && input->pPaths == nullptr) {
     return STATUS_INVALID_PARAMETER;
   }
@@ -1348,6 +1851,220 @@ _Use_decl_annotations_
         !target_signal_matches(path.TargetVideoSignalInfo, state->mode)) {
       return STATUS_INVALID_PARAMETER;
     }
+  }
+  return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+  NTSTATUS
+  LumenVddAdapterQueryTargetInfo(
+    IDDCX_ADAPTER adapter,
+    IDARG_IN_QUERYTARGET_INFO *input,
+    IDARG_OUT_QUERYTARGET_INFO *output
+  ) {
+  UNREFERENCED_PARAMETER(adapter);
+  if (input->ConnectorIndex != 0) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  output->TargetCaps = IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE | IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE;
+  output->DitheringSupport = {};
+  return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+  NTSTATUS
+  LumenVddAdapterCommitModes2(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES2 *input) {
+  auto *state = adapter_context(adapter)->state;
+  std::lock_guard lock(state->mutex);
+  if (input->PathCount != 0 && input->pPaths == nullptr) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  std::uint32_t active_paths = 0;
+  for (std::uint32_t index = 0; index < input->PathCount; ++index) {
+    const auto &path = input->pPaths[index];
+    if (path.Size != sizeof(path) || path.MonitorObject == nullptr ||
+        monitor_context(path.MonitorObject)->state != state) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    if ((path.Flags & IDDCX_PATH_FLAGS_ACTIVE) == IDDCX_PATH_FLAGS_NONE) {
+      continue;
+    }
+    ++active_paths;
+    const auto expected_color_space = state->mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 ?
+                                        IDDCX_COLOR_SPACE_G2084_P2020 :
+                                        IDDCX_COLOR_SPACE_G22_P709;
+    const auto expected_bpc = state->mode.bits_per_channel == 10 ?
+                                IDDCX_BITS_PER_COMPONENT_10 :
+                                IDDCX_BITS_PER_COMPONENT_8;
+    if (active_paths > 1 || state->generation == 0 || !valid_mode(state->mode) ||
+        !target_signal_matches(path.TargetVideoSignalInfo, state->mode) ||
+        path.WireFormatInfo.ColorSpace != expected_color_space ||
+        path.WireFormatInfo.BitsPerComponent.Rgb != expected_bpc ||
+        path.WireFormatInfo.BitsPerComponent.YCbCr444 != IDDCX_BITS_PER_COMPONENT_NONE ||
+        path.WireFormatInfo.BitsPerComponent.YCbCr422 != IDDCX_BITS_PER_COMPONENT_NONE ||
+        path.WireFormatInfo.BitsPerComponent.YCbCr420 != IDDCX_BITS_PER_COMPONENT_NONE) {
+      return STATUS_INVALID_PARAMETER;
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+  NTSTATUS
+  LumenVddMonitorSetDefaultHdrMetadata(
+    IDDCX_MONITOR monitor,
+    const IDARG_IN_MONITOR_SET_DEFAULT_HDR_METADATA *input
+  ) {
+  auto *state = monitor_context(monitor)->state;
+  if (input->Type != IDDCX_HDRMETADATA_TYPE_HDR10 || input->Size != sizeof(IDDCX_HDR10_METADATA) ||
+      input->Data.pHdr10 == nullptr) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  const auto metadata = copy_hdr10_metadata(*input->Data.pHdr10);
+  if (!lumen::vdd::hdr::valid_hdr10_metadata(metadata)) {
+    return STATUS_INVALID_PARAMETER;
+  }
+  std::shared_ptr<color_state_t> color_state;
+  std::uint64_t generation = 0;
+  HANDLE frame_ready_event = nullptr;
+  {
+    std::lock_guard lock(state->mutex);
+    if (state->generation == 0 || state->mode.dynamic_range != LUMEN_VDD_DYNAMIC_RANGE_HDR10) {
+      return STATUS_INVALID_DEVICE_STATE;
+    }
+    color_state = state->color_state;
+    generation = state->generation;
+    frame_ready_event = state->frame_ready_event;
+  }
+  {
+    std::lock_guard color_lock(color_state->mutex);
+    if (color_state->generation != generation) {
+      return STATUS_REVISION_MISMATCH;
+    }
+    color_state->default_hdr10_metadata = metadata;
+  }
+  if (frame_ready_event != nullptr) {
+    SetEvent(frame_ready_event);
+  }
+  return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+  NTSTATUS
+  LumenVddMonitorSetGammaRamp(IDDCX_MONITOR monitor, const IDARG_IN_SET_GAMMARAMP *input) {
+  auto *state = monitor_context(monitor)->state;
+  std::shared_ptr<color_transform_blob_t> next;
+  try {
+    next = std::make_shared<color_transform_blob_t>();
+  } catch (const std::bad_alloc &) {
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
+
+  switch (input->Type) {
+    case IDDCX_GAMMARAMP_TYPE_DEFAULT:
+      if (input->GammaRampSizeInBytes != 0 || input->pGammaRampData != nullptr) {
+        return STATUS_INVALID_PARAMETER;
+      }
+      next->type = LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT;
+      break;
+    case IDDCX_GAMMARAMP_TYPE_RGB256x3x16:
+      if (input->GammaRampSizeInBytes != sizeof(IDDCX_GAMMARAMP_RGB256x3x16) ||
+          input->pGammaRampData == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+      }
+      next->type = LUMEN_VDD_GAMMA_RAMP_TYPE_RGB256X3X16;
+      next->payload_size = sizeof(LUMEN_VDD_GAMMA_RAMP_RGB256X3X16);
+      {
+        const auto &source = *static_cast<const IDDCX_GAMMARAMP_RGB256x3x16 *>(input->pGammaRampData);
+        std::copy(std::begin(source.Red), std::end(source.Red), std::begin(next->payload.rgb256x3x16.red));
+        std::copy(std::begin(source.Green), std::end(source.Green), std::begin(next->payload.rgb256x3x16.green));
+        std::copy(std::begin(source.Blue), std::end(source.Blue), std::begin(next->payload.rgb256x3x16.blue));
+      }
+      break;
+    case IDDCX_GAMMARAMP_TYPE_3x4_COLORSPACE_TRANSFORM:
+      if (input->GammaRampSizeInBytes != sizeof(IDDCX_GAMMARAMP_3X4_COLORSPACE_TRANSFORM) ||
+          input->pGammaRampData == nullptr) {
+        return STATUS_INVALID_PARAMETER;
+      }
+      next->type = LUMEN_VDD_GAMMA_RAMP_TYPE_3X4_COLORSPACE_TRANSFORM;
+      next->payload_size = sizeof(LUMEN_VDD_GAMMA_RAMP_3X4_COLORSPACE_TRANSFORM);
+      {
+        const auto &source =
+          *static_cast<const IDDCX_GAMMARAMP_3X4_COLORSPACE_TRANSFORM *>(input->pGammaRampData);
+        if ((source.MatrixEnabled != FALSE && source.MatrixEnabled != TRUE) ||
+            (source.LutEnabled != FALSE && source.LutEnabled != TRUE)) {
+          return STATUS_INVALID_PARAMETER;
+        }
+        auto &transform = next->payload.transform_3x4;
+        transform.matrix_enabled = source.MatrixEnabled == TRUE ? 1U : 0U;
+        transform.lut_enabled = source.LutEnabled == TRUE ? 1U : 0U;
+        if (transform.matrix_enabled != 0) {
+          for (std::size_t row = 0; row < 3; ++row) {
+            for (std::size_t column = 0; column < 4; ++column) {
+              transform.color_matrix_3x4[row][column] = source.ColorMatrix3x4[row][column];
+            }
+          }
+          transform.scalar_multiplier = source.ScalarMultiplier;
+        }
+        if (transform.lut_enabled != 0) {
+          for (std::size_t index = 0; index < LUMEN_VDD_COLOR_TRANSFORM_LUT_ENTRY_COUNT; ++index) {
+            transform.lookup_table_1d[index] = {
+              source.LookupTable1D[index].Red,
+              source.LookupTable1D[index].Green,
+              source.LookupTable1D[index].Blue,
+            };
+          }
+        }
+        if (!lumen::vdd::color::valid_transform(transform)) {
+          return STATUS_INVALID_PARAMETER;
+        }
+        lumen::vdd::color::clear_disabled_sections(transform);
+        if (lumen::vdd::color::effective_type(next->type, transform) ==
+            LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT) {
+          next->type = LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT;
+          next->payload_size = 0;
+          std::memset(&next->payload, 0, sizeof(next->payload));
+        }
+      }
+      break;
+    default:
+      return STATUS_INVALID_PARAMETER;
+  }
+
+  std::shared_ptr<color_state_t> color_state;
+  std::uint64_t generation = 0;
+  HANDLE frame_ready_event = nullptr;
+  {
+    std::lock_guard lock(state->mutex);
+    if (state->generation == 0) {
+      return STATUS_INVALID_DEVICE_STATE;
+    }
+    color_state = state->color_state;
+    generation = state->generation;
+    frame_ready_event = state->frame_ready_event;
+  }
+  {
+    std::lock_guard color_lock(color_state->mutex);
+    if (color_state->generation != generation || !color_state->current_transform) {
+      return STATUS_REVISION_MISMATCH;
+    }
+    if (color_state->current_transform->type == next->type &&
+        color_state->current_transform->payload_size == next->payload_size &&
+        std::memcmp(
+          &color_state->current_transform->payload,
+          &next->payload,
+          sizeof(next->payload)
+        ) == 0) {
+      return STATUS_SUCCESS;
+    }
+    if (color_state->next_transform_version == std::numeric_limits<std::uint64_t>::max()) {
+      return STATUS_INTEGER_OVERFLOW;
+    }
+    next->version = color_state->next_transform_version++;
+    color_state->current_transform = std::move(next);
+  }
+  if (frame_ready_event != nullptr) {
+    SetEvent(frame_ready_event);
   }
   return STATUS_SUCCESS;
 }
@@ -1395,7 +2112,40 @@ _Use_decl_annotations_
   if (input->TargetModeBufferInputCount < 1 || input->pTargetModes == nullptr) {
     return STATUS_BUFFER_TOO_SMALL;
   }
-  input->pTargetModes[0] = target_mode(state->mode);
+  const auto &advertised_mode =
+    state->mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 &&
+        !state->exact_modes_published.load(std::memory_order_acquire) ?
+      lumen::vdd::hdr::baseline_mode :
+      state->mode;
+  input->pTargetModes[0] = target_mode(advertised_mode);
+  return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+  NTSTATUS
+  LumenVddMonitorQueryTargetModes2(
+    IDDCX_MONITOR monitor,
+    const IDARG_IN_QUERYTARGETMODES2 *input,
+    IDARG_OUT_QUERYTARGETMODES *output
+  ) {
+  auto *state = monitor_context(monitor)->state;
+  std::lock_guard lock(state->mutex);
+  if (!valid_mode(state->mode)) {
+    return STATUS_INVALID_DEVICE_STATE;
+  }
+  output->TargetModeBufferOutputCount = 1;
+  if (input->TargetModeBufferInputCount == 0) {
+    return STATUS_SUCCESS;
+  }
+  if (input->TargetModeBufferInputCount < 1 || input->pTargetModes == nullptr) {
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+  const auto &advertised_mode =
+    state->mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 &&
+        !state->exact_modes_published.load(std::memory_order_acquire) ?
+      lumen::vdd::hdr::baseline_mode :
+      state->mode;
+  input->pTargetModes[0] = target_mode2(advertised_mode);
   return STATUS_SUCCESS;
 }
 
@@ -1419,6 +2169,7 @@ _Use_decl_annotations_
       state->generation,
       state->mode,
       state->frame_ready_event,
+      state->color_state,
       direct_frames_enabled
     ));
   } catch (...) {

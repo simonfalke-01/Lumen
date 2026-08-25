@@ -1115,12 +1115,24 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    if (!virtual_display::valid_required_direct_capture_request(
+          config.virtual_display_direct_required,
+          hwdevice_type == mem_type_e::dxgi,
+          static_cast<bool>(config.virtual_display_frame_source)
+        )) {
+      BOOST_LOG(error) << "Required Lumen VDD capture lacks the exact DXGI direct-frame source"sv;
+      return {};
+    }
     if (hwdevice_type == mem_type_e::dxgi && config.virtual_display_frame_source) {
       auto direct = std::make_shared<dxgi::display_vdd_vram_t>();
       if (!direct->init(config, display_name)) {
         return direct;
       }
       config.virtual_display_frame_source->stop();
+      if (config.virtual_display_direct_required) {
+        BOOST_LOG(error) << "Required Lumen VDD direct-frame initialization failed; refusing capture fallback"sv;
+        return {};
+      }
       BOOST_LOG(warning) << "Lumen VDD direct-frame initialization failed; falling back to DDA/WGC"sv;
     }
 

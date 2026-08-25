@@ -53,6 +53,11 @@ namespace platf::virtual_display {
     visually_lossless = 2,  ///< Explicit, validated visually-lossless conversion.
   };
 
+  /** The VDD shared surface is always format-preserving, independent of codec fidelity. */
+  [[nodiscard]] constexpr fidelity_e direct_surface_fidelity() noexcept {
+    return fidelity_e::lossless;
+  }
+
   /** @brief Exact virtual-display mode. */
   struct mode_t {
     std::uint32_t width {};  ///< Active width in pixels.
@@ -161,6 +166,7 @@ namespace platf::virtual_display {
     std::uint64_t preferred_render_adapter_luid {};  ///< Exact adapter requested for the active generation.
     std::uint64_t assigned_render_adapter_luid {};  ///< Actual adapter observed in the latest swap-chain assignment.
     bool render_adapter_preference_submitted {};  ///< Whether the IddCx preference API was called.
+    std::optional<delivery_policy_e> delivery_policy;  ///< Driver-reported policy for a nonzero generation.
   };
 
   /** @brief Injectable generation-fenced VDD control channel. */
@@ -365,6 +371,13 @@ namespace platf::virtual_display {
     required  ///< Reject startup unless the exact VDD mode becomes active.
   };
 
+  /** Umbra v3 requires the optimized VDD path unless the operator explicitly disables it. */
+  [[nodiscard]] constexpr activation_policy_e modern_activation_policy(
+    const activation_policy_e configured
+  ) noexcept {
+    return configured == activation_policy_e::optional ? activation_policy_e::required : configured;
+  }
+
   class session_lease_t;
 
   /** @brief Backend start result atomically paired with one explicit session owner. */
@@ -483,9 +496,10 @@ namespace platf::virtual_display {
 
   /**
    * @brief Apply VDD policy at a transport-neutral live-session boundary.
-   * @details Only exact SDR/8-bit selections are admitted until HDR support is
-   * proven end to end. Optional fallback is forbidden after an uncertain
-   * rollback or a backend response that cannot be safely released.
+   * @details SDR/8-bit and HDR10/10-bit selections are admitted only when the
+   * intersected system and driver limits prove the exact tuple. Optional
+   * fallback is forbidden after an uncertain rollback or a backend response
+   * that cannot be safely released.
    *
    * @param policy Configured activation/fallback policy.
    * @param request Exact requested mode and Latency/Quality delivery policy.

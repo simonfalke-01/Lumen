@@ -20,10 +20,10 @@ extern "C" {
 #endif
 
 /** Fixed driver ABI version. */
-#define LUMEN_VDD_ABI_VERSION 4u
-/** Maximum supported width in the baseline SDR driver. */
+#define LUMEN_VDD_ABI_VERSION 5u
+/** Maximum supported width. */
 #define LUMEN_VDD_MAX_WIDTH 8192u
-/** Maximum supported height in the baseline SDR driver. */
+/** Maximum supported height. */
 #define LUMEN_VDD_MAX_HEIGHT 8192u
 /** Maximum rational component accepted at the trust boundary. */
 #define LUMEN_VDD_MAX_RATIONAL_COMPONENT 1000000000u
@@ -43,6 +43,12 @@ extern "C" {
 #define LUMEN_VDD_CAP_VISUALLY_LOSSLESS 0x00000040u
 /** Driver capability: runtime IddCx render-adapter preference submission. */
 #define LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE 0x00000080u
+/** Driver capability: shared DXGI_FORMAT_R16G16B16A16_FLOAT direct frames. */
+#define LUMEN_VDD_CAP_DIRECT_FRAME_FP16 0x00000100u
+/** Driver capability: resolved color-space, white-level, and HDR10 frame metadata. */
+#define LUMEN_VDD_CAP_FRAME_METADATA_V2 0x00000200u
+/** Driver capability: immutable versioned gamma/color-transform queries. */
+#define LUMEN_VDD_CAP_COLOR_TRANSFORM_V1 0x00000400u
 
 /** Dynamic range values in the fixed control ABI. */
 #define LUMEN_VDD_DYNAMIC_RANGE_SDR 0u
@@ -57,6 +63,28 @@ extern "C" {
 #define LUMEN_VDD_FRAME_SLOT_COUNT 2u
 /** Direct-frame texture format: DXGI_FORMAT_B8G8R8A8_UNORM. */
 #define LUMEN_VDD_FRAME_FORMAT_BGRA8 1u
+/** Direct-frame texture format: DXGI_FORMAT_R16G16B16A16_FLOAT. */
+#define LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT 2u
+
+/** Stable surface color-space values resolved from IddCx metadata. */
+#define LUMEN_VDD_COLOR_SPACE_SRGB 1u
+#define LUMEN_VDD_COLOR_SPACE_SCRGB 2u
+#define LUMEN_VDD_COLOR_SPACE_HDR10 3u
+
+/** Stable HDR10 metadata source types. Metadata is resolved for every nonzero type. */
+#define LUMEN_VDD_HDR_METADATA_NONE 0u
+#define LUMEN_VDD_HDR_METADATA_DEFAULT 1u
+#define LUMEN_VDD_HDR_METADATA_UNCHANGED 2u
+#define LUMEN_VDD_HDR_METADATA_NEW 3u
+
+/** Stable gamma-ramp payload types. */
+#define LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT 1u
+#define LUMEN_VDD_GAMMA_RAMP_TYPE_RGB256X3X16 2u
+#define LUMEN_VDD_GAMMA_RAMP_TYPE_3X4_COLORSPACE_TRANSFORM 3u
+/** Fixed number of entries in an IddCx 3x4 color-space-transform LUT. */
+#define LUMEN_VDD_COLOR_TRANSFORM_LUT_ENTRY_COUNT 4096u
+/** Fixed bytes reserved for the largest immutable transform payload. */
+#define LUMEN_VDD_COLOR_TRANSFORM_PAYLOAD_SIZE 49212u
 
 /** Private IOCTL function numbers. */
 #define LUMEN_VDD_IOCTL_INDEX 0x900u
@@ -70,6 +98,7 @@ extern "C" {
 #define IOCTL_LUMEN_VDD_DEQUEUE_FRAME LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 7u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_READ_DATA | LUMEN_VDD_FILE_WRITE_DATA)
 #define IOCTL_LUMEN_VDD_RELEASE_FRAME LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 8u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_WRITE_DATA)
 #define IOCTL_LUMEN_VDD_OPEN_FRAME_EVENT LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 9u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_READ_DATA | LUMEN_VDD_FILE_WRITE_DATA)
+#define IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 10u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_READ_DATA | LUMEN_VDD_FILE_WRITE_DATA)
 
 #pragma pack(push, 1)
 
@@ -84,6 +113,63 @@ extern "C" {
     uint8_t delivery_policy;  ///< LUMEN_VDD_POLICY_*.
     uint8_t minimum_fidelity;  ///< LUMEN_VDD_FIDELITY_*.
   } LUMEN_VDD_MODE;
+
+  /** Exact HDR10 mastering-display and content-light metadata. */
+  typedef struct LUMEN_VDD_HDR10_METADATA {
+    uint16_t red_primary[2];  ///< CIE1931 red X/Y normalized to 50,000.
+    uint16_t green_primary[2];  ///< CIE1931 green X/Y normalized to 50,000.
+    uint16_t blue_primary[2];  ///< CIE1931 blue X/Y normalized to 50,000.
+    uint16_t white_point[2];  ///< CIE1931 white X/Y normalized to 50,000.
+    uint16_t maximum_mastering_luminance;  ///< Whole nits.
+    uint16_t minimum_mastering_luminance;  ///< Nits normalized to 10,000.
+    uint16_t maximum_content_light_level;  ///< Whole nits.
+    uint16_t maximum_frame_average_light_level;  ///< Whole nits.
+  } LUMEN_VDD_HDR10_METADATA;
+
+  /** Exact legacy 256-entry per-channel gamma table. */
+  typedef struct LUMEN_VDD_GAMMA_RAMP_RGB256X3X16 {
+    uint16_t red[256];  ///< Red channel values.
+    uint16_t green[256];  ///< Green channel values.
+    uint16_t blue[256];  ///< Blue channel values.
+  } LUMEN_VDD_GAMMA_RAMP_RGB256X3X16;
+
+  /** One floating-point RGB LUT entry. */
+  typedef struct LUMEN_VDD_RGB_FLOAT {
+    float red;  ///< Red component.
+    float green;  ///< Green component.
+    float blue;  ///< Blue component.
+  } LUMEN_VDD_RGB_FLOAT;
+
+  /** Exact IddCx 3x4 matrix/scalar/LUT color transform with normalized BOOL fields. */
+  typedef struct LUMEN_VDD_GAMMA_RAMP_3X4_COLORSPACE_TRANSFORM {
+    uint32_t matrix_enabled;  ///< Exactly zero or one.
+    float color_matrix_3x4[3][4];  ///< Row-major 3x4 matrix.
+    float scalar_multiplier;  ///< Scalar applied to every matrix element.
+    uint32_t lut_enabled;  ///< Exactly zero or one.
+    LUMEN_VDD_RGB_FLOAT lookup_table_1d[LUMEN_VDD_COLOR_TRANSFORM_LUT_ENTRY_COUNT];  ///< Exact 4096-entry LUT.
+  } LUMEN_VDD_GAMMA_RAMP_3X4_COLORSPACE_TRANSFORM;
+
+  /** Fixed-size storage for any supported immutable gamma/color-transform payload. */
+  typedef union LUMEN_VDD_COLOR_TRANSFORM_PAYLOAD {
+    LUMEN_VDD_GAMMA_RAMP_RGB256X3X16 rgb256x3x16;  ///< Type LUMEN_VDD_GAMMA_RAMP_TYPE_RGB256X3X16.
+    LUMEN_VDD_GAMMA_RAMP_3X4_COLORSPACE_TRANSFORM transform_3x4;  ///< Type LUMEN_VDD_GAMMA_RAMP_TYPE_3X4_COLORSPACE_TRANSFORM.
+    uint8_t storage[LUMEN_VDD_COLOR_TRANSFORM_PAYLOAD_SIZE];  ///< Stable fixed response extent.
+  } LUMEN_VDD_COLOR_TRANSFORM_PAYLOAD;
+
+  /** Query one exact immutable transform version for the active generation. */
+  typedef struct LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST {
+    uint64_t generation;  ///< Exact active generation.
+    uint64_t transform_version;  ///< Exact nonzero descriptor/open-channel version.
+  } LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST;
+
+  /** Fixed-size immutable transform response. */
+  typedef struct LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE {
+    uint64_t generation;  ///< Exact active generation.
+    uint64_t transform_version;  ///< Exact immutable version, starting with DEFAULT version 1.
+    uint32_t gamma_ramp_type;  ///< LUMEN_VDD_GAMMA_RAMP_*.
+    uint32_t payload_size;  ///< Zero, 1536, or 49212 according to gamma_ramp_type.
+    LUMEN_VDD_COLOR_TRANSFORM_PAYLOAD payload;  ///< Exact copied OS payload; unused bytes are zero.
+  } LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE;
 
   /** Fixed ABI and practical driver capability response. */
   typedef struct LUMEN_VDD_QUERY_ABI_RESPONSE {
@@ -158,7 +244,13 @@ extern "C" {
     uint32_t slot_count;  ///< Must equal LUMEN_VDD_FRAME_SLOT_COUNT.
     uint64_t texture_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Raw WUDFHost NT handles for shared textures.
     uint64_t fence_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Raw WUDFHost NT handles for shared D3D11 fences.
-    uint64_t reserved[2];  ///< Must be zero.
+    uint64_t color_transform_version;  ///< Current immutable transform version, starting with DEFAULT version 1.
+    uint32_t initial_surface_color_space;  ///< Initial LUMEN_VDD_COLOR_SPACE_* for encoder creation.
+    uint32_t initial_sdr_white_level_nits;  ///< Initial committed IddCx SDR white level.
+    uint32_t initial_hdr_metadata_type;  ///< Resolved initial LUMEN_VDD_HDR_METADATA_*.
+    uint32_t initial_metadata_reserved;  ///< Must be zero.
+    LUMEN_VDD_HDR10_METADATA initial_hdr10_metadata;  ///< Resolved initial/default metadata; zero for SDR.
+    uint64_t reserved;  ///< Must be zero.
   } LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE;
 
   /** Driver-published auto-reset event exposed for authorized reverse duplication. */
@@ -185,6 +277,12 @@ extern "C" {
     int64_t producer_signal_qpc;  ///< QPC sampled after the producer fence signal was submitted.
     uint32_t slot;  ///< Slot index below LUMEN_VDD_FRAME_SLOT_COUNT.
     uint32_t reserved;  ///< Must be zero.
+    uint64_t color_transform_version;  ///< Exact immutable transform retained by this slot lease.
+    uint32_t surface_color_space;  ///< LUMEN_VDD_COLOR_SPACE_*.
+    uint32_t sdr_white_level_nits;  ///< IddCx SDR white level copied for this frame.
+    uint32_t hdr_metadata_type;  ///< LUMEN_VDD_HDR_METADATA_*; nonzero types carry resolved metadata.
+    uint32_t metadata_reserved;  ///< Must be zero.
+    LUMEN_VDD_HDR10_METADATA hdr10_metadata;  ///< Resolved effective HDR10 metadata when hdr_metadata_type is nonzero.
   } LUMEN_VDD_DEQUEUE_FRAME_RESPONSE;
 
   /** Release one exact leased frame after conversion and NVENC completion. */
@@ -201,18 +299,26 @@ extern "C" {
 
 #define LUMEN_VDD_STATIC_ASSERT(expression, name) typedef char lumen_vdd_static_assert_##name[(expression) ? 1 : -1]
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_MODE) == 20, mode_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_HDR10_METADATA) == 24, hdr10_metadata_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_GAMMA_RAMP_RGB256X3X16) == 1536, gamma_rgb256_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_RGB_FLOAT) == 12, rgb_float_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_GAMMA_RAMP_3X4_COLORSPACE_TRANSFORM) == 49212, gamma_transform_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_COLOR_TRANSFORM_PAYLOAD) == 49212, color_transform_payload_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST) == 16, query_color_transform_request_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE) == 49236, query_color_transform_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_ABI_RESPONSE) == 56, query_abi_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_STATE_RESPONSE) == 68, query_state_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_PREPARE_MODE_REQUEST) == 44, prepare_request_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_PREPARE_MODE_RESPONSE) == 164, prepare_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_GENERATION_REQUEST) == 8, generation_request_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST) == 16, open_frame_request_size);
-  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE) == 96, open_frame_response_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE) == 136, open_frame_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE) == 40, open_frame_event_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_DEQUEUE_FRAME_REQUEST) == 8, dequeue_frame_request_size);
-  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_DEQUEUE_FRAME_RESPONSE) == 48, dequeue_frame_response_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_DEQUEUE_FRAME_RESPONSE) == 96, dequeue_frame_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_RELEASE_FRAME_REQUEST) == 40, release_frame_request_size);
   LUMEN_VDD_STATIC_ASSERT((IOCTL_LUMEN_VDD_PREPARE_MODE & 3u) == LUMEN_VDD_METHOD_BUFFERED, prepare_is_buffered);
+  LUMEN_VDD_STATIC_ASSERT((IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM & 3u) == LUMEN_VDD_METHOD_BUFFERED, query_color_transform_is_buffered);
 #undef LUMEN_VDD_STATIC_ASSERT
 
 #if defined(__cplusplus)

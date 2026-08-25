@@ -97,6 +97,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/wasapi_virtual_microphone.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_status.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_status.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_frame.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_frame.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_frame_win.cpp"

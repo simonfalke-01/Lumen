@@ -8,7 +8,9 @@
   // standard includes
   #include <algorithm>
   #include <atomic>
+#include <cmath>
   #include <cstdint>
+#include <cstring>
   #include <limits>
   #include <mutex>
   #include <optional>
@@ -36,6 +38,7 @@
   #include "virtual_display_driver/LumenVirtualDisplayGuids.h"
   #include "virtual_display_driver/LumenDirectFrameSlotPolicy.h"
   #include "virtual_display_frame.h"
+  #include "virtual_display_status.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace std::chrono_literals;
@@ -77,6 +80,101 @@ namespace platf::virtual_display {
       }
       return seconds * 1'000'000'000ULL +
              remainder * 1'000'000'000ULL / static_cast<std::uint64_t>(frequency.QuadPart);
+    }
+
+    frame_hdr10_metadata_t frame_hdr10_metadata(const LUMEN_VDD_HDR10_METADATA &metadata) noexcept {
+      return {
+        {metadata.red_primary[0], metadata.red_primary[1]},
+        {metadata.green_primary[0], metadata.green_primary[1]},
+        {metadata.blue_primary[0], metadata.blue_primary[1]},
+        {metadata.white_point[0], metadata.white_point[1]},
+        metadata.maximum_mastering_luminance,
+        metadata.minimum_mastering_luminance,
+        metadata.maximum_content_light_level,
+        metadata.maximum_frame_average_light_level,
+      };
+    }
+
+    std::optional<frame_color_metadata_t> frame_color_metadata(
+      const std::uint32_t color_space,
+      const std::uint32_t sdr_white_level_nits,
+      const std::uint32_t hdr_metadata_type,
+      const std::uint32_t reserved,
+      const LUMEN_VDD_HDR10_METADATA &metadata,
+      const dynamic_range_e dynamic_range,
+      const frame_format_e format
+    ) noexcept {
+      if (reserved != 0 || color_space < LUMEN_VDD_COLOR_SPACE_SRGB ||
+          color_space > LUMEN_VDD_COLOR_SPACE_HDR10 || hdr_metadata_type > LUMEN_VDD_HDR_METADATA_NEW) {
+        return std::nullopt;
+      }
+      const frame_color_metadata_t converted {
+        static_cast<frame_color_space_e>(color_space),
+        sdr_white_level_nits,
+        static_cast<hdr_metadata_type_e>(hdr_metadata_type),
+        frame_hdr10_metadata(metadata),
+      };
+      return valid_frame_color_metadata(converted, dynamic_range, format) ?
+               std::optional {converted} :
+               std::nullopt;
+    }
+
+    bool zero_bytes(const std::uint8_t *data, const std::size_t size) noexcept {
+      return std::all_of(data, data + size, [](const std::uint8_t value) {
+        return value == 0;
+      });
+    }
+
+    std::shared_ptr<const color_transform_t> color_transform(
+      const LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE &response
+    ) {
+      auto transform = std::make_shared<color_transform_t>();
+      transform->generation = response.generation;
+      transform->version = response.transform_version;
+      if (response.gamma_ramp_type == LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT) {
+        if (response.payload_size != 0 ||
+            !zero_bytes(response.payload.storage, sizeof(response.payload.storage))) {
+          return {};
+        }
+        transform->type = color_transform_type_e::default_;
+        transform->payload = std::monostate {};
+      } else if (response.gamma_ramp_type == LUMEN_VDD_GAMMA_RAMP_TYPE_RGB256X3X16) {
+        if (response.payload_size != sizeof(response.payload.rgb256x3x16) ||
+            !zero_bytes(
+              response.payload.storage + response.payload_size,
+              sizeof(response.payload.storage) - response.payload_size
+            )) {
+          return {};
+        }
+        color_transform_rgb256_t payload;
+        std::ranges::copy(response.payload.rgb256x3x16.red, payload.red.begin());
+        std::ranges::copy(response.payload.rgb256x3x16.green, payload.green.begin());
+        std::ranges::copy(response.payload.rgb256x3x16.blue, payload.blue.begin());
+        transform->type = color_transform_type_e::rgb256x3x16;
+        transform->payload = std::move(payload);
+      } else if (response.gamma_ramp_type == LUMEN_VDD_GAMMA_RAMP_TYPE_3X4_COLORSPACE_TRANSFORM) {
+        const auto &input = response.payload.transform_3x4;
+        if (response.payload_size != sizeof(input) || input.matrix_enabled > 1 || input.lut_enabled > 1) {
+          return {};
+        }
+        color_transform_3x4_t payload;
+        payload.matrix_enabled = input.matrix_enabled != 0;
+        std::memcpy(payload.color_matrix_3x4.data(), input.color_matrix_3x4, sizeof(input.color_matrix_3x4));
+        payload.scalar_multiplier = input.scalar_multiplier;
+        payload.lut_enabled = input.lut_enabled != 0;
+        for (std::size_t index = 0; index < color_transform_lut_entry_count; ++index) {
+          payload.lookup_table_1d[index] = {
+            input.lookup_table_1d[index].red,
+            input.lookup_table_1d[index].green,
+            input.lookup_table_1d[index].blue,
+          };
+        }
+        transform->type = color_transform_type_e::colorspace_3x4;
+        transform->payload = std::move(payload);
+      } else {
+        return {};
+      }
+      return prepare_color_transform(*transform) ? transform : std::shared_ptr<const color_transform_t> {};
     }
 
     /** @brief Map one Win32 device-IO failure into the stable frame contract. */
@@ -236,8 +334,16 @@ namespace platf::virtual_display {
 
       LUMEN_VDD_QUERY_ABI_RESPONSE abi {};
       const auto abi_status = ioctl(IOCTL_LUMEN_VDD_QUERY_ABI, nullptr, 0, &abi, sizeof(abi));
+      const std::uint32_t required_capabilities = LUMEN_VDD_CAP_DIRECT_FRAME_V1 |
+                                                  LUMEN_VDD_CAP_FRAME_METADATA_V2 |
+                                                  LUMEN_VDD_CAP_COLOR_TRANSFORM_V1 |
+                                                  (mode.dynamic_range == dynamic_range_e::hdr10 ?
+                                                     LUMEN_VDD_CAP_HDR10 |
+                                                       LUMEN_VDD_CAP_10BIT |
+                                                       LUMEN_VDD_CAP_DIRECT_FRAME_FP16 :
+                                                     LUMEN_VDD_CAP_SDR8);
       if (abi_status != frame_io_e::ok || abi.abi_version != LUMEN_VDD_ABI_VERSION ||
-          (abi.capability_flags & LUMEN_VDD_CAP_DIRECT_FRAME_V1) == 0) {
+          (abi.capability_flags & required_capabilities) != required_capabilities) {
         stop();
         return abi_status == frame_io_e::ok ? frame_io_e::unsupported : abi_status;
       }
@@ -305,10 +411,9 @@ namespace platf::virtual_display {
       if (response.generation != generation || response.source_process_id != source_process_id ||
           response.source_reserved != 0 || response.source_process_creation_time != source_process_creation_time ||
           response.slot_count != LUMEN_VDD_FRAME_SLOT_COUNT ||
-          response.texture_format != LUMEN_VDD_FRAME_FORMAT_BGRA8 ||
-          !std::ranges::all_of(response.reserved, [](const std::uint64_t value) {
-            return value == 0;
-          })) {
+          (response.texture_format != LUMEN_VDD_FRAME_FORMAT_BGRA8 &&
+           response.texture_format != LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT) ||
+          response.color_transform_version == 0 || response.reserved != 0) {
         stop();
         return frame_io_e::invalid_data;
       }
@@ -316,12 +421,30 @@ namespace platf::virtual_display {
         stop();
         return frame_io_e::transport_error;
       }
+      const auto format = response.texture_format == LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT ?
+                            frame_format_e::rgba16_float :
+                            frame_format_e::bgra8;
+      const auto initial_color_metadata = frame_color_metadata(
+        response.initial_surface_color_space,
+        response.initial_sdr_white_level_nits,
+        response.initial_hdr_metadata_type,
+        response.initial_metadata_reserved,
+        response.initial_hdr10_metadata,
+        mode.dynamic_range,
+        format
+      );
+      if (!initial_color_metadata) {
+        close_response_handles(response);
+        stop();
+        return frame_io_e::invalid_data;
+      }
       resources = {
         response.generation,
         response.adapter_luid,
         response.width,
         response.height,
-        frame_format_e::bgra8,
+        format,
+        mode.dynamic_range,
         response.slot_count,
         {
           static_cast<std::uintptr_t>(response.texture_handles[0]),
@@ -331,8 +454,15 @@ namespace platf::virtual_display {
           static_cast<std::uintptr_t>(response.fence_handles[0]),
           static_cast<std::uintptr_t>(response.fence_handles[1]),
         },
+        response.color_transform_version,
+        *initial_color_metadata,
       };
       if (!valid_frame_resources(resources, generation, mode)) {
+        close_response_handles(response);
+        stop();
+        return frame_io_e::invalid_data;
+      }
+      if (!resolve_color_transform(response.color_transform_version)) {
         close_response_handles(response);
         stop();
         return frame_io_e::invalid_data;
@@ -451,8 +581,11 @@ namespace platf::virtual_display {
         }
         D3D11_TEXTURE2D_DESC texture_desc {};
         textures[slot]->GetDesc(&texture_desc);
+        const auto expected_texture_format = resources.format == frame_format_e::rgba16_float ?
+                                               DXGI_FORMAT_R16G16B16A16_FLOAT :
+                                               DXGI_FORMAT_B8G8R8A8_UNORM;
         if (texture_desc.Width != resources.width || texture_desc.Height != resources.height ||
-            texture_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+            texture_desc.Format != expected_texture_format ||
             texture_desc.MipLevels != 1 || texture_desc.ArraySize != 1 ||
             texture_desc.SampleDesc.Count != 1 || texture_desc.Usage != D3D11_USAGE_DEFAULT ||
             (texture_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
@@ -489,6 +622,19 @@ namespace platf::virtual_display {
             sizeof(response)
           );
           if (status == frame_io_e::ok) {
+            const auto color_metadata = frame_color_metadata(
+              response.surface_color_space,
+              response.sdr_white_level_nits,
+              response.hdr_metadata_type,
+              response.metadata_reserved,
+              response.hdr10_metadata,
+              resources.dynamic_range,
+              resources.format
+            );
+            if (!color_metadata) {
+              fail_locked(true);
+              return {frame_io_e::invalid_data, {}};
+            }
             const frame_descriptor_t frame {
               response.generation,
               response.sequence,
@@ -496,10 +642,17 @@ namespace platf::virtual_display {
               response.capture_qpc,
               response.producer_signal_qpc,
               response.slot,
+              response.color_transform_version,
+              *color_metadata,
             };
             if (response.reserved != 0 || !valid_frame_descriptor(frame, resources) ||
                 frame.sequence <= last_sequence || in_use[frame.slot] ||
                 frame.producer_fence_value <= last_fence[frame.slot]) {
+              fail_locked(true);
+              return {frame_io_e::invalid_data, {}};
+            }
+            auto transform = resolve_color_transform(frame.color_transform_version);
+            if (!transform) {
               fail_locked(true);
               return {frame_io_e::invalid_data, {}};
             }
@@ -535,7 +688,7 @@ namespace platf::virtual_display {
             return {
               frame_io_e::ok,
               std::shared_ptr<frame_lease_t> {
-                new frame_lease_t(source, frame, textures[frame.slot].Get())
+                new frame_lease_t(source, frame, textures[frame.slot].Get(), std::move(transform))
               },
             };
           }
@@ -590,6 +743,33 @@ namespace platf::virtual_display {
     void stop() noexcept {
       std::lock_guard lock(mutex);
       fail_locked(false);
+    }
+
+    std::shared_ptr<const color_transform_t> resolve_color_transform(const std::uint64_t version) {
+      if (auto cached = color_transforms.find(generation, version)) {
+        return cached;
+      }
+      try {
+        const LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST request {generation, version};
+        auto response = std::make_unique<LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE>();
+        if (ioctl(
+              IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM,
+              &request,
+              sizeof(request),
+              response.get(),
+              sizeof(*response)
+            ) != frame_io_e::ok ||
+            response->generation != generation || response->transform_version != version) {
+          return {};
+        }
+        auto parsed = color_transform(*response);
+        if (!parsed || !color_transforms.commit(parsed)) {
+          return {};
+        }
+        return parsed;
+      } catch (...) {
+        return {};
+      }
     }
 
     frame_io_e wait_for_availability(const std::chrono::steady_clock::time_point deadline) const noexcept {
@@ -723,6 +903,7 @@ namespace platf::virtual_display {
         runtime_quarantined.store(true, std::memory_order_release);
       }
       healthy = false;
+      report_direct_frame_stopped(generation, quarantine);
       for (std::size_t slot = 0; slot < direct_frame_slot_count; ++slot) {
         if (keyed_owned[slot] && keyed_mutexes[slot] && last_fence[slot] != std::numeric_limits<std::uint64_t>::max()) {
           static_cast<void>(keyed_mutexes[slot]->ReleaseSync(
@@ -740,6 +921,7 @@ namespace platf::virtual_display {
       if (source_process != nullptr) {
         CloseHandle(std::exchange(source_process, nullptr));
       }
+      color_transforms.clear();
     }
 
     std::uint64_t generation {};  ///< Exact active driver generation.
@@ -753,6 +935,7 @@ namespace platf::virtual_display {
     HANDLE availability_event {};  ///< Driver-published resource/frame availability event.
     HANDLE cancel_event {};  ///< Host cancellation event for bounded waits.
     frame_resources_t resources;  ///< Validated imported resource metadata.
+    color_transform_cache_t color_transforms;  ///< Driver-matched current and previous immutable transforms.
     ComPtr<IDXGIAdapter1> adapter;  ///< Exact IddCx render adapter.
     ComPtr<ID3D11Device> device;  ///< Import and conversion device.
     ComPtr<ID3D11Device1> device1;  ///< Shared texture import interface.
@@ -773,11 +956,13 @@ namespace platf::virtual_display {
   frame_lease_t::frame_lease_t(
     std::shared_ptr<frame_source_t> source,
     frame_descriptor_t descriptor,
-    void *native_texture
+    void *native_texture,
+    std::shared_ptr<const color_transform_t> color_transform
   ):
       source_ {std::move(source)},
       descriptor_ {descriptor},
-      native_texture_ {native_texture} {
+      native_texture_ {native_texture},
+      color_transform_ {std::move(color_transform)} {
   }
 
   frame_lease_t::~frame_lease_t() {
@@ -792,6 +977,10 @@ namespace platf::virtual_display {
 
   void *frame_lease_t::native_texture() const noexcept {
     return native_texture_;
+  }
+
+  const std::shared_ptr<const color_transform_t> &frame_lease_t::color_transform() const noexcept {
+    return color_transform_;
   }
 
   frame_source_t::frame_source_t(std::unique_ptr<impl_t> impl):
@@ -847,9 +1036,12 @@ namespace platf::virtual_display {
   ) {
     auto impl = std::make_unique<frame_source_t::impl_t>(selection);
     if (impl->initialize(timeout) != frame_io_e::ok) {
+      impl.reset();
+      report_direct_frame_fallback(selection.generation);
       return {};
     }
     auto source = std::shared_ptr<frame_source_t> {new frame_source_t(std::move(impl))};
+    report_direct_frame_bound(selection.generation);
     BOOST_LOG(info) << "Lumen VDD direct-frame one-copy path enabled for generation "sv
                     << selection.generation << "; two persistent shared texture/fence slots"sv;
     return source;
@@ -857,6 +1049,7 @@ namespace platf::virtual_display {
 
   void quarantine_direct_frame_runtime() noexcept {
     runtime_quarantined.store(true, std::memory_order_release);
+    report_direct_frame_quarantined();
   }
 
   bool direct_frame_runtime_quarantined() noexcept {

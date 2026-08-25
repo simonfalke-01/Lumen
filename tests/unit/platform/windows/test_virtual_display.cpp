@@ -10,6 +10,7 @@
 #include <barrier>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <string>
 #include <thread>
 #include <utility>
@@ -31,10 +32,19 @@
 // local includes
 #include "src/platform/windows/virtual_display.h"
 #include "src/platform/windows/virtual_display_driver/LumenDirectFrameSlotPolicy.h"
+#include "src/platform/windows/virtual_display_driver/LumenColorTransformPolicy.h"
+#include "src/platform/windows/virtual_display_driver/LumenHdrModePolicy.h"
+#include "src/platform/windows/virtual_display_driver/LumenModeValidationPolicy.h"
 #include "src/platform/windows/virtual_display_driver/LumenSingleDeleteOwner.h"
 #include "src/platform/windows/virtual_display_driver/LumenVirtualDisplayProtocol.h"
 #include "src/platform/windows/virtual_display_frame.h"
 #include "src/utility.h"
+
+#if defined(_WIN32)
+namespace platf::dxgi {
+  int init();
+}
+#endif
 
 namespace {
   using namespace platf::virtual_display;
@@ -513,23 +523,210 @@ TEST(VirtualDisplayPolicy, OptionalFallbackRejectsUncertainRollback) {
   EXPECT_EQ(rejected.diagnostic, start_error_e::rollback_failed);
 }
 
+TEST(VirtualDisplayPolicy, ModernSessionsRequireVddUnlessExplicitlyDisabled) {
+  EXPECT_EQ(
+    modern_activation_policy(activation_policy_e::optional),
+    activation_policy_e::required
+  );
+  EXPECT_EQ(
+    modern_activation_policy(activation_policy_e::required),
+    activation_policy_e::required
+  );
+  EXPECT_EQ(
+    modern_activation_policy(activation_policy_e::disabled),
+    activation_policy_e::disabled
+  );
+  EXPECT_EQ(direct_surface_fidelity(), fidelity_e::lossless);
+}
+
+TEST(VirtualDisplayPolicy, AdmitsProvenHdr10TenBitSession) {
+  auto backend = std::make_shared<lease_backend_t>();
+  auto hdr_mode = mode_4k120;
+  hdr_mode.dynamic_range = dynamic_range_e::hdr10;
+  hdr_mode.bits_per_channel = 10;
+  const auto prepared = prepare_stream_session(
+    activation_policy_e::required,
+    modern_stream_request(82, hdr_mode, delivery_policy_e::quality),
+    capable_limits(),
+    "physical",
+    backend
+  );
+  EXPECT_EQ(prepared.outcome, session_prepare_e::virtual_display);
+  ASSERT_TRUE(prepared.selection);
+  EXPECT_EQ(prepared.selection->selected_mode, hdr_mode);
+  ASSERT_TRUE(prepared.lease);
+  EXPECT_TRUE(prepared.lease->release());
+}
+
+TEST(VirtualDisplayPolicy, OptionalLegacySessionAdmitsProvenHdr10TenBitVdd) {
+  auto backend = std::make_shared<lease_backend_t>();
+  auto hdr_mode = mode_4k120;
+  hdr_mode.dynamic_range = dynamic_range_e::hdr10;
+  hdr_mode.bits_per_channel = 10;
+  const auto prepared = prepare_stream_session(
+    activation_policy_e::optional,
+    {83, hdr_mode, delivery_policy_e::quality, direct_surface_fidelity()},
+    capable_limits(),
+    "physical",
+    backend
+  );
+  ASSERT_EQ(prepared.outcome, session_prepare_e::virtual_display);
+  ASSERT_TRUE(prepared.lease);
+  EXPECT_TRUE(prepared.lease->release());
+}
+
 TEST(VirtualDisplayProtocol, UsesBufferedAdminServiceAbiWithStableSizes) {
-  EXPECT_EQ(LUMEN_VDD_ABI_VERSION, 4U);
+  EXPECT_EQ(LUMEN_VDD_ABI_VERSION, 5U);
   EXPECT_EQ(sizeof(LUMEN_VDD_MODE), 20U);
   EXPECT_EQ(sizeof(LUMEN_VDD_QUERY_ABI_RESPONSE), 56U);
   EXPECT_EQ(sizeof(LUMEN_VDD_PREPARE_MODE_REQUEST), 44U);
   EXPECT_EQ(sizeof(LUMEN_VDD_PREPARE_MODE_RESPONSE), 164U);
   EXPECT_EQ(sizeof(LUMEN_VDD_QUERY_STATE_RESPONSE), 68U);
   EXPECT_EQ(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST), 16U);
-  EXPECT_EQ(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE), 96U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE), 136U);
   EXPECT_EQ(sizeof(LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE), 40U);
-  EXPECT_EQ(sizeof(LUMEN_VDD_DEQUEUE_FRAME_RESPONSE), 48U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_HDR10_METADATA), 24U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_GAMMA_RAMP_RGB256X3X16), 1536U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_RGB_FLOAT), 12U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_GAMMA_RAMP_3X4_COLORSPACE_TRANSFORM), 49212U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_COLOR_TRANSFORM_PAYLOAD), 49212U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST), 16U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE), 49236U);
+  EXPECT_EQ(sizeof(LUMEN_VDD_DEQUEUE_FRAME_RESPONSE), 96U);
   EXPECT_EQ(sizeof(LUMEN_VDD_RELEASE_FRAME_REQUEST), 40U);
   EXPECT_EQ(IOCTL_LUMEN_VDD_OPEN_FRAME_CHANNEL & 3U, LUMEN_VDD_METHOD_BUFFERED);
   EXPECT_NE(IOCTL_LUMEN_VDD_OPEN_FRAME_CHANNEL & (LUMEN_VDD_FILE_WRITE_DATA << 14U), 0U);
   EXPECT_NE(IOCTL_LUMEN_VDD_DEQUEUE_FRAME & (LUMEN_VDD_FILE_READ_DATA << 14U), 0U);
   EXPECT_NE(IOCTL_LUMEN_VDD_RELEASE_FRAME & (LUMEN_VDD_FILE_WRITE_DATA << 14U), 0U);
   EXPECT_NE(IOCTL_LUMEN_VDD_OPEN_FRAME_EVENT & (LUMEN_VDD_FILE_READ_DATA << 14U), 0U);
+  EXPECT_NE(IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM & (LUMEN_VDD_FILE_READ_DATA << 14U), 0U);
+  EXPECT_NE(IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM & (LUMEN_VDD_FILE_WRITE_DATA << 14U), 0U);
+}
+
+TEST(VirtualDisplayHdrEdidPolicy, UsesStandardHdr10Bt2020CtaWithoutVendorPayload) {
+  EXPECT_EQ(lumen::vdd::hdr::edid.size(), 256U);
+  EXPECT_TRUE(lumen::vdd::hdr::valid_edid_checksums());
+  EXPECT_TRUE(lumen::vdd::hdr::has_hdr10_bt2020_cta());
+  EXPECT_FALSE(lumen::vdd::hdr::contains_vendor_specific_data_block());
+}
+
+TEST(VirtualDisplayModePolicy, HandlesLargeReducedDenominatorsWithoutOverflow) {
+  LUMEN_VDD_MODE mode {
+    LUMEN_VDD_MAX_WIDTH,
+    LUMEN_VDD_MAX_HEIGHT,
+    999999937,
+    99999989,
+    LUMEN_VDD_DYNAMIC_RANGE_SDR,
+    8,
+    LUMEN_VDD_POLICY_LATENCY,
+    LUMEN_VDD_FIDELITY_LOSSLESS,
+  };
+  EXPECT_TRUE(lumen::vdd::mode::valid(mode));
+  mode.refresh_numerator = LUMEN_VDD_MAX_RATIONAL_COMPONENT;
+  mode.refresh_denominator = LUMEN_VDD_MAX_RATIONAL_COMPONENT;
+  EXPECT_FALSE(lumen::vdd::mode::valid(mode));
+}
+
+TEST(VirtualDisplayHdrModePolicy, AddsExactDriverModeBesideStableBaseline) {
+  const LUMEN_VDD_MODE exact {
+    3456,
+    2160,
+    60000,
+    1001,
+    LUMEN_VDD_DYNAMIC_RANGE_HDR10,
+    10,
+    LUMEN_VDD_POLICY_LATENCY,
+    LUMEN_VDD_FIDELITY_LOSSLESS,
+  };
+  const auto modes = lumen::vdd::hdr::descriptor_modes(exact);
+  ASSERT_EQ(modes.count, 2U);
+  EXPECT_EQ(modes.preferred_index, 1U);
+  EXPECT_TRUE(lumen::vdd::hdr::modes_equal(modes.modes[0], lumen::vdd::hdr::baseline_mode));
+  EXPECT_TRUE(lumen::vdd::hdr::modes_equal(modes.modes[1], exact));
+
+  const auto baseline_only = lumen::vdd::hdr::descriptor_modes(lumen::vdd::hdr::baseline_mode);
+  ASSERT_EQ(baseline_only.count, 1U);
+  EXPECT_EQ(baseline_only.preferred_index, 0U);
+  auto quality_baseline = lumen::vdd::hdr::baseline_mode;
+  quality_baseline.delivery_policy = LUMEN_VDD_POLICY_QUALITY;
+  const auto quality_baseline_only = lumen::vdd::hdr::descriptor_modes(quality_baseline);
+  EXPECT_EQ(quality_baseline_only.count, 1U);
+}
+
+TEST(VirtualDisplayHdrMetadataPolicy, RejectsInvalidChromaticityAndLuminanceRelationships) {
+  LUMEN_VDD_HDR10_METADATA metadata {
+    {35400, 14600},
+    {8500, 39850},
+    {6550, 2300},
+    {15635, 16450},
+    1000,
+    50,
+    1000,
+    400,
+  };
+  EXPECT_TRUE(lumen::vdd::hdr::valid_hdr10_metadata(metadata));
+  metadata.red_primary[1] = 14601;
+  EXPECT_TRUE(lumen::vdd::hdr::valid_hdr10_metadata(metadata));
+  metadata.red_primary[1] = 14600;
+  metadata.red_primary[0] = 50001;
+  EXPECT_FALSE(lumen::vdd::hdr::valid_hdr10_metadata(metadata));
+  metadata.red_primary[0] = 35400;
+  metadata.maximum_mastering_luminance = 0;
+  EXPECT_FALSE(lumen::vdd::hdr::valid_hdr10_metadata(metadata));
+  metadata.maximum_mastering_luminance = 1000;
+  metadata.maximum_frame_average_light_level = 1001;
+  EXPECT_FALSE(lumen::vdd::hdr::valid_hdr10_metadata(metadata));
+}
+
+TEST(VirtualDisplayColorTransformPolicy, ValidatesExactTypesBoolsAndFiniteValues) {
+  using namespace lumen::vdd::color;
+  EXPECT_TRUE(valid_payload_header(LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT, 0));
+  EXPECT_TRUE(valid_payload_header(
+    LUMEN_VDD_GAMMA_RAMP_TYPE_RGB256X3X16,
+    sizeof(LUMEN_VDD_GAMMA_RAMP_RGB256X3X16)
+  ));
+  EXPECT_TRUE(valid_payload_header(
+    LUMEN_VDD_GAMMA_RAMP_TYPE_3X4_COLORSPACE_TRANSFORM,
+    sizeof(LUMEN_VDD_GAMMA_RAMP_3X4_COLORSPACE_TRANSFORM)
+  ));
+  EXPECT_FALSE(valid_payload_header(LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT, 1));
+
+  LUMEN_VDD_GAMMA_RAMP_3X4_COLORSPACE_TRANSFORM transform {};
+  transform.matrix_enabled = 1;
+  transform.scalar_multiplier = 1.0F;
+  transform.lut_enabled = 1;
+  EXPECT_TRUE(valid_transform(transform));
+  transform.matrix_enabled = 2;
+  EXPECT_FALSE(valid_transform(transform));
+  transform.matrix_enabled = 1;
+  transform.lookup_table_1d[17].green = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(valid_transform(transform));
+  transform.lookup_table_1d[17].green = std::numeric_limits<float>::max();
+  EXPECT_TRUE(valid_transform(transform));
+
+  transform.matrix_enabled = 0;
+  transform.scalar_multiplier = std::numeric_limits<float>::quiet_NaN();
+  transform.color_matrix_3x4[1][2] = std::numeric_limits<float>::quiet_NaN();
+  transform.lut_enabled = 0;
+  transform.lookup_table_1d[17].green = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_TRUE(valid_transform(transform));
+  clear_disabled_sections(transform);
+  EXPECT_EQ(transform.scalar_multiplier, 0.0F);
+  EXPECT_EQ(transform.color_matrix_3x4[1][2], 0.0F);
+  EXPECT_EQ(transform.lookup_table_1d[17].green, 0.0F);
+  EXPECT_EQ(
+    effective_type(LUMEN_VDD_GAMMA_RAMP_TYPE_3X4_COLORSPACE_TRANSFORM, transform),
+    LUMEN_VDD_GAMMA_RAMP_TYPE_DEFAULT
+  );
+}
+
+TEST(VirtualDisplayColorTransformPolicy, AcceptsCompatibleRuntimeMetadataTail) {
+  using lumen::vdd::color::valid_compatible_prefix;
+  EXPECT_TRUE(valid_compatible_prefix(120, 112, 120, 120));
+  EXPECT_TRUE(valid_compatible_prefix(120, 112, 112, 108));
+  EXPECT_FALSE(valid_compatible_prefix(111, 112, 120, 120));
+  EXPECT_FALSE(valid_compatible_prefix(120, 112, 107, 108));
+  EXPECT_FALSE(valid_compatible_prefix(120, std::numeric_limits<std::uint32_t>::max(), 120, 120));
 }
 
 TEST(VirtualDisplayDirectFrameValidation, RequiresExactUniqueTwoSlotResources) {
@@ -539,9 +736,12 @@ TEST(VirtualDisplayDirectFrameValidation, RequiresExactUniqueTwoSlotResources) {
     mode_4k120.width,
     mode_4k120.height,
     frame_format_e::bgra8,
+    dynamic_range_e::sdr,
     2,
     {10, 11},
     {12, 13},
+    1,
+    {frame_color_space_e::srgb, 80, hdr_metadata_type_e::none, {}},
   };
   EXPECT_TRUE(valid_frame_resources(resources, 9, mode_4k120));
   resources.generation = 8;
@@ -550,6 +750,120 @@ TEST(VirtualDisplayDirectFrameValidation, RequiresExactUniqueTwoSlotResources) {
   resources.fence_handles[1] = resources.texture_handles[0];
   EXPECT_FALSE(valid_frame_resources(resources, 9, mode_4k120));
 }
+
+TEST(VirtualDisplayFrameAbi5Policy, ValidatesSdrHdrFormatsMetadataAndPixelPitch) {
+  EXPECT_EQ(frame_format_pixel_pitch(frame_format_e::bgra8), 4U);
+  EXPECT_EQ(frame_format_pixel_pitch(frame_format_e::rgba16_float), 8U);
+  EXPECT_TRUE(requires_direct_frame_for_vdd_hdr(true, true));
+  EXPECT_FALSE(requires_direct_frame_for_vdd_hdr(true, false));
+  EXPECT_FALSE(requires_direct_frame_for_vdd_hdr(false, true));
+  EXPECT_TRUE(valid_required_direct_capture_request(false, false, false));
+  EXPECT_TRUE(valid_required_direct_capture_request(true, true, true));
+  EXPECT_FALSE(valid_required_direct_capture_request(true, false, true));
+  EXPECT_FALSE(valid_required_direct_capture_request(true, true, false));
+
+  frame_color_metadata_t sdr {frame_color_space_e::srgb, 80, hdr_metadata_type_e::none, {}};
+  EXPECT_TRUE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::bgra8));
+  EXPECT_FALSE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::rgba16_float));
+  sdr.surface_color_space = frame_color_space_e::scrgb;
+  EXPECT_TRUE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::rgba16_float));
+  sdr.sdr_white_level_nits = 79;
+  EXPECT_FALSE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::rgba16_float));
+
+  const frame_hdr10_metadata_t hdr10 {
+    {35'400, 14'600},
+    {8'500, 39'850},
+    {6'550, 2'300},
+    {15'635, 16'450},
+    1'000,
+    50,
+    1'000,
+    400,
+  };
+  frame_color_metadata_t hdr {frame_color_space_e::scrgb, 203, hdr_metadata_type_e::default_, hdr10};
+  EXPECT_TRUE(valid_frame_color_metadata(hdr, dynamic_range_e::hdr10, frame_format_e::rgba16_float));
+  hdr.hdr10_metadata.red_primary[1] = 14'601;
+  EXPECT_TRUE(valid_frame_color_metadata(hdr, dynamic_range_e::hdr10, frame_format_e::rgba16_float));
+  hdr.hdr10_metadata.red_primary[1] = 14'600;
+  hdr.hdr10_metadata.red_primary[0] = 50'001;
+  EXPECT_FALSE(valid_frame_color_metadata(hdr, dynamic_range_e::hdr10, frame_format_e::rgba16_float));
+  hdr.hdr10_metadata.red_primary[0] = 35'400;
+  hdr.surface_color_space = frame_color_space_e::hdr10;
+  EXPECT_FALSE(valid_frame_color_metadata(hdr, dynamic_range_e::hdr10, frame_format_e::rgba16_float));
+  hdr.surface_color_space = frame_color_space_e::scrgb;
+  hdr.hdr_metadata_type = hdr_metadata_type_e::none;
+  EXPECT_FALSE(valid_frame_color_metadata(hdr, dynamic_range_e::hdr10, frame_format_e::rgba16_float));
+}
+
+TEST(VirtualDisplayFrameAbi5Policy, RetainsOnlyCurrentAndPreviousImmutableTransforms) {
+  color_transform_cache_t cache;
+  const auto make_transform = [](const std::uint64_t generation, const std::uint64_t version) {
+    auto transform = std::make_shared<color_transform_t>();
+    transform->generation = generation;
+    transform->version = version;
+    return transform;
+  };
+  const auto first = make_transform(7, 1);
+  const auto second = make_transform(7, 2);
+  const auto third = make_transform(7, 3);
+  ASSERT_TRUE(cache.commit(first));
+  ASSERT_TRUE(cache.commit(second));
+  EXPECT_EQ(cache.find(7, 1), first);
+  ASSERT_TRUE(cache.commit(third));
+  EXPECT_FALSE(cache.find(7, 1));
+  EXPECT_EQ(cache.find(7, 2), second);
+  EXPECT_EQ(cache.find(7, 3), third);
+
+  const auto next_generation = make_transform(8, 1);
+  ASSERT_TRUE(cache.commit(next_generation));
+  EXPECT_FALSE(cache.find(7, 3));
+  EXPECT_EQ(cache.find(8, 1), next_generation);
+}
+
+TEST(VirtualDisplayFrameAbi5Policy, IgnoresDisabledNaNsAndPrecomposesIdentityWireMatrices) {
+  color_transform_t transform;
+  transform.generation = 9;
+  transform.version = 2;
+  transform.type = color_transform_type_e::colorspace_3x4;
+  color_transform_3x4_t payload;
+  payload.matrix_enabled = false;
+  payload.scalar_multiplier = std::numeric_limits<float>::quiet_NaN();
+  payload.color_matrix_3x4[0] = std::numeric_limits<float>::quiet_NaN();
+  payload.lut_enabled = false;
+  payload.lookup_table_1d[0].red = std::numeric_limits<float>::quiet_NaN();
+  transform.payload = payload;
+  ASSERT_TRUE(prepare_color_transform(transform));
+  EXPECT_EQ(transform.type, color_transform_type_e::default_);
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(transform.payload));
+
+  transform.type = color_transform_type_e::colorspace_3x4;
+  payload = {};
+  payload.matrix_enabled = true;
+  payload.scalar_multiplier = 1.0f;
+  payload.color_matrix_3x4 = {
+    1.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 1.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 1.0f, 0.0f,
+  };
+  transform.payload = payload;
+  ASSERT_TRUE(prepare_color_transform(transform));
+  const auto &prepared = std::get<color_transform_3x4_t>(transform.payload);
+  EXPECT_NEAR(prepared.wire_rec2020_matrix_3x4[0], 0.6274f, 0.0002f);
+  EXPECT_NEAR(prepared.wire_rec2020_matrix_3x4[1], 0.3293f, 0.0002f);
+  EXPECT_NEAR(prepared.wire_rec2020_matrix_3x4[2], 0.0433f, 0.0002f);
+
+  auto malformed = transform;
+  auto &malformed_payload = std::get<color_transform_3x4_t>(malformed.payload);
+  malformed_payload.matrix_enabled = true;
+  malformed_payload.color_matrix_3x4[0] = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(prepare_color_transform(malformed));
+}
+
+#if defined(_WIN32)
+TEST(VirtualDisplayFrameAbi5Shaders, CompilesEveryDirectXConversionVariant) {
+  EXPECT_EQ(platf::dxgi::init(), 0);
+}
+#endif
 
 TEST(VirtualDisplayDirectFrameValidation, AutomaticallyRequiresActiveNvencAndExactNvidiaAdapterProbe) {
   const direct_frame_adapter_identity_t imported {
@@ -791,11 +1105,23 @@ TEST(VirtualDisplayDirectFrameValidation, RequiresGenerationSlotQpcAndOddProduce
     mode_4k120.width,
     mode_4k120.height,
     frame_format_e::bgra8,
+    dynamic_range_e::sdr,
     2,
     {10, 11},
     {12, 13},
+    1,
+    {frame_color_space_e::srgb, 80, hdr_metadata_type_e::none, {}},
   };
-  frame_descriptor_t frame {9, 1, 1, 100, 110, 0};
+  frame_descriptor_t frame {
+    9,
+    1,
+    1,
+    100,
+    110,
+    0,
+    1,
+    {frame_color_space_e::srgb, 80, hdr_metadata_type_e::none, {}},
+  };
   EXPECT_TRUE(valid_frame_descriptor(frame, resources));
   frame.producer_fence_value = 2;
   EXPECT_FALSE(valid_frame_descriptor(frame, resources));

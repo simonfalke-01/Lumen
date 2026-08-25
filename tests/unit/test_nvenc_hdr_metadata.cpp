@@ -32,6 +32,9 @@ namespace {
 TEST(NvencHdrStaticMetadataTest, RejectsMalformedMasteringAndContentLightBlocks) {
   const auto valid = hdr10_metadata();
   EXPECT_TRUE(nvenc::valid_hdr_static_metadata(valid));
+  auto independently_rounded = valid;
+  independently_rounded.display_primaries[0].y = 14'601;
+  EXPECT_TRUE(nvenc::valid_hdr_static_metadata(independently_rounded));
 
   const auto expect_invalid = [&](auto mutate) {
     auto malformed = valid;
@@ -45,7 +48,7 @@ TEST(NvencHdrStaticMetadataTest, RejectsMalformedMasteringAndContentLightBlocks)
     metadata.display_primaries[1] = metadata.display_primaries[0];
   });
   expect_invalid([](auto &metadata) {
-    metadata.white_point = {40'000, 20'000};
+    metadata.white_point = {50'001, 1};
   });
   expect_invalid([](auto &metadata) {
     metadata.maximum_mastering_luminance = 0;
