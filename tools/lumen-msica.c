@@ -12,6 +12,11 @@
 #include <wchar.h>
 #include <wctype.h>
 
+#define LUMEN_UPGRADE_CODE L"{89721553-C582-4D70-8BBF-1E6C5431C8D5}"
+#define LUMEN_VDD_FEATURE L"CM_C_virtual_display_driver"
+
+static void log_message(MSIHANDLE installation, const wchar_t *message);
+
 /** Read one complete MSI property into process-heap storage. */
 static UINT read_property(MSIHANDLE installation, const wchar_t *name, wchar_t **value) {
   DWORD length = 0;
@@ -36,12 +41,53 @@ static UINT read_property(MSIHANDLE installation, const wchar_t *name, wchar_t *
   return ERROR_SUCCESS;
 }
 
+/** Return whether text is one normalized uppercase braced product GUID. */
+static BOOL normalized_product_code(const wchar_t *product_code) {
+  size_t index;
+  if (product_code == NULL || wcslen(product_code) != 38u ||
+      product_code[0] != L'{' || product_code[37] != L'}') {
+    return FALSE;
+  }
+  for (index = 1; index < 37u; ++index) {
+    const wchar_t character = product_code[index];
+    if (index == 9u || index == 14u || index == 19u || index == 24u) {
+      if (character != L'-') {
+        return FALSE;
+      }
+    } else if (!((character >= L'0' && character <= L'9') ||
+                 (character >= L'A' && character <= L'F'))) {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/** Return whether one detected ProductCode belongs to Lumen's UpgradeCode. */
+static BOOL related_lumen_product(const wchar_t *product_code, UINT *error) {
+  DWORD index;
+  for (index = 0;; ++index) {
+    wchar_t related[39];
+    const UINT result = MsiEnumRelatedProductsW(LUMEN_UPGRADE_CODE, 0, index, related);
+    if (result == ERROR_NO_MORE_ITEMS) {
+      *error = ERROR_SUCCESS;
+      return FALSE;
+    }
+    if (result != ERROR_SUCCESS) {
+      *error = result;
+      return FALSE;
+    }
+    if (_wcsicmp(related, product_code) == 0) {
+      *error = ERROR_SUCCESS;
+      return TRUE;
+    }
+  }
+}
+
 /** Convert a normalized braced ProductCode to its 32-character key token. */
 static BOOL product_token(const wchar_t *product_code, wchar_t token[33]) {
   size_t input_index;
   size_t output_index = 0;
-  if (product_code == NULL || wcslen(product_code) != 38u ||
-      product_code[0] != L'{' || product_code[37] != L'}') {
+  if (!normalized_product_code(product_code)) {
     return FALSE;
   }
   for (input_index = 1; input_index < 37; ++input_index) {
@@ -56,6 +102,85 @@ static BOOL product_token(const wchar_t *product_code, wchar_t token[33]) {
   }
   token[output_index] = L'\0';
   return output_index == 32u;
+}
+
+/**
+ * @brief Resolve whether a replaced Lumen MSI owns an installed VDD feature.
+ *
+ * The result is written to LUMEN_UPGRADE_OWNED_VDD for deferred setup. Every
+ * detected product is checked against Lumen's permanent UpgradeCode before its
+ * feature state is trusted.
+ *
+ * @param installation Unrestricted immediate Windows Installer handle.
+ * @return ERROR_SUCCESS on success or an MSI/Win32 error on invalid state.
+ */
+__declspec(dllexport) UINT __stdcall LumenResolveUpgradeVddOwnership(MSIHANDLE installation) {
+  wchar_t *detected = NULL;
+  wchar_t *cursor;
+  UINT result = read_property(installation, L"WIX_UPGRADE_DETECTED", &detected);
+  if (result != ERROR_SUCCESS) {
+    return result;
+  }
+  result = MsiSetPropertyW(installation, L"LUMEN_UPGRADE_OWNED_VDD", L"0");
+  if (result == ERROR_SUCCESS) {
+    result = MsiSetPropertyW(installation, L"LUMEN_UPGRADE_VDD_OWNER_PRODUCT", L"");
+  }
+  if (result != ERROR_SUCCESS || detected[0] == L'\0') {
+    HeapFree(GetProcessHeap(), 0, detected);
+    return result;
+  }
+
+  cursor = detected;
+  while (*cursor != L'\0') {
+    wchar_t product_code[39];
+    wchar_t *separator = wcschr(cursor, L';');
+    const size_t length = separator == NULL ? wcslen(cursor) : (size_t) (separator - cursor);
+    INSTALLSTATE feature_state;
+    UINT related_error = ERROR_SUCCESS;
+    if (length != 38u) {
+      HeapFree(GetProcessHeap(), 0, detected);
+      return ERROR_INVALID_DATA;
+    }
+    memcpy(product_code, cursor, length * sizeof(wchar_t));
+    product_code[length] = L'\0';
+    if (!normalized_product_code(product_code)) {
+      HeapFree(GetProcessHeap(), 0, detected);
+      return ERROR_INVALID_DATA;
+    }
+    if (!related_lumen_product(product_code, &related_error)) {
+      HeapFree(GetProcessHeap(), 0, detected);
+      return related_error == ERROR_SUCCESS ? ERROR_INVALID_DATA : related_error;
+    }
+
+    feature_state = MsiQueryFeatureStateW(product_code, LUMEN_VDD_FEATURE);
+    if (feature_state == INSTALLSTATE_LOCAL) {
+      result = MsiSetPropertyW(installation, L"LUMEN_UPGRADE_OWNED_VDD", L"1");
+      if (result == ERROR_SUCCESS) {
+        result = MsiSetPropertyW(installation, L"LUMEN_UPGRADE_VDD_OWNER_PRODUCT", product_code);
+      }
+      if (result == ERROR_SUCCESS) {
+        log_message(installation, L"The replaced Lumen product owns Virtual Display; cleanup is enabled if the new feature is absent.");
+      }
+      HeapFree(GetProcessHeap(), 0, detected);
+      return result;
+    }
+    if (feature_state != INSTALLSTATE_UNKNOWN &&
+        feature_state != INSTALLSTATE_ABSENT &&
+        feature_state != INSTALLSTATE_ADVERTISED) {
+      HeapFree(GetProcessHeap(), 0, detected);
+      return ERROR_INVALID_DATA;
+    }
+    if (separator == NULL) {
+      break;
+    }
+    cursor = separator + 1;
+    if (*cursor == L'\0') {
+      HeapFree(GetProcessHeap(), 0, detected);
+      return ERROR_INVALID_DATA;
+    }
+  }
+  HeapFree(GetProcessHeap(), 0, detected);
+  return ERROR_SUCCESS;
 }
 
 /** Emit one informational record to the MSI log. */

@@ -51,6 +51,8 @@
       </div>
     </div>
 
+    <Vdd-Status v-if="platform === 'windows'"></Vdd-Status>
+
     <!-- Version -->
     <div class="card my-4">
       <div class="card-body" v-if="version">
@@ -136,6 +138,7 @@
   import { initApp } from './init'
   import Navbar from './Navbar.vue'
   import ResourceCard from './ResourceCard.vue'
+  import VddStatus from './VddStatus.vue'
   import LumenVersion, {
     fetchLumenReleases,
     formatReleaseNotesAsHtml,
@@ -157,6 +160,7 @@
     components: {
       Navbar,
       ResourceCard,
+      VddStatus,
       AlertCircle,
       AlertTriangle,
       FileText,

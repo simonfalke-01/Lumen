@@ -40,7 +40,14 @@ param(
 
     [Parameter(Mandatory=$false)]
     [ValidateSet("0", "1")]
-    [string]$RemoveVirtualDisplay
+    [string]$RemoveVirtualDisplay,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("0", "1")]
+    [string]$UpgradeOwnedVirtualDisplay = "0",
+
+    [Parameter(Mandatory=$false)]
+    [string]$UpgradeVddOwnerProduct
 )
 
 # Constants
@@ -293,6 +300,13 @@ if (-not $isAdmin) {
     }
     if ($InstallVirtualDisplay) {
         $arguments += " -InstallVirtualDisplay $InstallVirtualDisplay"
+    }
+    if ($RemoveVirtualDisplay) {
+        $arguments += " -RemoveVirtualDisplay $RemoveVirtualDisplay"
+    }
+    $arguments += " -UpgradeOwnedVirtualDisplay $UpgradeOwnedVirtualDisplay"
+    if ($UpgradeVddOwnerProduct) {
+        $arguments += " -UpgradeVddOwnerProduct `"$UpgradeVddOwnerProduct`""
     }
     try {
         # Relaunch the script with elevation
@@ -788,7 +802,8 @@ function Invoke-VirtualDisplaySetup {
             "-Action", $DriverAction,
             "-RootDir", "`"$RootDir`"",
             "-ProductCode", "`"$ProductCode`"",
-            "-TransactionKind", $TransactionKind
+            "-TransactionKind", $TransactionKind,
+            "-UpgradeOwnerProductCode", "`"$UpgradeVddOwnerProduct`""
         )
         $process = Start-Process `
             -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
@@ -1171,6 +1186,9 @@ if ($Msi -or $ProductCode -or $Action -in @("rollback", "commit", "resume")) {
         throw "TransactionKind is required for this installer action."
     }
     $ProductCode = ConvertTo-NormalizedProductCode -Value $ProductCode
+    if (-not [string]::IsNullOrWhiteSpace($UpgradeVddOwnerProduct)) {
+        $UpgradeVddOwnerProduct = ConvertTo-NormalizedProductCode -Value $UpgradeVddOwnerProduct
+    }
 } else {
     $ProductCode = "{00000000-0000-0000-0000-000000000000}"
     if ([string]::IsNullOrWhiteSpace($TransactionKind)) {
@@ -1191,12 +1209,17 @@ $virtualMicrophoneSelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualMic
     $InstallVirtualMicrophone -eq "1"
 }
 $virtualDisplaySelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualDisplay)) {
-    $false
+    Test-Path -LiteralPath (Join-Path $RootDir "drivers\virtual-display\LumenVirtualDisplay.inf") `
+        -PathType Leaf
 } else {
     $InstallVirtualDisplay -eq "1"
 }
 $virtualDisplayRemoveSelected = -not [string]::IsNullOrWhiteSpace($RemoveVirtualDisplay) -and
     $RemoveVirtualDisplay -eq "1"
+$upgradeOwnedVirtualDisplaySelected = $Msi -and $Action -eq "install" -and
+    $UpgradeOwnedVirtualDisplay -eq "1" -and -not $virtualDisplaySelected
+$virtualDisplayRemoveSelected = $virtualDisplayRemoveSelected -or
+    $upgradeOwnedVirtualDisplaySelected
 $virtualDisplayTransactionSelected = $virtualDisplaySelected -or $virtualDisplayRemoveSelected
 
 $rollbackRootDirectory = Join-Path $programDataDirectory "LumenVirtualHidInstallerV2"
@@ -1293,7 +1316,8 @@ function Register-DriverResumeTask {
         "-InstallVirtualHid", $(if ($virtualHidSelected) { "1" } else { "0" }),
         "-InstallVirtualMicrophone", $(if ($virtualMicrophoneSelected) { "1" } else { "0" }),
         "-InstallVirtualDisplay", $(if ($virtualDisplaySelected) { "1" } else { "0" }),
-        "-RemoveVirtualDisplay", $(if ($virtualDisplayRemoveSelected) { "1" } else { "0" })
+        "-RemoveVirtualDisplay", $(if ($virtualDisplayRemoveSelected) { "1" } else { "0" }),
+        "-UpgradeOwnedVirtualDisplay", $(if ($upgradeOwnedVirtualDisplaySelected) { "1" } else { "0" })
     ) -join " "
     $action = New-ScheduledTaskAction -Execute $powerShell -Argument $arguments
     $trigger = New-ScheduledTaskTrigger -AtStartup

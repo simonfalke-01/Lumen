@@ -267,13 +267,6 @@ if(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
         endif()
     endforeach()
 
-    if(NOT TARGET lumen-vddctl)
-        message(FATAL_ERROR
-                "The lumen-vddctl target is required when packaging the Lumen Virtual Display driver")
-    endif()
-    install(TARGETS lumen-vddctl
-            RUNTIME DESTINATION "tools"
-            COMPONENT application)
     install(FILES ${VIRTUAL_DISPLAY_DRIVER_FILES}
             DESTINATION "drivers/virtual-display"
             COMPONENT virtual_display_driver)
@@ -281,6 +274,15 @@ else()
     message(STATUS
             "Lumen Virtual Display driver package not supplied; installer generation will not include the driver")
 endif()
+
+# Keep the lifecycle helper in every Windows MSI. A driver-less major upgrade
+# may still need it to remove a VDD feature owned by the product being replaced.
+if(NOT TARGET lumen-vddctl)
+    message(FATAL_ERROR "The lumen-vddctl target is required for Windows packaging")
+endif()
+install(TARGETS lumen-vddctl
+        RUNTIME DESTINATION "tools"
+        COMPONENT application)
 
 if(LUMEN_WINDOWS_FULL_PROFILE)
     if(NOT LUMEN_EXPERIMENTAL_MSQUIC)
@@ -410,14 +412,14 @@ set(CPACK_COMPONENT_VIRTUAL_MICROPHONE_DRIVER_DISABLED true)
 # Lumen Virtual Display driver
 set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DISPLAY_NAME "Lumen Virtual Display")
 set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DESCRIPTION
-        "Optional Lumen indirect-display driver for exact session resolution and refresh selection.")
+        "Lumen indirect-display driver for exact session resolution and refresh selection.")
 set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_GROUP "Core")
 set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DEPENDS application)
-set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DISABLED true)
+set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DISABLED false)
 
-# ZIP packages are intentionally non-privileged. Keep the driver package and
-# its install/remove helper out of the lite archive so unpacked builds use the
-# SendInput fallback unless a matching driver is already installed.
+# ZIP packages are intentionally non-privileged. Keep the driver payload out
+# of the lite archive; the lifecycle helper is inert without elevation and an
+# explicit setup transaction.
 get_cmake_property(SUNSHINE_WINDOWS_PACKAGE_COMPONENTS COMPONENTS)
 set(SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG
         "${CMAKE_CURRENT_BINARY_DIR}/LumenWindowsCPackOptions.cmake")

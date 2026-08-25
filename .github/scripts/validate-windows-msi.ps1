@@ -40,6 +40,8 @@ $services = Read-MsiRows `
     'SELECT `ServiceInstall`,`Name`,`StartType`,`Component_` FROM `ServiceInstall`' 4
 $features = Read-MsiRows `
     'SELECT `Feature`,`Level` FROM `Feature`' 2
+$upgrades = Read-MsiRows `
+    'SELECT `UpgradeCode`,`ActionProperty` FROM `Upgrade`' 2
 $properties = Read-MsiRows `
     'SELECT `Property`,`Value` FROM `Property`' 2
 $files = Read-MsiRows `
@@ -73,6 +75,20 @@ foreach ($action in $rebootActions) {
         $row[0][3] -ne 'LumenReadPendingDriverReboot') {
         throw "Generated MSI has an invalid VDD reboot bridge action: $action"
     }
+}
+$upgradeOwnershipAction = @($actions | Where-Object { $_[0] -eq 'CA_LumenResolveUpgradeVddOwnership' })
+if ($upgradeOwnershipAction.Count -ne 1 -or
+    $upgradeOwnershipAction[0][2] -ne 'LumenMsiCA' -or
+    $upgradeOwnershipAction[0][3] -ne 'LumenResolveUpgradeVddOwnership' -or
+    $sequenceNames -notcontains 'CA_LumenResolveUpgradeVddOwnership') {
+    throw 'Generated MSI is missing the upgrade-aware Virtual Display ownership resolver.'
+}
+$lumenUpgradeRows = @($upgrades | Where-Object {
+    $_[0] -eq '{89721553-C582-4D70-8BBF-1E6C5431C8D5}' -and
+    $_[1] -eq 'WIX_UPGRADE_DETECTED'
+})
+if ($lumenUpgradeRows.Count -eq 0) {
+    throw 'Generated MSI does not expose detected Lumen products to the VDD ownership resolver.'
 }
 
 if ($services.Count -ne 1 -or
@@ -121,6 +137,12 @@ foreach ($setterName in $setterNames) {
     } else {
         ' -File "\[INSTALL_ROOT\]scripts\\lumen-setup\.ps1" '
     }
+    $expectedUpgradeOwnership = if ($setterName -like 'SetLumenInstall*') {
+        ' -UpgradeOwnedVirtualDisplay \[LUMEN_UPGRADE_OWNED_VDD\] ' +
+            '-UpgradeVddOwnerProduct "\[LUMEN_UPGRADE_VDD_OWNER_PRODUCT\]"$'
+    } else {
+        ' -UpgradeOwnedVirtualDisplay 0 -UpgradeVddOwnerProduct ""$'
+    }
     if ($command -notmatch '^"\[System64Folder\]WindowsPowerShell\\v1\.0\\powershell\.exe" ' -or
         $command -notmatch $expectedScript -or
         $command -notmatch ' -Msi ' -or
@@ -129,7 +151,8 @@ foreach ($setterName in $setterNames) {
         $command -notmatch ' -InstallVirtualHid \[LUMEN_INSTALL_VHID\] ' -or
         $command -notmatch ' -InstallVirtualMicrophone \[LUMEN_INSTALL_VMIC\] ' -or
         $command -notmatch ' -InstallVirtualDisplay \[LUMEN_INSTALL_VDD\] ' -or
-        $command -notmatch ' -RemoveVirtualDisplay \[LUMEN_REMOVE_VDD\]$') {
+        $command -notmatch ' -RemoveVirtualDisplay \[LUMEN_REMOVE_VDD\] ' -or
+        $command -notmatch $expectedUpgradeOwnership) {
         throw "Generated MSI has an invalid deferred command: $setterName"
     }
     if ($command -match '&(?:amp;)?quot;|\[CustomActionData\]|-MsiData') {
@@ -154,6 +177,13 @@ foreach ($commitAction in @('CA_LumenInstallCommit', 'CA_LumenUninstallCommit'))
 $installSetterRows = @($sequence | Where-Object { $_[0] -eq 'SetLumenInstallData' })
 if ($installSetterRows.Count -ne 1) {
     throw 'Generated MSI must set CA_LumenInstall CustomActionData exactly once.'
+}
+$upgradeOwnershipSequence = @($sequence | Where-Object {
+    $_[0] -eq 'CA_LumenResolveUpgradeVddOwnership'
+})
+if ($upgradeOwnershipSequence.Count -ne 1 -or
+    [int]$upgradeOwnershipSequence[0][2] -ge [int]$installSetterRows[0][2]) {
+    throw 'VDD upgrade ownership must resolve before deferred install data is frozen.'
 }
 $removeExistingProducts = @($sequence | Where-Object { $_[0] -eq 'RemoveExistingProducts' })
 $installDeferred = @($sequence | Where-Object { $_[0] -eq 'CA_LumenInstall' })
@@ -243,25 +273,28 @@ if ($expectVmicFeature) {
 $vddFeature = @($features | Where-Object { $_[0] -eq 'CM_C_virtual_display_driver' })
 $vddDefault = @($properties | Where-Object { $_[0] -eq 'LUMEN_INSTALL_VDD' })
 $vddRemoveDefault = @($properties | Where-Object { $_[0] -eq 'LUMEN_REMOVE_VDD' })
-if ($vddDefault.Count -ne 1 -or $vddDefault[0][1] -ne '0') {
-    throw 'The Virtual Display feature must remain explicit opt-in.'
-}
 if ($vddRemoveDefault.Count -ne 1 -or $vddRemoveDefault[0][1] -ne '0') {
     throw 'The Virtual Display removal selector must default to disabled.'
 }
 $vddFiles = @($files | Where-Object {
-    $_[1] -match '(?i)LumenVirtualDisplay\.(inf|cat|dll)|lumen-vddctl\.exe'
+    $_[1] -match '(?i)LumenVirtualDisplay\.(inf|cat|dll)'
 })
+$vddHelpers = @($files | Where-Object { $_[1] -match '(?i)lumen-vddctl\.exe' })
+if ($vddHelpers.Count -ne 1) {
+    throw 'Every Windows MSI must carry exactly one VDD lifecycle helper for upgrade cleanup.'
+}
 $expectVddFeature = $env:EXPECT_VDD_FEATURE -eq 'true'
 if ($expectVddFeature) {
+    if ($vddDefault.Count -ne 1 -or $vddDefault[0][1] -ne '1') {
+        throw 'An MSI containing Lumen Virtual Display must select it by default.'
+    }
     if ($vddFeature.Count -ne 1) {
         throw 'Generated MSI is missing the Virtual Display feature.'
     }
     foreach ($requiredVddFile in @(
         'LumenVirtualDisplay.inf',
         'LumenVirtualDisplay.cat',
-        'LumenVirtualDisplay.dll',
-        'lumen-vddctl.exe'
+        'LumenVirtualDisplay.dll'
     )) {
         if (-not ($vddFiles | Where-Object { $_[1] -match "(?i)$([regex]::Escape($requiredVddFile))" })) {
             throw "Generated MSI is missing $requiredVddFile."
@@ -270,8 +303,13 @@ if ($expectVddFeature) {
     if (-not ($files | Where-Object { $_[1] -match '(?i)virtual-display-setup\.ps1' })) {
         throw 'Generated MSI is missing the Virtual Display transaction helper.'
     }
-} elseif ($vddFeature.Count -ne 0 -or $vddFiles.Count -ne 0) {
-    throw 'Generated MSI unexpectedly contains Virtual Display files or features.'
+} else {
+    if ($vddDefault.Count -ne 1 -or $vddDefault[0][1] -ne '0') {
+        throw 'An MSI without a Virtual Display package must disable its driver transaction.'
+    }
+    if ($vddFeature.Count -ne 0 -or $vddFiles.Count -ne 0) {
+        throw 'Generated MSI unexpectedly contains a Virtual Display feature or driver payload.'
+    }
 }
 
 $msquicFiles = @($files | Where-Object {

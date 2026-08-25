@@ -1195,11 +1195,13 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Select whether Lumen's owned virtual display is used for modern or legacy sessions.
+            Select whether Lumen's owned virtual display is used for Umbra v3 or legacy Moonlight sessions.
             Lumen only activates a mode when the requested width, height, and reduced refresh rational are applied exactly.
-            SDR and HDR requests must also match the exact negotiated bit depth and display capabilities.
-            The ABI v4 driver can use the explicitly hardware-gated two-slot one-copy path.
-            If its capability, adapter identity, shared handle, fence, timeout, conversion, or NVENC boundary is unavailable, capture falls back to DDA/WGC on the active VDD output.
+            ABI 5 admits only exact SDR/8-bit or HDR/10-bit modes after intersecting the driver, OS, GPU, and encoder limits.
+            Its two-slot direct-frame path exports BGRA8/sRGB for SDR and FP16/scRGB for HDR, together with validated frame metadata and versioned color transforms.
+            HDR on a selected VDD requires that direct path and fails closed if any capability, adapter, handle, fence, metadata, transform, conversion, or NVENC gate fails; Lumen never substitutes untransformed DDA/WGC HDR capture.
+            Legacy SDR can use DDA/WGC on the active VDD output when the direct path is unavailable or safely quarantined.
+            @note{For Umbra v3, <code>optional</code> is treated as <code>required</code>; use <code>disabled</code> to opt out of VDD. Legacy Moonlight keeps the compatibility fallback described below.}
             @note{Applies to Windows only.}
         </td>
     </tr>
@@ -1222,11 +1224,11 @@ The key retains its upstream name for compatibility with existing configuration 
     </tr>
     <tr>
         <td>optional</td>
-        <td>Prefer an exact VDD mode, but fall back to physical capture only after the VDD transaction has rolled back safely.</td>
+        <td>For legacy Moonlight, prefer an exact VDD mode and use the configured physical capture path only after a safe pre-activation rollback. For Umbra v3, require the exact VDD mode and ABI 5 direct-frame channel.</td>
     </tr>
     <tr>
         <td>required</td>
-        <td>Reject stream startup unless the exact VDD mode can be established and owned safely.</td>
+        <td>Reject stream startup unless the exact VDD mode and required direct-frame boundary can be established and owned safely.</td>
     </tr>
 </table>
 

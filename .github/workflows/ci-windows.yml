@@ -1145,6 +1145,7 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          EXPECT_VDD_FEATURE: ${{ inputs.release_tag != '' && 'true' || 'false' }}
         run: ./.github/scripts/test-windows-msi.ps1 -Scenario '${{ matrix.scenario }}'
 
       - name: Collect MSI and UMDF diagnostics

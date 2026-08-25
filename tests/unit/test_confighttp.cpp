@@ -341,6 +341,7 @@ protected:
     server->resource["^/pairing-pin-test$"]["POST"] = confighttp::savePin;
     server->resource["^/pairing-cancel-test$"]["POST"] = confighttp::cancelPendingPairingRequest;
     server->resource["^/unpair-test$"]["POST"] = confighttp::unpair;
+    server->resource["^/vdd-status-test$"]["GET"] = confighttp::getVddStatus;
     server->resource["^/password-test$"]["POST"] = [](
                                                        const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> &response,
                                                        const std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> &request
@@ -585,6 +586,45 @@ TEST_F(ConfigHttpTest, AuthenticateCaseInsensitiveUsername) {
 
   const auto response = client->request("GET", "/auth-test", "", headers);
   ASSERT_EQ(response->status_code, "200 OK");
+}
+
+TEST_F(ConfigHttpTest, VddStatusRequiresAuthenticationAndReturnsStableSchema) {
+  const auto unauthorized = client->request("GET", "/vdd-status-test");
+  ASSERT_EQ(unauthorized->status_code, "401 Unauthorized");
+
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto response = client->request("GET", "/vdd-status-test", "", headers);
+  ASSERT_EQ(response->status_code, "200 OK");
+  const auto body = nlohmann::json::parse(response->content.string());
+  for (const auto *field : {
+         "installed",
+         "compatible",
+         "deviceHealthy",
+         "problem",
+         "active",
+         "generation",
+         "mode",
+         "deliveryPolicy",
+         "directFrameBound",
+         "quarantined",
+         "fallback",
+         "diagnostic",
+       }) {
+    EXPECT_TRUE(body.contains(field)) << field;
+  }
+  EXPECT_TRUE(body["installed"].is_boolean());
+  EXPECT_TRUE(body["compatible"].is_boolean());
+  EXPECT_TRUE(body["deviceHealthy"].is_boolean());
+  EXPECT_TRUE(body["active"].is_boolean());
+  EXPECT_TRUE(body["directFrameBound"].is_boolean());
+  EXPECT_TRUE(body["quarantined"].is_boolean());
+  EXPECT_TRUE(body["fallback"].is_boolean());
+  EXPECT_TRUE(body["deliveryPolicy"].is_null() || body["deliveryPolicy"].is_string());
+  if (body["deliveryPolicy"].is_string()) {
+    EXPECT_TRUE(body["deliveryPolicy"] == "latency" || body["deliveryPolicy"] == "quality");
+  }
+  EXPECT_TRUE(body["diagnostic"].is_string());
 }
 
 TEST(LoginThrottleTest, NormalizesSourcesAndExpiresBudgets) {

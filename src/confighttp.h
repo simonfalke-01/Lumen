@@ -188,6 +188,13 @@ namespace confighttp {
   void getPendingPairingRequests(const resp_https_t &response, const req_https_t &request);
   void cancelPendingPairingRequest(const resp_https_t &response, const req_https_t &request);
 
+  /**
+   * @brief Return authenticated read-only Lumen Virtual Display status.
+   * @param response HTTP response object to populate.
+   * @param request Authenticated HTTP request.
+   */
+  void getVddStatus(const resp_https_t &response, const req_https_t &request);
+
   // Browse helper functions (also exposed for unit testing)
   /**
    * @brief Checks whether a directory entry qualifies as an executable file.

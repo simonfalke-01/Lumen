@@ -310,8 +310,11 @@ unsigned form omits key 9.
 3 profile, 4 width, 5 height, 6 refresh numerator, 7 denominator, 8 bitrate
 kbps, 9 codec-offer array, 10 audio-tuple array, 11 microphone tuple or null,
 12 semantic DATAGRAM cap (`1152`), 13 trace ID bstr16, 14 HDR-offer array,
-15 presentation-offer array, 16 resume bool, 17 quality-requirements map. FEC
-is implicitly scheme zero and has no offer key.
+15 presentation-offer array, 16 resume bool, 17 quality-requirements map, and
+18 play-audio-on-host bool. Key 18 is mandatory and controls whether host audio
+continues locally while the selected audio tuple is captured; missing, null,
+integer, or other non-boolean values are malformed. FEC is implicitly scheme
+zero and has no offer key.
 
 `START_RESPONSE` (`0x0101`): 1 status, 2 start-intent ID, 3 session ID bstr16,
 4 selected profile, 5 codec tuple, 6 width, 7 height, 8 refresh numerator,
@@ -528,8 +531,8 @@ not a cryptographic replay mechanism. At `2^64-1024` the sender ends the session
 and opens a new connection rather than risk exhaustion. A connection change
 resets namespaces; a QUIC path migration does not. Video fragments may arrive
 out of order inside this window and the separate frame bound. `object_id` means
-input generation, video frame ID,
-audio sample position, or microphone sample position according to channel.
+input generation, video frame ID, audio sample position, microphone sample
+position, or transport-telemetry generation according to channel.
 The receiver DATAGRAM cap is immutable `1152` for the connection; `header_len +
 payload_len` must equal the QUIC DATAGRAM application length and payload length
 is consequently at most 1108.
@@ -543,11 +546,13 @@ Unlisted triples are reserved and rejected.
 | client to host | 1 | 1 | complete input state/edge batch |
 | host to client | 1 | 2 | input generation/edge acknowledgement |
 | host to client | 1 | 3 | input resynchronization request |
+| host to client | 1 | 4 | controller feedback and motion-rate control |
 | host to client | 2 | 1 | encoded video data fragment |
 | host to client | 2 | 2 | reserved video repair; always rejected phase one |
 | client to host | 2 | 3 | video loss/keyframe/decode feedback |
 | host to client | 3 | 1 | encoded audio packet |
 | client to host | 4 | 1 | encoded microphone packet |
+| host to client | 5 | 1 | live QUIC RTT telemetry |
 
 There is no application path channel. QUIC migration/path validation owns it.
 There is no application control DATAGRAM; security-sensitive and transactional
@@ -653,6 +658,38 @@ Input resync payload is exactly 16 bytes: offset 0 expected next edge ID u64,
 offset 8 reason u8 (`1` edge pressure, `2` host reset, `3` authority transfer),
 offsets 9...15 zero. ACK/resync object ID is the latest accepted state sequence.
 
+Controller feedback payload is exactly 40 bytes:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | current input authority generation |
+| 4 | 4 | nonzero controller instance generation |
+| 8 | 1 | controller ID, `0...15` |
+| 9 | 1 | command |
+| 10 | 2 | command value length |
+| 12 | 24 | command value followed by zero padding |
+| 36 | 4 | zero |
+
+Commands are `1` main rumble (`low u16, high u16`), `2` trigger rumble
+(`left u16, right u16`), `3` motion state (`type u8, zero u8, report-rate
+u16`), `4` RGB LED (`r u8, g u8, b u8`), and `5` adaptive triggers
+(`flags u8, left type u8, right type u8, zero u8, left[10], right[10]`).
+Command value lengths are respectively 4, 4, 4, 3, and 24. Motion type is
+acceleration `1` or gyroscope `2`; rate is `0...2000` Hz and zero disables the
+type. Adaptive flags use only bits 2 and 3. ULM3 object ID equals the input
+authority generation.
+
+Each client and host starts a controller instance generation at one for the
+first accepted arrival of a slot in an input generation and increments it on
+every later accepted arrival of that slot. Removal invalidates the current
+instance without resetting its counter. `INPUT_RESET` starts a new input
+generation and resets controller instance counters. The client applies a
+feedback command only when session ID, input generation, controller ID, and
+controller instance generation all match its live controller state. Stale
+commands are ignored. The host emits these commands from the same production
+virtual-controller feedback queue used by legacy GameStream; v3 does not route
+them through or alter the legacy control channel.
+
 The host applies pointer motion before a click from the same generation. It
 acknowledges the highest complete generation and edge range. On a gap beyond
 the retained 256 host / 512 client edge windows it requests a complete reset.
@@ -719,7 +756,20 @@ Video feedback payload begins with 32 bytes:
 | 24 | 8 | zero |
 | 32 | variable | sorted non-overlapping `(first u16,count u16)` ranges |
 
-Ranges occur only for action 2 and object ID is the affected frame.
+Ranges occur only for action 2 and object ID is the affected frame. Deadline
+miss is present only for action 1 or 3 and is zero for actions 2, 4, and 5. It is
+zero when decode completes by the selected presentation map's key-5
+maximum-present-age budget. Otherwise it is the positive number of whole
+microseconds after that deadline, rounded up and saturated at `1,000,000`.
+Umbra starts the deadline at the first valid fragment's client-local monotonic
+receive time and samples completion in that same clock domain. It retains this
+deadline through reassembly and decoder completion; it never subtracts host
+capture time from a client clock. Pending deadline state is generation-scoped
+and bounded independently of frame payload storage. Lumen validates the one-
+second miss bound and records sample count, positive-miss count, current
+consecutive misses, latest miss, and peak miss in the production session media
+snapshot. This observation is reported at teardown and does not switch profiles
+or mutate encoder policy during the session.
 
 `VIDEO_CONFIG` is reliable control, has a strictly increasing nonzero
 generation, and is acknowledged before dependent video is emitted. A generation
@@ -761,6 +811,30 @@ generation.
 
 Phase one negotiates mono microphone, stereo, 5.1, or 7.1 only. The exact map
 must fit the eight-byte payload field; channel guessing is forbidden.
+
+### 10.4 Transport telemetry
+
+Lumen emits channel 5 kind 1 at most once per 250 ms from the real MsQuic
+`QUIC_STATISTICS_V2` connection sample. The replaceable record is authenticated
+by the active session ID, expires after one second, has the lowest scheduler
+priority, and cannot consume the urgent control/input send reserve. Its payload
+is exactly 24 bytes:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | nonzero connection-local telemetry generation |
+| 8 | 4 | MsQuic smoothed RTT, microseconds, `1...1,000,000` |
+| 12 | 4 | MsQuic minimum RTT, microseconds, `1...smoothed RTT` |
+| 16 | 4 | bounded RTT variation estimate, microseconds, `0...1,000,000` |
+| 20 | 4 | zero |
+
+ULM3 semantic sequence, object ID, and payload generation are identical. A new
+authenticated connection resets the namespace. The variation is a one-quarter
+EWMA of the greater of the smoothed-RTT sample delta and the current
+smoothed-minus-minimum gap; the first sample uses that gap. Umbra validates every
+field, ignores an older accepted in-window generation, and displays smoothed RTT,
+variation, and minimum RTT. These measurements are observation only and do not
+trigger automatic mode switching.
 
 ## 11. Latency profile
 
@@ -831,7 +905,8 @@ Reliable control always makes progress; large assets/snapshots use the exact
 ULB3 unidirectional object stream so they cannot monopolize stream 0.
 Live media uses DATAGRAM and therefore is not retransmitted by QUIC. Codec
 headers, session transitions, app metadata, and configuration use reliable
-streams.
+streams. Live RTT telemetry is a low-priority replaceable DATAGRAM and never
+blocks media or input waiting for delivery.
 
 Congestion response reduces in this order:
 
@@ -1031,7 +1106,7 @@ docs/protocols/vectors/quic_v3_oracle_test.py
 
 They cover complete-frame pairing/authentication transcripts, fresh nonce and
 SPKI/invited-host binding, host confirmation, exact ULI3/ULC3/ULM3/ULB3
-encoding, all eight routes and lifecycle artifacts, direction errors,
+encoding, all ten routes and lifecycle artifacts, direction errors,
 truncation, length mismatch, reserved flags, session mismatch, phase-one FEC
 rejection, invitation mutation, bulk digest mismatch, and immutable size bounds.
 

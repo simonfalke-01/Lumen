@@ -253,15 +253,19 @@ ROUTES = {
     ("c2h", 1, 1): "input-state",
     ("h2c", 1, 2): "input-ack",
     ("h2c", 1, 3): "input-resync",
+    ("h2c", 1, 4): "controller-feedback",
     ("h2c", 2, 1): "video-fragment",
     ("h2c", 2, 2): "video-repair",
     ("c2h", 2, 3): "video-feedback",
     ("h2c", 3, 1): "audio",
     ("c2h", 4, 1): "microphone",
+    ("h2c", 5, 1): "transport-telemetry",
 }
 
 
-def validate_payload(route: str, payload: bytes, flags: int, object_id: int) -> None:
+def validate_payload(
+    route: str, payload: bytes, flags: int, sequence: int, object_id: int
+) -> None:
     """Validate the exact phase-one kind-specific binary prefix and bounds."""
     if route == "input-state":
         if len(payload) < 32:
@@ -281,6 +285,30 @@ def validate_payload(route: str, payload: bytes, flags: int, object_id: int) -> 
     elif route == "input-resync":
         if len(payload) != 16 or payload[8] not in (1, 2, 3) or payload[9:] != bytes(7):
             raise ValueError("input-resync layout")
+    elif route == "controller-feedback":
+        if len(payload) != 40:
+            raise ValueError("controller-feedback length")
+        input_generation, controller_generation, controller, command, value_length = (
+            struct.unpack(">IIBBH", payload[:12])
+        )
+        if (
+            input_generation == 0
+            or object_id != input_generation
+            or controller_generation == 0
+            or controller >= 16
+            or command not in (1, 2, 3, 4, 5)
+            or payload[36:] != bytes(4)
+        ):
+            raise ValueError("controller-feedback generation/route")
+        expected_length = {1: 4, 2: 4, 3: 4, 4: 3, 5: 24}[command]
+        if value_length != expected_length or payload[12 + value_length : 36] != bytes(24 - value_length):
+            raise ValueError("controller-feedback value/reserved")
+        if command == 3:
+            motion_type, reserved, report_rate = struct.unpack(">BBH", payload[12:16])
+            if motion_type not in (1, 2) or reserved != 0 or report_rate > 2_000:
+                raise ValueError("controller-feedback motion")
+        if command == 5 and (payload[12] & ~0x0C or payload[15] != 0):
+            raise ValueError("controller-feedback adaptive")
     elif route in ("video-fragment", "video-repair"):
         if len(payload) <= 64:
             raise ValueError("video payload length")
@@ -318,13 +346,15 @@ def validate_payload(route: str, payload: bytes, flags: int, object_id: int) -> 
     elif route == "video-feedback":
         if len(payload) < 32:
             raise ValueError("video-feedback prefix")
-        _, _, action, range_count, reserved, _, _, tail = struct.unpack(
+        _, _, action, range_count, reserved, _, deadline_miss, tail = struct.unpack(
             ">QQBBBBI8s", payload[:32]
         )
         if (
             action not in (1, 2, 3, 4, 5)
             or range_count > 16
             or reserved != 0
+            or deadline_miss > 1_000_000
+            or (action not in (1, 3) and deadline_miss != 0)
             or tail != bytes(8)
         ):
             raise ValueError("video-feedback fields")
@@ -353,6 +383,22 @@ def validate_payload(route: str, payload: bytes, flags: int, object_id: int) -> 
             raise ValueError("audio flags/reserved")
         if payload_flags & 0x05 and len(payload) != 48:
             raise ValueError("audio empty payload flag")
+    elif route == "transport-telemetry":
+        if len(payload) != 24:
+            raise ValueError("transport-telemetry length")
+        generation, smoothed_rtt, minimum_rtt, variation, reserved = struct.unpack(
+            ">QIIII", payload
+        )
+        if (
+            generation == 0
+            or generation != sequence
+            or generation != object_id
+            or not 1 <= smoothed_rtt <= 1_000_000
+            or not 1 <= minimum_rtt <= smoothed_rtt
+            or variation > 1_000_000
+            or reserved != 0
+        ):
+            raise ValueError("transport-telemetry generation/fields")
 
 
 def validate_envelope(
@@ -393,7 +439,7 @@ def validate_envelope(
     if (channel, kind) == (2, 1) and flags & 0x08:
         raise ValueError("repair flag on data")
     payload = record[ENVELOPE_SIZE:]
-    validate_payload(route, payload, flags, object_id)
+    validate_payload(route, payload, flags, sequence, object_id)
     return route, sequence, object_id, payload
 
 
@@ -804,6 +850,7 @@ def build_fixture() -> dict:
             15: [presentation],
             16: False,
             17: quality_requirements,
+            18: True,
         },
     )
     start_response = control(
@@ -931,6 +978,16 @@ def build_fixture() -> dict:
     input_ack = envelope(session_id, 1, 2, 0, 44, 77, input_ack_payload)
     input_resync_payload = struct.pack(">QB7x", 13, 1)
     input_resync = envelope(session_id, 1, 3, 0, 45, 77, input_resync_payload)
+    controller_feedback_payload = (
+        struct.pack(">IIBBHBBH", 1, 1, 0, 3, 4, 2, 0, 100) + bytes(24)
+    )
+    controller_feedback = envelope(
+        session_id, 1, 4, 0, 46, 1, controller_feedback_payload
+    )
+    transport_telemetry_payload = struct.pack(">QIIII", 1, 4_000, 3_000, 1_000, 0)
+    transport_telemetry = envelope(
+        session_id, 5, 1, 0, 1, 1, transport_telemetry_payload
+    )
 
     video_extension = struct.pack(
         ">QIIQQIIHHHHHBBBBBBI4s",
@@ -956,15 +1013,15 @@ def build_fixture() -> dict:
         bytes(4),
     )
     video = envelope(
-        session_id, 2, 1, 0x05, 46, 9001, video_extension + bytes(range(64))
+        session_id, 2, 1, 0x05, 47, 9001, video_extension + bytes(range(64))
     )
     repair = envelope(
-        session_id, 2, 2, 0x08, 47, 9001, video_extension + bytes(range(16))
+        session_id, 2, 2, 0x08, 48, 9001, video_extension + bytes(range(16))
     )
     feedback_payload = struct.pack(
-        ">QQBBBBI8s", 9000, 9000, 2, 1, 0, 0, 500, bytes(8)
+        ">QQBBBBI8s", 9000, 9000, 2, 1, 0, 0, 0, bytes(8)
     ) + struct.pack(">HH", 0, 1)
-    video_feedback = envelope(session_id, 2, 3, 0, 48, 9001, feedback_payload)
+    video_feedback = envelope(session_id, 2, 3, 0, 49, 9001, feedback_payload)
 
     audio_extension = struct.pack(
         ">QQIHBBBBBB8sI8s",
@@ -982,7 +1039,7 @@ def build_fixture() -> dict:
         96_000,
         bytes(8),
     )
-    audio = envelope(session_id, 3, 1, 0, 49, 48_096, audio_extension + b"opus")
+    audio = envelope(session_id, 3, 1, 0, 50, 48_096, audio_extension + b"opus")
     mic_extension = struct.pack(
         ">QQIHBBBBBB8sI8s",
         1_004_000,
@@ -1049,11 +1106,13 @@ def build_fixture() -> dict:
         "route_input_state": _artifact("route", input_state),
         "route_input_ack": _artifact("route", input_ack),
         "route_input_resync": _artifact("route", input_resync),
+        "route_controller_feedback": _artifact("route", controller_feedback),
         "route_video_fragment": _artifact("route", video),
         "route_video_repair_reserved": _artifact("route", repair),
         "route_video_feedback": _artifact("route", video_feedback),
         "route_audio": _artifact("route", audio),
         "route_microphone": _artifact("route", microphone),
+        "route_transport_telemetry": _artifact("route", transport_telemetry),
         "bulk_asset_header": _artifact("bulk", asset_bulk_header),
         "bulk_asset_payload": _artifact("bulk", asset_payload),
     }
@@ -1431,9 +1490,57 @@ def build_fixture() -> dict:
             session_id,
             INITIAL_MAX_SEMANTIC_DATAGRAM,
         ),
+        "video-feedback-deadline-over-bound": (
+            video_feedback[:64] + struct.pack(">I", 1_000_001) + video_feedback[68:],
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "video-feedback-deadline-on-loss": (
+            video_feedback[:64] + struct.pack(">I", 1) + video_feedback[68:],
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
         "input-format-one-rejected": (
             input_format_one,
             "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "controller-feedback-stale-input-generation": (
+            controller_feedback[:36] + struct.pack(">Q", 2) + controller_feedback[44:],
+            "h2c",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "controller-feedback-reserved-tail": (
+            controller_feedback[:60] + b"\x01" + controller_feedback[61:],
+            "h2c",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "controller-feedback-command-length": (
+            controller_feedback[:53] + b"\x05" + controller_feedback[54:],
+            "h2c",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "transport-telemetry-generation-mismatch": (
+            transport_telemetry[:36] + struct.pack(">Q", 2) + transport_telemetry[44:],
+            "h2c",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "transport-telemetry-minimum-over-smoothed": (
+            transport_telemetry[:56] + struct.pack(">I", 5_000) + transport_telemetry[60:],
+            "h2c",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "transport-telemetry-reserved": (
+            transport_telemetry[:-1] + b"\x01",
+            "h2c",
             session_id,
             INITIAL_MAX_SEMANTIC_DATAGRAM,
         ),
@@ -1464,10 +1571,12 @@ def build_fixture() -> dict:
         (input_state, "c2h", "input-state"),
         (input_ack, "h2c", "input-ack"),
         (input_resync, "h2c", "input-resync"),
+        (controller_feedback, "h2c", "controller-feedback"),
         (video, "h2c", "video-fragment"),
         (video_feedback, "c2h", "video-feedback"),
         (audio, "h2c", "audio"),
         (microphone, "c2h", "microphone"),
+        (transport_telemetry, "h2c", "transport-telemetry"),
     ):
         if (
             validate_envelope(

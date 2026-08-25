@@ -24,6 +24,7 @@
 
 #ifdef _WIN32
   #include "platform/windows/misc.h"
+  #include "platform/windows/virtual_display_status.h"
 
   #include <vector>
   #include <Windows.h>
@@ -1896,6 +1897,68 @@ namespace confighttp {
   }
 
   /**
+   * @brief Return read-only Lumen Virtual Display health and active-path status.
+   * @param response HTTP response populated after authentication.
+   * @param request HTTP request carrying the dashboard credentials.
+   *
+   * @api_examples{/api/vdd/status| GET| null}
+   */
+  void getVddStatus(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree {
+      {"installed", false},
+      {"compatible", false},
+      {"deviceHealthy", false},
+      {"problem", nullptr},
+      {"active", false},
+      {"generation", nullptr},
+      {"mode", nullptr},
+      {"deliveryPolicy", nullptr},
+      {"directFrameBound", false},
+      {"quarantined", false},
+      {"fallback", false},
+      {"diagnostic", "Lumen Virtual Display is available only on Windows."},
+    };
+
+#ifdef _WIN32
+    const auto status = platf::virtual_display::query_system_status();
+    output_tree["installed"] = status.installed;
+    output_tree["compatible"] = status.compatible;
+    output_tree["deviceHealthy"] = status.device_healthy;
+    output_tree["problem"] = status.device_problem ?
+                               nlohmann::json {*status.device_problem} :
+                               nlohmann::json {nullptr};
+    output_tree["directFrameBound"] = status.direct_frame_bound;
+    output_tree["quarantined"] = status.direct_frame_quarantined;
+    output_tree["fallback"] = status.fallback;
+    output_tree["diagnostic"] = status.diagnostic;
+    if (status.active) {
+      output_tree["active"] = true;
+      output_tree["generation"] = status.active->generation;
+      output_tree["deliveryPolicy"] =
+        status.active->delivery_policy == platf::virtual_display::delivery_policy_e::latency ?
+          "latency" :
+          "quality";
+      output_tree["mode"] = {
+        {"width", status.active->mode.width},
+        {"height", status.active->mode.height},
+        {"refreshNumerator", status.active->mode.refresh.numerator},
+        {"refreshDenominator", status.active->mode.refresh.denominator},
+        {"hdr", status.active->mode.dynamic_range == platf::virtual_display::dynamic_range_e::hdr10},
+        {"bitDepth", status.active->mode.bits_per_channel},
+      };
+    }
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
    * @brief Install ViGEmBus driver with elevated permissions.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -2231,6 +2294,7 @@ namespace confighttp {
     server.resource["^/api/restart$"]["POST"] = restart;
     server.resource["^/api/vigembus/status$"]["GET"] = getViGEmBusStatus;
     server.resource["^/api/vigembus/install$"]["POST"] = installViGEmBus;
+    server.resource["^/api/vdd/status$"]["GET"] = getVddStatus;
 
     // static/dynamic resources
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;

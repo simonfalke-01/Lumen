@@ -479,7 +479,10 @@ cmake -S . -B '$buildMsys' -G Ninja \
   -DSUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR='$vmicCmake' \
   -DSUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR='$vddCmake'
 ninja -C '$buildMsys'
-'$buildMsys/tests/test_sunshine.exe'
+# Physical encoder probes run on the RTX hardware gate. The disposable builder
+# runs the complete nonhardware suite so virtualized DXGI drivers cannot crash
+# the packaging preflight before artifacts are validated.
+'$buildMsys/tests/test_sunshine.exe' --gtest_filter='-EncoderVariants/EncoderTest.*'
 cd '$buildMsys'
 cpack -G WIX
 cpack -G ZIP

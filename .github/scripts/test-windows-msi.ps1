@@ -317,12 +317,44 @@ function Get-MsiProperty {
     return $value
 }
 
+function New-MajorUpgradeFixture {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceMsi,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationMsi
+    )
+
+    Copy-Item -LiteralPath $SourceMsi -Destination $DestinationMsi -Force
+    $replacementProductCode = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
+    $replacementPackageCode = ([Guid]::NewGuid()).ToString('B').ToUpperInvariant()
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $installer.GetType().InvokeMember(
+        'OpenDatabase',
+        'InvokeMethod',
+        $null,
+        $installer,
+        @($DestinationMsi, 1)
+    )
+    $view = $database.OpenView(
+        "UPDATE ``Property`` SET ``Value``='$replacementProductCode' " +
+        "WHERE ``Property``='ProductCode'"
+    )
+    [void]$view.Execute()
+    [void]$view.Close()
+    [void]$database.Commit()
+    $summary = $installer.SummaryInformation($DestinationMsi, 1)
+    $summary.Property(9) = $replacementPackageCode
+    [void]$summary.Persist()
+    return [pscustomobject]@{
+        Path = $DestinationMsi
+        ProductCode = $replacementProductCode
+    }
+}
+
 switch ($Scenario) {
     'install-no-vhid' {
         $upgradeArguments = @('/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=0')
-        if ($env:EXPECT_VDD_FEATURE -eq 'true') {
-            $upgradeArguments += 'LUMEN_INSTALL_VDD=1'
-        }
         [void](Invoke-Msi `
             -Arguments $upgradeArguments `
             -LogName 'lumen-msi-install-no-vhid.log' `
@@ -441,11 +473,10 @@ switch ($Scenario) {
                 '/qn',
                 '/norestart',
                 'LUMEN_INSTALL_VHID=0',
-                'LUMEN_INSTALL_VMIC=0',
-                'LUMEN_INSTALL_VDD=1'
+                'LUMEN_INSTALL_VMIC=0'
             ) `
             -LogName 'lumen-msi-install-vdd.log' `
-            -FailureMessage 'MSI install with Virtual Display failed.')
+            -FailureMessage 'MSI default Virtual Display installation failed.')
         Assert-ServiceRunning
         $devices = @(
             Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
@@ -462,6 +493,16 @@ switch ($Scenario) {
             -ErrorAction Stop
         if ([string]$driverInf.Data -notmatch '^oem\d+\.inf$') {
             throw "Virtual Display reported an invalid driver INF path: $($driverInf.Data)"
+        }
+        $removeDeviceOutput = @(
+            & pnputil.exe /remove-device $devices[0].PNPDeviceID 2>&1
+        ) -join [Environment]::NewLine
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not remove the VDD root for package-only cleanup validation: $removeDeviceOutput"
+        }
+        $publishedInfPath = Join-Path "$env:SystemRoot\INF" ([string]$driverInf.Data)
+        if (-not (Test-Path -LiteralPath $publishedInfPath -PathType Leaf)) {
+            throw 'Removing the VDD root unexpectedly removed its staged package before MSI validation.'
         }
         [void](Invoke-Msi `
             -Arguments @(
@@ -482,6 +523,9 @@ switch ($Scenario) {
         )
         if ($deselectedDevices.Count -ne 0) {
             throw 'Virtual Display remained installed after feature deselection.'
+        }
+        if (Test-Path -LiteralPath $publishedInfPath -PathType Leaf) {
+            throw 'Virtual Display feature deselection left its owned device-absent package staged.'
         }
         [void](Invoke-Msi `
             -Arguments @('/x', $productCode, '/qn', '/norestart') `
@@ -620,8 +664,46 @@ switch ($Scenario) {
         }
         Assert-ServiceRunning
 
+        $finalProductCode = $productCode
+        if ($env:EXPECT_VDD_FEATURE -eq 'true') {
+            $installedVdd = @(
+                Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+                    @($_.HardwareID) -contains 'ROOT\LumenVirtualDisplay'
+                }
+            )
+            if ($installedVdd.Count -ne 1 -or $installedVdd[0].Status -ne 'OK') {
+                throw 'The full MSI did not own one healthy VDD before opt-out upgrade validation.'
+            }
+            $replacement = New-MajorUpgradeFixture `
+                -SourceMsi $msiPath `
+                -DestinationMsi (Join-Path $env:RUNNER_TEMP 'Lumen-vdd-optout-upgrade.msi')
+            [void](Invoke-Msi `
+                -Arguments @(
+                    '/i',
+                    "`"$($replacement.Path)`"",
+                    '/qn',
+                    '/norestart',
+                    'LUMEN_INSTALL_VHID=0',
+                    'LUMEN_INSTALL_VDD=0'
+                ) `
+                -LogName 'lumen-msi-upgrade-vdd-optout.log' `
+                -FailureMessage 'Lumen major upgrade with Virtual Display deselected failed.')
+            $remainingVdd = @(
+                Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+                    @($_.HardwareID) -contains 'ROOT\LumenVirtualDisplay'
+                }
+            )
+            if ($remainingVdd.Count -ne 0) {
+                throw 'A major upgrade that deselected Virtual Display orphaned the previous VDD.'
+            }
+            $driverStoreText = (& pnputil.exe /enum-drivers /files 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0 -or $driverStoreText -match '(?i)LumenVirtualDisplay\.inf') {
+                throw 'A major upgrade that deselected Virtual Display left its driver package staged.'
+            }
+            $finalProductCode = $replacement.ProductCode
+        }
         [void](Invoke-Msi `
-            -Arguments @('/x', $productCode, '/qn', '/norestart') `
+            -Arguments @('/x', $finalProductCode, '/qn', '/norestart') `
             -LogName 'lumen-msi-upgrade-uninstall.log' `
             -FailureMessage 'Uninstall after Lumen-to-Lumen upgrade failed.')
     }

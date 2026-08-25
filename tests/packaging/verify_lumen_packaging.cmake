@@ -340,7 +340,11 @@ assert_file_contains_literal(
 assert_file_contains_literal(
     "cmake/packaging/windows.cmake"
     [=[install(TARGETS lumen-vddctl]=]
-    "The Virtual Display package must install its root-device lifecycle helper")
+    "Every Windows package must install the Virtual Display lifecycle helper")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[# Keep the lifecycle helper in every Windows MSI. A driver-less major upgrade]=]
+    "Driver-less MSI packages must retain the Virtual Display lifecycle helper")
 assert_file_contains_literal(
     "cmake/packaging/windows.cmake"
     [=[DESTINATION "drivers/virtual-display"]=]
@@ -355,12 +359,46 @@ assert_file_contains_literal(
     "WiX must patch the optional Virtual Display feature")
 assert_file_contains_literal(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
-    [=[Property Id="LUMEN_INSTALL_VDD" Value="0"]=]
-    "Virtual Display must remain explicit opt-in")
+    [=[Property Id="LUMEN_INSTALL_VDD" Value="@LUMEN_INSTALL_VDD_DEFAULT@"]=]
+    "Virtual Display selection must follow whether its package is present")
+assert_file_contains_literal(
+    "cmake/packaging/windows_wix.cmake"
+    [=[set(LUMEN_INSTALL_VDD_DEFAULT 1)]=]
+    "WiX packages containing the Virtual Display driver must select it by default")
+assert_file_contains_literal(
+    "cmake/packaging/windows_wix.cmake"
+    [=[set(LUMEN_INSTALL_VDD_DEFAULT 0)]=]
+    "WiX packages without the Virtual Display driver must keep its transaction disabled")
+assert_file_contains_literal(
+    "cmake/packaging/windows.cmake"
+    [=[set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DISABLED false)]=]
+    "The packaged Virtual Display feature must be selected by default")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[drivers\virtual-display\LumenVirtualDisplay.inf]=]
+    "Direct setup must select Virtual Display only when its package is present")
 assert_file_contains_literal(
     "src_assets/windows/misc/sunshine-setup.ps1"
     [=[[string]$InstallVirtualDisplay]=]
     "Setup must accept MSI Virtual Display feature ownership")
+foreach(vdd_upgrade_contract IN ITEMS
+        [=[LumenResolveUpgradeVddOwnership]=]
+        [=[MsiEnumRelatedProductsW]=]
+        [=[MsiQueryFeatureStateW]=]
+        [=[LUMEN_UPGRADE_OWNED_VDD]=])
+    assert_file_contains_literal(
+        "tools/lumen-msica.c"
+        "${vdd_upgrade_contract}"
+        "MSI upgrade ownership resolution must retain ${vdd_upgrade_contract}")
+endforeach()
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/sunshine-installer.wxs"
+    [=[-UpgradeOwnedVirtualDisplay [LUMEN_UPGRADE_OWNED_VDD]]=]
+    "Deferred install actions must receive verified prior-product VDD ownership")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[$upgradeOwnedVirtualDisplaySelected]=]
+    "Setup must remove a replaced product's VDD when the new feature is absent")
 assert_file_contains_literal(
     "src_assets/windows/misc/virtual-display-setup.ps1"
     [=[LumenVirtualDisplayInstallerV1]=]
@@ -369,9 +407,77 @@ assert_file_contains_literal(
     "src_assets/windows/misc/virtual-display-setup.ps1"
     [=[/export-driver]=]
     "Virtual Display rollback must export the previous driver package")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[PreviousPublishedInfName]=]
+    "Virtual Display replacement must retain the exact previous published INF identity")
+foreach(vdd_identity_contract IN ITEMS
+        [=[PreviousPublishedInfSha256]=]
+        [=[PreviousPackageManifestSha256]=]
+        [=[ForwardPublishedInfSha256]=]
+        [=[ForwardPackageManifestSha256]=]
+        [=[Assert-InstalledDriverIdentity]=]
+        [=[now refers to a different driver package]=])
+    assert_file_contains_literal(
+        "src_assets/windows/misc/virtual-display-setup.ps1"
+        "${vdd_identity_contract}"
+        "Persisted VDD deletion identity must retain ${vdd_identity_contract}")
+endforeach()
+foreach(vdd_durable_ownership_contract IN ITEMS
+        [=[owned-driver.json]=]
+        [=[Write-OwnedDriverIdentity]=]
+        [=[Read-OwnedDriverIdentity]=]
+        [=[DeferredPreviousPackageRemoval]=]
+        [=[Apply-CommittedOwnership]=]
+        [=[Remove-DeferredPreviousPackage]=]
+        [=[Set-PendingReboot -State $state -Phase "commit-remove-previous"]=]
+        [=[UpgradeOwnerProductCode]=]
+        [=[No device or durable VDD ownership manifest exists]=])
+    assert_file_contains_literal(
+        "src_assets/windows/misc/virtual-display-setup.ps1"
+        "${vdd_durable_ownership_contract}"
+        "Durable device-absent VDD cleanup must retain ${vdd_durable_ownership_contract}")
+endforeach()
+assert_file_contains_literal(
+    ".github/workflows/ci-windows.yml"
+    [=[EXPECT_VDD_FEATURE: ${{ inputs.release_tag != '' && 'true' || 'false' }}]=]
+    "The live MSI scenario must receive the same VDD payload expectation as table validation")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[Remove-StateLessBootstrap]=]
+    "A failed pre-mutation VDD bootstrap must clean retry-blocking artifacts")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[throw $bootstrapError]=]
+    "VDD bootstrap cleanup must preserve the original failure after restoring retryability")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[if ([bool]$state.RollbackComplete) {]=]
+    "Completed VDD rollback cleanup must remain retryable after state publication")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[Remove-PublishedDriverPackage]=]
+    "Virtual Display replacement and uninstall must remove the exact superseded package")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[remained staged after removal]=]
+    "Virtual Display cleanup must verify that the superseded package left Driver Store")
+assert_file_contains_literal(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[if ([bool]$state.DesiredPresent) {]=]
+    "Virtual Display reboot resume must reinstall only when the transaction still desires the driver")
+assert_file_excludes(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[if ([string]$state.TransactionKind -eq "install") {]=]
+    "Virtual Display feature deselection must not reinstall the driver after a reboot")
 foreach(vdd_msi_contract IN ITEMS
         [=['install-vdd']=]
-        [=[LUMEN_INSTALL_VDD=1]=]
+        [=[MSI default Virtual Display installation failed.]=]
+        [=[New-MajorUpgradeFixture]=]
+        [=[Lumen major upgrade with Virtual Display deselected failed.]=]
+        [=[orphaned the previous VDD]=]
+        [=[package-only cleanup validation]=]
+        [=[owned device-absent package staged]=]
         [=[ROOT\LumenVirtualDisplay]=]
         [=[LumenVirtualDisplay\.inf]=])
     assert_file_contains_literal(
@@ -379,6 +485,10 @@ foreach(vdd_msi_contract IN ITEMS
         "${vdd_msi_contract}"
         "MSI validation must retain the Virtual Display contract ${vdd_msi_contract}")
 endforeach()
+assert_file_excludes(
+    ".github/scripts/test-windows-msi.ps1"
+    [=[LUMEN_INSTALL_VDD=1]=]
+    "MSI live validation must prove Virtual Display installation without a property override")
 assert_file_contains_literal(
     "scripts/windows/build-full-profile.ps1"
     [=[LUMEN_MSQUIC_SHIM_DLL_SHA256]=]
@@ -395,6 +505,10 @@ assert_file_contains_literal(
     "scripts/windows/build-full-profile.ps1"
     [=[$SourceRoot = $sourceProvenance.SourceRoot]=]
     "The full-profile builder must replace the mutable source root before compilation")
+assert_file_contains_literal(
+    "scripts/windows/build-full-profile.ps1"
+    [=[--gtest_filter='-EncoderVariants/EncoderTest.*']=]
+    "The disposable full-profile builder must leave physical encoder probes to the hardware gate")
 foreach(full_profile_toolchain_contract IN ITEMS
         [=[[string]$PythonPath]=]
         [=[[string]$DotNetRoot]=]

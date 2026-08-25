@@ -11,7 +11,9 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidateSet("install", "uninstall")]
-    [string]$TransactionKind
+    [string]$TransactionKind,
+
+    [string]$UpgradeOwnerProductCode
 )
 
 Set-StrictMode -Version Latest
@@ -42,16 +44,22 @@ function ConvertTo-NormalizedProductCode {
 
 Assert-Administrator
 $ProductCode = ConvertTo-NormalizedProductCode -Value $ProductCode
+if (-not [string]::IsNullOrWhiteSpace($UpgradeOwnerProductCode)) {
+    $UpgradeOwnerProductCode = ConvertTo-NormalizedProductCode -Value $UpgradeOwnerProductCode
+}
 if ($Action -in @("install", "uninstall") -and $Action -ne $TransactionKind) {
     throw "Virtual Display transaction kind does not match the action."
 }
 
 $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 $rollbackRoot = Join-Path $programData "LumenVirtualDisplayInstallerV1"
+$ownershipFile = Join-Path $rollbackRoot "owned-driver.json"
 $rollbackProduct = Join-Path $rollbackRoot $ProductCode
 $rollbackDirectory = Join-Path $rollbackProduct $TransactionKind
 $rollbackState = Join-Path $rollbackDirectory "virtual-display-rollback.json"
 $rollbackDriver = Join-Path $rollbackDirectory "virtual-display-driver"
+$identityCheckDriver = Join-Path $rollbackDirectory "virtual-display-identity-check"
+$forwardIdentityDriver = Join-Path $rollbackDirectory "virtual-display-forward-identity"
 $rollbackScript = Join-Path $rollbackDirectory "virtual-display-setup.ps1"
 $rollbackHelper = Join-Path $rollbackDirectory "lumen-vddctl.exe"
 $packageInf = Join-Path $RootDir "drivers\virtual-display\LumenVirtualDisplay.inf"
@@ -292,7 +300,7 @@ function Set-PendingReboot {
         [Parameter(Mandatory = $true)]
         [psobject]$State,
         [Parameter(Mandatory = $true)]
-        [ValidateSet("forward-remove", "forward-verify", "rollback-remove", "rollback-verify")]
+        [ValidateSet("forward-remove", "forward-verify", "commit-remove-previous", "rollback-remove", "rollback-verify")]
         [string]$Phase
     )
     $State.PendingPhase = $Phase
@@ -303,17 +311,26 @@ function Set-PendingReboot {
     $script:RebootRequired = $true
 }
 
-function Export-InstalledDriver {
-    param([string]$InfName)
-    if (Test-Path -LiteralPath $rollbackDriver) {
-        Remove-Item -LiteralPath $rollbackDriver -Recurse -Force
+function Get-DriverManifestSha256 {
+    param([object[]]$Files)
+    $lines = @(
+        $Files | Sort-Object FileName | ForEach-Object {
+            "$($_.FileName.ToLowerInvariant()):$($_.Sha256)"
+        }
+    )
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace("-", "")
+    } finally {
+        $sha256.Dispose()
     }
-    New-Item -ItemType Directory -Path $rollbackDriver | Out-Null
-    Invoke-PnpUtil `
-        -Arguments @("/export-driver", $InfName, $rollbackDriver) `
-        -Description "Backing up the installed Lumen Virtual Display driver" | Out-Null
+}
+
+function Read-ExportedDriverPackage {
+    param([string]$ExportRoot)
     $infs = @(
-        Get-ChildItem -LiteralPath $rollbackDriver -Filter "*.inf" -File -Recurse |
+        Get-ChildItem -LiteralPath $ExportRoot -Filter "*.inf" -File -Recurse |
             Where-Object {
                 Select-String -LiteralPath $_.FullName -SimpleMatch `
                     -Pattern "ROOT\LumenVirtualDisplay" -Quiet
@@ -337,7 +354,12 @@ function Export-InstalledDriver {
     $catalog = Join-Path $packageDirectory $catalogName
     $driver = Join-Path $packageDirectory "LumenVirtualDisplay.dll"
     $required = @($inf.FullName, $catalog, $driver)
-    $backupRoot = [IO.Path]::GetFullPath($rollbackDriver) + [IO.Path]::DirectorySeparatorChar
+    $allFiles = @(Get-ChildItem -LiteralPath $ExportRoot -File -Recurse)
+    if ($allFiles.Count -ne $required.Count -or
+        @($allFiles | Where-Object { $required -notcontains $_.FullName }).Count -ne 0) {
+        throw "The exported Lumen Virtual Display package has unexpected files."
+    }
+    $backupRoot = [IO.Path]::GetFullPath($ExportRoot) + [IO.Path]::DirectorySeparatorChar
     $files = foreach ($path in $required) {
         $fullPath = [IO.Path]::GetFullPath($path)
         if (-not $fullPath.StartsWith($backupRoot, [StringComparison]::OrdinalIgnoreCase) -or
@@ -350,47 +372,266 @@ function Export-InstalledDriver {
         }
         [ordered]@{
             RelativePath = $fullPath.Substring($backupRoot.Length)
+            FileName = [IO.Path]::GetFileName($fullPath)
             Sha256 = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash.ToUpperInvariant()
         }
+    }
+    if (@($files | Group-Object FileName | Where-Object { $_.Count -ne 1 }).Count -ne 0) {
+        throw "The exported Lumen Virtual Display package has duplicate file identities."
     }
     $signature = Get-AuthenticodeSignature -LiteralPath $catalog
     if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
         $null -eq $signature.SignerCertificate) {
         throw "The exported Lumen Virtual Display catalog signature is not valid."
     }
+    $infEntry = @($files | Where-Object { $_.FileName -ceq $inf.Name })
+    if ($infEntry.Count -ne 1) {
+        throw "The exported Lumen Virtual Display INF identity is ambiguous."
+    }
     return [pscustomobject]@{
         InfPath = $inf.FullName
         Files = @($files)
+        InfSha256 = $infEntry[0].Sha256
+        ManifestSha256 = Get-DriverManifestSha256 -Files @($files)
         CatalogSignerThumbprint = $signature.SignerCertificate.Thumbprint.ToUpperInvariant()
+    }
+}
+
+function Export-InstalledDriver {
+    param([string]$InfName)
+    if (Test-Path -LiteralPath $rollbackDriver) {
+        Remove-Item -LiteralPath $rollbackDriver -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $rollbackDriver | Out-Null
+    Invoke-PnpUtil `
+        -Arguments @("/export-driver", $InfName, $rollbackDriver) `
+        -Description "Backing up the installed Lumen Virtual Display driver" | Out-Null
+    return Read-ExportedDriverPackage -ExportRoot $rollbackDriver
+}
+
+function Read-InstalledDriverIdentity {
+    param(
+        [string]$InfName,
+        [string]$ExportRoot,
+        [string]$Description
+    )
+    if (Test-Path -LiteralPath $ExportRoot) {
+        Remove-Item -LiteralPath $ExportRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $ExportRoot | Out-Null
+    try {
+        Invoke-PnpUtil `
+            -Arguments @("/export-driver", $InfName, $ExportRoot) `
+            -Description $Description | Out-Null
+        return Read-ExportedDriverPackage -ExportRoot $ExportRoot
+    } catch {
+        Remove-Item -LiteralPath $ExportRoot -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Assert-InstalledDriverIdentity {
+    param(
+        [string]$InfName,
+        [string]$ExpectedInfSha256,
+        [string]$ExpectedManifestSha256,
+        [string]$ExpectedCatalogSignerThumbprint
+    )
+    foreach ($hash in @($ExpectedInfSha256, $ExpectedManifestSha256)) {
+        if ($hash -cnotmatch '^[0-9A-F]{64}$') {
+            throw "The saved Lumen Virtual Display package hash is invalid."
+        }
+    }
+    if ($ExpectedCatalogSignerThumbprint -cnotmatch '^[0-9A-F]{40,128}$') {
+        throw "The saved Lumen Virtual Display signer identity is invalid."
+    }
+    $actual = Read-InstalledDriverIdentity `
+        -InfName $InfName `
+        -ExportRoot $identityCheckDriver `
+        -Description "Verifying the staged Lumen Virtual Display driver package"
+    try {
+        if ($actual.InfSha256 -cne $ExpectedInfSha256 -or
+            $actual.ManifestSha256 -cne $ExpectedManifestSha256 -or
+            $actual.CatalogSignerThumbprint -cne $ExpectedCatalogSignerThumbprint) {
+            throw "The published Virtual Display INF name now refers to a different driver package: $InfName"
+        }
+    } finally {
+        Remove-Item -LiteralPath $identityCheckDriver -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-DriverIdentityFields {
+    param([psobject]$Identity)
+    if ([string]$Identity.PublishedInfName -cnotmatch '^oem\d+\.inf$' -or
+        [string]$Identity.InfSha256 -cnotmatch '^[0-9A-F]{64}$' -or
+        [string]$Identity.ManifestSha256 -cnotmatch '^[0-9A-F]{64}$' -or
+        [string]$Identity.CatalogSignerThumbprint -cnotmatch '^[0-9A-F]{40,128}$') {
+        throw "The saved Lumen Virtual Display ownership identity is invalid."
+    }
+}
+
+function Assert-SecureOwnershipAcl {
+    param([string]$Path)
+    $allowed = @("S-1-5-18", "S-1-5-32-544")
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $allowed) {
+        throw "The Lumen Virtual Display ownership path has an untrusted owner."
+    }
+    $rules = $acl.GetAccessRules(
+        $true,
+        $true,
+        [Security.Principal.SecurityIdentifier]
+    )
+    foreach ($rule in $rules) {
+        if ($rule.IdentityReference.Value -notin $allowed -or
+            $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            throw "The Lumen Virtual Display ownership path grants untrusted access."
+        }
+    }
+}
+
+function Read-OwnedDriverIdentity {
+    if (-not (Test-Path -LiteralPath $ownershipFile -PathType Leaf)) {
+        return $null
+    }
+    $root = Get-Item -LiteralPath $rollbackRoot -Force -ErrorAction Stop
+    $manifest = Get-Item -LiteralPath $ownershipFile -Force -ErrorAction Stop
+    if (-not $root.PSIsContainer -or
+        ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        ($manifest.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "The Lumen Virtual Display ownership manifest path is not secure."
+    }
+    Assert-SecureOwnershipAcl -Path $rollbackRoot
+    Assert-SecureOwnershipAcl -Path $ownershipFile
+    $saved = Get-Content -LiteralPath $ownershipFile -Raw | ConvertFrom-Json
+    if ([int]$saved.Schema -ne 1) {
+        throw "The Lumen Virtual Display ownership manifest schema is invalid."
+    }
+    $saved.ProductCode = ConvertTo-NormalizedProductCode -Value ([string]$saved.ProductCode)
+    Assert-DriverIdentityFields -Identity $saved
+    return $saved
+}
+
+function Write-OwnedDriverIdentity {
+    param([psobject]$Identity)
+    Assert-DriverIdentityFields -Identity $Identity
+    if (-not (Test-Path -LiteralPath $rollbackRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $rollbackRoot -Force | Out-Null
+    }
+    Set-Acl -LiteralPath $rollbackRoot -AclObject (New-SecureDirectoryAcl)
+    $pending = Join-Path $rollbackRoot "owned-driver.pending"
+    [ordered]@{
+        Schema = 1
+        ProductCode = $ProductCode
+        PublishedInfName = [string]$Identity.PublishedInfName
+        InfSha256 = [string]$Identity.InfSha256
+        ManifestSha256 = [string]$Identity.ManifestSha256
+        CatalogSignerThumbprint = [string]$Identity.CatalogSignerThumbprint
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $pending -Encoding UTF8
+    Move-Item -LiteralPath $pending -Destination $ownershipFile -Force
+}
+
+function Remove-OwnedDriverIdentity {
+    if (Test-Path -LiteralPath $ownershipFile -PathType Leaf) {
+        $manifest = Get-Item -LiteralPath $ownershipFile -Force
+        if ($manifest.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "The Lumen Virtual Display ownership manifest is a reparse point."
+        }
+        Remove-Item -LiteralPath $ownershipFile -Force
     }
 }
 
 function Save-State {
     param([psobject]$State)
     $pending = Join-Path $rollbackDirectory "virtual-display-rollback.pending"
-    $State | ConvertTo-Json | Set-Content -LiteralPath $pending -Encoding UTF8
+    $State | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath $pending -Encoding UTF8
     Move-Item -LiteralPath $pending -Destination $rollbackState -Force
 }
 
 function Read-State {
     Assert-RollbackDirectory
     $state = Get-Content -LiteralPath $rollbackState -Raw | ConvertFrom-Json
-    if ([int]$state.Schema -ne 2 -or
+    $previousPublishedInf = [string]$state.PreviousPublishedInfName
+    $forwardPublishedInf = [string]$state.ForwardPublishedInfName
+    $previousFields = @(
+        [string]$state.PreviousPublishedInfName,
+        [string]$state.PreviousPublishedInfSha256,
+        [string]$state.PreviousPackageManifestSha256,
+        [string]$state.PreviousCatalogSignerThumbprint
+    )
+    $previousIdentityAbsent = @($previousFields | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count -eq 0
+    $previousIdentityValid =
+        [string]$state.PreviousPublishedInfSha256 -cmatch '^[0-9A-F]{64}$' -and
+        [string]$state.PreviousPackageManifestSha256 -cmatch '^[0-9A-F]{64}$' -and
+        [string]$state.PreviousCatalogSignerThumbprint -cmatch '^[0-9A-F]{40,128}$'
+    $forwardFields = @(
+        [string]$state.ForwardPublishedInfName,
+        [string]$state.ForwardPublishedInfSha256,
+        [string]$state.ForwardPackageManifestSha256,
+        [string]$state.ForwardCatalogSignerThumbprint
+    )
+    $forwardIdentityAbsent = @($forwardFields | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count -eq 0
+    $forwardIdentityValid =
+        $forwardPublishedInf -cmatch '^oem\d+\.inf$' -and
+        [string]$state.ForwardPublishedInfSha256 -cmatch '^[0-9A-F]{64}$' -and
+        [string]$state.ForwardPackageManifestSha256 -cmatch '^[0-9A-F]{64}$' -and
+        [string]$state.ForwardCatalogSignerThumbprint -cmatch '^[0-9A-F]{40,128}$'
+    $resultFields = @(
+        [string]$state.ResultPublishedInfName,
+        [string]$state.ResultPublishedInfSha256,
+        [string]$state.ResultPackageManifestSha256,
+        [string]$state.ResultCatalogSignerThumbprint
+    )
+    $resultIdentityAbsent = @($resultFields | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count -eq 0
+    $resultIdentityValid =
+        [string]$state.ResultPublishedInfName -cmatch '^oem\d+\.inf$' -and
+        [string]$state.ResultPublishedInfSha256 -cmatch '^[0-9A-F]{64}$' -and
+        [string]$state.ResultPackageManifestSha256 -cmatch '^[0-9A-F]{64}$' -and
+        [string]$state.ResultCatalogSignerThumbprint -cmatch '^[0-9A-F]{40,128}$'
+    if ([int]$state.Schema -ne 5 -or
         [string]$state.ProductCode -cne $ProductCode -or
         [string]$state.TransactionKind -cne $TransactionKind -or
         -not [IO.Path]::GetFullPath([string]$state.RootDir).Equals(
             [IO.Path]::GetFullPath($RootDir),
             [StringComparison]::OrdinalIgnoreCase) -or
+        ([bool]$state.DriverWasPresent -and -not [bool]$state.PackageWasPresent) -or
+        ([bool]$state.PackageWasPresent -and
+            ($previousPublishedInf -cnotmatch '^oem\d+\.inf$' -or -not $previousIdentityValid)) -or
+        (-not [bool]$state.PackageWasPresent -and -not $previousIdentityAbsent) -or
+        (-not $forwardIdentityAbsent -and -not $forwardIdentityValid) -or
+        (-not $resultIdentityAbsent -and -not $resultIdentityValid) -or
+        ([bool]$state.DeferredPreviousPackageRemoval -and
+            (-not [bool]$state.PackageWasPresent -or [bool]$state.DriverWasPresent)) -or
         [string]$state.PendingPhase -notin @(
             "none",
             "forward-remove",
             "forward-verify",
+            "commit-remove-previous",
             "rollback-remove",
             "rollback-verify"
         )) {
         throw "Virtual Display rollback state does not match this transaction."
     }
     return $state
+}
+
+function Remove-StateLessBootstrap {
+    if (Test-Path -LiteralPath $rollbackState -PathType Leaf) {
+        throw "Refusing to remove a Virtual Display bootstrap after transaction state was published."
+    }
+    if (Test-Path -LiteralPath $rollbackDirectory -PathType Container) {
+        Assert-RollbackDirectory
+        Unregister-ResumeTask
+        Clear-RebootMarker
+        Remove-Item -LiteralPath $rollbackDirectory -Recurse -Force
+    }
+    foreach ($parent in @($rollbackProduct, $rollbackRoot)) {
+        if ((Test-Path -LiteralPath $parent -PathType Container) -and
+            @(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) {
+            Remove-Item -LiteralPath $parent -Force
+        }
+    }
 }
 
 function Start-Transaction {
@@ -401,38 +642,146 @@ function Start-Transaction {
         (Test-Path -LiteralPath $rollbackHelper)) {
         throw "A pending Virtual Display transaction must be resolved first."
     }
-    Copy-Item -LiteralPath $script:CurrentScriptPath -Destination $rollbackScript -Force
-    Copy-Item -LiteralPath $installedHelper -Destination $rollbackHelper -Force
-    $current = Get-InstalledVirtualDisplay
-    $backup = $null
-    if ($null -ne $current) {
-        $backup = Export-InstalledDriver -InfName $current.InfName
-    }
-    Save-State -State ([ordered]@{
-        Schema = 2
-        ProductCode = $ProductCode
-        TransactionKind = $TransactionKind
-        RootDir = $RootDir
-        DriverWasPresent = $null -ne $current
-        DesiredPresent = $DesiredPresent
-        BackedUpDriverInfPath = if ($null -eq $backup) { $null } else { $backup.InfPath }
-        BackupFiles = if ($null -eq $backup) { @() } else { @($backup.Files) }
-        BackupCatalogSignerThumbprint = if ($null -eq $backup) {
-            $null
-        } else {
-            $backup.CatalogSignerThumbprint
+    try {
+        Copy-Item -LiteralPath $script:CurrentScriptPath -Destination $rollbackScript -Force
+        Copy-Item -LiteralPath $installedHelper -Destination $rollbackHelper -Force
+        $current = Get-InstalledVirtualDisplay
+        $owned = Read-OwnedDriverIdentity
+        if ($null -ne $owned -and
+            [string]$owned.ProductCode -cne $ProductCode -and
+            ([string]::IsNullOrWhiteSpace($UpgradeOwnerProductCode) -or
+                [string]$owned.ProductCode -cne $UpgradeOwnerProductCode)) {
+            Write-Warning "Ignoring a VDD ownership manifest belonging to a different Lumen product."
+            $owned = $null
         }
-        PendingPhase = "none"
-        PendingBootIdentifier = $null
-        RollbackComplete = $false
-        Committed = $false
-    })
+        $packageInfName = $null
+        if ($null -ne $current) {
+            $packageInfName = $current.InfName
+            if ($null -ne $owned) {
+                if ([string]$owned.PublishedInfName -cne $current.InfName) {
+                    throw "The active Virtual Display driver does not match Lumen's ownership manifest."
+                }
+                Assert-InstalledDriverIdentity `
+                    -InfName $current.InfName `
+                    -ExpectedInfSha256 ([string]$owned.InfSha256) `
+                    -ExpectedManifestSha256 ([string]$owned.ManifestSha256) `
+                    -ExpectedCatalogSignerThumbprint ([string]$owned.CatalogSignerThumbprint)
+            }
+        } elseif ($null -ne $owned) {
+            $publishedInf = Join-Path (Join-Path $env:SystemRoot "INF") ([string]$owned.PublishedInfName)
+            if (Test-Path -LiteralPath $publishedInf -PathType Leaf) {
+                Assert-InstalledDriverIdentity `
+                    -InfName ([string]$owned.PublishedInfName) `
+                    -ExpectedInfSha256 ([string]$owned.InfSha256) `
+                    -ExpectedManifestSha256 ([string]$owned.ManifestSha256) `
+                    -ExpectedCatalogSignerThumbprint ([string]$owned.CatalogSignerThumbprint)
+                $packageInfName = [string]$owned.PublishedInfName
+            }
+        } elseif (-not $DesiredPresent) {
+            Write-Warning "No device or durable VDD ownership manifest exists; no staged package can be removed safely."
+        }
+        $backup = $null
+        if (-not [string]::IsNullOrEmpty($packageInfName)) {
+            $backup = Export-InstalledDriver -InfName $packageInfName
+        }
+        Save-State -State ([ordered]@{
+            Schema = 5
+            ProductCode = $ProductCode
+            TransactionKind = $TransactionKind
+            RootDir = $RootDir
+            DriverWasPresent = $null -ne $current
+            PackageWasPresent = $null -ne $backup
+            DesiredPresent = $DesiredPresent
+            PreviousPublishedInfName = if ($null -eq $backup) { $null } else { $packageInfName }
+            PreviousPublishedInfSha256 = if ($null -eq $backup) { $null } else { $backup.InfSha256 }
+            PreviousPackageManifestSha256 = if ($null -eq $backup) { $null } else { $backup.ManifestSha256 }
+            PreviousCatalogSignerThumbprint = if ($null -eq $backup) {
+                $null
+            } else {
+                $backup.CatalogSignerThumbprint
+            }
+            ForwardPublishedInfName = $null
+            ForwardPublishedInfSha256 = $null
+            ForwardPackageManifestSha256 = $null
+            ForwardCatalogSignerThumbprint = $null
+            ResultPublishedInfName = $null
+            ResultPublishedInfSha256 = $null
+            ResultPackageManifestSha256 = $null
+            ResultCatalogSignerThumbprint = $null
+            DeferredPreviousPackageRemoval = $null -ne $backup -and $null -eq $current
+            PreserveForwardPackageOnRollback = $false
+            BackedUpDriverInfPath = if ($null -eq $backup) { $null } else { $backup.InfPath }
+            BackupFiles = if ($null -eq $backup) { @() } else { @($backup.Files) }
+            BackupCatalogSignerThumbprint = if ($null -eq $backup) {
+                $null
+            } else {
+                $backup.CatalogSignerThumbprint
+            }
+            PendingPhase = "none"
+            PendingBootIdentifier = $null
+            RollbackComplete = $false
+            Committed = $false
+        })
+    } catch {
+        $bootstrapError = $_
+        if (-not (Test-Path -LiteralPath $rollbackState -PathType Leaf)) {
+            try {
+                Remove-StateLessBootstrap
+            } catch {
+                throw "Virtual Display transaction bootstrap failed and cleanup could not complete: $($bootstrapError.Exception.Message) $($_.Exception.Message)"
+            }
+        }
+        throw $bootstrapError
+    }
+}
+
+function Remove-PublishedDriverPackage {
+    param(
+        [string]$InfName,
+        [string]$ExpectedInfSha256,
+        [string]$ExpectedManifestSha256,
+        [string]$ExpectedCatalogSignerThumbprint
+    )
+    if ([string]::IsNullOrEmpty($InfName)) {
+        return $false
+    }
+    if ($InfName -cnotmatch '^oem\d+\.inf$') {
+        throw "Lumen Virtual Display reported an invalid published INF: $InfName"
+    }
+    $publishedInf = Join-Path (Join-Path $env:SystemRoot "INF") $InfName
+    if (-not (Test-Path -LiteralPath $publishedInf -PathType Leaf)) {
+        return $false
+    }
+    Assert-InstalledDriverIdentity `
+        -InfName $InfName `
+        -ExpectedInfSha256 $ExpectedInfSha256 `
+        -ExpectedManifestSha256 $ExpectedManifestSha256 `
+        -ExpectedCatalogSignerThumbprint $ExpectedCatalogSignerThumbprint
+    $deleteExit = Invoke-PnpUtil `
+        -Arguments @("/delete-driver", $InfName, "/uninstall", "/force") `
+        -Description "Removing the Lumen Virtual Display driver package"
+    if ($deleteExit -eq 3010) {
+        return $true
+    }
+    if (Test-Path -LiteralPath $publishedInf -PathType Leaf) {
+        throw "Lumen Virtual Display driver package remained staged after removal: $InfName"
+    }
+    return $false
 }
 
 function Remove-CurrentDriver {
+    param(
+        [string]$ExpectedInfName,
+        [string]$ExpectedInfSha256,
+        [string]$ExpectedManifestSha256,
+        [string]$ExpectedCatalogSignerThumbprint
+    )
     $current = Get-InstalledVirtualDisplay
     if ($null -eq $current) {
         return $false
+    }
+    if ($current.InfName -cne $ExpectedInfName) {
+        throw "The active Virtual Display package changed after transaction state was captured."
     }
     $removeExit = Invoke-PnpUtil `
         -Arguments @("/remove-device", $current.InstanceId) `
@@ -440,14 +789,36 @@ function Remove-CurrentDriver {
     if ($removeExit -eq 3010) {
         return $true
     }
-    $deleteExit = Invoke-PnpUtil `
-        -Arguments @("/delete-driver", $current.InfName, "/uninstall", "/force") `
-        -Description "Removing the Lumen Virtual Display driver package"
-    if ($deleteExit -eq 3010) {
+    if (Remove-PublishedDriverPackage `
+            -InfName $current.InfName `
+            -ExpectedInfSha256 $ExpectedInfSha256 `
+            -ExpectedManifestSha256 $ExpectedManifestSha256 `
+            -ExpectedCatalogSignerThumbprint $ExpectedCatalogSignerThumbprint) {
         return $true
     }
     if ($null -ne (Get-InstalledVirtualDisplay)) {
         throw "Lumen Virtual Display is still present after removal."
+    }
+    return $false
+}
+
+function Remove-CurrentDeviceOnly {
+    param([string]$ExpectedInfName)
+    $current = Get-InstalledVirtualDisplay
+    if ($null -eq $current) {
+        return $false
+    }
+    if ($current.InfName -cne $ExpectedInfName) {
+        throw "The active Virtual Display package changed before device-only rollback."
+    }
+    $removeExit = Invoke-PnpUtil `
+        -Arguments @("/remove-device", $current.InstanceId) `
+        -Description "Removing the rolled-back Lumen Virtual Display device"
+    if ($removeExit -eq 3010) {
+        return $true
+    }
+    if ($null -ne (Get-InstalledVirtualDisplay)) {
+        throw "Lumen Virtual Display remained present after device-only rollback."
     }
     return $false
 }
@@ -465,6 +836,76 @@ function Install-Driver {
         throw "Lumen Virtual Display did not become healthy after installation."
     }
     return $false
+}
+
+function Capture-ResultDriverIdentity {
+    param([psobject]$State)
+    $current = Get-InstalledVirtualDisplay
+    if ($null -eq $current -or $current.Status -ne "OK") {
+        throw "The installed Virtual Display cannot be recorded as Lumen-owned."
+    }
+    $identity = Read-InstalledDriverIdentity `
+        -InfName $current.InfName `
+        -ExportRoot $forwardIdentityDriver `
+        -Description "Recording the installed Lumen Virtual Display package"
+    $State.ResultPublishedInfName = $current.InfName
+    $State.ResultPublishedInfSha256 = $identity.InfSha256
+    $State.ResultPackageManifestSha256 = $identity.ManifestSha256
+    $State.ResultCatalogSignerThumbprint = $identity.CatalogSignerThumbprint
+    Save-State -State $State
+}
+
+function Get-ResultDriverIdentity {
+    param([psobject]$State)
+    return [pscustomobject]@{
+        PublishedInfName = [string]$State.ResultPublishedInfName
+        InfSha256 = [string]$State.ResultPublishedInfSha256
+        ManifestSha256 = [string]$State.ResultPackageManifestSha256
+        CatalogSignerThumbprint = [string]$State.ResultCatalogSignerThumbprint
+    }
+}
+
+function Test-PreviousAndResultIdentityEqual {
+    param([psobject]$State)
+    return [string]$State.PreviousPublishedInfName -ceq [string]$State.ResultPublishedInfName -and
+        [string]$State.PreviousPublishedInfSha256 -ceq [string]$State.ResultPublishedInfSha256 -and
+        [string]$State.PreviousPackageManifestSha256 -ceq [string]$State.ResultPackageManifestSha256 -and
+        [string]$State.PreviousCatalogSignerThumbprint -ceq [string]$State.ResultCatalogSignerThumbprint
+}
+
+function Remove-DeferredPreviousPackage {
+    param([psobject]$State)
+    $removeDeferredPackage = [bool]$State.DeferredPreviousPackageRemoval -and
+        (-not [bool]$State.DesiredPresent -or
+            -not (Test-PreviousAndResultIdentityEqual -State $State))
+    if (-not $removeDeferredPackage) {
+        return $false
+    }
+    return Remove-PublishedDriverPackage `
+        -InfName ([string]$State.PreviousPublishedInfName) `
+        -ExpectedInfSha256 ([string]$State.PreviousPublishedInfSha256) `
+        -ExpectedManifestSha256 ([string]$State.PreviousPackageManifestSha256) `
+        -ExpectedCatalogSignerThumbprint ([string]$State.PreviousCatalogSignerThumbprint)
+}
+
+function Apply-CommittedOwnership {
+    param([psobject]$State)
+    if ([bool]$State.DesiredPresent) {
+        $identity = Get-ResultDriverIdentity -State $State
+        Assert-DriverIdentityFields -Identity $identity
+        $current = Get-InstalledVirtualDisplay
+        if ($null -eq $current -or $current.InfName -cne $identity.PublishedInfName) {
+            throw "The installed Virtual Display changed before ownership was committed."
+        }
+        Assert-InstalledDriverIdentity `
+            -InfName $identity.PublishedInfName `
+            -ExpectedInfSha256 $identity.InfSha256 `
+            -ExpectedManifestSha256 $identity.ManifestSha256 `
+            -ExpectedCatalogSignerThumbprint $identity.CatalogSignerThumbprint
+        Write-OwnedDriverIdentity -Identity $identity
+    } else {
+        Remove-OwnedDriverIdentity
+    }
 }
 
 function Remove-RollbackArtifacts {
@@ -558,6 +999,7 @@ function Complete-ForwardOperation {
     Clear-RebootMarker
     Unregister-ResumeTask
     if ([bool]$State.Committed) {
+        Apply-CommittedOwnership -State $State
         Remove-RollbackArtifacts
     }
 }
@@ -573,13 +1015,28 @@ function Complete-RollbackOperation {
 
 function Invoke-ForwardInstall {
     $state = Read-State
-    if ([bool]$state.DriverWasPresent) {
+    if ([bool]$state.PackageWasPresent) {
         Resolve-BackupInf -State $state | Out-Null
     }
-    $removeNeedsReboot = Remove-CurrentDriver
-    if ($removeNeedsReboot) {
-        Set-PendingReboot -State $state -Phase "forward-remove"
-        return
+    if (-not [bool]$state.DeferredPreviousPackageRemoval) {
+        $removeNeedsReboot = Remove-CurrentDriver `
+            -ExpectedInfName ([string]$state.PreviousPublishedInfName) `
+            -ExpectedInfSha256 ([string]$state.PreviousPublishedInfSha256) `
+            -ExpectedManifestSha256 ([string]$state.PreviousPackageManifestSha256) `
+            -ExpectedCatalogSignerThumbprint ([string]$state.PreviousCatalogSignerThumbprint)
+        if ($removeNeedsReboot) {
+            Set-PendingReboot -State $state -Phase "forward-remove"
+            return
+        }
+        $deleteNeedsReboot = Remove-PublishedDriverPackage `
+            -InfName ([string]$state.PreviousPublishedInfName) `
+            -ExpectedInfSha256 ([string]$state.PreviousPublishedInfSha256) `
+            -ExpectedManifestSha256 ([string]$state.PreviousPackageManifestSha256) `
+            -ExpectedCatalogSignerThumbprint ([string]$state.PreviousCatalogSignerThumbprint)
+        if ($deleteNeedsReboot) {
+            Set-PendingReboot -State $state -Phase "forward-remove"
+            return
+        }
     }
     $installNeedsReboot = Install-Driver -InfPath $packageInf
     if ($installNeedsReboot) {
@@ -587,17 +1044,36 @@ function Invoke-ForwardInstall {
         return
     }
     Assert-DesiredState -Present $true
+    Capture-ResultDriverIdentity -State $state
     Complete-ForwardOperation -State $state
 }
 
 function Invoke-ForwardUninstall {
     $state = Read-State
-    if ([bool]$state.DriverWasPresent) {
+    if ([bool]$state.PackageWasPresent) {
         Resolve-BackupInf -State $state | Out-Null
     }
-    $removeNeedsReboot = Remove-CurrentDriver
+    if ([bool]$state.DeferredPreviousPackageRemoval) {
+        Assert-DesiredState -Present $false
+        Complete-ForwardOperation -State $state
+        return
+    }
+    $removeNeedsReboot = Remove-CurrentDriver `
+        -ExpectedInfName ([string]$state.PreviousPublishedInfName) `
+        -ExpectedInfSha256 ([string]$state.PreviousPublishedInfSha256) `
+        -ExpectedManifestSha256 ([string]$state.PreviousPackageManifestSha256) `
+        -ExpectedCatalogSignerThumbprint ([string]$state.PreviousCatalogSignerThumbprint)
     if ($removeNeedsReboot) {
-        Set-PendingReboot -State $state -Phase "forward-verify"
+        Set-PendingReboot -State $state -Phase "forward-remove"
+        return
+    }
+    $deleteNeedsReboot = Remove-PublishedDriverPackage `
+        -InfName ([string]$state.PreviousPublishedInfName) `
+        -ExpectedInfSha256 ([string]$state.PreviousPublishedInfSha256) `
+        -ExpectedManifestSha256 ([string]$state.PreviousPackageManifestSha256) `
+        -ExpectedCatalogSignerThumbprint ([string]$state.PreviousCatalogSignerThumbprint)
+    if ($deleteNeedsReboot) {
+        Set-PendingReboot -State $state -Phase "forward-remove"
         return
     }
     Assert-DesiredState -Present $false
@@ -616,14 +1092,54 @@ function Invoke-Rollback {
         Remove-RollbackArtifacts
         return
     }
+    if ([bool]$state.RollbackComplete) {
+        Remove-RollbackArtifacts
+        return
+    }
     if (-not [bool]$state.RollbackComplete) {
         if ([bool]$state.DriverWasPresent) {
             $backup = Resolve-BackupInf -State $state
         }
-        $removeNeedsReboot = Remove-CurrentDriver
+        $forward = Get-InstalledVirtualDisplay
+        if ($null -ne $forward) {
+            $forwardIdentity = Read-InstalledDriverIdentity `
+                -InfName $forward.InfName `
+                -ExportRoot $forwardIdentityDriver `
+                -Description "Recording the installed Virtual Display package before rollback"
+            $state.ForwardPublishedInfName = $forward.InfName
+            $state.ForwardPublishedInfSha256 = $forwardIdentity.InfSha256
+            $state.ForwardPackageManifestSha256 = $forwardIdentity.ManifestSha256
+            $state.ForwardCatalogSignerThumbprint = $forwardIdentity.CatalogSignerThumbprint
+            $state.PreserveForwardPackageOnRollback = [bool]$state.DeferredPreviousPackageRemoval -and
+                [string]$state.PreviousPublishedInfName -ceq $forward.InfName -and
+                [string]$state.PreviousPublishedInfSha256 -ceq $forwardIdentity.InfSha256 -and
+                [string]$state.PreviousPackageManifestSha256 -ceq $forwardIdentity.ManifestSha256 -and
+                [string]$state.PreviousCatalogSignerThumbprint -ceq $forwardIdentity.CatalogSignerThumbprint
+            Save-State -State $state
+        }
+        $removeNeedsReboot = if ([bool]$state.PreserveForwardPackageOnRollback) {
+            Remove-CurrentDeviceOnly -ExpectedInfName ([string]$state.ForwardPublishedInfName)
+        } else {
+            Remove-CurrentDriver `
+                -ExpectedInfName ([string]$state.ForwardPublishedInfName) `
+                -ExpectedInfSha256 ([string]$state.ForwardPublishedInfSha256) `
+                -ExpectedManifestSha256 ([string]$state.ForwardPackageManifestSha256) `
+                -ExpectedCatalogSignerThumbprint ([string]$state.ForwardCatalogSignerThumbprint)
+        }
         if ($removeNeedsReboot) {
             Set-PendingReboot -State $state -Phase "rollback-remove"
             return
+        }
+        if (-not [bool]$state.PreserveForwardPackageOnRollback) {
+            $deleteNeedsReboot = Remove-PublishedDriverPackage `
+                -InfName ([string]$state.ForwardPublishedInfName) `
+                -ExpectedInfSha256 ([string]$state.ForwardPublishedInfSha256) `
+                -ExpectedManifestSha256 ([string]$state.ForwardPackageManifestSha256) `
+                -ExpectedCatalogSignerThumbprint ([string]$state.ForwardCatalogSignerThumbprint)
+            if ($deleteNeedsReboot) {
+                Set-PendingReboot -State $state -Phase "rollback-remove"
+                return
+            }
         }
         if ([bool]$state.DriverWasPresent) {
             $installNeedsReboot = Install-Driver -InfPath $backup
@@ -642,13 +1158,22 @@ function Invoke-Commit {
         return
     }
     $state = Read-State
+    if ([string]$state.PendingPhase -ne "none") {
+        $state.Committed = $true
+        Save-State -State $state
+        $script:RebootRequired = $true
+        return
+    }
+    $deleteNeedsReboot = Remove-DeferredPreviousPackage -State $state
+    if ($deleteNeedsReboot) {
+        $state.Committed = $true
+        Set-PendingReboot -State $state -Phase "commit-remove-previous"
+        return
+    }
     $state.Committed = $true
     Save-State -State $state
-    if ([string]$state.PendingPhase -eq "none") {
-        Remove-RollbackArtifacts
-    } else {
-        $script:RebootRequired = $true
-    }
+    Apply-CommittedOwnership -State $state
+    Remove-RollbackArtifacts
 }
 
 function Invoke-Resume {
@@ -668,26 +1193,66 @@ function Invoke-Resume {
     }
 
     if ([bool]$state.Committed) {
-        if ($phase -eq "forward-remove") {
-            Assert-DesiredState -Present $false
-            if ([string]$state.TransactionKind -ne "install") {
-                throw "Invalid forward-remove phase for a Virtual Display uninstall."
-            }
-            $installNeedsReboot = Install-Driver -InfPath $packageInf
-            if ($installNeedsReboot) {
-                Set-PendingReboot -State $state -Phase "forward-verify"
+        if ($phase -eq "commit-remove-previous") {
+            $deleteNeedsReboot = Remove-PublishedDriverPackage `
+                -InfName ([string]$state.PreviousPublishedInfName) `
+                -ExpectedInfSha256 ([string]$state.PreviousPublishedInfSha256) `
+                -ExpectedManifestSha256 ([string]$state.PreviousPackageManifestSha256) `
+                -ExpectedCatalogSignerThumbprint ([string]$state.PreviousCatalogSignerThumbprint)
+            if ($deleteNeedsReboot) {
+                Set-PendingReboot -State $state -Phase "commit-remove-previous"
                 return
+            }
+        } elseif ($phase -eq "forward-remove") {
+            Assert-DesiredState -Present $false
+            $deleteNeedsReboot = Remove-PublishedDriverPackage `
+                -InfName ([string]$state.PreviousPublishedInfName) `
+                -ExpectedInfSha256 ([string]$state.PreviousPublishedInfSha256) `
+                -ExpectedManifestSha256 ([string]$state.PreviousPackageManifestSha256) `
+                -ExpectedCatalogSignerThumbprint ([string]$state.PreviousCatalogSignerThumbprint)
+            if ($deleteNeedsReboot) {
+                Set-PendingReboot -State $state -Phase "forward-remove"
+                return
+            }
+            if ([bool]$state.DesiredPresent) {
+                $installNeedsReboot = Install-Driver -InfPath $packageInf
+                if ($installNeedsReboot) {
+                    Set-PendingReboot -State $state -Phase "forward-verify"
+                    return
+                }
+                Assert-DesiredState -Present $true
+                Capture-ResultDriverIdentity -State $state
             }
         } elseif ($phase -ne "forward-verify") {
             throw "Invalid committed Virtual Display resume phase: $phase"
         }
         Assert-DesiredState -Present ([bool]$state.DesiredPresent)
+        if ([bool]$state.DesiredPresent -and
+            [string]::IsNullOrEmpty([string]$state.ResultPublishedInfName)) {
+            Capture-ResultDriverIdentity -State $state
+        }
+        $deleteNeedsReboot = Remove-DeferredPreviousPackage -State $state
+        if ($deleteNeedsReboot) {
+            Set-PendingReboot -State $state -Phase "commit-remove-previous"
+            return
+        }
         Complete-ForwardOperation -State $state
         return
     }
 
     if ($phase -eq "rollback-remove") {
         Assert-DesiredState -Present $false
+        if (-not [bool]$state.PreserveForwardPackageOnRollback) {
+            $deleteNeedsReboot = Remove-PublishedDriverPackage `
+                -InfName ([string]$state.ForwardPublishedInfName) `
+                -ExpectedInfSha256 ([string]$state.ForwardPublishedInfSha256) `
+                -ExpectedManifestSha256 ([string]$state.ForwardPackageManifestSha256) `
+                -ExpectedCatalogSignerThumbprint ([string]$state.ForwardCatalogSignerThumbprint)
+            if ($deleteNeedsReboot) {
+                Set-PendingReboot -State $state -Phase "rollback-remove"
+                return
+            }
+        }
         if ([bool]$state.DriverWasPresent) {
             $backup = Resolve-BackupInf -State $state
             $installNeedsReboot = Install-Driver -InfPath $backup

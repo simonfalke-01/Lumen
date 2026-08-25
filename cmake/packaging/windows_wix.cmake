@@ -108,6 +108,11 @@ file(COPY "${CMAKE_CURRENT_LIST_DIR}/wix_resources/"
         DESTINATION "${WIX_BUILD_PARENT_DIRECTORY}/")
 set(LUMEN_MSICA_BINARY "${CMAKE_BINARY_DIR}/tools/lumen_msica.dll")
 file(TO_NATIVE_PATH "${LUMEN_MSICA_BINARY}" LUMEN_MSICA_BINARY_WIX)
+if(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
+    set(LUMEN_INSTALL_VDD_DEFAULT 1)
+else()
+    set(LUMEN_INSTALL_VDD_DEFAULT 0)
+endif()
 configure_file(
         "${CMAKE_CURRENT_LIST_DIR}/wix_resources/sunshine-installer.wxs"
         "${WIX_BUILD_PARENT_DIRECTORY}/sunshine-installer.wxs"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import unittest
 
 import quic_v3_oracle as oracle
@@ -106,13 +107,34 @@ class QuicV3OracleTest(unittest.TestCase):
             self.assertIn(name, artifacts)
         self.assertEqual(
             len([name for name in artifacts if name.startswith("route_")]),
-            8,
+            10,
         )
         repair = next(
             item for item in fixture["routing"] if item["semantic"] == "video-repair"
         )
         self.assertTrue(repair["registered"])
         self.assertFalse(repair["phase_one_allowed"])
+
+    def test_transport_telemetry_binds_generation_and_bounds_rtt_fields(self) -> None:
+        fixture = oracle.build_fixture()
+        record = bytes.fromhex(
+            fixture["artifacts"]["route_transport_telemetry"]["hex"]
+        )
+        route, sequence, object_id, payload = oracle.validate_envelope(
+            record, "h2c", bytes(range(0xC0, 0xD0)), 1152
+        )
+        self.assertEqual((route, sequence, object_id), ("transport-telemetry", 1, 1))
+        self.assertEqual(struct.unpack(">QIIII", payload), (1, 4_000, 3_000, 1_000, 0))
+
+    def test_start_host_audio_is_an_explicit_boolean(self) -> None:
+        fixture = oracle.build_fixture()
+        start = bytes.fromhex(fixture["artifacts"]["start_request"]["hex"])
+        fields = oracle.validate_control(start, "c2h")
+        self.assertEqual(set(fields), set(range(1, 19)))
+        self.assertIs(fields[18], True)
+
+        false_start = oracle.control(0x0100, 5, {**fields, 18: False})
+        self.assertIs(oracle.validate_control(false_start, "c2h")[18], False)
 
     def test_invitation_and_bulk_headers_are_exact(self) -> None:
         fixture = oracle.build_fixture()

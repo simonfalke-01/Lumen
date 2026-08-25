@@ -267,9 +267,11 @@ is enabled; normal Windows CI still builds and validates the driver and its MSI 
 
 The repository contains an x64 UMDF2 indirect-display driver under
 `src/platform/windows/virtual_display_driver`. The regular CMake build does not
-build or package it. The complete Windows profile below accepts it only as an
-exact signed package; the lite package continues through existing DDA/WGC
-capture without installing the driver.
+build it. A Windows MSI includes and selects the VDD component by default only
+when CMake receives an exact signed package through
+`SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR`; an MSI built without that
+payload has no VDD feature to select. Lite ZIP packages always exclude the
+driver and continue to use the existing DDA/WGC capture paths.
 
 Build the driver only from a Visual Studio 2022 Developer Command Prompt with a
 matching Windows 11 SDK and WDK:
@@ -279,15 +281,26 @@ msbuild src\platform\windows\virtual_display_driver\LumenVirtualDisplay.vcxproj 
 ```
 
 Portable tests cover mode arithmetic, ABI layouts, generation and lease
-lifecycle, rollback, stable-container selection, and render-adapter binding.
-ABI 4 adds two persistent shared texture/fence slots, PID-reuse-safe reverse
-handle duplication, and a bounded event-driven frame channel. The driver
-performs one GPU `CopyResource` from each accepted IddCx surface into a safe
-slot; this is a one-copy path, not zero-copy. Regular and lite packages continue
-to use DDA/WGC, while only the strict complete profile accepts the separately
-built driver package. Public release still requires Microsoft-signed catalogs
-and full MSI lifecycle validation. HDR and latency claims remain separate
-hardware gates. See the
+lifecycle, rollback, stable-container selection, render-adapter binding,
+frame metadata, and immutable color-transform validation. ABI 5 exports two
+persistent shared texture/fence slots through a bounded event-driven channel:
+SDR uses BGRA8/sRGB and HDR uses FP16/scRGB. The driver performs one GPU
+`CopyResource` from each accepted IddCx surface into a safe slot; this is a
+one-copy path, not zero-copy. ABI 5 also carries validated per-frame white-level
+and HDR10 metadata plus versioned default, RGB gamma-table, or 3x4-matrix/LUT
+color transforms to the host.
+
+HDR VDD capture requires the complete ABI 5 FP16 direct-frame path. Startup
+fails closed when its IddCx 1.10, exact-mode, adapter, metadata, transform,
+shared-handle, fence, conversion, or NVENC gates do not pass; it never falls
+back to an untransformed DDA/WGC HDR capture. Legacy SDR may retain DDA/WGC
+capture on the active VDD output after the direct channel is safely disabled.
+These are capture-boundary guarantees, not end-to-end lossless or latency
+claims.
+
+The complete Windows profile requires the separately built signed driver
+package. Public release artifacts still require Microsoft-signed catalogs and
+full MSI lifecycle validation. See the
 [driver README](../src/platform/windows/virtual_display_driver/README.md) for
 the exact validation boundary.
 
