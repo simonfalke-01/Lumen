@@ -5,10 +5,10 @@
 
 #include "src/protocol_v3/media_pipeline.h"
 
-#include <gtest/gtest.h>
-
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <gtest/gtest.h>
 #include <memory>
 #include <vector>
 
@@ -23,20 +23,36 @@ namespace {
     }
   }
 
+  std::uint32_t read_be32(const std::span<const std::uint8_t> bytes, const std::size_t offset) {
+    return (static_cast<std::uint32_t>(bytes[offset]) << 24U) |
+           (static_cast<std::uint32_t>(bytes[offset + 1]) << 16U) |
+           (static_cast<std::uint32_t>(bytes[offset + 2]) << 8U) |
+           bytes[offset + 3];
+  }
+
   class transport_t final: public media::TransportSink {
   public:
-    bool update_policy(std::uint64_t, quic::Profile, std::uint64_t) noexcept override { return true; }
+    bool update_policy(std::uint64_t, quic::Profile, std::uint64_t) noexcept override {
+      return true;
+    }
+
     quic::EnqueueResult enqueue(std::uint64_t, quic::Packet packet) override {
       packets.emplace_back(*packet.bytes);
-      return quic::EnqueueResult::queued;
+      return enqueue_result;
     }
+
     quic::EnqueueResult enqueue_video_frame(
       std::uint64_t,
-      std::shared_ptr<const quic::LazyVideoFrame>
+      std::shared_ptr<const quic::LazyVideoFrame> frame
     ) override {
-      return quic::EnqueueResult::queued;
+      video_frames.emplace_back(std::move(frame));
+      return video_enqueue_result;
     }
+
+    quic::EnqueueResult enqueue_result {quic::EnqueueResult::queued};
+    quic::EnqueueResult video_enqueue_result {quic::EnqueueResult::queued};
     std::vector<std::vector<std::uint8_t>> packets;
+    std::vector<std::shared_ptr<const quic::LazyVideoFrame>> video_frames;
   };
 
   class input_t final: public media::InputSink {
@@ -45,14 +61,26 @@ namespace {
       ++submissions;
       return true;
     }
-    void reset() noexcept override {}
+
+    void reset() noexcept override {
+      ++resets;
+    }
+
     std::size_t submissions {};
+    std::size_t resets {};
   };
 
   class microphone_t final: public media::MicrophoneSink {
   public:
-    bool submit(const media::MicrophonePacket &) override { return true; }
-    void stop() noexcept override {}
+    bool submit(const media::MicrophonePacket &) override {
+      return true;
+    }
+
+    void stop() noexcept override {
+      ++stops;
+    }
+
+    std::size_t stops {};
   };
 
   class feedback_t final: public media::VideoFeedbackSink {
@@ -61,6 +89,7 @@ namespace {
       actions.push_back(feedback.action);
       deadline_misses.push_back(feedback.deadline_miss_microseconds);
     }
+
     std::vector<std::uint8_t> actions;
     std::vector<std::uint32_t> deadline_misses;
   };
@@ -99,7 +128,7 @@ namespace {
     append_be(payload, std::uint64_t {0});
     return payload;
   }
-}
+}  // namespace
 
 TEST(ProtocolV3InputFormat, AcceptsTwoAndExplicitlyRejectsOne) {
   transport_t transport;
@@ -218,16 +247,12 @@ TEST(ProtocolV3ControllerFeedback, SerializesEveryProductionCommandAndRejectsInv
   ASSERT_EQ(pipeline.submit_controller_feedback(feedback), media::PublishResult::accepted);
   EXPECT_EQ(transport.packets.back()[54], 0);
   EXPECT_EQ(transport.packets.back()[55], 24);
-  EXPECT_TRUE(std::ranges::all_of(
-    transport.packets.back().begin() + 60,
-    transport.packets.back().begin() + 70,
-    [](const auto byte) { return byte == 0x11; }
-  ));
-  EXPECT_TRUE(std::ranges::all_of(
-    transport.packets.back().begin() + 70,
-    transport.packets.back().begin() + 80,
-    [](const auto byte) { return byte == 0x22; }
-  ));
+  EXPECT_TRUE(std::ranges::all_of(transport.packets.back().begin() + 60, transport.packets.back().begin() + 70, [](const auto byte) {
+    return byte == 0x11;
+  }));
+  EXPECT_TRUE(std::ranges::all_of(transport.packets.back().begin() + 70, transport.packets.back().begin() + 80, [](const auto byte) {
+    return byte == 0x22;
+  }));
 
   feedback.controller_generation = 0;
   EXPECT_EQ(pipeline.submit_controller_feedback(feedback), media::PublishResult::invalid);
@@ -292,4 +317,125 @@ TEST(ProtocolV3VideoFeedback, DeadlineMissFeedsBoundedProductionTelemetry) {
     after_rejection.latest_deadline_miss_microseconds,
     telemetry.latest_deadline_miss_microseconds
   );
+}
+
+TEST(ProtocolV3AudioPublication, PreservesGenerationAndReportsBackpressureAndClosedState) {
+  transport_t transport;
+  input_t input;
+  microphone_t microphone;
+  feedback_t feedback;
+  auto negotiated = config();
+  negotiated.audio_generation = 0x12345678U;
+  media::SessionPipeline pipeline(negotiated, transport, input, microphone, feedback);
+  ASSERT_TRUE(pipeline.bind_connection(7));
+
+  const std::array<std::uint8_t, 4> opus {0x11, 0x22, 0x33, 0x44};
+  const media::EncodedAudioPacket packet {
+    .capture_time_microseconds = 90,
+    .first_sample_position = 240,
+    .opus = opus,
+    .discontinuity = true,
+  };
+  ASSERT_EQ(pipeline.submit_audio(packet), media::PublishResult::accepted);
+  ASSERT_EQ(transport.packets.size(), 1U);
+  const auto &wire = transport.packets.back();
+  const auto payload_offset = quic::datagram_header_bytes;
+  ASSERT_EQ(wire.size(), payload_offset + 48U + opus.size());
+  EXPECT_EQ(read_be32(wire, payload_offset + 16U), negotiated.audio_generation);
+  EXPECT_EQ(wire[payload_offset + 25U], 0x02U);
+  EXPECT_TRUE(std::ranges::equal(opus.begin(), opus.end(), wire.end() - opus.size(), wire.end()));
+
+  transport.enqueue_result = quic::EnqueueResult::would_block;
+  EXPECT_EQ(pipeline.submit_audio(packet), media::PublishResult::backpressured);
+  transport.enqueue_result = quic::EnqueueResult::shutting_down;
+  EXPECT_EQ(pipeline.submit_audio(packet), media::PublishResult::stopped);
+  const auto before_stop = pipeline.snapshot();
+  EXPECT_EQ(before_stop.audio_packets, 1U);
+  EXPECT_EQ(before_stop.backpressure_drops, 2U);
+
+  pipeline.stop();
+  pipeline.stop();
+  EXPECT_EQ(input.resets, 1U);
+  EXPECT_EQ(microphone.stops, 1U);
+  EXPECT_EQ(pipeline.submit_audio(packet), media::PublishResult::stopped);
+}
+
+TEST(ProtocolV3GenerationInstrumentation, KeepsRawAudioAndVideoEventsScopedPerSession) {
+  struct evidence_t {
+    std::uint8_t session_tag {};
+    std::uint32_t audio_generation {};
+    std::uint32_t video_generation {};
+    media::TelemetrySnapshot telemetry;
+  };
+
+  const auto publish = [](const std::uint8_t session_tag, const std::uint32_t audio_generation, const std::uint32_t video_generation) {
+    transport_t transport;
+    input_t input;
+    microphone_t microphone;
+    feedback_t feedback;
+    auto negotiated = config();
+    negotiated.session_id.fill(session_tag);
+    negotiated.audio_generation = audio_generation;
+    negotiated.video_generation = video_generation;
+    media::SessionPipeline pipeline(negotiated, transport, input, microphone, feedback);
+    EXPECT_TRUE(pipeline.bind_connection(session_tag));
+
+    const std::array<std::uint8_t, 3> opus {session_tag, 0x22, 0x33};
+    EXPECT_EQ(
+      pipeline.submit_audio({
+        .capture_time_microseconds = 10,
+        .first_sample_position = 20,
+        .opus = opus,
+      }),
+      media::PublishResult::accepted
+    );
+
+    auto storage = std::make_shared<const std::vector<std::uint8_t>>(
+      std::initializer_list<std::uint8_t> {session_tag, 0x55, 0x66, 0x77}
+    );
+    EXPECT_EQ(
+      pipeline.submit_video({
+        .frame_id = session_tag,
+        .capture_time_microseconds = 30,
+        .encoder_complete_delta_microseconds = 5,
+        .storage = storage,
+        .bytes = *storage,
+        .request_recovery = [] {
+        },
+        .key_frame = true,
+      }),
+      media::PublishResult::accepted
+    );
+
+    EXPECT_EQ(transport.packets.size(), 1U);
+    EXPECT_EQ(transport.video_frames.size(), 1U);
+    std::array<std::uint8_t, quic::maximum_semantic_datagram_bytes> header {};
+    quic::VideoFragmentView fragment;
+    EXPECT_TRUE(transport.video_frames.front()->materialize(0, header, fragment));
+    return evidence_t {
+      .session_tag = transport.packets.front()[12],
+      .audio_generation = read_be32(
+        transport.packets.front(),
+        quic::datagram_header_bytes + 16U
+      ),
+      .video_generation = read_be32(
+        header,
+        quic::datagram_header_bytes + 56U
+      ),
+      .telemetry = pipeline.snapshot(),
+    };
+  };
+
+  const auto first = publish(0x31, 101, 201);
+  const auto second = publish(0x32, 102, 202);
+  EXPECT_EQ(first.session_tag, 0x31);
+  EXPECT_EQ(second.session_tag, 0x32);
+  EXPECT_EQ(first.audio_generation, 101U);
+  EXPECT_EQ(second.audio_generation, 102U);
+  EXPECT_EQ(first.video_generation, 201U);
+  EXPECT_EQ(second.video_generation, 202U);
+  EXPECT_EQ(first.telemetry.audio_packets, 1U);
+  EXPECT_EQ(first.telemetry.video_frames, 1U);
+  EXPECT_EQ(second.telemetry.audio_packets, 1U);
+  EXPECT_EQ(second.telemetry.video_frames, 1U);
 }
