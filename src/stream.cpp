@@ -11,6 +11,7 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -41,6 +42,7 @@ extern "C" {
 #include "process.h"
 #if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
   #include "protocol_common/input_state.h"
+  #include "protocol_common/status.h"
   #include "protocol_v3/media_pipeline.h"
   #include "protocol_v3/runtime.h"
 #endif
@@ -2628,16 +2630,13 @@ namespace stream {
 
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
-    std::atomic_uint32_t client_microphone_owner;  ///< Launch session holding the single virtual microphone writer slot.
 
     bool claim_client_microphone(std::uint32_t launch_session_id) {
-      auto expected = std::uint32_t {0};
-      return client_microphone_owner.compare_exchange_strong(expected, launch_session_id) || expected == launch_session_id;
+      return client_microphone::claim_writer(client_microphone::writer_owner_t::legacy(launch_session_id));
     }
 
     void release_client_microphone(std::uint32_t launch_session_id) {
-      auto expected = launch_session_id;
-      client_microphone_owner.compare_exchange_strong(expected, 0);
+      client_microphone::release_writer(client_microphone::writer_owner_t::legacy(launch_session_id));
     }
 
     /**
@@ -3051,11 +3050,49 @@ namespace stream {
       });
     }
 
+    /** @brief Stable pre-commit status for v3 microphone admission failures. */
+    class v3_microphone_admission_error final: public std::runtime_error {
+    public:
+      v3_microphone_admission_error(
+        const lumen::protocol_common::Status status,
+        const char *message
+      ):
+          std::runtime_error(message),
+          status_ {static_cast<std::uint8_t>(status)} {
+      }
+
+      /** @return Protocol status returned before any session commit. */
+      std::uint8_t status() const noexcept {
+        return status_;
+      }
+
+    private:
+      std::uint8_t status_;  ///< Stable control status for the failed admission.
+    };
+
     class native_v3_session_resources final:
         public v3_runtime::SessionResources,
         private v3_media::InputSink,
-        private v3_media::MicrophoneSink,
         private v3_media::VideoFeedbackSink {
+      /** @brief Pipeline-facing mic adapter whose stop never recurses into whole-session teardown. */
+      class microphone_adapter_t final: public v3_media::MicrophoneSink {
+      public:
+        explicit microphone_adapter_t(native_v3_session_resources &owner):
+            owner_ {owner} {
+        }
+
+        bool submit(const v3_media::MicrophonePacket &packet) override {
+          return owner_.submit_microphone(packet);
+        }
+
+        void stop() noexcept override {
+          owner_.stop_microphone();
+        }
+
+      private:
+        native_v3_session_resources &owner_;  ///< Resource owner whose mic-only methods are invoked.
+      };
+
     public:
       native_v3_session_resources(
         v3_media::NegotiatedMediaConfig selection,
@@ -3082,6 +3119,25 @@ namespace stream {
   #endif
         if (terminal_failure_.expired() || !input_) {
           throw std::runtime_error {"protocol-v3 native resource allocation"};
+        }
+        auto microphone_claim_cleanup = util::fail_guard([this]() noexcept {
+          release_microphone_writer();
+        });
+        if (selection_.microphone_enabled) {
+          if (!client_microphone_available()) {
+            throw v3_microphone_admission_error {
+              lumen::protocol_common::Status::unsupported_media,
+              "protocol-v3 virtual microphone unavailable",
+            };
+          }
+          const auto owner = client_microphone::writer_owner_t::protocol_v3(session_owner_id_);
+          if (!client_microphone::claim_writer(owner)) {
+            throw v3_microphone_admission_error {
+              lumen::protocol_common::Status::busy,
+              "protocol-v3 virtual microphone writer busy",
+            };
+          }
+          microphone_writer_claimed_ = true;
         }
         if (selection_.fidelity == 3 &&
             !video::current_nvenc_lossless_capability(selection_.codec_id - 1)) {
@@ -3119,13 +3175,12 @@ namespace stream {
         }
         configure_stream();
         auto &input_sink = static_cast<v3_media::InputSink &>(*this);
-        auto &microphone_sink = static_cast<v3_media::MicrophoneSink &>(*this);
         auto &feedback_sink = static_cast<v3_media::VideoFeedbackSink &>(*this);
         pipeline_ = std::make_unique<v3_media::SessionPipeline>(
           selection_,
           transport_,
           input_sink,
-          microphone_sink,
+          microphone_adapter_,
           feedback_sink
         );
         if (!pipeline_->bind_connection(connection_id)) {
@@ -3140,6 +3195,7 @@ namespace stream {
   #ifdef _WIN32
         virtual_display_cleanup.disable();
   #endif
+        microphone_claim_cleanup.disable();
       }
 
       ~native_v3_session_resources() override {
@@ -3337,10 +3393,7 @@ namespace stream {
           if (!input_) {
             return false;
           }
-          if (microphone_receiver_ && !microphone_receiver_->reset(
-                                        selection_.microphone_generation,
-                                        client_microphone::clock_t::now()
-                                      )) {
+          if (microphone_receiver_ && !microphone_receiver_->reset(selection_.microphone_generation)) {
             input::begin_close(input_);
             input::reset(input_);
             pipeline_->detach_connection();
@@ -3383,10 +3436,11 @@ namespace stream {
             feedback_sender_.join();
           }
           if (microphone_receiver_) {
-            microphone_receiver_->stop();
+            microphone_receiver_->shutdown();
           }
           microphone_receiver_.reset();
           microphone_sink_.reset();
+          release_microphone_writer();
           if (pipeline_) {
             const auto telemetry = pipeline_->snapshot();
             BOOST_LOG(info) << "Protocol-v3 media telemetry: feedback="sv << telemetry.feedback_packets
@@ -3583,16 +3637,25 @@ namespace stream {
         }
   #ifdef _WIN32
         microphone_sink_ = platf::win_audio::make_virtual_microphone();
-        microphone_receiver_ = std::make_unique<client_microphone::receiver_t>(
+        microphone_receiver_ = std::make_unique<client_microphone::clocked_receiver_t>(
           std::make_unique<client_microphone::opus_decoder_t>(),
           *microphone_sink_
         );
-        if (!microphone_receiver_->reset(selection_.microphone_generation, client_microphone::clock_t::now())) {
+        if (!microphone_receiver_->reset(selection_.microphone_generation)) {
           throw std::runtime_error {"protocol-v3 virtual microphone start"};
         }
   #else
         throw std::runtime_error {"protocol-v3 virtual microphone unavailable"};
   #endif
+      }
+
+      /** @brief Release the shared writer after playout has stopped, exactly once. */
+      void release_microphone_writer() noexcept {
+        if (!microphone_writer_claimed_) {
+          return;
+        }
+        client_microphone::release_writer(client_microphone::writer_owner_t::protocol_v3(session_owner_id_));
+        microphone_writer_claimed_ = false;
       }
 
       void consume_video() {
@@ -3823,17 +3886,16 @@ namespace stream {
         touch_points_.clear();
       }
 
-      bool submit(const v3_media::MicrophonePacket &packet) override {
+      bool submit_microphone(const v3_media::MicrophonePacket &packet) {
         if (!microphone_receiver_) {
           return false;
         }
-        const auto now = client_microphone::clock_t::now();
         if ((packet.flags & 0x04U) != 0) {
           microphone_receiver_->stop();
           return true;
         }
         if ((packet.flags & 0x02U) != 0 &&
-            !microphone_receiver_->reset(packet.generation, now)) {
+            !microphone_receiver_->reset(packet.generation)) {
           return false;
         }
         client_microphone::packet_t native {
@@ -3845,11 +3907,17 @@ namespace stream {
                     client_microphone::packet_kind_e::opus,
           .payload = {packet.opus.begin(), packet.opus.end()},
         };
-        if (microphone_receiver_->submit(std::move(native), now) != client_microphone::submit_result_e::accepted) {
+        if (microphone_receiver_->submit(std::move(native)) != client_microphone::submit_result_e::accepted) {
           return false;
         }
-        microphone_receiver_->poll(now + client_microphone::JITTER_WINDOW);
         return true;
+      }
+
+      /** @brief Stop only microphone playout when the media pipeline revokes its sink. */
+      void stop_microphone() noexcept {
+        if (microphone_receiver_) {
+          microphone_receiver_->stop();
+        }
       }
 
       void submit(const v3_media::VideoFeedback &feedback) override {
@@ -4474,6 +4542,7 @@ namespace stream {
       safe::mail_raw_t::queue_t<platf::gamepad_feedback_msg_t> feedback_packets_;
       video::egress_queue_t video_egress_;
       v3_media::TransportSink &transport_;  ///< Live QUIC sink used after platform media activation.
+      microphone_adapter_t microphone_adapter_ {*this};  ///< Nonrecursive pipeline-facing microphone sink.
       std::unique_ptr<v3_media::SessionPipeline> pipeline_;  ///< Constructed only after ABI5 resolves PQ metadata.
       config_t stream_config_ {};
       std::jthread video_capture_;
@@ -4504,7 +4573,8 @@ namespace stream {
       std::array<controller_state_t, 16> controller_states_ {};
       std::unordered_map<std::uint32_t, touch_point_t> touch_points_;
       std::unique_ptr<client_microphone::sink_t> microphone_sink_;
-      std::unique_ptr<client_microphone::receiver_t> microphone_receiver_;
+      std::unique_ptr<client_microphone::clocked_receiver_t> microphone_receiver_;
+      bool microphone_writer_claimed_ {};  ///< Whether this v3 resource owns the shared writer.
     };
 
     class native_v3_session_resource_factory final: public v3_runtime::SessionResourceFactory {
@@ -4525,6 +4595,8 @@ namespace stream {
             transport_,
             std::move(terminal_failure)
           );
+        } catch (const v3_microphone_admission_error &error) {
+          return std::unexpected(error.status());
         } catch (...) {
           return std::unexpected(std::uint8_t {8});
         }

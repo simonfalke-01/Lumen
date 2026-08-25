@@ -6,8 +6,11 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 // lib includes
@@ -17,6 +20,37 @@
 #include "client_microphone.h"
 
 namespace client_microphone {
+  namespace {
+    std::mutex writer_mutex;  ///< Serializes cross-protocol writer arbitration.
+    std::optional<writer_owner_t> writer_owner;  ///< Exact tagged owner of the single writer.
+  }  // namespace
+
+  writer_owner_t writer_owner_t::legacy(const std::uint32_t launch_session_id) {
+    return {writer_protocol_e::legacy, launch_session_id};
+  }
+
+  writer_owner_t writer_owner_t::protocol_v3(const std::uint64_t connection_id) {
+    return {writer_protocol_e::protocol_v3, connection_id};
+  }
+
+  bool claim_writer(const writer_owner_t owner) {
+    if (owner.id == 0) {
+      return false;
+    }
+    std::lock_guard lock {writer_mutex};
+    if (!writer_owner) {
+      writer_owner = owner;
+    }
+    return writer_owner == owner;
+  }
+
+  void release_writer(const writer_owner_t owner) {
+    std::lock_guard lock {writer_mutex};
+    if (writer_owner == owner) {
+      writer_owner.reset();
+    }
+  }
+
   /**
    * @brief Return the bounded signed distance between monotonic packet sequences.
    *
@@ -409,6 +443,13 @@ namespace client_microphone {
     return delivered;
   }
 
+  std::optional<clock_t::time_point> receiver_t::next_poll_time() const {
+    if (!impl_->active || !impl_->scheduled) {
+      return std::nullopt;
+    }
+    return impl_->next_playout;
+  }
+
   bool receiver_t::active() const {
     return impl_->active;
   }
@@ -423,5 +464,138 @@ namespace client_microphone {
 
   const statistics_t &receiver_t::statistics() const {
     return impl_->stats;
+  }
+
+  /** @brief Synchronized receiver state and independently clocked playout worker. */
+  struct clocked_receiver_t::impl_t {
+    receiver_t receiver;  ///< Serialized jitter receiver and sink lifecycle.
+    mutable std::mutex mutex;  ///< Protects receiver state and shutdown state.
+    std::condition_variable changed;  ///< Wakes the worker when a deadline or lifecycle changes.
+    std::uint64_t revision {};  ///< Monotonic state-change counter used by worker waits.
+    bool shut_down {};  ///< Whether `shutdown_worker()` permanently closed this wrapper.
+    std::jthread worker;  ///< Independent monotonic playout worker; declared last to start after state initialization.
+
+    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink):
+        receiver(std::move(decoder), sink),
+        worker([this](const std::stop_token token) {
+          run(token);
+        }) {
+    }
+
+    ~impl_t() {
+      shutdown_worker();
+    }
+
+    /** @brief Notify the playout worker after changing receiver state under `mutex`. */
+    void notify_change() {
+      ++revision;
+      changed.notify_all();
+    }
+
+    /** @brief Wait for exact receiver deadlines and poll independently of packet arrival. */
+    void run(const std::stop_token token) {
+      std::unique_lock lock {mutex};
+      auto observed_revision = revision;
+      while (!token.stop_requested()) {
+        if (const auto deadline = receiver.next_poll_time()) {
+          changed.wait_until(lock, *deadline, [&]() {
+            return token.stop_requested() || revision != observed_revision;
+          });
+        } else {
+          changed.wait(lock, [&]() {
+            return token.stop_requested() || revision != observed_revision;
+          });
+        }
+
+        if (token.stop_requested()) {
+          break;
+        }
+        if (revision != observed_revision) {
+          observed_revision = revision;
+          continue;
+        }
+
+        receiver.poll(clock_t::now());
+      }
+    }
+
+    /** @brief Idempotently request worker stop, join it, and stop the sink generation. */
+    void shutdown_worker() {
+      {
+        std::lock_guard lock {mutex};
+        if (shut_down) {
+          return;
+        }
+        shut_down = true;
+        worker.request_stop();
+        notify_change();
+      }
+      if (worker.joinable()) {
+        worker.join();
+      }
+      std::lock_guard lock {mutex};
+      receiver.stop();
+    }
+  };
+
+  clocked_receiver_t::clocked_receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink):
+      impl_(std::make_unique<impl_t>(std::move(decoder), sink)) {
+  }
+
+  clocked_receiver_t::~clocked_receiver_t() = default;
+
+  bool clocked_receiver_t::reset(const std::uint64_t generation) {
+    std::lock_guard lock {impl_->mutex};
+    if (impl_->shut_down) {
+      return false;
+    }
+    const auto started = impl_->receiver.reset(generation, clock_t::now());
+    impl_->notify_change();
+    return started;
+  }
+
+  submit_result_e clocked_receiver_t::submit(packet_t packet) {
+    std::lock_guard lock {impl_->mutex};
+    if (impl_->shut_down) {
+      return submit_result_e::inactive;
+    }
+    const auto result = impl_->receiver.submit(std::move(packet), clock_t::now());
+    if (result == submit_result_e::accepted) {
+      impl_->notify_change();
+    }
+    return result;
+  }
+
+  void clocked_receiver_t::stop() {
+    std::lock_guard lock {impl_->mutex};
+    if (impl_->shut_down) {
+      return;
+    }
+    impl_->receiver.stop();
+    impl_->notify_change();
+  }
+
+  void clocked_receiver_t::shutdown() {
+    impl_->shutdown_worker();
+  }
+
+  bool clocked_receiver_t::active() const {
+    std::lock_guard lock {impl_->mutex};
+    return !impl_->shut_down && impl_->receiver.active();
+  }
+
+  std::uint64_t clocked_receiver_t::generation() const {
+    std::lock_guard lock {impl_->mutex};
+    return impl_->receiver.generation();
+  }
+
+  std::size_t clocked_receiver_t::queued_packets() const {
+    std::lock_guard lock {impl_->mutex};
+    return impl_->receiver.queued_packets();
+  }
+
+  statistics_t clocked_receiver_t::statistics() const {
+    std::lock_guard lock {impl_->mutex};
+    return impl_->receiver.statistics();
   }
 }  // namespace client_microphone
