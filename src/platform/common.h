@@ -5,12 +5,18 @@
 #pragma once
 
 // standard includes
+#include <algorithm>
+#include <array>
 #include <bitset>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -1292,7 +1298,44 @@ namespace platf {
   constexpr auto SERVICE_TYPE = "_nvstream._tcp";  ///< mDNS service type advertised for GameStream discovery.
 
   namespace publish {
+    /** @brief Exact DNS-SD service record owned for one registration lifetime. */
+    struct service_t {
+      std::string type;  ///< DNS-SD service type, for example `_lumen-v3._udp`.
+      std::uint16_t port {};  ///< Host-order service port advertised in SRV.
+      std::vector<std::pair<std::string, std::string>> txt;  ///< Ordered TXT key/value pairs.
+    };
+
+    /** @brief Validate the only two DNS-SD records Lumen is allowed to publish. */
+    [[nodiscard]] inline bool valid_service(const service_t &service) {
+      if (service.port == 0) {
+        return false;
+      }
+      if (service.type == SERVICE_TYPE) {
+        return service.txt.empty();
+      }
+      const auto lowercase_hex = [](const std::string_view value, const std::size_t length) {
+        return value.size() == length && std::ranges::all_of(value, [](const char character) {
+                 return (character >= '0' && character <= '9') ||
+                        (character >= 'a' && character <= 'f');
+               });
+      };
+      return service.type == "_lumen-v3._udp" && service.txt.size() == 4 &&
+             service.txt[0] == std::pair {std::string {"v"}, std::string {"3"}} &&
+             service.txt[1].first == "id" && lowercase_hex(service.txt[1].second, 32) &&
+             service.txt[2] == std::pair {std::string {"port"}, std::to_string(service.port)} &&
+             service.txt[3].first == "caps" && lowercase_hex(service.txt[3].second, 16);
+    }
+
+    /** @brief Validate one nonempty, duplicate-free legacy/modern publication set. */
+    [[nodiscard]] inline bool valid_services(const std::vector<service_t> &services) {
+      return !services.empty() && services.size() <= 2 &&
+             std::ranges::all_of(services, valid_service) &&
+             (services.size() != 2 || services[0].type != services[1].type);
+    }
+
     [[nodiscard]] std::unique_ptr<deinit_t> start();
+    /** @brief Publish the exact configured legacy/modern DNS-SD record set. */
+    [[nodiscard]] std::unique_ptr<deinit_t> start(std::vector<service_t> services);
   }
 
   /**

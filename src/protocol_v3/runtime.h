@@ -426,6 +426,22 @@ namespace lumen::protocol_v3::runtime {
     std::uint64_t pairing_permissions {0x17};  ///< Host-approved QR permission ceiling.
   };
 
+  /** @brief Strict `_lumen-v3._udp` TXT payload derived from a live host identity. */
+  struct DiscoveryAdvertisement {
+    std::string service_type;  ///< Exact DNS-SD service type (`_lumen-v3._udp`).
+    std::string version;  ///< Exact protocol major (`3`).
+    std::string host_id;  ///< 32 lowercase hexadecimal host-ID characters.
+    std::string port;  ///< Decimal QUIC UDP port.
+    std::string capabilities;  ///< 16 lowercase hexadecimal capability characters.
+  };
+
+  /** @brief Format and validate one protocol-v3 DNS-SD advertisement. */
+  std::optional<DiscoveryAdvertisement> make_discovery_advertisement(
+    const control::Identifier &host_id,
+    std::uint16_t port,
+    std::uint64_t capabilities
+  );
+
   /** @brief Owning production construction and lifecycle for protocol v3. */
   class ProtocolV3Service {
   public:
@@ -450,6 +466,8 @@ namespace lumen::protocol_v3::runtime {
     [[nodiscard]] bool running() const noexcept;
     /** @brief Return the last synchronous QUIC listener startup stage attempted. */
     [[nodiscard]] quic_server::StartupStage startup_stage() const noexcept;
+    /** @brief Return strict discovery TXT fields only while the listener is live. */
+    [[nodiscard]] std::optional<DiscoveryAdvertisement> discovery_advertisement() const;
 
     /** @brief Issue and persist one exact ULI3 QR invitation URI. */
     std::expected<std::string, std::uint8_t> issue_invitation(

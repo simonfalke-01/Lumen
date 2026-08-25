@@ -27,6 +27,7 @@
 #include "logging.h"
 #include "nvhttp.h"
 #include "platform/common.h"
+#include "protocol_v3/control_session.h"
 #include "rtsp.h"
 #include "utility.h"
 
@@ -1811,7 +1812,12 @@ namespace config {
     {
       int pairing_permissions = static_cast<int>(protocol_v3.pairing_permissions);
       int_between_f(vars, "protocol_v3_pairing_permissions", pairing_permissions, {1, 255});
-      protocol_v3.pairing_permissions = static_cast<std::uint64_t>(pairing_permissions) | 0x17U;
+      const auto requested_permissions = static_cast<std::uint64_t>(pairing_permissions);
+      if ((requested_permissions & ~lumen::protocol_v3::control_session::defined_permission_mask) != 0) {
+        BOOST_LOG(warning) << "Ignoring undefined protocol-v3 pairing permission bits 6/7"sv;
+      }
+      protocol_v3.pairing_permissions =
+        (requested_permissions & lumen::protocol_v3::control_session::defined_permission_mask) | 0x17U;
     }
 #if !LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
     if (protocol_v3.enabled) {

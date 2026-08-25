@@ -382,6 +382,29 @@ namespace lumen::protocol_v3::runtime {
     return entries_.size();
   }
 
+  std::optional<DiscoveryAdvertisement> make_discovery_advertisement(
+    const control::Identifier &host_id,
+    const std::uint16_t port,
+    const std::uint64_t capabilities
+  ) {
+    if (!nonzero(host_id) || port == 0 || capabilities == 0) {
+      return std::nullopt;
+    }
+    std::array<std::uint8_t, 8> capability_bytes {};
+    for (std::size_t index = 0; index < capability_bytes.size(); ++index) {
+      capability_bytes[index] = static_cast<std::uint8_t>(
+        capabilities >> ((capability_bytes.size() - index - 1) * 8U)
+      );
+    }
+    return DiscoveryAdvertisement {
+      .service_type = "_lumen-v3._udp",
+      .version = "3",
+      .host_id = encode_hex(host_id),
+      .port = std::to_string(port),
+      .capabilities = encode_hex(capability_bytes),
+    };
+  }
+
   struct PersistentAuthorizationStore::Impl {
     struct StoredClient {
       control::ClientRecord record;
@@ -444,6 +467,12 @@ namespace lumen::protocol_v3::runtime {
         std::map<control::Identifier, StoredClient> next_clients;
         std::map<control::Identifier, StoredInvitation> next_invitations;
         std::map<control::Identifier, ConsumedInvitation> next_consumed;
+        bool permissions_migrated = false;
+        const auto migrate_permissions = [&](const std::uint64_t permissions) {
+          const auto defined = permissions & control::defined_permission_mask;
+          permissions_migrated = permissions_migrated || defined != permissions;
+          return defined;
+        };
         const auto subtree = root.get_child_optional("protocol_v3");
         if (!subtree) {
           loaded = true;
@@ -468,7 +497,7 @@ namespace lumen::protocol_v3::runtime {
             }
             client.record.client_id = *client_id;
             client.record.public_key = *public_key;
-            client.record.permissions = node.get<std::uint64_t>("permissions");
+            client.record.permissions = migrate_permissions(node.get<std::uint64_t>("permissions"));
             client.record.generation = node.get<std::uint64_t>("generation");
             client.display_name = node.get<std::string>("display_name");
             client.enabled = node.get<bool>("enabled", true);
@@ -497,7 +526,7 @@ namespace lumen::protocol_v3::runtime {
             invitation.invitation_id = *invitation_id;
             invitation.token_sha256 = *token_hash;
             invitation.invitation_sha256 = *digest;
-            invitation.permissions = node.get<std::uint64_t>("permissions");
+            invitation.permissions = migrate_permissions(node.get<std::uint64_t>("permissions"));
             invitation.expires_at_unix_seconds = node.get<std::uint64_t>("expires_at_unix_seconds");
             if (!valid_stored_invitation(invitation, now)) {
               continue;
@@ -527,16 +556,24 @@ namespace lumen::protocol_v3::runtime {
             consumed.invitation.invitation_id = *invitation_id;
             consumed.invitation.token_sha256 = *token_hash;
             consumed.invitation.invitation_sha256 = *invitation_digest;
-            consumed.invitation.permissions = node.get<std::uint64_t>("invitation_permissions");
+            consumed.invitation.permissions = migrate_permissions(
+              node.get<std::uint64_t>("invitation_permissions")
+            );
             consumed.pair_attempt_id = *attempt;
             consumed.client_id = *client_id;
             consumed.client_public_key = *public_key;
             consumed.display_name = node.get<std::string>("display_name");
-            consumed.requested_permissions = node.get<std::uint64_t>("requested_permissions");
-            consumed.approved_permissions = node.get<std::uint64_t>("approved_permissions");
+            consumed.requested_permissions = migrate_permissions(
+              node.get<std::uint64_t>("requested_permissions")
+            );
+            consumed.approved_permissions = migrate_permissions(
+              node.get<std::uint64_t>("approved_permissions")
+            );
             consumed.outcome.client_id = consumed.client_id;
             consumed.outcome.public_key = consumed.client_public_key;
-            consumed.outcome.permissions = node.get<std::uint64_t>("outcome_permissions");
+            consumed.outcome.permissions = migrate_permissions(
+              node.get<std::uint64_t>("outcome_permissions")
+            );
             consumed.outcome.generation = node.get<std::uint64_t>("outcome_generation");
             consumed.expires_at_unix_seconds = node.get<std::uint64_t>("expires_at_unix_seconds");
             if (consumed.expires_at_unix_seconds <= now || !valid_consumed(consumed) ||
@@ -551,6 +588,9 @@ namespace lumen::protocol_v3::runtime {
         clients = std::move(next_clients);
         invitations = std::move(next_invitations);
         consumed = std::move(next_consumed);
+        if (permissions_migrated && !persist_state(clients, invitations, consumed, legacy_host_seed)) {
+          return false;
+        }
         loaded = true;
         return true;
       } catch (...) {
@@ -665,13 +705,19 @@ namespace lumen::protocol_v3::runtime {
       return nonzero(entry.invitation.invitation_id) && nonzero(entry.invitation.token_sha256) &&
              nonzero(entry.invitation.invitation_sha256) && nonzero(entry.pair_attempt_id) &&
              nonzero(entry.client_id) && nonzero(entry.client_public_key) &&
+             entry.invitation.permissions != 0 &&
+             (entry.invitation.permissions & ~control::defined_permission_mask) == 0 &&
              !entry.display_name.empty() && entry.requested_permissions != 0 &&
+             (entry.requested_permissions & ~control::defined_permission_mask) == 0 &&
              entry.approved_permissions != 0 &&
+             (entry.approved_permissions & ~control::defined_permission_mask) == 0 &&
              (entry.approved_permissions & ~entry.requested_permissions) == 0 &&
              (entry.approved_permissions & ~entry.invitation.permissions) == 0 &&
              entry.outcome.client_id == entry.client_id &&
              entry.outcome.public_key == entry.client_public_key &&
-             entry.outcome.permissions != 0 && entry.outcome.generation != 0;
+             entry.outcome.permissions != 0 &&
+             (entry.outcome.permissions & ~control::defined_permission_mask) == 0 &&
+             entry.outcome.generation != 0;
     }
 
     std::string state_file;
@@ -2384,7 +2430,7 @@ namespace lumen::protocol_v3::runtime {
                                     {4, control::cbor::Value {false}},
                                   });
           }
-          if (*action == 1 && (client.permissions & (1U << 5)) == 0) {
+          if (*action == 1 && (client.permissions & control::application_quit_permission) == 0) {
             return make_result({
               {1, static_cast<std::uint64_t>(Status::unauthorized)},
               {2, bytes(*session_id)},
@@ -3012,6 +3058,17 @@ namespace lumen::protocol_v3::runtime {
     return impl_->startup_stage;
   }
 
+  std::optional<DiscoveryAdvertisement> ProtocolV3Service::discovery_advertisement() const {
+    if (!running() || !impl_->identity || impl_->udp_port == 0) {
+      return std::nullopt;
+    }
+    return make_discovery_advertisement(
+      impl_->identity->host_id(),
+      impl_->udp_port,
+      control::Config {}.capabilities
+    );
+  }
+
   std::expected<std::string, std::uint8_t> ProtocolV3Service::issue_invitation(
     std::string hostname,
     const bool hostname_is_ip,
@@ -3147,7 +3204,8 @@ namespace lumen::protocol_v3::runtime {
     const control::Identifier &client_id,
     const std::uint64_t permissions
   ) {
-    if (permissions == 0 || (permissions & ~impl_->pairing_permissions) != 0 ||
+    if (permissions == 0 || (permissions & ~control::defined_permission_mask) != 0 ||
+        (permissions & ~impl_->pairing_permissions) != 0 ||
         !impl_->authorization || !impl_->authorization->set_client_permissions(client_id, permissions)) {
       return false;
     }

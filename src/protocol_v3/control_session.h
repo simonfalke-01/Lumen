@@ -140,7 +140,10 @@ namespace lumen::protocol_v3::control_session {
   inline constexpr std::uint64_t input_permission = 1U << 2;  ///< Send input.
   inline constexpr std::uint64_t microphone_permission = 1U << 3;  ///< Send microphone media.
   inline constexpr std::uint64_t stop_permission = 1U << 4;  ///< Stop an owned stream.
-  inline constexpr std::uint64_t defined_permission_mask = 0xff;  ///< All allocated permissions.
+  inline constexpr std::uint64_t application_quit_permission = 1U << 5;  ///< Quit the streamed application.
+  inline constexpr std::uint64_t defined_permission_mask =
+    browse_permission | start_permission | input_permission | microphone_permission |
+    stop_permission | application_quit_permission;  ///< All allocated permissions; bits 6/7 are undefined.
 
   /** @brief Cryptographically secure random-byte source. */
   class Random {
@@ -345,6 +348,15 @@ namespace lumen::protocol_v3::control_session {
     std::shared_ptr<ResponseCacheCoordinator> response_cache {
       std::make_shared<ResponseCacheCoordinator>(resource_budget)
     };  ///< Shared by every connection created from one factory.
+    std::chrono::milliseconds server_hello_timeout {2'000};  ///< CLIENT_HELLO-to-SERVER_HELLO bound.
+    std::chrono::milliseconds authorization_request_timeout {3'000};  ///< SERVER_HELLO-to-pair/auth bound.
+    std::chrono::milliseconds signed_response_timeout {2'000};  ///< Pair/auth signed-response bound.
+    std::chrono::milliseconds start_response_timeout {10'000};  ///< START terminal-response bound.
+    std::chrono::milliseconds attach_response_timeout {3'000};  ///< ATTACH response bound.
+    std::chrono::milliseconds configuration_ack_timeout {3'000};  ///< Host-config acknowledgement bound.
+    std::chrono::milliseconds stop_response_timeout {2'000};  ///< STOP response bound.
+    std::chrono::milliseconds teardown_timeout {5'000};  ///< Complete session teardown bound.
+    std::chrono::milliseconds authenticated_idle_timeout {120'000};  ///< Nonzero authenticated idle bound.
   };
 
   /** @brief Concrete authenticated protocol-v3 control session. */
@@ -366,6 +378,10 @@ namespace lumen::protocol_v3::control_session {
     std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> control(
       const quic_server::ControlFrame &frame
     ) override;
+    quic_server::MonotonicClock::time_point begin_control(
+      const quic_server::ControlFrame &frame
+    ) noexcept override;
+    quic_server::MonotonicClock::time_point application_deadline() const noexcept override;
     void datagram(const quic_server::DatagramRecord &record) override;
     std::optional<Identifier> active_session_id() const noexcept override;
     bool authenticated() const noexcept override;

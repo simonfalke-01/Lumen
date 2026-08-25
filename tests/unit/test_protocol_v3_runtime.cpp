@@ -987,6 +987,74 @@ TEST(ProtocolV3Identity, InsecureExistingBlobIsRejectedWithoutAclWeakening) {
   EXPECT_FALSE(files->secure.contains(paths.identity.string()));
 }
 
+TEST(ProtocolV3Runtime, DiscoveryAdvertisementUsesStrictVersionThreeTxtEncoding) {
+  control::Identifier host_id {};
+  std::iota(host_id.begin(), host_id.end(), 0);
+
+  const auto advertisement = runtime::make_discovery_advertisement(host_id, 48030, 0x37f);
+  ASSERT_TRUE(advertisement.has_value());
+  EXPECT_EQ(advertisement->service_type, "_lumen-v3._udp");
+  EXPECT_EQ(advertisement->version, "3");
+  EXPECT_EQ(advertisement->host_id, "000102030405060708090a0b0c0d0e0f");
+  EXPECT_EQ(advertisement->port, "48030");
+  EXPECT_EQ(advertisement->capabilities, "000000000000037f");
+
+  control::Identifier zero_id {};
+  EXPECT_FALSE(runtime::make_discovery_advertisement(zero_id, 48030, 0x37f));
+  EXPECT_FALSE(runtime::make_discovery_advertisement(host_id, 0, 0x37f));
+  EXPECT_FALSE(runtime::make_discovery_advertisement(host_id, 48030, 0));
+}
+
+TEST(ProtocolV3Runtime, UndefinedPersistedPermissionBitsAreRemovedAndCommitted) {
+  control::SecureRandom random;
+  std::array<std::uint8_t, 16> suffix {};
+  ASSERT_TRUE(random.fill(suffix));
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("lumen-v3-permission-migration-" + hex(suffix));
+  const auto state_file = directory / "lumen-state.json";
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  const auto cleanup = std::unique_ptr<void, std::function<void(void *)>> {
+    reinterpret_cast<void *>(1),
+    [&](void *) {
+      std::error_code ignored;
+      std::filesystem::remove_all(directory, ignored);
+    },
+  };
+  std::ofstream(state_file)
+    << R"JSON({
+  "protocol_v3": {
+    "host_identity_seed": "0101010101010101010101010101010101010101010101010101010101010101",
+    "clients": [
+      {
+        "client_id": "02020202020202020202020202020202",
+        "public_key": "0303030303030303030303030303030303030303030303030303030303030303",
+        "permissions": 255,
+        "generation": 1,
+        "display_name": "Migrated client",
+        "enabled": true
+      }
+    ],
+    "invitations": [],
+    "consumed_invitations": []
+  }
+})JSON";
+
+  control::Identifier client_id {};
+  client_id.fill(0x02);
+  {
+    runtime::PersistentAuthorizationStore store {state_file.string(), true};
+    ASSERT_TRUE(store.ready());
+    const auto client = store.paired_client(client_id);
+    ASSERT_TRUE(client.has_value());
+    EXPECT_EQ(client->permissions, control::defined_permission_mask);
+  }
+  runtime::PersistentAuthorizationStore reopened {state_file.string(), true};
+  ASSERT_TRUE(reopened.ready());
+  const auto client = reopened.paired_client(client_id);
+  ASSERT_TRUE(client.has_value());
+  EXPECT_EQ(client->permissions, control::defined_permission_mask);
+}
+
 TEST(ProtocolV3Runtime, AttachIntentCacheReturnsExactCommittedOutcomeBeforeExpiry) {
   control::SecureRandom random;
   control::Identifier intent {};

@@ -379,6 +379,13 @@ namespace lumen::protocol_v3::control_session {
       }
     }
 
+    [[noreturn]] void close_with(
+      const quic_server::ApplicationCloseCode code,
+      const std::string_view message
+    ) {
+      throw quic_server::ApplicationCloseError {code, std::string {message}};
+    }
+
     template<std::size_t Size>
     bool nonzero(const std::array<std::uint8_t, Size> &value) noexcept {
       return std::ranges::any_of(value, [](const auto byte) { return byte != 0; });
@@ -467,11 +474,11 @@ namespace lumen::protocol_v3::control_session {
     Map decode_map(const quic_server::ControlFrame &frame) {
       const auto decoded = cbor::decode(frame.bytes.subspan(quic_server::control_header_bytes));
       if (!decoded) {
-        throw std::runtime_error {"v3 control CBOR"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "v3 control CBOR");
       }
       const auto *map = std::get_if<Map>(&decoded.value->storage);
       if (!map) {
-        throw std::runtime_error {"v3 control map"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "v3 control map");
       }
       return *map;
     }
@@ -632,8 +639,93 @@ namespace lumen::protocol_v3::control_session {
         backend {session_backend},
         datagram_maximum {connection.maximum_datagram_bytes} {
       spki = connection.leaf_spki_sha256;
-      if (!config.response_cache || !nonzero(spki) || identity.host_id() != derived_id(identity.public_key())) {
+      phase_deadline = connection.connected_at + config.server_hello_timeout;
+      if (!config.response_cache || !nonzero(spki) || identity.host_id() != derived_id(identity.public_key()) ||
+          config.server_hello_timeout != std::chrono::seconds {2} ||
+          config.authorization_request_timeout != std::chrono::seconds {3} ||
+          config.signed_response_timeout != std::chrono::seconds {2} ||
+          config.start_response_timeout != std::chrono::seconds {10} ||
+          config.attach_response_timeout != std::chrono::seconds {3} ||
+          config.configuration_ack_timeout != std::chrono::seconds {3} ||
+          config.stop_response_timeout != std::chrono::seconds {2} ||
+          config.teardown_timeout != std::chrono::seconds {5} ||
+          config.authenticated_idle_timeout != std::chrono::seconds {120}) {
         throw std::invalid_argument {"invalid v3 host identity"};
+      }
+    }
+
+    quic_server::MonotonicClock::time_point begin_control(
+      const quic_server::ControlFrame &frame
+    ) noexcept {
+      const auto now = quic_server::MonotonicClock::now();
+      const bool begins_expected_phase =
+        (state == State::hello && frame.message_type == 0x0001) ||
+        (state == State::authorization && (frame.message_type == 0x0003 || frame.message_type == 0x0010));
+      if (begins_expected_phase && phase_deadline != quic_server::MonotonicClock::time_point {} &&
+          now <= phase_deadline) {
+        phase_deadline = {};
+      }
+      if ((frame.flags & 1U) != 0) {
+        if (const auto outstanding = outstanding_host_requests.find(frame.request_id);
+            outstanding != outstanding_host_requests.end()) {
+          operation_deadline = outstanding->second.deadline;
+          return application_deadline();
+        }
+      }
+      const auto timeout = [&]() {
+        switch (frame.message_type) {
+          case 0x0001:
+            return config.server_hello_timeout;
+          case 0x0003:
+          case 0x0010:
+            return config.signed_response_timeout;
+          case 0x0100:
+            return config.start_response_timeout;
+          case 0x0102:
+            return config.attach_response_timeout;
+          case 0x0130:
+            return config.stop_response_timeout;
+          default:
+            return config.authenticated_idle_timeout;
+        }
+      }();
+      operation_deadline = now + timeout;
+      return application_deadline();
+    }
+
+    quic_server::MonotonicClock::time_point application_deadline() const noexcept {
+      auto deadline = quic_server::MonotonicClock::time_point::max();
+      const auto include = [&](const quic_server::MonotonicClock::time_point candidate) {
+        if (candidate != quic_server::MonotonicClock::time_point {}) {
+          deadline = std::min(deadline, candidate);
+        }
+      };
+      include(phase_deadline);
+      include(operation_deadline);
+      include(authenticated_idle_deadline);
+      for (const auto &[_, request] : outstanding_host_requests) {
+        include(request.deadline);
+      }
+      return deadline;
+    }
+
+    void finish_control() {
+      const auto now = quic_server::MonotonicClock::now();
+      if (operation_deadline != quic_server::MonotonicClock::time_point {} && now > operation_deadline) {
+        operation_deadline = {};
+        close_with(quic_server::ApplicationCloseCode::phase_timeout, "v3 response deadline expired");
+      }
+      operation_deadline = {};
+      if (state == State::ready || state == State::streaming) {
+        phase_deadline = {};
+        authenticated_idle_deadline = now + config.authenticated_idle_timeout;
+      }
+    }
+
+    void record_authenticated_activity() noexcept {
+      if (state == State::ready || state == State::streaming) {
+        authenticated_idle_deadline =
+          quic_server::MonotonicClock::now() + config.authenticated_idle_timeout;
       }
     }
 
@@ -651,14 +743,18 @@ namespace lumen::protocol_v3::control_session {
     std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> process(
       const quic_server::ControlFrame &frame
     ) {
+      if (phase_deadline != quic_server::MonotonicClock::time_point {} &&
+          quic_server::MonotonicClock::now() > phase_deadline) {
+        close_with(quic_server::ApplicationCloseCode::phase_timeout, "v3 request phase expired");
+      }
       if (state == State::closed || frame.request_id == 0) {
-        throw std::runtime_error {"invalid v3 request"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 request");
       }
       if ((frame.flags & 1U) != 0) {
         return configuration_acknowledgement(frame);
       }
       if (frame.flags != 0 || frame.request_id % 2 == 0) {
-        throw std::runtime_error {"invalid v3 client request authority"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 client request authority");
       }
       auto admission = config.response_cache->reserve(
         connection.connection_id,
@@ -686,7 +782,7 @@ namespace lumen::protocol_v3::control_session {
       auto reservation = std::move(*admission.reservation);
       const auto expected = last_request_id == 0 ? 1 : last_request_id + 2;
       if (frame.request_id != expected || frame.request_id < last_request_id) {
-        throw std::runtime_error {"v3 request sequence"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "v3 request sequence");
       }
       last_request_id = frame.request_id;
       const auto fields = decode_map(frame);
@@ -717,7 +813,7 @@ namespace lumen::protocol_v3::control_session {
             }
             break;
           case State::closed:
-            throw std::runtime_error {"unsupported v3 request state"};
+            close_with(quic_server::ApplicationCloseCode::malformed, "unsupported v3 request state");
         }
         if (output.empty() || !output.front() ||
             !config.response_cache->commit(
@@ -738,9 +834,11 @@ namespace lumen::protocol_v3::control_session {
       const quic_server::ControlFrame &frame,
       const Map &fields
     ) {
-      if (frame.message_type != 0x0001 || !exact_keys(fields, 1, 8) ||
-          unsigned_field(fields, 1) != 3 || unsigned_field(fields, 2) != 3) {
-        throw std::runtime_error {"invalid v3 CLIENT_HELLO"};
+      if (frame.message_type != 0x0001 || !exact_keys(fields, 1, 8)) {
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 CLIENT_HELLO");
+      }
+      if (unsigned_field(fields, 1) != 3 || unsigned_field(fields, 2) != 3) {
+        close_with(quic_server::ApplicationCloseCode::version_or_alpn, "unsupported v3 version");
       }
       const auto nonce = fixed_field<32>(fields, 3);
       const auto capabilities = unsigned_field(fields, 4);
@@ -751,14 +849,15 @@ namespace lumen::protocol_v3::control_session {
       if (!nonce || !nonzero(*nonce) || !capabilities || (*capabilities & ~config.capabilities) != 0 ||
           !profiles || !valid_profile_array(*profiles) || !attempt || !nonzero(*attempt) ||
           (client.has_value() == invitation.has_value()) ||
-          (!client && !is_null(fields, 6)) || (!invitation && !is_null(fields, 7)) ||
-          !pairing_admission.admit_hello(
-            connection.remote_source,
-            *attempt,
-            quic_server::MonotonicClock::now()
-          ) ||
-          !nonces.claim(connection.remote_source, *attempt, *nonce, quic_server::MonotonicClock::now())) {
-        throw std::runtime_error {"invalid or replayed v3 CLIENT_HELLO"};
+          (!client && !is_null(fields, 6)) || (!invitation && !is_null(fields, 7))) {
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 CLIENT_HELLO fields");
+      }
+      const auto now = quic_server::MonotonicClock::now();
+      if (!pairing_admission.admit_hello(connection.remote_source, *attempt, now)) {
+        close_with(quic_server::ApplicationCloseCode::abuse_limit, "v3 CLIENT_HELLO admission limit");
+      }
+      if (!nonces.claim(connection.remote_source, *attempt, *nonce, now)) {
+        close_with(quic_server::ApplicationCloseCode::authentication_failed, "replayed v3 CLIENT_HELLO");
       }
       if (!random.fill(server_nonce) || !nonzero(server_nonce)) {
         throw std::runtime_error {"v3 server nonce"};
@@ -781,6 +880,8 @@ namespace lumen::protocol_v3::control_session {
       auto encoded = response(frame, 0x0002, response_fields);
       server_hello = *encoded;
       state = State::authorization;
+      phase_deadline =
+        quic_server::MonotonicClock::now() + config.authorization_request_timeout;
       return encoded;
     }
 
@@ -789,7 +890,7 @@ namespace lumen::protocol_v3::control_session {
       const Map &fields
     ) {
       if (frame.message_type != 0x0010 || !exact_keys(fields, 1, 9)) {
-        throw std::runtime_error {"invalid v3 PAIR_REQUEST"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 PAIR_REQUEST");
       }
       const auto id = fixed_field<16>(fields, 1);
       const auto token = fixed_field<32>(fields, 2);
@@ -800,15 +901,20 @@ namespace lumen::protocol_v3::control_session {
       const auto *name = text_field(fields, 7);
       const auto permissions = unsigned_field(fields, 8);
       const auto signature = fixed_field<64>(fields, 9);
-      if (!id || id != invitation_id || !token || !nonzero(*token) || !attempt || *attempt != attempt_id ||
-          !pairing_admission.admit(connection.remote_source, *id, quic_server::MonotonicClock::now())) {
-        throw std::runtime_error {"v3 pairing admission rejected"};
+      if (!id || !token || !nonzero(*token) || !attempt) {
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 PAIR_REQUEST fields");
+      }
+      if (id != invitation_id || *attempt != attempt_id) {
+        close_with(quic_server::ApplicationCloseCode::authentication_failed, "v3 pairing authority mismatch");
+      }
+      if (!pairing_admission.admit(connection.remote_source, *id, quic_server::MonotonicClock::now())) {
+        close_with(quic_server::ApplicationCloseCode::abuse_limit, "v3 pairing admission limit");
       }
       if (!invitation_hash || !nonzero(*invitation_hash) || !client_id ||
           !client_public || derived_id(*client_public) != *client_id || !name || name->empty() ||
           name->size() > 64 || !cbor::is_valid_utf8(*name) || !permissions ||
           (*permissions & ~defined_permission_mask) != 0 || !signature) {
-        throw std::runtime_error {"invalid v3 pairing fields"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 pairing fields");
       }
       const auto unsigned_request = encode_frame(
         frame.message_type,
@@ -822,7 +928,7 @@ namespace lumen::protocol_v3::control_session {
         {client_hello, server_hello, unsigned_request}
       );
       if (!crypto::ed25519_verify(*client_public, client_transcript, *signature)) {
-        throw std::runtime_error {"invalid v3 client pairing signature"};
+        close_with(quic_server::ApplicationCloseCode::authentication_failed, "invalid v3 client pairing signature");
       }
       PairingClaim claim {
         .invitation_id = *id,
@@ -839,12 +945,12 @@ namespace lumen::protocol_v3::control_session {
       if (!stored || stored->client_id != *client_id || stored->public_key != *client_public ||
           stored->permissions == 0 || (stored->permissions & ~claim.approved_permissions) != 0 ||
           stored->generation == 0) {
-        throw std::runtime_error {"v3 invitation rejected"};
+        close_with(quic_server::ApplicationCloseCode::authentication_failed, "v3 invitation rejected");
       }
       client_record = *stored;
       const auto authority = authorities.claim(stored->client_id, connection.connection_id, true);
       if (!authority) {
-        throw std::runtime_error {"v3 connection authority rejected"};
+        close_with(quic_server::ApplicationCloseCode::unauthorized, "v3 connection authority rejected");
       }
       authority_generation = authority->generation;
       if (authority->replaced_connection_id) {
@@ -880,7 +986,7 @@ namespace lumen::protocol_v3::control_session {
       const Map &fields
     ) {
       if (frame.message_type != 0x0003 || !exact_keys(fields, 1, 4)) {
-        throw std::runtime_error {"invalid v3 CLIENT_AUTH"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 CLIENT_AUTH");
       }
       const auto client_id = fixed_field<16>(fields, 1);
       const auto attempt = fixed_field<16>(fields, 2);
@@ -888,13 +994,13 @@ namespace lumen::protocol_v3::control_session {
       const auto signature = fixed_field<64>(fields, 4);
       if (!client_id || client_id != claimed_client_id || !attempt || *attempt != attempt_id ||
           !replace || !signature) {
-        throw std::runtime_error {"invalid v3 auth fields"};
+        close_with(quic_server::ApplicationCloseCode::authentication_failed, "invalid v3 auth fields");
       }
       const auto record = authorization.paired_client(*client_id);
       if (!record || record->client_id != *client_id || derived_id(record->public_key) != *client_id ||
           record->permissions == 0 || (record->permissions & ~defined_permission_mask) != 0 ||
           record->generation == 0) {
-        throw std::runtime_error {"unknown v3 client"};
+        close_with(quic_server::ApplicationCloseCode::authentication_failed, "unknown v3 client");
       }
       const auto unsigned_request = encode_frame(
         frame.message_type,
@@ -908,12 +1014,12 @@ namespace lumen::protocol_v3::control_session {
         {client_hello, server_hello, unsigned_request}
       );
       if (!crypto::ed25519_verify(record->public_key, client_transcript, *signature)) {
-        throw std::runtime_error {"invalid v3 client auth signature"};
+        close_with(quic_server::ApplicationCloseCode::authentication_failed, "invalid v3 client auth signature");
       }
       client_record = *record;
       const auto authority = authorities.claim(record->client_id, connection.connection_id, *replace);
       if (!authority) {
-        throw std::runtime_error {"v3 connection replacement rejected"};
+        close_with(quic_server::ApplicationCloseCode::unauthorized, "v3 connection replacement rejected");
       }
       authority_generation = authority->generation;
       if (authority->replaced_connection_id) {
@@ -947,18 +1053,19 @@ namespace lumen::protocol_v3::control_session {
       const quic_server::ControlFrame &frame,
       const Map &fields
     ) {
-      if (frame.message_type != 0x0100 || !client_record ||
-          (client_record->permissions & start_permission) == 0 ||
-          !valid_start_request(fields, datagram_maximum)) {
-        throw std::runtime_error {"invalid or unauthorized v3 START"};
+      if (frame.message_type != 0x0100 || !valid_start_request(fields, datagram_maximum)) {
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 START");
+      }
+      if (!client_record || (client_record->permissions & start_permission) == 0) {
+        close_with(quic_server::ApplicationCloseCode::unauthorized, "unauthorized v3 START");
       }
       const auto request_intent = fixed_field<16>(fields, 1);
       if (!request_intent) {
-        throw std::runtime_error {"missing v3 START intent"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "missing v3 START intent");
       }
       auto authority_lease = current_authority_lease();
       if (!authority_lease) {
-        throw std::runtime_error {"stale v3 START authority"};
+        close_with(quic_server::ApplicationCloseCode::unauthorized, "stale v3 START authority");
       }
       auto result = backend.start(
         *client_record,
@@ -979,11 +1086,13 @@ namespace lumen::protocol_v3::control_session {
         }
         return {response(frame, 0x0101, std::move(failed))};
       }
+      if (outstanding_host_requests.size() + result->host_requests.size() > 32) {
+        close_with(quic_server::ApplicationCloseCode::resource_limit, "v3 host request limit");
+      }
       if (!nonzero(result->session_id) || !exact_keys(result->response_fields, 2, 23) ||
           (!result->replay_requires_attach &&
            (result->host_requests.size() < 2 || result->host_requests.size() > 3)) ||
-          (result->replay_requires_attach && !result->host_requests.empty()) ||
-          outstanding_host_requests.size() + result->host_requests.size() > 32) {
+          (result->replay_requires_attach && !result->host_requests.empty())) {
         throw std::runtime_error {"v3 START failed"};
       }
       const auto response_session = fixed_field<16>(result->response_fields, 3);
@@ -1009,7 +1118,7 @@ namespace lumen::protocol_v3::control_session {
         state = State::ready;
         return output;
       }
-      const auto deadline = quic_server::MonotonicClock::now() + std::chrono::seconds {3};
+      const auto deadline = quic_server::MonotonicClock::now() + config.configuration_ack_timeout;
       for (auto &request : result->host_requests) {
         if ((request.message_type != 0x0140 && request.message_type != 0x0142 && request.message_type != 0x0144) ||
             (request.message_type == 0x0144 && (client_record->permissions & microphone_permission) == 0) ||
@@ -1048,20 +1157,22 @@ namespace lumen::protocol_v3::control_session {
     ) {
       if (state != State::streaming || !client_record || !session_id ||
           frame.request_id % 2 != 0 || (frame.flags != 1 && frame.flags != 3)) {
-        throw std::runtime_error {"invalid v3 configuration acknowledgement authority"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "invalid v3 configuration acknowledgement authority");
       }
       if (const auto completed = completed_host_acknowledgements.find(frame.request_id);
           completed != completed_host_acknowledgements.end()) {
         if (!std::ranges::equal(completed->second, frame.bytes)) {
-          throw std::runtime_error {"v3 configuration acknowledgement conflict"};
+          close_with(quic_server::ApplicationCloseCode::request_id_conflict, "v3 configuration acknowledgement conflict");
         }
         return {};
       }
       const auto outstanding = outstanding_host_requests.find(frame.request_id);
       if (outstanding == outstanding_host_requests.end() ||
-          outstanding->second.acknowledgement_type != frame.message_type ||
-          quic_server::MonotonicClock::now() > outstanding->second.deadline) {
-        throw std::runtime_error {"unknown or expired v3 configuration acknowledgement"};
+          outstanding->second.acknowledgement_type != frame.message_type) {
+        close_with(quic_server::ApplicationCloseCode::malformed, "unknown v3 configuration acknowledgement");
+      }
+      if (quic_server::MonotonicClock::now() > outstanding->second.deadline) {
+        close_with(quic_server::ApplicationCloseCode::phase_timeout, "expired v3 configuration acknowledgement");
       }
       const auto fields = decode_map(frame);
       const auto status = unsigned_field(fields, 1);
@@ -1074,14 +1185,14 @@ namespace lumen::protocol_v3::control_session {
           *acknowledged_session != outstanding->second.session_id || !generation ||
           *generation != outstanding->second.generation ||
           (video && (!decoder_capacity || (*decoder_capacity != 1 && *decoder_capacity != 2)))) {
-        throw std::runtime_error {"rejected or malformed v3 configuration acknowledgement"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "rejected or malformed v3 configuration acknowledgement");
       }
       const auto acknowledgement = frame.message_type == 0x0141 ? ConfigurationAcknowledgement::video :
                                    frame.message_type == 0x0143 ? ConfigurationAcknowledgement::audio :
                                                                   ConfigurationAcknowledgement::microphone;
       auto authority_lease = current_authority_lease();
       if (!authority_lease) {
-        throw std::runtime_error {"stale v3 configuration acknowledgement authority"};
+        close_with(quic_server::ApplicationCloseCode::unauthorized, "stale v3 configuration acknowledgement authority");
       }
       if (!backend.acknowledge_configuration(
             *client_record,
@@ -1093,7 +1204,7 @@ namespace lumen::protocol_v3::control_session {
         throw std::runtime_error {"v3 configuration backend rejected acknowledgement"};
       }
       if (completed_host_acknowledgements.size() >= 32) {
-        throw std::runtime_error {"v3 configuration acknowledgement cache"};
+        close_with(quic_server::ApplicationCloseCode::resource_limit, "v3 configuration acknowledgement cache");
       }
       completed_host_acknowledgements.emplace(
         frame.request_id,
@@ -1114,7 +1225,7 @@ namespace lumen::protocol_v3::control_session {
       const Map &fields
     ) {
       if (!client_record) {
-        throw std::runtime_error {"stale v3 control authority"};
+        close_with(quic_server::ApplicationCloseCode::unauthorized, "stale v3 control authority");
       }
       const auto operation = [&]() -> std::optional<AuthenticatedControl> {
         switch (frame.message_type) {
@@ -1129,7 +1240,7 @@ namespace lumen::protocol_v3::control_session {
         }
       }();
       if (!operation) {
-        throw std::runtime_error {"unsupported v3 control operation"};
+        close_with(quic_server::ApplicationCloseCode::malformed, "unsupported v3 control operation");
       }
       const auto required_permission = [&]() -> std::uint64_t {
         switch (*operation) {
@@ -1148,11 +1259,11 @@ namespace lumen::protocol_v3::control_session {
         return UINT64_MAX;
       }();
       if (required_permission != 0 && (client_record->permissions & required_permission) == 0) {
-        throw std::runtime_error {"forbidden v3 control operation"};
+        close_with(quic_server::ApplicationCloseCode::unauthorized, "forbidden v3 control operation");
       }
       auto authority_lease = current_authority_lease();
       if (!authority_lease) {
-        throw std::runtime_error {"stale v3 control authority"};
+        close_with(quic_server::ApplicationCloseCode::unauthorized, "stale v3 control authority");
       }
       auto result = backend.control(
         *client_record,
@@ -1273,6 +1384,9 @@ namespace lumen::protocol_v3::control_session {
     std::uint64_t last_request_id {};
     std::uint64_t next_host_request_id {2};
     bool media_started {};
+    quic_server::MonotonicClock::time_point phase_deadline {};
+    quic_server::MonotonicClock::time_point operation_deadline {};
+    quic_server::MonotonicClock::time_point authenticated_idle_deadline {};
     std::vector<std::uint8_t> client_hello;
     std::vector<std::uint8_t> server_hello;
     std::map<std::uint64_t, OutstandingHostRequest> outstanding_host_requests;
@@ -1313,25 +1427,54 @@ namespace lumen::protocol_v3::control_session {
   std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> ControlSession::control(
     const quic_server::ControlFrame &frame
   ) {
-    return impl_->process(frame);
+    if (impl_->operation_deadline == quic_server::MonotonicClock::time_point {}) {
+      static_cast<void>(impl_->begin_control(frame));
+    }
+    try {
+      auto responses = impl_->process(frame);
+      impl_->finish_control();
+      return responses;
+    } catch (const ResponseCacheError &error) {
+      impl_->operation_deadline = {};
+      close_with(
+        error.kind() == ResponseCacheError::Kind::request_id_conflict ?
+          quic_server::ApplicationCloseCode::request_id_conflict :
+          quic_server::ApplicationCloseCode::resource_limit,
+        error.what()
+      );
+    } catch (...) {
+      impl_->operation_deadline = {};
+      throw;
+    }
+  }
+
+  quic_server::MonotonicClock::time_point ControlSession::begin_control(
+    const quic_server::ControlFrame &frame
+  ) noexcept {
+    return impl_->begin_control(frame);
+  }
+
+  quic_server::MonotonicClock::time_point ControlSession::application_deadline() const noexcept {
+    return impl_->application_deadline();
   }
 
   void ControlSession::datagram(const quic_server::DatagramRecord &record) {
     if (!impl_->client_record || !impl_->session_id || record.session_id != *impl_->session_id) {
-      throw std::runtime_error {"unauthorized v3 DATAGRAM"};
+      close_with(quic_server::ApplicationCloseCode::unauthorized, "unauthorized v3 DATAGRAM");
     }
     const bool permitted =
       (record.channel == 1 && (impl_->client_record->permissions & input_permission) != 0) ||
       (record.channel == 2 && record.kind == 3) ||
       (record.channel == 4 && (impl_->client_record->permissions & microphone_permission) != 0);
     if (!permitted) {
-      throw std::runtime_error {"forbidden v3 DATAGRAM channel"};
+      close_with(quic_server::ApplicationCloseCode::unauthorized, "forbidden v3 DATAGRAM channel");
     }
     auto authority_lease = impl_->current_authority_lease();
     if (!authority_lease) {
-      throw std::runtime_error {"unauthorized v3 DATAGRAM"};
+      close_with(quic_server::ApplicationCloseCode::unauthorized, "unauthorized v3 DATAGRAM");
     }
     impl_->backend.datagram(*impl_->client_record, record);
+    impl_->record_authenticated_activity();
   }
 
   std::optional<Identifier> ControlSession::active_session_id() const noexcept {
@@ -1349,18 +1492,11 @@ namespace lumen::protocol_v3::control_session {
   }
 
   std::uint64_t ControlSession::idle_timeout_ms() const noexcept {
-    if (!impl_->current_authority()) {
-      return 5'000;
-    }
-    if (impl_->outstanding_host_requests.empty()) {
-      return 0;
-    }
-    const auto deadline = std::ranges::min_element(
-      impl_->outstanding_host_requests,
-      {},
-      [](const auto &entry) { return entry.second.deadline; }
-    )->second.deadline;
+    const auto deadline = impl_->application_deadline();
     const auto now = quic_server::MonotonicClock::now();
+    if (deadline == quic_server::MonotonicClock::time_point::max()) {
+      return static_cast<std::uint64_t>(impl_->config.authenticated_idle_timeout.count());
+    }
     if (deadline <= now) {
       return 1;
     }
@@ -1391,6 +1527,8 @@ namespace lumen::protocol_v3::control_session {
     impl_->client_record = client;
     impl_->authority_generation = claim->generation;
     impl_->state = Impl::State::ready;
+    impl_->phase_deadline = {};
+    impl_->record_authenticated_activity();
     return true;
   }
 #endif

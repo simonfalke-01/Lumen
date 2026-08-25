@@ -11,6 +11,13 @@
 #include <WinDNS.h>
 #include <winerror.h>
 
+// standard includes
+#include <algorithm>
+#include <array>
+#include <string>
+#include <utility>
+#include <vector>
+
 // local includes
 #include "misc.h"
 #include "src/config.h"
@@ -56,7 +63,6 @@ extern "C" {
 #endif
 
   constexpr auto SERVICE_DOMAIN = "local";  ///< Protocol or platform constant for service domain.
-  const auto SERVICE_TYPE_DOMAIN = std::format("{}.{}"sv, platf::SERVICE_TYPE, SERVICE_DOMAIN);  ///< Protocol or platform constant for service type domain.
 
 #ifndef __MINGW32__
   /**
@@ -148,10 +154,16 @@ namespace platf::publish {
     alarm->ring(pInstance);
   }
 
-  static int service(bool enable, PDNS_SERVICE_INSTANCE &existing_instance) {
+  static int service(
+    const bool enable,
+    PDNS_SERVICE_INSTANCE &existing_instance,
+    const service_t &descriptor
+  ) {
     auto alarm = safe::make_alarm<PDNS_SERVICE_INSTANCE>();
 
-    std::wstring domain = utf_utils::from_utf8(SERVICE_TYPE_DOMAIN);
+    std::wstring domain = utf_utils::from_utf8(
+      std::format("{}.{}"sv, descriptor.type, SERVICE_DOMAIN)
+    );
 
     auto hostname = platf::get_host_name();
     auto name = utf_utils::from_utf8(net::mdns_instance_name(hostname) + '.') + domain;
@@ -159,7 +171,7 @@ namespace platf::publish {
 
     DNS_SERVICE_INSTANCE instance {};
     instance.pszInstanceName = name.data();
-    instance.wPort = net::map_port(nvhttp::PORT_HTTP);
+    instance.wPort = descriptor.port;
     instance.pszHostName = host.data();
 
     // Setting these values ensures Windows mDNS answers comply with RFC 1035.
@@ -171,11 +183,30 @@ namespace platf::publish {
     // Most clients aren't strictly checking TXT record compliance with RFC 1035,
     // but Apple's mDNS resolver does and rejects the entire answer if an invalid
     // TXT record is present.
-    PWCHAR keys[] = {nullptr};
-    PWCHAR values[] = {nullptr};
-    instance.dwPropertyCount = 1;
-    instance.keys = keys;
-    instance.values = values;
+    std::vector<std::wstring> key_storage;
+    std::vector<std::wstring> value_storage;
+    key_storage.reserve(descriptor.txt.size());
+    value_storage.reserve(descriptor.txt.size());
+    for (const auto &[key, value] : descriptor.txt) {
+      key_storage.push_back(utf_utils::from_utf8(key));
+      value_storage.push_back(utf_utils::from_utf8(value));
+    }
+    std::vector<PWCHAR> keys;
+    std::vector<PWCHAR> values;
+    if (descriptor.txt.empty()) {
+      keys.push_back(nullptr);
+      values.push_back(nullptr);
+    } else {
+      keys.reserve(key_storage.size());
+      values.reserve(value_storage.size());
+      for (std::size_t index = 0; index < key_storage.size(); ++index) {
+        keys.push_back(key_storage[index].data());
+        values.push_back(value_storage[index].data());
+      }
+    }
+    instance.dwPropertyCount = static_cast<DWORD>(keys.size());
+    instance.keys = keys.data();
+    instance.values = values.data();
 
     DNS_SERVICE_REGISTER_REQUEST req {};
     req.Version = DNS_QUERY_REQUEST_VERSION1;
@@ -219,9 +250,10 @@ namespace platf::publish {
    */
   class mdns_registration_t: public ::platf::deinit_t {
   public:
-    mdns_registration_t():
+    explicit mdns_registration_t(service_t descriptor):
+        descriptor_ {std::move(descriptor)},
         existing_instance(nullptr) {
-      if (service(true, existing_instance)) {
+      if (service(true, existing_instance, descriptor_)) {
         BOOST_LOG(error) << "Unable to register Lumen mDNS service"sv;
         return;
       }
@@ -231,7 +263,7 @@ namespace platf::publish {
 
     ~mdns_registration_t() override {
       if (existing_instance) {
-        if (service(false, existing_instance)) {
+        if (service(false, existing_instance, descriptor_)) {
           BOOST_LOG(error) << "Unable to unregister Lumen mDNS service"sv;
           return;
         }
@@ -240,8 +272,38 @@ namespace platf::publish {
       }
     }
 
+    [[nodiscard]] bool registered() const noexcept {
+      return existing_instance != nullptr;
+    }
+
   private:
+    service_t descriptor_;
     PDNS_SERVICE_INSTANCE existing_instance;
+  };
+
+  /** @brief Joint lifetime for the configured legacy and protocol-v3 registrations. */
+  class mdns_registrations_t: public ::platf::deinit_t {
+  public:
+    explicit mdns_registrations_t(std::vector<service_t> services) {
+      registrations_.reserve(services.size());
+      for (auto &descriptor : services) {
+        auto registration = std::make_unique<mdns_registration_t>(std::move(descriptor));
+        if (!registration->registered()) {
+          registrations_.clear();
+          return;
+        }
+        registrations_.push_back(std::move(registration));
+      }
+      ready_ = true;
+    }
+
+    [[nodiscard]] bool ready() const noexcept {
+      return ready_;
+    }
+
+  private:
+    bool ready_ {};
+    std::vector<std::unique_ptr<mdns_registration_t>> registrations_;
   };
 
   /**
@@ -268,14 +330,36 @@ namespace platf::publish {
     return 0;
   }
 
-  std::unique_ptr<::platf::deinit_t> start() {
-    HMODULE handle = LoadLibrary("dnsapi.dll");
+  HMODULE dnsapi_handle() {
+    static HMODULE handle = []() {
+      auto loaded = LoadLibrary("dnsapi.dll");
+      if (!loaded || load_funcs(loaded)) {
+        return HMODULE {};
+      }
+      return loaded;
+    }();
+    return handle;
+  }
 
-    if (!handle || load_funcs(handle)) {
-      BOOST_LOG(error) << "Couldn't load dnsapi.dll, You'll need to add PC manually from Moonlight"sv;
+  std::unique_ptr<::platf::deinit_t> start() {
+    std::vector<service_t> services;
+    services.push_back({
+      .type = platf::SERVICE_TYPE,
+      .port = net::map_port(nvhttp::PORT_HTTP),
+    });
+    return start(std::move(services));
+  }
+
+  std::unique_ptr<::platf::deinit_t> start(std::vector<service_t> services) {
+    if (!valid_services(services)) {
+      BOOST_LOG(error) << "Refusing invalid Lumen mDNS service set"sv;
       return nullptr;
     }
-
-    return std::make_unique<mdns_registration_t>();
+    if (!dnsapi_handle()) {
+      BOOST_LOG(error) << "Couldn't load dnsapi.dll; Lumen discovery is unavailable"sv;
+      return nullptr;
+    }
+    auto registrations = std::make_unique<mdns_registrations_t>(std::move(services));
+    return registrations->ready() ? std::move(registrations) : nullptr;
   }
 }  // namespace platf::publish

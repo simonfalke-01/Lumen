@@ -176,13 +176,33 @@ i2j7w5vhA66Ep18oU6mfswVI
 
   class TestSession final: public quic::ControlSessionV3 {
   public:
-    explicit TestSession(const bool active): active_ {active} {
+    explicit TestSession(
+      const bool active,
+      const std::optional<quic::ApplicationCloseCode> close_code = std::nullopt,
+      const std::chrono::milliseconds deadline_timeout = std::chrono::seconds {120}
+    ):
+        active_ {active},
+        close_code_ {close_code},
+        deadline_timeout_ {deadline_timeout},
+        deadline_ {quic::MonotonicClock::now() + deadline_timeout_} {
     }
 
     std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> control(
       const quic::ControlFrame &
     ) override {
+      if (close_code_) {
+        throw quic::ApplicationCloseError {*close_code_, "test close"};
+      }
       return {};
+    }
+
+    quic::MonotonicClock::time_point begin_control(const quic::ControlFrame &) noexcept override {
+      deadline_ = quic::MonotonicClock::now() + deadline_timeout_;
+      return deadline_;
+    }
+
+    quic::MonotonicClock::time_point application_deadline() const noexcept override {
+      return deadline_;
     }
 
     void datagram(const quic::DatagramRecord &) override {
@@ -197,7 +217,7 @@ i2j7w5vhA66Ep18oU6mfswVI
     }
 
     std::uint64_t idle_timeout_ms() const noexcept override {
-      return 0;
+      return static_cast<std::uint64_t>(deadline_timeout_.count());
     }
 
     void datagram_maximum_changed(std::uint16_t) override {
@@ -212,6 +232,9 @@ i2j7w5vhA66Ep18oU6mfswVI
 
   private:
     bool active_;
+    std::optional<quic::ApplicationCloseCode> close_code_;
+    std::chrono::milliseconds deadline_timeout_;
+    quic::MonotonicClock::time_point deadline_;
   };
 
   class TestSessionFactory final: public quic::SessionFactory {
@@ -220,8 +243,11 @@ i2j7w5vhA66Ep18oU6mfswVI
     }
 
     std::unique_ptr<quic::ControlSessionV3> create(const quic::ConnectionContext &) override {
-      return std::make_unique<TestSession>(active_);
+      return std::make_unique<TestSession>(active_, close_code, deadline_timeout);
     }
+
+    std::optional<quic::ApplicationCloseCode> close_code;
+    std::chrono::milliseconds deadline_timeout {std::chrono::seconds {120}};
 
   private:
     bool active_;
@@ -323,12 +349,20 @@ i2j7w5vhA66Ep18oU6mfswVI
       return quic::ApiStatus::success;
     }
 
-    quic::ApiStatus connection_set_idle_timeout(quic::Handle, std::uint64_t) override {
+    quic::ApiStatus connection_set_idle_timeout(
+      const quic::Handle connection,
+      const std::uint64_t timeout
+    ) override {
+      idle_timeouts.emplace_back(connection, timeout);
       return quic::ApiStatus::success;
     }
 
     void connection_shutdown(const quic::Handle connection, const std::uint64_t error) noexcept override {
-      connection_shutdowns.emplace_back(connection, error);
+      {
+        std::lock_guard lock {connection_shutdown_mutex};
+        connection_shutdowns.emplace_back(connection, error);
+      }
+      connection_shutdown_condition.notify_all();
     }
 
     void connection_close(quic::Handle) noexcept override {
@@ -428,10 +462,20 @@ i2j7w5vhA66Ep18oU6mfswVI
       listener_stop_condition.notify_all();
     }
 
+    bool wait_for_connection_shutdown(const std::uint64_t error, const std::chrono::milliseconds timeout) {
+      std::unique_lock lock {connection_shutdown_mutex};
+      return connection_shutdown_condition.wait_for(lock, timeout, [&] {
+        return std::ranges::any_of(connection_shutdowns, [&](const auto &shutdown) {
+          return shutdown.second == error;
+        });
+      });
+    }
+
     ListenerCallback listener_callback;
     ConnectionCallback connection_callback;
     std::map<quic::Handle, StreamCallback> stream_callbacks;
     std::vector<std::pair<quic::Handle, std::uint64_t>> connection_shutdowns;
+    std::vector<std::pair<quic::Handle, std::uint64_t>> idle_timeouts;
     std::vector<std::pair<quic::Handle, std::uint64_t>> stream_shutdowns;
     std::vector<DatagramSend> datagram_sends;
     std::optional<quic::CongestionSample> congestion;
@@ -441,6 +485,8 @@ i2j7w5vhA66Ep18oU6mfswVI
     quic::ApiStatus configuration_load_status {quic::ApiStatus::success};
     std::mutex listener_stop_mutex;
     std::condition_variable listener_stop_condition;
+    std::mutex connection_shutdown_mutex;
+    std::condition_variable connection_shutdown_condition;
     bool block_first_listener_stop {};
     bool first_listener_stop_entered {};
     bool release_first_listener_stop {};
@@ -745,10 +791,151 @@ i2j7w5vhA66Ep18oU6mfswVI
 
   TEST(ProtocolV3Security, ApplicationCloseCodesMatchTheVersionThreeWireContract) {
     EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::malformed), 0x100U);
+    EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::version_or_alpn), 0x101U);
+    EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::authentication_failed), 0x102U);
+    EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::unauthorized), 0x103U);
+    EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::phase_timeout), 0x104U);
     EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::connection_replaced), 0x105U);
     EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::abuse_limit), 0x106U);
+    EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::resource_limit), 0x107U);
+    EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::request_id_conflict), 0x108U);
     EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::internal_failure), 0x109U);
     EXPECT_EQ(static_cast<std::uint64_t>(quic::ApplicationCloseCode::normal_shutdown), 0x10AU);
+  }
+
+  TEST(ProtocolV3Security, TypedSessionFailuresReachTheExactApplicationCloseCode) {
+    constexpr std::array codes {
+      quic::ApplicationCloseCode::malformed,
+      quic::ApplicationCloseCode::version_or_alpn,
+      quic::ApplicationCloseCode::authentication_failed,
+      quic::ApplicationCloseCode::unauthorized,
+      quic::ApplicationCloseCode::phase_timeout,
+      quic::ApplicationCloseCode::connection_replaced,
+      quic::ApplicationCloseCode::abuse_limit,
+      quic::ApplicationCloseCode::resource_limit,
+      quic::ApplicationCloseCode::request_id_conflict,
+      quic::ApplicationCloseCode::internal_failure,
+      quic::ApplicationCloseCode::normal_shutdown,
+    };
+    for (const auto code : codes) {
+      TestMsQuicApi api;
+      TestSessionFactory factory;
+      factory.close_code = code;
+      quic::QuicServer server {api, test_config(), factory};
+      connect_test_server(api, server);
+      constexpr quic::Handle control_stream = 20;
+      ASSERT_EQ(
+        api.connection_event({
+          .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+          .stream = control_stream,
+          .stream_id = 0,
+        }),
+        quic::ApiStatus::success
+      );
+      const auto hello = control_frame(0x0001, 1);
+      const quic::Buffer buffer {hello.data(), hello.size()};
+      EXPECT_EQ(
+        api.stream_event(control_stream, {
+                                           .kind = quic::StreamEvent::Kind::receive,
+                                           .buffers = std::span {&buffer, 1},
+                                           .total_buffer_bytes = hello.size(),
+                                         }),
+        quic::ApiStatus::aborted
+      );
+      ASSERT_EQ(api.connection_shutdowns.size(), 1U);
+      EXPECT_EQ(api.connection_shutdowns.front().second, static_cast<std::uint64_t>(code));
+    }
+  }
+
+  TEST(ProtocolV3Security, PinnedDeadlineDefaultsRemainExactAndAuthenticatedIdleIsNonzero) {
+    const quic::Config transport;
+    EXPECT_EQ(transport.handshake_timeout, std::chrono::seconds {5});
+    EXPECT_EQ(transport.hello_timeout, std::chrono::seconds {2});
+
+    const control::Config session;
+    EXPECT_EQ(session.server_hello_timeout, std::chrono::seconds {2});
+    EXPECT_EQ(session.authorization_request_timeout, std::chrono::seconds {3});
+    EXPECT_EQ(session.signed_response_timeout, std::chrono::seconds {2});
+    EXPECT_EQ(session.start_response_timeout, std::chrono::seconds {10});
+    EXPECT_EQ(session.attach_response_timeout, std::chrono::seconds {3});
+    EXPECT_EQ(session.configuration_ack_timeout, std::chrono::seconds {3});
+    EXPECT_EQ(session.stop_response_timeout, std::chrono::seconds {2});
+    EXPECT_EQ(session.teardown_timeout, std::chrono::seconds {5});
+    EXPECT_EQ(session.authenticated_idle_timeout, std::chrono::seconds {120});
+    EXPECT_NE(session.authenticated_idle_timeout.count(), 0);
+  }
+
+  TEST(ProtocolV3Transport, SchedulerLanesMatchTheFiveProductionProducers) {
+    EXPECT_EQ(quic::scheduled_lane_count, 5U);
+    EXPECT_EQ(static_cast<std::uint8_t>(quic::Lane::microphone), 3U);
+    EXPECT_EQ(static_cast<std::uint8_t>(quic::Lane::key_config), 4U);
+    EXPECT_EQ(static_cast<std::uint8_t>(quic::Lane::delta_video), 5U);
+    EXPECT_EQ(static_cast<std::uint8_t>(quic::Lane::telemetry), 6U);
+    constexpr std::array produced {
+      quic::Lane::control,
+      quic::Lane::input_edge,
+      quic::Lane::audio,
+      quic::Lane::delta_video,
+      quic::Lane::telemetry,
+    };
+    EXPECT_EQ(quic::delivery_for(quic::Lane::control), quic::Delivery::reliable_stream);
+    EXPECT_EQ(quic::delivery_for(quic::Lane::key_config), quic::Delivery::reliable_stream);
+    for (const auto lane : std::span {produced}.subspan(1)) {
+      EXPECT_EQ(quic::delivery_for(lane), quic::Delivery::datagram);
+    }
+  }
+
+  TEST(ProtocolV3Transport, UnproducedSemanticLanesCannotEnterTheOutboundScheduler) {
+    TestMsQuicApi api;
+    TestSessionFactory factory;
+    quic::QuicServer server {api, test_config(), factory};
+    connect_test_server(api, server);
+    authenticate_test_server(api);
+    const auto bytes = std::make_shared<const std::vector<std::uint8_t>>(control_frame(0x0005, 3));
+    for (const auto lane : {quic::Lane::microphone, quic::Lane::key_config}) {
+      EXPECT_EQ(
+        server.enqueue(1, {
+                            .lane = lane,
+                            .bytes = bytes,
+                          }),
+        quic::EnqueueResult::invalid_packet
+      );
+    }
+  }
+
+  TEST(ProtocolV3Security, ApplicationDeadlineClosesWithPhaseTimeoutWithoutMorePeerTraffic) {
+    TestMsQuicApi api;
+    TestSessionFactory factory;
+    factory.deadline_timeout = std::chrono::milliseconds {20};
+    quic::QuicServer server {api, test_config(), factory};
+    connect_test_server(api, server);
+    constexpr quic::Handle control_stream = 20;
+    ASSERT_EQ(
+      api.connection_event({
+        .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+        .stream = control_stream,
+        .stream_id = 0,
+      }),
+      quic::ApiStatus::success
+    );
+    const auto hello = control_frame(0x0001, 1);
+    const quic::Buffer buffer {hello.data(), hello.size()};
+    ASSERT_EQ(
+      api.stream_event(control_stream, {
+                                         .kind = quic::StreamEvent::Kind::receive,
+                                         .buffers = std::span {&buffer, 1},
+                                         .total_buffer_bytes = hello.size(),
+                                       }),
+      quic::ApiStatus::success
+    );
+    EXPECT_TRUE(api.wait_for_connection_shutdown(
+      static_cast<std::uint64_t>(quic::ApplicationCloseCode::phase_timeout),
+      std::chrono::seconds {1}
+    ));
+    ASSERT_FALSE(api.idle_timeouts.empty());
+    EXPECT_TRUE(std::ranges::all_of(api.idle_timeouts, [](const auto &entry) {
+      return entry.second != 0;
+    }));
   }
 
   TEST(ProtocolV3Security, SynchronousListenerStopCompletionDoesNotReenterTheServerLock) {
