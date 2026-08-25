@@ -74,20 +74,25 @@ file(SHA256 "${CMAKE_SOURCE_DIR}/src/platform/windows/msquic_shim/lumen_msquic_s
      _lumen_msquic_shim_header_sha256)
 file(SHA256 "${CMAKE_SOURCE_DIR}/src/platform/windows/msquic_shim/lumen_msquic_shim.cpp"
      _lumen_msquic_shim_source_sha256)
+file(SHA256 "${CMAKE_SOURCE_DIR}/src/platform/windows/msquic_shim/cng_key_journal.h"
+     _lumen_msquic_shim_cng_journal_sha256)
 file(SHA256 "${CMAKE_SOURCE_DIR}/src/platform/windows/msquic_shim/LumenMsQuicShim.vcxproj"
      _lumen_msquic_shim_project_sha256)
 if(NOT _lumen_msquic_shim_header_sha256 STREQUAL
-       "ca7512a2827a33085415e9e6d5ba2c5236fa4fabcf63098bc08aab563712de23" OR
+       "0649ca20aeb3a883200842456ffee4ac1e76f07144a41b972d666c4cb10267fa" OR
    NOT _lumen_msquic_shim_source_sha256 STREQUAL
-       "aed4d27590ae2746e35cf61465f6ddd26b44507be8a38cd2d0dced463239c16a" OR
+       "72ded95fa3d1f57846c1b22186aa79c4e1f1a50062534492c80d94747c032db1" OR
+   NOT _lumen_msquic_shim_cng_journal_sha256 STREQUAL
+       "7fb567a6ac16050bc7b2b4bd1da650644a49958bae6aed0b683ca37b69d24962" OR
    NOT _lumen_msquic_shim_project_sha256 STREQUAL
-       "0032cc4545fbf146bc5c0f2899e042a1a54387b6dd4d4a9c31edb425c4b3d40b")
+       "36be00e3274561990716bd952c8f7d178feb898b3cd2c64acba7956e57f90aef")
     message(FATAL_ERROR "Lumen MsQuic shim ABI/source/toolset manifest validation failed.")
 endif()
 file(READ "${_lumen_msquic_shim_manifest}" _lumen_msquic_manifest_json)
 string(JSON _lumen_msquic_manifest_abi GET "${_lumen_msquic_manifest_json}" abi)
 string(JSON _lumen_msquic_manifest_header GET "${_lumen_msquic_manifest_json}" header_sha256)
 string(JSON _lumen_msquic_manifest_source GET "${_lumen_msquic_manifest_json}" source_sha256)
+string(JSON _lumen_msquic_manifest_cng_journal GET "${_lumen_msquic_manifest_json}" cng_key_journal_sha256)
 string(JSON _lumen_msquic_manifest_project GET "${_lumen_msquic_manifest_json}" project_sha256)
 string(JSON _lumen_msquic_manifest_arch GET "${_lumen_msquic_manifest_json}" architecture)
 string(JSON _lumen_msquic_manifest_toolset GET "${_lumen_msquic_manifest_json}" toolset)
@@ -100,6 +105,7 @@ if(NOT _lumen_msquic_manifest_abi EQUAL 3 OR
    NOT _lumen_msquic_manifest_toolset STREQUAL "v143" OR
    NOT _lumen_msquic_manifest_header STREQUAL _lumen_msquic_shim_header_sha256 OR
    NOT _lumen_msquic_manifest_source STREQUAL _lumen_msquic_shim_source_sha256 OR
+   NOT _lumen_msquic_manifest_cng_journal STREQUAL _lumen_msquic_shim_cng_journal_sha256 OR
    NOT _lumen_msquic_manifest_project STREQUAL _lumen_msquic_shim_project_sha256 OR
    NOT _lumen_msquic_manifest_dll STREQUAL LUMEN_MSQUIC_SHIM_DLL_SHA256 OR
    NOT _lumen_msquic_manifest_lib STREQUAL LUMEN_MSQUIC_SHIM_LIB_SHA256 OR

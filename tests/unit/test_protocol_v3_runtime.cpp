@@ -5,6 +5,7 @@
 
 #include "src/protocol_common/crypto.h"
 #include "src/protocol_common/status.h"
+#include "src/protocol_v3/host_identity_store.h"
 #include "src/protocol_v3/runtime.h"
 #include "src/rtsp.h"
 #include "src/video.h"
@@ -16,9 +17,12 @@
 #include <fstream>
 #include <future>
 #include <gtest/gtest.h>
+#include <map>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <span>
+#include <set>
 #include <thread>
 
 namespace {
@@ -658,6 +662,108 @@ namespace {
     )
                                         .count());
   }
+
+  struct FakeIdentityFiles {
+    runtime::HostPrincipal principal {runtime::HostPrincipal::elevated_administrator};
+    std::map<std::string, std::vector<std::uint8_t>> files;
+    std::set<std::string> secure;
+    bool reject_writes {};
+  };
+
+  class FakeIdentityPlatform final: public runtime::HostIdentityPlatform {
+  public:
+    explicit FakeIdentityPlatform(std::shared_ptr<FakeIdentityFiles> files):
+        files_ {std::move(files)} {
+    }
+
+    runtime::HostPrincipal principal() const noexcept override {
+      return files_->principal;
+    }
+
+    std::expected<std::vector<std::uint8_t>, runtime::HostIdentityError> protect(
+      const std::span<const std::uint8_t> plaintext
+    ) override {
+      std::vector<std::uint8_t> output(plaintext.begin(), plaintext.end());
+      for (auto &byte : output) {
+        byte ^= 0xa5U;
+      }
+      return output;
+    }
+
+    std::expected<std::vector<std::uint8_t>, runtime::HostIdentityError> unprotect(
+      const std::span<const std::uint8_t> protected_bytes
+    ) override {
+      std::vector<std::uint8_t> output(protected_bytes.begin(), protected_bytes.end());
+      for (auto &byte : output) {
+        byte ^= 0xa5U;
+      }
+      return output;
+    }
+
+    bool write_private(
+      const std::filesystem::path &path,
+      const std::span<const std::uint8_t> bytes
+    ) override {
+      if (files_->reject_writes) {
+        return false;
+      }
+      files_->files[path.string()] = {bytes.begin(), bytes.end()};
+      files_->secure.insert(path.string());
+      return true;
+    }
+
+    bool read_private(
+      const std::filesystem::path &path,
+      std::vector<std::uint8_t> &bytes
+    ) const override {
+      const auto found = files_->files.find(path.string());
+      if (found == files_->files.end() || !verify_private(path)) {
+        return false;
+      }
+      bytes = found->second;
+      return true;
+    }
+
+    bool exists(const std::filesystem::path &path) const override {
+      return files_->files.contains(path.string());
+    }
+
+    bool verify_private(const std::filesystem::path &path) const override {
+      return files_->secure.contains(path.string());
+    }
+
+    bool replace_private(
+      const std::filesystem::path &source,
+      const std::filesystem::path &destination
+    ) override {
+      const auto found = files_->files.find(source.string());
+      if (found == files_->files.end() || !verify_private(source)) {
+        return false;
+      }
+      files_->files[destination.string()] = found->second;
+      files_->files.erase(found);
+      files_->secure.erase(source.string());
+      files_->secure.insert(destination.string());
+      return true;
+    }
+
+    bool remove_private(const std::filesystem::path &path) override {
+      files_->files.erase(path.string());
+      files_->secure.erase(path.string());
+      return true;
+    }
+
+  private:
+    std::shared_ptr<FakeIdentityFiles> files_;
+  };
+
+  runtime::HostIdentityPaths fake_identity_paths() {
+    return {
+      .identity = "/identity/credentials/protocol_v3_identity.bin",
+      .temporary = "/identity/credentials/protocol_v3_identity.bin.pending",
+      .journal = "/identity/credentials/protocol_v3_identity.journal",
+    };
+  }
 }  // namespace
 
 TEST(ProtocolV3Runtime, AuthorizationPersistsAtomicallyWithPrivatePermissionsAndExactRetry) {
@@ -728,6 +834,11 @@ TEST(ProtocolV3Runtime, AuthorizationPersistsAtomicallyWithPrivatePermissionsAnd
       std::istreambuf_iterator<char> {}
     };
     EXPECT_EQ(serialized.find(hex(invitation.token)), std::string::npos);
+    EXPECT_EQ(serialized.find(hex(first_seed)), std::string::npos);
+    const auto identity_paths = runtime::host_identity_paths_for_state_file(state_file);
+    EXPECT_TRUE(std::filesystem::is_regular_file(identity_paths.identity));
+    EXPECT_TRUE(std::filesystem::is_regular_file(identity_paths.journal));
+    EXPECT_FALSE(std::filesystem::exists(identity_paths.temporary));
   }
 
   runtime::PersistentAuthorizationStore reloaded {state_file.string(), true};
@@ -745,6 +856,131 @@ TEST(ProtocolV3Runtime, AuthorizationPersistsAtomicallyWithPrivatePermissionsAnd
   EXPECT_EQ(permissions & std::filesystem::perms::group_all, std::filesystem::perms::none);
   EXPECT_EQ(permissions & std::filesystem::perms::others_all, std::filesystem::perms::none);
 #endif
+}
+
+TEST(ProtocolV3Identity, MigratesLegacySeedToVersionedProtectedBlobAndRetiresPlaintext) {
+  auto files = std::make_shared<FakeIdentityFiles>();
+  const auto paths = fake_identity_paths();
+  runtime::HostIdentityStore store {
+    paths,
+    std::make_unique<FakeIdentityPlatform>(files),
+    true,
+  };
+  control::SecureRandom random;
+  control::Bytes32 legacy {};
+  std::iota(legacy.begin(), legacy.end(), 1U);
+
+  const auto loaded = store.load_or_create(legacy, random);
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->seed, legacy);
+  EXPECT_TRUE(loaded->retire_legacy_seed);
+  EXPECT_TRUE(files->files.contains(paths.identity.string()));
+  EXPECT_TRUE(files->files.contains(paths.journal.string()));
+  EXPECT_FALSE(files->files.contains(paths.temporary.string()));
+  const auto &blob = files->files.at(paths.identity.string());
+  EXPECT_EQ(std::search(blob.begin(), blob.end(), legacy.begin(), legacy.end()), blob.end());
+}
+
+TEST(ProtocolV3Identity, RecoversEveryInterruptedMigrationStageWithoutRotatingIdentity) {
+  const std::array stages {
+    runtime::HostIdentityStage::journal_started,
+    runtime::HostIdentityStage::temporary_written,
+    runtime::HostIdentityStage::temporary_verified,
+    runtime::HostIdentityStage::identity_replaced,
+    runtime::HostIdentityStage::journal_committed,
+  };
+  control::Bytes32 legacy {};
+  std::iota(legacy.begin(), legacy.end(), 7U);
+  control::SecureRandom random;
+
+  for (const auto stage : stages) {
+    auto files = std::make_shared<FakeIdentityFiles>();
+    const auto paths = fake_identity_paths();
+    runtime::HostIdentityStore interrupted {
+      paths,
+      std::make_unique<FakeIdentityPlatform>(files),
+      true,
+      [stage](const auto observed) { return observed == stage; },
+    };
+    const auto first = interrupted.load_or_create(legacy, random);
+    ASSERT_FALSE(first.has_value());
+    EXPECT_EQ(first.error(), runtime::HostIdentityError::injected_interruption);
+
+    runtime::HostIdentityStore recovered {
+      paths,
+      std::make_unique<FakeIdentityPlatform>(files),
+      true,
+    };
+    const auto second = recovered.load_or_create(legacy, random);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->seed, legacy);
+    EXPECT_TRUE(second->retire_legacy_seed);
+    EXPECT_TRUE(files->files.contains(paths.identity.string()));
+    EXPECT_TRUE(files->files.contains(paths.journal.string()));
+    EXPECT_FALSE(files->files.contains(paths.temporary.string()));
+  }
+}
+
+TEST(ProtocolV3Identity, CorruptProtectedBlobFailsClosedWithoutReplacement) {
+  auto files = std::make_shared<FakeIdentityFiles>();
+  const auto paths = fake_identity_paths();
+  control::SecureRandom random;
+  control::Bytes32 legacy {};
+  std::iota(legacy.begin(), legacy.end(), 3U);
+  {
+    runtime::HostIdentityStore store {
+      paths,
+      std::make_unique<FakeIdentityPlatform>(files),
+      true,
+    };
+    ASSERT_TRUE(store.load_or_create(legacy, random).has_value());
+  }
+  auto &blob = files->files.at(paths.identity.string());
+  ASSERT_GT(blob.size(), 20U);
+  blob[20] ^= 0x5aU;
+  const auto corrupted = blob;
+
+  runtime::HostIdentityStore reloaded {
+    paths,
+    std::make_unique<FakeIdentityPlatform>(files),
+    true,
+  };
+  const auto result = reloaded.load_or_create(legacy, random);
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), runtime::HostIdentityError::identity_mismatch);
+  EXPECT_EQ(files->files.at(paths.identity.string()), corrupted);
+}
+
+TEST(ProtocolV3Identity, UnsupportedPrincipalCreatesNoSecondIdentity) {
+  auto files = std::make_shared<FakeIdentityFiles>();
+  files->principal = runtime::HostPrincipal::unsupported;
+  const auto paths = fake_identity_paths();
+  runtime::HostIdentityStore store {
+    paths,
+    std::make_unique<FakeIdentityPlatform>(files),
+    true,
+  };
+  control::SecureRandom random;
+  const auto result = store.load_or_create(std::nullopt, random);
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), runtime::HostIdentityError::unsupported_principal);
+  EXPECT_TRUE(files->files.empty());
+}
+
+TEST(ProtocolV3Identity, InsecureExistingBlobIsRejectedWithoutAclWeakening) {
+  auto files = std::make_shared<FakeIdentityFiles>();
+  const auto paths = fake_identity_paths();
+  files->files[paths.identity.string()] = {'L', 'U', 'M', 'E', 'N', 'I', 'D', '3'};
+  runtime::HostIdentityStore store {
+    paths,
+    std::make_unique<FakeIdentityPlatform>(files),
+    true,
+  };
+  control::SecureRandom random;
+  const auto result = store.load_or_create(std::nullopt, random);
+  EXPECT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), runtime::HostIdentityError::security_failure);
+  EXPECT_FALSE(files->secure.contains(paths.identity.string()));
 }
 
 TEST(ProtocolV3Runtime, AttachIntentCacheReturnsExactCommittedOutcomeBeforeExpiry) {

@@ -5,5 +5,8 @@
     <Filter Include="Header Files"><UniqueIdentifier>{14371F26-8534-47F5-BA09-BA91C8415675}</UniqueIdentifier></Filter>
   </ItemGroup>
   <ItemGroup><ClCompile Include="lumen_msquic_shim.cpp"><Filter>Source Files</Filter></ClCompile></ItemGroup>
-  <ItemGroup><ClInclude Include="lumen_msquic_shim.h"><Filter>Header Files</Filter></ClInclude></ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="cng_key_journal.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="lumen_msquic_shim.h"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
 </Project>

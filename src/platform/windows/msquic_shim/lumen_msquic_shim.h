@@ -139,6 +139,14 @@ extern "C" {
   );
   LUMEN_MSQUIC_EXPORT lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_close(lumen_msquic_shim *shim);
   LUMEN_MSQUIC_EXPORT int LUMEN_MSQUIC_CALL lumen_msquic_is_schannel(lumen_msquic_shim *shim);
+  /**
+   * Configure the absolute owned-key journal path and reap exact stale entries.
+   * This must succeed before importing a PKCS#12 credential.
+   */
+  LUMEN_MSQUIC_EXPORT lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_set_cng_journal_path(
+    lumen_msquic_shim *shim,
+    const char *journal_path
+  );
   LUMEN_MSQUIC_EXPORT lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_registration_open(
     lumen_msquic_shim *shim,
     const char *name,

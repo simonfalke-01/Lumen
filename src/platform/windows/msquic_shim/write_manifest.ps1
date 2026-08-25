@@ -6,6 +6,7 @@ $manifest = Get-Content -LiteralPath (Join-Path $ProjectDirectory "manifest.json
 $manifest.abi = 3
 $manifest.header_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ProjectDirectory "lumen_msquic_shim.h")).Hash.ToLowerInvariant()
 $manifest.source_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ProjectDirectory "lumen_msquic_shim.cpp")).Hash.ToLowerInvariant()
+$manifest.cng_key_journal_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ProjectDirectory "cng_key_journal.h")).Hash.ToLowerInvariant()
 $manifest.project_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $ProjectDirectory "LumenMsQuicShim.vcxproj")).Hash.ToLowerInvariant()
 $manifest | Add-Member -NotePropertyName shim_dll_sha256 -NotePropertyValue ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $OutputDirectory "lumen_msquic_shim.dll")).Hash.ToLowerInvariant())
 $manifest | Add-Member -NotePropertyName shim_import_library_sha256 -NotePropertyValue ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $OutputDirectory "lumen_msquic_shim.lib")).Hash.ToLowerInvariant())

@@ -191,6 +191,10 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
         ${PLATFORM_TARGET_FILES})
 
+list(APPEND SUNSHINE_TARGET_FILES
+        "${CMAKE_SOURCE_DIR}/src/protocol_v3/host_identity_store.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_v3/host_identity_store.h")
+
 if(WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC)
     list(APPEND SUNSHINE_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.cpp"

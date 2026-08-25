@@ -3,9 +3,10 @@
   "architecture": "x64",
   "toolset": "v143",
   "msquic_version": "2.6.0",
-  "header_sha256": "ca7512a2827a33085415e9e6d5ba2c5236fa4fabcf63098bc08aab563712de23",
-  "source_sha256": "aed4d27590ae2746e35cf61465f6ddd26b44507be8a38cd2d0dced463239c16a",
-  "project_sha256": "0032cc4545fbf146bc5c0f2899e042a1a54387b6dd4d4a9c31edb425c4b3d40b",
+  "header_sha256": "0649ca20aeb3a883200842456ffee4ac1e76f07144a41b972d666c4cb10267fa",
+  "source_sha256": "72ded95fa3d1f57846c1b22186aa79c4e1f1a50062534492c80d94747c032db1",
+  "cng_key_journal_sha256": "7fb567a6ac16050bc7b2b4bd1da650644a49958bae6aed0b683ca37b69d24962",
+  "project_sha256": "36be00e3274561990716bd952c8f7d178feb898b3cd2c64acba7956e57f90aef",
   "msquic_header_sha256": "ebd3499686c2b3008ed0ee5b06dae1a62a50192816abfe9a67bbbba97cabb861",
   "msquic_library_sha256": "aa08808c1ca29166ea476a66410b73c7d0d85a34459ea59a30de63cca7ad7327",
   "msquic_runtime_sha256": "c981e61cd207f42d46b54ef7dbf1049f1f836424c3ba981f4469ac2b2bea9610"

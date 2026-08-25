@@ -36,6 +36,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="lumen_msquic_shim.cpp" />
+    <ClInclude Include="cng_key_journal.h" />
     <ClInclude Include="lumen_msquic_shim.h" />
     <None Include="manifest.json" />
     <None Include="write_manifest.ps1" />

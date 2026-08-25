@@ -89,10 +89,9 @@ namespace lumen::protocol_v3::runtime {
   /**
    * @brief Atomic shared-state implementation of the v3 authorization boundary.
    *
-   * The adapter stores the host Ed25519 seed, single-use invitations, and paired
-   * client records under the existing Lumen JSON state transaction. Pairing is
-   * published in memory only after the invitation consumption and new client
-   * record have been atomically committed to disk.
+   * The adapter stores invitations and paired clients under the existing JSON
+   * transaction. The host Ed25519 seed is held by a separate protected,
+   * versioned identity store and is never written back to general state JSON.
    */
   class PersistentAuthorizationStore final: public control::AuthorizationStore {
   public:

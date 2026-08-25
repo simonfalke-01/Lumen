@@ -33,6 +33,7 @@
 #include "crypto.h"
 #include "file_handler.h"
 #include "httpcommon.h"
+#include "protocol_v3/host_identity_store.h"
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
@@ -373,10 +374,8 @@ namespace http {
       return -1;
     }
 
-    fs::permissions(pkey_path, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, err_code);
-
-    if (err_code) {
-      BOOST_LOG(error) << "Couldn't change permissions of ["sv << config::nvhttp.pkey << "] :"sv << err_code.message();
+    if (!lumen::protocol_v3::runtime::secure_private_key_file(pkey_path)) {
+      BOOST_LOG(error) << "Couldn't apply and verify private-key security for ["sv << config::nvhttp.pkey << ']';
       return -1;
     }
 

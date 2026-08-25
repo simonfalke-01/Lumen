@@ -3050,9 +3050,15 @@ namespace lumen::protocol_v3::quic_server {
 
     class ShimMsQuicApi final: public MsQuicApi {
     public:
-      ShimMsQuicApi() {
+      explicit ShimMsQuicApi(const std::string &cng_journal_path) {
         if (lumen_msquic_open(LUMEN_MSQUIC_SHIM_ABI_VERSION, &shim_) != LUMEN_MSQUIC_SUCCESS) {
           throw std::runtime_error {"lumen_msquic_shim_open_failed"};
+        }
+        if (cng_journal_path.empty() ||
+            lumen_msquic_set_cng_journal_path(shim_, cng_journal_path.c_str()) != LUMEN_MSQUIC_SUCCESS) {
+          static_cast<void>(lumen_msquic_close(shim_));
+          shim_ = nullptr;
+          throw std::runtime_error {"lumen_msquic_cng_journal_failed"};
         }
       }
 
@@ -3371,10 +3377,11 @@ namespace lumen::protocol_v3::quic_server {
   }  // namespace
 #endif
 
-  std::unique_ptr<MsQuicApi> make_native_msquic_api() {
+  std::unique_ptr<MsQuicApi> make_native_msquic_api(std::string cng_journal_path) {
 #if defined(_WIN32) && defined(LUMEN_EXPERIMENTAL_MSQUIC)
-    return std::make_unique<ShimMsQuicApi>();
+    return std::make_unique<ShimMsQuicApi>(cng_journal_path);
 #else
+    static_cast<void>(cng_journal_path);
     return {};
 #endif
   }

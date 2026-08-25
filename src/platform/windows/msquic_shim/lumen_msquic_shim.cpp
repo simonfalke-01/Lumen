@@ -5,6 +5,7 @@
 
 #define LUMEN_MSQUIC_SHIM_BUILD 1
 #include "lumen_msquic_shim.h"
+#include "cng_key_journal.h"
 
 #include <algorithm>
 #include <array>
@@ -113,82 +114,145 @@ namespace {
     );
   }
 
-  /** @brief Move-only owner that deletes one exact persisted CNG key. */
-  class PersistedCngKey {
+  std::u16string portable_string(const std::wstring &value) {
+    static_assert(sizeof(wchar_t) == sizeof(char16_t));
+    return {
+      reinterpret_cast<const char16_t *>(value.data()),
+      reinterpret_cast<const char16_t *>(value.data() + value.size()),
+    };
+  }
+
+  std::wstring native_string(const std::u16string &value) {
+    static_assert(sizeof(wchar_t) == sizeof(char16_t));
+    return {
+      reinterpret_cast<const wchar_t *>(value.data()),
+      reinterpret_cast<const wchar_t *>(value.data() + value.size()),
+    };
+  }
+
+  /** @brief Crash-safe Windows file storage for the bounded owned-key journal. */
+  class WindowsCngJournalStore final: public lumen::msquic::cng::JournalStore {
   public:
-    PersistedCngKey() = default;
-
-    /** @brief Take immediate cleanup ownership of one caller-owned CNG key handle. */
-    explicit PersistedCngKey(const NCRYPT_KEY_HANDLE handle) noexcept:
-        handle_ {handle} {
+    explicit WindowsCngJournalStore(std::wstring path):
+        path_ {std::move(path)} {
     }
 
-    PersistedCngKey(const PersistedCngKey &) = delete;
-    PersistedCngKey &operator=(const PersistedCngKey &) = delete;
-
-    /** @brief Transfer cleanup ownership without duplicating the key handle. */
-    PersistedCngKey(PersistedCngKey &&other) noexcept:
-        provider {std::move(other.provider)},
-        container {std::move(other.container)},
-        unique_name {std::move(other.unique_name)},
-        handle_ {std::exchange(other.handle_, 0)} {
-    }
-
-    /** @brief Replace cleanup ownership after deleting the previously held key. */
-    PersistedCngKey &operator=(PersistedCngKey &&other) noexcept {
-      if (this != &other) {
-        static_cast<void>(cleanup_with_report());
-        provider = std::move(other.provider);
-        container = std::move(other.container);
-        unique_name = std::move(other.unique_name);
-        handle_ = std::exchange(other.handle_, 0);
+    bool read(std::vector<lumen::msquic::cng::KeyIdentity> &entries) noexcept override {
+      try {
+        const auto temporary_path = path_ + L".tmp";
+        std::vector<std::uint8_t> bytes;
+        if (read_bytes(temporary_path, bytes)) {
+          std::vector<lumen::msquic::cng::KeyIdentity> recovered;
+          if (lumen::msquic::cng::deserialize(bytes, recovered) &&
+              MoveFileExW(
+                temporary_path.c_str(),
+                path_.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+              )) {
+            entries = std::move(recovered);
+            return true;
+          }
+          DeleteFileW(temporary_path.c_str());
+        }
+        bytes.clear();
+        if (!read_bytes(path_, bytes)) {
+          if (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND) {
+            entries.clear();
+            return true;
+          }
+          return false;
+        }
+        return lumen::msquic::cng::deserialize(bytes, entries);
+      } catch (...) {
+        return false;
       }
-      return *this;
     }
 
-    ~PersistedCngKey() {
-      static_cast<void>(cleanup_with_report());
-    }
-
-    /**
-     * @brief Delete the exact owned key and release its handle.
-     * @return True when no key remained or deletion succeeded.
-     */
-    bool cleanup() noexcept {
-      if (!handle_) {
+    bool write(const std::vector<lumen::msquic::cng::KeyIdentity> &entries) noexcept override {
+      try {
+        std::vector<std::uint8_t> bytes;
+        if (!lumen::msquic::cng::serialize(entries, bytes)) {
+          return false;
+        }
+        const auto temporary_path = path_ + L".tmp";
+        DeleteFileW(temporary_path.c_str());
+        const auto file = CreateFileW(
+          temporary_path.c_str(),
+          GENERIC_WRITE,
+          0,
+          nullptr,
+          CREATE_NEW,
+          FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_WRITE_THROUGH,
+          nullptr
+        );
+        if (file == INVALID_HANDLE_VALUE) {
+          return false;
+        }
+        DWORD written {};
+        const auto write_ok = WriteFile(
+                                file,
+                                bytes.data(),
+                                static_cast<DWORD>(bytes.size()),
+                                &written,
+                                nullptr
+                              ) &&
+                              written == bytes.size() && FlushFileBuffers(file);
+        const auto close_ok = CloseHandle(file) != FALSE;
+        if (!write_ok || !close_ok ||
+            !MoveFileExW(
+              temporary_path.c_str(),
+              path_.c_str(),
+              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+            )) {
+          DeleteFileW(temporary_path.c_str());
+          return false;
+        }
         return true;
+      } catch (...) {
+        return false;
       }
-      last_cleanup_status_ = NCryptDeleteKey(handle_, 0);
-      if (last_cleanup_status_ == ERROR_SUCCESS) {
-        handle_ = 0;
-        return true;
-      }
-      NCryptFreeObject(handle_);
-      handle_ = 0;
-      return false;
     }
-
-    /** @brief Delete the owned key and emit one bounded diagnostic on failure. */
-    bool cleanup_with_report() noexcept {
-      const auto cleaned = cleanup();
-      if (!cleaned) {
-        report_cleanup_failure(last_cleanup_status_);
-      }
-      return cleaned;
-    }
-
-    /** @brief Return the exact owned key handle for read-only property queries. */
-    NCRYPT_KEY_HANDLE handle() const noexcept {
-      return handle_;
-    }
-
-    std::wstring provider;  ///< CNG storage provider recorded by the imported certificate.
-    std::wstring container;  ///< Provider-local key container recorded by the imported certificate.
-    std::wstring unique_name;  ///< Provider-issued unique key name retained for diagnostics.
 
   private:
-    NCRYPT_KEY_HANDLE handle_ {};  ///< Caller-owned handle retained until cleanup.
-    SECURITY_STATUS last_cleanup_status_ {ERROR_SUCCESS};  ///< Most recent deletion result.
+    static bool read_bytes(const std::wstring &path, std::vector<std::uint8_t> &bytes) {
+      const auto file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+      );
+      if (file == INVALID_HANDLE_VALUE) {
+        return false;
+      }
+      LARGE_INTEGER size {};
+      if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+          size.QuadPart > static_cast<LONGLONG>(lumen::msquic::cng::maximum_serialized_bytes)) {
+        CloseHandle(file);
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+      }
+      bytes.resize(static_cast<std::size_t>(size.QuadPart));
+      DWORD read {};
+      const auto read_ok = ReadFile(
+                             file,
+                             bytes.data(),
+                             static_cast<DWORD>(bytes.size()),
+                             &read,
+                             nullptr
+                           ) &&
+                           read == bytes.size();
+      const auto close_ok = CloseHandle(file) != FALSE;
+      if (!read_ok || !close_ok) {
+        SetLastError(ERROR_READ_FAULT);
+        return false;
+      }
+      return true;
+    }
+
+    std::wstring path_;
   };
 
   /**
@@ -227,6 +291,141 @@ namespace {
     return true;
   }
 
+  /** @brief Exact provider/container CNG operations used by the portable reaper. */
+  class WindowsCngKeyBackend final: public lumen::msquic::cng::KeyBackend {
+  public:
+    OpenResult open(const lumen::msquic::cng::KeyIdentity &identity) noexcept override {
+      try {
+        const auto provider_name = native_string(identity.provider);
+        const auto container_name = native_string(identity.container);
+        NCRYPT_PROV_HANDLE provider {};
+        if (NCryptOpenStorageProvider(&provider, provider_name.c_str(), 0) != ERROR_SUCCESS) {
+          return {};
+        }
+        NCRYPT_KEY_HANDLE key {};
+        const auto open_status = NCryptOpenKey(
+          provider,
+          &key,
+          container_name.c_str(),
+          0,
+          NCRYPT_SILENT_FLAG | (identity.machine_key ? NCRYPT_MACHINE_KEY_FLAG : 0)
+        );
+        NCryptFreeObject(provider);
+        if (open_status == NTE_BAD_KEYSET) {
+          return {.status = OpenStatus::missing};
+        }
+        if (open_status != ERROR_SUCCESS || !key) {
+          return {};
+        }
+        std::wstring unique_name;
+        if (!read_ncrypt_string_property(key, NCRYPT_UNIQUE_NAME_PROPERTY, unique_name)) {
+          NCryptFreeObject(key);
+          return {};
+        }
+        return {
+          .status = OpenStatus::opened,
+          .handle = static_cast<Handle>(key),
+          .unique_name = portable_string(unique_name),
+        };
+      } catch (...) {
+        return {};
+      }
+    }
+
+    bool delete_key(const Handle handle) noexcept override {
+      last_status_ = NCryptDeleteKey(static_cast<NCRYPT_KEY_HANDLE>(handle), 0);
+      return last_status_ == ERROR_SUCCESS;
+    }
+
+    void free_key(const Handle handle) noexcept override {
+      if (handle) {
+        NCryptFreeObject(static_cast<NCRYPT_HANDLE>(handle));
+      }
+    }
+
+    SECURITY_STATUS last_status() const noexcept {
+      return last_status_;
+    }
+
+  private:
+    SECURITY_STATUS last_status_ {ERROR_SUCCESS};
+  };
+
+  /** @brief Move-only owner for one exact journal-authorized persisted CNG key. */
+  class PersistedCngKey {
+  public:
+    PersistedCngKey() = default;
+
+    PersistedCngKey(
+      const NCRYPT_KEY_HANDLE handle,
+      lumen::msquic::cng::KeyIdentity identity,
+      std::shared_ptr<lumen::msquic::cng::OwnedKeyJournal> journal
+    ) noexcept:
+        identity_ {std::move(identity)},
+        journal_ {std::move(journal)},
+        handle_ {handle} {
+    }
+
+    PersistedCngKey(const PersistedCngKey &) = delete;
+    PersistedCngKey &operator=(const PersistedCngKey &) = delete;
+
+    PersistedCngKey(PersistedCngKey &&other) noexcept:
+        identity_ {std::move(other.identity_)},
+        journal_ {std::move(other.journal_)},
+        handle_ {std::exchange(other.handle_, 0)} {
+    }
+
+    PersistedCngKey &operator=(PersistedCngKey &&other) noexcept {
+      if (this != &other) {
+        static_cast<void>(cleanup_with_report());
+        identity_ = std::move(other.identity_);
+        journal_ = std::move(other.journal_);
+        handle_ = std::exchange(other.handle_, 0);
+      }
+      return *this;
+    }
+
+    ~PersistedCngKey() {
+      static_cast<void>(cleanup_with_report());
+    }
+
+    bool cleanup() noexcept {
+      if (!handle_) {
+        return true;
+      }
+      WindowsCngKeyBackend backend;
+      const auto cleanup = journal_ ?
+                             journal_->release_owned(identity_, static_cast<std::uintptr_t>(handle_), backend) :
+                             lumen::msquic::cng::Result {
+                               .status = lumen::msquic::cng::Status::not_owned,
+                             };
+      if (!journal_) {
+        backend.free_key(static_cast<std::uintptr_t>(handle_));
+      }
+      handle_ = 0;
+      last_cleanup_status_ = backend.last_status();
+      if (cleanup.status != lumen::msquic::cng::Status::success &&
+          last_cleanup_status_ == ERROR_SUCCESS) {
+        last_cleanup_status_ = NTE_INTERNAL_ERROR;
+      }
+      return cleanup.status == lumen::msquic::cng::Status::success;
+    }
+
+    bool cleanup_with_report() noexcept {
+      const auto cleaned = cleanup();
+      if (!cleaned) {
+        report_cleanup_failure(last_cleanup_status_);
+      }
+      return cleaned;
+    }
+
+  private:
+    lumen::msquic::cng::KeyIdentity identity_;
+    std::shared_ptr<lumen::msquic::cng::OwnedKeyJournal> journal_;
+    NCRYPT_KEY_HANDLE handle_ {};
+    SECURITY_STATUS last_cleanup_status_ {ERROR_SUCCESS};
+  };
+
   /** @brief Result of inspecting one imported certificate for a private key. */
   struct PersistedCngKeyAcquisition {
     bool private_key_present {};  ///< The certificate carried a provider-backed private key.
@@ -239,7 +438,10 @@ namespace {
    * @param certificate Imported certificate context.
    * @return Key presence, rollback status, and move-only key owner.
    */
-  PersistedCngKeyAcquisition acquire_persisted_cng_key(const PCCERT_CONTEXT certificate) noexcept {
+  PersistedCngKeyAcquisition acquire_persisted_cng_key(
+    const PCCERT_CONTEXT certificate,
+    const std::shared_ptr<lumen::msquic::cng::OwnedKeyJournal> &journal
+  ) noexcept {
     DWORD property_bytes {};
     if (!CertGetCertificateContextProperty(
           certificate,
@@ -287,17 +489,26 @@ namespace {
         storage_provider,
         &reopened_key,
         provider_info->pwszContainerName,
-        provider_info->dwKeySpec,
+        0,
         NCRYPT_SILENT_FLAG | open_flags
       );
       NCryptFreeObject(storage_provider);
       return open_status == ERROR_SUCCESS ? reopened_key : NCRYPT_KEY_HANDLE {};
     };
 
+    const auto delete_unjournaled = [](const NCRYPT_KEY_HANDLE key) noexcept {
+      WindowsCngKeyBackend backend;
+      if (backend.delete_key(static_cast<std::uintptr_t>(key))) {
+        return true;
+      }
+      backend.free_key(static_cast<std::uintptr_t>(key));
+      report_cleanup_failure(backend.last_status());
+      return false;
+    };
+
     HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key {};
     DWORD key_spec {};
     BOOL caller_frees {};
-    std::optional<PersistedCngKey> owned_key;
     if (CryptAcquireCertificatePrivateKey(
           certificate,
           CRYPT_ACQUIRE_SILENT_FLAG | CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG,
@@ -314,37 +525,48 @@ namespace {
         return result;
       }
       if (caller_frees) {
-        owned_key.emplace(static_cast<NCRYPT_KEY_HANDLE>(key));
-      } else {
-        const auto reopened_key = reopen_key();
-        if (!reopened_key) {
-          result.rollback_complete = false;
-          return result;
-        }
-        owned_key.emplace(reopened_key);
+        NCryptFreeObject(key);
       }
-    } else {
-      const auto reopened_key = reopen_key();
-      if (!reopened_key) {
-        result.rollback_complete = false;
-        return result;
-      }
-      owned_key.emplace(reopened_key);
+    }
+
+    const auto reopened_key = reopen_key();
+    if (!reopened_key) {
+      result.rollback_complete = false;
+      return result;
     }
     try {
-      owned_key->provider = provider_info->pwszProvName;
-      owned_key->container = provider_info->pwszContainerName;
+      std::wstring unique_name;
       if (!read_ncrypt_string_property(
-            owned_key->handle(),
+            reopened_key,
             NCRYPT_UNIQUE_NAME_PROPERTY,
-            owned_key->unique_name
+            unique_name
           )) {
-        result.rollback_complete = owned_key->cleanup();
+        result.rollback_complete = delete_unjournaled(reopened_key);
         return result;
       }
-      result.key.emplace(std::move(*owned_key));
+      lumen::msquic::cng::KeyIdentity identity {
+        .provider = portable_string(provider_info->pwszProvName),
+        .container = portable_string(provider_info->pwszContainerName),
+        .unique_name = portable_string(unique_name),
+        .machine_key = (provider_info->dwFlags & CRYPT_MACHINE_KEYSET) != 0,
+      };
+      if (!journal) {
+        result.rollback_complete = delete_unjournaled(reopened_key);
+        return result;
+      }
+      const auto record_status = journal->record_before_escape(identity);
+      if (record_status != lumen::msquic::cng::Status::success) {
+        if (record_status == lumen::msquic::cng::Status::already_owned) {
+          NCryptFreeObject(reopened_key);
+          result.rollback_complete = false;
+        } else {
+          result.rollback_complete = delete_unjournaled(reopened_key);
+        }
+        return result;
+      }
+      result.key.emplace(reopened_key, std::move(identity), journal);
     } catch (...) {
-      result.rollback_complete = owned_key->cleanup();
+      result.rollback_complete = delete_unjournaled(reopened_key);
     }
     return result;
   }
@@ -686,6 +908,7 @@ struct lumen_msquic_shim {
   std::map<HQUIC, std::shared_ptr<StreamContext>> streams;
   std::map<HQUIC, std::weak_ptr<SendRegistry>> stream_send_registries;
   std::map<HQUIC, std::shared_ptr<CredentialContext>> configuration_credentials;
+  std::shared_ptr<lumen::msquic::cng::OwnedKeyJournal> cng_journal;
 };
 
 namespace {
@@ -748,6 +971,35 @@ extern "C" {
     uint32_t length = sizeof(provider);
     return QUIC_SUCCEEDED(shim->api->GetParam(nullptr, QUIC_PARAM_GLOBAL_TLS_PROVIDER, &length, &provider)) &&
            provider == QUIC_TLS_PROVIDER_SCHANNEL;
+  }
+
+  lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_set_cng_journal_path(
+    lumen_msquic_shim *shim,
+    const char *journal_path
+  ) {
+    if (!shim || !journal_path) {
+      return LUMEN_MSQUIC_INVALID_STATE;
+    }
+    try {
+      auto path = wide(journal_path);
+      if (path.empty()) {
+        return LUMEN_MSQUIC_INVALID_STATE;
+      }
+      auto store = std::make_shared<WindowsCngJournalStore>(std::move(path));
+      auto journal = std::make_shared<lumen::msquic::cng::OwnedKeyJournal>(std::move(store));
+      WindowsCngKeyBackend backend;
+      std::lock_guard lock {shim->mutex};
+      if (!shim->configuration_credentials.empty()) {
+        return LUMEN_MSQUIC_INVALID_STATE;
+      }
+      const auto reaped = journal->reap(backend);
+      shim->cng_journal = std::move(journal);
+      return reaped.status == lumen::msquic::cng::Status::success ?
+               LUMEN_MSQUIC_SUCCESS :
+               LUMEN_MSQUIC_CLEANUP_ERROR;
+    } catch (...) {
+      return LUMEN_MSQUIC_OUT_OF_MEMORY;
+    }
   }
 
   lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_registration_open(
@@ -822,6 +1074,14 @@ extern "C" {
     if (!s || !pkcs12 || pkcs12_size == 0 || pkcs12_size > UINT32_MAX || !password) {
       return LUMEN_MSQUIC_INVALID_STATE;
     }
+    std::shared_ptr<lumen::msquic::cng::OwnedKeyJournal> journal;
+    {
+      std::lock_guard lock {s->mutex};
+      journal = s->cng_journal;
+    }
+    if (!journal) {
+      return LUMEN_MSQUIC_INVALID_STATE;
+    }
     std::shared_ptr<CredentialContext> credential;
     bool rollback_complete = true;
     const auto fail = [&](const lumen_msquic_status status) {
@@ -855,7 +1115,7 @@ extern "C" {
       {
         CertificateEnumeration certificates {credential->store};
         while (const auto candidate = certificates.next()) {
-          auto acquisition = acquire_persisted_cng_key(candidate);
+          auto acquisition = acquire_persisted_cng_key(candidate, journal);
           if (!acquisition.private_key_present) {
             continue;
           }
@@ -919,8 +1179,22 @@ extern "C" {
   }
 
   void LUMEN_MSQUIC_CALL lumen_msquic_configuration_close(lumen_msquic_shim *s, lumen_msquic_handle h) {
+    if (!s) {
+      return;
+    }
     const auto handle = native(h);
     s->api->ConfigurationClose(handle);
+    std::shared_ptr<CredentialContext> credential;
+    {
+      std::lock_guard lock {s->mutex};
+      auto owned = s->configuration_credentials.extract(handle);
+      if (!owned.empty()) {
+        credential = std::move(owned.mapped());
+      }
+    }
+    if (credential) {
+      static_cast<void>(credential->release());
+    }
   }
 
   lumen_msquic_status LUMEN_MSQUIC_CALL lumen_msquic_listener_open(

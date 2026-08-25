@@ -848,5 +848,5 @@ namespace lumen::protocol_v3::quic_server {
    *
    * @return Owned facade on an opted-in Windows build; null otherwise.
    */
-  std::unique_ptr<MsQuicApi> make_native_msquic_api();
+  std::unique_ptr<MsQuicApi> make_native_msquic_api(std::string cng_journal_path = {});
 }  // namespace lumen::protocol_v3::quic_server

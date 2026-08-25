@@ -4,6 +4,7 @@
  */
 
 #include "runtime.h"
+#include "host_identity_store.h"
 #include "start_mode_contract.h"
 
 #include "../file_handler.h"
@@ -400,7 +401,12 @@ namespace lumen::protocol_v3::runtime {
     explicit Impl(std::string path, const bool persist, WallClock clock):
         state_file {std::move(path)},
         persistent {persist},
-        wall_clock {clock ? std::move(clock) : WallClock {system_unix_seconds}} {
+        wall_clock {clock ? std::move(clock) : WallClock {system_unix_seconds}},
+        identity_store {
+          host_identity_paths_for_state_file(state_file),
+          make_native_host_identity_platform(),
+          persistent
+        } {
       load();
     }
 
@@ -438,7 +444,7 @@ namespace lumen::protocol_v3::runtime {
           if (!decoded || !nonzero(*decoded)) {
             return false;
           }
-          host_seed = *decoded;
+          legacy_host_seed = *decoded;
         }
 
         if (const auto nodes = subtree->get_child_optional("clients")) {
@@ -660,8 +666,10 @@ namespace lumen::protocol_v3::runtime {
     std::string state_file;
     bool persistent {};
     WallClock wall_clock;
+    HostIdentityStore identity_store;
     mutable std::mutex mutex;
     bool loaded {};
+    std::optional<control::Bytes32> legacy_host_seed;
     std::optional<control::Bytes32> host_seed;
     std::map<control::Identifier, StoredClient> clients;
     std::map<control::Identifier, StoredInvitation> invitations;
@@ -692,16 +700,18 @@ namespace lumen::protocol_v3::runtime {
     if (impl_->host_seed) {
       return *impl_->host_seed;
     }
-    control::Bytes32 seed {};
-    if (!random.fill(seed) || !nonzero(seed)) {
+    auto loaded = impl_->identity_store.load_or_create(impl_->legacy_host_seed, random);
+    if (!loaded || !nonzero(loaded->seed)) {
       return std::unexpected(static_cast<std::uint8_t>(Status::internal_failure));
     }
-    if (!impl_->persist_state(impl_->clients, impl_->invitations, impl_->consumed, seed)) {
-      OPENSSL_cleanse(seed.data(), seed.size());
+    if (loaded->retire_legacy_seed &&
+        !impl_->persist_state(impl_->clients, impl_->invitations, impl_->consumed, std::nullopt)) {
+      OPENSSL_cleanse(loaded->seed.data(), loaded->seed.size());
       return std::unexpected(static_cast<std::uint8_t>(Status::internal_failure));
     }
-    impl_->host_seed = seed;
-    return seed;
+    impl_->legacy_host_seed.reset();
+    impl_->host_seed = loaded->seed;
+    return loaded->seed;
   }
 
   bool PersistentAuthorizationStore::add_invitation(const Invitation &invitation) {
@@ -729,7 +739,7 @@ namespace lumen::protocol_v3::runtime {
       .expires_at_unix_seconds = invitation.expires_at_unix_seconds,
     };
     consumed_candidate.erase(invitation.invitation_id);
-    if (!impl_->persist_state(impl_->clients, candidate, consumed_candidate, impl_->host_seed)) {
+    if (!impl_->persist_state(impl_->clients, candidate, consumed_candidate, impl_->legacy_host_seed)) {
       return false;
     }
     impl_->invitations = std::move(candidate);
@@ -744,7 +754,7 @@ namespace lumen::protocol_v3::runtime {
     }
     auto candidate = impl_->invitations;
     candidate.erase(invitation_id);
-    if (!impl_->persist_state(impl_->clients, candidate, impl_->consumed, impl_->host_seed)) {
+    if (!impl_->persist_state(impl_->clients, candidate, impl_->consumed, impl_->legacy_host_seed)) {
       return false;
     }
     impl_->invitations = std::move(candidate);
@@ -802,7 +812,7 @@ namespace lumen::protocol_v3::runtime {
     auto &updated = candidate.find(client_id)->second;
     updated.enabled = enabled;
     ++updated.record.generation;
-    if (!impl_->persist_state(candidate, impl_->invitations, impl_->consumed, impl_->host_seed)) {
+    if (!impl_->persist_state(candidate, impl_->invitations, impl_->consumed, impl_->legacy_host_seed)) {
       return false;
     }
     impl_->clients = std::move(candidate);
@@ -829,7 +839,7 @@ namespace lumen::protocol_v3::runtime {
     auto &updated = candidate.find(client_id)->second;
     updated.record.permissions = permissions;
     ++updated.record.generation;
-    if (!impl_->persist_state(candidate, impl_->invitations, impl_->consumed, impl_->host_seed)) {
+    if (!impl_->persist_state(candidate, impl_->invitations, impl_->consumed, impl_->legacy_host_seed)) {
       return false;
     }
     impl_->clients = std::move(candidate);
@@ -843,7 +853,7 @@ namespace lumen::protocol_v3::runtime {
     }
     auto candidate = impl_->clients;
     candidate.erase(client_id);
-    if (!impl_->persist_state(candidate, impl_->invitations, impl_->consumed, impl_->host_seed)) {
+    if (!impl_->persist_state(candidate, impl_->invitations, impl_->consumed, impl_->legacy_host_seed)) {
       return false;
     }
     impl_->clients = std::move(candidate);
@@ -935,7 +945,7 @@ namespace lumen::protocol_v3::runtime {
       .outcome = stored.record,
       .expires_at_unix_seconds = impl_->wall_clock() + consumed_tombstone_lifetime_seconds,
     };
-    if (!impl_->persist_state(next_clients, next_invitations, next_consumed, impl_->host_seed)) {
+    if (!impl_->persist_state(next_clients, next_invitations, next_consumed, impl_->legacy_host_seed)) {
       return std::unexpected(static_cast<std::uint8_t>(Status::internal_failure));
     }
     impl_->clients = std::move(next_clients);
@@ -2713,6 +2723,9 @@ namespace lumen::protocol_v3::runtime {
         (config.pairing_permissions & 0x17U) != 0x17U) {
       return quic_server::ApiStatus::invalid_state;
     }
+    if (!verify_private_key_file(config.private_key_file)) {
+      return quic_server::ApiStatus::invalid_state;
+    }
     const auto certificate_pem = file_handler::read_file(config.certificate_file.c_str());
     const auto private_key_pem = file_handler::read_file(config.private_key_file.c_str());
     impl_->certificate = quic_server::make_certificate_credential_from_pem(certificate_pem, private_key_pem);
@@ -2720,7 +2733,9 @@ namespace lumen::protocol_v3::runtime {
       impl_->clear();
       return quic_server::ApiStatus::invalid_state;
     }
-    impl_->api = quic_server::make_native_msquic_api();
+    const auto cng_journal = host_identity_paths_for_state_file(config.state_file).identity.parent_path() /
+                             "protocol_v3_cng_keys.journal";
+    impl_->api = quic_server::make_native_msquic_api(cng_journal.string());
     if (!impl_->api) {
       impl_->clear();
       return quic_server::ApiStatus::not_supported;
