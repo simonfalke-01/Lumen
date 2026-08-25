@@ -30,6 +30,7 @@ namespace rtsp_stream {
 
 #if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
   namespace lumen::protocol_v3::media {
+    enum class PublishResult;
     struct NegotiatedMediaConfig;
     class TransportSink;
   }
@@ -352,6 +353,34 @@ namespace stream {
 
   /** @brief Exercise exact legacy and protocol-v3 production destination isolation. */
   [[nodiscard]] audio_destination_isolation_probe_t audio_destination_isolation_probe_for_test();
+
+  /** @brief Raw observations from capture through the exact production v3 audio drain. */
+  struct protocol_v3_audio_fixture_probe_t {
+    lumen::protocol_v3::media::PublishResult publish_result;  ///< SessionPipeline admission of the captured Opus packet.
+    audio::AudioPacketDestination::enqueue_result_e pressure_result;  ///< Admission beyond the private destination capacity.
+    audio::AudioPacketDestination::enqueue_result_e enqueue_after_repeated_close;  ///< Admission after two destination close calls.
+    std::uint64_t first_sample_position {};  ///< Captured packet's exact 48 kHz sample position.
+    std::size_t opus_bytes {};  ///< Encoded Opus payload size delivered by capture.
+    bool discontinuity {};  ///< Captured decoder reset/flush marker.
+    bool capture_completed {};  ///< Whether capture produced and drained one packet before the watchdog.
+    bool repeated_pipeline_stop_completed {};  ///< Whether two production pipeline stop calls returned.
+  };
+
+  /**
+   * @brief Run platform capture through the exact private v3 destination and SessionPipeline drain.
+   *
+   * @param selection Negotiated v3 media configuration used by capture and packetization.
+   * @param transport Production transport sink attached to the test QuicServer.
+   * @param connection_id Authenticated QuicServer connection identity.
+   * @param capture_time_microseconds Deterministic raw-event timestamp for the fixture.
+   * @return Raw capture, destination, and pipeline observations.
+   */
+  [[nodiscard]] protocol_v3_audio_fixture_probe_t protocol_v3_audio_fixture_probe_for_test(
+    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection,
+    lumen::protocol_v3::media::TransportSink &transport,
+    std::uint64_t connection_id,
+    std::uint64_t capture_time_microseconds
+  );
 
   /** @brief Exercise the production immutable controller-feedback generation fence. */
   bool protocol_v3_feedback_is_current_for_test(

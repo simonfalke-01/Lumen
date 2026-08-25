@@ -3031,6 +3031,26 @@ namespace stream {
       audio_packet_queue_t<audio::packet_t> packets_;
     };
 
+    /**
+     * @brief Submit one encoded packet through the shared production v3 audio drain.
+     * @param pipeline Bound per-session media pipeline.
+     * @param packet Encoded packet popped from the private v3 destination.
+     * @param capture_time_microseconds Exact capture timestamp for the wire record.
+     * @return SessionPipeline publication result.
+     */
+    v3_media::PublishResult publish_v3_audio_packet(
+      v3_media::SessionPipeline &pipeline,
+      const audio::packet_t &packet,
+      const std::uint64_t capture_time_microseconds
+    ) {
+      return pipeline.submit_audio({
+        .capture_time_microseconds = capture_time_microseconds,
+        .first_sample_position = packet.sample_position,
+        .opus = {std::begin(packet.payload), packet.payload.size()},
+        .discontinuity = packet.discontinuity,
+      });
+    }
+
     class native_v3_session_resources final:
         public v3_runtime::SessionResources,
         private v3_media::InputSink,
@@ -3647,12 +3667,11 @@ namespace stream {
 
       void consume_audio() {
         while (const auto packet = audio_destination_->pop()) {
-          const auto result = pipeline_->submit_audio({
-            .capture_time_microseconds = v3_microseconds(std::chrono::steady_clock::now()),
-            .first_sample_position = packet->sample_position,
-            .opus = {std::begin(packet->payload), packet->payload.size()},
-            .discontinuity = packet->discontinuity,
-          });
+          const auto result = publish_v3_audio_packet(
+            *pipeline_,
+            *packet,
+            v3_microseconds(std::chrono::steady_clock::now())
+          );
           if (result == v3_media::PublishResult::detached) {
             continue;
           }
@@ -4684,6 +4703,113 @@ namespace stream {
         result.v3_second_after_close_tag = tag(*popped);
       }
     }
+    return result;
+  }
+
+  protocol_v3_audio_fixture_probe_t protocol_v3_audio_fixture_probe_for_test(
+    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection,
+    lumen::protocol_v3::media::TransportSink &transport,
+    const std::uint64_t connection_id,
+    const std::uint64_t capture_time_microseconds
+  ) {
+    struct input_sink_t final: v3_media::InputSink {
+      bool submit(const v3_media::InputBatch &) override {
+        return true;
+      }
+
+      void reset() noexcept override {
+      }
+    } input_sink;
+
+    struct microphone_sink_t final: v3_media::MicrophoneSink {
+      bool submit(const v3_media::MicrophonePacket &) override {
+        return true;
+      }
+
+      void stop() noexcept override {
+      }
+    } microphone_sink;
+
+    struct feedback_sink_t final: v3_media::VideoFeedbackSink {
+      void submit(const v3_media::VideoFeedback &) override {
+      }
+    } feedback_sink;
+
+    protocol_v3_audio_fixture_probe_t result {
+      .publish_result = v3_media::PublishResult::stopped,
+      .pressure_result = audio::AudioPacketDestination::enqueue_result_e::closed,
+      .enqueue_after_repeated_close = audio::AudioPacketDestination::enqueue_result_e::closed,
+    };
+    v3_media::SessionPipeline pipeline {
+      selection,
+      transport,
+      input_sink,
+      microphone_sink,
+      feedback_sink,
+    };
+    if (!pipeline.bind_connection(connection_id)) {
+      return result;
+    }
+
+    auto mail = std::make_shared<safe::mail_raw_t>();
+    auto destination = std::make_shared<v3_audio_packet_destination>();
+    auto shutdown = mail->event<bool>(mail::shutdown);
+    std::atomic_bool drained {};
+    std::jthread consumer {[&]() {
+      if (const auto packet = destination->pop()) {
+        result.first_sample_position = packet->sample_position;
+        result.opus_bytes = packet->payload.size();
+        result.discontinuity = packet->discontinuity;
+        result.publish_result = publish_v3_audio_packet(
+          pipeline,
+          *packet,
+          capture_time_microseconds
+        );
+        result.capture_completed = true;
+        drained.store(true, std::memory_order_release);
+      }
+      shutdown->raise(true);
+    }};
+    std::jthread watchdog {[&](const std::stop_token token) {
+      for (auto elapsed = 0ms; elapsed < 3s && !token.stop_requested() && !drained.load(std::memory_order_acquire); elapsed += 10ms) {
+        std::this_thread::sleep_for(10ms);
+      }
+      if (!token.stop_requested() && !drained.load(std::memory_order_acquire)) {
+        shutdown->raise(true);
+        destination->close();
+      }
+    }};
+
+    audio::config_t capture_config {};
+    configure_v3_audio(capture_config, selection);
+    audio::capture(mail, capture_config, destination);
+    watchdog.request_stop();
+    if (watchdog.joinable()) {
+      watchdog.join();
+    }
+    destination->close();
+    destination->close();
+    if (consumer.joinable()) {
+      consumer.join();
+    }
+    result.enqueue_after_repeated_close = destination->enqueue({});
+
+    v3_audio_packet_destination pressure_destination;
+    const auto pressure_packet = []() {
+      audio::buffer_t payload {1};
+      payload[0] = 0x5a;
+      return audio::packet_t {.payload = std::move(payload)};
+    };
+    for (std::size_t index = 0; index < 32; ++index) {
+      static_cast<void>(pressure_destination.enqueue(pressure_packet()));
+    }
+    result.pressure_result = pressure_destination.enqueue(pressure_packet());
+    pressure_destination.close();
+    pressure_destination.close();
+
+    pipeline.stop();
+    pipeline.stop();
+    result.repeated_pipeline_stop_completed = true;
     return result;
   }
 

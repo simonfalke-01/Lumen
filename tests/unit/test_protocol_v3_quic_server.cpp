@@ -3,16 +3,22 @@
  * @brief Pure protocol-v3 wire, credential, and bounded-security tests.
  */
 
+#include "../tests_common.h"
 #include "src/protocol_v3/control_session.h"
 #include "src/protocol_v3/quic_server.h"
+#include "src/protocol_v3/runtime.h"
+#include "src/stream.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <map>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <span>
 #include <string>
 #include <string_view>
@@ -21,12 +27,23 @@
 
 namespace {
   namespace control = lumen::protocol_v3::control_session;
+  namespace media = lumen::protocol_v3::media;
   namespace quic = lumen::protocol_v3::quic_server;
+  namespace runtime = lumen::protocol_v3::runtime;
 
   void append_be(std::vector<std::uint8_t> &out, std::uint64_t value, std::size_t count) {
     while (count-- > 0) {
       out.push_back(static_cast<std::uint8_t>(value >> (count * 8U)));
     }
+  }
+
+  std::uint64_t read_be(const std::span<const std::uint8_t> bytes, const std::size_t offset, std::size_t count) {
+    std::uint64_t value {};
+    auto cursor = offset;
+    while (count-- != 0) {
+      value = (value << 8U) | bytes[cursor++];
+    }
+    return value;
   }
 
   std::array<std::uint8_t, 16> session_id() {
@@ -35,6 +52,30 @@ namespace {
       id[index] = static_cast<std::uint8_t>(0xc0 + index);
     }
     return id;
+  }
+
+  std::string hex_bytes(const std::span<const std::uint8_t> bytes) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2U);
+    for (const auto byte : bytes) {
+      result.push_back(digits[byte >> 4U]);
+      result.push_back(digits[byte & 0x0fU]);
+    }
+    return result;
+  }
+
+  const nlohmann::json &scheduled_audio_fixture() {
+    static const auto fixture = [] {
+      const auto path = std::filesystem::path {SUNSHINE_SOURCE_DIR} /
+                        "tests/fixtures/protocol_v3_audio_datagrams.json";
+      std::ifstream input {path};
+      if (!input) {
+        throw std::runtime_error("Unable to open protocol-v3 audio datagram fixture: " + path.string());
+      }
+      return nlohmann::json::parse(input);
+    }();
+    return fixture;
   }
 
   std::vector<std::uint8_t> control_frame(std::uint16_t type, std::uint64_t request) {
@@ -418,6 +459,104 @@ i2j7w5vhA66Ep18oU6mfswVI
       }),
       quic::ApiStatus::success
     );
+  }
+
+  struct ProtocolV3ScheduledAudioFixtureTest: PlatformTestSuite {};
+
+  TEST_F(ProtocolV3ScheduledAudioFixtureTest, CapturesThroughProductionQueuePipelineAndScheduler) {
+    const auto &fixture = scheduled_audio_fixture();
+    ASSERT_EQ(fixture.at("schema"), "lumen-protocol-v3-audio-datagram/1");
+    ASSERT_EQ(fixture.at("profile"), "quality");
+    ASSERT_EQ(fixture.at("sessionIdHex"), hex_bytes(session_id()));
+
+    TestMsQuicApi api;
+    TestSessionFactory factory;
+    quic::QuicServer server {api, test_config(), factory};
+    runtime::QuicTransportSink transport;
+    transport.attach(server, quic::Profile::quality, 100'000);
+    connect_test_server(api, server);
+    authenticate_test_server(api);
+    const auto maximum_datagram_bytes = fixture.at("maximumDatagramBytes").get<std::uint16_t>();
+    ASSERT_EQ(
+      api.connection_event({
+        .kind = quic::ConnectionEvent::Kind::datagram_state_changed,
+        .maximum_datagram_bytes = maximum_datagram_bytes,
+        .datagram_send_enabled = true,
+      }),
+      quic::ApiStatus::success
+    );
+
+    const auto capture_time = fixture.at("captureTimeMicroseconds").get<std::uint64_t>();
+    const auto connection_id = fixture.at("connectionId").get<std::uint64_t>();
+    for (const auto &vector : fixture.at("vectors")) {
+      media::NegotiatedMediaConfig selection;
+      selection.session_id = session_id();
+      selection.profile = quic::Profile::quality;
+      selection.audio_generation = vector.at("audioGeneration").get<std::uint32_t>();
+      selection.audio.sample_rate = vector.at("sampleRate").get<std::uint32_t>();
+      selection.audio.frame_samples = vector.at("frameSamples").get<std::uint16_t>();
+      selection.audio.channels = vector.at("channels").get<std::uint8_t>();
+      selection.audio.layout = vector.at("layout").get<std::uint8_t>();
+      selection.audio.streams = vector.at("streams").get<std::uint8_t>();
+      selection.audio.coupled_streams = vector.at("coupledStreams").get<std::uint8_t>();
+      selection.audio.bitrate_bps = vector.at("bitrateBps").get<std::uint32_t>();
+      const auto mapping = vector.at("mapping").get<std::vector<std::uint8_t>>();
+      ASSERT_EQ(mapping.size(), selection.audio.mapping.size());
+      std::ranges::copy(mapping, selection.audio.mapping.begin());
+
+      const auto sends_before = api.datagram_sends.size();
+      const auto probe = stream::protocol_v3_audio_fixture_probe_for_test(
+        selection,
+        transport,
+        connection_id,
+        capture_time
+      );
+      ASSERT_TRUE(probe.capture_completed) << vector.at("name").get<std::string>();
+      EXPECT_EQ(probe.publish_result, media::PublishResult::accepted);
+      EXPECT_EQ(probe.pressure_result, audio::AudioPacketDestination::enqueue_result_e::backpressure);
+      EXPECT_EQ(probe.enqueue_after_repeated_close, audio::AudioPacketDestination::enqueue_result_e::closed);
+      EXPECT_TRUE(probe.repeated_pipeline_stop_completed);
+      EXPECT_EQ(probe.first_sample_position, vector.at("firstSamplePosition").get<std::uint64_t>());
+      EXPECT_EQ(probe.discontinuity, vector.at("discontinuity").get<bool>());
+      EXPECT_EQ(probe.opus_bytes, vector.at("opusBytes").get<std::size_t>());
+
+      ASSERT_EQ(api.datagram_sends.size(), sends_before + 1U);
+      const auto &scheduled = api.datagram_sends.back();
+      EXPECT_TRUE(scheduled.urgent);
+      EXPECT_EQ(hex_bytes(scheduled.bytes), vector.at("scheduledDatagramHex").get<std::string>());
+      const auto parsed = quic::parse_datagram_record(
+        scheduled.bytes,
+        quic::Direction::host_to_client,
+        selection.session_id,
+        maximum_datagram_bytes
+      );
+      ASSERT_TRUE(parsed);
+      EXPECT_EQ(parsed->channel, 3);
+      EXPECT_EQ(parsed->kind, 1);
+      EXPECT_EQ(parsed->sequence, 1U);
+      EXPECT_EQ(parsed->object_id, probe.first_sample_position);
+      ASSERT_GE(parsed->payload.size(), 48U);
+      EXPECT_EQ(parsed->payload.size(), 48U + probe.opus_bytes);
+      EXPECT_EQ(read_be(parsed->payload, 0, 8), capture_time);
+      EXPECT_EQ(read_be(parsed->payload, 8, 8), probe.first_sample_position);
+      EXPECT_EQ(read_be(parsed->payload, 16, 4), selection.audio_generation);
+      EXPECT_EQ(read_be(parsed->payload, 20, 2), selection.audio.frame_samples);
+      EXPECT_EQ(parsed->payload[22], selection.audio.channels);
+      EXPECT_EQ(parsed->payload[23], selection.audio.layout);
+      EXPECT_EQ(parsed->payload[24], 1);
+      EXPECT_EQ(parsed->payload[25] & 0x02U, probe.discontinuity ? 0x02U : 0U);
+      EXPECT_EQ(parsed->payload[26], selection.audio.streams);
+      EXPECT_EQ(parsed->payload[27], selection.audio.coupled_streams);
+      EXPECT_TRUE(std::ranges::equal(selection.audio.mapping, parsed->payload.subspan(28, 8)));
+      EXPECT_EQ(read_be(parsed->payload, 36, 4), selection.audio.bitrate_bps);
+      EXPECT_EQ(
+        api.connection_event({
+          .kind = quic::ConnectionEvent::Kind::datagram_send_complete,
+          .send_token = scheduled.token,
+        }),
+        quic::ApiStatus::success
+      );
+    }
   }
 
   TEST(ProtocolV3Wire, ParsersRejectWrongNamespaceDirectionAndFlags) {
