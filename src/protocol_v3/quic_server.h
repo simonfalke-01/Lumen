@@ -56,6 +56,7 @@ namespace lumen::protocol_v3::quic_server {
     microphone = 3,  ///< Time-bounded client microphone media; DATAGRAM.
     key_config = 4,  ///< Reliable ULC3 codec/configuration semantics.
     delta_video = 5,  ///< Replaceable non-reference video media; DATAGRAM.
+    telemetry = 6,  ///< Replaceable authenticated transport telemetry; DATAGRAM.
   };
 
   /** @brief Wire delivery contract for one semantic lane. */

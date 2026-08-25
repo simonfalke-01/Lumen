@@ -17,6 +17,8 @@
 #include <span>
 
 namespace lumen::protocol_v3::media {
+  inline constexpr std::uint32_t maximum_deadline_miss_microseconds = 1'000'000;  ///< Wire/reporting bound.
+
   /** @brief Exact negotiated Opus tuple used by audio or microphone media. */
   struct OpusTuple {
     std::uint32_t sample_rate {48'000};  ///< Negotiated sample rate.
@@ -64,6 +66,7 @@ namespace lumen::protocol_v3::media {
     std::uint32_t microphone_generation {1};  ///< Acknowledged microphone configuration.
     std::uint32_t input_generation {1};  ///< Current input authority generation.
     OpusTuple audio;  ///< Host-audio tuple.
+    bool host_audio {};  ///< Whether captured audio also remains audible on the host.
     OpusTuple microphone {.channels = 1, .coupled_streams = 0, .mapping = {0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, .bitrate_bps = 64'000};  ///< Client microphone tuple.
     bool microphone_enabled {};  ///< Whether channel 4 was negotiated.
     bool fec_enabled {};  ///< Must remain false in protocol-v3 phase one.
@@ -139,6 +142,26 @@ namespace lumen::protocol_v3::media {
     std::uint8_t reason {};  ///< Edge pressure, host reset, or authority transfer.
   };
 
+  /** @brief Authenticated host controller-output command for one live controller instance. */
+  struct ControllerFeedback {
+    std::uint32_t input_generation {};  ///< Current input authority generation.
+    std::uint32_t controller_generation {};  ///< Nonzero instance generation for the controller slot.
+    std::uint8_t controller_id {};  ///< Client-relative controller identifier, 0...15.
+    std::uint8_t command {};  ///< Rumble, trigger rumble, motion rate, LED, or adaptive triggers.
+    std::uint16_t low_frequency {};  ///< Main low-frequency or left-trigger motor strength.
+    std::uint16_t high_frequency {};  ///< Main high-frequency or right-trigger motor strength.
+    std::uint16_t report_rate_hz {};  ///< Requested motion sampling rate; zero disables it.
+    std::uint8_t motion_type {};  ///< Moonlight acceleration or gyroscope type.
+    std::uint8_t red {};  ///< RGB LED red channel.
+    std::uint8_t green {};  ///< RGB LED green channel.
+    std::uint8_t blue {};  ///< RGB LED blue channel.
+    std::uint8_t adaptive_flags {};  ///< DualSense left/right effect-valid flags.
+    std::uint8_t adaptive_left_type {};  ///< DualSense left effect type.
+    std::uint8_t adaptive_right_type {};  ///< DualSense right effect type.
+    std::array<std::uint8_t, 10> adaptive_left {};  ///< Exact left effect payload.
+    std::array<std::uint8_t, 10> adaptive_right {};  ///< Exact right effect payload.
+  };
+
   /** @brief Typed media publication result. */
   enum class PublishResult {
     accepted,  ///< Every record was accepted by the transport queue.
@@ -207,6 +230,11 @@ namespace lumen::protocol_v3::media {
     std::uint64_t input_batches {};  ///< Applied client input batches.
     std::uint64_t microphone_packets {};  ///< Applied microphone packets.
     std::uint64_t feedback_packets {};  ///< Consumed video feedback packets.
+    std::uint64_t deadline_samples {};  ///< Complete/decode-failure feedback carrying deadline evidence.
+    std::uint64_t deadline_misses {};  ///< Deadline samples with a positive miss.
+    std::uint64_t consecutive_deadline_misses {};  ///< Current positive-miss run.
+    std::uint32_t latest_deadline_miss_microseconds {};  ///< Latest complete/failure miss, including zero.
+    std::uint32_t peak_deadline_miss_microseconds {};  ///< Largest bounded miss observed.
     std::uint64_t backpressure_drops {};  ///< Rejected bounded publications.
     std::uint64_t latest_input_state {};  ///< Latest applied input watermark.
     std::uint64_t latest_input_edge {};  ///< Latest applied edge watermark.
@@ -250,6 +278,9 @@ namespace lumen::protocol_v3::media {
 
     /** @brief Publish one input resynchronization request. */
     PublishResult submit_input_resynchronization(const InputResynchronization &request);
+
+    /** @brief Publish one controller feedback command from the production platform queue. */
+    PublishResult submit_controller_feedback(const ControllerFeedback &feedback);
 
     /** @brief Validate and synchronously route one client DATAGRAM. */
     ReceiveResult receive(const quic_server::DatagramRecord &record);

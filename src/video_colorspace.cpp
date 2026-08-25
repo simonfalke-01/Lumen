@@ -32,9 +32,9 @@ namespace video {
     /* See video::config_t declaration for details */
 
     if (config.protocolV3Colorimetry) {
-      if (config.colorTransfer == 2) {
+      if (config.colorTransfer == 16) {
         colorspace.colorspace = colorspace_e::bt2020;
-      } else if (config.colorTransfer == 3) {
+      } else if (config.colorTransfer == 18) {
         colorspace.colorspace = colorspace_e::bt2020hlg;
       } else if (config.colorMatrix == 9) {
         colorspace.colorspace = colorspace_e::bt2020sdr;

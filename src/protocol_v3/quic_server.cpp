@@ -43,14 +43,19 @@ namespace lumen::protocol_v3::quic_server {
     constexpr auto force_close_send_drain_timeout = std::chrono::milliseconds {250};
     constexpr auto listener_stop_timeout = std::chrono::seconds {5};
     constexpr auto congestion_sample_interval = std::chrono::milliseconds {5};
+    constexpr auto rtt_telemetry_interval = std::chrono::milliseconds {250};
+    constexpr auto rtt_telemetry_lifetime = std::chrono::seconds {1};
+    constexpr std::uint64_t maximum_reported_rtt_microseconds = 1'000'000;
+    constexpr std::size_t rtt_telemetry_payload_bytes = 24;
     constexpr std::size_t maximum_packet_bytes = 16U * 1024U * 1024U;
-    constexpr std::array<Lane, 6> all_lanes {
+    constexpr std::array<Lane, 7> all_lanes {
       Lane::control,
       Lane::input_edge,
       Lane::audio,
       Lane::microphone,
       Lane::key_config,
       Lane::delta_video,
+      Lane::telemetry,
     };
 
     std::size_t lane_index(const Lane lane) noexcept {
@@ -102,6 +107,18 @@ namespace lumen::protocol_v3::quic_server {
         value = (value << 8U) | bytes[offset + index];
       }
       return value;
+    }
+
+    void write_be(
+      const std::span<std::uint8_t> output,
+      const std::size_t offset,
+      std::uint64_t value,
+      std::size_t byte_count
+    ) noexcept {
+      while (byte_count-- != 0) {
+        output[offset + byte_count] = static_cast<std::uint8_t>(value);
+        value >>= 8U;
+      }
     }
 
     bool valid_bulk_transfer(const BulkTransfer &transfer) {
@@ -170,9 +187,10 @@ namespace lumen::protocol_v3::quic_server {
                                  ((channel == 1 && kind == 1) ||
                                   (channel == 2 && kind == 3) ||
                                   (channel == 4 && kind == 1)) :
-                                 ((channel == 1 && (kind == 2 || kind == 3)) ||
+                                 ((channel == 1 && (kind == 2 || kind == 3 || kind == 4)) ||
                                   (channel == 2 && kind == 1) ||
-                                  (channel == 3 && kind == 1));
+                                  (channel == 3 && kind == 1) ||
+                                  (channel == 5 && kind == 1));
       if (!valid_route) {
         return std::unexpected(ParseError::reserved_route);
       }
@@ -322,6 +340,7 @@ namespace lumen::protocol_v3::quic_server {
       case Lane::audio:
       case Lane::microphone:
       case Lane::delta_video:
+      case Lane::telemetry:
         return Delivery::datagram;
     }
     return Delivery::reliable_stream;
@@ -338,6 +357,7 @@ namespace lumen::protocol_v3::quic_server {
       case Lane::key_config:
         return 2;
       case Lane::delta_video:
+      case Lane::telemetry:
         return 3;
     }
     return 3;
@@ -627,7 +647,17 @@ namespace lumen::protocol_v3::quic_server {
           handle {native_handle},
           id {process_id},
           remote_source {std::move(source)},
-          send_slots {send_capacity} {
+          send_slots {send_capacity},
+          rtt_telemetry_buffers {
+            std::make_shared<std::vector<std::uint8_t>>(
+              datagram_header_bytes + rtt_telemetry_payload_bytes,
+              0
+            ),
+            std::make_shared<std::vector<std::uint8_t>>(
+              datagram_header_bytes + rtt_telemetry_payload_bytes,
+              0
+            ),
+          } {
       }
 
       /** @brief Acquire one connection-owned send context. */
@@ -667,6 +697,7 @@ namespace lumen::protocol_v3::quic_server {
         pending_video_fragments = 0;
         pending_video_object.reset();
         pending_video_objects_mixed = false;
+        rtt_telemetry_in_flight = false;
       }
 
       Handle handle {invalid_handle};
@@ -689,9 +720,11 @@ namespace lumen::protocol_v3::quic_server {
       std::size_t video_frame_bytes {};
       std::array<PendingSend, SendSlotPool::maximum_capacity> pending;
       SendSlotPool send_slots;
+      std::array<std::shared_ptr<std::vector<std::uint8_t>>, 2> rtt_telemetry_buffers;
       std::size_t pending_video_fragments {};
       std::optional<std::uint64_t> pending_video_object;
       bool pending_video_objects_mixed {};
+      bool rtt_telemetry_in_flight {};
       std::map<std::uint64_t, BulkTransfer> pending_bulk;
       std::map<Handle, std::shared_ptr<BulkSend>> bulk_streams;
       std::size_t bulk_transfer_count {};
@@ -702,6 +735,10 @@ namespace lumen::protocol_v3::quic_server {
       std::optional<std::array<std::uint8_t, 16>> active_session_id;
       std::optional<CongestionSample> congestion;
       MonotonicClock::time_point last_congestion_sample_at {};
+      MonotonicClock::time_point last_rtt_telemetry_at {};
+      std::uint64_t rtt_telemetry_generation {};
+      std::uint64_t prior_smoothed_rtt_microseconds {};
+      std::uint64_t rtt_variation_microseconds {};
       MonotonicClock::time_point connected_at {};
       AbuseTracker abuse;
     };
@@ -905,7 +942,8 @@ namespace lumen::protocol_v3::quic_server {
         const bool lane_matches =
           (packet.lane == Lane::input_edge && parsed->channel == 1) ||
           (packet.lane == Lane::delta_video && parsed->channel == 2) ||
-          (packet.lane == Lane::audio && parsed->channel == 3);
+          (packet.lane == Lane::audio && parsed->channel == 3) ||
+          (packet.lane == Lane::telemetry && parsed->channel == 5);
         if (!lane_matches) {
           return EnqueueResult::invalid_packet;
         }
@@ -923,6 +961,8 @@ namespace lumen::protocol_v3::quic_server {
           packet.deadline = now + (is_latency(connection.profile) ?
                                      config_.video_lifetime :
                                      config_.quality_video_lifetime);
+        } else if (packet.lane == Lane::telemetry) {
+          packet.deadline = now + rtt_telemetry_lifetime;
         }
       }
       if (packet.deadline != MonotonicClock::time_point {} && packet.deadline <= now) {
@@ -1385,7 +1425,13 @@ namespace lumen::protocol_v3::quic_server {
                                                   maximum_semantic_datagram_bytes
                                                 )) :
                                                 0;
-          for (const auto lane : {Lane::input_edge, Lane::audio, Lane::microphone, Lane::delta_video}) {
+          for (const auto lane : {
+                 Lane::input_edge,
+                 Lane::audio,
+                 Lane::microphone,
+                 Lane::delta_video,
+                 Lane::telemetry,
+               }) {
             auto &queue = connection.queues[lane_index(lane)];
             for (auto it = queue.begin(); it != queue.end();) {
               if (connection.maximum_datagram_bytes == 0 ||
@@ -1836,6 +1882,12 @@ namespace lumen::protocol_v3::quic_server {
                 if (!connections_.contains(id) || connection.closing || connection.session != session) {
                   return ApiStatus::aborted;
                 }
+                if (connection.active_session_id != active_session) {
+                  connection.rtt_telemetry_generation = 0;
+                  connection.prior_smoothed_rtt_microseconds = 0;
+                  connection.rtt_variation_microseconds = 0;
+                  connection.last_rtt_telemetry_at = {};
+                }
                 connection.active_session_id = active_session;
                 if (!accepted(api_.connection_set_idle_timeout(connection.handle, idle_timeout))) {
                   begin_shutdown_locked(connection, shutdown_internal_error);
@@ -1974,8 +2026,12 @@ namespace lumen::protocol_v3::quic_server {
         return;
       }
       const auto video = pending->packet.lane == Lane::delta_video;
+      const auto telemetry = pending->packet.lane == Lane::telemetry;
       const auto mixed = connection.pending_video_objects_mixed;
       static_cast<void>(connection.release_send(token));
+      if (telemetry) {
+        connection.rtt_telemetry_in_flight = false;
+      }
       if (!video) {
         return;
       }
@@ -2027,12 +2083,119 @@ namespace lumen::protocol_v3::quic_server {
       try {
         if (const auto sample = api_.congestion_sample(connection.handle)) {
           connection.congestion = *sample;
+          queue_rtt_telemetry_locked(connection, *sample, now);
           if (congestion_observer_ != nullptr) {
             congestion_observer_->on_congestion_sample(connection.id, *sample, next_event_time_locked());
           }
         }
       } catch (...) {
       }
+    }
+
+    void queue_rtt_telemetry_locked(
+      Connection &connection,
+      const CongestionSample &sample,
+      const MonotonicClock::time_point now
+    ) {
+      if ((sample.valid_fields & CongestionSample::valid_rtt) == 0 ||
+          sample.smoothed_rtt_microseconds == 0 ||
+          sample.smoothed_rtt_microseconds > maximum_reported_rtt_microseconds ||
+          sample.minimum_rtt_microseconds == 0 ||
+          sample.minimum_rtt_microseconds > sample.smoothed_rtt_microseconds ||
+          connection.rtt_telemetry_in_flight || !connection.active_session_id ||
+          !connection.datagram_send_enabled ||
+          connection.maximum_datagram_bytes < datagram_header_bytes + rtt_telemetry_payload_bytes ||
+          (connection.last_rtt_telemetry_at != MonotonicClock::time_point {} &&
+           now - connection.last_rtt_telemetry_at < rtt_telemetry_interval) ||
+          connection.rtt_telemetry_generation == std::numeric_limits<std::uint64_t>::max()) {
+        return;
+      }
+
+      const auto minimum_gap = sample.smoothed_rtt_microseconds - sample.minimum_rtt_microseconds;
+      const auto sample_delta = connection.prior_smoothed_rtt_microseconds == 0 ?
+                                  minimum_gap :
+                                  (sample.smoothed_rtt_microseconds > connection.prior_smoothed_rtt_microseconds ?
+                                     sample.smoothed_rtt_microseconds - connection.prior_smoothed_rtt_microseconds :
+                                     connection.prior_smoothed_rtt_microseconds - sample.smoothed_rtt_microseconds);
+      const auto variation_input = std::min(
+        maximum_reported_rtt_microseconds,
+        std::max(minimum_gap, sample_delta)
+      );
+      connection.rtt_variation_microseconds = connection.prior_smoothed_rtt_microseconds == 0 ?
+                                                variation_input :
+                                                (connection.rtt_variation_microseconds * 3 + variation_input + 3) / 4;
+      connection.prior_smoothed_rtt_microseconds = sample.smoothed_rtt_microseconds;
+
+      auto &queue = connection.queues[lane_index(Lane::telemetry)];
+      for (const auto &queued : queue) {
+        connection.queued_bytes -= queued.bytes->size();
+        --connection.queued_packets;
+        emit_locked(
+          Event::Kind::packet_superseded,
+          &connection,
+          queued.sequence,
+          queued.lane,
+          queued.bytes->size()
+        );
+      }
+      queue.clear();
+      if (connection.queued_packets >= config_.maximum_queued_packets ||
+          datagram_header_bytes + rtt_telemetry_payload_bytes >
+            config_.maximum_queued_bytes - std::min(
+              connection.queued_bytes + connection.video_frame_bytes,
+              config_.maximum_queued_bytes
+            )) {
+        return;
+      }
+
+      const auto generation = connection.rtt_telemetry_generation + 1;
+      const auto buffer = std::ranges::find_if(connection.rtt_telemetry_buffers, [](const auto &candidate) {
+        return candidate.use_count() == 1;
+      });
+      if (buffer == connection.rtt_telemetry_buffers.end()) {
+        return;
+      }
+      auto bytes = *buffer;
+      std::ranges::fill(*bytes, 0);
+      auto record = std::span<std::uint8_t> {*bytes};
+      record[0] = 'U';
+      record[1] = 'L';
+      record[2] = 'M';
+      record[3] = '3';
+      record[4] = 3;
+      record[5] = 5;
+      record[6] = 1;
+      write_be(record, 8, datagram_header_bytes, 2);
+      write_be(record, 10, rtt_telemetry_payload_bytes, 2);
+      std::copy(
+        connection.active_session_id->begin(),
+        connection.active_session_id->end(),
+        record.begin() + 12
+      );
+      write_be(record, 28, generation, 8);
+      write_be(record, 36, generation, 8);
+      write_be(record, 44, generation, 8);
+      write_be(record, 52, sample.smoothed_rtt_microseconds, 4);
+      write_be(record, 56, sample.minimum_rtt_microseconds, 4);
+      write_be(record, 60, connection.rtt_variation_microseconds, 4);
+
+      QueuedPacket packet {
+        .sequence = connection.next_packet_sequence++,
+        .lane = Lane::telemetry,
+        .bytes = bytes,
+        .deadline = now + rtt_telemetry_lifetime,
+        .replaceable = true,
+        .object_id = generation,
+        .independently_decodable = false,
+      };
+      const auto sequence = packet.sequence;
+      const auto byte_count = packet.bytes->size();
+      connection.queued_bytes += byte_count;
+      queue.push_back(std::move(packet));
+      ++connection.queued_packets;
+      connection.rtt_telemetry_generation = generation;
+      connection.last_rtt_telemetry_at = now;
+      emit_locked(Event::Kind::packet_queued, &connection, sequence, Lane::telemetry, byte_count);
     }
 
     void complete_send_locked(
@@ -2395,7 +2558,7 @@ namespace lumen::protocol_v3::quic_server {
           return;
         }
 
-        const bool urgent = next->lane != Lane::delta_video;
+        const bool urgent = next->lane != Lane::delta_video && next->lane != Lane::telemetry;
         if (!urgent &&
             connection.send_slots.active() >= config_.maximum_in_flight_sends - config_.urgent_send_reserve) {
           return;
@@ -2425,6 +2588,9 @@ namespace lumen::protocol_v3::quic_server {
           return;
         }
         pending->packet = *next;
+        if (pending->packet.lane == Lane::telemetry) {
+          connection.rtt_telemetry_in_flight = true;
+        }
         const std::array<Buffer, 1> buffers {{
           {pending->packet.bytes->data(), pending->packet.bytes->size()},
         }};

@@ -14,6 +14,7 @@
 
 // standard includes
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 
 // lib includes
@@ -41,6 +42,25 @@ namespace proc {
    * @brief Parsed command arguments used when launching a child process.
    */
   typedef config::prep_cmd_t cmd_t;
+
+  /**
+   * @brief Populate per-session child-process variables from one launch request.
+   *
+   * `LUMEN_CLIENT_REFRESH_NUMERATOR` and `LUMEN_CLIENT_REFRESH_DENOMINATOR`
+   * preserve exact fractional refresh. Legacy `SUNSHINE_CLIENT_FPS` remains an
+   * integer for existing application scripts.
+   *
+   * @param env Environment updated in place.
+   * @param app_id Selected configured application ID.
+   * @param app_name Selected configured application name.
+   * @param launch_session Complete launch selection.
+   */
+  void apply_launch_environment(
+    boost::process::v1::environment &env,
+    int app_id,
+    std::string_view app_name,
+    const rtsp_stream::launch_session_t &launch_session
+  );
 
   /**
    * pre_cmds -- guaranteed to be executed unless any of the commands fail.

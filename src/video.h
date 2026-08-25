@@ -57,7 +57,7 @@ namespace video {
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
     bool protocolV3Colorimetry {};  ///< Use exact protocol-v3 colorimetry instead of legacy inference.
     std::uint8_t colorPrimaries {};  ///< Exact H.273 primaries code for protocol v3.
-    std::uint8_t colorTransfer {};  ///< Exact H.273 transfer code: SDR, PQ, or HLG.
+    std::uint8_t colorTransfer {};  ///< Exact H.273 transfer code: SDR, PQ (16), or HLG (18).
     std::uint8_t colorMatrix {};  ///< Exact H.273 matrix code.
     std::uint8_t colorRange {};  ///< Zero limited or one full range.
     bool hasStaticHDRMetadata {};  ///< Whether exact selected static HDR metadata applies.
@@ -72,6 +72,8 @@ namespace video {
     std::string output_name;  ///< Per-session capture output, or empty for the configured default.
     std::shared_ptr<const stream_policy::EffectiveStreamPolicy> optimization_policy;  ///< Immutable resolved session policy.
     stream_policy::ClientProtocol client_protocol {stream_policy::ClientProtocol::vanilla};  ///< Exact negotiated client family.
+    bool virtual_display_active {};  ///< An exact Lumen VDD generation owns `output_name` for this session.
+    bool virtual_display_direct_required {};  ///< Reject capture if the active VDD direct-frame path cannot stay healthy.
     std::shared_ptr<platf::virtual_display::frame_source_t> virtual_display_frame_source;  ///< Production VDD direct-frame source, or empty for DDA/WGC.
     std::function<std::pair<std::uint64_t, std::uint64_t>()> capture_input_watermark;  ///< Applied input watermark sampled at capture submission.
   };
@@ -874,5 +876,37 @@ namespace video {
   inline std::chrono::nanoseconds capture_frame_interval(const config_t &config) {
     const AVRational fps = framerate_to_rational(config);
     return std::chrono::nanoseconds {(static_cast<int64_t>(fps.den) * 1'000'000'000LL) / fps.num};
+  }
+
+  /** @brief Capture-thread action after a backend requests display reinitialization. */
+  enum class capture_reinitialization_e {
+    retry,  ///< Recreate the capture display and continue the session.
+    terminate  ///< End the capture because its required direct source was lost.
+  };
+
+  /**
+   * @brief Decide whether a capture backend may be recreated after source loss.
+   *
+   * Required Lumen VDD sessions are generation-bound. Recreating their display
+   * would either spin on the stopped source or cross into DDA/WGC fallback.
+   *
+   * @param config Active stream configuration.
+   * @return Retry for ordinary capture, or terminate for required direct capture.
+   */
+  [[nodiscard]] constexpr capture_reinitialization_e capture_reinitialization_action(
+    const config_t &config
+  ) noexcept {
+    return config.virtual_display_direct_required ?
+             capture_reinitialization_e::terminate :
+             capture_reinitialization_e::retry;
+  }
+
+  /**
+   * @brief Return the bounded display-open attempt count for one capture path.
+   * @param config Active stream configuration.
+   * @return One attempt for generation-bound direct capture, otherwise two.
+   */
+  [[nodiscard]] constexpr int display_initialization_attempts(const config_t &config) noexcept {
+    return config.virtual_display_direct_required ? 1 : 2;
   }
 }  // namespace video

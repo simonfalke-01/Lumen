@@ -1269,6 +1269,13 @@ namespace rtsp_stream {
     args.try_emplace("x-nv-video[0].clientRefreshRateX100"sv, "0"sv);
 
     stream::config_t config;
+#ifdef _WIN32
+    auto virtual_display_cleanup = util::fail_guard([&config]() noexcept {
+      if (!stream::cleanup_virtual_display(config)) {
+        BOOST_LOG(error) << "Legacy stream startup unwind could not restore Lumen virtual-display topology"sv;
+      }
+    });
+#endif
 
     const auto parsed_optimization_mode = stream_policy::parse_rtsp_announce_optimization_mode(payload);
     const auto parsed_fidelity = stream_policy::parse_rtsp_announce_fidelity_request(payload);
@@ -1518,6 +1525,9 @@ namespace rtsp_stream {
 
 #ifdef _WIN32
     {
+      const auto physical_capture_name = config.monitor.output_name;
+      const auto physical_width = config.monitor.width;
+      const auto physical_height = config.monitor.height;
       const auto refresh = video::framerate_to_rational(config.monitor);
       if (refresh.num <= 0 || refresh.den <= 0 ||
           static_cast<std::uint64_t>(refresh.num) > std::numeric_limits<std::uint32_t>::max() ||
@@ -1546,6 +1556,12 @@ namespace rtsp_stream {
         static_cast<std::uint8_t>(config.monitor.dynamicRange != 0 ? 10 : 8),
       };
       auto encoder_limits = platf::virtual_display::mode_limits_t {};
+      encoder_limits.supports_hdr10 =
+        (config.monitor.videoFormat == 1 &&
+         (video::active_hevc_mode == 3 || video::active_hevc_mode == 5)) ||
+        (config.monitor.videoFormat == 2 &&
+         (video::active_av1_mode == 3 || video::active_av1_mode == 5));
+      encoder_limits.supports_10bit = encoder_limits.supports_hdr10;
       if (config.monitor.videoFormat == 0) {
         // NVIDIA's H.264 NVENC path is bounded to 4096 active pixels per axis.
         encoder_limits.maximum_width = 4096;
@@ -1584,19 +1600,44 @@ namespace rtsp_stream {
       if (prepared.outcome == platf::virtual_display::session_prepare_e::virtual_display && prepared.selection) {
         config.monitor.width = static_cast<int>(prepared.selection->selected_mode.width);
         config.monitor.height = static_cast<int>(prepared.selection->selected_mode.height);
+        config.monitor.virtual_display_active = true;
+        config.monitor.virtual_display_direct_required =
+          activation_policy == platf::virtual_display::activation_policy_e::required ||
+          config.monitor.dynamicRange != 0;
         config.monitor.virtual_display_frame_source = platf::virtual_display::make_system_frame_source(
           *prepared.selection,
           std::chrono::milliseconds {250}
         );
-        if (!config.monitor.virtual_display_frame_source) {
+        if (!config.monitor.virtual_display_frame_source && config.monitor.virtual_display_direct_required) {
+          const auto topology_restored = stream::cleanup_virtual_display(config);
+          if (stream::allow_legacy_physical_hdr_fallback(
+                activation_policy == platf::virtual_display::activation_policy_e::optional,
+                config.monitor.dynamicRange != 0,
+                topology_restored
+              )) {
+            config.monitor.output_name = physical_capture_name;
+            config.monitor.width = physical_width;
+            config.monitor.height = physical_height;
+            BOOST_LOG(warning) << "Lumen VDD HDR direct-frame open failed after activation; restored topology and continuing physical HDR capture"sv;
+          } else {
+            BOOST_LOG(error) << "Lumen VDD direct-frame boundary unavailable; refusing required or unsafe capture fallback"sv;
+            if (!topology_restored) {
+              BOOST_LOG(error) << "Lumen VDD direct-frame startup failure could not restore display topology"sv;
+            }
+            respond(sock, session, &option, 503, "Service Unavailable", req->sequenceNumber, {});
+            return;
+          }
+        } else if (!config.monitor.virtual_display_frame_source) {
           BOOST_LOG(info) << "Lumen VDD direct-frame boundary unavailable; using proven DDA/WGC capture on the active VDD output"sv;
         }
-        BOOST_LOG(info) << "Lumen VDD selected exact legacy mode "sv
-                        << prepared.selection->selected_mode.width << 'x'
-                        << prepared.selection->selected_mode.height << '@'
-                        << prepared.selection->selected_mode.refresh.numerator << '/'
-                        << prepared.selection->selected_mode.refresh.denominator
-                        << " on "sv << config.monitor.output_name;
+        if (config.monitor.virtual_display_active) {
+          BOOST_LOG(info) << "Lumen VDD selected exact legacy mode "sv
+                          << prepared.selection->selected_mode.width << 'x'
+                          << prepared.selection->selected_mode.height << '@'
+                          << prepared.selection->selected_mode.refresh.numerator << '/'
+                          << prepared.selection->selected_mode.refresh.denominator
+                          << " on "sv << config.monitor.output_name;
+        }
       } else if (activation_policy != platf::virtual_display::activation_policy_e::disabled) {
         BOOST_LOG(info) << "Lumen VDD safely fell back to the configured physical capture path [diagnostic="sv
                         << static_cast<int>(prepared.diagnostic) << ']';
@@ -1631,6 +1672,9 @@ namespace rtsp_stream {
     }
 
     microphone_claim_guard.disable();
+#ifdef _WIN32
+    virtual_display_cleanup.disable();
+#endif
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 

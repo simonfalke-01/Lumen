@@ -261,6 +261,7 @@ namespace input {
 
     detail::controller_timer_generation_t timers;  ///< Connection generation and cancellable delayed work.
     gamepad_slot_allocator_t::reservation_t reservation;  ///< Generation-qualified global slot ownership.
+    platf::gamepad_feedback_id_t feedback_identity {};  ///< Immutable identity assigned before allocation.
 
     int id;  ///< Global gamepad slot assigned to this client controller.
 
@@ -1317,12 +1318,22 @@ namespace input {
     }
 
     // Allocate a new gamepad
-    if (platf::alloc_gamepad(platf_input, {reservation.id, packet->controllerNumber}, arrival, input->feedback_queue)) {
+    auto &gamepad = input->gamepads[packet->controllerNumber];
+    if (platf::alloc_gamepad(
+          platf_input,
+          {
+            reservation.id,
+            packet->controllerNumber,
+            gamepad.feedback_identity.input_generation,
+            gamepad.feedback_identity.controller_generation,
+          },
+          arrival,
+          input->feedback_queue
+        )) {
       gamepad_slots.release(reservation);
       return false;
     }
 
-    auto &gamepad = input->gamepads[packet->controllerNumber];
     gamepad.reservation = reservation;
     gamepad.id = reservation.id;
     gamepad.timers.connect();
@@ -1583,7 +1594,17 @@ namespace input {
         return false;
       }
 
-      if (platf::alloc_gamepad(platf_input, {reservation.id, (uint8_t) packet->controllerNumber}, {}, input->feedback_queue)) {
+      if (platf::alloc_gamepad(
+            platf_input,
+            {
+              reservation.id,
+              static_cast<std::uint8_t>(packet->controllerNumber),
+              gamepad.feedback_identity.input_generation,
+              gamepad.feedback_identity.controller_generation,
+            },
+            {},
+            input->feedback_queue
+          )) {
         gamepad_slots.release(reservation);
         return false;
       }
@@ -1599,6 +1620,7 @@ namespace input {
       gamepad.id = -1;
       gamepad.gamepad_state = {};
       gamepad.back_button_state = button_state_e::NONE;
+      gamepad.feedback_identity = {};
       return true;
     }
 
@@ -2216,7 +2238,7 @@ namespace input {
     std::shared_ptr<input_t> &input,
     ordered_state_operation_t operation,
     bool supersedable,
-    std::function<void()> completion
+    std::function<void(bool)> completion
   ) {
     if (!input || !input->dispatcher || !operation) {
       return false;
@@ -2228,10 +2250,13 @@ namespace input {
           return passthrough_next_message(raw_input, std::move(packet));
         }};
         if (!operation(injector)) {
+          if (completion) {
+            completion(false);
+          }
           throw std::runtime_error {"protocol-v3 ordered input operation failed"};
         }
         if (completion) {
-          completion();
+          completion(true);
         }
       },
       supersedable
@@ -2240,6 +2265,26 @@ namespace input {
       BOOST_LOG(debug) << "Ignoring protocol-v3 input state after ordered dispatcher shutdown"sv;
       return false;
     }
+    return true;
+  }
+
+  bool set_gamepad_feedback_identity(
+    input_t *input,
+    const std::uint8_t controller,
+    const std::uint32_t input_generation,
+    const std::uint32_t controller_generation
+  ) noexcept {
+    if (!input || controller >= input->gamepads.size() || input_generation == 0 ||
+        controller_generation == 0) {
+      return false;
+    }
+    auto &gamepad = input->gamepads[controller];
+    if (gamepad.id >= 0) {
+      return gamepad.feedback_identity.id == controller &&
+             gamepad.feedback_identity.input_generation == input_generation &&
+             gamepad.feedback_identity.controller_generation == controller_generation;
+    }
+    gamepad.feedback_identity = {controller, input_generation, controller_generation};
     return true;
   }
 

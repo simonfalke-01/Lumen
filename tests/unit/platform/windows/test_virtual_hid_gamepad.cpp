@@ -260,12 +260,14 @@ namespace {
     harness_t &harness,
     profile_kind_e profile,
     feedback_queue_t queue = {},
-    std::uint64_t generation = 1
+    std::uint64_t generation = 1,
+    std::uint32_t input_generation = 0,
+    std::uint32_t controller_generation = 0
   ) {
     return virtual_hid_gamepad_t::create(
       harness.session,
       profile,
-      {0, 3},
+      {0, 3, input_generation, controller_generation},
       {},
       std::move(queue),
       generation
@@ -378,10 +380,14 @@ TEST(VirtualHidGamepadTest, GenericWindowsReportInvertsTriggerPolarity) {
 TEST(VirtualHidGamepadTest, DeduplicatesParsedRumbleAndRgbFeedback) {
   harness_t harness;
   auto [mail, queue] = feedback_queue();
-  auto created = create_gamepad(harness, profile_kind_e::dualshock4, queue, 9);
+  auto created = create_gamepad(harness, profile_kind_e::dualshock4, queue, 9, 7, 3);
   ASSERT_TRUE(created) << created.error;
-  ASSERT_TRUE(pop_feedback(queue));
-  ASSERT_TRUE(pop_feedback(queue));
+  const auto acceleration = pop_feedback(queue);
+  const auto gyroscope = pop_feedback(queue);
+  ASSERT_TRUE(acceleration);
+  ASSERT_TRUE(gyroscope);
+  EXPECT_EQ(acceleration->identity, (gamepad_feedback_id_t {3, 7, 3}));
+  EXPECT_EQ(gyroscope->identity, (gamepad_feedback_id_t {3, 7, 3}));
 
   // DS4 USB output: report 0x05, valid rumble + lightbar flags, motors, RGB.
   std::vector<std::uint8_t> report(32);
@@ -401,6 +407,8 @@ TEST(VirtualHidGamepadTest, DeduplicatesParsedRumbleAndRgbFeedback) {
   ASSERT_TRUE(second);
   EXPECT_EQ(first->type, gamepad_feedback_e::rumble);
   EXPECT_EQ(second->type, gamepad_feedback_e::set_rgb_led);
+  EXPECT_EQ(first->identity, (gamepad_feedback_id_t {3, 7, 3}));
+  EXPECT_EQ(second->identity, (gamepad_feedback_id_t {3, 7, 3}));
   EXPECT_FALSE(queue->pop(30ms));
   created.backend->close();
 }

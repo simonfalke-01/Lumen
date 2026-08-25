@@ -117,6 +117,8 @@ namespace lumen::protocol_v3::media {
               config.matrix_code == 6 || config.matrix_code == 9) &&
              (config.transfer == 1 || (config.primaries == 9 && config.matrix_code == 9)) &&
              (config.transfer != 1 || !config.static_hdr_metadata.has_value()) &&
+             (config.transfer != 2 || config.static_hdr_metadata.has_value()) &&
+             (config.transfer != 3 || !config.static_hdr_metadata.has_value()) &&
              (config.codec_flags & ~0x03U) == 0 && config.fidelity >= 1 && config.fidelity <= 3 &&
              (config.fidelity != 3 || (config.codec_flags & 0x02U) != 0) &&
              config.video_generation != 0 && config.audio_generation != 0 &&
@@ -558,6 +560,72 @@ namespace lumen::protocol_v3::media {
     );
   }
 
+  PublishResult SessionPipeline::submit_controller_feedback(
+    const ControllerFeedback &feedback
+  ) {
+    std::lock_guard lock {mutex_};
+    if (!running_) {
+      return PublishResult::stopped;
+    }
+    if (feedback.input_generation == 0 || feedback.controller_generation == 0 ||
+        feedback.controller_id >= 16 || feedback.command < 1 || feedback.command > 5 ||
+        next_input_sequence_ > sequence_exhaustion_boundary) {
+      return PublishResult::invalid;
+    }
+
+    std::array<std::uint8_t, 40> payload {};
+    write_be(payload, 0, feedback.input_generation, 4);
+    write_be(payload, 4, feedback.controller_generation, 4);
+    payload[8] = feedback.controller_id;
+    payload[9] = feedback.command;
+    switch (feedback.command) {
+      case 1:
+      case 2:
+        write_be(payload, 10, 4, 2);
+        write_be(payload, 12, feedback.low_frequency, 2);
+        write_be(payload, 14, feedback.high_frequency, 2);
+        break;
+      case 3:
+        if ((feedback.motion_type != 1 && feedback.motion_type != 2) ||
+            feedback.report_rate_hz > 2'000) {
+          return PublishResult::invalid;
+        }
+        write_be(payload, 10, 4, 2);
+        payload[12] = feedback.motion_type;
+        write_be(payload, 14, feedback.report_rate_hz, 2);
+        break;
+      case 4:
+        write_be(payload, 10, 3, 2);
+        payload[12] = feedback.red;
+        payload[13] = feedback.green;
+        payload[14] = feedback.blue;
+        break;
+      case 5:
+        if ((feedback.adaptive_flags & ~0x0cU) != 0) {
+          return PublishResult::invalid;
+        }
+        write_be(payload, 10, 24, 2);
+        payload[12] = feedback.adaptive_flags;
+        payload[13] = feedback.adaptive_left_type;
+        payload[14] = feedback.adaptive_right_type;
+        std::ranges::copy(feedback.adaptive_left, payload.begin() + 16);
+        std::ranges::copy(feedback.adaptive_right, payload.begin() + 26);
+        break;
+      default:
+        return PublishResult::invalid;
+    }
+    return publish(
+      quic_server::Lane::input_edge,
+      1,
+      4,
+      0,
+      next_input_sequence_++,
+      feedback.input_generation,
+      payload,
+      false
+    );
+  }
+
   ReceiveResult SessionPipeline::receive(const quic_server::DatagramRecord &record) {
     std::lock_guard lock {mutex_};
     if (!running_) {
@@ -717,8 +785,12 @@ namespace lumen::protocol_v3::media {
       }
       const auto action = record.payload[16];
       const auto range_count = record.payload[17];
+      const auto deadline_miss_microseconds = read_be32(record.payload, 20);
       if (action < 1 || action > 5 || range_count > 16 ||
-          read_be16(record.payload, 18) != 0 || read_be64(record.payload, 24) != 0 ||
+          read_be16(record.payload, 18) != 0 ||
+          deadline_miss_microseconds > maximum_deadline_miss_microseconds ||
+          ((action != 1 && action != 3) && deadline_miss_microseconds != 0) ||
+          read_be64(record.payload, 24) != 0 ||
           record.payload.size() != 32U + static_cast<std::size_t>(range_count) * 4U ||
           (action != 2 && range_count != 0)) {
         return ReceiveResult::malformed;
@@ -740,10 +812,30 @@ namespace lumen::protocol_v3::media {
         .last_reassembled_frame_id = read_be64(record.payload, 0),
         .last_decoded_frame_id = read_be64(record.payload, 8),
         .action = action,
-        .deadline_miss_microseconds = read_be32(record.payload, 20),
+        .deadline_miss_microseconds = deadline_miss_microseconds,
         .loss_ranges = record.payload.subspan(32),
       });
       ++telemetry_.feedback_packets;
+      if (action == 1 || action == 3) {
+        if (telemetry_.deadline_samples != std::numeric_limits<std::uint64_t>::max()) {
+          ++telemetry_.deadline_samples;
+        }
+        telemetry_.latest_deadline_miss_microseconds = deadline_miss_microseconds;
+        telemetry_.peak_deadline_miss_microseconds = std::max(
+          telemetry_.peak_deadline_miss_microseconds,
+          deadline_miss_microseconds
+        );
+        if (deadline_miss_microseconds == 0) {
+          telemetry_.consecutive_deadline_misses = 0;
+        } else {
+          if (telemetry_.deadline_misses != std::numeric_limits<std::uint64_t>::max()) {
+            ++telemetry_.deadline_misses;
+          }
+          if (telemetry_.consecutive_deadline_misses != std::numeric_limits<std::uint64_t>::max()) {
+            ++telemetry_.consecutive_deadline_misses;
+          }
+        }
+      }
       return ReceiveResult::accepted;
     }
     return ReceiveResult::forbidden;

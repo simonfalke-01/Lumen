@@ -166,6 +166,12 @@ i2j7w5vhA66Ep18oU6mfswVI
 
   class TestMsQuicApi final: public quic::MsQuicApi {
   public:
+    struct DatagramSend {
+      std::vector<std::uint8_t> bytes;
+      std::uint64_t token {};
+      bool urgent {};
+    };
+
     bool is_schannel() const noexcept override {
       return true;
     }
@@ -310,16 +316,21 @@ i2j7w5vhA66Ep18oU6mfswVI
 
     quic::ApiStatus datagram_send(
       quic::Handle,
-      std::span<const quic::Buffer>,
-      std::uint64_t,
-      bool,
+      const std::span<const quic::Buffer> buffers,
+      const std::uint64_t token,
+      const bool urgent,
       bool
     ) override {
+      DatagramSend send {.token = token, .urgent = urgent};
+      for (const auto &buffer : buffers) {
+        send.bytes.insert(send.bytes.end(), buffer.data, buffer.data + buffer.size);
+      }
+      datagram_sends.push_back(std::move(send));
       return quic::ApiStatus::success;
     }
 
     std::optional<quic::CongestionSample> congestion_sample(quic::Handle) noexcept override {
-      return std::nullopt;
+      return congestion;
     }
 
     quic::ApiStatus accept_connection(const quic::Handle connection = 10) {
@@ -359,6 +370,8 @@ i2j7w5vhA66Ep18oU6mfswVI
     std::map<quic::Handle, StreamCallback> stream_callbacks;
     std::vector<std::pair<quic::Handle, std::uint64_t>> connection_shutdowns;
     std::vector<std::pair<quic::Handle, std::uint64_t>> stream_shutdowns;
+    std::vector<DatagramSend> datagram_sends;
+    std::optional<quic::CongestionSample> congestion;
     quic::Handle next_stream {100};
     std::atomic_size_t listener_stop_calls {};
     bool complete_listener_stop_synchronously {};
@@ -420,6 +433,38 @@ i2j7w5vhA66Ep18oU6mfswVI
     ASSERT_TRUE(quic::parse_datagram_record(record, quic::Direction::client_to_host, id, 1152));
     EXPECT_EQ(
       quic::parse_datagram_record(record, quic::Direction::host_to_client, id, 1152).error(),
+      quic::ParseError::reserved_route
+    );
+    const auto controller_feedback = datagram(1, 4);
+    ASSERT_TRUE(quic::parse_datagram_record(
+      controller_feedback,
+      quic::Direction::host_to_client,
+      id,
+      1152
+    ));
+    EXPECT_EQ(
+      quic::parse_datagram_record(
+        controller_feedback,
+        quic::Direction::client_to_host,
+        id,
+        1152
+      ).error(),
+      quic::ParseError::reserved_route
+    );
+    const auto rtt_telemetry = datagram(5, 1);
+    ASSERT_TRUE(quic::parse_datagram_record(
+      rtt_telemetry,
+      quic::Direction::host_to_client,
+      id,
+      1152
+    ));
+    EXPECT_EQ(
+      quic::parse_datagram_record(
+        rtt_telemetry,
+        quic::Direction::client_to_host,
+        id,
+        1152
+      ).error(),
       quic::ParseError::reserved_route
     );
     bad = record;
@@ -774,6 +819,87 @@ i2j7w5vhA66Ep18oU6mfswVI
     EXPECT_EQ(quic::latency_video_send_budget({32, 4, 1152, 100'000, 4'000, {}, {}}), 28U);
     EXPECT_EQ(quic::latency_video_send_budget({32, 4, 1152, 20'000, 1'000, {}, {}}), 3U);
     EXPECT_EQ(quic::latency_video_send_budget({32, 4, 1152, 100'000, 4'000, 8'000, 4'544}), 3U);
+  }
+
+  TEST(ProtocolV3Transport, RealCongestionSampleEmitsBoundedAuthenticatedRttTelemetry) {
+    TestMsQuicApi api;
+    api.congestion = quic::CongestionSample {
+      .valid_fields = quic::CongestionSample::valid_rtt,
+      .smoothed_rtt_microseconds = 4'000,
+      .minimum_rtt_microseconds = 3'000,
+    };
+    TestSessionFactory factory;
+    quic::QuicServer server {api, test_config(), factory};
+    connect_test_server(api, server);
+    authenticate_test_server(api);
+    ASSERT_EQ(
+      api.connection_event({
+        .kind = quic::ConnectionEvent::Kind::datagram_state_changed,
+        .maximum_datagram_bytes = 1'152,
+        .datagram_send_enabled = true,
+      }),
+      quic::ApiStatus::success
+    );
+
+    auto video = std::make_shared<const std::vector<std::uint8_t>>(datagram(2, 1));
+    ASSERT_EQ(
+      server.enqueue(1, {
+        .lane = quic::Lane::delta_video,
+        .bytes = video,
+        .deadline = {},
+        .replaceable = true,
+      }),
+      quic::EnqueueResult::queued
+    );
+    ASSERT_EQ(api.datagram_sends.size(), 1U);
+    const auto video_token = api.datagram_sends.front().token;
+    ASSERT_EQ(
+      api.connection_event({
+        .kind = quic::ConnectionEvent::Kind::datagram_send_complete,
+        .send_token = video_token,
+      }),
+      quic::ApiStatus::success
+    );
+
+    ASSERT_EQ(api.datagram_sends.size(), 2U);
+    const auto &telemetry = api.datagram_sends.back();
+    EXPECT_FALSE(telemetry.urgent);
+    const auto active_session = session_id();
+    const auto parsed = quic::parse_datagram_record(
+      telemetry.bytes,
+      quic::Direction::host_to_client,
+      active_session,
+      1'152
+    );
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(parsed->channel, 5);
+    EXPECT_EQ(parsed->kind, 1);
+    EXPECT_EQ(parsed->sequence, 1U);
+    EXPECT_EQ(parsed->object_id, 1U);
+    ASSERT_EQ(parsed->payload.size(), 24U);
+    EXPECT_EQ(parsed->payload[7], 1);
+    EXPECT_EQ(parsed->payload[8], 0);
+    EXPECT_EQ(parsed->payload[9], 0);
+    EXPECT_EQ(parsed->payload[10], 0x0f);
+    EXPECT_EQ(parsed->payload[11], 0xa0);
+    EXPECT_EQ(parsed->payload[12], 0);
+    EXPECT_EQ(parsed->payload[13], 0);
+    EXPECT_EQ(parsed->payload[14], 0x0b);
+    EXPECT_EQ(parsed->payload[15], 0xb8);
+    EXPECT_EQ(parsed->payload[16], 0);
+    EXPECT_EQ(parsed->payload[17], 0);
+    EXPECT_EQ(parsed->payload[18], 0x03);
+    EXPECT_EQ(parsed->payload[19], 0xe8);
+    EXPECT_TRUE(std::ranges::all_of(parsed->payload.begin() + 20, parsed->payload.end(), [](const auto byte) {
+      return byte == 0;
+    }));
+    EXPECT_EQ(
+      api.connection_event({
+        .kind = quic::ConnectionEvent::Kind::datagram_send_complete,
+        .send_token = telemetry.token,
+      }),
+      quic::ApiStatus::success
+    );
   }
 
   TEST(ProtocolV3Transport, SendSlotPoolIsBoundedReusableAndRejectsStaleCompletions) {

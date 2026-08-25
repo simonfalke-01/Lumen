@@ -24,8 +24,13 @@ namespace platf::virtual_display {
   class session_lease_t;
 }
 
+namespace rtsp_stream {
+  struct launch_session_t;
+}
+
 #if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
   namespace lumen::protocol_v3::media {
+    struct NegotiatedMediaConfig;
     class TransportSink;
   }
 
@@ -177,6 +182,50 @@ namespace stream {
     std::optional<int> gcmap;  ///< Optional game-controller mapping override from the launch request.
   };
 
+  /**
+   * @brief Run direct-frame shutdown before releasing its display-generation lease.
+   *
+   * @tparam StopFrameSource Callable that stops and resets the direct-frame source.
+   * @tparam ReleaseDisplayLease Callable that releases and resets the VDD lease.
+   * @param stop_frame_source Source shutdown action.
+   * @param release_display_lease Lease release action.
+   * @return Result returned by `release_display_lease` after source shutdown.
+   */
+  template<class StopFrameSource, class ReleaseDisplayLease>
+  [[nodiscard]] bool ordered_virtual_display_cleanup(
+    StopFrameSource &&stop_frame_source,
+    ReleaseDisplayLease &&release_display_lease
+  ) noexcept {
+    std::forward<StopFrameSource>(stop_frame_source)();
+    return std::forward<ReleaseDisplayLease>(release_display_lease)();
+  }
+
+  /**
+   * @brief Decide whether legacy HDR may return to physical capture after VDD open fails.
+   *
+   * @param policy_optional Whether the configured legacy VDD policy permits fallback.
+   * @param hdr_requested Whether the stream requested HDR capture.
+   * @param topology_restored Whether VDD teardown restored the prior topology.
+   * @return True only for optional HDR after a verified rollback.
+   */
+  [[nodiscard]] constexpr bool allow_legacy_physical_hdr_fallback(
+    const bool policy_optional,
+    const bool hdr_requested,
+    const bool topology_restored
+  ) noexcept {
+    return policy_optional && hdr_requested && topology_restored;
+  }
+
+#ifdef _WIN32
+  /**
+   * @brief Stop/reset a session's direct-frame source, then release/reset its VDD lease.
+   *
+   * @param config Session configuration owning the source and lease.
+   * @return True when no lease existed or the active lease released successfully.
+   */
+  [[nodiscard]] bool cleanup_virtual_display(config_t &config) noexcept;
+#endif
+
   namespace session {
     /**
      * @brief Enumerates supported state options.
@@ -248,6 +297,25 @@ namespace stream {
   }  // namespace session
 
 #if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
+  /**
+   * @brief Apply the exact negotiated v3 Opus tuple and host-playback policy.
+   * @param output Audio capture configuration updated in place.
+   * @param selection Immutable v3 media selection.
+   */
+  void configure_protocol_v3_audio(
+    audio::config_t &output,
+    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection
+  );
+
+#ifdef SUNSHINE_TESTS
+  /** @brief Exercise the production immutable controller-feedback generation fence. */
+  bool protocol_v3_feedback_is_current_for_test(
+    const platf::gamepad_feedback_msg_t &message,
+    std::uint32_t input_generation,
+    std::uint32_t controller_generation
+  ) noexcept;
+#endif
+
   /**
    * @brief Create the native START-owned protocol-v3 capture/input/media factory.
    *

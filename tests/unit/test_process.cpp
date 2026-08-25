@@ -70,6 +70,45 @@ TEST_F(ProcessPNGTest, CheckValidPNG_ValidSignature) {
   EXPECT_TRUE(proc::check_valid_png(test_file));
 }
 
+TEST(ProcessLaunchEnvironmentTest, PreservesExactModernRefreshAndLegacyIntegerCompatibility) {
+  boost::process::v1::environment env {boost::this_process::environment()};
+  rtsp_stream::launch_session_t launch {};
+  launch.width = 3456;
+  launch.height = 2160;
+  launch.fps = 60;
+  launch.refresh_numerator = 60'000;
+  launch.refresh_denominator = 1'001;
+  launch.enable_hdr = true;
+  launch.host_audio = false;
+  launch.surround_info = 0x003f0006;
+  launch.surround_params = "642012345";
+
+  proc::apply_launch_environment(env, 7, "Desktop", launch);
+
+  EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_NUMERATOR"].to_string(), "60000");
+  EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_DENOMINATOR"].to_string(), "1001");
+  EXPECT_NEAR(std::stod(env["LUMEN_CLIENT_FPS"].to_string()), 60'000.0 / 1'001.0, 1e-12);
+  EXPECT_EQ(env["LUMEN_CLIENT_HDR"].to_string(), "true");
+  EXPECT_EQ(env["LUMEN_CLIENT_HOST_AUDIO"].to_string(), "false");
+  EXPECT_EQ(env["LUMEN_CLIENT_AUDIO_CONFIGURATION"].to_string(), "5.1");
+  EXPECT_EQ(env["LUMEN_CLIENT_AUDIO_SURROUND_PARAMS"].to_string(), "642012345");
+  EXPECT_EQ(env["SUNSHINE_CLIENT_FPS"].to_string(), "60");
+}
+
+TEST(ProcessLaunchEnvironmentTest, LegacyLaunchFallsBackToIntegerRefreshRational) {
+  boost::process::v1::environment env {boost::this_process::environment()};
+  rtsp_stream::launch_session_t launch {};
+  launch.fps = 120;
+  launch.surround_info = 2;
+
+  proc::apply_launch_environment(env, 1, "Legacy", launch);
+
+  EXPECT_EQ(env["LUMEN_CLIENT_FPS"].to_string(), "120");
+  EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_NUMERATOR"].to_string(), "120");
+  EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_DENOMINATOR"].to_string(), "1");
+  EXPECT_EQ(env["SUNSHINE_CLIENT_FPS"].to_string(), "120");
+}
+
 TEST_F(ProcessPNGTest, CheckValidPNG_WrongSignature) {
   // Invalid PNG signature (wrong magic bytes)
   const std::vector<unsigned char> invalid_png_data = {

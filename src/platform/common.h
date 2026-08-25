@@ -119,6 +119,16 @@ namespace platf {
     set_adaptive_triggers,  ///< Set adaptive triggers
   };
 
+  /** @brief Immutable client-visible identity captured when one virtual controller is allocated. */
+  struct gamepad_feedback_id_t {
+    std::uint16_t id {};  ///< Client-relative controller identifier.
+    std::uint32_t input_generation {};  ///< Owning protocol-v3 input generation, or zero for legacy.
+    std::uint32_t controller_generation {};  ///< Owning controller instance generation, or zero for legacy.
+
+    /** @brief Compare the complete immutable feedback identity. */
+    bool operator==(const gamepad_feedback_id_t &) const = default;
+  };
+
   /**
    * @brief Feedback command sent from Sunshine to a virtual gamepad.
    */
@@ -126,15 +136,15 @@ namespace platf {
     /**
      * @brief Create a rumble object or message.
      *
-     * @param id Identifier for the controller, session, display, or resource.
+     * @param identity Immutable input/controller identity.
      * @param lowfreq Low-frequency rumble motor intensity.
      * @param highfreq High-frequency rumble motor intensity.
      * @return Constructed rumble object.
      */
-    static gamepad_feedback_msg_t make_rumble(std::uint16_t id, std::uint16_t lowfreq, std::uint16_t highfreq) {
+    static gamepad_feedback_msg_t make_rumble(gamepad_feedback_id_t identity, std::uint16_t lowfreq, std::uint16_t highfreq) {
       gamepad_feedback_msg_t msg;
       msg.type = gamepad_feedback_e::rumble;
-      msg.id = id;
+      msg.identity = identity;
       msg.data.rumble = {lowfreq, highfreq};
       return msg;
     }
@@ -142,15 +152,15 @@ namespace platf {
     /**
      * @brief Create rumble triggers.
      *
-     * @param id Identifier for the controller, session, display, or resource.
+     * @param identity Immutable input/controller identity.
      * @param left Left trigger or motor payload for the feedback command.
      * @param right Right trigger or motor payload for the feedback command.
      * @return Constructed rumble triggers object.
      */
-    static gamepad_feedback_msg_t make_rumble_triggers(std::uint16_t id, std::uint16_t left, std::uint16_t right) {
+    static gamepad_feedback_msg_t make_rumble_triggers(gamepad_feedback_id_t identity, std::uint16_t left, std::uint16_t right) {
       gamepad_feedback_msg_t msg;
       msg.type = gamepad_feedback_e::rumble_triggers;
-      msg.id = id;
+      msg.identity = identity;
       msg.data.rumble_triggers = {left, right};
       return msg;
     }
@@ -158,15 +168,15 @@ namespace platf {
     /**
      * @brief Motion-event feedback command payload for a controller.
      *
-     * @param id Identifier for the controller, session, display, or resource.
+     * @param identity Immutable input/controller identity.
      * @param motion_type Motion type.
      * @param report_rate Report rate.
      * @return Constructed motion event state object.
      */
-    static gamepad_feedback_msg_t make_motion_event_state(std::uint16_t id, std::uint8_t motion_type, std::uint16_t report_rate) {
+    static gamepad_feedback_msg_t make_motion_event_state(gamepad_feedback_id_t identity, std::uint8_t motion_type, std::uint16_t report_rate) {
       gamepad_feedback_msg_t msg;
       msg.type = gamepad_feedback_e::set_motion_event_state;
-      msg.id = id;
+      msg.identity = identity;
       msg.data.motion_event_state.motion_type = motion_type;
       msg.data.motion_event_state.report_rate = report_rate;
       return msg;
@@ -175,16 +185,16 @@ namespace platf {
     /**
      * @brief Create RGB led.
      *
-     * @param id Identifier for the controller, session, display, or resource.
+     * @param identity Immutable input/controller identity.
      * @param r Red color channel value.
      * @param g Green color channel value.
      * @param b Blue color channel value.
      * @return Constructed RGB led object.
      */
-    static gamepad_feedback_msg_t make_rgb_led(std::uint16_t id, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+    static gamepad_feedback_msg_t make_rgb_led(gamepad_feedback_id_t identity, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
       gamepad_feedback_msg_t msg;
       msg.type = gamepad_feedback_e::set_rgb_led;
-      msg.id = id;
+      msg.identity = identity;
       msg.data.rgb_led = {r, g, b};
       return msg;
     }
@@ -192,7 +202,7 @@ namespace platf {
     /**
      * @brief Create adaptive triggers.
      *
-     * @param id Identifier for the controller, session, display, or resource.
+     * @param identity Immutable input/controller identity.
      * @param event_flags Event flags.
      * @param type_left Type left.
      * @param type_right Type right.
@@ -200,16 +210,16 @@ namespace platf {
      * @param right Right trigger or motor payload for the feedback command.
      * @return Constructed adaptive triggers object.
      */
-    static gamepad_feedback_msg_t make_adaptive_triggers(std::uint16_t id, uint8_t event_flags, uint8_t type_left, uint8_t type_right, const std::array<uint8_t, 10> &left, const std::array<uint8_t, 10> &right) {
+    static gamepad_feedback_msg_t make_adaptive_triggers(gamepad_feedback_id_t identity, uint8_t event_flags, uint8_t type_left, uint8_t type_right, const std::array<uint8_t, 10> &left, const std::array<uint8_t, 10> &right) {
       gamepad_feedback_msg_t msg;
       msg.type = gamepad_feedback_e::set_adaptive_triggers;
-      msg.id = id;
+      msg.identity = identity;
       msg.data.adaptive_triggers = {.event_flags = event_flags, .type_left = type_left, .type_right = type_right, .left = left, .right = right};
       return msg;
     }
 
     gamepad_feedback_e type;  ///< Feedback command type stored in the union payload.
-    std::uint16_t id;  ///< Controller identifier associated with this message.
+    gamepad_feedback_id_t identity;  ///< Immutable session/controller identity captured at emission.
 
     union {
       struct {
@@ -410,6 +420,13 @@ namespace platf {
     // client. It must be used when communicating back to the client via
     // the input feedback queue.
     std::uint8_t clientRelativeIndex;  ///< Client relative index.
+    std::uint32_t inputGeneration {};  ///< Protocol-v3 input generation, or zero for legacy clients.
+    std::uint32_t controllerGeneration {};  ///< Protocol-v3 controller instance generation, or zero for legacy.
+
+    /** @brief Return the immutable feedback identity for callbacks owned by this allocation. */
+    gamepad_feedback_id_t feedback_identity() const noexcept {
+      return {clientRelativeIndex, inputGeneration, controllerGeneration};
+    }
   };
 
   /**

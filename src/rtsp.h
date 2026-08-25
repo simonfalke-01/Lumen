@@ -118,6 +118,8 @@ namespace rtsp_stream {
     int width;  ///< Frame or display width in pixels.
     int height;  ///< Frame or display height in pixels.
     int fps;  ///< Requested video frame rate.
+    std::uint32_t refresh_numerator {};  ///< Exact requested refresh numerator when available.
+    std::uint32_t refresh_denominator {};  ///< Exact requested refresh denominator when available.
     int gcmap;  ///< Game controller mapping requested by the client.
     int appid;  ///< Application ID requested for launch or resume.
     int surround_info;  ///< Encoded GameStream surround-sound capability flags.

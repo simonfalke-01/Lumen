@@ -1041,24 +1041,62 @@ namespace lumen::protocol_v3::runtime {
     if (launch.application_id == 0) {
       return false;
     }
-    const auto fps = launch.refresh_denominator == 0 ? 0 :
-                                                       launch.refresh_numerator / launch.refresh_denominator;
-    if (launch.application_id > INT_MAX || launch.width > INT_MAX || launch.height > INT_MAX ||
-        fps == 0 || fps > INT_MAX) {
-      return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
+    auto legacy_shape = make_legacy_launch_session(launch);
+    if (!legacy_shape) {
+      return std::unexpected(legacy_shape.error());
     }
-    auto legacy_shape = std::make_shared<rtsp_stream::launch_session_t>();
-    legacy_shape->host_audio = false;
-    legacy_shape->unique_id = "protocol-v3";
-    legacy_shape->width = static_cast<int>(launch.width);
-    legacy_shape->height = static_cast<int>(launch.height);
-    legacy_shape->fps = static_cast<int>(fps);
-    legacy_shape->appid = static_cast<int>(launch.application_id);
-    legacy_shape->surround_info = 2;
-    if (const auto status = proc::proc.execute(static_cast<int>(launch.application_id), legacy_shape); status != 0) {
+    if (const auto status = proc::proc.execute(static_cast<int>(launch.application_id), *legacy_shape); status != 0) {
       return std::unexpected(static_cast<std::uint8_t>(status == 404 ? Status::application_not_found : Status::resource_failure));
     }
     return true;
+  }
+
+  std::expected<std::shared_ptr<rtsp_stream::launch_session_t>, std::uint8_t>
+    make_legacy_launch_session(const ApplicationLaunch &launch) {
+    if (launch.application_id > INT_MAX || launch.width > INT_MAX || launch.height > INT_MAX ||
+        launch.refresh_numerator == 0 || launch.refresh_denominator == 0 ||
+        launch.audio.sample_rate != 48'000 ||
+        (launch.audio.channels != 2 && launch.audio.channels != 6 && launch.audio.channels != 8) ||
+        launch.audio.layout != (launch.audio.channels == 2 ? 1 : launch.audio.channels == 6 ? 2 :
+                                                                                              3) ||
+        static_cast<unsigned>(launch.audio.streams) + launch.audio.coupled_streams != launch.audio.channels) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
+    }
+    const auto rounded_fps =
+      (static_cast<std::uint64_t>(launch.refresh_numerator) + launch.refresh_denominator / 2U) /
+      launch.refresh_denominator;
+    if (rounded_fps == 0 || rounded_fps > INT_MAX) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
+    }
+    const auto channel_mask = launch.audio.channels == 2 ? 0x3U :
+                              launch.audio.channels == 6 ? 0x3fU :
+                                                           0x63fU;
+    std::string surround_params;
+    surround_params.reserve(static_cast<std::size_t>(launch.audio.channels) + 3U);
+    surround_params.push_back(static_cast<char>('0' + launch.audio.channels));
+    surround_params.push_back(static_cast<char>('0' + launch.audio.streams));
+    surround_params.push_back(static_cast<char>('0' + launch.audio.coupled_streams));
+    for (std::size_t index = 0; index < launch.audio.channels; ++index) {
+      if (launch.audio.mapping[index] >= launch.audio.channels) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
+      }
+      surround_params.push_back(static_cast<char>('0' + launch.audio.mapping[index]));
+    }
+
+    auto legacy_shape = std::make_shared<rtsp_stream::launch_session_t>();
+    legacy_shape->host_audio = launch.host_audio;
+    legacy_shape->unique_id = "protocol-v3";
+    legacy_shape->width = static_cast<int>(launch.width);
+    legacy_shape->height = static_cast<int>(launch.height);
+    legacy_shape->fps = static_cast<int>(rounded_fps);
+    legacy_shape->refresh_numerator = launch.refresh_numerator;
+    legacy_shape->refresh_denominator = launch.refresh_denominator;
+    legacy_shape->appid = static_cast<int>(launch.application_id);
+    legacy_shape->surround_info = static_cast<int>((channel_mask << 16U) | launch.audio.channels);
+    legacy_shape->surround_params = std::move(surround_params);
+    legacy_shape->continuous_audio = true;
+    legacy_shape->enable_hdr = launch.enable_hdr;
+    return legacy_shape;
   }
 
   bool LumenApplicationBridge::stop(const bool quit_application) noexcept {
@@ -1390,11 +1428,14 @@ namespace lumen::protocol_v3::runtime {
       return std::unexpected(static_cast<std::uint8_t>(Status::unauthorized));
     }
     if (connection_id == 0 || maximum_datagram_bytes < quic_server::maximum_semantic_datagram_bytes ||
-        !exact_keys(request_fields, 1, 17) || impl_->sessions.size() >= 8 ||
+        impl_->sessions.size() >= 8 ||
         std::ranges::any_of(impl_->sessions, [&](const auto &entry) {
           return entry.second.owner_client_id == client.client_id;
         })) {
       return std::unexpected(static_cast<std::uint8_t>(Status::busy));
+    }
+    if (!exact_keys(request_fields, 1, 18)) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
     }
     const auto intent = fixed_field<16>(request_fields, 1);
     const auto trace = fixed_field<16>(request_fields, 13);
@@ -1411,10 +1452,13 @@ namespace lumen::protocol_v3::runtime {
     const auto *presentation_offers = array_field(request_fields, 15);
     const auto *resume = field(request_fields, 16);
     const auto *resume_value = resume ? std::get_if<bool>(&resume->storage) : nullptr;
+    const auto *host_audio = field(request_fields, 18);
+    const auto *host_audio_value = host_audio ? std::get_if<bool>(&host_audio->storage) : nullptr;
     if (!intent || !trace || !app || !profile || !width || !height || !refresh_numerator ||
         !refresh_denominator || !bitrate || !codec_offers || codec_offers->empty() ||
         !audio_offers || audio_offers->empty() || !microphone_value || !presentation_offers ||
-        presentation_offers->empty() || !resume_value || *app > UINT32_MAX || *width > UINT32_MAX ||
+        presentation_offers->empty() || !resume_value || !host_audio_value ||
+        *app > UINT32_MAX || *width > UINT32_MAX ||
         *height > UINT32_MAX || *refresh_numerator > UINT32_MAX || *refresh_denominator > UINT32_MAX ||
         *bitrate > UINT32_MAX || (*profile != 1 && *profile != 2)) {
       return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
@@ -1545,11 +1589,12 @@ namespace lumen::protocol_v3::runtime {
     selected.bit_depth = static_cast<std::uint8_t>(*bit_depth);
     selected.chroma_layout = static_cast<std::uint8_t>(*layout);
     selected.primaries = static_cast<std::uint8_t>(*primaries);
-    selected.transfer = static_cast<std::uint8_t>(*transfer);
+    selected.transfer = static_cast<std::uint8_t>(*transfer == 16 ? 2 : *transfer == 18 ? 3 : 1);
     selected.range = static_cast<std::uint8_t>(*range);
     selected.codec_flags = static_cast<std::uint8_t>(*codec_flags);
     selected.fidelity = static_cast<std::uint8_t>(*fidelity);
     selected.audio = *audio;
+    selected.host_audio = *host_audio_value;
     if (const auto *microphone_map = std::get_if<Map>(&microphone_value->storage)) {
       if ((client.permissions & control::microphone_permission) == 0) {
         return std::unexpected(static_cast<std::uint8_t>(Status::unauthorized));
@@ -1565,32 +1610,10 @@ namespace lumen::protocol_v3::runtime {
     }
     const auto *hdr_offers = array_field(request_fields, 14);
     control::cbor::Value selected_hdr {control::cbor::Null {}};
+    std::uint32_t client_maximum_mastering {};
+    std::uint16_t client_maximum_cll {};
+    std::uint16_t client_maximum_fall {};
     if (*transfer != 1 && hdr_offers) {
-      video::config_t hdr_probe {};
-      hdr_probe.width = static_cast<int>(*width);
-      hdr_probe.height = static_cast<int>(*height);
-      hdr_probe.framerate = static_cast<int>(*refresh_numerator / *refresh_denominator);
-      hdr_probe.bitrate = static_cast<int>(*bitrate);
-      hdr_probe.slicesPerFrame = 1;
-      hdr_probe.videoFormat = static_cast<int>(*codec_id - 1);
-      hdr_probe.dynamicRange = 1;
-      hdr_probe.chromaSamplingType = *layout == 2 ? 1 : 0;
-      hdr_probe.encoderCscMode = *matrix == 9 ? 2 : 1;
-      hdr_probe.output_name = config::video.output_name;
-      const auto host_metadata = video::active_hdr_metadata(hdr_probe);
-      if (!host_metadata) {
-        return std::unexpected(static_cast<std::uint8_t>(Status::unsupported_media));
-      }
-      const auto mastering_maximum =
-        static_cast<std::uint32_t>(host_metadata->maxDisplayLuminance) * 10'000U;
-      const auto valid_chromaticity = std::ranges::all_of(host_metadata->displayPrimaries, [](const auto &primary) {
-                                        return primary.x != 0 && primary.y != 0;
-                                      }) &&
-                                      host_metadata->whitePoint.x != 0 && host_metadata->whitePoint.y != 0;
-      if (mastering_maximum == 0 || host_metadata->minDisplayLuminance > mastering_maximum ||
-          !valid_chromaticity) {
-        return std::unexpected(static_cast<std::uint8_t>(Status::unsupported_media));
-      }
       for (const auto &offer : *hdr_offers) {
         const auto *candidate = std::get_if<Map>(&offer.storage);
         const auto *hdr_transfer = candidate ? unsigned_field(*candidate, 1) : nullptr;
@@ -1610,51 +1633,28 @@ namespace lumen::protocol_v3::runtime {
         const auto *maximum_cll = static_capability ? unsigned_field(*static_capability, 3) : nullptr;
         const auto *maximum_fall = static_capability ? unsigned_field(*static_capability, 4) : nullptr;
         const auto *dynamic_metadata = candidate ? array_field(*candidate, 7) : nullptr;
-        if (candidate && exact_keys(*candidate, 1, 7) && hdr_transfer && hdr_primaries &&
+        const auto common_match = candidate && exact_keys(*candidate, 1, 7) && hdr_transfer && hdr_primaries &&
             hdr_matrix && hdr_range && hdr_depth && static_capability && exact_keys(*static_capability, 1, 4) &&
-            static_supported && *static_supported && maximum_mastering && *maximum_mastering <= UINT32_MAX &&
+            static_supported && maximum_mastering && *maximum_mastering <= UINT32_MAX &&
             maximum_cll && *maximum_cll <= UINT16_MAX && maximum_fall && *maximum_fall <= UINT16_MAX &&
-            mastering_maximum <= *maximum_mastering &&
-            host_metadata->maxContentLightLevel <= *maximum_cll &&
-            host_metadata->maxFrameAverageLightLevel <= *maximum_fall && dynamic_metadata &&
+            dynamic_metadata &&
             ((*hdr_transfer == 2 && *transfer == 16) || (*hdr_transfer == 3 && *transfer == 18)) &&
             *hdr_primaries == *primaries && *hdr_matrix == *matrix && *hdr_range == *range &&
-            *hdr_depth == *bit_depth && *bit_depth == 10 && (*hdr_transfer == 2 || *hdr_transfer == 3)) {
-          Array primary_values;
-          primary_values.reserve(6);
-          for (const auto &primary : host_metadata->displayPrimaries) {
-            primary_values.emplace_back(primary.x);
-            primary_values.emplace_back(primary.y);
-          }
-          Array white_values {host_metadata->whitePoint.x, host_metadata->whitePoint.y};
-          Map mastering {
-            {1, std::move(primary_values)},
-            {2, std::move(white_values)},
-            {3, mastering_maximum},
-            {4, host_metadata->minDisplayLuminance},
-            {5, host_metadata->maxContentLightLevel},
-            {6, host_metadata->maxFrameAverageLightLevel},
-          };
+            *hdr_depth == *bit_depth && *bit_depth == 10 && (*hdr_transfer == 2 || *hdr_transfer == 3);
+        const auto pq_static_match = *transfer != 16 || (common_match && *static_supported);
+        if (common_match && pq_static_match) {
+          client_maximum_mastering = static_cast<std::uint32_t>(*maximum_mastering);
+          client_maximum_cll = static_cast<std::uint16_t>(*maximum_cll);
+          client_maximum_fall = static_cast<std::uint16_t>(*maximum_fall);
           selected_hdr = Map {
             {1, *hdr_transfer},
             {2, *hdr_primaries},
             {3, *hdr_matrix},
             {4, *hdr_range},
             {5, *hdr_depth},
-            {6, mastering},
+            {6, control::cbor::Null {}},
             {7, Array {}},
           };
-          media::StaticHDRMetadata metadata;
-          for (std::size_t index = 0; index < std::size(host_metadata->displayPrimaries); ++index) {
-            metadata.display_primaries[index * 2] = host_metadata->displayPrimaries[index].x;
-            metadata.display_primaries[index * 2 + 1] = host_metadata->displayPrimaries[index].y;
-          }
-          metadata.white_point = {host_metadata->whitePoint.x, host_metadata->whitePoint.y};
-          metadata.maximum_mastering_luminance = mastering_maximum;
-          metadata.minimum_mastering_luminance = host_metadata->minDisplayLuminance;
-          metadata.maximum_content_light_level = host_metadata->maxContentLightLevel;
-          metadata.maximum_frame_average_light_level = host_metadata->maxFrameAverageLightLevel;
-          selected.static_hdr_metadata = metadata;
           break;
         }
       }
@@ -1781,6 +1781,9 @@ namespace lumen::protocol_v3::runtime {
       .height = static_cast<std::uint32_t>(*height),
       .refresh_numerator = static_cast<std::uint32_t>(*refresh_numerator),
       .refresh_denominator = static_cast<std::uint32_t>(*refresh_denominator),
+      .host_audio = *host_audio_value,
+      .enable_hdr = selected.transfer != 1,
+      .audio = selected.audio,
       .resume = *resume_value,
     };
     auto application = impl_->applications.start(launch);
@@ -1799,6 +1802,64 @@ namespace lumen::protocol_v3::runtime {
       return std::unexpected(resources ? static_cast<std::uint8_t>(Status::resource_failure) : resources.error());
     }
     staged_resources = std::move(*resources);
+    const auto &effective = staged_resources->effective_media_config();
+    const auto immutable_selection_matches =
+      effective.session_id == selected.session_id && effective.profile == selected.profile &&
+      effective.semantic_datagram_bytes == selected.semantic_datagram_bytes &&
+      effective.video_bitrate_kbps == selected.video_bitrate_kbps &&
+      effective.width == selected.width && effective.height == selected.height &&
+      effective.refresh_numerator == selected.refresh_numerator &&
+      effective.refresh_denominator == selected.refresh_denominator &&
+      effective.codec_id == selected.codec_id && effective.matrix_code == selected.matrix_code &&
+      effective.bit_depth == selected.bit_depth && effective.chroma_layout == selected.chroma_layout &&
+      effective.primaries == selected.primaries && effective.transfer == selected.transfer &&
+      effective.range == selected.range && effective.codec_flags == selected.codec_flags &&
+      effective.fidelity == selected.fidelity && effective.host_audio == selected.host_audio;
+    if (!immutable_selection_matches ||
+        (selected.transfer == 1 && effective.static_hdr_metadata) ||
+        (selected.transfer == 2 && !effective.static_hdr_metadata) ||
+        (selected.transfer == 3 && effective.static_hdr_metadata)) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
+    selected.static_hdr_metadata = effective.static_hdr_metadata;
+    if (selected.transfer == 2) {
+      const auto &metadata = *selected.static_hdr_metadata;
+      const auto valid_chromaticity = std::ranges::all_of(metadata.display_primaries, [](const auto coordinate) {
+        return coordinate != 0 && coordinate <= 50'000;
+      }) && std::ranges::all_of(metadata.white_point, [](const auto coordinate) {
+        return coordinate != 0 && coordinate <= 50'000;
+      });
+      if (!valid_chromaticity || metadata.maximum_mastering_luminance == 0 ||
+          metadata.minimum_mastering_luminance > metadata.maximum_mastering_luminance ||
+          metadata.maximum_mastering_luminance > client_maximum_mastering ||
+          metadata.maximum_content_light_level > client_maximum_cll ||
+          metadata.maximum_frame_average_light_level > client_maximum_fall) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::unsupported_media));
+      }
+      auto *response_hdr = std::get_if<Map>(&response.back().second.storage);
+      if (!response_hdr) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+      }
+      const auto mastering_field = std::ranges::find_if(*response_hdr, [](const auto &entry) {
+        return entry.first == 6;
+      });
+      if (mastering_field == response_hdr->end()) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+      }
+      Array primary_values;
+      primary_values.reserve(metadata.display_primaries.size());
+      for (const auto coordinate : metadata.display_primaries) {
+        primary_values.emplace_back(coordinate);
+      }
+      mastering_field->second = Map {
+        {1, std::move(primary_values)},
+        {2, Array {metadata.white_point[0], metadata.white_point[1]}},
+        {3, metadata.maximum_mastering_luminance},
+        {4, metadata.minimum_mastering_luminance},
+        {5, metadata.maximum_content_light_level},
+        {6, metadata.maximum_frame_average_light_level},
+      };
+    }
     const auto codec_initialization_view = staged_resources->video_codec_initialization();
     if (codec_initialization_view.empty() || codec_initialization_view.size() > 1'048'576U) {
       return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
@@ -2059,7 +2120,11 @@ namespace lumen::protocol_v3::runtime {
           if (session == impl_->sessions.end()) {
             return make_result({{1, static_cast<std::uint64_t>(Status::unauthorized)}, {2, 0U}});
           }
-          if (session->second.input_generation == UINT32_MAX || !session->second.resources->reset_input(*state)) {
+          if (session->second.input_generation == UINT32_MAX ||
+              !session->second.resources->reset_input(
+                *state,
+                session->second.input_generation + 1
+              )) {
             return make_result({{1, static_cast<std::uint64_t>(Status::resource_failure)}, {2, session->second.input_generation}});
           }
           session->second.input_baseline_required = false;

@@ -167,15 +167,34 @@ namespace input {
    * @param input Shared stream input state.
    * @param operation Consumer-thread operation using the direct ordered injector.
    * @param supersedable Whether a newer consecutive state may replace this work.
-   * @param completion Callback run after actual platform injection.
+   * @param completion Callback reporting actual platform-injection success or failure.
    * @return True when accepted, coalesced, or safely pressure-dropped; false when closed.
    */
   bool passthrough_state(
     std::shared_ptr<input_t> &input,
     ordered_state_operation_t operation,
     bool supersedable,
-    std::function<void()> completion = {}
+    std::function<void(bool)> completion = {}
   );
+
+  /**
+   * @brief Bind immutable v3 authority identity to the next controller allocation.
+   *
+   * Must run inside that input session's ordered state operation immediately
+   * before its controller-arrival packet is injected.
+   *
+   * @param input Session input state.
+   * @param controller Client-relative controller slot.
+   * @param input_generation Nonzero input authority generation.
+   * @param controller_generation Nonzero controller instance generation.
+   * @return True when the unallocated slot accepted the identity.
+   */
+  bool set_gamepad_feedback_identity(
+    input_t *input,
+    std::uint8_t controller,
+    std::uint32_t input_generation,
+    std::uint32_t controller_generation
+  ) noexcept;
 
   /**
    * @brief Seal input producers before waiting for the control stream to terminate.

@@ -19,6 +19,10 @@
 #include <string>
 #include <vector>
 
+namespace rtsp_stream {
+  struct launch_session_t;
+}
+
 namespace lumen::protocol_v3::runtime {
   namespace control = lumen::protocol_v3::control_session;
 
@@ -181,8 +185,20 @@ namespace lumen::protocol_v3::runtime {
     std::uint32_t height {};  ///< Selected capture height.
     std::uint32_t refresh_numerator {};  ///< Selected rational refresh numerator.
     std::uint32_t refresh_denominator {1};  ///< Selected rational refresh denominator.
+    bool host_audio {};  ///< Whether captured audio also remains audible on the host.
+    bool enable_hdr {};  ///< Whether the selected video transfer requires HDR capture.
+    media::OpusTuple audio;  ///< Exact selected host-audio layout and Opus mapping.
     bool resume {};  ///< Reuse an already running matching application when true.
   };
+
+  /**
+   * @brief Convert a validated v3 application selection into Lumen's process-launch shape.
+   *
+   * @param launch Complete v3 application selection.
+   * @return Fully populated legacy-shaped launch state, or protocol status on invalid input.
+   */
+  [[nodiscard]] std::expected<std::shared_ptr<rtsp_stream::launch_session_t>, std::uint8_t>
+    make_legacy_launch_session(const ApplicationLaunch &launch);
 
   /** @brief Concrete host application boundary used by the production backend. */
   class ApplicationBridge {
@@ -215,8 +231,20 @@ namespace lumen::protocol_v3::runtime {
   class SessionResources {
   public:
     virtual ~SessionResources() = default;
+    /** Return the effective immutable media selection after platform resource activation. */
+    virtual const media::NegotiatedMediaConfig &effective_media_config() const noexcept = 0;
     virtual std::span<const std::uint8_t> video_codec_initialization() const noexcept = 0;
-    virtual bool reset_input(std::span<const std::uint8_t> state_block) = 0;
+    /**
+     * @brief Replace input state and advance its authenticated authority generation.
+     *
+     * @param state_block Complete validated input reset state.
+     * @param next_generation Nonzero generation committed only when the reset succeeds.
+     * @return True when the production input backend accepted the reset.
+     */
+    virtual bool reset_input(
+      std::span<const std::uint8_t> state_block,
+      std::uint32_t next_generation
+    ) = 0;
     virtual bool apply_text(const control::cbor::Value::Map &request_fields) = 0;
     virtual media::ReceiveResult datagram(const quic_server::DatagramRecord &record) = 0;
     virtual bool start_media() = 0;
@@ -237,7 +265,11 @@ namespace lumen::protocol_v3::runtime {
   };
 
   /** @brief QuicServer adapter shared by every START-owned media pipeline. */
-  class QuicTransportSink final: public media::TransportSink {
+  class QuicTransportSink
+#ifndef SUNSHINE_TESTS
+    final
+#endif
+    : public media::TransportSink {
   public:
     /** @brief Attach the fully constructed single listener before accepting START. */
     void attach(

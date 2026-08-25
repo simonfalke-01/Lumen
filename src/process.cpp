@@ -6,6 +6,11 @@
 
 // standard includes
 #include <filesystem>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <numeric>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,6 +65,69 @@ namespace proc {
 
   std::unique_ptr<platf::deinit_t> init() {
     return std::make_unique<deinit_t>();
+  }
+
+  void apply_launch_environment(
+    boost::process::v1::environment &env,
+    const int app_id,
+    const std::string_view app_name,
+    const rtsp_stream::launch_session_t &launch_session
+  ) {
+    auto refresh_numerator = launch_session.refresh_numerator;
+    auto refresh_denominator = launch_session.refresh_denominator;
+    if (refresh_numerator == 0 || refresh_denominator == 0) {
+      refresh_numerator = launch_session.fps > 0 ? static_cast<std::uint32_t>(launch_session.fps) : 0U;
+      refresh_denominator = 1;
+    }
+    const auto divisor = std::gcd(refresh_numerator, refresh_denominator);
+    if (divisor > 1) {
+      refresh_numerator /= divisor;
+      refresh_denominator /= divisor;
+    }
+    std::ostringstream exact_fps;
+    exact_fps.imbue(std::locale::classic());
+    exact_fps << std::setprecision(std::numeric_limits<double>::max_digits10)
+              << static_cast<double>(refresh_numerator) / refresh_denominator;
+
+    env["LUMEN_APP_ID"] = std::to_string(app_id);
+    env["LUMEN_APP_NAME"] = std::string {app_name};
+    env["LUMEN_CLIENT_WIDTH"] = std::to_string(launch_session.width);
+    env["LUMEN_CLIENT_HEIGHT"] = std::to_string(launch_session.height);
+    env["LUMEN_CLIENT_FPS"] = exact_fps.str();
+    env["LUMEN_CLIENT_REFRESH_NUMERATOR"] = std::to_string(refresh_numerator);
+    env["LUMEN_CLIENT_REFRESH_DENOMINATOR"] = std::to_string(refresh_denominator);
+    env["LUMEN_CLIENT_HDR"] = launch_session.enable_hdr ? "true" : "false";
+    env["LUMEN_CLIENT_GCMAP"] = std::to_string(launch_session.gcmap);
+    env["LUMEN_CLIENT_HOST_AUDIO"] = launch_session.host_audio ? "true" : "false";
+    env["LUMEN_CLIENT_ENABLE_SOPS"] = launch_session.enable_sops ? "true" : "false";
+
+    env["SUNSHINE_APP_ID"] = std::to_string(app_id);
+    env["SUNSHINE_APP_NAME"] = std::string {app_name};
+    env["SUNSHINE_CLIENT_WIDTH"] = std::to_string(launch_session.width);
+    env["SUNSHINE_CLIENT_HEIGHT"] = std::to_string(launch_session.height);
+    env["SUNSHINE_CLIENT_FPS"] = std::to_string(launch_session.fps);
+    env["SUNSHINE_CLIENT_HDR"] = launch_session.enable_hdr ? "true" : "false";
+    env["SUNSHINE_CLIENT_GCMAP"] = std::to_string(launch_session.gcmap);
+    env["SUNSHINE_CLIENT_HOST_AUDIO"] = launch_session.host_audio ? "true" : "false";
+    env["SUNSHINE_CLIENT_ENABLE_SOPS"] = launch_session.enable_sops ? "true" : "false";
+
+    const auto channel_count = launch_session.surround_info & 65535;
+    switch (channel_count) {
+      case 2:
+        env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "2.0";
+        env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "2.0";
+        break;
+      case 6:
+        env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "5.1";
+        env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "5.1";
+        break;
+      case 8:
+        env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "7.1";
+        env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "7.1";
+        break;
+    }
+    env["LUMEN_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session.surround_params;
+    env["SUNSHINE_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session.surround_params;
   }
 
   void terminate_process_group(boost::process::v1::child &proc, boost::process::v1::group &group, std::chrono::seconds exit_timeout) {
@@ -166,43 +234,8 @@ namespace proc {
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
 
-    // Add stream-specific environment variables. LUMEN_* is authoritative while
-    // SUNSHINE_* remains available for existing application scripts.
-    _env["LUMEN_APP_ID"] = std::to_string(_app_id);
-    _env["LUMEN_APP_NAME"] = _app.name;
-    _env["LUMEN_CLIENT_WIDTH"] = std::to_string(launch_session->width);
-    _env["LUMEN_CLIENT_HEIGHT"] = std::to_string(launch_session->height);
-    _env["LUMEN_CLIENT_FPS"] = std::to_string(launch_session->fps);
-    _env["LUMEN_CLIENT_HDR"] = launch_session->enable_hdr ? "true" : "false";
-    _env["LUMEN_CLIENT_GCMAP"] = std::to_string(launch_session->gcmap);
-    _env["LUMEN_CLIENT_HOST_AUDIO"] = launch_session->host_audio ? "true" : "false";
-    _env["LUMEN_CLIENT_ENABLE_SOPS"] = launch_session->enable_sops ? "true" : "false";
-    _env["SUNSHINE_APP_ID"] = std::to_string(_app_id);
-    _env["SUNSHINE_APP_NAME"] = _app.name;
-    _env["SUNSHINE_CLIENT_WIDTH"] = std::to_string(launch_session->width);
-    _env["SUNSHINE_CLIENT_HEIGHT"] = std::to_string(launch_session->height);
-    _env["SUNSHINE_CLIENT_FPS"] = std::to_string(launch_session->fps);
-    _env["SUNSHINE_CLIENT_HDR"] = launch_session->enable_hdr ? "true" : "false";
-    _env["SUNSHINE_CLIENT_GCMAP"] = std::to_string(launch_session->gcmap);
-    _env["SUNSHINE_CLIENT_HOST_AUDIO"] = launch_session->host_audio ? "true" : "false";
-    _env["SUNSHINE_CLIENT_ENABLE_SOPS"] = launch_session->enable_sops ? "true" : "false";
-    int channelCount = launch_session->surround_info & 65535;
-    switch (channelCount) {
-      case 2:
-        _env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "2.0";
-        _env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "2.0";
-        break;
-      case 6:
-        _env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "5.1";
-        _env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "5.1";
-        break;
-      case 8:
-        _env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "7.1";
-        _env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "7.1";
-        break;
-    }
-    _env["LUMEN_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session->surround_params;
-    _env["SUNSHINE_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session->surround_params;
+    // LUMEN_* carries exact modern values while SUNSHINE_* retains the legacy shape.
+    apply_launch_environment(_env, _app_id, _app.name, *launch_session);
 
     if (!_app.output.empty() && _app.output != "null"sv) {
 #ifdef _WIN32

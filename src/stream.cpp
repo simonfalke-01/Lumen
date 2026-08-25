@@ -6,11 +6,13 @@
 // standard includes
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <fstream>
 #include <future>
 #include <mutex>
 #include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -101,6 +103,26 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace stream {
+#ifdef _WIN32
+  bool cleanup_virtual_display(config_t &config) noexcept {
+    return ordered_virtual_display_cleanup(
+      [&config]() noexcept {
+        if (config.monitor.virtual_display_frame_source) {
+          config.monitor.virtual_display_frame_source->stop();
+          config.monitor.virtual_display_frame_source.reset();
+        }
+        config.monitor.virtual_display_active = false;
+        config.monitor.virtual_display_direct_required = false;
+      },
+      [&config]() noexcept {
+        const bool released = !config.virtual_display_lease || config.virtual_display_lease->release();
+        config.virtual_display_lease.reset();
+        return released;
+      }
+    );
+  }
+#endif
+
   bool microphone_replay_window_t::may_accept(std::uint64_t sequence) const {
     if (!initialized_ || sequence > highest_) {
       return true;
@@ -944,11 +966,11 @@ namespace stream {
       auto &data = msg.data.rumble;
 
       plaintext.useless = 0xC0FFEE;
-      plaintext.id = util::endian::little(msg.id);
+      plaintext.id = util::endian::little(msg.identity.id);
       plaintext.lowfreq = util::endian::little(data.lowfreq);
       plaintext.highfreq = util::endian::little(data.highfreq);
 
-      BOOST_LOG(verbose) << "Rumble: "sv << msg.id << " :: "sv << util::hex(data.lowfreq).to_string_view() << " :: "sv << util::hex(data.highfreq).to_string_view();
+      BOOST_LOG(verbose) << "Rumble: "sv << msg.identity.id << " :: "sv << util::hex(data.lowfreq).to_string_view() << " :: "sv << util::hex(data.highfreq).to_string_view();
       std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
         encrypted_payload;
 
@@ -960,11 +982,11 @@ namespace stream {
 
       auto &data = msg.data.rumble_triggers;
 
-      plaintext.id = util::endian::little(msg.id);
+      plaintext.id = util::endian::little(msg.identity.id);
       plaintext.left = util::endian::little(data.left_trigger);
       plaintext.right = util::endian::little(data.right_trigger);
 
-      BOOST_LOG(verbose) << "Rumble triggers: "sv << msg.id << " :: "sv << util::hex(data.left_trigger).to_string_view() << " :: "sv << util::hex(data.right_trigger).to_string_view();
+      BOOST_LOG(verbose) << "Rumble triggers: "sv << msg.identity.id << " :: "sv << util::hex(data.left_trigger).to_string_view() << " :: "sv << util::hex(data.right_trigger).to_string_view();
       std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
         encrypted_payload;
 
@@ -976,11 +998,11 @@ namespace stream {
 
       auto &data = msg.data.motion_event_state;
 
-      plaintext.id = util::endian::little(msg.id);
+      plaintext.id = util::endian::little(msg.identity.id);
       plaintext.reportrate = util::endian::little(data.report_rate);
       plaintext.type = data.motion_type;
 
-      BOOST_LOG(verbose) << "Motion event state: "sv << msg.id << " :: "sv << util::hex(data.report_rate).to_string_view() << " :: "sv << util::hex(data.motion_type).to_string_view();
+      BOOST_LOG(verbose) << "Motion event state: "sv << msg.identity.id << " :: "sv << util::hex(data.report_rate).to_string_view() << " :: "sv << util::hex(data.motion_type).to_string_view();
       std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
         encrypted_payload;
 
@@ -992,12 +1014,12 @@ namespace stream {
 
       auto &data = msg.data.rgb_led;
 
-      plaintext.id = util::endian::little(msg.id);
+      plaintext.id = util::endian::little(msg.identity.id);
       plaintext.r = data.r;
       plaintext.g = data.g;
       plaintext.b = data.b;
 
-      BOOST_LOG(verbose) << "RGB: "sv << msg.id << " :: "sv << util::hex(data.r).to_string_view() << util::hex(data.g).to_string_view() << util::hex(data.b).to_string_view();
+      BOOST_LOG(verbose) << "RGB: "sv << msg.identity.id << " :: "sv << util::hex(data.r).to_string_view() << util::hex(data.g).to_string_view() << util::hex(data.b).to_string_view();
       std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
         encrypted_payload;
 
@@ -1007,7 +1029,7 @@ namespace stream {
       plaintext.header.type = packetTypes[IDX_SET_ADAPTIVE_TRIGGERS];
       plaintext.header.payloadLength = sizeof(plaintext) - sizeof(control_header_v2);
 
-      plaintext.id = util::endian::little(msg.id);
+      plaintext.id = util::endian::little(msg.identity.id);
       plaintext.event_flags = msg.data.adaptive_triggers.event_flags;
       plaintext.type_left = msg.data.adaptive_triggers.type_left;
       std::ranges::copy(msg.data.adaptive_triggers.left, plaintext.left);
@@ -2594,10 +2616,9 @@ namespace stream {
       input::reset(session.input);
 
 #ifdef _WIN32
-      if (session.config.virtual_display_lease && !session.config.virtual_display_lease->release()) {
+      if (!cleanup_virtual_display(session.config)) {
         BOOST_LOG(error) << "Failed to restore Lumen virtual-display topology for session "sv << session.launch_session_id;
       }
-      session.config.virtual_display_lease.reset();
 #endif
 
       // If this is the last session, invoke the platform callbacks
@@ -2848,6 +2869,39 @@ namespace stream {
       std::memcpy(output, &value, sizeof(value));
     }
 
+    bool v3_feedback_is_current(
+      const platf::gamepad_feedback_msg_t &message,
+      const std::uint32_t input_generation,
+      const std::uint32_t controller_generation
+    ) noexcept {
+      return message.identity.input_generation != 0 &&
+             message.identity.controller_generation != 0 &&
+             message.identity.input_generation == input_generation &&
+             message.identity.controller_generation == controller_generation;
+    }
+
+    void configure_v3_audio(
+      audio::config_t &output,
+      const v3_media::NegotiatedMediaConfig &selection
+    ) {
+      output.packetDuration = static_cast<int>(
+        selection.audio.frame_samples * 1'000U / selection.audio.sample_rate
+      );
+      output.channels = selection.audio.channels;
+      output.mask = selection.audio.channels == 2 ? 0x3 :
+                    selection.audio.channels == 6 ? 0x3f :
+                                                    0x63f;
+      output.bitrate = static_cast<int>(selection.audio.bitrate_bps);
+      output.flags.reset();
+      output.flags[audio::config_t::HOST_AUDIO] = selection.host_audio;
+      output.flags[audio::config_t::CONTINUOUS_AUDIO] = true;
+      output.flags[audio::config_t::CUSTOM_SURROUND_PARAMS] = true;
+      output.customStreamParams.channelCount = selection.audio.channels;
+      output.customStreamParams.streams = selection.audio.streams;
+      output.customStreamParams.coupledStreams = selection.audio.coupled_streams;
+      std::ranges::copy(selection.audio.mapping, output.customStreamParams.mapping);
+    }
+
     class native_v3_session_resources final:
         public v3_runtime::SessionResources,
         private v3_media::InputSink,
@@ -2866,9 +2920,18 @@ namespace stream {
           mail_ {std::make_shared<safe::mail_raw_t>()},
           input_ {input::alloc(mail_)},
           audio_packets_ {mail_->queue<audio::packet_t>(mail::audio_packets)},
+          feedback_packets_ {mail_->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)},
           video_egress_ {selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ? 1U : 2U},
-          pipeline_ {selection_, transport, *this, *this, *this} {
-        if (!terminal_failure_ || !input_ || !pipeline_.bind_connection(connection_id)) {
+          transport_ {transport},
+          current_input_generation_ {selection_.input_generation} {
+  #ifdef _WIN32
+        auto virtual_display_cleanup = util::fail_guard([this]() noexcept {
+          if (!cleanup_virtual_display(stream_config_)) {
+            BOOST_LOG(error) << "Protocol-v3 constructor unwind could not restore Lumen virtual-display topology"sv;
+          }
+        });
+  #endif
+        if (!terminal_failure_ || !input_) {
           throw std::runtime_error {"protocol-v3 native resource allocation"};
         }
         if (selection_.fidelity == 3 &&
@@ -2892,26 +2955,56 @@ namespace stream {
           throw std::runtime_error {"protocol-v3 video egress registration"};
         }
         configure_stream();
+        auto &input_sink = static_cast<v3_media::InputSink &>(*this);
+        auto &microphone_sink = static_cast<v3_media::MicrophoneSink &>(*this);
+        auto &feedback_sink = static_cast<v3_media::VideoFeedbackSink &>(*this);
+        pipeline_ = std::make_unique<v3_media::SessionPipeline>(
+          selection_,
+          transport_,
+          input_sink,
+          microphone_sink,
+          feedback_sink
+        );
+        if (!pipeline_->bind_connection(connection_id)) {
+          throw std::runtime_error {"protocol-v3 native transport binding"};
+        }
         const stream_policy::ScopedPolicyBinding binding {*stream_config_.optimization_policy};
         auto codec_initialization = video::codec_initialization(stream_config_.monitor);
         if (!codec_initialization || codec_initialization->empty()) {
           throw std::runtime_error {"protocol-v3 codec initialization unavailable"};
         }
         codec_initialization_ = std::move(*codec_initialization);
+  #ifdef _WIN32
+        virtual_display_cleanup.disable();
+  #endif
       }
 
       ~native_v3_session_resources() override {
         stop();
       }
 
+      const v3_media::NegotiatedMediaConfig &effective_media_config() const noexcept override {
+        return selection_;
+      }
+
       std::span<const std::uint8_t> video_codec_initialization() const noexcept override {
         return codec_initialization_;
       }
 
-      bool reset_input(const std::span<const std::uint8_t> state_block) override {
+      bool reset_input(
+        const std::span<const std::uint8_t> state_block,
+        const std::uint32_t next_generation
+      ) override {
+        if (next_generation == 0 || !validate_state(state_block)) {
+          return false;
+        }
+        revoke_input_authority();
+        pending_input_generation_.store(next_generation, std::memory_order_release);
         input::reset(input_);
         input_ = input::alloc(mail_);
         if (!input_) {
+          pending_input_generation_.store(0, std::memory_order_release);
+          report_terminal_failure_async();
           return false;
         }
         input_causality_.reset();
@@ -2919,19 +3012,74 @@ namespace stream {
         prior_controller_mask_ = 0;
         arrived_controller_mask_ = 0;
         controller_states_.fill(controller_state_t {});
+        for (auto &generation : controller_generation_counters_) generation.store(0);
         touch_points_.clear();
-        if (!validate_state(state_block)) {
-          return false;
-        }
-        return input::passthrough_state(
+        struct reset_completion_t {
+          enum class state_e { pending, completed, timed_out };
+          std::mutex mutex;
+          std::promise<bool> result;
+          state_e state {state_e::pending};
+        };
+        auto completion = std::make_shared<reset_completion_t>();
+        auto applied_result = completion->result.get_future();
+        const auto submitted = input::passthrough_state(
           input_,
           [this, state = std::vector<std::uint8_t> {state_block.begin(), state_block.end()}](
             const input::ordered_injector_t &injector
           ) {
             return apply_state(state, injector);
           },
-          false
+          false,
+          [this, next_generation, completion](const bool operation_success) {
+            bool success = operation_success;
+            {
+              std::lock_guard lock {completion->mutex};
+              if (completion->state == reset_completion_t::state_e::timed_out) {
+                success = false;
+              }
+              if (success) {
+                current_input_generation_.store(next_generation, std::memory_order_release);
+                input_authority_active_.store(true, std::memory_order_release);
+                pending_input_generation_.store(0, std::memory_order_release);
+                input_authority_changed_.notify_all();
+              } else {
+                revoke_input_authority();
+              }
+              try {
+                completion->result.set_value(success);
+              } catch (...) {
+              }
+              if (completion->state != reset_completion_t::state_e::timed_out) {
+                completion->state = reset_completion_t::state_e::completed;
+              }
+            }
+            if (!success) {
+              report_terminal_failure();
+            }
+          }
         );
+        if (!submitted) {
+          revoke_input_authority();
+          report_terminal_failure_async();
+          return false;
+        }
+        if (applied_result.wait_for(250ms) != std::future_status::ready) {
+          bool timed_out = false;
+          {
+            std::lock_guard lock {completion->mutex};
+            if (completion->state == reset_completion_t::state_e::pending) {
+              completion->state = reset_completion_t::state_e::timed_out;
+              timed_out = true;
+            }
+          }
+          if (!timed_out) {
+            return applied_result.get();
+          }
+          revoke_input_authority();
+          report_terminal_failure_async();
+          return false;
+        }
+        return applied_result.get();
       }
 
       bool apply_text(const lumen::protocol_v3::control_session::cbor::Value::Map &fields) override {
@@ -2959,7 +3107,7 @@ namespace stream {
       v3_media::ReceiveResult datagram(
         const lumen::protocol_v3::quic_server::DatagramRecord &record
       ) override {
-        return pipeline_.receive(record);
+        return pipeline_->receive(record);
       }
 
       bool start_media() override {
@@ -2971,6 +3119,9 @@ namespace stream {
             }};
             audio_sender_ = std::jthread {[this] {
               consume_audio();
+            }};
+            feedback_sender_ = std::jthread {[this] {
+              consume_controller_feedback();
             }};
             video_capture_ = std::jthread {[this] {
               try {
@@ -3000,7 +3151,8 @@ namespace stream {
       }
 
       void detach_connection() noexcept override {
-        pipeline_.detach_connection();
+        pipeline_->detach_connection();
+        revoke_input_authority();
         input::begin_close(input_);
         input::reset(input_);
         if (microphone_receiver_) {
@@ -3014,7 +3166,7 @@ namespace stream {
       }
 
       bool attach_connection(const std::uint64_t connection_id) override {
-        if (connection_id == 0 || !pipeline_.bind_connection(connection_id)) {
+        if (connection_id == 0 || !pipeline_->bind_connection(connection_id)) {
           return false;
         }
         try {
@@ -3028,13 +3180,13 @@ namespace stream {
                                       )) {
             input::begin_close(input_);
             input::reset(input_);
-            pipeline_.detach_connection();
+            pipeline_->detach_connection();
             return false;
           }
           mail_->event<bool>(mail::idr)->raise(true);
           return true;
         } catch (...) {
-          pipeline_.detach_connection();
+          pipeline_->detach_connection();
           return false;
         }
       }
@@ -3042,11 +3194,15 @@ namespace stream {
       void stop() noexcept override {
         std::call_once(stop_once_, [this] {
           explicit_stop_.store(true, std::memory_order_release);
-          pipeline_.stop();
+          revoke_input_authority();
+          if (pipeline_) {
+            pipeline_->stop();
+          }
           input::begin_close(input_);
           input::reset(input_);
           mail_->event<bool>(mail::shutdown)->raise(true);
           audio_packets_->stop();
+          feedback_packets_->stop();
           video_egress_.stop();
           if (video_capture_.joinable()) {
             video_capture_.join();
@@ -3060,21 +3216,28 @@ namespace stream {
           if (audio_sender_.joinable()) {
             audio_sender_.join();
           }
+          if (feedback_sender_.joinable()) {
+            feedback_sender_.join();
+          }
           if (microphone_receiver_) {
             microphone_receiver_->stop();
           }
           microphone_receiver_.reset();
           microphone_sink_.reset();
-#ifdef _WIN32
-          if (stream_config_.monitor.virtual_display_frame_source) {
-            stream_config_.monitor.virtual_display_frame_source->stop();
-            stream_config_.monitor.virtual_display_frame_source.reset();
+          if (pipeline_) {
+            const auto telemetry = pipeline_->snapshot();
+            BOOST_LOG(info) << "Protocol-v3 media telemetry: feedback="sv << telemetry.feedback_packets
+                            << " deadline_samples="sv << telemetry.deadline_samples
+                            << " deadline_misses="sv << telemetry.deadline_misses
+                            << " consecutive_deadline_misses="sv << telemetry.consecutive_deadline_misses
+                            << " latest_deadline_miss_us="sv << telemetry.latest_deadline_miss_microseconds
+                            << " peak_deadline_miss_us="sv << telemetry.peak_deadline_miss_microseconds;
           }
-          if (stream_config_.virtual_display_lease && !stream_config_.virtual_display_lease->release()) {
+  #ifdef _WIN32
+          if (!cleanup_virtual_display(stream_config_)) {
             BOOST_LOG(error) << "Protocol-v3 failed to restore Lumen virtual-display topology"sv;
           }
-          stream_config_.virtual_display_lease.reset();
-#endif
+  #endif
         });
       }
 
@@ -3129,19 +3292,11 @@ namespace stream {
         stream_config_.monitor.enableIntraRefresh = 0;
         stream_config_.monitor.protocolV3Colorimetry = true;
         stream_config_.monitor.colorPrimaries = selection_.primaries;
-        stream_config_.monitor.colorTransfer = selection_.transfer;
+        stream_config_.monitor.colorTransfer = selection_.transfer == 2 ? 16 :
+                                                 selection_.transfer == 3 ? 18 :
+                                                                            1;
         stream_config_.monitor.colorMatrix = selection_.matrix_code;
         stream_config_.monitor.colorRange = selection_.range;
-        stream_config_.monitor.hasStaticHDRMetadata = selection_.static_hdr_metadata.has_value();
-        if (selection_.static_hdr_metadata) {
-          const auto &metadata = *selection_.static_hdr_metadata;
-          stream_config_.monitor.staticHDRDisplayPrimaries = metadata.display_primaries;
-          stream_config_.monitor.staticHDRWhitePoint = metadata.white_point;
-          stream_config_.monitor.staticHDRMaximumMasteringLuminance = metadata.maximum_mastering_luminance;
-          stream_config_.monitor.staticHDRMinimumMasteringLuminance = metadata.minimum_mastering_luminance;
-          stream_config_.monitor.staticHDRMaximumContentLightLevel = metadata.maximum_content_light_level;
-          stream_config_.monitor.staticHDRMaximumFrameAverageLightLevel = metadata.maximum_frame_average_light_level;
-        }
         stream_config_.monitor.output_name = config::video.output_name;
         stream_config_.monitor.optimization_policy = stream_config_.optimization_policy;
         stream_config_.monitor.client_protocol = stream_policy::ClientProtocol::umbra_v3;
@@ -3149,23 +3304,9 @@ namespace stream {
           const auto watermark = input_causality_.capture();
           return std::make_pair(watermark.state_sequence, watermark.edge_id);
         };
-        stream_config_.audio.packetDuration = static_cast<int>(
-          selection_.audio.frame_samples * 1'000U / selection_.audio.sample_rate
-        );
-        stream_config_.audio.channels = selection_.audio.channels;
-        stream_config_.audio.mask = selection_.audio.channels == 2 ? 0x3 :
-                                    selection_.audio.channels == 6 ? 0x3f :
-                                                                     0x63f;
-        stream_config_.audio.bitrate = static_cast<int>(selection_.audio.bitrate_bps);
-        stream_config_.audio.flags.reset();
-        stream_config_.audio.flags[audio::config_t::CONTINUOUS_AUDIO] = true;
-        stream_config_.audio.flags[audio::config_t::CUSTOM_SURROUND_PARAMS] = true;
-        stream_config_.audio.customStreamParams.channelCount = selection_.audio.channels;
-        stream_config_.audio.customStreamParams.streams = selection_.audio.streams;
-        stream_config_.audio.customStreamParams.coupledStreams = selection_.audio.coupled_streams;
-        std::ranges::copy(selection_.audio.mapping, stream_config_.audio.customStreamParams.mapping);
+        configure_v3_audio(stream_config_.audio, selection_);
 
-#ifdef _WIN32
+  #ifdef _WIN32
         const platf::virtual_display::mode_t requested_display_mode {
           selection_.width,
           selection_.height,
@@ -3176,12 +3317,14 @@ namespace stream {
           selection_.bit_depth,
         };
         auto display_limits = platf::virtual_display::mode_limits_t {};
+        display_limits.supports_hdr10 = selection_.transfer == 2 || selection_.transfer == 3;
+        display_limits.supports_10bit = selection_.bit_depth == 10;
         if (selection_.codec_id == 1) {
           display_limits.maximum_width = 4096;
           display_limits.maximum_height = 4096;
           display_limits.maximum_pixels = 4096ULL * 4096ULL;
         }
-        const auto activation_policy = []() {
+        const auto configured_activation_policy = []() {
           switch (config::video.dd.virtual_display_policy) {
             case config::video_t::dd_t::virtual_display_policy_e::optional:
               return platf::virtual_display::activation_policy_e::optional;
@@ -3192,9 +3335,9 @@ namespace stream {
               return platf::virtual_display::activation_policy_e::disabled;
           }
         }();
-        const auto minimum_fidelity = selection_.fidelity == 2 ?
-                                        platf::virtual_display::fidelity_e::visually_lossless :
-                                        platf::virtual_display::fidelity_e::lossless;
+        const auto activation_policy = platf::virtual_display::modern_activation_policy(
+          configured_activation_policy
+        );
         auto prepared = platf::virtual_display::prepare_system_stream_session(
           activation_policy,
           {
@@ -3203,7 +3346,7 @@ namespace stream {
             selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ?
               platf::virtual_display::delivery_policy_e::latency :
               platf::virtual_display::delivery_policy_e::quality,
-            minimum_fidelity,
+            platf::virtual_display::direct_surface_fidelity(),
           },
           display_limits,
           stream_config_.monitor.output_name
@@ -3215,20 +3358,65 @@ namespace stream {
         stream_config_.virtual_display_lease = std::move(prepared.lease);
         if (prepared.outcome == platf::virtual_display::session_prepare_e::virtual_display &&
             prepared.selection) {
+          stream_config_.monitor.virtual_display_active = true;
+          stream_config_.monitor.virtual_display_direct_required = true;
           stream_config_.monitor.virtual_display_frame_source =
             platf::virtual_display::make_system_frame_source(*prepared.selection, 250ms);
           if (!stream_config_.monitor.virtual_display_frame_source) {
-            BOOST_LOG(info) << "Protocol-v3 VDD direct-frame boundary unavailable; using DDA/WGC"sv;
+            if (!cleanup_virtual_display(stream_config_)) {
+              throw std::runtime_error {"protocol-v3 VDD direct-frame open and rollback failed"};
+            }
+            throw std::runtime_error {"protocol-v3 VDD direct-frame boundary unavailable"};
           }
         }
-#endif
+  #endif
+        selection_.static_hdr_metadata.reset();
+        if (selection_.transfer == 2) {
+  #ifdef _WIN32
+          if (!stream_config_.monitor.virtual_display_frame_source) {
+            throw std::runtime_error {"protocol-v3 PQ requires ABI5 direct-frame metadata"};
+          }
+          const auto &color = stream_config_.monitor.virtual_display_frame_source->resources().initial_color_metadata;
+          if (color.hdr_metadata_type == platf::virtual_display::hdr_metadata_type_e::none) {
+            throw std::runtime_error {"protocol-v3 PQ ABI5 metadata unavailable"};
+          }
+          const auto &source = color.hdr10_metadata;
+          v3_media::StaticHDRMetadata metadata;
+          metadata.display_primaries = {
+            source.red_primary[0], source.red_primary[1],
+            source.green_primary[0], source.green_primary[1],
+            source.blue_primary[0], source.blue_primary[1],
+          };
+          metadata.white_point = source.white_point;
+          metadata.maximum_mastering_luminance =
+            static_cast<std::uint32_t>(source.maximum_mastering_luminance) * 10'000U;
+          metadata.minimum_mastering_luminance = source.minimum_mastering_luminance;
+          metadata.maximum_content_light_level = source.maximum_content_light_level;
+          metadata.maximum_frame_average_light_level = source.maximum_frame_average_light_level;
+          selection_.static_hdr_metadata = metadata;
+  #else
+          throw std::runtime_error {"protocol-v3 PQ ABI5 metadata unavailable"};
+  #endif
+        } else if (selection_.transfer != 1 && selection_.transfer != 3) {
+          throw std::runtime_error {"protocol-v3 unsupported effective transfer"};
+        }
+        stream_config_.monitor.hasStaticHDRMetadata = selection_.static_hdr_metadata.has_value();
+        if (selection_.static_hdr_metadata) {
+          const auto &metadata = *selection_.static_hdr_metadata;
+          stream_config_.monitor.staticHDRDisplayPrimaries = metadata.display_primaries;
+          stream_config_.monitor.staticHDRWhitePoint = metadata.white_point;
+          stream_config_.monitor.staticHDRMaximumMasteringLuminance = metadata.maximum_mastering_luminance;
+          stream_config_.monitor.staticHDRMinimumMasteringLuminance = metadata.minimum_mastering_luminance;
+          stream_config_.monitor.staticHDRMaximumContentLightLevel = metadata.maximum_content_light_level;
+          stream_config_.monitor.staticHDRMaximumFrameAverageLightLevel = metadata.maximum_frame_average_light_level;
+        }
       }
 
       void start_microphone() {
         if (!selection_.microphone_enabled) {
           return;
         }
-#ifdef _WIN32
+  #ifdef _WIN32
         microphone_sink_ = platf::win_audio::make_virtual_microphone();
         microphone_receiver_ = std::make_unique<client_microphone::receiver_t>(
           std::make_unique<client_microphone::opus_decoder_t>(),
@@ -3237,9 +3425,9 @@ namespace stream {
         if (!microphone_receiver_->reset(selection_.microphone_generation, client_microphone::clock_t::now())) {
           throw std::runtime_error {"protocol-v3 virtual microphone start"};
         }
-#else
+  #else
         throw std::runtime_error {"protocol-v3 virtual microphone unavailable"};
-#endif
+  #endif
       }
 
       void consume_video() {
@@ -3267,7 +3455,7 @@ namespace stream {
             packet->applied_input_state_sequence,
             packet->applied_input_edge_id,
           };
-          const auto result = pipeline_.submit_video({
+          const auto result = pipeline_->submit_video({
             .frame_id = static_cast<std::uint64_t>(packet->frame_index()),
             .capture_time_microseconds = v3_microseconds(captured),
             .encoder_submit_delta_microseconds = submit_delta,
@@ -3296,7 +3484,7 @@ namespace stream {
               report_terminal_failure();
               return;
             }
-            const auto acknowledgement = pipeline_.submit_input_acknowledgement({
+            const auto acknowledgement = pipeline_->submit_input_acknowledgement({
               .host_receive_time_microseconds = v3_microseconds(completed),
               .applied_state_sequence = captured_watermark.state_sequence,
               .applied_edge_id = captured_watermark.edge_id,
@@ -3317,7 +3505,7 @@ namespace stream {
           if (packet->channel_data != this) {
             continue;
           }
-          const auto result = pipeline_.submit_audio({
+          const auto result = pipeline_->submit_audio({
             .capture_time_microseconds = v3_microseconds(std::chrono::steady_clock::now()),
             .first_sample_position = packet->sample_position,
             .opus = {std::begin(packet->payload), packet->payload.size()},
@@ -3333,8 +3521,69 @@ namespace stream {
         }
       }
 
+      /** @brief Forward the production virtual-controller output queue over authenticated v3. */
+      void consume_controller_feedback() {
+        while (const auto packet = feedback_packets_->pop()) {
+          if (packet->identity.id >= current_controller_generations_.size()) {
+            BOOST_LOG(error) << "Protocol-v3 platform emitted an invalid controller identifier"sv;
+            continue;
+          }
+          if (!await_input_authority(packet->identity.input_generation)) {
+            continue;
+          }
+          const auto input_generation = current_input_generation_.load(std::memory_order_acquire);
+          const auto controller_generation =
+            current_controller_generations_[packet->identity.id].load(std::memory_order_acquire);
+          if (!v3_feedback_is_current(*packet, input_generation, controller_generation)) {
+            continue;
+          }
+          v3_media::ControllerFeedback feedback {
+            .input_generation = packet->identity.input_generation,
+            .controller_generation = packet->identity.controller_generation,
+            .controller_id = static_cast<std::uint8_t>(packet->identity.id),
+          };
+          switch (packet->type) {
+            case platf::gamepad_feedback_e::rumble:
+              feedback.command = 1;
+              feedback.low_frequency = packet->data.rumble.lowfreq;
+              feedback.high_frequency = packet->data.rumble.highfreq;
+              break;
+            case platf::gamepad_feedback_e::rumble_triggers:
+              feedback.command = 2;
+              feedback.low_frequency = packet->data.rumble_triggers.left_trigger;
+              feedback.high_frequency = packet->data.rumble_triggers.right_trigger;
+              break;
+            case platf::gamepad_feedback_e::set_motion_event_state:
+              feedback.command = 3;
+              feedback.motion_type = packet->data.motion_event_state.motion_type;
+              feedback.report_rate_hz = packet->data.motion_event_state.report_rate;
+              break;
+            case platf::gamepad_feedback_e::set_rgb_led:
+              feedback.command = 4;
+              feedback.red = packet->data.rgb_led.r;
+              feedback.green = packet->data.rgb_led.g;
+              feedback.blue = packet->data.rgb_led.b;
+              break;
+            case platf::gamepad_feedback_e::set_adaptive_triggers:
+              feedback.command = 5;
+              feedback.adaptive_flags = packet->data.adaptive_triggers.event_flags;
+              feedback.adaptive_left_type = packet->data.adaptive_triggers.type_left;
+              feedback.adaptive_right_type = packet->data.adaptive_triggers.type_right;
+              feedback.adaptive_left = packet->data.adaptive_triggers.left;
+              feedback.adaptive_right = packet->data.adaptive_triggers.right;
+              break;
+          }
+          const auto result = pipeline_->submit_controller_feedback(feedback);
+          if (result == v3_media::PublishResult::invalid ||
+              result == v3_media::PublishResult::path_too_small) {
+            BOOST_LOG(error) << "Protocol-v3 rejected platform controller feedback"sv;
+          }
+        }
+      }
+
       bool submit(const v3_media::InputBatch &batch) override {
-        if (!validate_state(batch.state_block) || batch.edge_records.size() % 32 != 0) {
+        if (!input_authority_active_.load(std::memory_order_acquire) ||
+            !validate_state(batch.state_block) || batch.edge_records.size() % 32 != 0) {
           return false;
         }
         auto applied_edge = input_causality_.queued_edge();
@@ -3378,13 +3627,18 @@ namespace stream {
             return true;
           },
           supersedable,
-          [this, state_sequence = batch.state_sequence, applied_edge]() {
+          [this, state_sequence = batch.state_sequence, applied_edge](const bool applied) {
+            if (!applied) {
+              revoke_input_authority();
+              report_terminal_failure();
+              return;
+            }
             if (!input_causality_.mark_applied(state_sequence, applied_edge)) {
               report_terminal_failure();
               return;
             }
             const input::detail::causal_watermark_value_t watermark {state_sequence, applied_edge};
-            const auto acknowledgement = pipeline_.submit_input_acknowledgement({
+            const auto acknowledgement = pipeline_->submit_input_acknowledgement({
               .host_receive_time_microseconds = v3_microseconds(std::chrono::steady_clock::now()),
               .applied_state_sequence = state_sequence,
               .applied_edge_id = applied_edge,
@@ -3514,6 +3768,34 @@ namespace stream {
             (supported_buttons & ~std::uint32_t {0x003fffff}) != 0) {
           return false;
         }
+        const auto prior_generation =
+          controller_generation_counters_[controller].load(std::memory_order_acquire);
+        if (prior_generation == UINT32_MAX) {
+          return false;
+        }
+        const auto controller_generation = prior_generation + 1;
+        controller_generation_counters_[controller].store(
+          controller_generation,
+          std::memory_order_release
+        );
+        current_controller_generations_[controller].store(
+          controller_generation,
+          std::memory_order_release
+        );
+        const auto pending_input_generation =
+          pending_input_generation_.load(std::memory_order_acquire);
+        const auto input_generation = pending_input_generation != 0 ?
+                                        pending_input_generation :
+                                        current_input_generation_.load(std::memory_order_acquire);
+        if (!input::set_gamepad_feedback_identity(
+              input_.get(),
+              controller,
+              input_generation,
+              controller_generation
+            )) {
+          current_controller_generations_[controller].store(0, std::memory_order_release);
+          return false;
+        }
         SS_CONTROLLER_ARRIVAL_PACKET packet {};
         packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(std::uint32_t));
         packet.header.magic = util::endian::little<std::uint32_t>(SS_CONTROLLER_ARRIVAL_MAGIC);
@@ -3522,6 +3804,7 @@ namespace stream {
         packet.capabilities = util::endian::little(capabilities);
         packet.supportedButtonFlags = util::endian::little(supported_buttons);
         if (!inject(packet)) {
+          current_controller_generations_[controller].store(0, std::memory_order_release);
           return false;
         }
         arrived_controller_mask_ |= static_cast<std::uint16_t>(1U << controller);
@@ -3780,6 +4063,7 @@ namespace stream {
             return false;
           }
           arrived_controller_mask_ &= static_cast<std::uint16_t>(~(1U << controller));
+          current_controller_generations_[controller].store(0, std::memory_order_release);
           controller_states_[controller] = {};
         }
         prior_controller_mask_ = active_mask;
@@ -3897,8 +4181,13 @@ namespace stream {
           return inject_controller_state(device, prior_controller_mask_, state, inject);
         }
         if (kind == 4) {
-          if ((arrived_controller_mask_ & (1U << device)) != 0 ||
-              !inject_controller_arrival(
+          if ((arrived_controller_mask_ & (1U << device)) != 0) {
+            const auto &state = controller_states_[device];
+            return state.type == static_cast<std::uint8_t>(value) &&
+                   state.capabilities == code &&
+                   state.supported_buttons == v3_read_be<std::uint32_t>(edge, 24);
+          }
+          if (!inject_controller_arrival(
                 device,
                 static_cast<std::uint8_t>(value),
                 code,
@@ -3966,17 +4255,69 @@ namespace stream {
       }
 
       void report_terminal_failure() noexcept {
-        if (explicit_stop_.load(std::memory_order_acquire)) {
-          return;
-        }
-        bool expected = false;
-        if (!failure_reported_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        if (!claim_terminal_failure()) {
           return;
         }
         try {
           terminal_failure_();
         } catch (...) {
         }
+      }
+
+      void report_terminal_failure_async() noexcept {
+        if (!claim_terminal_failure()) {
+          return;
+        }
+        auto callback = terminal_failure_;
+        try {
+          std::thread([callback]() mutable noexcept {
+            try {
+              callback();
+            } catch (...) {
+            }
+          }).detach();
+        } catch (...) {
+          try {
+            callback();
+          } catch (...) {
+          }
+        }
+      }
+
+      bool claim_terminal_failure() noexcept {
+        if (explicit_stop_.load(std::memory_order_acquire)) {
+          return false;
+        }
+        bool expected = false;
+        return failure_reported_.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+      }
+
+      void revoke_input_authority() noexcept {
+        input_authority_active_.store(false, std::memory_order_release);
+        current_input_generation_.store(0, std::memory_order_release);
+        pending_input_generation_.store(0, std::memory_order_release);
+        for (auto &generation : current_controller_generations_) {
+          generation.store(0, std::memory_order_release);
+        }
+        input_authority_changed_.notify_all();
+      }
+
+      bool await_input_authority(const std::uint32_t generation) noexcept {
+        if (generation == 0) {
+          return false;
+        }
+        auto current = current_input_generation_.load(std::memory_order_acquire);
+        if (input_authority_active_.load(std::memory_order_acquire) && current == generation) {
+          return true;
+        }
+        std::unique_lock lock {input_authority_mutex_};
+        input_authority_changed_.wait_for(lock, 300ms, [this, generation]() {
+          return explicit_stop_.load(std::memory_order_acquire) ||
+                 current_input_generation_.load(std::memory_order_acquire) == generation ||
+                 pending_input_generation_.load(std::memory_order_acquire) != generation;
+        });
+        current = current_input_generation_.load(std::memory_order_acquire);
+        return input_authority_active_.load(std::memory_order_acquire) && current == generation;
       }
 
       v3_media::NegotiatedMediaConfig selection_;
@@ -3986,13 +4327,16 @@ namespace stream {
       safe::mail_t mail_;
       std::shared_ptr<input::input_t> input_;
       safe::mail_raw_t::queue_t<audio::packet_t> audio_packets_;
+      safe::mail_raw_t::queue_t<platf::gamepad_feedback_msg_t> feedback_packets_;
       video::egress_queue_t video_egress_;
-      v3_media::SessionPipeline pipeline_;
+      v3_media::TransportSink &transport_;  ///< Live QUIC sink used after platform media activation.
+      std::unique_ptr<v3_media::SessionPipeline> pipeline_;  ///< Constructed only after ABI5 resolves PQ metadata.
       config_t stream_config_ {};
       std::jthread video_capture_;
       std::jthread audio_capture_;
       std::jthread video_sender_;
       std::jthread audio_sender_;
+      std::jthread feedback_sender_;
       std::once_flag stop_once_;
       std::once_flag start_once_;
       bool media_started_ {};
@@ -4006,6 +4350,13 @@ namespace stream {
       std::int64_t prior_horizontal_wheel_ {};
       std::uint16_t prior_controller_mask_ {};
       std::uint16_t arrived_controller_mask_ {};
+      std::atomic_uint32_t current_input_generation_ {};
+      std::atomic_uint32_t pending_input_generation_ {};
+      std::atomic_bool input_authority_active_ {true};
+      std::mutex input_authority_mutex_;
+      std::condition_variable input_authority_changed_;
+      std::array<std::atomic_uint32_t, 16> controller_generation_counters_ {};
+      std::array<std::atomic_uint32_t, 16> current_controller_generations_ {};
       std::array<controller_state_t, 16> controller_states_ {};
       std::unordered_map<std::uint32_t, touch_point_t> touch_points_;
       std::unique_ptr<client_microphone::sink_t> microphone_sink_;
@@ -4039,6 +4390,23 @@ namespace stream {
       v3_media::TransportSink &transport_;
     };
   }  // namespace
+
+  void configure_protocol_v3_audio(
+    audio::config_t &output,
+    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection
+  ) {
+    configure_v3_audio(output, selection);
+  }
+
+#ifdef SUNSHINE_TESTS
+  bool protocol_v3_feedback_is_current_for_test(
+    const platf::gamepad_feedback_msg_t &message,
+    const std::uint32_t input_generation,
+    const std::uint32_t controller_generation
+  ) noexcept {
+    return v3_feedback_is_current(message, input_generation, controller_generation);
+  }
+#endif
 
   std::unique_ptr<lumen::protocol_v3::runtime::SessionResourceFactory>
     make_protocol_v3_session_resource_factory(

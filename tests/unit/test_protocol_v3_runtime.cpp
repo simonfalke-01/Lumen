@@ -4,7 +4,10 @@
  */
 
 #include "src/protocol_common/crypto.h"
+#include "src/protocol_common/status.h"
 #include "src/protocol_v3/runtime.h"
+#include "src/rtsp.h"
+#include "src/video.h"
 
 #include <array>
 #include <atomic>
@@ -20,6 +23,7 @@ namespace {
   namespace control = lumen::protocol_v3::control_session;
   namespace media = lumen::protocol_v3::media;
   namespace protocol_crypto = lumen::protocol_common::crypto;
+  using ProtocolStatus = lumen::protocol_common::Status;
   namespace quic = lumen::protocol_v3::quic_server;
   namespace runtime = lumen::protocol_v3::runtime;
 
@@ -45,11 +49,15 @@ namespace {
       ++state_->destructor_calls;
     }
 
+    const media::NegotiatedMediaConfig &effective_media_config() const noexcept override {
+      return effective_;
+    }
+
     std::span<const std::uint8_t> video_codec_initialization() const noexcept override {
       return codec_initialization_;
     }
 
-    bool reset_input(std::span<const std::uint8_t>) override {
+    bool reset_input(std::span<const std::uint8_t>, std::uint32_t) override {
       return true;
     }
 
@@ -92,6 +100,7 @@ namespace {
     std::shared_ptr<StopRaceState> state_;
     std::function<void()> terminal_failure_;
     const std::array<std::uint8_t, 1> codec_initialization_ {0x01};
+    media::NegotiatedMediaConfig effective_;
   };
 
   class StopRaceApplicationBridge final: public runtime::ApplicationBridge {
@@ -107,7 +116,8 @@ namespace {
       return std::unexpected(std::uint8_t {8});
     }
 
-    std::expected<bool, std::uint8_t> start(const runtime::ApplicationLaunch &) override {
+    std::expected<bool, std::uint8_t> start(const runtime::ApplicationLaunch &launch) override {
+      last_launch = launch;
       return false;
     }
 
@@ -121,6 +131,7 @@ namespace {
     }
 
     std::atomic_int stop_calls {};
+    std::optional<runtime::ApplicationLaunch> last_launch;
   };
 
   class StopRaceResourceFactory final: public runtime::SessionResourceFactory {
@@ -133,6 +144,114 @@ namespace {
       return std::unexpected(std::uint8_t {8});
     }
   };
+
+  class CapturedSelectionResources final: public runtime::SessionResources {
+  public:
+    explicit CapturedSelectionResources(media::NegotiatedMediaConfig effective):
+        effective_ {std::move(effective)} {
+    }
+
+    const media::NegotiatedMediaConfig &effective_media_config() const noexcept override {
+      return effective_;
+    }
+
+    std::span<const std::uint8_t> video_codec_initialization() const noexcept override {
+      return initialization_;
+    }
+    bool reset_input(std::span<const std::uint8_t>, std::uint32_t) override { return true; }
+    bool apply_text(const control::cbor::Value::Map &) override { return true; }
+    media::ReceiveResult datagram(const quic::DatagramRecord &) override {
+      return media::ReceiveResult::accepted;
+    }
+    bool start_media() override { return true; }
+    void detach_connection() noexcept override {}
+    bool attach_connection(std::uint64_t) override { return true; }
+    void stop() noexcept override {}
+
+  private:
+    media::NegotiatedMediaConfig effective_;
+    const std::array<std::uint8_t, 1> initialization_ {0x01};
+  };
+
+  class CapturingResourceFactory final: public runtime::SessionResourceFactory {
+  public:
+    std::expected<std::unique_ptr<runtime::SessionResources>, std::uint8_t> create(
+      const media::NegotiatedMediaConfig &config,
+      std::uint64_t,
+      std::function<void()>
+    ) override {
+      auto effective = config;
+      effective.static_hdr_metadata = resolved_metadata;
+      selected = effective;
+      return std::make_unique<CapturedSelectionResources>(std::move(effective));
+    }
+
+    std::optional<media::NegotiatedMediaConfig> selected;
+    std::optional<media::StaticHDRMetadata> resolved_metadata;
+  };
+
+  class AcceptingTransport final: public runtime::QuicTransportSink {
+  public:
+    bool update_policy(std::uint64_t, quic::Profile, std::uint64_t) noexcept override {
+      return true;
+    }
+  };
+
+  const control::cbor::Value *map_field(
+    const control::cbor::Value::Map &map,
+    const std::uint64_t key
+  ) {
+    const auto found = std::ranges::find_if(map, [key](const auto &entry) {
+      return entry.first == key;
+    });
+    return found == map.end() ? nullptr : &found->second;
+  }
+
+  control::cbor::Value::Map start_fields(
+    const std::uint64_t codec_transfer,
+    const bool host_audio = false
+  ) {
+    using control::cbor::Value;
+    const auto hdr_transfer = codec_transfer == 16 ? 2U : 3U;
+    return {
+      {1, Value::Bytes(16, 0x11)},
+      {2, 0U},
+      {3, 2U},
+      {4, 1920U},
+      {5, 1080U},
+      {6, 60000U},
+      {7, 1001U},
+      {8, 100000U},
+      {9, Value::Array {Value::Map {
+            {1, 2U}, {2, 1U}, {3, 10U}, {4, 1U}, {5, 9U},
+            {6, codec_transfer}, {7, 9U}, {8, 0U}, {9, 0U}, {10, 1U},
+          }}},
+      {10, Value::Array {Value::Map {
+             {1, 1U}, {2, 48000U}, {3, 2U}, {4, 240U}, {5, 1U},
+             {6, 1U}, {7, 1U}, {8, Value::Bytes {0, 1}}, {9, 256000U},
+           }}},
+      {11, Value {control::cbor::Null {}}},
+      {12, static_cast<std::uint64_t>(quic::maximum_semantic_datagram_bytes)},
+      {13, Value::Bytes(16, 0x22)},
+      {14, Value::Array {Value::Map {
+             {1, hdr_transfer}, {2, 9U}, {3, 9U}, {4, 0U}, {5, 10U},
+             {6, Value::Map {{1, Value {codec_transfer == 16}}, {2, 10000000U}, {3, 10000U}, {4, 10000U}}},
+             {7, Value::Array {}},
+           }}},
+      {15, Value::Array {Value::Map {{1, 3U}, {2, 2U}, {3, 0U}, {4, 0U}, {5, 0U}}}},
+      {16, Value {false}},
+      {17, Value::Map {
+             {1, 1U}, {2, Value {false}}, {3, Value {false}},
+             {4, Value {true}}, {5, Value {true}}, {6, Value {false}},
+           }},
+      {18, Value {host_audio}},
+    };
+  }
+
+  std::uint64_t unsigned_value(const control::cbor::Value *value) {
+    const auto *integer = value ? std::get_if<std::uint64_t>(&value->storage) : nullptr;
+    return integer ? *integer : UINT64_MAX;
+  }
 
   control::cbor::Value::Map stop_fields(
     const control::Identifier &session_id,
@@ -283,6 +402,225 @@ TEST(ProtocolV3Runtime, AttachIntentCacheReturnsExactCommittedOutcomeBeforeExpir
   EXPECT_EQ(conflict.match, runtime::AttachIntentCache::Match::conflict);
   const auto expired = cache.lookup(intent, 9, media_generations, now + std::chrono::seconds {61});
   EXPECT_EQ(expired.match, runtime::AttachIntentCache::Match::missing);
+}
+
+TEST(ProtocolV3Runtime, BuildsHlgNullAndPqAbi5MasteringIntoStartAndVideoConfig) {
+  const auto prior_hevc_mode = video::active_hevc_mode;
+  video::active_hevc_mode = 3;
+  const auto restore_hevc = std::unique_ptr<void, std::function<void(void *)>> {
+    reinterpret_cast<void *>(1),
+    [&](void *) {
+      video::active_hevc_mode = prior_hevc_mode;
+    },
+  };
+  control::ClientRecord client {
+    .client_id = control::Identifier {},
+    .permissions = control::start_permission,
+    .generation = 1,
+  };
+  client.client_id.fill(0x31);
+
+  {
+    control::SecureRandom random;
+    StopRaceApplicationBridge applications;
+    CapturingResourceFactory factory;
+    AcceptingTransport transport;
+    runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+    const auto started = backend.start(
+      client,
+      start_fields(18),
+      1,
+      quic::maximum_semantic_datagram_bytes
+    );
+    ASSERT_TRUE(started.has_value());
+    ASSERT_TRUE(applications.last_launch.has_value());
+    EXPECT_EQ(applications.last_launch->refresh_numerator, 60'000U);
+    EXPECT_EQ(applications.last_launch->refresh_denominator, 1'001U);
+    EXPECT_TRUE(applications.last_launch->enable_hdr);
+    EXPECT_FALSE(applications.last_launch->host_audio);
+    EXPECT_EQ(applications.last_launch->audio.channels, 2U);
+    EXPECT_EQ(applications.last_launch->audio.layout, 1U);
+    EXPECT_EQ(applications.last_launch->audio.frame_samples, 240U);
+    EXPECT_EQ(applications.last_launch->audio.bitrate_bps, 256'000U);
+    ASSERT_TRUE(factory.selected);
+    EXPECT_EQ(factory.selected->transfer, 3U);
+    EXPECT_FALSE(factory.selected->static_hdr_metadata.has_value());
+    const auto *response_hdr_value = map_field(started->response_fields, 23);
+    const auto *response_hdr = response_hdr_value ?
+                                 std::get_if<control::cbor::Value::Map>(&response_hdr_value->storage) :
+                                 nullptr;
+    ASSERT_NE(response_hdr, nullptr);
+    EXPECT_EQ(unsigned_value(map_field(*response_hdr, 1)), 3U);
+    ASSERT_NE(map_field(*response_hdr, 6), nullptr);
+    EXPECT_TRUE(std::holds_alternative<control::cbor::Null>(map_field(*response_hdr, 6)->storage));
+    ASSERT_FALSE(started->host_requests.empty());
+    ASSERT_EQ(started->host_requests.front().message_type, 0x0140U);
+    const auto *video_hdr_value = map_field(started->host_requests.front().request_fields, 5);
+    const auto *video_hdr = video_hdr_value ?
+                              std::get_if<control::cbor::Value::Map>(&video_hdr_value->storage) :
+                              nullptr;
+    ASSERT_NE(video_hdr, nullptr);
+    EXPECT_TRUE(std::holds_alternative<control::cbor::Null>(map_field(*video_hdr, 6)->storage));
+  }
+
+  const media::StaticHDRMetadata abi5_metadata {
+    {35'400, 14'600, 8'500, 39'850, 6'550, 2'300},
+    {15'635, 16'450},
+    10'000'000,
+    50,
+    1'000,
+    400,
+  };
+  {
+    control::SecureRandom random;
+    StopRaceApplicationBridge applications;
+    CapturingResourceFactory factory;
+    factory.resolved_metadata = abi5_metadata;
+    AcceptingTransport transport;
+    runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+    auto pq_client = client;
+    pq_client.client_id.fill(0x32);
+    const auto started = backend.start(
+      pq_client,
+      start_fields(16),
+      2,
+      quic::maximum_semantic_datagram_bytes
+    );
+    ASSERT_TRUE(started.has_value());
+    ASSERT_TRUE(factory.selected);
+    EXPECT_EQ(factory.selected->transfer, 2U);
+    ASSERT_TRUE(factory.selected->static_hdr_metadata.has_value());
+    const auto *response_hdr_value = map_field(started->response_fields, 23);
+    const auto *response_hdr = response_hdr_value ?
+                                 std::get_if<control::cbor::Value::Map>(&response_hdr_value->storage) :
+                                 nullptr;
+    ASSERT_NE(response_hdr, nullptr);
+    EXPECT_EQ(unsigned_value(map_field(*response_hdr, 1)), 2U);
+    EXPECT_TRUE(std::holds_alternative<control::cbor::Value::Map>(map_field(*response_hdr, 6)->storage));
+    const auto *video_hdr_value = map_field(started->host_requests.front().request_fields, 5);
+    ASSERT_NE(video_hdr_value, nullptr);
+    EXPECT_EQ(video_hdr_value->storage, response_hdr_value->storage);
+  }
+
+  {
+    control::SecureRandom random;
+    StopRaceApplicationBridge applications;
+    CapturingResourceFactory factory;
+    AcceptingTransport transport;
+    runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+    auto pq_client = client;
+    pq_client.client_id.fill(0x33);
+    EXPECT_FALSE(backend.start(
+      pq_client,
+      start_fields(16),
+      3,
+      quic::maximum_semantic_datagram_bytes
+    ).has_value());
+  }
+}
+
+TEST(ProtocolV3Runtime, LegacyApplicationShapeKeepsExactRefreshHdrAndSelectedSurroundTuple) {
+  media::OpusTuple audio {
+    .sample_rate = 48'000,
+    .frame_samples = 240,
+    .channels = 8,
+    .layout = 3,
+    .streams = 5,
+    .coupled_streams = 3,
+    .mapping = {0, 1, 2, 3, 4, 5, 6, 7},
+    .bitrate_bps = 450'000,
+  };
+  const runtime::ApplicationLaunch launch {
+    .application_id = 7,
+    .width = 3456,
+    .height = 2160,
+    .refresh_numerator = 60'000,
+    .refresh_denominator = 1'001,
+    .host_audio = true,
+    .enable_hdr = true,
+    .audio = audio,
+    .resume = false,
+  };
+
+  const auto shaped = runtime::make_legacy_launch_session(launch);
+  ASSERT_TRUE(shaped.has_value());
+  EXPECT_EQ((*shaped)->width, 3456);
+  EXPECT_EQ((*shaped)->height, 2160);
+  EXPECT_EQ((*shaped)->fps, 60);
+  EXPECT_EQ((*shaped)->refresh_numerator, 60'000U);
+  EXPECT_EQ((*shaped)->refresh_denominator, 1'001U);
+  EXPECT_TRUE((*shaped)->host_audio);
+  EXPECT_TRUE((*shaped)->enable_hdr);
+  EXPECT_TRUE((*shaped)->continuous_audio);
+  EXPECT_EQ((*shaped)->surround_info, 0x063f0008);
+  EXPECT_EQ((*shaped)->surround_params, "85301234567");
+}
+
+TEST(ProtocolV3Runtime, RequiresAndCarriesExplicitHostAudioSelection) {
+  const auto prior_hevc_mode = video::active_hevc_mode;
+  video::active_hevc_mode = 3;
+  const auto restore_hevc = std::unique_ptr<void, std::function<void(void *)>> {
+    reinterpret_cast<void *>(1),
+    [&](void *) {
+      video::active_hevc_mode = prior_hevc_mode;
+    },
+  };
+  control::ClientRecord client {
+    .client_id = control::Identifier {},
+    .permissions = control::start_permission,
+    .generation = 1,
+  };
+
+  for (const bool host_audio : {false, true}) {
+    client.client_id.fill(host_audio ? 0x52 : 0x51);
+    control::SecureRandom random;
+    StopRaceApplicationBridge applications;
+    CapturingResourceFactory factory;
+    AcceptingTransport transport;
+    runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+    const auto started = backend.start(
+      client,
+      start_fields(18, host_audio),
+      host_audio ? 52 : 51,
+      quic::maximum_semantic_datagram_bytes
+    );
+    ASSERT_TRUE(started.has_value());
+    ASSERT_TRUE(applications.last_launch.has_value());
+    EXPECT_EQ(applications.last_launch->host_audio, host_audio);
+    ASSERT_TRUE(factory.selected.has_value());
+    EXPECT_EQ(factory.selected->host_audio, host_audio);
+  }
+
+  const auto expect_malformed = [&](control::cbor::Value::Map fields, const std::uint64_t connection_id) {
+    control::SecureRandom random;
+    StopRaceApplicationBridge applications;
+    CapturingResourceFactory factory;
+    AcceptingTransport transport;
+    runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+    const auto started = backend.start(
+      client,
+      fields,
+      connection_id,
+      quic::maximum_semantic_datagram_bytes
+    );
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error(), static_cast<std::uint8_t>(ProtocolStatus::malformed));
+    EXPECT_FALSE(applications.last_launch.has_value());
+  };
+
+  auto missing = start_fields(18, false);
+  std::erase_if(missing, [](const auto &entry) {
+    return entry.first == 18;
+  });
+  expect_malformed(std::move(missing), 53);
+
+  auto malformed = start_fields(18, false);
+  const auto host_audio = std::ranges::find_if(malformed, [](const auto &entry) {
+    return entry.first == 18;
+  });
+  ASSERT_NE(host_audio, malformed.end());
+  host_audio->second = control::cbor::Value {0U};
+  expect_malformed(std::move(malformed), 54);
 }
 
 TEST(ProtocolV3Runtime, StopDetachesOwnershipBeforeTerminalCallbackAndRemainsReusable) {

@@ -85,6 +85,7 @@ namespace platf {
     std::map<uint32_t, uint8_t> pointer_id_map;  ///< Legacy DS4 touch map.
     uint8_t available_pointers {};  ///< Legacy DS4 available touch pointers.
     uint8_t client_relative_index;  ///< Client relative index.
+    gamepad_feedback_id_t feedback_identity {};  ///< Immutable input/controller feedback identity.
     vigem_notification_t notification;  ///< Bounded exact notification registration identity.
     thread_pool_util::ThreadPool::task_id_t repeat_task {};  ///< Legacy DS4 repeat task.
     std::chrono::steady_clock::time_point last_report_ts;  ///< Legacy DS4 report time.
@@ -368,6 +369,7 @@ namespace platf {
       {
         std::lock_guard lock(gamepads_mutex);
         gamepad.client_relative_index = id.clientRelativeIndex;
+        gamepad.feedback_identity = id.feedback_identity();
         gamepad.feedback_queue = std::move(feedback_queue);
         gamepad.last_rumble = {};
         gamepad.last_rgb_led = {};
@@ -397,6 +399,7 @@ namespace platf {
         std::lock_guard lock(gamepads_mutex);
         gamepad.notification.active.store(false);
         gamepad.feedback_queue.reset();
+        gamepad.feedback_identity = {};
         gamepad.last_rumble = {};
         gamepad.last_rgb_led = {};
       }
@@ -473,7 +476,7 @@ namespace platf {
           return;
         }
         message = gamepad_feedback_msg_t::make_rumble(
-          gamepad.client_relative_index,
+          gamepad.feedback_identity,
           normalized_large_motor,
           normalized_small_motor
         );

@@ -24,6 +24,7 @@ extern "C" {
 #include <src/config.h>
 #include <src/stream_policy.h>
 #include <src/video.h>
+#include <src/video_colorspace.h>
 
 using namespace std::literals;
 
@@ -55,6 +56,39 @@ namespace {
     };
   }
 }  // namespace
+
+TEST(VideoColorspaceTest, MapsProtocolV3H273TransfersExactly) {
+  video::config_t config {};
+  config.protocolV3Colorimetry = true;
+  config.dynamicRange = 1;
+  config.colorMatrix = 9;
+
+  config.colorTransfer = 16;
+  EXPECT_EQ(video::colorspace_from_client_config(config, true).colorspace, video::colorspace_e::bt2020);
+
+  config.colorTransfer = 18;
+  EXPECT_EQ(video::colorspace_from_client_config(config, true).colorspace, video::colorspace_e::bt2020hlg);
+
+  config.colorTransfer = 1;
+  EXPECT_EQ(video::colorspace_from_client_config(config, false).colorspace, video::colorspace_e::bt2020sdr);
+}
+
+TEST(VideoCaptureRecoveryTest, RequiredDirectSourceLossTerminatesInsteadOfReinitializing) {
+  video::config_t ordinary {};
+  EXPECT_EQ(
+    video::capture_reinitialization_action(ordinary),
+    video::capture_reinitialization_e::retry
+  );
+  EXPECT_EQ(video::display_initialization_attempts(ordinary), 2);
+
+  auto direct_required = ordinary;
+  direct_required.virtual_display_direct_required = true;
+  EXPECT_EQ(
+    video::capture_reinitialization_action(direct_required),
+    video::capture_reinitialization_e::terminate
+  );
+  EXPECT_EQ(video::display_initialization_attempts(direct_required), 1);
+}
 
 TEST(VideoCodecInitializationTest, ExtractsOnlyH264ParameterSets) {
   const std::vector<std::uint8_t> access_unit {

@@ -102,20 +102,20 @@ namespace platf::win_gamepad {
      * @param profile Selected profile.
      * @param definition Portable profile definition.
      * @param queue Stream feedback queue.
-     * @param client_index Client-relative controller index.
+     * @param identity Immutable client feedback identity.
      * @param generation Router generation.
      */
     feedback_state_t(
       profile_kind_e profile,
       lvh_core::profile_definition_t definition,
       feedback_queue_t queue,
-      std::uint8_t client_index,
+      gamepad_feedback_id_t identity,
       std::uint64_t generation
     ):
         profile {profile},
         definition {std::move(definition)},
         queue {std::move(queue)},
-        client_index {client_index},
+        identity {identity},
         generation {generation} {
       if (profile == profile_kind_e::generic) {
         pid_thread = std::jthread([this](std::stop_token stop_token) {
@@ -197,14 +197,14 @@ namespace platf::win_gamepad {
             return;
           }
           last_rumble = std::pair {event.low_frequency_rumble, event.high_frequency_rumble};
-          queue->raise(gamepad_feedback_msg_t::make_rumble(client_index, event.low_frequency_rumble, event.high_frequency_rumble));
+          queue->raise(gamepad_feedback_msg_t::make_rumble(identity, event.low_frequency_rumble, event.high_frequency_rumble));
           break;
         case lvh_core::output_kind_e::trigger_rumble:
           if (last_trigger_rumble == std::pair {event.left_trigger_rumble, event.right_trigger_rumble}) {
             return;
           }
           last_trigger_rumble = std::pair {event.left_trigger_rumble, event.right_trigger_rumble};
-          queue->raise(gamepad_feedback_msg_t::make_rumble_triggers(client_index, event.left_trigger_rumble, event.right_trigger_rumble));
+          queue->raise(gamepad_feedback_msg_t::make_rumble_triggers(identity, event.left_trigger_rumble, event.right_trigger_rumble));
           break;
         case lvh_core::output_kind_e::rgb_led:
           {
@@ -213,7 +213,7 @@ namespace platf::win_gamepad {
               return;
             }
             last_rgb = color;
-            queue->raise(gamepad_feedback_msg_t::make_rgb_led(client_index, event.red, event.green, event.blue));
+            queue->raise(gamepad_feedback_msg_t::make_rgb_led(identity, event.red, event.green, event.blue));
             break;
           }
         case lvh_core::output_kind_e::adaptive_triggers:
@@ -229,7 +229,7 @@ namespace platf::win_gamepad {
               return;
             }
             last_adaptive = state;
-            queue->raise(gamepad_feedback_msg_t::make_adaptive_triggers(client_index, event.adaptive_trigger_flags, event.left_trigger_effect_type, event.right_trigger_effect_type, event.left_trigger_effect, event.right_trigger_effect));
+            queue->raise(gamepad_feedback_msg_t::make_adaptive_triggers(identity, event.adaptive_trigger_flags, event.left_trigger_effect_type, event.right_trigger_effect_type, event.left_trigger_effect, event.right_trigger_effect));
             break;
           }
         case lvh_core::output_kind_e::raw_report:
@@ -305,7 +305,7 @@ namespace platf::win_gamepad {
     profile_kind_e profile;  ///< Selected profile.
     lvh_core::profile_definition_t definition;  ///< Portable output parser profile.
     feedback_queue_t queue;  ///< Current stream feedback queue.
-    std::uint8_t client_index {};  ///< Client-relative controller index.
+    gamepad_feedback_id_t identity {};  ///< Immutable input/controller identity.
     std::uint64_t generation {};  ///< Router slot generation.
     std::atomic_bool active {true};  ///< Stale-event fence.
     std::mutex feedback_mutex;  ///< Serializes deduplication and queue raises.
@@ -361,7 +361,7 @@ namespace platf::win_gamepad {
       profile,
       definition,
       std::move(feedback_queue),
-      id.clientRelativeIndex,
+      id.feedback_identity(),
       generation
     );
     const auto callback_generation = generation;
@@ -422,8 +422,8 @@ namespace platf::win_gamepad {
     }
 
     if (backend->definition_.capabilities.motion && backend->feedback_->queue) {
-      backend->feedback_->queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.clientRelativeIndex, LI_MOTION_TYPE_ACCEL, 100));
-      backend->feedback_->queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.clientRelativeIndex, LI_MOTION_TYPE_GYRO, 100));
+      backend->feedback_->queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.feedback_identity(), LI_MOTION_TYPE_ACCEL, 100));
+      backend->feedback_->queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.feedback_identity(), LI_MOTION_TYPE_GYRO, 100));
     }
     return {
       .backend = std::move(backend),

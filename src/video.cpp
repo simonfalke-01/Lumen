@@ -219,6 +219,8 @@ namespace video {
       append(config.refreshDenominator);
       append_codec_cache_string(fingerprint, config.output_name);
       append(config.client_protocol);
+      append(config.virtual_display_active);
+      append(config.virtual_display_direct_required);
       append(static_cast<bool>(config.virtual_display_frame_source));
 
       append(config::video.qp);
@@ -1664,16 +1666,18 @@ namespace video {
    * @param config Configuration values to apply.
    */
   void reset_display(std::shared_ptr<platf::display_t> &disp, const platf::mem_type_e &type, const std::string &display_name, const config_t &config) {
-    // We try this twice, in case we still get an error on reinitialization
-    for (int x = 0; x < 2; ++x) {
+    const auto attempts = display_initialization_attempts(config);
+    for (int attempt = 0; attempt < attempts; ++attempt) {
       disp.reset();
       disp = platf::display(type, display_name, config);
       if (disp) {
         break;
       }
 
-      // The capture code depends on us to sleep between failures
-      std::this_thread::sleep_for(200ms);
+      if (attempt + 1 < attempts) {
+        // Ordinary capture retains one bounded retry after the backend settles.
+        std::this_thread::sleep_for(200ms);
+      }
     }
   }
 
@@ -1958,6 +1962,11 @@ namespace video {
       switch (status) {
         case platf::capture_e::reinit:
           {
+            if (capture_reinitialization_action(capture_ctxs.front().config) ==
+                capture_reinitialization_e::terminate) {
+              BOOST_LOG(error) << "Required Lumen VDD direct-frame source was lost; terminating capture"sv;
+              return;
+            }
             display_ready_event.reset();
             reinit_event.raise(true);
 
@@ -2992,6 +3001,11 @@ namespace video {
       if (disp) {
         break;
       }
+      if (capture_reinitialization_action(synced_session_ctxs.front()->config) ==
+          capture_reinitialization_e::terminate) {
+        BOOST_LOG(error) << "Required Lumen VDD direct-frame display could not be initialized; terminating capture"sv;
+        return encode_e::error;
+      }
     }
 
     if (!disp) {
@@ -3121,6 +3135,13 @@ namespace video {
       auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
       switch (status) {
         case platf::capture_e::reinit:
+          if (!synced_session_ctxs.empty() &&
+              capture_reinitialization_action(synced_session_ctxs.front()->config) ==
+                capture_reinitialization_e::terminate) {
+            BOOST_LOG(error) << "Required Lumen VDD direct-frame source was lost; terminating synchronous capture"sv;
+            return encode_e::error;
+          }
+          return ec != platf::capture_e::ok ? ec : status;
         case platf::capture_e::error:
         case platf::capture_e::ok:
         case platf::capture_e::timeout:
