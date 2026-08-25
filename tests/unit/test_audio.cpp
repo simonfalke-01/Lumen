@@ -50,6 +50,63 @@ namespace {
     bool closed_ {};
   };
 
+  enum class route_protocol_e {
+    legacy,
+    umbra_v3
+  };
+
+  struct routed_packet_t {
+    route_protocol_e protocol {route_protocol_e::legacy};
+    std::uint64_t owner_id {};
+    packet_t packet;
+  };
+
+  template<route_protocol_e Protocol>
+  class routed_destination_t final: public AudioPacketDestination {
+  public:
+    explicit routed_destination_t(const std::uint64_t owner_id):
+        owner_id_ {owner_id} {
+    }
+
+    enqueue_result_e enqueue(packet_t packet) override {
+      std::lock_guard lock {mutex_};
+      if (closed_) {
+        return enqueue_result_e::closed;
+      }
+      packets_.push_back({Protocol, owner_id_, std::move(packet)});
+      packet_available_.notify_all();
+      return enqueue_result_e::enqueued;
+    }
+
+    void close() noexcept override {
+      std::lock_guard lock {mutex_};
+      closed_ = true;
+      packet_available_.notify_all();
+    }
+
+    bool wait_for_packet(const std::chrono::milliseconds timeout) {
+      std::unique_lock lock {mutex_};
+      return packet_available_.wait_for(lock, timeout, [this] {
+        return !packets_.empty() || closed_;
+      }) && !packets_.empty();
+    }
+
+    std::vector<routed_packet_t> packets() const {
+      std::lock_guard lock {mutex_};
+      return packets_;
+    }
+
+  private:
+    std::uint64_t owner_id_ {};
+    mutable std::mutex mutex_;
+    std::condition_variable packet_available_;
+    std::vector<routed_packet_t> packets_;
+    bool closed_ {};
+  };
+
+  using legacy_destination_t = routed_destination_t<route_protocol_e::legacy>;
+  using v3_destination_t = routed_destination_t<route_protocol_e::umbra_v3>;
+
   struct blocking_destination_state_t {
     std::promise<void> entered;
     std::promise<void> release;
@@ -247,22 +304,31 @@ TEST_F(AudioPacketDestinationTest, TwoProtocolV3AndOneLegacyDestinationRemainIso
     std::make_shared<safe::mail_raw_t>(),
     std::make_shared<safe::mail_raw_t>(),
   };
-  std::array<std::shared_ptr<recording_destination_t>, 3> destinations {
-    std::make_shared<recording_destination_t>(),
-    std::make_shared<recording_destination_t>(),
-    std::make_shared<recording_destination_t>(),
+  const auto first_v3 = std::make_shared<v3_destination_t>(101);
+  const auto second_v3 = std::make_shared<v3_destination_t>(102);
+  const auto legacy = std::make_shared<legacy_destination_t>(201);
+  std::array<std::shared_ptr<AudioPacketDestination>, 3> destinations {
+    first_v3,
+    second_v3,
+    legacy,
+  };
+  std::array<config_t, 3> configs {
+    stereo_config(),
+    config_t {5, 6, 0x3f, {0}, {}},
+    config_t {5, 8, 0x63f, {0}, {}},
   };
   std::array<std::jthread, 3> captures;
   for (std::size_t index = 0; index < captures.size(); ++index) {
-    captures[index] = std::jthread {[mail = mails[index], destination = destinations[index]] {
-      audio::capture(mail, stereo_config(), destination);
+    captures[index] = std::jthread {[mail = mails[index], destination = destinations[index], config = configs[index]] {
+      audio::capture(mail, config, destination);
     }};
   }
 
-  std::array<bool, 3> received {};
-  for (std::size_t index = 0; index < destinations.size(); ++index) {
-    received[index] = destinations[index]->wait_for_packet(3s);
-  }
+  const std::array<bool, 3> received {
+    first_v3->wait_for_packet(3s),
+    second_v3->wait_for_packet(3s),
+    legacy->wait_for_packet(3s),
+  };
   for (const auto &mail : mails) {
     stop_capture(mail);
   }
@@ -270,13 +336,25 @@ TEST_F(AudioPacketDestinationTest, TwoProtocolV3AndOneLegacyDestinationRemainIso
     capture.join();
   }
 
-  for (std::size_t index = 0; index < destinations.size(); ++index) {
-    EXPECT_TRUE(received[index]);
-    const auto &destination = destinations[index];
-    const auto packets = destination->packets();
+  EXPECT_TRUE(std::ranges::all_of(received, [](const bool value) {
+    return value;
+  }));
+  const auto first_v3_packets = first_v3->packets();
+  const auto second_v3_packets = second_v3->packets();
+  const auto legacy_packets = legacy->packets();
+  const auto verify_route = [](const std::vector<routed_packet_t> &packets, const route_protocol_e protocol, const std::uint64_t owner_id) {
     ASSERT_FALSE(packets.empty());
     EXPECT_TRUE(std::ranges::all_of(packets, [](const auto &packet) {
-      return packet.payload.size() != 0;
+      return packet.packet.payload.size() != 0;
     }));
-  }
+    EXPECT_TRUE(std::ranges::all_of(packets, [protocol, owner_id](const auto &packet) {
+      return packet.protocol == protocol && packet.owner_id == owner_id;
+    }));
+  };
+  verify_route(first_v3_packets, route_protocol_e::umbra_v3, 101);
+  verify_route(second_v3_packets, route_protocol_e::umbra_v3, 102);
+  verify_route(legacy_packets, route_protocol_e::legacy, 201);
+  EXPECT_NE(first_v3_packets.front().packet.payload.size(), second_v3_packets.front().packet.payload.size());
+  EXPECT_NE(first_v3_packets.front().packet.payload.size(), legacy_packets.front().packet.payload.size());
+  EXPECT_NE(second_v3_packets.front().packet.payload.size(), legacy_packets.front().packet.payload.size());
 }

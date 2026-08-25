@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <gtest/gtest.h>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -32,27 +33,61 @@ namespace {
 
   class transport_t final: public media::TransportSink {
   public:
+    struct packet_event_t {
+      std::uint64_t connection_id {};
+      quic::Lane lane {quic::Lane::control};
+      quic::MonotonicClock::time_point deadline {};
+      bool replaceable {};
+      std::vector<std::uint8_t> bytes;
+    };
+
+    struct video_event_t {
+      std::uint64_t connection_id {};
+      std::shared_ptr<const quic::LazyVideoFrame> frame;
+    };
+
     bool update_policy(std::uint64_t, quic::Profile, std::uint64_t) noexcept override {
       return true;
     }
 
-    quic::EnqueueResult enqueue(std::uint64_t, quic::Packet packet) override {
+    quic::EnqueueResult enqueue(const std::uint64_t connection_id, quic::Packet packet) override {
+      if (stopped) {
+        return quic::EnqueueResult::shutting_down;
+      }
+      if (packets.size() >= maximum_packets) {
+        return quic::EnqueueResult::would_block;
+      }
       packets.emplace_back(*packet.bytes);
-      return enqueue_result;
+      packet_events.push_back({
+        .connection_id = connection_id,
+        .lane = packet.lane,
+        .deadline = packet.deadline,
+        .replaceable = packet.replaceable,
+        .bytes = *packet.bytes,
+      });
+      return quic::EnqueueResult::queued;
     }
 
     quic::EnqueueResult enqueue_video_frame(
-      std::uint64_t,
+      const std::uint64_t connection_id,
       std::shared_ptr<const quic::LazyVideoFrame> frame
     ) override {
+      video_events.push_back({connection_id, frame});
       video_frames.emplace_back(std::move(frame));
       return video_enqueue_result;
     }
 
-    quic::EnqueueResult enqueue_result {quic::EnqueueResult::queued};
+    void stop() noexcept {
+      stopped = true;
+    }
+
     quic::EnqueueResult video_enqueue_result {quic::EnqueueResult::queued};
+    std::size_t maximum_packets {std::numeric_limits<std::size_t>::max()};
+    bool stopped {};
     std::vector<std::vector<std::uint8_t>> packets;
+    std::vector<packet_event_t> packet_events;
     std::vector<std::shared_ptr<const quic::LazyVideoFrame>> video_frames;
+    std::vector<video_event_t> video_events;
   };
 
   class input_t final: public media::InputSink {
@@ -326,6 +361,7 @@ TEST(ProtocolV3AudioPublication, PreservesGenerationAndReportsBackpressureAndClo
   feedback_t feedback;
   auto negotiated = config();
   negotiated.audio_generation = 0x12345678U;
+  transport.maximum_packets = 1;
   media::SessionPipeline pipeline(negotiated, transport, input, microphone, feedback);
   ASSERT_TRUE(pipeline.bind_connection(7));
 
@@ -345,9 +381,8 @@ TEST(ProtocolV3AudioPublication, PreservesGenerationAndReportsBackpressureAndClo
   EXPECT_EQ(wire[payload_offset + 25U], 0x02U);
   EXPECT_TRUE(std::ranges::equal(opus.begin(), opus.end(), wire.end() - opus.size(), wire.end()));
 
-  transport.enqueue_result = quic::EnqueueResult::would_block;
   EXPECT_EQ(pipeline.submit_audio(packet), media::PublishResult::backpressured);
-  transport.enqueue_result = quic::EnqueueResult::shutting_down;
+  transport.stop();
   EXPECT_EQ(pipeline.submit_audio(packet), media::PublishResult::stopped);
   const auto before_stop = pipeline.snapshot();
   EXPECT_EQ(before_stop.audio_packets, 1U);
@@ -362,9 +397,10 @@ TEST(ProtocolV3AudioPublication, PreservesGenerationAndReportsBackpressureAndClo
 
 TEST(ProtocolV3GenerationInstrumentation, KeepsRawAudioAndVideoEventsScopedPerSession) {
   struct evidence_t {
-    std::uint8_t session_tag {};
-    std::uint32_t audio_generation {};
-    std::uint32_t video_generation {};
+    transport_t::packet_event_t audio_event;
+    transport_t::video_event_t video_event;
+    std::vector<std::uint8_t> video_header;
+    std::vector<std::uint8_t> video_payload;
     media::TelemetrySnapshot telemetry;
   };
 
@@ -408,32 +444,67 @@ TEST(ProtocolV3GenerationInstrumentation, KeepsRawAudioAndVideoEventsScopedPerSe
     );
 
     EXPECT_EQ(transport.packets.size(), 1U);
+    EXPECT_EQ(transport.packet_events.size(), 1U);
     EXPECT_EQ(transport.video_frames.size(), 1U);
+    EXPECT_EQ(transport.video_events.size(), 1U);
+    if (transport.packets.size() != 1U || transport.packet_events.size() != 1U ||
+        transport.video_frames.size() != 1U || transport.video_events.size() != 1U) {
+      return evidence_t {};
+    }
     std::array<std::uint8_t, quic::maximum_semantic_datagram_bytes> header {};
     quic::VideoFragmentView fragment;
-    EXPECT_TRUE(transport.video_frames.front()->materialize(0, header, fragment));
+    const auto materialized = transport.video_frames.front()->materialize(0, header, fragment);
+    EXPECT_TRUE(materialized);
+    if (!materialized) {
+      return evidence_t {};
+    }
     return evidence_t {
-      .session_tag = transport.packets.front()[12],
-      .audio_generation = read_be32(
-        transport.packets.front(),
-        quic::datagram_header_bytes + 16U
-      ),
-      .video_generation = read_be32(
-        header,
-        quic::datagram_header_bytes + 56U
-      ),
+      .audio_event = transport.packet_events.front(),
+      .video_event = transport.video_events.front(),
+      .video_header = {header.begin(), header.begin() + static_cast<std::ptrdiff_t>(fragment.header_size)},
+      .video_payload = {fragment.payload, fragment.payload + fragment.payload_size},
       .telemetry = pipeline.snapshot(),
     };
   };
 
   const auto first = publish(0x31, 101, 201);
   const auto second = publish(0x32, 102, 202);
-  EXPECT_EQ(first.session_tag, 0x31);
-  EXPECT_EQ(second.session_tag, 0x32);
-  EXPECT_EQ(first.audio_generation, 101U);
-  EXPECT_EQ(second.audio_generation, 102U);
-  EXPECT_EQ(first.video_generation, 201U);
-  EXPECT_EQ(second.video_generation, 202U);
+  ASSERT_GE(first.audio_event.bytes.size(), quic::datagram_header_bytes + 20U);
+  ASSERT_GE(second.audio_event.bytes.size(), quic::datagram_header_bytes + 20U);
+  ASSERT_GE(first.video_header.size(), quic::datagram_header_bytes + 60U);
+  ASSERT_GE(second.video_header.size(), quic::datagram_header_bytes + 60U);
+  EXPECT_EQ(first.audio_event.connection_id, 0x31U);
+  EXPECT_EQ(second.audio_event.connection_id, 0x32U);
+  EXPECT_EQ(first.audio_event.lane, quic::Lane::audio);
+  EXPECT_EQ(second.audio_event.lane, quic::Lane::audio);
+  EXPECT_GT(first.audio_event.deadline, quic::MonotonicClock::time_point {});
+  EXPECT_GT(second.audio_event.deadline, quic::MonotonicClock::time_point {});
+  EXPECT_FALSE(first.audio_event.replaceable);
+  EXPECT_FALSE(second.audio_event.replaceable);
+  EXPECT_EQ(first.video_event.connection_id, 0x31U);
+  EXPECT_EQ(second.video_event.connection_id, 0x32U);
+  EXPECT_EQ(first.video_event.frame->object_id(), 0x31U);
+  EXPECT_EQ(second.video_event.frame->object_id(), 0x32U);
+  EXPECT_TRUE(std::ranges::all_of(first.audio_event.bytes.begin() + 12, first.audio_event.bytes.begin() + 28, [](const auto byte) {
+    return byte == 0x31;
+  }));
+  EXPECT_TRUE(std::ranges::all_of(second.audio_event.bytes.begin() + 12, second.audio_event.bytes.begin() + 28, [](const auto byte) {
+    return byte == 0x32;
+  }));
+  EXPECT_TRUE(std::ranges::all_of(first.video_header.begin() + 12, first.video_header.begin() + 28, [](const auto byte) {
+    return byte == 0x31;
+  }));
+  EXPECT_TRUE(std::ranges::all_of(second.video_header.begin() + 12, second.video_header.begin() + 28, [](const auto byte) {
+    return byte == 0x32;
+  }));
+  EXPECT_EQ(read_be32(first.audio_event.bytes, quic::datagram_header_bytes + 16U), 101U);
+  EXPECT_EQ(read_be32(second.audio_event.bytes, quic::datagram_header_bytes + 16U), 102U);
+  EXPECT_EQ(read_be32(first.video_header, quic::datagram_header_bytes + 56U), 201U);
+  EXPECT_EQ(read_be32(second.video_header, quic::datagram_header_bytes + 56U), 202U);
+  EXPECT_EQ(first.video_payload, (std::vector<std::uint8_t> {0x31, 0x55, 0x66, 0x77}));
+  EXPECT_EQ(second.video_payload, (std::vector<std::uint8_t> {0x32, 0x55, 0x66, 0x77}));
+  EXPECT_NE(first.audio_event.bytes, second.audio_event.bytes);
+  EXPECT_NE(first.video_header, second.video_header);
   EXPECT_EQ(first.telemetry.audio_packets, 1U);
   EXPECT_EQ(first.telemetry.video_frames, 1U);
   EXPECT_EQ(second.telemetry.audio_packets, 1U);
