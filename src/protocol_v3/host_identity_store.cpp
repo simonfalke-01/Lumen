@@ -328,9 +328,10 @@ namespace lumen::protocol_v3::runtime {
     private:
       static constexpr wchar_t private_sddl[] = L"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 
-      static std::array<std::uint8_t, 35> entropy() {
-        std::array<std::uint8_t, 35> output {};
+      static std::array<std::uint8_t, 37> entropy() {
+        std::array<std::uint8_t, 37> output {};
         constexpr std::string_view value = "Lumen protocol v3 identity entropy v1";
+        static_assert(value.size() == output.size());
         std::copy(value.begin(), value.end(), output.begin());
         return output;
       }
@@ -688,7 +689,9 @@ namespace lumen::protocol_v3::runtime {
     }
     std::ifstream input {path, std::ios::binary};
     bytes.assign(std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {});
-    return (input.good() || input.eof()) && !bytes.empty() && platform->write_private(path, bytes);
+    const auto read = input.good() || input.eof();
+    input.close();
+    return read && !bytes.empty() && platform->write_private(path, bytes);
   }
 
   bool verify_private_key_file(const std::filesystem::path &path) {
