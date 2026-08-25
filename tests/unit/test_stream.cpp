@@ -100,6 +100,55 @@ TEST(ProtocolV3AudioConfigurationTest, AppliesExplicitHostPlaybackPolicyAndExact
   }
 }
 
+TEST(StreamAudioPacketQueueProductionTest, EnforcesCapacityAndCloseWakeup) {
+  using result_e = audio::AudioPacketDestination::enqueue_result_e;
+  const auto probe = stream::audio_packet_queue_probe_for_test();
+
+  EXPECT_EQ(probe.first_enqueue, result_e::enqueued);
+  EXPECT_EQ(probe.full_enqueue, result_e::backpressure);
+  EXPECT_TRUE(probe.first_pop_present);
+  EXPECT_EQ(probe.first_pop_tag, 0x11);
+  EXPECT_EQ(probe.refill_enqueue, result_e::enqueued);
+  EXPECT_FALSE(probe.pop_after_repeated_close_present);
+  EXPECT_EQ(probe.enqueue_after_repeated_close, result_e::closed);
+  EXPECT_TRUE(probe.waiter_blocked_before_close);
+  EXPECT_TRUE(probe.waiter_ready_after_close);
+  EXPECT_FALSE(probe.waiter_pop_present);
+}
+
+TEST(StreamAudioDestinationProductionTest, LegacySharedQueuePreservesOwnersAndIndependentClose) {
+  using result_e = audio::AudioPacketDestination::enqueue_result_e;
+  const auto probe = stream::audio_destination_isolation_probe_for_test();
+
+  EXPECT_EQ(probe.legacy_first_enqueue, result_e::enqueued);
+  EXPECT_EQ(probe.legacy_second_while_full, result_e::backpressure);
+  EXPECT_EQ(probe.legacy_first_pop_owner, 1);
+  EXPECT_EQ(probe.legacy_first_pop_tag, 0xa1);
+  EXPECT_EQ(probe.legacy_second_after_pop, result_e::enqueued);
+  EXPECT_EQ(probe.legacy_second_pop_owner, 2);
+  EXPECT_EQ(probe.legacy_second_pop_tag, 0xb2);
+  EXPECT_EQ(probe.legacy_first_after_close, result_e::closed);
+  EXPECT_EQ(probe.legacy_second_after_first_close, result_e::enqueued);
+  EXPECT_EQ(probe.legacy_second_after_close_owner, 2);
+  EXPECT_EQ(probe.legacy_second_after_close_tag, 0xb3);
+  EXPECT_EQ(probe.legacy_second_after_owner_expiry, result_e::closed);
+}
+
+TEST(StreamAudioDestinationProductionTest, ProtocolV3OwnsPrivateQueuesAndIndependentClose) {
+  using result_e = audio::AudioPacketDestination::enqueue_result_e;
+  const auto probe = stream::audio_destination_isolation_probe_for_test();
+
+  EXPECT_EQ(probe.v3_first_enqueued_count, 32U);
+  EXPECT_EQ(probe.v3_first_over_capacity, result_e::backpressure);
+  EXPECT_EQ(probe.v3_second_enqueue, result_e::enqueued);
+  EXPECT_EQ(probe.v3_first_pop_tag, 0x40);
+  EXPECT_EQ(probe.v3_second_pop_tag, 0xb1);
+  EXPECT_FALSE(probe.v3_first_pop_after_close_present);
+  EXPECT_EQ(probe.v3_first_after_repeated_close, result_e::closed);
+  EXPECT_EQ(probe.v3_second_after_first_close, result_e::enqueued);
+  EXPECT_EQ(probe.v3_second_after_close_tag, 0xb2);
+}
+
 TEST(ProtocolV3ControllerFeedbackTest, DelayedGenerationCannotRetargetAReusedControllerSlot) {
   const auto delayed = platf::gamepad_feedback_msg_t::make_rumble(
     {2, 7, 1},

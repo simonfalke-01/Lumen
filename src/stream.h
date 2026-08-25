@@ -308,6 +308,51 @@ namespace stream {
   );
 
 #ifdef SUNSHINE_TESTS
+  /** @brief Raw observations from the exact production audio packet queue. */
+  struct audio_packet_queue_probe_t {
+    audio::AudioPacketDestination::enqueue_result_e first_enqueue;  ///< Admission of the first capacity-one packet.
+    audio::AudioPacketDestination::enqueue_result_e full_enqueue;  ///< Admission while the capacity-one queue is full.
+    audio::AudioPacketDestination::enqueue_result_e refill_enqueue;  ///< Admission after popping the first packet.
+    audio::AudioPacketDestination::enqueue_result_e enqueue_after_repeated_close;  ///< Admission after two close calls.
+    bool first_pop_present {};  ///< Whether the first queued packet was returned.
+    std::uint8_t first_pop_tag {};  ///< Payload tag returned by the first pop.
+    bool pop_after_repeated_close_present {};  ///< Whether close retained a queued packet.
+    bool waiter_blocked_before_close {};  ///< Whether an empty-queue consumer remained blocked before close.
+    bool waiter_ready_after_close {};  ///< Whether close woke the blocked consumer within the bounded wait.
+    bool waiter_pop_present {};  ///< Whether the close-woken consumer received a packet.
+  };
+
+  /** @brief Raw observations from the exact legacy and protocol-v3 audio destinations. */
+  struct audio_destination_isolation_probe_t {
+    audio::AudioPacketDestination::enqueue_result_e legacy_first_enqueue;  ///< First legacy owner admission.
+    audio::AudioPacketDestination::enqueue_result_e legacy_second_while_full;  ///< Second owner admission while the shared queue is full.
+    audio::AudioPacketDestination::enqueue_result_e legacy_second_after_pop;  ///< Second owner admission after capacity is released.
+    audio::AudioPacketDestination::enqueue_result_e legacy_first_after_close;  ///< Closed first owner admission.
+    audio::AudioPacketDestination::enqueue_result_e legacy_second_after_first_close;  ///< Live second owner admission after first closes.
+    audio::AudioPacketDestination::enqueue_result_e legacy_second_after_owner_expiry;  ///< Second owner admission after its session expires.
+    std::uint8_t legacy_first_pop_owner {};  ///< Session identity returned for the first legacy packet.
+    std::uint8_t legacy_first_pop_tag {};  ///< Payload tag returned for the first legacy packet.
+    std::uint8_t legacy_second_pop_owner {};  ///< Session identity returned for the second legacy packet.
+    std::uint8_t legacy_second_pop_tag {};  ///< Payload tag returned for the second legacy packet.
+    std::uint8_t legacy_second_after_close_owner {};  ///< Session identity returned after the first destination closes.
+    std::uint8_t legacy_second_after_close_tag {};  ///< Payload tag returned after the first destination closes.
+    std::uint32_t v3_first_enqueued_count {};  ///< Packets accepted by the first v3 destination before saturation.
+    audio::AudioPacketDestination::enqueue_result_e v3_first_over_capacity;  ///< Admission beyond the first v3 queue capacity.
+    audio::AudioPacketDestination::enqueue_result_e v3_second_enqueue;  ///< Independent second v3 destination admission.
+    audio::AudioPacketDestination::enqueue_result_e v3_first_after_repeated_close;  ///< First v3 admission after two close calls.
+    audio::AudioPacketDestination::enqueue_result_e v3_second_after_first_close;  ///< Second v3 admission after first closes.
+    std::uint8_t v3_first_pop_tag {};  ///< First payload tag returned by the first v3 queue.
+    std::uint8_t v3_second_pop_tag {};  ///< First payload tag returned by the second v3 queue.
+    bool v3_first_pop_after_close_present {};  ///< Whether repeated close retained first-v3 packets.
+    std::uint8_t v3_second_after_close_tag {};  ///< Second-v3 payload returned after the first closes.
+  };
+
+  /** @brief Exercise exact capacity, pop, and close semantics of audio_packet_queue_t. */
+  [[nodiscard]] audio_packet_queue_probe_t audio_packet_queue_probe_for_test();
+
+  /** @brief Exercise exact legacy and protocol-v3 production destination isolation. */
+  [[nodiscard]] audio_destination_isolation_probe_t audio_destination_isolation_probe_for_test();
+
   /** @brief Exercise the production immutable controller-feedback generation fence. */
   bool protocol_v3_feedback_is_current_for_test(
     const platf::gamepad_feedback_msg_t &message,

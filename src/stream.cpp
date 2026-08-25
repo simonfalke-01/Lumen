@@ -4541,6 +4541,152 @@ namespace stream {
   }
 
 #ifdef SUNSHINE_TESTS
+  audio_packet_queue_probe_t audio_packet_queue_probe_for_test() {
+    const auto packet = [](const std::uint8_t tag) {
+      audio::buffer_t payload {1};
+      payload[0] = tag;
+      return audio::packet_t {.payload = std::move(payload)};
+    };
+    const auto tag = [](const audio::packet_t &packet) {
+      return packet.payload.size() == 0 ? std::uint8_t {} : packet.payload[0];
+    };
+
+    audio_packet_queue_probe_t result {};
+    audio_packet_queue_t<audio::packet_t> queue {1};
+    result.first_enqueue = queue.enqueue(packet(0x11));
+    result.full_enqueue = queue.enqueue(packet(0x22));
+    if (result.first_enqueue == audio::AudioPacketDestination::enqueue_result_e::enqueued) {
+      const auto popped = queue.pop();
+      result.first_pop_present = popped.has_value();
+      if (popped) {
+        result.first_pop_tag = tag(*popped);
+      }
+    }
+    result.refill_enqueue = queue.enqueue(packet(0x33));
+    queue.close();
+    queue.close();
+    result.pop_after_repeated_close_present = queue.pop().has_value();
+    result.enqueue_after_repeated_close = queue.enqueue(packet(0x44));
+
+    auto blocked_queue = std::make_shared<audio_packet_queue_t<audio::packet_t>>(1);
+    auto started = std::make_shared<std::promise<void>>();
+    auto popped = std::make_shared<std::promise<std::optional<audio::packet_t>>>();
+    auto started_future = started->get_future();
+    auto popped_future = popped->get_future();
+    std::thread waiter {[blocked_queue, started, popped]() {
+      started->set_value();
+      popped->set_value(blocked_queue->pop());
+    }};
+    waiter.detach();
+    started_future.wait();
+    result.waiter_blocked_before_close =
+      popped_future.wait_for(20ms) == std::future_status::timeout;
+    blocked_queue->close();
+    result.waiter_ready_after_close =
+      popped_future.wait_for(1s) == std::future_status::ready;
+    if (result.waiter_ready_after_close) {
+      result.waiter_pop_present = popped_future.get().has_value();
+    }
+    return result;
+  }
+
+  audio_destination_isolation_probe_t audio_destination_isolation_probe_for_test() {
+    const auto packet = [](const std::uint8_t tag) {
+      audio::buffer_t payload {1};
+      payload[0] = tag;
+      return audio::packet_t {.payload = std::move(payload)};
+    };
+    const auto tag = [](const audio::packet_t &packet) {
+      return packet.payload.size() == 0 ? std::uint8_t {} : packet.payload[0];
+    };
+
+    audio_destination_isolation_probe_t result {};
+    auto legacy_queue = std::make_shared<legacy_audio_packet_queue_t>(1);
+    auto first_session = std::make_shared<session_t>();
+    auto second_session = std::make_shared<session_t>();
+    const auto owner_id = [&first_session, &second_session](const std::weak_ptr<session_t> &session) {
+      const auto owner = session.lock();
+      if (owner.get() == first_session.get()) {
+        return std::uint8_t {1};
+      }
+      if (owner.get() == second_session.get()) {
+        return std::uint8_t {2};
+      }
+      return std::uint8_t {};
+    };
+    legacy_audio_packet_destination first_legacy {first_session, legacy_queue};
+    legacy_audio_packet_destination second_legacy {second_session, legacy_queue};
+
+    result.legacy_first_enqueue = first_legacy.enqueue(packet(0xa1));
+    result.legacy_second_while_full = second_legacy.enqueue(packet(0xb1));
+    if (result.legacy_first_enqueue == audio::AudioPacketDestination::enqueue_result_e::enqueued) {
+      const auto popped = legacy_queue->pop();
+      if (popped) {
+        result.legacy_first_pop_owner = owner_id(popped->session);
+        result.legacy_first_pop_tag = tag(popped->packet);
+      }
+    }
+    result.legacy_second_after_pop = second_legacy.enqueue(packet(0xb2));
+    if (result.legacy_second_after_pop == audio::AudioPacketDestination::enqueue_result_e::enqueued) {
+      const auto popped = legacy_queue->pop();
+      if (popped) {
+        result.legacy_second_pop_owner = owner_id(popped->session);
+        result.legacy_second_pop_tag = tag(popped->packet);
+      }
+    }
+    first_legacy.close();
+    first_legacy.close();
+    result.legacy_first_after_close = first_legacy.enqueue(packet(0xa2));
+    result.legacy_second_after_first_close = second_legacy.enqueue(packet(0xb3));
+    if (result.legacy_second_after_first_close ==
+        audio::AudioPacketDestination::enqueue_result_e::enqueued) {
+      const auto popped = legacy_queue->pop();
+      if (popped) {
+        result.legacy_second_after_close_owner = owner_id(popped->session);
+        result.legacy_second_after_close_tag = tag(popped->packet);
+      }
+    }
+    second_session.reset();
+    result.legacy_second_after_owner_expiry = second_legacy.enqueue(packet(0xb4));
+
+    v3_audio_packet_destination first_v3;
+    v3_audio_packet_destination second_v3;
+    for (std::uint32_t index = 0; index < 32; ++index) {
+      if (first_v3.enqueue(packet(static_cast<std::uint8_t>(0x40U + index))) !=
+          audio::AudioPacketDestination::enqueue_result_e::enqueued) {
+        break;
+      }
+      ++result.v3_first_enqueued_count;
+    }
+    result.v3_first_over_capacity = first_v3.enqueue(packet(0xee));
+    result.v3_second_enqueue = second_v3.enqueue(packet(0xb1));
+    if (result.v3_first_enqueued_count != 0) {
+      const auto popped = first_v3.pop();
+      if (popped) {
+        result.v3_first_pop_tag = tag(*popped);
+      }
+    }
+    if (result.v3_second_enqueue == audio::AudioPacketDestination::enqueue_result_e::enqueued) {
+      const auto popped = second_v3.pop();
+      if (popped) {
+        result.v3_second_pop_tag = tag(*popped);
+      }
+    }
+    first_v3.close();
+    first_v3.close();
+    result.v3_first_pop_after_close_present = first_v3.pop().has_value();
+    result.v3_first_after_repeated_close = first_v3.enqueue(packet(0xef));
+    result.v3_second_after_first_close = second_v3.enqueue(packet(0xb2));
+    if (result.v3_second_after_first_close ==
+        audio::AudioPacketDestination::enqueue_result_e::enqueued) {
+      const auto popped = second_v3.pop();
+      if (popped) {
+        result.v3_second_after_close_tag = tag(*popped);
+      }
+    }
+    return result;
+  }
+
   bool protocol_v3_feedback_is_current_for_test(
     const platf::gamepad_feedback_msg_t &message,
     const std::uint32_t input_generation,
