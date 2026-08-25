@@ -37,7 +37,7 @@ $actions = Read-MsiRows `
 $sequence = Read-MsiRows `
     'SELECT `Action`,`Condition`,`Sequence` FROM `InstallExecuteSequence`' 3
 $services = Read-MsiRows `
-    'SELECT `ServiceInstall`,`Name`,`StartType`,`Component_` FROM `ServiceInstall`' 4
+    'SELECT `ServiceInstall`,`Name`,`StartType`,`Component_`,`StartName` FROM `ServiceInstall`' 5
 $features = Read-MsiRows `
     'SELECT `Feature`,`Level` FROM `Feature`' 2
 $upgrades = Read-MsiRows `
@@ -93,8 +93,9 @@ if ($lumenUpgradeRows.Count -eq 0) {
 
 if ($services.Count -ne 1 -or
     $services[0][1] -ne 'LumenService' -or
-    $services[0][2] -ne '2') {
-    throw 'Generated MSI does not contain an automatic declarative LumenService row.'
+    $services[0][2] -ne '2' -or
+    $services[0][4] -ne 'LocalSystem') {
+    throw 'Generated MSI does not contain an automatic LocalSystem LumenService row.'
 }
 $expectedFirewallProtocols = @{
     'Lumen TCP' = '6'
@@ -143,6 +144,11 @@ foreach ($setterName in $setterNames) {
     } else {
         ' -UpgradeOwnedVirtualDisplay 0 -UpgradeVddOwnerProduct ""$'
     }
+    $expectedIdentityDisposition = if ($setterName -like 'SetLumenInstall*') {
+        ' -IdentityDisposition preserve '
+    } else {
+        ' -IdentityDisposition remove '
+    }
     if ($command -notmatch '^"\[System64Folder\]WindowsPowerShell\\v1\.0\\powershell\.exe" ' -or
         $command -notmatch $expectedScript -or
         $command -notmatch ' -Msi ' -or
@@ -152,6 +158,7 @@ foreach ($setterName in $setterNames) {
         $command -notmatch ' -InstallVirtualMicrophone \[LUMEN_INSTALL_VMIC\] ' -or
         $command -notmatch ' -InstallVirtualDisplay \[LUMEN_INSTALL_VDD\] ' -or
         $command -notmatch ' -RemoveVirtualDisplay \[LUMEN_REMOVE_VDD\] ' -or
+        $command -notmatch $expectedIdentityDisposition -or
         $command -notmatch $expectedUpgradeOwnership) {
         throw "Generated MSI has an invalid deferred command: $setterName"
     }
@@ -197,6 +204,18 @@ if ($stopServices.Count -ne 1 -or $uninstallSetter.Count -ne 1 -or $uninstallDef
     [int]$uninstallSetter[0][2] -le [int]$stopServices[0][2] -or
     [int]$uninstallDeferred[0][2] -le [int]$stopServices[0][2]) {
     throw 'VDD driver uninstall must be sequenced after StopServices.'
+}
+$installDispositionRows = @($sequence | Where-Object {
+    $_[0] -in @('CA_LumenInstallRollback', 'CA_LumenInstall', 'CA_LumenInstallCommit')
+})
+$uninstallDispositionRows = @($sequence | Where-Object {
+    $_[0] -in @('CA_LumenUninstallRollback', 'CA_LumenUninstall', 'CA_LumenUninstallCommit')
+})
+if (@($installDispositionRows | Where-Object { $_[1] -ne 'NOT (REMOVE="ALL")' }).Count -ne 0 -or
+    @($uninstallDispositionRows | Where-Object {
+        $_[1] -ne 'REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE'
+    }).Count -ne 0) {
+    throw 'Identity disposition must preserve repair/feature/related-upgrade and remove only full uninstall.'
 }
 $installExecute = @($sequence | Where-Object { $_[0] -eq 'InstallExecute' })
 $installFinalize = @($sequence | Where-Object { $_[0] -eq 'InstallFinalize' })

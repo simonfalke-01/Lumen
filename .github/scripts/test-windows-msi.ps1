@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('install-no-vhid', 'install-vhid', 'install-vmic', 'install-vdd', 'driver-reboot', 'upgrade', 'legacy-import')]
+    [ValidateSet('install-no-vhid', 'install-vhid', 'install-vmic', 'install-vdd', 'driver-reboot', 'upgrade', 'legacy-import', 'identity-reinstall')]
     [string]$Scenario
 )
 
@@ -51,6 +51,13 @@ function Assert-ServiceRunning {
     if ($service.Status -ne 'Running') {
         throw 'LumenService is not running after MSI installation.'
     }
+    $serviceConfiguration = Get-CimInstance `
+        -ClassName Win32_Service `
+        -Filter "Name='LumenService'" `
+        -ErrorAction Stop
+    if ([string]$serviceConfiguration.StartName -cne 'LocalSystem') {
+        throw "LumenService runs as unexpected principal: $($serviceConfiguration.StartName)"
+    }
     $deadline = (Get-Date).AddSeconds(30)
     do {
         $hostProcess = Get-Process Lumen -ErrorAction SilentlyContinue |
@@ -61,6 +68,54 @@ function Assert-ServiceRunning {
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
     throw 'LumenService is running but did not launch Lumen.exe.'
+}
+
+function Get-ProtectedIdentitySnapshot {
+    $identityRoot = 'C:\Program Files\Lumen\config\credentials'
+    $snapshot = @{}
+    foreach ($name in @('protocol_v3_identity.bin', 'protocol_v3_identity.journal')) {
+        $path = Join-Path $identityRoot $name
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+            $sections = [Security.AccessControl.AccessControlSections]::Owner -bor
+                [Security.AccessControl.AccessControlSections]::Group -bor
+                [Security.AccessControl.AccessControlSections]::Access
+            $snapshot[$name] = @{
+                Present = $true
+                Bytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($path))
+                AclSddl = $acl.GetSecurityDescriptorSddlForm($sections)
+            }
+        } else {
+            $snapshot[$name] = @{ Present = $false }
+        }
+    }
+    if (-not [bool]$snapshot['protocol_v3_identity.bin'].Present) {
+        throw 'The protected protocol-v3 identity blob was not created by the installed service.'
+    }
+    return $snapshot
+}
+
+function Assert-ProtectedIdentitySnapshot {
+    param([Parameter(Mandatory = $true)][hashtable]$Snapshot)
+    $identityRoot = 'C:\Program Files\Lumen\config\credentials'
+    foreach ($name in $Snapshot.Keys) {
+        $path = Join-Path $identityRoot $name
+        if (-not [bool]$Snapshot[$name].Present) {
+            if (Test-Path -LiteralPath $path) {
+                throw "Installer created protected identity state that was absent from the snapshot: $name"
+            }
+            continue
+        }
+        $actualBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($path))
+        $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+        $sections = [Security.AccessControl.AccessControlSections]::Owner -bor
+            [Security.AccessControl.AccessControlSections]::Group -bor
+            [Security.AccessControl.AccessControlSections]::Access
+        if ($actualBytes -cne [string]$Snapshot[$name].Bytes -or
+            $acl.GetSecurityDescriptorSddlForm($sections) -cne [string]$Snapshot[$name].AclSddl) {
+            throw "Installer did not preserve exact protected identity bytes and ACL metadata: $name"
+        }
+    }
 }
 
 function Install-ViGEmBus {
@@ -706,6 +761,37 @@ switch ($Scenario) {
             -Arguments @('/x', $finalProductCode, '/qn', '/norestart') `
             -LogName 'lumen-msi-upgrade-uninstall.log' `
             -FailureMessage 'Uninstall after Lumen-to-Lumen upgrade failed.')
+    }
+    'identity-reinstall' {
+        [void](Invoke-Msi `
+            -Arguments @('/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=0') `
+            -LogName 'lumen-msi-identity-install.log' `
+            -FailureMessage 'MSI install for protected identity validation failed.')
+        Assert-ServiceRunning
+        $identityBlob = 'C:\Program Files\Lumen\config\credentials\protocol_v3_identity.bin'
+        $deadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $identityBlob -PathType Leaf) -and
+            (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 250
+        }
+        $snapshot = Get-ProtectedIdentitySnapshot
+
+        [void](Invoke-Msi `
+            -Arguments @('/fa', $productCode, '/qn', '/norestart') `
+            -LogName 'lumen-msi-identity-reinstall.log' `
+            -FailureMessage 'MSI repair/reinstall for protected identity validation failed.')
+        Assert-ServiceRunning
+        Assert-ProtectedIdentitySnapshot -Snapshot $snapshot
+
+        [void](Invoke-Msi `
+            -Arguments @('/x', $productCode, '/qn', '/norestart') `
+            -LogName 'lumen-msi-identity-uninstall.log' `
+            -FailureMessage 'MSI protected identity full uninstall failed.')
+        foreach ($name in @('protocol_v3_identity.bin', 'protocol_v3_identity.journal')) {
+            if (Test-Path -LiteralPath (Join-Path (Split-Path $identityBlob) $name)) {
+                throw "Full uninstall retained protected identity state: $name"
+            }
+        }
     }
     'legacy-import' {
         $fixtureId = '{A6C1CA63-42B6-4F83-AEC7-BCAC48E43CC8}'

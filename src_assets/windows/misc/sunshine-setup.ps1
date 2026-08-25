@@ -47,7 +47,11 @@ param(
     [string]$UpgradeOwnedVirtualDisplay = "0",
 
     [Parameter(Mandatory=$false)]
-    [string]$UpgradeVddOwnerProduct
+    [string]$UpgradeVddOwnerProduct,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("preserve", "remove")]
+    [string]$IdentityDisposition
 )
 
 # Constants
@@ -307,6 +311,9 @@ if (-not $isAdmin) {
     $arguments += " -UpgradeOwnedVirtualDisplay $UpgradeOwnedVirtualDisplay"
     if ($UpgradeVddOwnerProduct) {
         $arguments += " -UpgradeVddOwnerProduct `"$UpgradeVddOwnerProduct`""
+    }
+    if ($IdentityDisposition) {
+        $arguments += " -IdentityDisposition $IdentityDisposition"
     }
     try {
         # Relaunch the script with elevation
@@ -1198,6 +1205,13 @@ if ($Msi -or $ProductCode -or $Action -in @("rollback", "commit", "resume")) {
 if ($Action -in @("install", "uninstall") -and $TransactionKind -ne $Action) {
     throw "TransactionKind '$TransactionKind' does not match action '$Action'."
 }
+if ([string]::IsNullOrWhiteSpace($IdentityDisposition)) {
+    $IdentityDisposition = if ($TransactionKind -eq "uninstall") { "remove" } else { "preserve" }
+}
+if (($TransactionKind -eq "uninstall" -and $IdentityDisposition -ne "remove") -or
+    ($TransactionKind -eq "install" -and $IdentityDisposition -ne "preserve")) {
+    throw "Identity disposition '$IdentityDisposition' does not match transaction '$TransactionKind'."
+}
 $virtualHidSelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualHid)) {
     $true
 } else {
@@ -1228,6 +1242,15 @@ $rollbackDirectory = Join-Path $rollbackProductDirectory $TransactionKind.ToLowe
 $rollbackStatePath = Join-Path $rollbackDirectory "virtual-hid-rollback.json"
 $rollbackDriverDirectory = Join-Path $rollbackDirectory "virtual-hid-driver"
 $rollbackScriptPath = Join-Path $rollbackDirectory "lumen-setup.ps1"
+$protectedIdentityRoot = Join-Path $RootDir "config\credentials"
+$protectedIdentityBackupDirectory = Join-Path $rollbackDirectory "protocol-v3-identity"
+$protectedIdentityRollbackStatePath = Join-Path `
+    $rollbackDirectory `
+    "protocol-v3-identity-rollback.json"
+$protectedIdentityRelativePaths = @(
+    "protocol_v3_identity.bin",
+    "protocol_v3_identity.journal"
+)
 $virtualMicrophoneRollbackRootDirectory = Join-Path $programDataDirectory "LumenVirtualMicrophoneInstallerV1"
 $virtualMicrophoneRollbackProductDirectory = Join-Path `
     $virtualMicrophoneRollbackRootDirectory `
@@ -1317,7 +1340,8 @@ function Register-DriverResumeTask {
         "-InstallVirtualMicrophone", $(if ($virtualMicrophoneSelected) { "1" } else { "0" }),
         "-InstallVirtualDisplay", $(if ($virtualDisplaySelected) { "1" } else { "0" }),
         "-RemoveVirtualDisplay", $(if ($virtualDisplayRemoveSelected) { "1" } else { "0" }),
-        "-UpgradeOwnedVirtualDisplay", $(if ($upgradeOwnedVirtualDisplaySelected) { "1" } else { "0" })
+        "-UpgradeOwnedVirtualDisplay", $(if ($upgradeOwnedVirtualDisplaySelected) { "1" } else { "0" }),
+        "-IdentityDisposition", $IdentityDisposition
     ) -join " "
     $action = New-ScheduledTaskAction -Execute $powerShell -Argument $arguments
     $trigger = New-ScheduledTaskTrigger -AtStartup
@@ -1438,6 +1462,349 @@ function Assert-NoPendingRollbackTransaction {
         (Test-Path -LiteralPath $rollbackScriptPath)) {
         throw "A pending Virtual HID installer rollback transaction must be resolved before continuing."
     }
+}
+
+function Get-ProtectedIdentityAclSddl {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+
+    $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
+        [System.Security.AccessControl.AccessControlSections]::Group -bor
+        [System.Security.AccessControl.AccessControlSections]::Access
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    return $acl.GetSecurityDescriptorSddlForm($sections)
+}
+
+function Get-ProtectedIdentitySha256 {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+}
+
+function Assert-ProtectedIdentityRootSafe {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$InstallRoot,
+        [Parameter(Mandatory=$true)]
+        [string]$IdentityRoot
+    )
+
+    $fullInstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+    $fullIdentityRoot = [System.IO.Path]::GetFullPath($IdentityRoot)
+    $expectedIdentityRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $fullInstallRoot "config\credentials")
+    )
+    if (-not $fullIdentityRoot.Equals(
+        $expectedIdentityRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Protected identity root is outside the exact Lumen configuration directory."
+    }
+
+    foreach ($directoryPath in @(
+        $fullInstallRoot,
+        (Join-Path $fullInstallRoot "config"),
+        $fullIdentityRoot
+    )) {
+        if (-not (Test-Path -LiteralPath $directoryPath)) {
+            continue
+        }
+        $directory = Get-Item -LiteralPath $directoryPath -Force -ErrorAction Stop
+        if (-not $directory.PSIsContainer -or
+            ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "Protected identity path contains a non-directory or reparse point: $directoryPath"
+        }
+    }
+}
+
+function Assert-ProtectedIdentityFileMatches {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+        [Parameter(Mandatory=$true)]
+        [psobject]$Record,
+        [switch]$VerifyAcl
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Protected identity file is missing: $Path"
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Protected identity file is a reparse point: $Path"
+    }
+    if ([int64]$item.Length -ne [int64]$Record.Length -or
+        (Get-ProtectedIdentitySha256 -Path $Path) -cne [string]$Record.Sha256) {
+        throw "Protected identity file bytes do not match the exact transaction snapshot: $Path"
+    }
+    if ($VerifyAcl -and
+        (Get-ProtectedIdentityAclSddl -Path $Path) -cne [string]$Record.AclSddl) {
+        throw "Protected identity file ACL metadata does not match the exact transaction snapshot: $Path"
+    }
+}
+
+function Save-ProtectedIdentityRollbackState {
+    param(
+        [Parameter(Mandatory=$true)]
+        [psobject]$State
+    )
+
+    $pendingPath = Join-Path $rollbackDirectory "protocol-v3-identity-rollback.pending"
+    $State | ConvertTo-Json -Depth 6 | Set-Content `
+        -LiteralPath $pendingPath `
+        -Encoding UTF8 `
+        -ErrorAction Stop
+    Move-Item `
+        -LiteralPath $pendingPath `
+        -Destination $protectedIdentityRollbackStatePath `
+        -Force `
+        -ErrorAction Stop
+}
+
+function Read-ProtectedIdentityRollbackState {
+    $state = Get-Content `
+        -LiteralPath $protectedIdentityRollbackStatePath `
+        -Raw `
+        -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ([int]$state.Schema -ne 1 -or
+        [string]$state.OwnerProductCode -cne $ProductCode -or
+        [string]$state.TransactionKind -cne "uninstall" -or
+        [string]$state.Disposition -cne "remove") {
+        throw "Protected identity rollback state has an invalid owner or schema."
+    }
+
+    Assert-ProtectedIdentityRootSafe `
+        -InstallRoot ([string]$state.InstallRoot) `
+        -IdentityRoot ([string]$state.IdentityRoot)
+    $records = @($state.Items)
+    if ($records.Count -ne $protectedIdentityRelativePaths.Count) {
+        throw "Protected identity rollback state has an invalid file count."
+    }
+    for ($index = 0; $index -lt $protectedIdentityRelativePaths.Count; $index++) {
+        $record = $records[$index]
+        $expectedBackup = "identity-$index.backup"
+        if ([string]$record.RelativePath -cne $protectedIdentityRelativePaths[$index] -or
+            [string]$record.BackupFile -cne $expectedBackup) {
+            throw "Protected identity rollback state contains an unexpected path."
+        }
+    }
+    return $state
+}
+
+function Start-ProtectedIdentityUninstallTransaction {
+    if ($IdentityDisposition -eq "preserve") {
+        Write-LogMessage `
+            -Message "Preserving the protocol-v3 identity for install, repair, feature change, or related upgrade." `
+            -Level "Information"
+        return $false
+    }
+    if ((Test-Path -LiteralPath $protectedIdentityRollbackStatePath) -or
+        (Test-Path -LiteralPath $protectedIdentityBackupDirectory)) {
+        throw "A pending protected identity uninstall transaction must be resolved first."
+    }
+
+    Assert-InstallRollbackDirectorySecure
+    Assert-ProtectedIdentityRootSafe -InstallRoot $RootDir -IdentityRoot $protectedIdentityRoot
+    New-Item `
+        -ItemType Directory `
+        -Path $protectedIdentityBackupDirectory `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $records = [System.Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $protectedIdentityRelativePaths.Count; $index++) {
+        $relativePath = $protectedIdentityRelativePaths[$index]
+        $sourcePath = Join-Path $protectedIdentityRoot $relativePath
+        $backupFile = "identity-$index.backup"
+        $backupPath = Join-Path $protectedIdentityBackupDirectory $backupFile
+        if (Test-Path -LiteralPath $sourcePath) {
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                throw "Protected identity path is not a file: $sourcePath"
+            }
+            $sourceItem = Get-Item -LiteralPath $sourcePath -Force -ErrorAction Stop
+            if ($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Protected identity path is a reparse point: $sourcePath"
+            }
+            [System.IO.File]::WriteAllBytes(
+                $backupPath,
+                [System.IO.File]::ReadAllBytes($sourcePath)
+            )
+            $record = [pscustomobject][ordered]@{
+                RelativePath = $relativePath
+                BackupFile = $backupFile
+                Present = $true
+                Length = [int64]$sourceItem.Length
+                Sha256 = Get-ProtectedIdentitySha256 -Path $sourcePath
+                AclSddl = Get-ProtectedIdentityAclSddl -Path $sourcePath
+            }
+            Assert-ProtectedIdentityFileMatches -Path $backupPath -Record $record
+        } else {
+            $record = [pscustomobject][ordered]@{
+                RelativePath = $relativePath
+                BackupFile = $backupFile
+                Present = $false
+                Length = [int64]0
+                Sha256 = $null
+                AclSddl = $null
+            }
+        }
+        $records.Add($record) | Out-Null
+    }
+
+    $state = [pscustomobject][ordered]@{
+        Schema = 1
+        OwnerProductCode = $ProductCode
+        TransactionKind = "uninstall"
+        Disposition = "remove"
+        InstallRoot = [System.IO.Path]::GetFullPath($RootDir)
+        IdentityRoot = [System.IO.Path]::GetFullPath($protectedIdentityRoot)
+        RemovalComplete = $false
+        RollbackComplete = $false
+        Committed = $false
+        Items = $records.ToArray()
+    }
+    Save-ProtectedIdentityRollbackState -State $state
+    Write-LogMessage -Message "Backed up the exact protected protocol-v3 identity state." -Level "Success"
+    return $true
+}
+
+function Assert-ProtectedIdentityRemoved {
+    param(
+        [Parameter(Mandatory=$true)]
+        [psobject]$State
+    )
+
+    foreach ($record in @($State.Items)) {
+        $path = Join-Path ([string]$State.IdentityRoot) ([string]$record.RelativePath)
+        if (Test-Path -LiteralPath $path) {
+            throw "Full uninstall did not remove protected identity state: $path"
+        }
+    }
+}
+
+function Invoke-ProtectedIdentityRemoval {
+    if ($IdentityDisposition -ne "remove") {
+        return $false
+    }
+    $state = Read-ProtectedIdentityRollbackState
+    foreach ($record in @($state.Items)) {
+        $path = Join-Path ([string]$state.IdentityRoot) ([string]$record.RelativePath)
+        if ([bool]$record.Present) {
+            Assert-ProtectedIdentityFileMatches -Path $path -Record $record -VerifyAcl
+        } elseif (Test-Path -LiteralPath $path) {
+            throw "Protected identity state appeared after the uninstall snapshot: $path"
+        }
+    }
+    foreach ($record in @($state.Items)) {
+        $path = Join-Path ([string]$state.IdentityRoot) ([string]$record.RelativePath)
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+    }
+    Assert-ProtectedIdentityRemoved -State $state
+    $state.RemovalComplete = $true
+    Save-ProtectedIdentityRollbackState -State $state
+    Write-LogMessage -Message "Removed and verified the protected protocol-v3 identity state." -Level "Success"
+    return $true
+}
+
+function Invoke-ProtectedIdentityRollback {
+    if (-not (Test-Path -LiteralPath $protectedIdentityRollbackStatePath -PathType Leaf)) {
+        return $false
+    }
+    $state = Read-ProtectedIdentityRollbackState
+    if ([bool]$state.Committed) {
+        Assert-ProtectedIdentityRemoved -State $state
+        return $false
+    }
+
+    $hasPresentFile = @($state.Items | Where-Object { [bool]$_.Present }).Count -ne 0
+    if ($hasPresentFile -and -not (Test-Path -LiteralPath ([string]$state.IdentityRoot))) {
+        New-Item `
+            -ItemType Directory `
+            -Path ([string]$state.IdentityRoot) `
+            -Force `
+            -ErrorAction Stop | Out-Null
+    }
+    Assert-ProtectedIdentityRootSafe `
+        -InstallRoot ([string]$state.InstallRoot) `
+        -IdentityRoot ([string]$state.IdentityRoot)
+
+    foreach ($record in @($state.Items)) {
+        $destination = Join-Path ([string]$state.IdentityRoot) ([string]$record.RelativePath)
+        if (-not [bool]$record.Present) {
+            if (Test-Path -LiteralPath $destination) {
+                $unexpected = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+                if ($unexpected.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    throw "Refusing to remove a reparse point during protected identity rollback."
+                }
+                Remove-Item -LiteralPath $destination -Force -ErrorAction Stop
+            }
+            continue
+        }
+
+        $backupPath = Join-Path $protectedIdentityBackupDirectory ([string]$record.BackupFile)
+        Assert-ProtectedIdentityFileMatches -Path $backupPath -Record $record
+        $pendingRestore = "$destination.restore-pending"
+        if (Test-Path -LiteralPath $pendingRestore) {
+            $pendingItem = Get-Item -LiteralPath $pendingRestore -Force -ErrorAction Stop
+            if ($pendingItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to replace a reparse-point identity restore file."
+            }
+            Remove-Item -LiteralPath $pendingRestore -Force -ErrorAction Stop
+        }
+        [System.IO.File]::WriteAllBytes(
+            $pendingRestore,
+            [System.IO.File]::ReadAllBytes($backupPath)
+        )
+        $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
+            [System.Security.AccessControl.AccessControlSections]::Group -bor
+            [System.Security.AccessControl.AccessControlSections]::Access
+        $restoredAcl = [System.Security.AccessControl.FileSecurity]::new()
+        $restoredAcl.SetSecurityDescriptorSddlForm(
+            [string]$record.AclSddl,
+            $sections
+        )
+        Set-Acl -LiteralPath $pendingRestore -AclObject $restoredAcl -ErrorAction Stop
+        Assert-ProtectedIdentityFileMatches `
+            -Path $pendingRestore `
+            -Record $record `
+            -VerifyAcl
+        Move-Item `
+            -LiteralPath $pendingRestore `
+            -Destination $destination `
+            -Force `
+            -ErrorAction Stop
+        Assert-ProtectedIdentityFileMatches -Path $destination -Record $record -VerifyAcl
+    }
+    $state.RollbackComplete = $true
+    $state.RemovalComplete = $false
+    Save-ProtectedIdentityRollbackState -State $state
+    Write-LogMessage `
+        -Message "Restored exact protected identity bytes and ACL metadata during rollback." `
+        -Level "Success"
+    return $true
+}
+
+function Invoke-ProtectedIdentityCommit {
+    if (-not (Test-Path -LiteralPath $protectedIdentityRollbackStatePath -PathType Leaf)) {
+        return $false
+    }
+    $state = Read-ProtectedIdentityRollbackState
+    if (-not [bool]$state.RemovalComplete) {
+        throw "Protected identity uninstall cannot commit before verified removal."
+    }
+    Assert-ProtectedIdentityRemoved -State $state
+    if (-not [bool]$state.Committed) {
+        $state.Committed = $true
+        Save-ProtectedIdentityRollbackState -State $state
+    }
+    return $true
 }
 
 function Get-ServiceSnapshot {
@@ -1838,12 +2205,18 @@ function Invoke-PersistedRollback {
     }
 
     if ([bool]$rollbackState.Committed) {
+        Invoke-ProtectedIdentityCommit | Out-Null
         Remove-InstallRollbackArtifacts
         Write-LogMessage -Message "Removed artifacts from an already committed transaction." -Level "Information"
         return $false
     }
 
     $rollbackErrors = [System.Collections.Generic.List[string]]::new()
+    try {
+        Invoke-ProtectedIdentityRollback | Out-Null
+    } catch {
+        $rollbackErrors.Add($_.Exception.Message) | Out-Null
+    }
     $driverNeedsRollback = -not $driverRollbackComplete -and (
         $driverWasPresent -or $transactionKind -eq "install"
     )
@@ -1993,6 +2366,7 @@ function Invoke-PersistedCommit {
         $commitState.Committed = $true
         Save-ParsedRollbackState -State $commitState
     }
+    Invoke-ProtectedIdentityCommit | Out-Null
     if ([bool]$commitState.DriverPendingReboot) {
         $script:RebootRequired = $true
         Write-LogMessage `
@@ -2902,6 +3276,12 @@ if ($Action -eq "install") {
         Write-LogMessage -Message "Windows Service is already absent." -Level "Information"
     }
     Write-Information ""
+
+    # The service is now stopped or absent. Snapshot both protected identity
+    # artifacts into the SYSTEM/Administrators-only transaction directory,
+    # then remove and verify them before any later uninstall mutation can fail.
+    Start-ProtectedIdentityUninstallTransaction | Out-Null
+    Invoke-ProtectedIdentityRemoval | Out-Null
 
     # 2. Remove the root device and the Lumen-owned driver package. The helper
     # is idempotent and reports reboot-required cleanup as exit code 3010.

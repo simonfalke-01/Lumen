@@ -316,6 +316,34 @@ assert_file_contains_literal(
     "src_assets/windows/misc/sunshine-setup.ps1"
     [=[Invoke-AllPersistedRollbacks]=]
     "Setup failures must roll back every selected device driver")
+foreach(identity_disposition_contract IN ITEMS
+        [=[protocol_v3_identity.bin]=]
+        [=[protocol_v3_identity.journal]=]
+        [=[Start-ProtectedIdentityUninstallTransaction]=]
+        [=[Invoke-ProtectedIdentityRemoval]=]
+        [=[Invoke-ProtectedIdentityRollback]=]
+        [=[Restored exact protected identity bytes and ACL metadata during rollback.]=])
+    assert_file_contains_literal(
+        "src_assets/windows/misc/sunshine-setup.ps1"
+        "${identity_disposition_contract}"
+        "Installer identity disposition must retain ${identity_disposition_contract}")
+endforeach()
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/sunshine-installer.wxs"
+    [=[-IdentityDisposition preserve]=]
+    "Repair, feature changes, and related upgrades must preserve protected identity")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/sunshine-installer.wxs"
+    [=[-IdentityDisposition remove]=]
+    "Full uninstall must explicitly remove protected identity")
+assert_file_contains_literal(
+    ".github/scripts/test-windows-msi.ps1"
+    [=['identity-reinstall']=]
+    "Windows MSI validation must scaffold exact identity preservation across reinstall")
+assert_file_contains_literal(
+    ".github/scripts/validate-windows-msi.ps1"
+    [=[`StartName` FROM `ServiceInstall`]=]
+    "MSI table validation must verify the service principal")
 assert_file_contains_literal(
     "cmake/packaging/windows.cmake"
     [=[LUMEN_WINDOWS_FULL_PROFILE]=]
