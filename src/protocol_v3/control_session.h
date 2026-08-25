@@ -228,7 +228,7 @@ namespace lumen::protocol_v3::control_session {
 
   /** @brief Immutable factory policy shared by all v3 connections. */
   struct Config {
-    std::uint64_t capabilities {0x17f};  ///< Advertised protocol-v3 capabilities.
+    std::uint64_t capabilities {0x37f};  ///< Advertised protocol-v3 capabilities, including compact input state.
     std::uint64_t default_pairing_permissions {0x17};  ///< Host-approved QR grants.
   };
 

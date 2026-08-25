@@ -3,6 +3,8 @@
  * @brief Protocol-v3 input format-version admission tests.
  */
 
+#include "src/protocol_common/input_state.h"
+#include "src/protocol_v3/control_session.h"
 #include "src/protocol_v3/media_pipeline.h"
 
 #include <algorithm>
@@ -21,6 +23,14 @@ namespace {
   void append_be(std::vector<std::uint8_t> &bytes, Integer value) {
     for (std::size_t index = 0; index < sizeof(Integer); ++index) {
       bytes.push_back(static_cast<std::uint8_t>(value >> ((sizeof(Integer) - index - 1) * 8U)));
+    }
+  }
+
+  template<class Integer>
+  void write_be(std::vector<std::uint8_t> &bytes, const std::size_t offset, Integer value) {
+    for (std::size_t index = 0; index < sizeof(Integer); ++index) {
+      bytes[offset + sizeof(Integer) - index - 1] = static_cast<std::uint8_t>(value);
+      value >>= 8U;
     }
   }
 
@@ -92,8 +102,9 @@ namespace {
 
   class input_t final: public media::InputSink {
   public:
-    bool submit(const media::InputBatch &) override {
+    bool submit(const media::InputBatch &batch) override {
       ++submissions;
+      last_state.assign(batch.state_block.begin(), batch.state_block.end());
       return true;
     }
 
@@ -103,6 +114,7 @@ namespace {
 
     std::size_t submissions {};
     std::size_t resets {};
+    std::vector<std::uint8_t> last_state;
   };
 
   class microphone_t final: public media::MicrophoneSink {
@@ -135,17 +147,73 @@ namespace {
     return value;
   }
 
-  std::vector<std::uint8_t> input_payload(const std::uint16_t format) {
+  std::vector<std::uint8_t> controller_state(
+    const std::uint16_t state_format,
+    const std::size_t controller_count,
+    const std::size_t touch_count = 0
+  ) {
+    const auto controller_bytes = state_format == 3 ? std::size_t {56} : std::size_t {64};
+    std::vector<std::uint8_t> state(
+      lumen::protocol_common::input_state::header_bytes + controller_count * controller_bytes +
+      touch_count * 32
+    );
+    write_be(state, 0, std::uint32_t {6});
+    write_be(state, 80, controller_count == 16 ? std::uint32_t {0xffff} : (std::uint32_t {1} << controller_count) - 1);
+    state[84] = static_cast<std::uint8_t>(controller_count);
+    state[85] = static_cast<std::uint8_t>(touch_count);
+    if (state_format == 3) {
+      state[87] = 3;
+    }
+    for (std::size_t index = 0; index < controller_count; ++index) {
+      const auto offset = lumen::protocol_common::input_state::header_bytes + index * controller_bytes;
+      state[offset] = static_cast<std::uint8_t>(index);
+      state[offset + 1] = static_cast<std::uint8_t>(1 + index % 5);
+      write_be(state, offset + 2, static_cast<std::uint16_t>(1U << (index % 9)));
+      write_be(state, offset + 4, std::uint64_t {1} << (index % 22));
+      write_be(state, offset + 48, std::uint16_t {0xffff});
+      write_be(state, offset + 52, std::uint32_t {1} << (index % 22));
+    }
+    const auto touch_base = lumen::protocol_common::input_state::header_bytes +
+                            controller_count * controller_bytes;
+    for (std::size_t index = 0; index < touch_count; ++index) {
+      const auto offset = touch_base + index * 32;
+      write_be(state, offset, static_cast<std::uint32_t>(index + 1));
+      state[offset + 4] = 1;
+    }
+    return state;
+  }
+
+  std::vector<std::uint8_t> input_edges(const std::size_t count) {
+    std::vector<std::uint8_t> edges(count * 32);
+    for (std::size_t index = 0; index < count; ++index) {
+      write_be(edges, index * 32, static_cast<std::uint64_t>(index + 1));
+    }
+    return edges;
+  }
+
+  std::vector<std::uint8_t> input_payload(
+    const std::uint16_t state_format,
+    const std::uint16_t edge_format = 2,
+    std::vector<std::uint8_t> state = {},
+    std::vector<std::uint8_t> edges = {}
+  ) {
+    if (state.empty()) {
+      state.resize(lumen::protocol_common::input_state::header_bytes);
+      write_be(state, 0, std::uint32_t {6});
+      if (state_format == 3) {
+        state[87] = 3;
+      }
+    }
     std::vector<std::uint8_t> payload;
     append_be(payload, std::uint64_t {100});
+    append_be(payload, static_cast<std::uint64_t>(edges.size() / 32));
+    append_be(payload, static_cast<std::uint16_t>(state.size()));
+    append_be(payload, static_cast<std::uint16_t>(edges.size() / 32));
+    append_be(payload, state_format);
+    append_be(payload, edge_format);
     append_be(payload, std::uint64_t {0});
-    append_be(payload, std::uint16_t {112});
-    append_be(payload, std::uint16_t {0});
-    append_be(payload, format);
-    append_be(payload, format);
-    append_be(payload, std::uint64_t {0});
-    append_be(payload, std::uint32_t {6});
-    payload.resize(32 + 112);
+    payload.insert(payload.end(), state.begin(), state.end());
+    payload.insert(payload.end(), edges.begin(), edges.end());
     return payload;
   }
 
@@ -165,7 +233,11 @@ namespace {
   }
 }  // namespace
 
-TEST(ProtocolV3InputFormat, AcceptsTwoAndExplicitlyRejectsOne) {
+TEST(ProtocolV3InputFormat, AdvertisesCompactInputCapability) {
+  EXPECT_EQ(lumen::protocol_v3::control_session::Config {}.capabilities, 0x37fU);
+}
+
+TEST(ProtocolV3InputFormat, AcceptsTwoAndThreeAndExplicitlyRejectsOne) {
   transport_t transport;
   input_t input;
   microphone_t microphone;
@@ -182,11 +254,101 @@ TEST(ProtocolV3InputFormat, AcceptsTwoAndExplicitlyRejectsOne) {
   EXPECT_EQ(input.submissions, 0U);
 
   auto format_two = input_payload(2);
+  const auto expected_format_two_state = std::vector<std::uint8_t>(
+    format_two.begin() + 32,
+    format_two.end()
+  );
   EXPECT_EQ(
     pipeline.receive({1, 1, 0, negotiated.session_id, 2, 1, format_two}),
     media::ReceiveResult::accepted
   );
   EXPECT_EQ(input.submissions, 1U);
+  EXPECT_EQ(input.last_state, expected_format_two_state);
+
+  auto format_three = input_payload(3);
+  write_be(format_three, 32, std::uint32_t {2});
+  EXPECT_EQ(
+    pipeline.receive({1, 1, 0, negotiated.session_id, 3, 2, format_three}),
+    media::ReceiveResult::accepted
+  );
+  EXPECT_EQ(input.submissions, 2U);
+  ASSERT_GT(input.last_state.size(), 87U);
+  EXPECT_EQ(input.last_state[87], 3U);
+}
+
+TEST(ProtocolV3InputFormat, RejectsStateMarkerAndEdgeFormatMismatch) {
+  transport_t transport;
+  input_t input;
+  microphone_t microphone;
+  feedback_t feedback;
+  const auto negotiated = config();
+  media::SessionPipeline pipeline(negotiated, transport, input, microphone, feedback);
+  ASSERT_TRUE(pipeline.bind_connection(1));
+
+  auto wrapper_three_marker_two = input_payload(3);
+  wrapper_three_marker_two[32 + 87] = 0;
+  EXPECT_EQ(
+    pipeline.receive({1, 1, 0, negotiated.session_id, 1, 1, wrapper_three_marker_two}),
+    media::ReceiveResult::malformed
+  );
+
+  auto wrapper_two_marker_three = input_payload(2);
+  wrapper_two_marker_three[32 + 87] = 3;
+  EXPECT_EQ(
+    pipeline.receive({1, 1, 0, negotiated.session_id, 1, 1, wrapper_two_marker_three}),
+    media::ReceiveResult::malformed
+  );
+
+  auto edge_format_three = input_payload(3, 3);
+  EXPECT_EQ(
+    pipeline.receive({1, 1, 0, negotiated.session_id, 1, 1, edge_format_three}),
+    media::ReceiveResult::malformed
+  );
+  EXPECT_EQ(input.submissions, 0U);
+}
+
+TEST(ProtocolV3InputFormat, EnforcesExactFormatTwoAndThreePayloadBoundaries) {
+  transport_t transport;
+  input_t input;
+  microphone_t microphone;
+  feedback_t feedback;
+  const auto negotiated = config();
+  media::SessionPipeline pipeline(negotiated, transport, input, microphone, feedback);
+  ASSERT_TRUE(pipeline.bind_connection(1));
+
+  auto format_two_boundary = input_payload(2, 2, controller_state(2, 15));
+  ASSERT_EQ(format_two_boundary.size(), 1'104U);
+  EXPECT_EQ(
+    pipeline.receive({1, 1, 0, negotiated.session_id, 1, 1, format_two_boundary}),
+    media::ReceiveResult::accepted
+  );
+  EXPECT_EQ(input.submissions, 1U);
+  EXPECT_EQ(input.last_state.size(), 1'072U);
+
+  auto format_two_with_edge = input_payload(2, 2, controller_state(2, 15), input_edges(1));
+  ASSERT_EQ(format_two_with_edge.size(), 1'136U);
+  EXPECT_EQ(
+    pipeline.receive({1, 1, 0, negotiated.session_id, 2, 2, format_two_with_edge}),
+    media::ReceiveResult::malformed
+  );
+
+  auto format_three_with_two_edges = input_payload(3, 2, controller_state(3, 16), input_edges(2));
+  write_be(format_three_with_two_edges, 32, std::uint32_t {2});
+  ASSERT_EQ(format_three_with_two_edges.size(), 1'104U);
+  EXPECT_EQ(
+    pipeline.receive({1, 1, 0, negotiated.session_id, 2, 2, format_three_with_two_edges}),
+    media::ReceiveResult::accepted
+  );
+  EXPECT_EQ(input.submissions, 2U);
+  EXPECT_EQ(input.last_state.size(), 1'008U);
+
+  auto oversized = input_payload(3, 2, controller_state(3, 16));
+  oversized.resize(1'109U);
+  EXPECT_EQ(
+    pipeline.receive({1, 1, 0, negotiated.session_id, 3, 3, oversized}),
+    media::ReceiveResult::malformed
+  );
+  EXPECT_EQ(input.submissions, 2U);
 }
 
 TEST(ProtocolV3HdrSelection, RequiresStaticMetadataForPqAndForbidsItForHlg) {

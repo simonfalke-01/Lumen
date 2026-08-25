@@ -4120,6 +4120,12 @@ namespace stream {
         const auto horizontal = static_cast<std::int64_t>(v3_read_be<std::uint64_t>(state, 32));
         const auto controller_count = state[84];
         const auto touch_count = state[85];
+        const auto state_format = lumen::protocol_common::input_state::format(state);
+        if (!state_format) {
+          return false;
+        }
+        const auto controller_record_bytes =
+          lumen::protocol_common::input_state::controller_record_bytes(*state_format);
         if (!prior_input_initialized_) {
           const auto mouse_buttons = v3_read_be<std::uint32_t>(state, 4);
           for (std::uint16_t button = 1; button <= 5; ++button) {
@@ -4203,7 +4209,8 @@ namespace stream {
         }
         const auto active_mask = static_cast<std::uint16_t>(v3_read_be<std::uint32_t>(state, 80));
         for (std::size_t index = 0; index < controller_count; ++index) {
-          const auto offset = 112U + index * 64U;
+          const auto offset = lumen::protocol_common::input_state::header_bytes +
+                              index * controller_record_bytes;
           const auto controller = state[offset];
           if (controller >= 16) {
             return false;
@@ -4296,7 +4303,8 @@ namespace stream {
           controller_states_[controller] = {};
         }
         prior_controller_mask_ = active_mask;
-        const auto touch_base = 112U + static_cast<std::size_t>(controller_count) * 64U;
+        const auto touch_base = lumen::protocol_common::input_state::header_bytes +
+                                static_cast<std::size_t>(controller_count) * controller_record_bytes;
         for (std::size_t index = 0; index < touch_count; ++index) {
           const auto offset = touch_base + index * 32U;
           const auto scale = static_cast<double>(UINT32_MAX);

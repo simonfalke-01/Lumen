@@ -4,6 +4,8 @@
  */
 
 #include "media_pipeline.h"
+
+#include "../protocol_common/input_state.h"
 #include "start_mode_contract.h"
 
 #include <algorithm>
@@ -16,6 +18,8 @@ namespace lumen::protocol_v3::media {
   namespace {
     constexpr std::size_t video_payload_header_bytes = 64;
     constexpr std::size_t audio_payload_header_bytes = 48;
+    constexpr std::size_t maximum_datagram_payload_bytes =
+      quic_server::maximum_semantic_datagram_bytes - quic_server::datagram_header_bytes;
     constexpr std::uint64_t sequence_exhaustion_boundary =
       std::numeric_limits<std::uint64_t>::max() - 1'024;
 
@@ -647,20 +651,29 @@ namespace lumen::protocol_v3::media {
       return ReceiveResult::ignored;
     }
     if (record.channel == 1 && record.kind == 1) {
-      if (record.payload.size() < 32 || record.object_id == 0) {
+      if (record.payload.size() < 32 || record.payload.size() > maximum_datagram_payload_bytes ||
+          record.object_id == 0) {
         return ReceiveResult::malformed;
       }
       const auto state_length = read_be16(record.payload, 16);
       const auto edge_count = read_be16(record.payload, 18);
+      const auto state_format = read_be16(record.payload, 20);
+      const auto edge_format = read_be16(record.payload, 22);
       const auto expected = 32U + state_length + static_cast<std::size_t>(edge_count) * 32U;
-      if (edge_count > 64 || read_be16(record.payload, 20) != 2 ||
-          read_be16(record.payload, 22) != 2 || read_be64(record.payload, 24) != 0 ||
+      if (edge_count > 64 || (state_format != 2 && state_format != 3) || edge_format != 2 ||
+          read_be64(record.payload, 24) != 0 ||
           expected != record.payload.size()) {
         return ReceiveResult::malformed;
       }
       const auto sample_time = read_be64(record.payload, 0);
       const auto newest_edge = read_be64(record.payload, 8);
-      if (state_length < 4) return ReceiveResult::malformed;
+      const auto state_block = record.payload.subspan(32, state_length);
+      const auto expected_state_format = state_format == 3 ?
+                                           protocol_common::input_state::Format::three :
+                                           protocol_common::input_state::Format::two;
+      if (protocol_common::input_state::validate(state_block, expected_state_format)) {
+        return ReceiveResult::malformed;
+      }
       const auto state_flags = read_be32(record.payload, 32);
       if ((highest_input_state_object_ == 0 &&
            (record.object_id != 1 || (state_flags & 0x04U) == 0)) ||
@@ -732,7 +745,7 @@ namespace lumen::protocol_v3::media {
         .state_sequence = record.object_id,
         .sample_time_microseconds = sample_time,
         .newest_edge_id = newest_edge,
-        .state_block = record.payload.subspan(32, state_length),
+        .state_block = state_block,
         .edge_records = record.payload.subspan(new_edge_offset),
       };
       if (!input_.submit(batch)) {

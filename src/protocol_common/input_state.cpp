@@ -1,6 +1,6 @@
 /**
  * @file src/protocol_common/input_state.cpp
- * @brief Strict protocol-v3 state-format-2 structural validation.
+ * @brief Strict protocol-v3 state-format-2/3 structural validation.
  */
 
 #include "input_state.h"
@@ -30,9 +30,47 @@ namespace lumen::protocol_common::input_state {
     }
   }  // namespace
 
-  std::optional<Error> validate(const std::span<const std::uint8_t> bytes, const std::optional<bool> expected_absolute) noexcept {
-    if (bytes.size() < 112) {
+  std::optional<Format> format(const std::span<const std::uint8_t> bytes) noexcept {
+    if (bytes.size() < header_bytes) {
+      return std::nullopt;
+    }
+    if (bytes[87] == 0) {
+      return Format::two;
+    }
+    if (bytes[87] == static_cast<std::uint8_t>(Format::three)) {
+      return Format::three;
+    }
+    return std::nullopt;
+  }
+
+  std::size_t controller_record_bytes(const Format format) noexcept {
+    return format == Format::three ? std::size_t {56} : std::size_t {64};
+  }
+
+  std::optional<Error> validate(
+    const std::span<const std::uint8_t> bytes,
+    const std::optional<bool> expected_absolute
+  ) noexcept {
+    if (bytes.size() < header_bytes) {
       return Error::too_short;
+    }
+    const auto declared_format = format(bytes);
+    if (!declared_format) {
+      return Error::format_mismatch;
+    }
+    return validate(bytes, *declared_format, expected_absolute);
+  }
+
+  std::optional<Error> validate(
+    const std::span<const std::uint8_t> bytes,
+    const Format expected_format,
+    const std::optional<bool> expected_absolute
+  ) noexcept {
+    if (bytes.size() < header_bytes) {
+      return Error::too_short;
+    }
+    if (format(bytes) != expected_format) {
+      return Error::format_mismatch;
     }
     const auto state_flags = read_be<std::uint32_t>(bytes, 0);
     const bool absolute = (state_flags & 1) != 0;
@@ -47,21 +85,24 @@ namespace lumen::protocol_common::input_state {
         (absolute && (read_be<std::uint64_t>(bytes, 8) != 0 || read_be<std::uint64_t>(bytes, 16) != 0))) {
       return Error::pointer_mode_mismatch;
     }
-    if (!zero_range(bytes, 87, 112)) {
+    const auto reserved_start = expected_format == Format::three ? std::size_t {88} : std::size_t {87};
+    if (!zero_range(bytes, reserved_start, header_bytes)) {
       return Error::reserved_not_zero;
     }
 
     const auto controller_count = bytes[84];
     const auto touch_count = bytes[85];
     const auto pen_count = bytes[86];
-    const auto expected_size = std::size_t {112} + std::size_t {64} * controller_count + std::size_t {32} * touch_count + std::size_t {40} * pen_count;
+    const auto controller_bytes = controller_record_bytes(expected_format);
+    const auto expected_size = header_bytes + controller_bytes * controller_count +
+                               std::size_t {32} * touch_count + std::size_t {40} * pen_count;
     if (controller_count > 16 || touch_count > 16 || pen_count > 4 || expected_size != bytes.size()) {
       return Error::wrong_size;
     }
     std::uint32_t controller_mask = 0;
     std::uint8_t previous_controller = 0;
     for (std::size_t index = 0; index < controller_count; ++index) {
-      const auto offset = std::size_t {112} + index * 64;
+      const auto offset = header_bytes + index * controller_bytes;
       const auto id = bytes[offset];
       const auto type = bytes[offset + 1];
       const auto flags = read_be<std::uint16_t>(bytes, offset + 2);
@@ -75,7 +116,7 @@ namespace lumen::protocol_common::input_state {
           (supported_buttons & ~std::uint32_t {0x003fffff}) != 0) {
         return Error::invalid_controller;
       }
-      if (!zero_range(bytes, offset + 56, offset + 64)) {
+      if (expected_format == Format::two && !zero_range(bytes, offset + 56, offset + 64)) {
         return Error::reserved_not_zero;
       }
       previous_controller = id;
@@ -85,7 +126,7 @@ namespace lumen::protocol_common::input_state {
       return Error::invalid_controller;
     }
 
-    const auto touch_start = std::size_t {112} + std::size_t {64} * controller_count;
+    const auto touch_start = header_bytes + controller_bytes * controller_count;
     std::array<std::uint32_t, 16> touch_ids {};
     for (std::size_t index = 0; index < touch_count; ++index) {
       const auto offset = touch_start + index * 32;
