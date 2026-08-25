@@ -346,7 +346,9 @@ namespace lumen::protocol_v3::runtime {
       control::Random &random,
       ApplicationBridge &applications,
       SessionResourceFactory &resources,
-      QuicTransportSink &transport
+      QuicTransportSink &transport,
+      std::shared_ptr<resource_budget::ResourceBudgetCoordinator> resource_budget =
+        std::make_shared<resource_budget::ResourceBudgetCoordinator>()
     );
     ~ProductionSessionBackend() override;
 

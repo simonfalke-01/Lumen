@@ -114,6 +114,7 @@ namespace {
     }
 
     std::expected<bool, std::uint8_t> start(const runtime::ApplicationLaunch &launch) override {
+      ++start_calls;
       last_launch = launch;
       return false;
     }
@@ -127,6 +128,7 @@ namespace {
       return false;
     }
 
+    std::atomic_int start_calls {};
     std::atomic_int stop_calls {};
     std::optional<runtime::ApplicationLaunch> last_launch;
   };
@@ -177,12 +179,14 @@ namespace {
       std::uint64_t,
       std::weak_ptr<runtime::TerminalFailureDispatcher>
     ) override {
+      ++create_calls;
       auto effective = config;
       effective.static_hdr_metadata = resolved_metadata;
       selected = effective;
       return std::make_unique<CapturedSelectionResources>(std::move(effective));
     }
 
+    int create_calls {};
     std::optional<media::NegotiatedMediaConfig> selected;
     std::optional<media::StaticHDRMetadata> resolved_metadata;
   };
@@ -1371,6 +1375,21 @@ TEST(ProtocolV3Runtime, StopDetachesOwnershipBeforeTerminalCallbackAndRemainsReu
     EXPECT_EQ(state->destructor_calls.load(), 1);
     EXPECT_FALSE(backend.owned_session(client).has_value());
 
+    auto exact_retry = backend.control(
+      client,
+      control::AuthenticatedControl::stop,
+      stop_fields(session_id, intent_byte),
+      intent_byte + 1U,
+      99,
+      2
+    );
+    EXPECT_TRUE(exact_retry.has_value());
+    if (exact_retry) {
+      EXPECT_EQ(result_status(*exact_retry), 0U);
+      EXPECT_TRUE(exact_retry->post_response_events.empty());
+    }
+    EXPECT_EQ(state->stop_calls.load(), 1);
+
     auto repeated = backend.control(
       client,
       control::AuthenticatedControl::stop,
@@ -1392,6 +1411,101 @@ TEST(ProtocolV3Runtime, StopDetachesOwnershipBeforeTerminalCallbackAndRemainsReu
   EXPECT_EQ(first->callback_calls.load(), 1);
   EXPECT_EQ(second->callback_calls.load(), 1);
   EXPECT_EQ(applications.stop_calls.load(), 2);
+}
+
+TEST(ProtocolV3Runtime, StartAndStopOutcomesReplayAcrossAuthoritiesWithoutRepeatingSideEffects) {
+  control::SecureRandom random;
+  StopRaceApplicationBridge applications;
+  CapturingResourceFactory factory;
+  AcceptingTransport transport;
+  runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+  const auto client = start_client(0x91);
+  const auto request = sdr_h264_start_fields(1920, 1080);
+
+  const auto first = backend.start(
+    client,
+    request,
+    91,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_TRUE(first.has_value());
+  EXPECT_FALSE(first->replay_requires_attach);
+  EXPECT_EQ(factory.create_calls, 1);
+  EXPECT_EQ(applications.start_calls.load(), 1);
+
+  const auto replayed = backend.start(
+    client,
+    request,
+    92,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_TRUE(replayed.has_value());
+  EXPECT_TRUE(replayed->replay_requires_attach);
+  EXPECT_TRUE(replayed->host_requests.empty());
+  EXPECT_EQ(replayed->session_id, first->session_id);
+  EXPECT_EQ(replayed->response_fields, first->response_fields);
+  EXPECT_EQ(factory.create_calls, 1);
+  EXPECT_EQ(applications.start_calls.load(), 1);
+
+  auto conflicting_request = request;
+  *mutable_map_field(conflicting_request, 8) = 90'000U;
+  const auto conflict = backend.start(
+    client,
+    conflicting_request,
+    93,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_FALSE(conflict.has_value());
+  EXPECT_EQ(conflict.error(), static_cast<std::uint8_t>(ProtocolStatus::busy));
+  EXPECT_EQ(factory.create_calls, 1);
+
+  const auto stopped = backend.control(
+    client,
+    control::AuthenticatedControl::stop,
+    stop_fields(first->session_id, 0x44),
+    3,
+    91,
+    1
+  );
+  ASSERT_TRUE(stopped.has_value());
+  EXPECT_EQ(result_status(*stopped), 0U);
+
+  const auto expired = backend.start(
+    client,
+    request,
+    94,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_FALSE(expired.has_value());
+  EXPECT_EQ(expired.error(), static_cast<std::uint8_t>(ProtocolStatus::expired));
+  EXPECT_EQ(factory.create_calls, 1);
+}
+
+TEST(ProtocolV3Runtime, OutcomeBudgetRefusalHappensBeforeStartSideEffects) {
+  control::SecureRandom random;
+  StopRaceApplicationBridge applications;
+  CapturingResourceFactory factory;
+  AcceptingTransport transport;
+  auto budget = std::make_shared<lumen::protocol_v3::resource_budget::ResourceBudgetCoordinator>();
+  auto held = budget->reserve(
+    lumen::protocol_v3::resource_budget::ResourceClass::operation_outcomes,
+    lumen::protocol_v3::resource_budget::class_ceilings[
+      static_cast<std::size_t>(lumen::protocol_v3::resource_budget::ResourceClass::operation_outcomes)
+    ]
+  );
+  ASSERT_TRUE(held.has_value());
+  runtime::ProductionSessionBackend backend {random, applications, factory, transport, budget};
+
+  const auto started = backend.start(
+    start_client(0x92),
+    sdr_h264_start_fields(1920, 1080),
+    95,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_FALSE(started.has_value());
+  EXPECT_EQ(started.error(), static_cast<std::uint8_t>(ProtocolStatus::resource_failure));
+  EXPECT_EQ(factory.create_calls, 0);
+  EXPECT_EQ(applications.start_calls.load(), 0);
 }
 
 TEST(ProtocolV3Runtime, LifeU03LatchesFailureDuringFactoryCreateBeforeCommit) {

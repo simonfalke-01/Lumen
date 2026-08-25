@@ -67,7 +67,7 @@ namespace lumen::protocol_v3::quic_server {
     }
 
     bool valid_config(const Config &config) noexcept {
-      return config.udp_port != 0 && config.certificate &&
+      return config.udp_port != 0 && config.certificate && config.resource_budget &&
              !config.certificate->pkcs12.empty() && !config.certificate->password.empty() &&
              config.maximum_connections > 0 && config.maximum_connections <= 64 &&
              config.maximum_connections_per_source > 0 &&
@@ -346,6 +346,22 @@ namespace lumen::protocol_v3::quic_server {
     return Delivery::reliable_stream;
   }
 
+  resource_budget::ResourceClass resource_class_for(const Lane lane) noexcept {
+    switch (lane) {
+      case Lane::control:
+      case Lane::input_edge:
+      case Lane::key_config:
+        return resource_budget::ResourceClass::critical;
+      case Lane::audio:
+      case Lane::microphone:
+      case Lane::delta_video:
+        return resource_budget::ResourceClass::media;
+      case Lane::telemetry:
+        return resource_budget::ResourceClass::metadata;
+    }
+    return resource_budget::ResourceClass::unclassified;
+  }
+
   std::uint8_t latency_priority(const Lane lane) noexcept {
     switch (lane) {
       case Lane::control:
@@ -608,6 +624,7 @@ namespace lumen::protocol_v3::quic_server {
       std::uint64_t sequence {};
       Lane lane {Lane::control};
       std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+      resource_budget::ResourceBudgetCoordinator::SharedLease budget;
       MonotonicClock::time_point deadline {};
       bool replaceable {};
       std::uint64_t object_id {};
@@ -617,6 +634,7 @@ namespace lumen::protocol_v3::quic_server {
     struct VideoFrameState {
       std::uint64_t first_sequence {};
       std::shared_ptr<const LazyVideoFrame> frame;
+      resource_budget::ResourceBudgetCoordinator::SharedLease budget;
       std::size_t next_fragment {};
       std::size_t in_flight {};
       bool canceled {};
@@ -633,8 +651,14 @@ namespace lumen::protocol_v3::quic_server {
 
     struct BulkSend {
       BulkTransfer transfer;
+      resource_budget::ResourceBudgetCoordinator::SharedLease budget;
       std::uint64_t send_token {};
       bool buffer_released {};
+    };
+
+    struct PendingBulk {
+      BulkTransfer transfer;
+      resource_budget::ResourceBudgetCoordinator::SharedLease budget;
     };
 
     struct Connection {
@@ -725,7 +749,7 @@ namespace lumen::protocol_v3::quic_server {
       std::optional<std::uint64_t> pending_video_object;
       bool pending_video_objects_mixed {};
       bool rtt_telemetry_in_flight {};
-      std::map<std::uint64_t, BulkTransfer> pending_bulk;
+      std::map<std::uint64_t, PendingBulk> pending_bulk;
       std::map<Handle, std::shared_ptr<BulkSend>> bulk_streams;
       std::size_t bulk_transfer_count {};
       std::size_t bulk_buffered_bytes {};
@@ -1040,10 +1064,21 @@ namespace lumen::protocol_v3::quic_server {
         return EnqueueResult::would_block;
       }
 
+      auto budget = config_.resource_budget->reserve_shared(
+        resource_class_for(packet.lane),
+        packet.bytes,
+        packet.bytes->capacity()
+      );
+      if (!budget) {
+        emit_locked(Event::Kind::packet_backpressured, &connection, 0, packet.lane, packet.bytes->size());
+        return EnqueueResult::would_block;
+      }
+
       QueuedPacket queued {
         .sequence = connection.next_packet_sequence++,
         .lane = packet.lane,
         .bytes = std::move(packet.bytes),
+        .budget = std::move(*budget),
         .deadline = packet.deadline,
         .replaceable = packet.replaceable,
         .object_id = object_id,
@@ -1154,10 +1189,26 @@ namespace lumen::protocol_v3::quic_server {
         );
         return EnqueueResult::would_block;
       }
+      auto budget = config_.resource_budget->reserve_shared(
+        resource_budget::ResourceClass::media,
+        frame,
+        frame->retained_bytes()
+      );
+      if (!budget) {
+        emit_locked(
+          Event::Kind::packet_backpressured,
+          &connection,
+          0,
+          Lane::delta_video,
+          frame->retained_bytes()
+        );
+        return EnqueueResult::would_block;
+      }
       auto state = std::make_shared<VideoFrameState>();
       state->first_sequence = connection.next_packet_sequence;
       connection.next_packet_sequence += frame->fragment_count();
       state->frame = std::move(frame);
+      state->budget = std::move(*budget);
       connection.video_frame_bytes += state->frame->retained_bytes();
       const auto sequence = state->first_sequence;
       const auto bytes = state->frame->retained_bytes();
@@ -1170,16 +1221,38 @@ namespace lumen::protocol_v3::quic_server {
     BulkSendResult send_bulk(
       const std::uint64_t connection_id,
       BulkTransfer transfer,
-      const bool reserved = false
+      const bool reserved = false,
+      resource_budget::ResourceBudgetCoordinator::SharedLease reserved_budget = {}
     ) {
       if (!valid_bulk_transfer(transfer)) {
         return BulkSendResult::invalid_object;
       }
       const auto payload_bytes = transfer.bytes->size() - bulk_header_bytes;
+      auto budget = reserved_budget ?
+                      std::optional {std::move(reserved_budget)} :
+                      config_.resource_budget->reserve_shared(
+                        resource_budget::ResourceClass::bulk,
+                        transfer.bytes,
+                        transfer.bytes->capacity()
+                      );
+      if (!budget) {
+        if (reserved) {
+          std::lock_guard lock {mutex_};
+          if (const auto found = connections_.find(connection_id); found != connections_.end()) {
+            auto &connection = *found->second;
+            if (connection.bulk_transfer_count != 0) {
+              --connection.bulk_transfer_count;
+            }
+            connection.bulk_buffered_bytes -= std::min(connection.bulk_buffered_bytes, payload_bytes);
+          }
+        }
+        return BulkSendResult::would_block;
+      }
       Handle connection_handle = invalid_handle;
       auto stream_slot = std::make_shared<Handle>(invalid_handle);
       auto send = std::make_shared<BulkSend>();
       send->transfer = std::move(transfer);
+      send->budget = std::move(*budget);
       {
         std::lock_guard lock {mutex_};
         const auto found = connections_.find(connection_id);
@@ -1317,6 +1390,10 @@ namespace lumen::protocol_v3::quic_server {
         total += connection->queued_packets + connection->video_frames.size();
       }
       return total;
+    }
+
+    resource_budget::Snapshot resource_budget_snapshot() const noexcept {
+      return config_.resource_budget->snapshot();
     }
 
     bool running() const noexcept {
@@ -1679,6 +1756,7 @@ namespace lumen::protocol_v3::quic_server {
           const auto payload = send->transfer.bytes ? send->transfer.bytes->size() - bulk_header_bytes : 0;
           connection.bulk_buffered_bytes -= std::min(connection.bulk_buffered_bytes, payload);
           send->transfer.bytes.reset();
+          send->budget = {};
           send->buffer_released = true;
           send_drain_condition_.notify_all();
         }
@@ -1920,6 +1998,16 @@ namespace lumen::protocol_v3::quic_server {
                     begin_shutdown_locked(connection, shutdown_internal_error);
                     return ApiStatus::aborted;
                   }
+                  auto budget = config_.resource_budget->reserve_shared(
+                    resource_budget::ResourceClass::critical,
+                    packet.bytes,
+                    packet.bytes->capacity()
+                  );
+                  if (!budget) {
+                    begin_shutdown_locked(connection, shutdown_internal_error);
+                    return ApiStatus::aborted;
+                  }
+                  packet.budget = std::move(*budget);
                   connection.queued_bytes += packet.bytes->size();
                   connection.queues[lane_index(packet.lane)].push_back(std::move(packet));
                   ++connection.queued_packets;
@@ -1937,9 +2025,22 @@ namespace lumen::protocol_v3::quic_server {
                     begin_shutdown_locked(connection, shutdown_internal_error);
                     return ApiStatus::aborted;
                   }
+                  auto budget = config_.resource_budget->reserve_shared(
+                    resource_budget::ResourceClass::bulk,
+                    transfer.bytes,
+                    transfer.bytes->capacity()
+                  );
+                  if (!budget) {
+                    begin_shutdown_locked(connection, shutdown_internal_error);
+                    return ApiStatus::aborted;
+                  }
                   ++connection.bulk_transfer_count;
                   connection.bulk_buffered_bytes += payload_bytes;
-                  connection.pending_bulk.emplace(transfer.request_id, std::move(transfer));
+                  const auto request_id = transfer.request_id;
+                  connection.pending_bulk.emplace(request_id, PendingBulk {
+                                                                .transfer = std::move(transfer),
+                                                                .budget = std::move(*budget),
+                                                              });
                 }
               } catch (...) {
                 if (!lock.owns_lock()) {
@@ -2179,10 +2280,20 @@ namespace lumen::protocol_v3::quic_server {
       write_be(record, 56, sample.minimum_rtt_microseconds, 4);
       write_be(record, 60, connection.rtt_variation_microseconds, 4);
 
+      auto budget = config_.resource_budget->reserve_shared(
+        resource_budget::ResourceClass::metadata,
+        bytes,
+        bytes->capacity()
+      );
+      if (!budget) {
+        return;
+      }
+
       QueuedPacket packet {
         .sequence = connection.next_packet_sequence++,
         .lane = Lane::telemetry,
         .bytes = bytes,
+        .budget = std::move(*budget),
         .deadline = now + rtt_telemetry_lifetime,
         .replaceable = true,
         .object_id = generation,
@@ -2660,11 +2771,12 @@ namespace lumen::protocol_v3::quic_server {
           const auto staged = control_request_id ? connection.pending_bulk.find(*control_request_id) :
                                                    connection.pending_bulk.end();
           if (staged != connection.pending_bulk.end()) {
-            auto transfer = std::move(staged->second);
+            auto transfer = std::move(staged->second.transfer);
+            auto budget = std::move(staged->second.budget);
             connection.pending_bulk.erase(staged);
             const auto id = connection.id;
             lock.unlock();
-            const auto bulk_status = send_bulk(id, std::move(transfer), true);
+            const auto bulk_status = send_bulk(id, std::move(transfer), true, std::move(budget));
             lock.lock();
             const auto live = connections_.find(id);
             if (live == connections_.end()) {
@@ -3016,6 +3128,10 @@ namespace lumen::protocol_v3::quic_server {
 
   std::size_t QuicServer::queued_packets() const noexcept {
     return impl_ ? impl_->queued_packets() : 0;
+  }
+
+  resource_budget::Snapshot QuicServer::resource_budget_snapshot() const noexcept {
+    return impl_ ? impl_->resource_budget_snapshot() : resource_budget::Snapshot {};
   }
 
   bool QuicServer::running() const noexcept {

@@ -5,6 +5,7 @@
 
 #include "runtime.h"
 #include "host_identity_store.h"
+#include "operation_outcomes.h"
 #include "start_mode_contract.h"
 
 #include "../file_handler.h"
@@ -51,6 +52,16 @@ namespace lumen::protocol_v3::runtime {
 
     std::mutex active_service_mutex;
     ProtocolV3Service *active_service {};
+
+    std::optional<control::Bytes32> canonical_digest(const Map &fields) {
+      const auto encoded = control::cbor::encode(control::cbor::Value {fields});
+      return encoded ? lumen::protocol_common::crypto::sha256(encoded.bytes) : std::nullopt;
+    }
+
+    std::optional<std::size_t> encoded_fields_bytes(const Map &fields) {
+      const auto encoded = control::cbor::encode(control::cbor::Value {fields});
+      return encoded ? std::optional {encoded.bytes.size()} : std::nullopt;
+    }
 
     template<std::size_t Size>
     bool nonzero(const std::array<std::uint8_t, Size> &value) noexcept {
@@ -1236,12 +1247,15 @@ namespace lumen::protocol_v3::runtime {
       control::Random &random_source,
       ApplicationBridge &application_bridge,
       SessionResourceFactory &resource_factory,
-      QuicTransportSink &transport_sink
+      QuicTransportSink &transport_sink,
+      std::shared_ptr<resource_budget::ResourceBudgetCoordinator> shared_budget
     ):
         random {random_source},
         applications {application_bridge},
         factory {resource_factory},
         transport {transport_sink},
+        budget {std::move(shared_budget)},
+        outcomes {budget},
         watchdog {[this](const std::stop_token stop_token) {
           run_watchdog(stop_token);
         }} {
@@ -1375,6 +1389,7 @@ namespace lumen::protocol_v3::runtime {
                 std::pair {session->second.owner_client_id, session->second.start_intent_id},
                 now + std::chrono::seconds {60}
               );
+              outcomes.end_session(session->first, now);
               session = sessions.erase(session);
             } else {
               ++session;
@@ -1466,6 +1481,8 @@ namespace lumen::protocol_v3::runtime {
     ApplicationBridge &applications;
     SessionResourceFactory &factory;
     QuicTransportSink &transport;
+    std::shared_ptr<resource_budget::ResourceBudgetCoordinator> budget;
+    operation_outcomes::Store outcomes;
     std::mutex mutex;
     std::shared_ptr<std::condition_variable_any> watchdog_wakeup {
       std::make_shared<std::condition_variable_any>()
@@ -1486,9 +1503,16 @@ namespace lumen::protocol_v3::runtime {
     control::Random &random,
     ApplicationBridge &applications,
     SessionResourceFactory &resources,
-    QuicTransportSink &transport
+    QuicTransportSink &transport,
+    std::shared_ptr<resource_budget::ResourceBudgetCoordinator> resource_budget
   ):
-      impl_ {std::make_unique<Impl>(random, applications, resources, transport)} {
+      impl_ {std::make_unique<Impl>(
+        random,
+        applications,
+        resources,
+        transport,
+        std::move(resource_budget)
+      )} {
   }
 
   ProductionSessionBackend::~ProductionSessionBackend() = default;
@@ -1556,17 +1580,62 @@ namespace lumen::protocol_v3::runtime {
     if ((client.permissions & control::start_permission) == 0) {
       return std::unexpected(static_cast<std::uint8_t>(Status::unauthorized));
     }
-    if (connection_id == 0 || maximum_datagram_bytes < quic_server::maximum_semantic_datagram_bytes ||
-        impl_->sessions.size() >= 8 ||
-        std::ranges::any_of(impl_->sessions, [&](const auto &entry) {
-          return entry.second.owner_client_id == client.client_id;
-        })) {
+    if (connection_id == 0 || maximum_datagram_bytes < quic_server::maximum_semantic_datagram_bytes) {
       return std::unexpected(static_cast<std::uint8_t>(Status::busy));
     }
     if (!exact_keys(request_fields, 1, 18)) {
       return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
     }
     const auto intent = fixed_field<16>(request_fields, 1);
+    const auto digest = canonical_digest(request_fields);
+    if (!intent || !digest) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
+    }
+    const auto now = quic_server::MonotonicClock::now();
+    const auto claim = impl_->outcomes.begin_start(
+      client.client_id,
+      *intent,
+      *digest,
+      {},
+      now
+    );
+    if (claim.match == operation_outcomes::Match::conflict) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::busy));
+    }
+    if (claim.match == operation_outcomes::Match::saturated) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
+    if (claim.match == operation_outcomes::Match::exact) {
+      if (claim.state == operation_outcomes::State::expired) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::expired));
+      }
+      if (!claim.replay) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::busy));
+      }
+      if (const auto status = unsigned_field(claim.replay->fields, 1)) {
+        return *status <= static_cast<std::uint64_t>(Status::internal_failure) ?
+                 std::unexpected(static_cast<std::uint8_t>(*status)) :
+                 std::unexpected(static_cast<std::uint8_t>(Status::internal_failure));
+      }
+      const auto replay_session = fixed_field<16>(claim.replay->fields, 3);
+      if (!replay_session) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::internal_failure));
+      }
+      return control::StartResult {
+        .session_id = *replay_session,
+        .response_fields = claim.replay->fields,
+        .host_requests = {},
+        .replay_requires_attach = true,
+      };
+    }
+
+    auto fresh = [&]() -> std::expected<control::StartResult, std::uint8_t> {
+      if (impl_->sessions.size() >= 8 ||
+          std::ranges::any_of(impl_->sessions, [&](const auto &entry) {
+            return entry.second.owner_client_id == client.client_id;
+          })) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::busy));
+      }
     const auto trace = fixed_field<16>(request_fields, 13);
     const auto *app = unsigned_field(request_fields, 2);
     const auto *profile = unsigned_field(request_fields, 3);
@@ -1701,6 +1770,9 @@ namespace lumen::protocol_v3::runtime {
     }
     if (!unique_session_id) {
       return std::unexpected(static_cast<std::uint8_t>(Status::internal_failure));
+    }
+    if (!impl_->outcomes.bind_start_session(client.client_id, *intent, *digest, selected.session_id)) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
     }
     control::Bytes32 attach_token {};
     if (!impl_->random_nonzero(attach_token)) {
@@ -2106,6 +2178,42 @@ namespace lumen::protocol_v3::runtime {
     } catch (...) {
       return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
     }
+    }();
+
+    if (fresh) {
+      const auto replay_bytes = encoded_fields_bytes(fresh->response_fields);
+      if (!replay_bytes ||
+          !impl_->outcomes.publish_active(
+            operation_outcomes::Operation::start,
+            client.client_id,
+            *intent,
+            *digest,
+            operation_outcomes::Replay {
+              .fields = fresh->response_fields,
+              .encoded_bytes = replay_bytes.value_or(0),
+            }
+          )) {
+        return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+      }
+      return fresh;
+    }
+
+    Map failure {{1, static_cast<std::uint64_t>(fresh.error())}};
+    const auto failure_bytes = encoded_fields_bytes(failure);
+    if (failure_bytes) {
+      static_cast<void>(impl_->outcomes.complete(
+        operation_outcomes::Operation::start,
+        client.client_id,
+        *intent,
+        *digest,
+        operation_outcomes::Replay {
+          .fields = std::move(failure),
+          .encoded_bytes = *failure_bytes,
+        },
+        quic_server::MonotonicClock::now()
+      ));
+    }
+    return fresh;
   }
 
   std::expected<control::ControlResult, std::uint8_t> ProductionSessionBackend::control(
@@ -2248,6 +2356,34 @@ namespace lumen::protocol_v3::runtime {
               *action > 1 || *reason < 1 || *reason > 3) {
             return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
           }
+          const auto digest = canonical_digest(request_fields);
+          if (!digest) {
+            return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
+          }
+          const auto prior = impl_->outcomes.lookup(
+            operation_outcomes::Operation::stop,
+            client.client_id,
+            *stop_intent,
+            *digest,
+            quic_server::MonotonicClock::now()
+          );
+          if (prior.match == operation_outcomes::Match::conflict) {
+            return make_result({
+              {1, static_cast<std::uint64_t>(Status::busy)},
+              {2, bytes(*session_id)},
+              {3, bytes(*stop_intent)},
+              {4, control::cbor::Value {false}},
+            });
+          }
+          if (prior.match == operation_outcomes::Match::exact) {
+            return prior.replay ? control::ControlResult {request, prior.replay->fields} :
+                                  make_result({
+                                    {1, static_cast<std::uint64_t>(Status::busy)},
+                                    {2, bytes(*session_id)},
+                                    {3, bytes(*stop_intent)},
+                                    {4, control::cbor::Value {false}},
+                                  });
+          }
           if (*action == 1 && (client.permissions & (1U << 5)) == 0) {
             return make_result({
               {1, static_cast<std::uint64_t>(Status::unauthorized)},
@@ -2265,37 +2401,81 @@ namespace lumen::protocol_v3::runtime {
               {4, control::cbor::Value {false}},
             });
           }
-          // Remove callback-visible authority before crossing the blocking
-          // native teardown barrier. Capture threads may report terminal
-          // failure while stop() joins them; revocation makes those reports inert.
-          if (session->second.terminal_failure) {
-            session->second.terminal_failure->revoke();
+          const auto claim = impl_->outcomes.begin_stop(
+            client.client_id,
+            *stop_intent,
+            *digest,
+            *session_id,
+            quic_server::MonotonicClock::now()
+          );
+          if (claim.match == operation_outcomes::Match::conflict) {
+            return make_result({
+              {1, static_cast<std::uint64_t>(Status::busy)},
+              {2, bytes(*session_id)},
+              {3, bytes(*stop_intent)},
+              {4, control::cbor::Value {false}},
+            });
           }
-          auto stopped_session = std::move(session->second);
-          impl_->sessions.erase(session);
-          impl_->watchdog_wakeup->notify_all();
-          lock.unlock();
+          if (claim.match == operation_outcomes::Match::saturated) {
+            return make_result({
+              {1, static_cast<std::uint64_t>(Status::resource_failure)},
+              {2, bytes(*session_id)},
+              {3, bytes(*stop_intent)},
+              {4, control::cbor::Value {false}},
+            });
+          }
+          auto fresh = [&]() -> std::expected<control::ControlResult, std::uint8_t> {
+            // Remove callback-visible authority before crossing the blocking
+            // native teardown barrier. Capture threads may report terminal
+            // failure while stop() joins them; revocation makes those reports inert.
+            if (session->second.terminal_failure) {
+              session->second.terminal_failure->revoke();
+            }
+            auto stopped_session = std::move(session->second);
+            impl_->sessions.erase(session);
+            impl_->watchdog_wakeup->notify_all();
+            lock.unlock();
 
-          stopped_session.resources->stop();
-          const auto application_quit = impl_->applications.stop(*action == 1);
-          if (stopped_session.connection_id != 0) {
-            static_cast<void>(impl_->transport.reset_policy(stopped_session.connection_id));
+            stopped_session.resources->stop();
+            const auto application_quit = impl_->applications.stop(*action == 1);
+            if (stopped_session.connection_id != 0) {
+              static_cast<void>(impl_->transport.reset_policy(stopped_session.connection_id));
+            }
+            auto result = make_result({{1, 0U}, {2, bytes(*session_id)}, {3, bytes(*stop_intent)}, {4, control::cbor::Value {application_quit}}});
+            result.post_response_events.push_back({
+              0x0133,
+              {
+                {1, bytes(*session_id)},
+                {2, *reason},
+                {3, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(quic_server::MonotonicClock::now().time_since_epoch()).count())},
+                {4, control::cbor::Value {impl_->applications.running()}},
+                {5, 0U},
+                {6, 0U},
+                {7, 0U},
+                {8, 0U},
+              },
+            });
+            return result;
+          }();
+          if (!fresh) {
+            return fresh;
           }
-          auto result = make_result({{1, 0U}, {2, bytes(*session_id)}, {3, bytes(*stop_intent)}, {4, control::cbor::Value {application_quit}}});
-          result.post_response_events.push_back({
-            0x0133,
-            {
-              {1, bytes(*session_id)},
-              {2, *reason},
-              {3, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(quic_server::MonotonicClock::now().time_since_epoch()).count())},
-              {4, control::cbor::Value {impl_->applications.running()}},
-              {5, 0U},
-              {6, 0U},
-              {7, 0U},
-              {8, 0U},
-            },
-          });
-          return result;
+          const auto replay_bytes = encoded_fields_bytes(fresh->response_fields);
+          if (!replay_bytes || !impl_->outcomes.complete(
+                operation_outcomes::Operation::stop,
+                client.client_id,
+                *stop_intent,
+                *digest,
+                operation_outcomes::Replay {
+                  .fields = fresh->response_fields,
+                  .encoded_bytes = replay_bytes.value_or(0),
+                },
+                quic_server::MonotonicClock::now()
+              )) {
+            return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+          }
+          impl_->outcomes.end_session(*session_id, quic_server::MonotonicClock::now());
+          return fresh;
         }
       case control::AuthenticatedControl::input_reset:
         {
@@ -2628,6 +2808,7 @@ namespace lumen::protocol_v3::runtime {
             session->second.connection_id,
             session->second.launched_application,
           });
+          impl_->outcomes.end_session(session->first, quic_server::MonotonicClock::now());
           session = impl_->sessions.erase(session);
         } else {
           ++session;
@@ -2674,6 +2855,7 @@ namespace lumen::protocol_v3::runtime {
       server.reset();
       session_factory.reset();
       backend.reset();
+      budget.reset();
       authorities.reset();
       pairing_admission.reset();
       nonces.reset();
@@ -2696,6 +2878,7 @@ namespace lumen::protocol_v3::runtime {
     std::unique_ptr<control::ConnectionAuthorities> authorities;
     LumenApplicationBridge applications;
     QuicTransportSink transport;
+    std::shared_ptr<resource_budget::ResourceBudgetCoordinator> budget;
     std::unique_ptr<ProductionSessionBackend> backend;
     std::unique_ptr<control::SessionFactory> session_factory;
     std::unique_ptr<quic_server::QuicServer> server;
@@ -2759,16 +2942,20 @@ namespace lumen::protocol_v3::runtime {
       impl_->nonces = std::make_unique<control::BoundedNonceRegistry>();
       impl_->pairing_admission = std::make_unique<control::BoundedPairingAdmission>();
       impl_->authorities = std::make_unique<control::ConnectionAuthorities>();
+      impl_->budget = std::make_shared<resource_budget::ResourceBudgetCoordinator>();
       impl_->backend = std::make_unique<ProductionSessionBackend>(
         impl_->random,
         impl_->applications,
         *impl_->resources,
-        impl_->transport
+        impl_->transport,
+        impl_->budget
       );
       impl_->session_factory = std::make_unique<control::SessionFactory>(
         control::Config {
           .capabilities = control::Config {}.capabilities,
           .default_pairing_permissions = config.pairing_permissions,
+          .resource_budget = impl_->budget,
+          .response_cache = std::make_shared<control::ResponseCacheCoordinator>(impl_->budget),
         },
         impl_->random,
         *impl_->identity,
@@ -2782,6 +2969,7 @@ namespace lumen::protocol_v3::runtime {
       server_config.udp_port = config.udp_port;
       server_config.profile = config.profile;
       server_config.certificate = impl_->certificate;
+      server_config.resource_budget = impl_->budget;
       impl_->server = std::make_unique<quic_server::QuicServer>(
         *impl_->api,
         std::move(server_config),

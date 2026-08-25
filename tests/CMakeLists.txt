@@ -211,8 +211,12 @@ if(NOT (WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC))
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.h
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.cpp
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.h
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/operation_outcomes.cpp
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/operation_outcomes.h
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.cpp
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.h
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/resource_budget.cpp
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/resource_budget.h
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.cpp
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/start_mode_contract.h)

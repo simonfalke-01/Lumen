@@ -269,7 +269,11 @@ namespace {
     return output;
   }
 
-  bool traverses_control_session(const control::cbor::Value::Map &fields, control::SessionBackend &backend) {
+  bool traverses_control_session(
+    const control::cbor::Value::Map &fields,
+    control::SessionBackend &backend,
+    control::Config config = {}
+  ) {
     FixedRandom random;
     control::Bytes32 seed {};
     seed.fill(0x41);
@@ -288,7 +292,7 @@ namespace {
     connection.leaf_spki_sha256.fill(0x33);
     control::ControlSession session {
       connection,
-      {},
+      std::move(config),
       random,
       identity,
       authorization,
@@ -389,6 +393,29 @@ TEST(ProtocolV3StartBoundary, EncodedFrameComposesControlSessionWithProductionBa
   auto invalid_host_audio = start_fields();
   invalid_host_audio.back().second = control::cbor::Value {0U};
   expect_no_mutation(invalid_host_audio);
+}
+
+TEST(ProtocolV3StartBoundary, CacheReservationRefusalPrecedesBackendStartSideEffects) {
+  auto budget = std::make_shared<lumen::protocol_v3::resource_budget::ResourceBudgetCoordinator>();
+  auto held = budget->reserve(
+    lumen::protocol_v3::resource_budget::ResourceClass::cached_responses,
+    lumen::protocol_v3::resource_budget::class_ceilings[
+      static_cast<std::size_t>(lumen::protocol_v3::resource_budget::ResourceClass::cached_responses)
+    ]
+  );
+  ASSERT_TRUE(held.has_value());
+  control::Config config {
+    .capabilities = control::Config {}.capabilities,
+    .default_pairing_permissions = control::Config {}.default_pairing_permissions,
+    .resource_budget = budget,
+    .response_cache = std::make_shared<control::ResponseCacheCoordinator>(budget),
+  };
+  CapturingBackend backend;
+  EXPECT_THROW(
+    static_cast<void>(traverses_control_session(start_fields(), backend, std::move(config))),
+    std::runtime_error
+  );
+  EXPECT_EQ(backend.start_calls, 0);
 }
 
 TEST(ProtocolV3StartBoundary, HostileKey18ShapesFailBeforeTheProductionBackend) {

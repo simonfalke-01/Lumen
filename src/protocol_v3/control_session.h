@@ -11,6 +11,7 @@
 #include "../protocol_common/secure_buffer.h"
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <expected>
@@ -18,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -26,6 +28,112 @@ namespace lumen::protocol_v3::control_session {
   using Identifier = std::array<std::uint8_t, 16>;  ///< Protocol-v3 opaque identifier.
   using Bytes32 = std::array<std::uint8_t, 32>;  ///< Nonce, hash, public key, or secret.
   using Signature = std::array<std::uint8_t, 64>;  ///< Ed25519 signature.
+
+  /**
+   * @brief Host-wide bounded cache for byte-identical same-connection responses.
+   *
+   * Reservations are acquired before request side effects. Completed entries
+   * expire after exactly 120 seconds, local pressure retires the oldest entry
+   * at 128 entries or 1 MiB, and host pressure retires the globally oldest
+   * entry at 8 MiB. Retired request IDs are never admitted again.
+   */
+  class ResponseCacheCoordinator {
+  private:
+    struct SharedState;
+
+  public:
+    static constexpr auto ttl = std::chrono::seconds {120};
+    static constexpr std::size_t maximum_entries_per_connection = 128;
+    static constexpr std::size_t maximum_bytes_per_connection = 1U * 1024U * 1024U;
+    static constexpr std::size_t maximum_bytes_host = 8U * 1024U * 1024U;
+    static constexpr std::size_t fixed_entry_charge = 256;
+
+    enum class Decision {
+      reserved,
+      replay,
+      in_progress,
+      request_id_conflict,
+      retired,
+      resource_limit,
+    };
+
+    class Reservation {
+    public:
+      Reservation() = default;
+      ~Reservation();
+      Reservation(const Reservation &) = delete;
+      Reservation &operator=(const Reservation &) = delete;
+      Reservation(Reservation &&other) noexcept;
+      Reservation &operator=(Reservation &&other) noexcept;
+      [[nodiscard]] explicit operator bool() const noexcept;
+
+    private:
+      friend class ResponseCacheCoordinator;
+      Reservation(
+        std::shared_ptr<SharedState> state,
+        std::uint64_t connection_id,
+        std::uint64_t generation
+      ) noexcept;
+      void cancel() noexcept;
+
+      std::shared_ptr<SharedState> state_;
+      std::uint64_t connection_id_ {};
+      std::uint64_t generation_ {};
+    };
+
+    struct Admission {
+      Decision decision {Decision::resource_limit};
+      std::shared_ptr<const std::vector<std::uint8_t>> replay;
+      std::optional<Reservation> reservation;
+    };
+
+    explicit ResponseCacheCoordinator(
+      std::shared_ptr<resource_budget::ResourceBudgetCoordinator> resource_budget =
+        std::make_shared<resource_budget::ResourceBudgetCoordinator>()
+    );
+    ~ResponseCacheCoordinator();
+    ResponseCacheCoordinator(const ResponseCacheCoordinator &) = delete;
+    ResponseCacheCoordinator &operator=(const ResponseCacheCoordinator &) = delete;
+
+    Admission reserve(
+      std::uint64_t connection_id,
+      std::uint64_t request_id,
+      std::span<const std::uint8_t> request,
+      std::size_t worst_case_response_bytes,
+      quic_server::MonotonicClock::time_point now
+    );
+    bool commit(
+      Reservation &&reservation,
+      std::shared_ptr<const std::vector<std::uint8_t>> response,
+      quic_server::MonotonicClock::time_point now
+    );
+    void cancel(Reservation &&reservation) noexcept;
+    void disconnect(std::uint64_t connection_id) noexcept;
+
+  private:
+    std::shared_ptr<SharedState> state_;
+  };
+
+  /** @brief Typed cache admission signal mapped to 0x107/0x108 by the transport lane. */
+  class ResponseCacheError final: public std::runtime_error {
+  public:
+    enum class Kind {
+      resource_limit,
+      request_id_conflict,
+    };
+
+    explicit ResponseCacheError(const Kind kind):
+        std::runtime_error {
+          kind == Kind::request_id_conflict ? "v3 request id conflict" : "v3 response cache resource limit"
+        },
+        kind_ {kind} {
+    }
+
+    [[nodiscard]] Kind kind() const noexcept { return kind_; }
+
+  private:
+    Kind kind_;
+  };
 
   inline constexpr std::uint64_t browse_permission = 1U << 0;  ///< Browse applications.
   inline constexpr std::uint64_t start_permission = 1U << 1;  ///< Start a stream.
@@ -163,6 +271,7 @@ namespace lumen::protocol_v3::control_session {
     Identifier session_id {};
     cbor::Value::Map response_fields;  ///< Exact response fields 2...23; status is added by control.
     std::vector<HostControlRequest> host_requests;  ///< Required configuration requests sent after START_RESPONSE.
+    bool replay_requires_attach {};  ///< Exact prior outcome returned without rebinding authority.
   };
 
   /** @brief Allocated authenticated client control operations routed after authorization. */
@@ -230,6 +339,12 @@ namespace lumen::protocol_v3::control_session {
   struct Config {
     std::uint64_t capabilities {0x37f};  ///< Advertised protocol-v3 capabilities, including compact input state.
     std::uint64_t default_pairing_permissions {0x17};  ///< Host-approved QR grants.
+    std::shared_ptr<resource_budget::ResourceBudgetCoordinator> resource_budget {
+      std::make_shared<resource_budget::ResourceBudgetCoordinator>()
+    };  ///< Shared host-wide accounting used by control and transport.
+    std::shared_ptr<ResponseCacheCoordinator> response_cache {
+      std::make_shared<ResponseCacheCoordinator>(resource_budget)
+    };  ///< Shared by every connection created from one factory.
   };
 
   /** @brief Concrete authenticated protocol-v3 control session. */

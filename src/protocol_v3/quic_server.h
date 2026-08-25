@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "resource_budget.h"
+
 #include "../protocol_common/cbor.h"
 
 #include <array>
@@ -704,6 +706,9 @@ namespace lumen::protocol_v3::quic_server {
     std::chrono::milliseconds quality_video_lifetime {100};  ///< Finite Quality video age.
     std::chrono::milliseconds handshake_timeout {5'000};  ///< QUIC/TLS handshake deadline.
     std::chrono::milliseconds hello_timeout {5'000};  ///< Handshake-to-CLIENT_HELLO deadline.
+    std::shared_ptr<resource_budget::ResourceBudgetCoordinator> resource_budget {
+      std::make_shared<resource_budget::ResourceBudgetCoordinator>()
+    };  ///< Host-wide retained-memory admission and accounting.
   };
 
   /** @brief Caller-owned immutable application payload and scheduling metadata. */
@@ -828,6 +833,9 @@ namespace lumen::protocol_v3::quic_server {
 
     /** @brief Current queued packet count across all connections. */
     std::size_t queued_packets() const noexcept;
+
+    /** @brief Current/high-water/refusal host resource accounting. */
+    resource_budget::Snapshot resource_budget_snapshot() const noexcept;
 
     /** @brief Whether the listener is accepting. */
     bool running() const noexcept;

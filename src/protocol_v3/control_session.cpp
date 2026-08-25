@@ -13,10 +13,345 @@
 #include <map>
 #include <openssl/rand.h>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace lumen::protocol_v3::control_session {
   namespace crypto = lumen::protocol_common::crypto;
+
+  struct ResponseCacheCoordinator::SharedState {
+    struct Entry {
+      std::uint64_t request_id {};
+      std::vector<std::uint8_t> request;
+      std::shared_ptr<const std::vector<std::uint8_t>> response;
+      resource_budget::ResourceBudgetCoordinator::SharedLease budget;
+      quic_server::MonotonicClock::time_point completed_at {};
+      std::size_t charge {};
+    };
+
+    struct Pending {
+      std::uint64_t generation {};
+      std::uint64_t request_id {};
+      std::vector<std::uint8_t> request;
+      resource_budget::ResourceBudgetCoordinator::Lease budget;
+      std::size_t charge {};
+    };
+
+    struct Connection {
+      Connection() {
+        entries.reserve(ResponseCacheCoordinator::maximum_entries_per_connection);
+        pending.reserve(ResponseCacheCoordinator::maximum_entries_per_connection);
+      }
+
+      std::uint64_t retired_floor {};
+      std::size_t bytes {};
+      std::size_t pending_bytes {};
+      std::vector<Entry> entries;
+      std::vector<Pending> pending;
+    };
+
+    static std::optional<std::size_t> charge(
+      const std::size_t request_bytes,
+      const std::size_t response_bytes
+    ) noexcept {
+      if (request_bytes > SIZE_MAX - ResponseCacheCoordinator::fixed_entry_charge ||
+          response_bytes > SIZE_MAX - ResponseCacheCoordinator::fixed_entry_charge - request_bytes) {
+        return std::nullopt;
+      }
+      return ResponseCacheCoordinator::fixed_entry_charge + request_bytes + response_bytes;
+    }
+
+    explicit SharedState(std::shared_ptr<resource_budget::ResourceBudgetCoordinator> shared_budget):
+        budget {std::move(shared_budget)} {
+    }
+
+    void retire(Connection &connection, const std::vector<Entry>::iterator entry) noexcept {
+      connection.retired_floor = std::max(connection.retired_floor, entry->request_id);
+      connection.bytes -= std::min(connection.bytes, entry->charge);
+      host_bytes -= std::min(host_bytes, entry->charge);
+      connection.entries.erase(entry);
+    }
+
+    void expire(const quic_server::MonotonicClock::time_point now) noexcept {
+      for (auto &[_, connection] : connections) {
+        for (auto entry = connection.entries.begin(); entry != connection.entries.end();) {
+          if (entry->completed_at + ResponseCacheCoordinator::ttl <= now) {
+            retire(connection, entry);
+            entry = connection.entries.begin();
+          } else {
+            ++entry;
+          }
+        }
+      }
+    }
+
+    bool retire_oldest(Connection &connection) noexcept {
+      if (connection.entries.empty()) {
+        return false;
+      }
+      const auto oldest = std::ranges::min_element(
+        connection.entries,
+        {},
+        [](const auto &entry) {
+          return std::pair {entry.completed_at, entry.request_id};
+        }
+      );
+      retire(connection, oldest);
+      return true;
+    }
+
+    bool retire_oldest_host() noexcept {
+      Connection *selected_connection = nullptr;
+      std::vector<Entry>::iterator selected_entry;
+      std::optional<std::tuple<quic_server::MonotonicClock::time_point, std::uint64_t, std::uint64_t>> selected;
+      for (auto &[connection_id, connection] : connections) {
+        for (auto entry = connection.entries.begin(); entry != connection.entries.end(); ++entry) {
+          const auto candidate = std::tuple {entry->completed_at, entry->request_id, connection_id};
+          if (!selected || candidate < *selected) {
+            selected = candidate;
+            selected_connection = &connection;
+            selected_entry = entry;
+          }
+        }
+      }
+      if (selected_connection == nullptr) {
+        return false;
+      }
+      retire(*selected_connection, selected_entry);
+      return true;
+    }
+
+    void cancel(const std::uint64_t connection_id, const std::uint64_t generation) noexcept {
+      std::scoped_lock lock {mutex};
+      const auto connection = connections.find(connection_id);
+      if (connection == connections.end()) {
+        return;
+      }
+      const auto pending = std::ranges::find_if(connection->second.pending, [&](const Pending &entry) {
+        return entry.generation == generation;
+      });
+      if (pending == connection->second.pending.end()) {
+        return;
+      }
+      const auto charge = pending->charge;
+      connection->second.pending_bytes -= std::min(connection->second.pending_bytes, charge);
+      host_pending_bytes -= std::min(host_pending_bytes, charge);
+      connection->second.pending.erase(pending);
+    }
+
+    std::shared_ptr<resource_budget::ResourceBudgetCoordinator> budget;
+    std::mutex mutex;
+    std::map<std::uint64_t, Connection> connections;
+    std::size_t host_bytes {};
+    std::size_t host_pending_bytes {};
+    std::uint64_t next_generation {1};
+  };
+
+  ResponseCacheCoordinator::Reservation::Reservation(
+    std::shared_ptr<SharedState> state,
+    const std::uint64_t connection_id,
+    const std::uint64_t generation
+  ) noexcept:
+      state_ {std::move(state)},
+      connection_id_ {connection_id},
+      generation_ {generation} {
+  }
+
+  ResponseCacheCoordinator::Reservation::~Reservation() {
+    cancel();
+  }
+
+  ResponseCacheCoordinator::Reservation::Reservation(Reservation &&other) noexcept:
+      state_ {std::exchange(other.state_, {})},
+      connection_id_ {std::exchange(other.connection_id_, 0)},
+      generation_ {std::exchange(other.generation_, 0)} {
+  }
+
+  ResponseCacheCoordinator::Reservation &ResponseCacheCoordinator::Reservation::operator=(
+    Reservation &&other
+  ) noexcept {
+    if (this != &other) {
+      cancel();
+      state_ = std::exchange(other.state_, {});
+      connection_id_ = std::exchange(other.connection_id_, 0);
+      generation_ = std::exchange(other.generation_, 0);
+    }
+    return *this;
+  }
+
+  ResponseCacheCoordinator::Reservation::operator bool() const noexcept {
+    return state_ && connection_id_ != 0 && generation_ != 0;
+  }
+
+  void ResponseCacheCoordinator::Reservation::cancel() noexcept {
+    if (state_) {
+      state_->cancel(connection_id_, generation_);
+      state_.reset();
+      connection_id_ = 0;
+      generation_ = 0;
+    }
+  }
+
+  ResponseCacheCoordinator::ResponseCacheCoordinator(
+    std::shared_ptr<resource_budget::ResourceBudgetCoordinator> resource_budget
+  ):
+      state_ {std::make_shared<SharedState>(std::move(resource_budget))} {
+    if (!state_->budget) {
+      throw std::invalid_argument {"v3 response cache resource budget"};
+    }
+  }
+
+  ResponseCacheCoordinator::~ResponseCacheCoordinator() = default;
+
+  ResponseCacheCoordinator::Admission ResponseCacheCoordinator::reserve(
+    const std::uint64_t connection_id,
+    const std::uint64_t request_id,
+    const std::span<const std::uint8_t> request,
+    const std::size_t worst_case_response_bytes,
+    const quic_server::MonotonicClock::time_point now
+  ) {
+    Admission admission;
+    std::vector<std::uint8_t> retained_request {request.begin(), request.end()};
+    const auto reserved_charge = SharedState::charge(retained_request.capacity(), worst_case_response_bytes);
+    if (connection_id == 0 || request_id == 0 || request.empty() || !reserved_charge ||
+        *reserved_charge > maximum_bytes_per_connection) {
+      return admission;
+    }
+
+    std::scoped_lock lock {state_->mutex};
+    state_->expire(now);
+    auto &connection = state_->connections[connection_id];
+    if (request_id <= connection.retired_floor) {
+      admission.decision = Decision::retired;
+      return admission;
+    }
+    if (const auto retained = std::ranges::find_if(connection.entries, [&](const SharedState::Entry &entry) {
+          return entry.request_id == request_id;
+        }); retained != connection.entries.end()) {
+      admission.decision = std::ranges::equal(retained->request, request) ?
+                             Decision::replay :
+                             Decision::request_id_conflict;
+      admission.replay = admission.decision == Decision::replay ? retained->response : nullptr;
+      return admission;
+    }
+    if (const auto pending = std::ranges::find_if(connection.pending, [&](const SharedState::Pending &entry) {
+          return entry.request_id == request_id;
+        }); pending != connection.pending.end()) {
+      admission.decision = std::ranges::equal(pending->request, request) ?
+                             Decision::in_progress :
+                             Decision::request_id_conflict;
+      return admission;
+    }
+
+    while ((connection.entries.size() + connection.pending.size() >= maximum_entries_per_connection ||
+            connection.bytes + connection.pending_bytes > maximum_bytes_per_connection - *reserved_charge) &&
+           state_->retire_oldest(connection)) {
+    }
+    if (connection.entries.size() + connection.pending.size() >= maximum_entries_per_connection ||
+        connection.bytes + connection.pending_bytes > maximum_bytes_per_connection - *reserved_charge) {
+      return admission;
+    }
+    while (state_->host_bytes + state_->host_pending_bytes > maximum_bytes_host - *reserved_charge &&
+           state_->retire_oldest_host()) {
+    }
+    if (state_->host_bytes + state_->host_pending_bytes > maximum_bytes_host - *reserved_charge ||
+        state_->next_generation == UINT64_MAX) {
+      return admission;
+    }
+
+    std::optional<resource_budget::ResourceBudgetCoordinator::Lease> budget;
+    while (!(budget = state_->budget->reserve(
+               resource_budget::ResourceClass::cached_responses,
+               *reserved_charge
+             ))) {
+      if (!state_->retire_oldest_host()) {
+        return admission;
+      }
+    }
+
+    const auto generation = state_->next_generation++;
+    connection.pending.push_back(SharedState::Pending {
+      .generation = generation,
+      .request_id = request_id,
+      .request = std::move(retained_request),
+      .budget = std::move(*budget),
+      .charge = *reserved_charge,
+    });
+    connection.pending_bytes += *reserved_charge;
+    state_->host_pending_bytes += *reserved_charge;
+    admission.decision = Decision::reserved;
+    admission.reservation = Reservation {state_, connection_id, generation};
+    return admission;
+  }
+
+  bool ResponseCacheCoordinator::commit(
+    Reservation &&reservation,
+    std::shared_ptr<const std::vector<std::uint8_t>> response,
+    const quic_server::MonotonicClock::time_point now
+  ) {
+    if (!reservation || !response || response->empty() || reservation.state_ != state_) {
+      return false;
+    }
+    std::scoped_lock lock {state_->mutex};
+    const auto connection = state_->connections.find(reservation.connection_id_);
+    if (connection == state_->connections.end()) {
+      return false;
+    }
+    const auto pending = std::ranges::find_if(connection->second.pending, [&](const SharedState::Pending &entry) {
+      return entry.generation == reservation.generation_;
+    });
+    if (pending == connection->second.pending.end()) {
+      return false;
+    }
+    const auto actual_charge = SharedState::charge(pending->request.capacity(), response->capacity());
+    if (!actual_charge || *actual_charge > pending->charge) {
+      return false;
+    }
+
+    const auto reserved_charge = pending->charge;
+    const auto request_id = pending->request_id;
+    auto request = std::move(pending->request);
+    auto budget = std::move(pending->budget);
+    if (!budget.resize(*actual_charge)) {
+      return false;
+    }
+    auto shared_budget = state_->budget->adopt_shared(response, std::move(budget));
+    if (!shared_budget) {
+      return false;
+    }
+    connection->second.pending_bytes -= std::min(connection->second.pending_bytes, reserved_charge);
+    state_->host_pending_bytes -= std::min(state_->host_pending_bytes, reserved_charge);
+    connection->second.pending.erase(pending);
+    connection->second.entries.push_back(SharedState::Entry {
+      .request_id = request_id,
+      .request = std::move(request),
+      .response = std::move(response),
+      .budget = std::move(*shared_budget),
+      .completed_at = now,
+      .charge = *actual_charge,
+    });
+    connection->second.bytes += *actual_charge;
+    state_->host_bytes += *actual_charge;
+    reservation.state_.reset();
+    reservation.connection_id_ = 0;
+    reservation.generation_ = 0;
+    return true;
+  }
+
+  void ResponseCacheCoordinator::cancel(Reservation &&reservation) noexcept {
+    reservation.cancel();
+  }
+
+  void ResponseCacheCoordinator::disconnect(const std::uint64_t connection_id) noexcept {
+    std::scoped_lock lock {state_->mutex};
+    const auto connection = state_->connections.find(connection_id);
+    if (connection == state_->connections.end()) {
+      return;
+    }
+    state_->host_bytes -= std::min(state_->host_bytes, connection->second.bytes);
+    state_->host_pending_bytes -= std::min(state_->host_pending_bytes, connection->second.pending_bytes);
+    state_->connections.erase(connection);
+  }
 
   namespace {
     using Map = cbor::Value::Map;
@@ -26,6 +361,23 @@ namespace lumen::protocol_v3::control_session {
     constexpr std::string_view pair_host_domain {"lumen/3 pair host\0", 18};
     constexpr std::string_view auth_client_domain {"lumen/3 auth client\0", 20};
     constexpr std::string_view auth_host_domain {"lumen/3 auth host\0", 18};
+
+    std::size_t worst_case_response_bytes(
+      const std::uint16_t message_type,
+      const std::size_t request_bytes
+    ) noexcept {
+      switch (message_type) {
+        case 0x0100:  // START_RESPONSE may carry codec initialization.
+        case 0x0200:  // APPLICATION_LIST_RESPONSE may carry a bounded page.
+          return request_bytes + ResponseCacheCoordinator::fixed_entry_charge <
+                  ResponseCacheCoordinator::maximum_bytes_per_connection ?
+                   ResponseCacheCoordinator::maximum_bytes_per_connection - request_bytes -
+                     ResponseCacheCoordinator::fixed_entry_charge :
+                   0;
+        default:
+          return 64U * 1024U;
+      }
+    }
 
     template<std::size_t Size>
     bool nonzero(const std::array<std::uint8_t, Size> &value) noexcept {
@@ -135,6 +487,7 @@ namespace lumen::protocol_v3::control_session {
         throw std::runtime_error {"v3 control encode"};
       }
       std::vector<std::uint8_t> output {'U', 'L', 'C', '3', 3, flags};
+      output.reserve(quic_server::control_header_bytes + payload.bytes.size());
       const auto append = [&output](const std::uint64_t value, std::size_t count) {
         while (count-- > 0) {
           output.push_back(static_cast<std::uint8_t>(value >> (count * 8U)));
@@ -248,11 +601,6 @@ namespace lumen::protocol_v3::control_session {
       closed,
     };
 
-    struct CachedResponse {
-      std::vector<std::uint8_t> request;
-      std::shared_ptr<const std::vector<std::uint8_t>> response;
-    };
-
     struct OutstandingHostRequest {
       std::uint16_t request_type {};
       std::uint16_t acknowledgement_type {};
@@ -284,7 +632,7 @@ namespace lumen::protocol_v3::control_session {
         backend {session_backend},
         datagram_maximum {connection.maximum_datagram_bytes} {
       spki = connection.leaf_spki_sha256;
-      if (!nonzero(spki) || identity.host_id() != derived_id(identity.public_key())) {
+      if (!config.response_cache || !nonzero(spki) || identity.host_id() != derived_id(identity.public_key())) {
         throw std::invalid_argument {"invalid v3 host identity"};
       }
     }
@@ -296,16 +644,6 @@ namespace lumen::protocol_v3::control_session {
     ) {
       auto encoded = std::make_shared<const std::vector<std::uint8_t>>(
         encode_frame(type, frame.request_id, 1, fields)
-      );
-      if (cache.size() >= 128) {
-        throw std::runtime_error {"v3 response cache"};
-      }
-      cache.emplace(
-        frame.request_id,
-        CachedResponse {
-          .request = {frame.bytes.begin(), frame.bytes.end()},
-          .response = encoded,
-        }
       );
       return encoded;
     }
@@ -322,45 +660,78 @@ namespace lumen::protocol_v3::control_session {
       if (frame.flags != 0 || frame.request_id % 2 == 0) {
         throw std::runtime_error {"invalid v3 client request authority"};
       }
-      if (const auto duplicate = cache.find(frame.request_id); duplicate != cache.end()) {
-        if (!std::ranges::equal(duplicate->second.request, frame.bytes)) {
-          throw std::runtime_error {"v3 request id conflict"};
-        }
-        return {duplicate->second.response};
+      auto admission = config.response_cache->reserve(
+        connection.connection_id,
+        frame.request_id,
+        frame.bytes,
+        worst_case_response_bytes(frame.message_type, frame.bytes.size()),
+        quic_server::MonotonicClock::now()
+      );
+      switch (admission.decision) {
+        case ResponseCacheCoordinator::Decision::replay:
+          return {std::move(admission.replay)};
+        case ResponseCacheCoordinator::Decision::in_progress:
+          throw std::runtime_error {"v3 request already in progress"};
+        case ResponseCacheCoordinator::Decision::request_id_conflict:
+        case ResponseCacheCoordinator::Decision::retired:
+          throw ResponseCacheError {ResponseCacheError::Kind::request_id_conflict};
+        case ResponseCacheCoordinator::Decision::resource_limit:
+          throw ResponseCacheError {ResponseCacheError::Kind::resource_limit};
+        case ResponseCacheCoordinator::Decision::reserved:
+          break;
       }
+      if (!admission.reservation) {
+        throw std::runtime_error {"v3 response cache reservation"};
+      }
+      auto reservation = std::move(*admission.reservation);
       const auto expected = last_request_id == 0 ? 1 : last_request_id + 2;
       if (frame.request_id != expected || frame.request_id < last_request_id) {
         throw std::runtime_error {"v3 request sequence"};
       }
       last_request_id = frame.request_id;
       const auto fields = decode_map(frame);
-      switch (state) {
-        case State::hello:
-          return {hello(frame, fields)};
-        case State::authorization:
-          if (pairing) {
-            return {pair(frame, fields)};
-          }
-          return {authenticate(frame, fields)};
-        case State::ready:
-          if (frame.message_type == 0x0100) {
-            return start(frame, fields);
-          }
-          return authenticated_control(frame, fields);
-        case State::streaming:
-          if (frame.message_type == 0x0100 && client_record && !backend.owned_session(*client_record)) {
-            session_id.reset();
-            outstanding_host_requests.clear();
-            completed_host_acknowledgements.clear();
-            media_started = false;
-            state = State::ready;
-            return start(frame, fields);
-          }
-          return authenticated_control(frame, fields);
-        case State::closed:
-          throw std::runtime_error {"unsupported v3 request state"};
+      std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> output;
+      try {
+        switch (state) {
+          case State::hello:
+            output = {hello(frame, fields)};
+            break;
+          case State::authorization:
+            output = pairing ? std::vector {pair(frame, fields)} :
+                               std::vector {authenticate(frame, fields)};
+            break;
+          case State::ready:
+            output = frame.message_type == 0x0100 ? start(frame, fields) :
+                                                    authenticated_control(frame, fields);
+            break;
+          case State::streaming:
+            if (frame.message_type == 0x0100 && client_record && !backend.owned_session(*client_record)) {
+              session_id.reset();
+              outstanding_host_requests.clear();
+              completed_host_acknowledgements.clear();
+              media_started = false;
+              state = State::ready;
+              output = start(frame, fields);
+            } else {
+              output = authenticated_control(frame, fields);
+            }
+            break;
+          case State::closed:
+            throw std::runtime_error {"unsupported v3 request state"};
+        }
+        if (output.empty() || !output.front() ||
+            !config.response_cache->commit(
+              std::move(reservation),
+              output.front(),
+              quic_server::MonotonicClock::now()
+            )) {
+          throw ResponseCacheError {ResponseCacheError::Kind::resource_limit};
+        }
+        return output;
+      } catch (...) {
+        config.response_cache->cancel(std::move(reservation));
+        throw;
       }
-      throw std::runtime_error {"unreachable v3 state"};
     }
 
     std::shared_ptr<const std::vector<std::uint8_t>> hello(
@@ -609,7 +980,9 @@ namespace lumen::protocol_v3::control_session {
         return {response(frame, 0x0101, std::move(failed))};
       }
       if (!nonzero(result->session_id) || !exact_keys(result->response_fields, 2, 23) ||
-          result->host_requests.size() < 2 || result->host_requests.size() > 3 ||
+          (!result->replay_requires_attach &&
+           (result->host_requests.size() < 2 || result->host_requests.size() > 3)) ||
+          (result->replay_requires_attach && !result->host_requests.empty()) ||
           outstanding_host_requests.size() + result->host_requests.size() > 32) {
         throw std::runtime_error {"v3 START failed"};
       }
@@ -631,6 +1004,11 @@ namespace lumen::protocol_v3::control_session {
       std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> output;
       output.reserve(1 + result->host_requests.size());
       output.push_back(response(frame, 0x0101, std::move(response_fields)));
+      if (result->replay_requires_attach) {
+        session_id.reset();
+        state = State::ready;
+        return output;
+      }
       const auto deadline = quic_server::MonotonicClock::now() + std::chrono::seconds {3};
       for (auto &request : result->host_requests) {
         if ((request.message_type != 0x0140 && request.message_type != 0x0142 && request.message_type != 0x0144) ||
@@ -846,7 +1224,7 @@ namespace lumen::protocol_v3::control_session {
       }
       session_id.reset();
       client_record.reset();
-      cache.clear();
+      config.response_cache->disconnect(connection.connection_id);
       outstanding_host_requests.clear();
       completed_host_acknowledgements.clear();
       pending_bulk_transfers.clear();
@@ -897,7 +1275,6 @@ namespace lumen::protocol_v3::control_session {
     bool media_started {};
     std::vector<std::uint8_t> client_hello;
     std::vector<std::uint8_t> server_hello;
-    std::map<std::uint64_t, CachedResponse> cache;
     std::map<std::uint64_t, OutstandingHostRequest> outstanding_host_requests;
     std::map<std::uint64_t, std::vector<std::uint8_t>> completed_host_acknowledgements;
     std::vector<quic_server::BulkTransfer> pending_bulk_transfers;
