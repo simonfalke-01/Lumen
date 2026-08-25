@@ -41,6 +41,7 @@ namespace lumen::protocol_v3::quic_server {
     constexpr auto shutdown_connection_replaced = static_cast<std::uint64_t>(ApplicationCloseCode::connection_replaced);
     constexpr auto shutdown_abuse_limit = static_cast<std::uint64_t>(ApplicationCloseCode::abuse_limit);
     constexpr auto force_close_send_drain_timeout = std::chrono::milliseconds {250};
+    constexpr auto application_deadline_transport_grace = std::chrono::milliseconds {250};
     constexpr auto listener_stop_timeout = std::chrono::seconds {5};
     constexpr auto congestion_sample_interval = std::chrono::milliseconds {5};
     constexpr auto rtt_telemetry_interval = std::chrono::milliseconds {250};
@@ -48,18 +49,31 @@ namespace lumen::protocol_v3::quic_server {
     constexpr std::uint64_t maximum_reported_rtt_microseconds = 1'000'000;
     constexpr std::size_t rtt_telemetry_payload_bytes = 24;
     constexpr std::size_t maximum_packet_bytes = 16U * 1024U * 1024U;
-    constexpr std::array<Lane, 7> all_lanes {
+    constexpr std::array<Lane, 5> all_lanes {
       Lane::control,
       Lane::input_edge,
       Lane::audio,
-      Lane::microphone,
-      Lane::key_config,
       Lane::delta_video,
       Lane::telemetry,
     };
 
     std::size_t lane_index(const Lane lane) noexcept {
-      return static_cast<std::size_t>(lane);
+      switch (lane) {
+        case Lane::control:
+          return 0;
+        case Lane::input_edge:
+          return 1;
+        case Lane::audio:
+          return 2;
+        case Lane::delta_video:
+          return 3;
+        case Lane::telemetry:
+          return 4;
+        case Lane::microphone:
+        case Lane::key_config:
+          return all_lanes.size();
+      }
+      return all_lanes.size();
     }
 
     bool is_latency(const Profile profile) noexcept {
@@ -87,7 +101,7 @@ namespace lumen::protocol_v3::quic_server {
              config.quality_video_lifetime.count() > 0 &&
              config.quality_video_lifetime <= std::chrono::seconds {1} &&
              config.handshake_timeout == std::chrono::seconds {5} &&
-             config.hello_timeout == std::chrono::seconds {5};
+             config.hello_timeout == std::chrono::seconds {2};
     }
 
     std::uint16_t read_be16(const std::span<const std::uint8_t> bytes, const std::size_t offset) noexcept {
@@ -764,6 +778,7 @@ namespace lumen::protocol_v3::quic_server {
       std::uint64_t prior_smoothed_rtt_microseconds {};
       std::uint64_t rtt_variation_microseconds {};
       MonotonicClock::time_point connected_at {};
+      MonotonicClock::time_point application_deadline {};
       AbuseTracker abuse;
     };
 
@@ -779,10 +794,20 @@ namespace lumen::protocol_v3::quic_server {
         session_factory_ {session_factory},
         observer_ {observer},
         congestion_observer_ {congestion_observer},
-        teardown_thread_ {[this](const std::stop_token stop) { teardown_sessions(stop); }} {
+        teardown_thread_ {[this](const std::stop_token stop) {
+          teardown_sessions(stop);
+        }},
+        deadline_thread_ {[this](const std::stop_token stop) {
+          enforce_application_deadlines(stop);
+        }} {
     }
 
     ~Impl() {
+      deadline_thread_.request_stop();
+      deadline_condition_.notify_all();
+      if (deadline_thread_.joinable()) {
+        deadline_thread_.join();
+      }
       force_close_all();
       teardown_thread_.request_stop();
       teardown_condition_.notify_all();
@@ -818,7 +843,7 @@ namespace lumen::protocol_v3::quic_server {
         1,
         0,
         static_cast<std::uint64_t>(config_.handshake_timeout.count()),
-        static_cast<std::uint64_t>(config_.hello_timeout.count()),
+        static_cast<std::uint64_t>(config_.handshake_timeout.count()),
         configuration
       );
       if (!accepted(status) || configuration == invalid_handle) {
@@ -941,6 +966,10 @@ namespace lumen::protocol_v3::quic_server {
       if (!packet.bytes || packet.bytes->empty() || packet.bytes->size() > maximum_packet_bytes) {
         return EnqueueResult::invalid_packet;
       }
+      const auto queue_index = lane_index(packet.lane);
+      if (queue_index >= connection.queues.size()) {
+        return EnqueueResult::invalid_packet;
+      }
       std::uint64_t object_id = 0;
       bool independently_decodable = false;
       if (delivery_for(packet.lane) == Delivery::datagram) {
@@ -979,7 +1008,7 @@ namespace lumen::protocol_v3::quic_server {
 
       const auto now = MonotonicClock::now();
       if (packet.deadline == MonotonicClock::time_point {}) {
-        if (packet.lane == Lane::audio || packet.lane == Lane::microphone) {
+        if (packet.lane == Lane::audio) {
           packet.deadline = now + config_.audio_lifetime;
         } else if (packet.lane == Lane::delta_video) {
           packet.deadline = now + (is_latency(connection.profile) ?
@@ -994,7 +1023,7 @@ namespace lumen::protocol_v3::quic_server {
       }
 
       drop_expired_locked(connection, now);
-      auto &lane_queue = connection.queues[lane_index(packet.lane)];
+      auto &lane_queue = connection.queues[queue_index];
       if (is_latency(connection.profile) && (packet.replaceable || independently_decodable)) {
         for (auto it = lane_queue.begin(); it != lane_queue.end();) {
           const bool same_replaceable_lane =
@@ -1482,13 +1511,17 @@ namespace lumen::protocol_v3::quic_server {
           }
           if (!accepted(api_.connection_set_idle_timeout(
                 connection.handle,
-                static_cast<std::uint64_t>(config_.hello_timeout.count())
+                static_cast<std::uint64_t>(
+                  (config_.hello_timeout + application_deadline_transport_grace).count()
+                )
               ))) {
             begin_shutdown_locked(connection, shutdown_internal_error);
             return ApiStatus::aborted;
           }
           connection.connected = true;
           connection.connected_at = MonotonicClock::now();
+          connection.application_deadline = connection.connected_at + config_.hello_timeout;
+          deadline_condition_.notify_all();
           emit_locked(Event::Kind::connection_connected, &connection, 0, Lane::control, 0);
           drain_locked(connection_owner, lock);
           return ApiStatus::success;
@@ -1505,7 +1538,6 @@ namespace lumen::protocol_v3::quic_server {
           for (const auto lane : {
                  Lane::input_edge,
                  Lane::audio,
-                 Lane::microphone,
                  Lane::delta_video,
                  Lane::telemetry,
                }) {
@@ -1607,10 +1639,22 @@ namespace lumen::protocol_v3::quic_server {
               try {
                 lock.unlock();
                 session->datagram(*parsed);
+                const auto application_deadline = session->application_deadline();
                 lock.lock();
                 if (!connections_.contains(id) || connection.closing) {
                   return ApiStatus::aborted;
                 }
+                connection.application_deadline = application_deadline;
+                deadline_condition_.notify_all();
+              } catch (const ApplicationCloseError &error) {
+                if (!lock.owns_lock()) {
+                  lock.lock();
+                }
+                if (!connections_.contains(id) || connection.closing) {
+                  return ApiStatus::aborted;
+                }
+                begin_shutdown_locked(connection, static_cast<std::uint64_t>(error.code()));
+                return ApiStatus::aborted;
               } catch (const std::runtime_error &) {
                 if (!lock.owns_lock()) {
                   lock.lock();
@@ -1850,9 +1894,15 @@ namespace lumen::protocol_v3::quic_server {
                     view.begin(),
                     view.begin() + 4,
                     std::array<std::uint8_t, 4> {'U', 'L', 'C', '3'}.begin()
-                  ) ||
-                  view[4] != 3) {
+                  )) {
                 begin_shutdown_locked(connection, shutdown_protocol_violation);
+                return ApiStatus::aborted;
+              }
+              if (view[4] != 3) {
+                begin_shutdown_locked(
+                  connection,
+                  static_cast<std::uint64_t>(ApplicationCloseCode::version_or_alpn)
+                );
                 return ApiStatus::aborted;
               }
               const auto payload = read_be32(view, 16);
@@ -1951,10 +2001,13 @@ namespace lumen::protocol_v3::quic_server {
               }
               try {
                 const auto session = connection.session;
+                connection.application_deadline = session->begin_control(*parsed);
+                deadline_condition_.notify_all();
                 lock.unlock();
                 auto responses = session->control(*parsed);
                 auto bulk_transfers = session->take_bulk_transfers();
                 const auto idle_timeout = session->idle_timeout_ms();
+                const auto application_deadline = session->application_deadline();
                 const auto active_session = session->active_session_id();
                 lock.lock();
                 if (!connections_.contains(id) || connection.closing || connection.session != session) {
@@ -1967,7 +2020,16 @@ namespace lumen::protocol_v3::quic_server {
                   connection.last_rtt_telemetry_at = {};
                 }
                 connection.active_session_id = active_session;
-                if (!accepted(api_.connection_set_idle_timeout(connection.handle, idle_timeout))) {
+                connection.application_deadline = application_deadline;
+                deadline_condition_.notify_all();
+                const auto transport_idle_timeout = idle_timeout >
+                                                        UINT64_MAX - application_deadline_transport_grace.count() ?
+                                                      UINT64_MAX :
+                                                      idle_timeout + application_deadline_transport_grace.count();
+                if (!accepted(api_.connection_set_idle_timeout(
+                      connection.handle,
+                      transport_idle_timeout
+                    ))) {
                   begin_shutdown_locked(connection, shutdown_internal_error);
                   return ApiStatus::aborted;
                 }
@@ -1995,7 +2057,10 @@ namespace lumen::protocol_v3::quic_server {
                   if (packet.bytes->size() > config_.maximum_queued_bytes -
                                                std::min(connection.queued_bytes, config_.maximum_queued_bytes) ||
                       connection.queued_packets >= config_.maximum_queued_packets) {
-                    begin_shutdown_locked(connection, shutdown_internal_error);
+                    begin_shutdown_locked(
+                      connection,
+                      static_cast<std::uint64_t>(ApplicationCloseCode::resource_limit)
+                    );
                     return ApiStatus::aborted;
                   }
                   auto budget = config_.resource_budget->reserve_shared(
@@ -2018,11 +2083,17 @@ namespace lumen::protocol_v3::quic_server {
                                                maximum_bulk_buffered_bytes + 1;
                   if (!valid_bulk_transfer(transfer) ||
                       !std::ranges::contains(response_request_ids, transfer.request_id) ||
-                      connection.pending_bulk.contains(transfer.request_id) ||
-                      connection.bulk_transfer_count >= maximum_bulk_streams ||
+                      connection.pending_bulk.contains(transfer.request_id)) {
+                    begin_shutdown_locked(connection, shutdown_internal_error);
+                    return ApiStatus::aborted;
+                  }
+                  if (connection.bulk_transfer_count >= maximum_bulk_streams ||
                       payload_bytes > maximum_bulk_buffered_bytes -
                                         std::min(connection.bulk_buffered_bytes, maximum_bulk_buffered_bytes)) {
-                    begin_shutdown_locked(connection, shutdown_internal_error);
+                    begin_shutdown_locked(
+                      connection,
+                      static_cast<std::uint64_t>(ApplicationCloseCode::resource_limit)
+                    );
                     return ApiStatus::aborted;
                   }
                   auto budget = config_.resource_budget->reserve_shared(
@@ -2042,6 +2113,15 @@ namespace lumen::protocol_v3::quic_server {
                                                                 .budget = std::move(*budget),
                                                               });
                 }
+              } catch (const ApplicationCloseError &error) {
+                if (!lock.owns_lock()) {
+                  lock.lock();
+                }
+                if (!connections_.contains(id) || connection.closing) {
+                  return ApiStatus::aborted;
+                }
+                begin_shutdown_locked(connection, static_cast<std::uint64_t>(error.code()));
+                return ApiStatus::aborted;
               } catch (...) {
                 if (!lock.owns_lock()) {
                   lock.lock();
@@ -2463,10 +2543,10 @@ namespace lumen::protocol_v3::quic_server {
 
     std::optional<Lane> next_lane_locked(const Connection &connection) const {
       const auto quality_priority = [](const Lane lane) {
-        if (lane == Lane::control || lane == Lane::key_config) {
+        if (lane == Lane::control) {
           return std::uint8_t {0};
         }
-        if (lane == Lane::input_edge || lane == Lane::audio || lane == Lane::microphone) {
+        if (lane == Lane::input_edge || lane == Lane::audio) {
           return std::uint8_t {1};
         }
         return std::uint8_t {2};
@@ -2796,6 +2876,8 @@ namespace lumen::protocol_v3::quic_server {
         return;
       }
       connection.closing = true;
+      connection.application_deadline = {};
+      deadline_condition_.notify_all();
       for (auto &queue : connection.queues) {
         queue.clear();
       }
@@ -3008,6 +3090,43 @@ namespace lumen::protocol_v3::quic_server {
       }
     }
 
+    void enforce_application_deadlines(const std::stop_token stop) noexcept {
+      std::unique_lock lock {mutex_};
+      while (!stop.stop_requested()) {
+        auto earliest = MonotonicClock::time_point::max();
+        for (const auto &[_, connection] : connections_) {
+          if (!connection->closing &&
+              connection->application_deadline != MonotonicClock::time_point {}) {
+            earliest = std::min(earliest, connection->application_deadline);
+          }
+        }
+        if (earliest == MonotonicClock::time_point::max()) {
+          deadline_condition_.wait(lock, [&] {
+            return stop.stop_requested() || std::ranges::any_of(connections_, [](const auto &entry) {
+                     return !entry.second->closing &&
+                            entry.second->application_deadline != MonotonicClock::time_point {};
+                   });
+          });
+          continue;
+        }
+        deadline_condition_.wait_until(lock, earliest);
+        if (stop.stop_requested()) {
+          return;
+        }
+        const auto now = MonotonicClock::now();
+        for (auto &[_, connection] : connections_) {
+          if (!connection->closing &&
+              connection->application_deadline != MonotonicClock::time_point {} &&
+              connection->application_deadline <= now) {
+            begin_shutdown_locked(
+              *connection,
+              static_cast<std::uint64_t>(ApplicationCloseCode::phase_timeout)
+            );
+          }
+        }
+      }
+    }
+
     void emit_locked(
       const Event::Kind kind,
       const Connection *connection,
@@ -3044,6 +3163,7 @@ namespace lumen::protocol_v3::quic_server {
     mutable std::mutex mutex_;
     std::condition_variable listener_stop_condition_;
     std::condition_variable send_drain_condition_;
+    std::condition_variable deadline_condition_;
     Handle registration_ {invalid_handle};
     Handle configuration_ {invalid_handle};
     Handle listener_ {invalid_handle};
@@ -3062,6 +3182,7 @@ namespace lumen::protocol_v3::quic_server {
     std::condition_variable teardown_condition_;
     std::deque<std::shared_ptr<ControlSessionV3>> teardown_sessions_;
     std::jthread teardown_thread_;
+    std::jthread deadline_thread_;
   };
 
   QuicServer::QuicServer(

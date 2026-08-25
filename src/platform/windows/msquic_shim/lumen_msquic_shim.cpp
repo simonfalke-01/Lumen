@@ -1286,7 +1286,7 @@ extern "C" {
     lumen_msquic_handle connection,
     uint64_t timeout_ms
   ) {
-    if (!s) {
+    if (!s || timeout_ms == 0) {
       return LUMEN_MSQUIC_INVALID_STATE;
     }
     QUIC_SETTINGS settings {};

@@ -5,9 +5,8 @@
 
 #pragma once
 
-#include "resource_budget.h"
-
 #include "../protocol_common/cbor.h"
+#include "resource_budget.h"
 
 #include <array>
 #include <chrono>
@@ -19,8 +18,10 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace lumen::protocol_v3::quic_server {
@@ -55,11 +56,13 @@ namespace lumen::protocol_v3::quic_server {
     control = 0,  ///< ULC3 control; the client-opened bidirectional stream.
     input_edge = 1,  ///< ULM3 input state/edge or acknowledgement.
     audio = 2,  ///< Time-bounded host audio; DATAGRAM.
-    microphone = 3,  ///< Time-bounded client microphone media; DATAGRAM.
-    key_config = 4,  ///< Reliable ULC3 codec/configuration semantics.
+    microphone = 3,  ///< Client-to-host microphone semantic; never an outbound scheduler lane.
+    key_config = 4,  ///< Reliable config semantic carried by the control lane, not a separate queue.
     delta_video = 5,  ///< Replaceable non-reference video media; DATAGRAM.
     telemetry = 6,  ///< Replaceable authenticated transport telemetry; DATAGRAM.
   };
+
+  inline constexpr std::size_t scheduled_lane_count = 5;  ///< Lanes with real host-side producers.
 
   /** @brief Wire delivery contract for one semantic lane. */
   enum class Delivery {
@@ -113,10 +116,32 @@ namespace lumen::protocol_v3::quic_server {
   /** @brief Protocol-v3 QUIC application close codes from the wire contract. */
   enum class ApplicationCloseCode : std::uint64_t {
     malformed = 0x100,  ///< Invalid fixed header, CBOR, length, or pre-auth/sessionless data lane.
+    version_or_alpn = 0x101,  ///< Wrong protocol version or ALPN namespace.
+    authentication_failed = 0x102,  ///< Collapsed pairing or client-authentication failure.
+    unauthorized = 0x103,  ///< Authenticated principal lacks permission or live authority.
+    phase_timeout = 0x104,  ///< A pinned protocol phase deadline expired.
     connection_replaced = 0x105,  ///< A newer authenticated authority generation replaced this connection.
     abuse_limit = 0x106,  ///< A bounded malformed-record or invalid-DATAGRAM rate threshold was exceeded.
+    resource_limit = 0x107,  ///< A hard allocation, stream, request, or retained-state cap was reached.
+    request_id_conflict = 0x108,  ///< A request ID was reused with different bytes or retired semantics.
     internal_failure = 0x109,  ///< A fail-closed internal invariant failed.
     normal_shutdown = 0x10A,  ///< The server explicitly shut down the connection.
+  };
+
+  /** @brief Typed application failure propagated from the control/session boundary. */
+  class ApplicationCloseError final: public std::runtime_error {
+  public:
+    ApplicationCloseError(ApplicationCloseCode code, std::string message):
+        std::runtime_error {std::move(message)},
+        code_ {code} {
+    }
+
+    [[nodiscard]] ApplicationCloseCode code() const noexcept {
+      return code_;
+    }
+
+  private:
+    ApplicationCloseCode code_;
   };
 
   /**
@@ -601,6 +626,12 @@ namespace lumen::protocol_v3::quic_server {
       const ControlFrame &frame
     ) = 0;
 
+    /** @brief Pin the current request deadline before entering synchronous application work. */
+    virtual MonotonicClock::time_point begin_control(const ControlFrame &frame) noexcept = 0;
+
+    /** @brief Return the absolute application deadline that malformed traffic must not extend. */
+    virtual MonotonicClock::time_point application_deadline() const noexcept = 0;
+
     /** @brief Route one validated callback-scoped client-to-host ULM3 record synchronously. */
     virtual void datagram(const DatagramRecord &record) = 0;
 
@@ -610,7 +641,7 @@ namespace lumen::protocol_v3::quic_server {
     /** @brief Return whether signed application authorization completed. */
     virtual bool authenticated() const noexcept = 0;
 
-    /** @brief Current application-phase idle deadline; zero disables transport idle timeout. */
+    /** @brief Current nonzero application deadline expressed as a transport idle fallback. */
     virtual std::uint64_t idle_timeout_ms() const noexcept = 0;
 
     /** @brief Apply the current path's bounded semantic DATAGRAM maximum. */
@@ -705,7 +736,7 @@ namespace lumen::protocol_v3::quic_server {
     std::chrono::milliseconds video_lifetime {25};  ///< Default latency delta-video lifetime.
     std::chrono::milliseconds quality_video_lifetime {100};  ///< Finite Quality video age.
     std::chrono::milliseconds handshake_timeout {5'000};  ///< QUIC/TLS handshake deadline.
-    std::chrono::milliseconds hello_timeout {5'000};  ///< Handshake-to-CLIENT_HELLO deadline.
+    std::chrono::milliseconds hello_timeout {2'000};  ///< Handshake-to-CLIENT_HELLO deadline.
     std::shared_ptr<resource_budget::ResourceBudgetCoordinator> resource_budget {
       std::make_shared<resource_budget::ResourceBudgetCoordinator>()
     };  ///< Host-wide retained-memory admission and accounting.

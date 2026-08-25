@@ -5,6 +5,7 @@
 #include "../tests_common.h"
 
 #include <src/network.h>
+#include <src/platform/common.h>
 
 struct MdnsInstanceNameTest: BaseTest, testing::WithParamInterface<std::tuple<std::string, std::string>> {};
 
@@ -26,6 +27,42 @@ INSTANTIATE_TEST_SUITE_P(
     std::make_tuple(std::string(128, 'a'), std::string(63, 'a'))
   )
 );
+
+TEST(MdnsServiceDescriptorTest, AcceptsOnlyExactLegacyOrProtocolV3Records) {
+  EXPECT_TRUE(platf::publish::valid_service({
+    .type = platf::SERVICE_TYPE,
+    .port = 47989,
+  }));
+  const platf::publish::service_t modern {
+    .type = "_lumen-v3._udp",
+    .port = 48030,
+    .txt = {
+      {"v", "3"},
+      {"id", "000102030405060708090a0b0c0d0e0f"},
+      {"port", "48030"},
+      {"caps", "000000000000037f"},
+    },
+  };
+  EXPECT_TRUE(platf::publish::valid_service(modern));
+  EXPECT_TRUE(platf::publish::valid_services({
+    {.type = platf::SERVICE_TYPE, .port = 47989},
+    modern,
+  }));
+  EXPECT_FALSE(platf::publish::valid_services({modern, modern}));
+
+  auto invalid = modern;
+  invalid.txt[1].second[0] = 'A';
+  EXPECT_FALSE(platf::publish::valid_service(invalid));
+  invalid = modern;
+  invalid.txt[2].second = "48031";
+  EXPECT_FALSE(platf::publish::valid_service(invalid));
+  invalid = modern;
+  invalid.txt[3].second.pop_back();
+  EXPECT_FALSE(platf::publish::valid_service(invalid));
+  invalid = modern;
+  invalid.type = "_nvstream._udp";
+  EXPECT_FALSE(platf::publish::valid_service(invalid));
+}
 
 /**
  * @brief Test fixture for bind_address tests with setup/teardown

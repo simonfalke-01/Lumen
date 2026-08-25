@@ -7,7 +7,9 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <optional>
 
 #ifdef __APPLE__
   #include <mach-o/dyld.h>
@@ -24,6 +26,7 @@
 #include "httpcommon.h"
 #include "logging.h"
 #include "main.h"
+#include "network.h"
 #include "nvhttp.h"
 #include "process.h"
 #include "protocol_v3/runtime.h"
@@ -424,11 +427,6 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  std::unique_ptr<platf::deinit_t> mDNS;
-  auto sync_mDNS = std::async(std::launch::async, [&mDNS]() {
-    mDNS = platf::publish::start();
-  });
-
   std::unique_ptr<platf::deinit_t> upnp_unmap;
   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
     upnp_unmap = upnp::start();
@@ -440,6 +438,13 @@ int main(int argc, char *argv[]) {
   }
 
   const auto listener_policy = config::listener_startup_policy(config::protocol_v3);
+  std::vector<platf::publish::service_t> mdns_services;
+  if (listener_policy.start_legacy) {
+    mdns_services.push_back({
+      .type = platf::SERVICE_TYPE,
+      .port = net::map_port(nvhttp::PORT_HTTP),
+    });
+  }
 
 #if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
   std::unique_ptr<lumen::protocol_v3::runtime::ProtocolV3Service> protocol_v3_service;
@@ -474,9 +479,31 @@ int main(int argc, char *argv[]) {
                        << "; continuing with Moonlight compatibility listeners"sv;
     } else {
       BOOST_LOG(info) << "Protocol v3 listening on UDP port "sv << config::protocol_v3.port;
+      if (const auto advertisement = protocol_v3_service->discovery_advertisement()) {
+        mdns_services.push_back({
+          .type = advertisement->service_type,
+          .port = config::protocol_v3.port,
+          .txt = {
+            {"v", advertisement->version},
+            {"id", advertisement->host_id},
+            {"port", advertisement->port},
+            {"caps", advertisement->capabilities},
+          },
+        });
+      } else {
+        BOOST_LOG(error) << "Protocol v3 is live but its strict discovery descriptor is unavailable"sv;
+      }
     }
   }
 #endif
+
+  std::unique_ptr<platf::deinit_t> mdns;
+  std::optional<std::future<void>> sync_mdns;
+  if (!mdns_services.empty()) {
+    sync_mdns.emplace(std::async(std::launch::async, [&mdns, services = std::move(mdns_services)]() mutable {
+      mdns = platf::publish::start(std::move(services));
+    }));
+  }
 
   std::optional<std::jthread> httpThread;
   std::optional<std::jthread> rtspThread;
@@ -512,6 +539,10 @@ int main(int argc, char *argv[]) {
 
   mainThreadLoop(shutdown_event);
 
+  if (sync_mdns) {
+    sync_mdns->wait();
+  }
+  mdns.reset();
 #if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
   if (protocol_v3_service) {
     protocol_v3_service->stop();

@@ -401,6 +401,7 @@ namespace platf::publish {
   client_t client;  ///< Avahi client used to register the Sunshine service.
 
   ptr_t<char> name;  ///< Current service name, updated when Avahi reports a collision.
+  std::vector<service_t> services;  ///< Exact legacy/modern records committed in one entry group.
 
   /**
    * @brief Create or update the Avahi service entry group.
@@ -458,35 +459,60 @@ namespace platf::publish {
     if (avahi::entry_group_is_empty(group)) {
       BOOST_LOG(info) << "Adding avahi service "sv << name.get();
 
-      ret = avahi::entry_group_add_service(
-        group,
-        avahi::IF_UNSPEC,
-        avahi::PROTO_UNSPEC,
-        avahi::PublishFlags(0),
-        name.get(),
-        platf::SERVICE_TYPE,
-        nullptr,
-        nullptr,
-        net::map_port(nvhttp::PORT_HTTP),
-        nullptr
-      );
-
-      if (ret < 0) {
-        if (ret == avahi::ERR_COLLISION) {
-          // A service name collision with a local service happened. Let's pick a new name
-          name.reset(avahi::alternative_service_name(name.get()));
-          BOOST_LOG(info) << "Service name collision, renaming service to "sv << name.get();
-
-          avahi::entry_group_reset(group);
-
-          create_services(c);
-
-          fg.disable();
-          return;
+      for (const auto &descriptor : services) {
+        if (descriptor.txt.empty()) {
+          ret = avahi::entry_group_add_service(
+            group,
+            avahi::IF_UNSPEC,
+            avahi::PROTO_UNSPEC,
+            avahi::PublishFlags(0),
+            name.get(),
+            descriptor.type.c_str(),
+            nullptr,
+            nullptr,
+            descriptor.port,
+            nullptr
+          );
+        } else {
+          std::array<std::string, 4> txt;
+          for (std::size_t index = 0; index < txt.size(); ++index) {
+            txt[index] = descriptor.txt[index].first + '=' + descriptor.txt[index].second;
+          }
+          ret = avahi::entry_group_add_service(
+            group,
+            avahi::IF_UNSPEC,
+            avahi::PROTO_UNSPEC,
+            avahi::PublishFlags(0),
+            name.get(),
+            descriptor.type.c_str(),
+            nullptr,
+            nullptr,
+            descriptor.port,
+            txt[0].c_str(),
+            txt[1].c_str(),
+            txt[2].c_str(),
+            txt[3].c_str(),
+            nullptr
+          );
         }
 
-        BOOST_LOG(error) << "Failed to add "sv << platf::SERVICE_TYPE << " service: "sv << avahi::strerror(ret);
-        return;
+        if (ret < 0) {
+          if (ret == avahi::ERR_COLLISION) {
+            // A service name collision with a local service happened. Let's pick a new name
+            name.reset(avahi::alternative_service_name(name.get()));
+            BOOST_LOG(info) << "Service name collision, renaming service to "sv << name.get();
+
+            avahi::entry_group_reset(group);
+
+            create_services(c);
+
+            fg.disable();
+            return;
+          }
+
+          BOOST_LOG(error) << "Failed to add "sv << descriptor.type << " service: "sv << avahi::strerror(ret);
+          return;
+        }
       }
 
       ret = avahi::entry_group_commit(group);
@@ -551,10 +577,24 @@ namespace platf::publish {
       if (poll_thread.joinable()) {
         poll_thread.join();
       }
+      services.clear();
     }
   };
 
   [[nodiscard]] std::unique_ptr<::platf::deinit_t> start() {
+    std::vector<service_t> requested;
+    requested.push_back({
+      .type = platf::SERVICE_TYPE,
+      .port = net::map_port(nvhttp::PORT_HTTP),
+    });
+    return start(std::move(requested));
+  }
+
+  [[nodiscard]] std::unique_ptr<::platf::deinit_t> start(std::vector<service_t> requested) {
+    if (!valid_services(requested)) {
+      BOOST_LOG(error) << "Refusing invalid Lumen mDNS service set"sv;
+      return nullptr;
+    }
     if (avahi::init_client()) {
       return nullptr;
     }
@@ -571,6 +611,7 @@ namespace platf::publish {
 
     auto instance_name = net::mdns_instance_name(platf::get_host_name());
     name.reset(avahi::strdup(instance_name.c_str()));
+    services = std::move(requested);
 
     client.reset(
       avahi::client_new(avahi::simple_poll_get(poll.get()), avahi::ClientFlags(0), client_callback, nullptr, &avhi_error)

@@ -31,6 +31,7 @@ extern "C" {
 #include "src/httpcommon.h"
 #include "src/network.h"
 #include "src/nvhttp.h"
+#include "src/protocol_v3/control_session.h"
 #include "src/rtsp.h"
 #include "src/stream_policy.h"
 #include "src/utility.h"
@@ -748,6 +749,20 @@ TEST(VanillaMoonlightCompatibility, V3StartupFailurePreservesConfiguredLegacyLis
   policy = config::listener_startup_policy(settings);
   EXPECT_FALSE(policy.start_legacy);
   EXPECT_TRUE(policy.v3_failure_is_fatal);
+}
+
+TEST(VanillaMoonlightCompatibility, UndefinedV3PairingPermissionBitsAreMigratedOutOfConfig) {
+  const auto saved = config::protocol_v3;
+  auto restore = util::fail_guard([&]() {
+    config::protocol_v3 = saved;
+  });
+
+  config::apply_config_for_test("protocol_v3_pairing_permissions = 255\n");
+  EXPECT_EQ(lumen::protocol_v3::control_session::defined_permission_mask, 0x3fU);
+  EXPECT_EQ(
+    config::protocol_v3.pairing_permissions,
+    lumen::protocol_v3::control_session::defined_permission_mask
+  );
 }
 
 TEST(VanillaMoonlightCompatibility, BuildsWithoutV3NormalizeMigratedV3OnlyConfiguration) {

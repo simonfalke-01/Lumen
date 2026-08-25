@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <thread>
+#include <vector>
 
 // platform includes
 #include <dns_sd.h>
@@ -28,35 +29,44 @@ namespace platf::publish {
       }
     };
 
-    /** @brief This class encapsulates the polling and deinitialization of our connection with
-     *         the mDNS service. Implements the `::platf::deinit_t` interface.
-     */
-    class deinit_t: public ::platf::deinit_t, std::unique_ptr<DNSServiceRef, ServiceRefDeleter> {
+    using service_ref_t = std::unique_ptr<DNSServiceRef, ServiceRefDeleter>;
+
+    /** @brief Poll and own the configured legacy/modern DNS-SD registrations together. */
+    class deinit_t: public ::platf::deinit_t {
     public:
-      /** @brief Construct deinit_t object.
-       *
-       * Create a thread that will use `select(2)` to wait for a response from the mDNS service.
-       * The thread will give up if an error is received or if `_stopRequested` becomes true.
-       *
-       * @param serviceRef An initialized reference to the mDNS service.
-       */
-      deinit_t(DNSServiceRef serviceRef):
-          unique_ptr(serviceRef) {
-        _thread = std::jthread {[serviceRef, &_stopRequested = std::as_const(_stopRequested)]() {
+      explicit deinit_t(std::vector<DNSServiceRef> service_refs) {
+        std::vector<DNSServiceRef> raw_refs;
+        raw_refs.reserve(service_refs.size());
+        service_refs_.reserve(service_refs.size());
+        for (const auto service_ref : service_refs) {
+          raw_refs.push_back(service_ref);
+          service_refs_.emplace_back(service_ref);
+        }
+        thread_ = std::jthread {[raw_refs = std::move(raw_refs), &stop_requested = std::as_const(stop_requested_)]() {
           platf::set_thread_name("publish::mdns");
-          const auto socket = DNSServiceRefSockFD(serviceRef);
-          while (!_stopRequested) {
+          while (!stop_requested) {
             auto fdset = fd_set {};
             FD_ZERO(&fdset);
-            FD_SET(socket, &fdset);
+            auto maximum_socket = -1;
+            for (const auto service_ref : raw_refs) {
+              const auto socket = DNSServiceRefSockFD(service_ref);
+              if (socket >= 0) {
+                FD_SET(socket, &fdset);
+                maximum_socket = std::max(maximum_socket, socket);
+              }
+            }
             auto timeout = timeval {.tv_sec = 3, .tv_usec = 0};  // 3 second timeout
-            const auto ready = select(socket + 1, &fdset, nullptr, nullptr, &timeout);
+            const auto ready = select(maximum_socket + 1, &fdset, nullptr, nullptr, &timeout);
             if (ready == -1) {
               BOOST_LOG(error) << "Failed to obtain response from DNS service."sv;
               break;
             } else if (ready != 0) {
-              DNSServiceProcessResult(serviceRef);
-              break;
+              for (const auto service_ref : raw_refs) {
+                const auto socket = DNSServiceRefSockFD(service_ref);
+                if (socket >= 0 && FD_ISSET(socket, &fdset)) {
+                  static_cast<void>(DNSServiceProcessResult(service_ref));
+                }
+              }
             }
           }
         }};
@@ -66,17 +76,31 @@ namespace platf::publish {
        *         connection to it.
        */
       ~deinit_t() override {
-        _stopRequested = true;
-        _thread.join();
+        stop_requested_ = true;
+        thread_.join();
       }
 
       deinit_t(const deinit_t &) = delete;
       deinit_t &operator=(const deinit_t &) = delete;
 
     private:
-      std::jthread _thread;  ///< Thread for polling the mDNS service for a response.
-      std::atomic<bool> _stopRequested = false;  ///< Whether to stop polling the mDNS service.
+      std::vector<service_ref_t> service_refs_;  ///< Owned registrations deallocated after polling stops.
+      std::jthread thread_;  ///< Thread for polling mDNS registration responses.
+      std::atomic<bool> stop_requested_ = false;  ///< Whether to stop polling.
     };
+
+    std::vector<std::uint8_t> encode_txt(const service_t &service) {
+      std::vector<std::uint8_t> encoded;
+      for (const auto &[key, value] : service.txt) {
+        const auto entry = key + '=' + value;
+        if (entry.size() > 255) {
+          return {};
+        }
+        encoded.push_back(static_cast<std::uint8_t>(entry.size()));
+        encoded.insert(encoded.end(), entry.begin(), entry.end());
+      }
+      return encoded;
+    }
 
     /** @brief Callback that will be invoked when the mDNS service finishes registering our service.
      *  @param errorCode Describes whether the registration was successful.
@@ -102,25 +126,47 @@ namespace platf::publish {
    *         deconstructed, will deregister the service.
    */
   [[nodiscard]] std::unique_ptr<::platf::deinit_t> start() {
-    auto serviceRef = DNSServiceRef {};
-    const auto status = DNSServiceRegister(
-      &serviceRef,
-      0,  // flags
-      0,  // interfaceIndex
-      nullptr,  // name
-      platf::SERVICE_TYPE,
-      nullptr,  // domain
-      nullptr,  // host
-      htons(net::map_port(nvhttp::PORT_HTTP)),
-      0,  // txtLen
-      nullptr,  // txtRecord
-      registrationCallback,
-      nullptr  // context
-    );
-    if (status != kDNSServiceErr_NoError) {
-      BOOST_LOG(error) << "Failed immediately to register DNS service: Error "sv << status;
+    std::vector<service_t> services;
+    services.push_back({
+      .type = platf::SERVICE_TYPE,
+      .port = net::map_port(nvhttp::PORT_HTTP),
+    });
+    return start(std::move(services));
+  }
+
+  [[nodiscard]] std::unique_ptr<::platf::deinit_t> start(std::vector<service_t> services) {
+    if (!valid_services(services)) {
+      BOOST_LOG(error) << "Refusing invalid Lumen mDNS service set"sv;
       return nullptr;
     }
-    return std::make_unique<deinit_t>(serviceRef);
+    std::vector<DNSServiceRef> service_refs;
+    service_refs.reserve(services.size());
+    for (const auto &service : services) {
+      auto service_ref = DNSServiceRef {};
+      const auto txt = encode_txt(service);
+      const auto status = DNSServiceRegister(
+        &service_ref,
+        0,
+        0,
+        nullptr,
+        service.type.c_str(),
+        nullptr,
+        nullptr,
+        htons(service.port),
+        static_cast<std::uint16_t>(txt.size()),
+        txt.empty() ? nullptr : txt.data(),
+        registrationCallback,
+        nullptr
+      );
+      if (status != kDNSServiceErr_NoError) {
+        BOOST_LOG(error) << "Failed immediately to register "sv << service.type << ": Error "sv << status;
+        for (const auto registered : service_refs) {
+          DNSServiceRefDeallocate(registered);
+        }
+        return nullptr;
+      }
+      service_refs.push_back(service_ref);
+    }
+    return std::make_unique<deinit_t>(std::move(service_refs));
   }
 }  // namespace platf::publish
