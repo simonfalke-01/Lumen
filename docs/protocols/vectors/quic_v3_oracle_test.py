@@ -11,6 +11,10 @@ import quic_v3_oracle as oracle
 
 
 class QuicV3OracleTest(unittest.TestCase):
+    @staticmethod
+    def artifact_bytes(fixture: dict, name: str) -> bytes:
+        return bytes.fromhex(fixture["artifacts"][name]["hex"])
+
     def test_checked_in_fixture_is_exact(self) -> None:
         generated = oracle.build_fixture()
         checked_in = json.loads(oracle.FIXTURE.read_text(encoding="utf-8"))
@@ -117,9 +121,7 @@ class QuicV3OracleTest(unittest.TestCase):
 
     def test_transport_telemetry_binds_generation_and_bounds_rtt_fields(self) -> None:
         fixture = oracle.build_fixture()
-        record = bytes.fromhex(
-            fixture["artifacts"]["route_transport_telemetry"]["hex"]
-        )
+        record = bytes.fromhex(fixture["artifacts"]["route_transport_telemetry"]["hex"])
         route, sequence, object_id, payload = oracle.validate_envelope(
             record, "h2c", bytes(range(0xC0, 0xD0)), 1152
         )
@@ -135,6 +137,187 @@ class QuicV3OracleTest(unittest.TestCase):
 
         false_start = oracle.control(0x0100, 5, {**fields, 18: False})
         self.assertIs(oracle.validate_control(false_start, "c2h")[18], False)
+
+    def test_compact_input_capability_is_server_advertised_only(self) -> None:
+        fixture = oracle.build_fixture()
+        artifacts = fixture["artifacts"]
+        for name in ("client_hello", "pair_recovery_client_hello", "auth_client_hello"):
+            fields = oracle.validate_control(
+                bytes.fromhex(artifacts[name]["hex"]), "c2h"
+            )
+            self.assertEqual(fields[4], 0x17F)
+            self.assertEqual(fields[4] & 0x200, 0)
+        for name in ("server_hello", "pair_recovery_server_hello", "auth_server_hello"):
+            fields = oracle.validate_control(
+                bytes.fromhex(artifacts[name]["hex"]), "h2c"
+            )
+            self.assertEqual(fields[6], 0x37F)
+            self.assertEqual(fields[6] & 0x200, 0x200)
+        invitation = self.artifact_bytes(fixture, "invitation_bytes")
+        self.assertEqual(int.from_bytes(invitation[160:168], "big"), 0x37F)
+
+    def test_input_formats_pin_compatibility_and_exact_payload_boundaries(self) -> None:
+        fixture = oracle.build_fixture()
+        artifacts = fixture["artifacts"]
+        self.assertEqual(
+            artifacts["route_input_state"]["sha256"],
+            "21705cbacc63ffeb6a5aa8fab3250e4b4c5d0e6014d6a0e86867d4921124b64e",
+        )
+        self.assertEqual(
+            artifacts["input_format2_compatibility"]["hex"],
+            artifacts["route_input_state"]["hex"],
+        )
+        self.assertEqual(
+            artifacts["input_format2_compatibility"]["sha256"],
+            artifacts["route_input_state"]["sha256"],
+        )
+
+        cases = {
+            "input_format2_15_controllers_1104": (2, 15, 0, 1_104, 64),
+            "input_format3_16_controllers_1040": (3, 16, 0, 1_040, 56),
+            "input_format3_16_controllers_two_edges_1104": (3, 16, 2, 1_104, 56),
+            "input_format3_touch_after_edge_ack_1072": (3, 16, 0, 1_072, 56),
+        }
+        session = bytes(range(0xC0, 0xD0))
+        for name, (
+            state_format,
+            controllers,
+            edges,
+            payload_bytes,
+            stride,
+        ) in cases.items():
+            record = bytes.fromhex(artifacts[name]["hex"])
+            route, _, _, payload = oracle.validate_envelope(
+                record, "c2h", session, 1_152
+            )
+            self.assertEqual(route, "input-state")
+            self.assertEqual(len(payload), payload_bytes)
+            state_length, edge_count, wrapper_format = struct.unpack(
+                ">HHH", payload[16:22]
+            )
+            self.assertEqual((edge_count, wrapper_format), (edges, state_format))
+            state = payload[32 : 32 + state_length]
+            self.assertEqual(state[84], controllers)
+            self.assertEqual(state[87], 3 if state_format == 3 else 0)
+            self.assertEqual(
+                state_length,
+                112 + controllers * stride + (32 if name.endswith("1072") else 0),
+            )
+            oracle.validate_input_state(state, state_format)
+
+    def test_compact_input_preserves_sixteen_heterogeneous_controller_records(
+        self,
+    ) -> None:
+        fixture = oracle.build_fixture()
+        record = self.artifact_bytes(fixture, "input_format3_16_controllers_1040")
+        payload = record[44:]
+        state_length = int.from_bytes(payload[16:18], "big")
+        state = payload[32 : 32 + state_length]
+        self.assertEqual(int.from_bytes(state[80:84], "big"), 0xFFFF)
+        records = [state[112 + index * 56 : 168 + index * 56] for index in range(16)]
+        self.assertEqual([record[0] for record in records], list(range(16)))
+        self.assertEqual(
+            [record[1] for record in records],
+            [1 + index % 5 for index in range(16)],
+        )
+        self.assertEqual(len({record[2:56] for record in records}), 16)
+
+    def test_input_budget_is_edges_before_dirty_touches_without_oversize(self) -> None:
+        fixture = oracle.build_fixture()
+        contract = fixture["input_contract"]
+        self.assertEqual(
+            contract["budget_order"],
+            [
+                "all-active-controllers",
+                "largest-contiguous-edge-prefix",
+                "dirty-touch-updates",
+            ],
+        )
+        edge_record = self.artifact_bytes(
+            fixture, "input_format3_16_controllers_two_edges_1104"
+        )[44:]
+        edge_state_length, edge_count = struct.unpack(">HH", edge_record[16:20])
+        self.assertEqual((edge_count, edge_record[32 + 85]), (2, 0))
+        first_edge = 32 + edge_state_length
+        self.assertEqual(
+            [
+                int.from_bytes(
+                    edge_record[first_edge + index * 32 : first_edge + index * 32 + 8],
+                    "big",
+                )
+                for index in range(2)
+            ],
+            [1, 2],
+        )
+
+        touch_record = self.artifact_bytes(
+            fixture, "input_format3_touch_after_edge_ack_1072"
+        )[44:]
+        _, touch_edge_count = struct.unpack(">HH", touch_record[16:20])
+        self.assertEqual((touch_edge_count, touch_record[32 + 85]), (0, 1))
+        self.assertEqual(len(edge_record), 1_104)
+        self.assertEqual(len(touch_record), 1_072)
+
+    def test_old_host_degrades_nonterminally_without_advancing_state(self) -> None:
+        contract = oracle.build_fixture()["input_contract"]
+        negotiation = contract["negotiation"]
+        self.assertEqual(negotiation["selected_format_without_0x200"], 2)
+        self.assertEqual(negotiation["selected_format_with_0x200"], 3)
+        old_host = next(
+            case
+            for case in contract["cases"]
+            if case["id"] == "old-host-15-controller-pending-edge"
+        )
+        self.assertEqual(old_host["would_be_payload_bytes"], 1_136)
+        self.assertFalse(old_host["emitted"])
+        self.assertFalse(old_host["state_sequence_advanced"])
+        self.assertEqual(old_host["outcome"], "nonterminal-degradation")
+
+    def test_rebind_generation_rejects_stale_and_accepts_current_feedback(self) -> None:
+        fixture = oracle.build_fixture()
+        contract = fixture["input_contract"]["generation_rebind"]
+        self.assertEqual(
+            (contract["first_generation"], contract["rebound_generation"]), (1, 2)
+        )
+        self.assertEqual(
+            (
+                contract["stale_feedback_generation"],
+                contract["accepted_feedback_generation"],
+            ),
+            (1, 2),
+        )
+        state_record = self.artifact_bytes(fixture, contract["state_artifact"])
+        _, _, _, state_payload = oracle.validate_envelope(
+            state_record, "c2h", bytes(range(0xC0, 0xD0)), 1_152
+        )
+        state_length = int.from_bytes(state_payload[16:18], "big")
+        arrival = state_payload[32 + state_length :]
+        self.assertEqual((arrival[16], arrival[17]), (4, 0))
+        self.assertEqual(int.from_bytes(arrival[:8], "big"), 17)
+        feedback = self.artifact_bytes(fixture, contract["feedback_artifact"])
+        _, _, _, feedback_payload = oracle.validate_envelope(
+            feedback, "h2c", bytes(range(0xC0, 0xD0)), 1_152
+        )
+        self.assertEqual(struct.unpack(">II", feedback_payload[:8]), (1, 2))
+
+    def test_input_hostiles_cover_format_cap_and_edge_prefix_fail_closed(self) -> None:
+        fixture = oracle.build_fixture()
+        hostiles = {item["name"]: item for item in fixture["hostile"]}
+        required = {
+            "input-format3-wrapper-marker2",
+            "input-format2-wrapper-marker3",
+            "input-edge-format3-rejected",
+            "input-format2-15-plus-edge-1136",
+            "input-format3-payload-1109",
+            "input-format3-noncontiguous-edge-prefix",
+            "input-format3-touch-before-edge-budget",
+        }
+        self.assertLessEqual(required, set(hostiles))
+        oversized = bytes.fromhex(
+            hostiles["input-format3-payload-1109"]["candidate_hex"]
+        )
+        self.assertEqual(len(oversized) - 44, 1_109)
+        self.assertEqual(hostiles["input-format3-payload-1109"]["expected"], "reject")
 
     def test_invitation_and_bulk_headers_are_exact(self) -> None:
         fixture = oracle.build_fixture()

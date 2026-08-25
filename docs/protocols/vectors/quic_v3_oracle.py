@@ -31,11 +31,20 @@ DOMAIN_AUTH_HOST = b"lumen/3 auth host\0"
 ENVELOPE_SIZE = 44
 MAX_CONTROL_PAYLOAD = 1_048_576
 INITIAL_MAX_SEMANTIC_DATAGRAM = 1_152
+MAX_SEMANTIC_PAYLOAD = INITIAL_MAX_SEMANTIC_DATAGRAM - ENVELOPE_SIZE
 MAX_VIDEO_FRAME = 67_108_864
 MAX_VIDEO_FRAGMENTS = 65_535
 VIDEO_FLAGS = 0x3F
 INVITATION_HEADER_SIZE = 172
 BULK_HEADER_SIZE = 64
+CLIENT_INPUT_CAPABILITIES = 0x17F
+COMPACT_INPUT_CAPABILITY = 0x200
+SERVER_INPUT_CAPABILITIES = CLIENT_INPUT_CAPABILITIES | COMPACT_INPUT_CAPABILITY
+INPUT_STATE_HEADER_SIZE = 112
+INPUT_EDGE_SIZE = 32
+INPUT_TOUCH_SIZE = 32
+INPUT_PEN_SIZE = 40
+INPUT_CONTROLLER_SIZE = {2: 64, 3: 56}
 
 
 def _head(major: int, value: int) -> bytes:
@@ -263,22 +272,153 @@ ROUTES = {
 }
 
 
+def validate_input_state(state: bytes, state_format: int) -> None:
+    """Validate the shared state-format-2/3 block independently of product code."""
+    if (
+        state_format not in INPUT_CONTROLLER_SIZE
+        or len(state) < INPUT_STATE_HEADER_SIZE
+    ):
+        raise ValueError("input-state format/header")
+    flags, mouse_buttons = struct.unpack(">II", state[:8])
+    absolute, relative = bool(flags & 1), bool(flags & 2)
+    if flags & ~0x07 or absolute == relative or mouse_buttons & ~0x1F:
+        raise ValueError("input-state flags")
+    if relative and state[40:48] != bytes(8):
+        raise ValueError("input-state relative pointer")
+    if absolute and state[8:24] != bytes(16):
+        raise ValueError("input-state absolute pointer")
+    marker = state[87]
+    if marker != (3 if state_format == 3 else 0):
+        raise ValueError("input-state marker/format mismatch")
+    reserved_start = 88 if state_format == 3 else 87
+    if state[reserved_start:INPUT_STATE_HEADER_SIZE] != bytes(
+        INPUT_STATE_HEADER_SIZE - reserved_start
+    ):
+        raise ValueError("input-state header reserved")
+
+    controller_count, touch_count, pen_count = state[84:87]
+    if controller_count > 16 or touch_count > 16 or pen_count > 4:
+        raise ValueError("input-state record count")
+    controller_size = INPUT_CONTROLLER_SIZE[state_format]
+    expected = (
+        INPUT_STATE_HEADER_SIZE
+        + controller_count * controller_size
+        + touch_count * INPUT_TOUCH_SIZE
+        + pen_count * INPUT_PEN_SIZE
+    )
+    if len(state) != expected:
+        raise ValueError("input-state block length")
+
+    expected_mask = 0
+    previous_controller = -1
+    for index in range(controller_count):
+        offset = INPUT_STATE_HEADER_SIZE + index * controller_size
+        semantic = state[offset : offset + 56]
+        (
+            controller_id,
+            controller_type,
+            capabilities,
+            buttons,
+            _left_trigger,
+            _right_trigger,
+            _left_x,
+            _left_y,
+            _right_x,
+            _right_y,
+            _gyro_x,
+            _gyro_y,
+            _gyro_z,
+            _accel_x,
+            _accel_y,
+            _accel_z,
+            battery,
+            battery_state,
+            reserved,
+            supported_buttons,
+        ) = struct.unpack(">BBHQHHhhhhiiiiiiHBBI", semantic)
+        if (
+            controller_id > 15
+            or controller_id <= previous_controller
+            or not 1 <= controller_type <= 5
+            or capabilities & ~0x01FF
+            or buttons & ~0x003FFFFF
+            or (battery != 0xFFFF and battery > 10_000)
+            or battery_state > 5
+            or reserved != 0
+            or supported_buttons & ~0x003FFFFF
+        ):
+            raise ValueError("input-state controller")
+        if state_format == 2 and state[offset + 56 : offset + 64] != bytes(8):
+            raise ValueError("input-state format-2 controller reserved")
+        previous_controller = controller_id
+        expected_mask |= 1 << controller_id
+    if int.from_bytes(state[80:84], "big") != expected_mask:
+        raise ValueError("input-state controller mask")
+
+    touch_start = INPUT_STATE_HEADER_SIZE + controller_count * controller_size
+    touch_ids = set()
+    for index in range(touch_count):
+        offset = touch_start + index * INPUT_TOUCH_SIZE
+        pointer_id = int.from_bytes(state[offset : offset + 4], "big")
+        event_type, contact_flags = state[offset + 4 : offset + 6]
+        rotation = int.from_bytes(state[offset + 20 : offset + 22], "big", signed=True)
+        if (
+            pointer_id in touch_ids
+            or event_type not in (1, 2, 3)
+            or contact_flags & ~1
+            or not -18_000 <= rotation <= 18_000
+            or state[offset + 22 : offset + 24] != bytes(2)
+            or state[offset + 28 : offset + 32] != bytes(4)
+        ):
+            raise ValueError("input-state touch")
+        touch_ids.add(pointer_id)
+
+
 def validate_payload(
     route: str, payload: bytes, flags: int, sequence: int, object_id: int
 ) -> None:
     """Validate the exact phase-one kind-specific binary prefix and bounds."""
+    if len(payload) > MAX_SEMANTIC_PAYLOAD:
+        raise ValueError("semantic payload limit")
     if route == "input-state":
         if len(payload) < 32:
             raise ValueError("input-state prefix")
         _, _, state_length, edge_count, state_format, edge_format, reserved = (
             struct.unpack(">QQHHHHQ", payload[:32])
         )
-        if state_format != 2 or edge_format != 2 or edge_count > 64 or reserved != 0:
+        if (
+            state_format not in INPUT_CONTROLLER_SIZE
+            or edge_format != 2
+            or edge_count > 64
+            or reserved != 0
+        ):
             raise ValueError("input-state fields")
-        if state_length < 112 or len(payload) != 32 + state_length + 32 * edge_count:
+        if (
+            state_length < INPUT_STATE_HEADER_SIZE
+            or len(payload) != 32 + state_length + INPUT_EDGE_SIZE * edge_count
+        ):
             raise ValueError("input-state length")
+        validate_input_state(payload[32 : 32 + state_length], state_format)
+        newest_edge = struct.unpack(">Q", payload[8:16])[0]
+        previous_edge = None
+        for index in range(edge_count):
+            offset = 32 + state_length + index * INPUT_EDGE_SIZE
+            edge_id, _, kind, device, _, _, _, edge_reserved = struct.unpack(
+                ">QQBBHiII", payload[offset : offset + INPUT_EDGE_SIZE]
+            )
+            if (
+                edge_id == 0
+                or (previous_edge is not None and edge_id != previous_edge + 1)
+                or kind not in (1, 2, 3, 4, 5, 6)
+                or (kind in (3, 4) and device >= 16)
+                or edge_reserved != 0
+            ):
+                raise ValueError("input-state edge")
+            previous_edge = edge_id
+        if previous_edge is not None and newest_edge != previous_edge:
+            raise ValueError("input-state newest edge")
         if object_id == 0:
-            raise ValueError("input generation")
+            raise ValueError("input state sequence")
     elif route == "input-ack":
         if len(payload) != 48 or struct.unpack(">Q", payload[40:48])[0] != 0:
             raise ValueError("input-ack layout")
@@ -301,7 +441,9 @@ def validate_payload(
         ):
             raise ValueError("controller-feedback generation/route")
         expected_length = {1: 4, 2: 4, 3: 4, 4: 3, 5: 24}[command]
-        if value_length != expected_length or payload[12 + value_length : 36] != bytes(24 - value_length):
+        if value_length != expected_length or payload[12 + value_length : 36] != bytes(
+            24 - value_length
+        ):
             raise ValueError("controller-feedback value/reserved")
         if command == 3:
             motion_type, reserved, report_rate = struct.unpack(">BBH", payload[12:16])
@@ -471,7 +613,14 @@ def invitation(
         + host_id
         + spki_hash
         + host_public
-        + struct.pack(">QQQHH", 1_700_000_000, 1_700_000_300, 0x17F, len(hostname), 0)
+        + struct.pack(
+            ">QQQHH",
+            1_700_000_000,
+            1_700_000_300,
+            SERVER_INPUT_CAPABILITIES,
+            len(hostname),
+            0,
+        )
         + hostname
     )
 
@@ -549,6 +698,150 @@ def _artifact(category: str, value: bytes) -> dict:
     return {"category": category, "hex": _hex(value), "sha256": _digest(value)}
 
 
+def input_controller(controller_id: int, state_format: int, variant: int = 0) -> bytes:
+    """Build one heterogeneous controller record with identical semantic bytes 0...55."""
+    if not 0 <= controller_id < 16 or state_format not in INPUT_CONTROLLER_SIZE:
+        raise ValueError("input controller arguments")
+    controller_type = 1 + (controller_id + variant) % 5
+    capabilities = 1 << ((controller_id + variant) % 9)
+    buttons = 1 << ((controller_id * 3 + variant) % 22)
+    supported_buttons = 1 << ((controller_id * 5 + variant) % 22)
+    semantic = struct.pack(
+        ">BBHQHHhhhhiiiiiiHBBI",
+        controller_id,
+        controller_type,
+        capabilities,
+        buttons,
+        0x1000 + controller_id,
+        0x2000 + controller_id,
+        -1000 - controller_id,
+        1000 + controller_id,
+        -2000 - controller_id,
+        2000 + controller_id,
+        0x00010000 + controller_id,
+        -0x00010000 - controller_id,
+        0x00008000 + controller_id,
+        0x00020000 + controller_id,
+        -0x00008000 - controller_id,
+        0x00004000 + controller_id,
+        0xFFFF if controller_id % 2 else 5_000 + controller_id,
+        controller_id % 6,
+        0,
+        supported_buttons,
+    )
+    if len(semantic) != 56:
+        raise AssertionError("controller semantic record size")
+    return semantic + (bytes(8) if state_format == 2 else b"")
+
+
+def input_touch(pointer_id: int, event_type: int = 1) -> bytes:
+    """Build one valid 32-byte dirty-touch state record."""
+    return struct.pack(
+        ">IBBHIIHHHHII",
+        pointer_id,
+        event_type,
+        1,
+        0x8000,
+        0x40000000,
+        0xC0000000,
+        10,
+        8,
+        0,
+        0,
+        0,
+        0,
+    )
+
+
+def input_state_block(
+    state_format: int,
+    controller_ids: tuple[int, ...],
+    touch_ids: tuple[int, ...] = (),
+    *,
+    initial: bool = True,
+    controller_variant: int = 0,
+) -> bytes:
+    """Build the exact common header plus format-specific controller/touch records."""
+    if state_format not in INPUT_CONTROLLER_SIZE:
+        raise ValueError("input state format")
+    if tuple(sorted(set(controller_ids))) != controller_ids or len(controller_ids) > 16:
+        raise ValueError("input controller order/count")
+    flags = 2 | (4 if initial else 0)
+    controller_mask = sum(1 << controller_id for controller_id in controller_ids)
+    state = (
+        struct.pack(">IIqqqqII", flags, 0, 0, 0, 0, 0, 0, 0)
+        + bytes(32)
+        + struct.pack(
+            ">IBBBB",
+            controller_mask,
+            len(controller_ids),
+            len(touch_ids),
+            0,
+            3 if state_format == 3 else 0,
+        )
+        + bytes(24)
+        + b"".join(
+            input_controller(controller_id, state_format, controller_variant)
+            for controller_id in controller_ids
+        )
+        + b"".join(input_touch(pointer_id) for pointer_id in touch_ids)
+    )
+    validate_input_state(state, state_format)
+    return state
+
+
+def input_edge(
+    edge_id: int,
+    *,
+    kind: int = 1,
+    device: int = 0,
+    code: int = 4,
+    value: int = 1,
+    auxiliary: int = 0,
+) -> bytes:
+    """Build one exact edge-format-2 record."""
+    return struct.pack(
+        ">QQBBHiII",
+        edge_id,
+        2_000_000 + edge_id,
+        kind,
+        device,
+        code,
+        value,
+        auxiliary,
+        0,
+    )
+
+
+def input_state_payload(
+    state_format: int,
+    state: bytes,
+    edges: tuple[bytes, ...] = (),
+    *,
+    sample_time: int = 2_000_000,
+    last_acknowledged_edge: int = 0,
+) -> bytes:
+    """Build one input wrapper whose edges are the largest contiguous represented prefix."""
+    newest_edge = (
+        int.from_bytes(edges[-1][:8], "big") if edges else last_acknowledged_edge
+    )
+    payload = (
+        struct.pack(
+            ">QQHHHHQ",
+            sample_time,
+            newest_edge,
+            len(state),
+            len(edges),
+            state_format,
+            2,
+            0,
+        )
+        + state
+        + b"".join(edges)
+    )
+    return payload
+
+
 def build_fixture() -> dict:
     client_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
     host_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
@@ -591,7 +884,7 @@ def build_fixture() -> dict:
             1: 3,
             2: 3,
             3: pair_client_nonce,
-            4: 0x17F,
+            4: CLIENT_INPUT_CAPABILITIES,
             5: [1, 2],
             6: None,
             7: invitation_id,
@@ -607,7 +900,7 @@ def build_fixture() -> dict:
             3: host_id,
             4: host_public,
             5: spki_hash,
-            6: 0x17F,
+            6: SERVER_INPUT_CAPABILITIES,
             7: INITIAL_MAX_SEMANTIC_DATAGRAM,
             8: pair_attempt_id,
         },
@@ -663,7 +956,7 @@ def build_fixture() -> dict:
             1: 3,
             2: 3,
             3: recovery_client_nonce,
-            4: 0x17F,
+            4: CLIENT_INPUT_CAPABILITIES,
             5: [1, 2],
             6: None,
             7: invitation_id,
@@ -679,7 +972,7 @@ def build_fixture() -> dict:
             3: host_id,
             4: host_public,
             5: spki_hash,
-            6: 0x17F,
+            6: SERVER_INPUT_CAPABILITIES,
             7: INITIAL_MAX_SEMANTIC_DATAGRAM,
             8: pair_attempt_id,
         },
@@ -719,7 +1012,7 @@ def build_fixture() -> dict:
             1: 3,
             2: 3,
             3: auth_client_nonce,
-            4: 0x17F,
+            4: CLIENT_INPUT_CAPABILITIES,
             5: [1, 2],
             6: client_id,
             7: None,
@@ -735,7 +1028,7 @@ def build_fixture() -> dict:
             3: host_id,
             4: host_public,
             5: spki_hash,
-            6: 0x17F,
+            6: SERVER_INPUT_CAPABILITIES,
             7: INITIAL_MAX_SEMANTIC_DATAGRAM,
             8: connection_attempt_id,
         },
@@ -949,16 +1242,44 @@ def build_fixture() -> dict:
 
     controller_capabilities = 0x0179
     supported_buttons = 0x104000
-    controller = (
-        struct.pack(">BBHQHHhhhhiiiiiiHBBI", 0, 2, controller_capabilities, 0x004000,
-                    0x2000, 0x4000, -1000, 1000, -2000, 2000,
-                    0x00018000, -0x00008000, 0x00004000,
-                    0x00010000, 0x00020000, -0x00010000,
-                    7500, 2, 0, supported_buttons)
-        + bytes(8)
+    controller = struct.pack(
+        ">BBHQHHhhhhiiiiiiHBBI",
+        0,
+        2,
+        controller_capabilities,
+        0x004000,
+        0x2000,
+        0x4000,
+        -1000,
+        1000,
+        -2000,
+        2000,
+        0x00018000,
+        -0x00008000,
+        0x00004000,
+        0x00010000,
+        0x00020000,
+        -0x00010000,
+        7500,
+        2,
+        0,
+        supported_buttons,
+    ) + bytes(8)
+    controller_touch = struct.pack(
+        ">IBBHIIHHHHII",
+        0x01000001,
+        3,
+        1,
+        0x8000,
+        0x40000000,
+        0xC0000000,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     )
-    controller_touch = struct.pack(">IBBHIIHHHHII", 0x01000001, 3, 1, 0x8000,
-                                   0x40000000, 0xc0000000, 0, 0, 0, 0, 0, 0)
     state_block = (
         struct.pack(">IIqqqqII", 6, 0, 0, 0, 0, 0, 0, 0)
         + bytes(32)
@@ -967,20 +1288,77 @@ def build_fixture() -> dict:
         + controller
         + controller_touch
     )
-    arrival_edge = struct.pack(">QQBBHiII", 12, 1_002_900, 4, 0,
-                               controller_capabilities, 2, supported_buttons, 0)
+    arrival_edge = struct.pack(
+        ">QQBBHiII",
+        12,
+        1_002_900,
+        4,
+        0,
+        controller_capabilities,
+        2,
+        supported_buttons,
+        0,
+    )
     input_payload = (
         struct.pack(">QQHHHHQ", 1_003_000, 12, len(state_block), 1, 2, 2, 0)
-        + state_block + arrival_edge
+        + state_block
+        + arrival_edge
     )
     input_state = envelope(session_id, 1, 1, 0, 43, 77, input_payload)
+
+    format2_15_state = input_state_block(2, tuple(range(15)))
+    format2_15_payload = input_state_payload(2, format2_15_state)
+    if len(format2_15_payload) != 1_104:
+        raise AssertionError("format-2 15-controller boundary")
+    format2_15 = envelope(session_id, 1, 1, 0, 54, 1, format2_15_payload)
+
+    format3_16_state = input_state_block(3, tuple(range(16)))
+    format3_16_payload = input_state_payload(3, format3_16_state)
+    if len(format3_16_payload) != 1_040:
+        raise AssertionError("format-3 16-controller compact boundary")
+    format3_16 = envelope(session_id, 1, 1, 0, 55, 1, format3_16_payload)
+
+    compact_edges = (input_edge(1), input_edge(2))
+    format3_16_edges_payload = input_state_payload(3, format3_16_state, compact_edges)
+    if len(format3_16_edges_payload) != 1_104:
+        raise AssertionError("format-3 controller/edge boundary")
+    format3_16_edges = envelope(session_id, 1, 1, 0, 56, 1, format3_16_edges_payload)
+
+    format3_touch_state = input_state_block(
+        3, tuple(range(16)), (0x01000001,), initial=False
+    )
+    format3_touch_payload = input_state_payload(
+        3, format3_touch_state, last_acknowledged_edge=2
+    )
+    if len(format3_touch_payload) != 1_072:
+        raise AssertionError("format-3 dirty-touch post-edge boundary")
+    format3_touch = envelope(session_id, 1, 1, 0, 57, 2, format3_touch_payload)
+
+    rebound_state = input_state_block(3, (0,), initial=False, controller_variant=1)
+    rebound_arrival = input_edge(
+        17,
+        kind=4,
+        device=0,
+        code=0x0002,
+        value=2,
+        auxiliary=0x000002,
+    )
+    rebound_payload = input_state_payload(
+        3, rebound_state, (rebound_arrival,), sample_time=2_100_000
+    )
+    rebound_state_record = envelope(session_id, 1, 1, 0, 58, 3, rebound_payload)
+    rebound_feedback_payload = struct.pack(
+        ">IIBBHBBH", 1, 2, 0, 3, 4, 2, 0, 100
+    ) + bytes(24)
+    rebound_feedback = envelope(session_id, 1, 4, 0, 59, 1, rebound_feedback_payload)
+
     input_ack_payload = struct.pack(">QQQQQQ", 1_003_200, 77, 12, 0, 9001, 0)
     input_ack = envelope(session_id, 1, 2, 0, 44, 77, input_ack_payload)
     input_resync_payload = struct.pack(">QB7x", 13, 1)
     input_resync = envelope(session_id, 1, 3, 0, 45, 77, input_resync_payload)
-    controller_feedback_payload = (
-        struct.pack(">IIBBHBBH", 1, 1, 0, 3, 4, 2, 0, 100) + bytes(24)
-    )
+    controller_feedback_payload = struct.pack(
+        ">IIBBHBBH", 1, 1, 0, 3, 4, 2, 0, 100
+    ) + bytes(24)
     controller_feedback = envelope(
         session_id, 1, 4, 0, 46, 1, controller_feedback_payload
     )
@@ -1104,6 +1482,21 @@ def build_fixture() -> dict:
         "session_stopping": _artifact("lifecycle", session_stopping),
         "session_ended": _artifact("lifecycle", session_ended),
         "route_input_state": _artifact("route", input_state),
+        "input_format2_compatibility": _artifact("input-contract", input_state),
+        "input_format2_15_controllers_1104": _artifact("input-contract", format2_15),
+        "input_format3_16_controllers_1040": _artifact("input-contract", format3_16),
+        "input_format3_16_controllers_two_edges_1104": _artifact(
+            "input-contract", format3_16_edges
+        ),
+        "input_format3_touch_after_edge_ack_1072": _artifact(
+            "input-contract", format3_touch
+        ),
+        "input_format3_rebind_generation2": _artifact(
+            "input-contract", rebound_state_record
+        ),
+        "controller_feedback_generation2": _artifact(
+            "input-contract", rebound_feedback
+        ),
         "route_input_ack": _artifact("route", input_ack),
         "route_input_resync": _artifact("route", input_resync),
         "route_controller_feedback": _artifact("route", controller_feedback),
@@ -1404,6 +1797,44 @@ def build_fixture() -> dict:
         session_id, 2, 3, 0, 51, 9001, overlapping_feedback_payload
     )
     input_format_one = input_state[:64] + struct.pack(">HH", 1, 1) + input_state[68:]
+    format3_marker_two = bytearray(format3_16)
+    format3_marker_two[ENVELOPE_SIZE + 32 + 87] = 0
+    format2_marker_three = bytearray(format2_15)
+    format2_marker_three[ENVELOPE_SIZE + 32 + 87] = 3
+    input_edge_format_three = (
+        input_state[: ENVELOPE_SIZE + 22]
+        + struct.pack(">H", 3)
+        + input_state[ENVELOPE_SIZE + 24 :]
+    )
+    format2_15_edge_payload = input_state_payload(2, format2_15_state, (input_edge(1),))
+    format2_15_edge = envelope(session_id, 1, 1, 0, 60, 2, format2_15_edge_payload)
+    format3_payload_1109 = envelope(
+        session_id,
+        1,
+        1,
+        0,
+        61,
+        2,
+        format3_16_edges_payload + bytes(5),
+    )
+    format3_noncontiguous_edges = envelope(
+        session_id,
+        1,
+        1,
+        0,
+        62,
+        2,
+        input_state_payload(3, format3_16_state, (input_edge(1), input_edge(3))),
+    )
+    format3_touch_before_edges = envelope(
+        session_id,
+        1,
+        1,
+        0,
+        63,
+        2,
+        input_state_payload(3, format3_touch_state, compact_edges),
+    )
     media_hostiles = {
         "truncated-envelope": (
             video[:43],
@@ -1508,6 +1939,48 @@ def build_fixture() -> dict:
             session_id,
             INITIAL_MAX_SEMANTIC_DATAGRAM,
         ),
+        "input-format3-wrapper-marker2": (
+            bytes(format3_marker_two),
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "input-format2-wrapper-marker3": (
+            bytes(format2_marker_three),
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "input-edge-format3-rejected": (
+            input_edge_format_three,
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "input-format2-15-plus-edge-1136": (
+            format2_15_edge,
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "input-format3-payload-1109": (
+            format3_payload_1109,
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "input-format3-noncontiguous-edge-prefix": (
+            format3_noncontiguous_edges,
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
+        "input-format3-touch-before-edge-budget": (
+            format3_touch_before_edges,
+            "c2h",
+            session_id,
+            INITIAL_MAX_SEMANTIC_DATAGRAM,
+        ),
         "controller-feedback-stale-input-generation": (
             controller_feedback[:36] + struct.pack(">Q", 2) + controller_feedback[44:],
             "h2c",
@@ -1533,7 +2006,9 @@ def build_fixture() -> dict:
             INITIAL_MAX_SEMANTIC_DATAGRAM,
         ),
         "transport-telemetry-minimum-over-smoothed": (
-            transport_telemetry[:56] + struct.pack(">I", 5_000) + transport_telemetry[60:],
+            transport_telemetry[:56]
+            + struct.pack(">I", 5_000)
+            + transport_telemetry[60:],
             "h2c",
             session_id,
             INITIAL_MAX_SEMANTIC_DATAGRAM,
@@ -1588,6 +2063,28 @@ def build_fixture() -> dict:
             != route
         ):
             raise AssertionError(f"positive route mismatch: {route}")
+
+    for record in (
+        format2_15,
+        format3_16,
+        format3_16_edges,
+        format3_touch,
+        rebound_state_record,
+    ):
+        if (
+            validate_envelope(record, "c2h", session_id, INITIAL_MAX_SEMANTIC_DATAGRAM)[
+                0
+            ]
+            != "input-state"
+        ):
+            raise AssertionError("positive compact input vector mismatch")
+    if (
+        validate_envelope(
+            rebound_feedback, "h2c", session_id, INITIAL_MAX_SEMANTIC_DATAGRAM
+        )[0]
+        != "controller-feedback"
+    ):
+        raise AssertionError("positive rebound feedback vector mismatch")
 
     client_key.public_key().verify(pair_signature, pair_message)
     host_key.public_key().verify(pair_response_signature, pair_response_message)
@@ -1679,9 +2176,105 @@ def build_fixture() -> dict:
         "phase_one_fec": False,
         "constants": {
             "initial_max_semantic_datagram": INITIAL_MAX_SEMANTIC_DATAGRAM,
+            "max_semantic_payload": MAX_SEMANTIC_PAYLOAD,
             "max_control_payload": MAX_CONTROL_PAYLOAD,
             "max_video_frame": MAX_VIDEO_FRAME,
             "max_video_fragments": MAX_VIDEO_FRAGMENTS,
+            "client_input_capabilities": CLIENT_INPUT_CAPABILITIES,
+            "compact_input_capability": COMPACT_INPUT_CAPABILITY,
+            "server_input_capabilities": SERVER_INPUT_CAPABILITIES,
+        },
+        "input_contract": {
+            "state_header_bytes": INPUT_STATE_HEADER_SIZE,
+            "edge_format": 2,
+            "edge_bytes": INPUT_EDGE_SIZE,
+            "touch_bytes": INPUT_TOUCH_SIZE,
+            "formats": {
+                "2": {"marker_byte_87": 0, "controller_bytes": 64},
+                "3": {"marker_byte_87": 3, "controller_bytes": 56},
+            },
+            "budget_order": [
+                "all-active-controllers",
+                "largest-contiguous-edge-prefix",
+                "dirty-touch-updates",
+            ],
+            "negotiation": {
+                "client_hello_capabilities": CLIENT_INPUT_CAPABILITIES,
+                "old_server_capabilities": CLIENT_INPUT_CAPABILITIES,
+                "new_server_capabilities": SERVER_INPUT_CAPABILITIES,
+                "selected_format_without_0x200": 2,
+                "selected_format_with_0x200": 3,
+            },
+            "cases": [
+                {
+                    "id": "format2-byte-compatible",
+                    "artifact": "input_format2_compatibility",
+                    "format": 2,
+                    "expected": "accept",
+                },
+                {
+                    "id": "format2-15-controller-boundary",
+                    "artifact": "input_format2_15_controllers_1104",
+                    "format": 2,
+                    "controllers": 15,
+                    "edges": 0,
+                    "payload_bytes": 1_104,
+                    "expected": "accept",
+                },
+                {
+                    "id": "old-host-15-controller-pending-edge",
+                    "format": 2,
+                    "controllers": 15,
+                    "edges": 1,
+                    "would_be_payload_bytes": 1_136,
+                    "emitted": False,
+                    "state_sequence_advanced": False,
+                    "outcome": "nonterminal-degradation",
+                },
+                {
+                    "id": "format3-16-controller-compact",
+                    "artifact": "input_format3_16_controllers_1040",
+                    "format": 3,
+                    "controllers": 16,
+                    "edges": 0,
+                    "payload_bytes": 1_040,
+                    "expected": "accept",
+                },
+                {
+                    "id": "format3-16-controller-two-edge-boundary",
+                    "artifact": "input_format3_16_controllers_two_edges_1104",
+                    "format": 3,
+                    "controllers": 16,
+                    "edges": 2,
+                    "touches": 0,
+                    "payload_bytes": 1_104,
+                    "expected": "accept",
+                },
+                {
+                    "id": "format3-touch-after-edge-ack",
+                    "artifact": "input_format3_touch_after_edge_ack_1072",
+                    "format": 3,
+                    "controllers": 16,
+                    "edges": 0,
+                    "touches": 1,
+                    "payload_bytes": 1_072,
+                    "expected": "accept",
+                },
+                {
+                    "id": "payload-1109",
+                    "payload_bytes": 1_109,
+                    "expected": "reject",
+                },
+            ],
+            "generation_rebind": {
+                "controller_id": 0,
+                "first_generation": 1,
+                "rebound_generation": 2,
+                "stale_feedback_generation": 1,
+                "accepted_feedback_generation": 2,
+                "state_artifact": "input_format3_rebind_generation2",
+                "feedback_artifact": "controller_feedback_generation2",
+            },
         },
         "identities": {
             "client_public": _hex(client_public),

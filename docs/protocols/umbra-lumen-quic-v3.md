@@ -133,7 +133,7 @@ umbra://pair/v3#<base64url-without-padding(invitation_bytes)>
 | 112 | 32 | host Ed25519 public key |
 | 144 | 8 | issue time, Unix seconds |
 | 152 | 8 | expiry time, Unix seconds |
-| 160 | 8 | capability snapshot |
+| 160 | 8 | host capability snapshot; current value `0x37f` |
 | 168 | 2 | hostname length, `1...253` |
 | 170 | 2 | zero |
 | 172 | variable | normalized ASCII hostname/IP, no NUL |
@@ -282,12 +282,18 @@ phase-one critical frame.
 3 fresh nonce bstr32, 4 capability uint64, 5 offered profile array (`1`
 LATENCY, `2` QUALITY), 6 paired client ID bstr16 or null, 7 invitation ID bstr16
 or null, 8 connection/pair attempt ID bstr16. Exactly one of keys 6 and 7 is
-non-null.
+non-null. Umbra keeps key 4 at `0x17f` so an older host sees the byte-identical
+client offer; compact input is a host-advertised extension rather than a client
+precondition.
 
 `SERVER_HELLO` (`0x0002`): 1 selected version (`3`), 2 fresh nonce bstr32,
 3 host ID bstr16, 4 host Ed25519 public key bstr32, 5 live TLS leaf SPKI hash
 bstr32, 6 capability uint64, 7 semantic DATAGRAM cap (`1152`), 8 exact attempt
-ID echoed from the client hello.
+ID echoed from the client hello. Capability bit `0x200` means the host accepts
+input state format 3 with 56-byte controller records. Current Lumen advertises
+`0x37f`; `0x17f` identifies the compatible older host contract without compact
+input. Umbra enables format 3 only from this authenticated server field, never
+from discovery or an unauthenticated hint.
 
 `PAIR_REQUEST` (`0x0010`): 1 invitation ID bstr16, 2 token bstr32, 3 complete
 invitation SHA-256 bstr32, 4 stable pair-attempt ID bstr16, 5 derived client ID
@@ -584,16 +590,19 @@ Input state payload is:
 | 8 | 8 | newest represented edge ID |
 | 16 | 2 | state block length |
 | 18 | 2 | edge count, `0...64` |
-| 20 | 2 | state format, `2` |
+| 20 | 2 | state format, `2` or capability-gated `3` |
 | 22 | 2 | edge format, `2` |
 | 24 | 8 | zero |
-| 32 | variable | complete state-format-2 block, then edge-format-2 records |
+| 32 | variable | complete declared state block, then edge-format-2 records |
 
-State and edge format are both exactly `2`. Format `1` is rejected and is not
-silently reinterpreted. ULM3 `object_id` is `state_seq`, starts at one, and
-increases exactly once per snapshot.
+State format `2` remains byte-identical and edge format remains exactly `2`.
+State format `3` is permitted only when the authenticated `SERVER_HELLO` has
+capability bit `0x200`; format `1`, unknown formats, wrapper/marker mismatch,
+and edge format other than `2` are rejected rather than reinterpreted. ULM3
+`object_id` is `state_seq`, starts at one, and increases exactly once per
+actually enqueued snapshot.
 
-State-format-2 begins with this exact 112-byte header:
+State formats 2 and 3 share this exact 112-byte header:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
@@ -610,9 +619,11 @@ State-format-2 begins with this exact 112-byte header:
 | 84 | 1 | controller record count, `0...16` |
 | 85 | 1 | touch record count, `0...16` |
 | 86 | 1 | pen record count, `0...4` |
-| 87 | 25 | zero |
+| 87 | 1 | format marker: `0` for state format 2, `3` for state format 3 |
+| 88 | 24 | zero |
 
-Controller records are 64 bytes, sorted by controller ID:
+Controller records are sorted by controller ID. Semantic bytes `0...55` have
+the same layout in both formats:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
@@ -628,7 +639,12 @@ Controller records are 64 bytes, sorted by controller ID:
 | 50 | 1 | Moonlight battery-state code, `0...5` |
 | 51 | 1 | zero |
 | 52 | 4 | supported-button mask, mask `0x003fffff` |
-| 56 | 8 | zero |
+
+State-format-2 controller records are 64 bytes and append eight zero bytes at
+offsets `56...63`. State-format-3 records are exactly 56 bytes and end after the
+supported-button mask. The active-controller bitmap is matched against every
+sorted record and preserves all 16 controller bits; heterogeneous controller
+types/capabilities are not merged or truncated by the compact encoding.
 
 Touch records remain 32 bytes. A controller touch uses pointer ID bits 31...24
 as controller ID plus one, bits 23...16 as touchpad index, and bits 15...0 as
@@ -656,6 +672,32 @@ the supported-button mask at offset 24. The host applies an arrival before the
 same batch's controller base state. It acknowledges an edge only after the
 ordered platform injector reports success; unsupported, unallocated, or
 failed controller operations close the input generation without an ACK.
+
+Snapshot budgeting is deterministic. The sender first reserves the complete
+header plus every active controller record, then takes the largest contiguous
+prefix of pending 32-byte edges, then uses remaining space for dirty 32-byte
+touch records. It never omits an active controller, skips an earlier edge to
+send a later edge/touch, exceeds the negotiated live payload cap, advances
+`state_seq`, or clears dirty state when no record is enqueued. At the immutable
+1,108-byte semantic payload ceiling the pinned boundaries are:
+
+- format 2 with 15 controllers and no edges: state 1,072, payload 1,104,
+  accepted byte-for-byte;
+- format 2 with 15 controllers plus one pending edge: payload 1,136, not sent;
+  an old `0x17f` host produces one explicit nonterminal degradation while the
+  sequence and edge remain pending;
+- format 3 with 16 controllers: state 1,008, payload 1,040;
+- format 3 with 16 controllers plus two contiguous edges: payload 1,104, with
+  dirty touches deferred;
+- after those edges are acknowledged, format 3 with 16 controllers plus one
+  dirty touch: state 1,040, payload 1,072; and
+- any payload of 1,109 bytes is rejected without allocation or partial apply.
+
+A smaller live QUIC path cap applies the same no-enqueue/no-advance degradation
+until the cap recovers. Controller removal releases its slot state; a later
+arrival/rebind increments that controller's instance generation. Feedback must
+match both the current input generation and current controller generation, so a
+generation-1 callback cannot target the generation-2 rebound device.
 
 Input ACK payload is exactly 48 bytes:
 
@@ -1122,7 +1164,11 @@ They cover complete-frame pairing/authentication transcripts, fresh nonce and
 SPKI/invited-host binding, host confirmation, exact ULI3/ULC3/ULM3/ULB3
 encoding, all ten routes and lifecycle artifacts, direction errors,
 truncation, length mismatch, reserved flags, session mismatch, phase-one FEC
-rejection, invitation mutation, bulk digest mismatch, and immutable size bounds.
+rejection, invitation mutation, bulk digest mismatch, and immutable size
+bounds. The input contract additionally pins client `0x17f` versus server
+`0x37f`, byte-identical format 2, format-3 marker/56-byte records, heterogeneous
+16-controller state, the 1,040/1,104/1,109 boundaries, edge-before-touch
+budgeting, old-host nonterminal degradation, and generation-2 rebind feedback.
 
 Release acceptance requires the C++ and Swift implementations to:
 
