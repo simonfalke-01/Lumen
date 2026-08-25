@@ -324,7 +324,11 @@ within 10-480 Hz using overflow-safe comparison. H.264 is limited to
 and codec-lossless offers without 4:4:4 plus explicit host proof are rejected
 before application launch or VDD/resource mutation. Resource activation and
 exact display readiness precede application launch; any later launch failure
-rolls back the staged resource lease and topology.
+rolls back the staged resource lease and topology. Each stable vector ID also
+binds bitrate, latency/quality profile, presentation mode and queue depth,
+microphone intent, and boolean host-audio intent so both implementations can
+evaluate the complete Gate-1 request decision rather than only the display
+tuple.
 
 `START_RESPONSE` (`0x0101`): 1 status, 2 start-intent ID, 3 session ID bstr16,
 4 selected profile, 5 codec tuple, 6 width, 7 height, 8 refresh numerator,

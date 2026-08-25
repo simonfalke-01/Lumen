@@ -49,7 +49,21 @@ TEST(ProtocolV3StartMode, CheckedInBoundaryVectorsMatchTheProductionContract) {
       vector.at("codec_flags").get<std::uint64_t>(),
       vector.at("fidelity").get<std::uint64_t>(),
     };
-    EXPECT_EQ(start_mode::name(start_mode::admit(mode)), vector.at("expected").get<std::string>())
+    const auto &presentation = vector.at("presentation");
+    const auto microphone = vector.at("microphone").get<std::string>();
+    const auto host_audio_valid = vector.at("host_audio").is_boolean();
+    const start_mode::Request request {
+      mode,
+      vector.at("bitrate_kbps").get<std::uint64_t>(),
+      vector.at("profile").get<std::uint64_t>(),
+      presentation.at("mode").get<std::uint64_t>(),
+      presentation.at("queue_depth").get<std::uint64_t>(),
+      microphone == "mono",
+      microphone == "none" || microphone == "mono",
+      host_audio_valid ? vector.at("host_audio").get<bool>() : false,
+      host_audio_valid,
+    };
+    EXPECT_EQ(start_mode::name(start_mode::admit(request)), vector.at("expected").get<std::string>())
       << vector.at("id").get<std::string>();
   }
 }

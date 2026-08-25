@@ -6,6 +6,7 @@
 #include "src/protocol_common/status.h"
 #include "src/protocol_v3/control_session.h"
 #include "src/protocol_v3/quic_server.h"
+#include "src/protocol_v3/runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -20,7 +21,9 @@
 
 namespace {
   namespace control = lumen::protocol_v3::control_session;
+  namespace media = lumen::protocol_v3::media;
   namespace quic = lumen::protocol_v3::quic_server;
+  namespace runtime = lumen::protocol_v3::runtime;
   using Status = lumen::protocol_common::Status;
 
   class FixedRandom final: public control::Random {
@@ -130,6 +133,79 @@ namespace {
     control::cbor::Value::Map last_start_fields;
   };
 
+  class ProductionResources final: public runtime::SessionResources {
+  public:
+    ProductionResources(media::NegotiatedMediaConfig config, int &stop_calls):
+        config_ {std::move(config)},
+        stop_calls_ {stop_calls} {
+    }
+    const media::NegotiatedMediaConfig &effective_media_config() const noexcept override { return config_; }
+    std::span<const std::uint8_t> video_codec_initialization() const noexcept override { return initialization_; }
+    bool reset_input(std::span<const std::uint8_t>, std::uint32_t) override { return true; }
+    bool apply_text(const control::cbor::Value::Map &) override { return true; }
+    media::ReceiveResult datagram(const quic::DatagramRecord &) override { return media::ReceiveResult::accepted; }
+    bool start_media() override { return true; }
+    void detach_connection() noexcept override {}
+    bool attach_connection(std::uint64_t) override { return true; }
+    void stop() noexcept override { ++stop_calls_; }
+
+  private:
+    media::NegotiatedMediaConfig config_;
+    int &stop_calls_;
+    const std::array<std::uint8_t, 1> initialization_ {0x01};
+  };
+
+  class ProductionResourceFactory final: public runtime::SessionResourceFactory {
+  public:
+    std::expected<std::unique_ptr<runtime::SessionResources>, std::uint8_t> create(
+      const media::NegotiatedMediaConfig &config,
+      std::uint64_t,
+      std::function<void()>
+    ) override {
+      ++create_calls;
+      selected = config;
+      return std::make_unique<ProductionResources>(config, stop_calls);
+    }
+    int create_calls {};
+    int stop_calls {};
+    std::optional<media::NegotiatedMediaConfig> selected;
+  };
+
+  class ProductionApplicationBridge final: public runtime::ApplicationBridge {
+  public:
+    std::expected<runtime::ApplicationSnapshot, std::uint8_t> snapshot() override {
+      return std::unexpected(std::uint8_t {8});
+    }
+    std::expected<runtime::ApplicationAsset, std::uint8_t> asset(
+      std::uint64_t,
+      const control::Bytes32 &
+    ) override {
+      return std::unexpected(std::uint8_t {8});
+    }
+    std::expected<bool, std::uint8_t> start(const runtime::ApplicationLaunch &launch) override {
+      ++start_calls;
+      last_launch = launch;
+      return true;
+    }
+    bool stop(bool) noexcept override { return true; }
+    bool running() noexcept override { return false; }
+    int start_calls {};
+    std::optional<runtime::ApplicationLaunch> last_launch;
+  };
+
+  class ProductionTransport final: public runtime::QuicTransportSink {
+  public:
+    bool update_policy(std::uint64_t, quic::Profile, std::uint64_t) noexcept override { return true; }
+  };
+
+  struct ProductionHarness {
+    FixedRandom random;
+    ProductionApplicationBridge applications;
+    ProductionResourceFactory resources;
+    ProductionTransport transport;
+    runtime::ProductionSessionBackend backend {random, applications, resources, transport};
+  };
+
   void append_be(std::vector<std::uint8_t> &output, const std::uint64_t value, std::size_t bytes) {
     while (bytes-- != 0) {
       output.push_back(static_cast<std::uint8_t>(value >> (bytes * 8U)));
@@ -163,14 +239,20 @@ namespace {
             {9, 0U},
             {10, 1U},
           }}},
-      {10, Value::Array {Value::Map {}}},
+      {10, Value::Array {Value::Map {
+             {1, 1U}, {2, 48'000U}, {3, 2U}, {4, 240U}, {5, 1U},
+             {6, 1U}, {7, 1U}, {8, Value::Bytes {0, 1}}, {9, 256'000U},
+           }}},
       {11, Value {control::cbor::Null {}}},
       {12, static_cast<std::uint64_t>(quic::maximum_semantic_datagram_bytes)},
       {13, Value::Bytes(16, 0x22)},
       {14, Value::Array {}},
-      {15, Value::Array {Value::Map {}}},
+      {15, Value::Array {Value::Map {{1, 3U}, {2, 2U}, {3, 0U}, {4, 0U}, {5, 0U}}}},
       {16, Value {false}},
-      {17, Value::Map {}},
+      {17, Value::Map {
+             {1, 1U}, {2, Value {false}}, {3, Value {false}},
+             {4, Value {false}}, {5, Value {false}}, {6, Value {false}},
+           }},
       {18, Value {host_audio}},
     };
   }
@@ -187,7 +269,7 @@ namespace {
     return output;
   }
 
-  bool traverses_control_session(const control::cbor::Value::Map &fields, CapturingBackend &backend) {
+  bool traverses_control_session(const control::cbor::Value::Map &fields, control::SessionBackend &backend) {
     FixedRandom random;
     control::Bytes32 seed {};
     seed.fill(0x41);
@@ -252,6 +334,61 @@ TEST(ProtocolV3StartBoundary, EncodedKey18AndExactRefreshReachTheProductionBacke
       EXPECT_EQ(*std::get_if<bool>(&host_audio_field->second.storage), host_audio);
     }
   }
+}
+
+TEST(ProtocolV3StartBoundary, EncodedFrameComposesControlSessionWithProductionBackend) {
+  ProductionHarness valid;
+  ASSERT_TRUE(traverses_control_session(start_fields(60'000, 1'001, true), valid.backend));
+  ASSERT_EQ(valid.resources.create_calls, 1);
+  ASSERT_EQ(valid.applications.start_calls, 1);
+  ASSERT_TRUE(valid.applications.last_launch.has_value());
+  EXPECT_EQ(valid.applications.last_launch->refresh_numerator, 60'000U);
+  EXPECT_EQ(valid.applications.last_launch->refresh_denominator, 1'001U);
+  EXPECT_TRUE(valid.applications.last_launch->host_audio);
+
+  const auto expect_no_mutation = [](const control::cbor::Value::Map &fields) {
+    ProductionHarness invalid;
+    try {
+      static_cast<void>(traverses_control_session(fields, invalid.backend));
+    } catch (const std::runtime_error &) {
+    }
+    EXPECT_EQ(invalid.resources.create_calls, 0);
+    EXPECT_EQ(invalid.applications.start_calls, 0);
+  };
+
+  auto oversized_h264 = start_fields();
+  const auto width = std::ranges::find_if(oversized_h264, [](const auto &entry) { return entry.first == 4; });
+  ASSERT_NE(width, oversized_h264.end());
+  width->second = control::cbor::Value {4'098U};
+  expect_no_mutation(oversized_h264);
+
+  auto invalid_bitrate = start_fields();
+  const auto bitrate = std::ranges::find_if(invalid_bitrate, [](const auto &entry) { return entry.first == 8; });
+  ASSERT_NE(bitrate, invalid_bitrate.end());
+  bitrate->second = control::cbor::Value {999U};
+  expect_no_mutation(invalid_bitrate);
+
+  auto invalid_presentation = start_fields();
+  const auto presentation = std::ranges::find_if(invalid_presentation, [](const auto &entry) {
+    return entry.first == 15;
+  });
+  ASSERT_NE(presentation, invalid_presentation.end());
+  auto *offers = std::get_if<control::cbor::Value::Array>(&presentation->second.storage);
+  ASSERT_NE(offers, nullptr);
+  auto *offer = std::get_if<control::cbor::Value::Map>(&offers->front().storage);
+  ASSERT_NE(offer, nullptr);
+  offer->front().second = control::cbor::Value {1U};
+  expect_no_mutation(invalid_presentation);
+
+  auto invalid_microphone = start_fields();
+  const auto microphone = std::ranges::find_if(invalid_microphone, [](const auto &entry) { return entry.first == 11; });
+  ASSERT_NE(microphone, invalid_microphone.end());
+  microphone->second = control::cbor::Value {0U};
+  expect_no_mutation(invalid_microphone);
+
+  auto invalid_host_audio = start_fields();
+  invalid_host_audio.back().second = control::cbor::Value {0U};
+  expect_no_mutation(invalid_host_audio);
 }
 
 TEST(ProtocolV3StartBoundary, HostileKey18ShapesFailBeforeTheProductionBackend) {

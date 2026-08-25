@@ -14,6 +14,11 @@ class StartModeOracleTests(unittest.TestCase):
         self.assertEqual(contract["start_keys"], list(range(1, 19)))
         self.assertEqual(contract["host_audio_key"], 18)
         self.assertEqual(contract["host_audio_type"], "bool")
+        for vector in fixture["vectors"]:
+            self.assertIn("bitrate_kbps", vector)
+            self.assertIn("presentation", vector)
+            self.assertIn("microphone", vector)
+            self.assertIn("host_audio", vector)
 
     def test_every_vector_matches_the_independent_oracle(self) -> None:
         fixture = oracle.load_fixture()
@@ -26,7 +31,7 @@ class StartModeOracleTests(unittest.TestCase):
                 vector["expected"],
                 vector["id"],
             )
-        self.assertGreaterEqual(len(ids), 20)
+        self.assertGreaterEqual(len(ids), 27)
 
 
 if __name__ == "__main__":

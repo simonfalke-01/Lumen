@@ -25,10 +25,14 @@ namespace lumen::protocol_v3::start_mode {
     refresh_component,  ///< A refresh component is zero or not representable as uint32.
     refresh_unreduced,  ///< The exact rational is not in canonical reduced form.
     refresh_range,  ///< The exact rational is below 10 Hz or above 480 Hz.
+    bitrate,  ///< Video bitrate is outside the protocol contract.
     codec,  ///< The codec identifier is outside H.264, HEVC, and AV1.
     color_mode,  ///< Chroma, bit depth, or SDR/HDR pairing is VDD-incompatible.
     h264_limit,  ///< H.264 exceeds its dimensions or requests HDR/10-bit.
     fidelity,  ///< Fidelity is invalid or codec-lossless lacks 4:4:4 host proof.
+    presentation,  ///< Presentation mode or queue depth is incompatible with the profile.
+    microphone,  ///< Microphone intent is not null or one valid mono tuple.
+    host_audio,  ///< Host-audio intent is not encoded as a boolean.
   };
 
   /**
@@ -48,6 +52,8 @@ namespace lumen::protocol_v3::start_mode {
         return "refresh_unreduced";
       case AdmissionError::refresh_range:
         return "refresh_range";
+      case AdmissionError::bitrate:
+        return "bitrate";
       case AdmissionError::codec:
         return "codec";
       case AdmissionError::color_mode:
@@ -56,6 +62,12 @@ namespace lumen::protocol_v3::start_mode {
         return "h264_limit";
       case AdmissionError::fidelity:
         return "fidelity";
+      case AdmissionError::presentation:
+        return "presentation";
+      case AdmissionError::microphone:
+        return "microphone";
+      case AdmissionError::host_audio:
+        return "host_audio";
     }
     return "unknown";
   }
@@ -72,6 +84,19 @@ namespace lumen::protocol_v3::start_mode {
     std::uint64_t dynamic_range {};  ///< 1 SDR, 2 PQ, or 3 HLG.
     std::uint64_t codec_flags {};  ///< Bit one is exact host codec-lossless proof.
     std::uint64_t fidelity {};  ///< 1 lossy, 2 visually lossless, or 3 codec lossless.
+  };
+
+  /** @brief Complete language-neutral Gate-1 request decision inputs. */
+  struct Request {
+    Mode mode;  ///< Selected codec/display tuple.
+    std::uint64_t bitrate_kbps {};  ///< Requested video bitrate.
+    std::uint64_t profile {};  ///< 1 latency or 2 quality.
+    std::uint64_t presentation_mode {};  ///< 1 immediate, 2 low-latency, or 3 display-linked.
+    std::uint64_t presentation_queue_depth {};  ///< Requested queued-frame depth.
+    bool microphone_enabled {};  ///< Whether a validated mono microphone tuple is present.
+    bool microphone_valid {true};  ///< Whether microphone intent has an approved wire shape.
+    bool host_audio {};  ///< Whether host audio remains audible.
+    bool host_audio_valid {true};  ///< Whether host-audio intent is a CBOR boolean.
   };
 
   /**
@@ -131,6 +156,30 @@ namespace lumen::protocol_v3::start_mode {
     if (mode.fidelity < 1 || mode.fidelity > 3 ||
         (mode.fidelity == 3 && (mode.chroma != 2 || (mode.codec_flags & 0x02U) == 0))) {
       return AdmissionError::fidelity;
+    }
+    return AdmissionError::none;
+  }
+
+  /** @brief Validate the full Gate-1 request decision after strict wire decoding. */
+  [[nodiscard]] constexpr AdmissionError admit(const Request &request) noexcept {
+    if (const auto mode = admit(request.mode); mode != AdmissionError::none) {
+      return mode;
+    }
+    if (request.bitrate_kbps < 1'000 || request.bitrate_kbps > 500'000) {
+      return AdmissionError::bitrate;
+    }
+    const auto compatible_presentation =
+      (request.profile == 1 && (request.presentation_mode == 1 || request.presentation_mode == 2)) ||
+      (request.profile == 2 && request.presentation_mode == 3);
+    if (!compatible_presentation || request.presentation_queue_depth < 1 ||
+        request.presentation_queue_depth > 2) {
+      return AdmissionError::presentation;
+    }
+    if (!request.microphone_valid) {
+      return AdmissionError::microphone;
+    }
+    if (!request.host_audio_valid) {
+      return AdmissionError::host_audio;
     }
     return AdmissionError::none;
   }

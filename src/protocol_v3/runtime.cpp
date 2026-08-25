@@ -1596,20 +1596,6 @@ namespace lumen::protocol_v3::runtime {
     selected.fidelity = static_cast<std::uint8_t>(*fidelity);
     selected.audio = *audio;
     selected.host_audio = *host_audio_value;
-    if (start_mode::admit({
-          selected.width,
-          selected.height,
-          selected.refresh_numerator,
-          selected.refresh_denominator,
-          selected.codec_id,
-          selected.bit_depth,
-          selected.chroma_layout,
-          selected.transfer,
-          selected.codec_flags,
-          selected.fidelity,
-        }) != start_mode::AdmissionError::none) {
-      return std::unexpected(static_cast<std::uint8_t>(Status::unsupported_media));
-    }
     if (const auto *microphone_map = std::get_if<Map>(&microphone_value->storage)) {
       if ((client.permissions & control::microphone_permission) == 0) {
         return std::unexpected(static_cast<std::uint8_t>(Status::unauthorized));
@@ -1622,6 +1608,34 @@ namespace lumen::protocol_v3::runtime {
       selected.microphone_enabled = true;
     } else if (!std::holds_alternative<control::cbor::Null>(microphone_value->storage)) {
       return std::unexpected(static_cast<std::uint8_t>(Status::malformed));
+    }
+    const auto *selected_presentation = std::get_if<Map>(&selected_presentation_value->storage);
+    const auto *presentation_mode = selected_presentation ? unsigned_field(*selected_presentation, 1) : nullptr;
+    const auto *presentation_queue = selected_presentation ? unsigned_field(*selected_presentation, 2) : nullptr;
+    if (!presentation_mode || !presentation_queue ||
+        start_mode::admit(start_mode::Request {
+          {
+            selected.width,
+            selected.height,
+            selected.refresh_numerator,
+            selected.refresh_denominator,
+            selected.codec_id,
+            selected.bit_depth,
+            selected.chroma_layout,
+            selected.transfer,
+            selected.codec_flags,
+            selected.fidelity,
+          },
+          *bitrate,
+          *profile,
+          *presentation_mode,
+          *presentation_queue,
+          selected.microphone_enabled,
+          true,
+          selected.host_audio,
+          true,
+        }) != start_mode::AdmissionError::none) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::unsupported_media));
     }
     const auto *hdr_offers = array_field(request_fields, 14);
     control::cbor::Value selected_hdr {control::cbor::Null {}};

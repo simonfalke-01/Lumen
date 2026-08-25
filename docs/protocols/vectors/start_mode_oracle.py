@@ -41,6 +41,8 @@ def admit(vector: dict, contract: dict) -> str:
         and numerator <= contract["maximum_refresh_hz"] * denominator
     ):
         return "refresh_range"
+    if not 1_000 <= vector["bitrate_kbps"] <= 500_000:
+        return "bitrate"
     if vector["codec"] not in contract["codec"].values():
         return "codec"
     valid_color_mode = vector["chroma"] in contract["chroma"].values() and (
@@ -67,6 +69,16 @@ def admit(vector: dict, contract: dict) -> str:
         )
     ):
         return "fidelity"
+    presentation = vector["presentation"]
+    compatible_presentation = (
+        vector["profile"] == 1 and presentation["mode"] in (1, 2)
+    ) or (vector["profile"] == 2 and presentation["mode"] == 3)
+    if not compatible_presentation or not 1 <= presentation["queue_depth"] <= 2:
+        return "presentation"
+    if vector["microphone"] not in ("none", "mono"):
+        return "microphone"
+    if not isinstance(vector["host_audio"], bool):
+        return "host_audio"
     return "none"
 
 

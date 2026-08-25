@@ -2939,7 +2939,7 @@ namespace stream {
             !video::current_nvenc_lossless_capability(selection_.codec_id - 1)) {
           throw std::runtime_error {"protocol-v3 NVENC lossless proof unavailable"};
         }
-        if (lumen::protocol_v3::start_mode::admit({
+        if (lumen::protocol_v3::start_mode::admit(lumen::protocol_v3::start_mode::Mode {
               selection_.width,
               selection_.height,
               selection_.refresh_numerator,

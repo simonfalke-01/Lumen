@@ -99,7 +99,7 @@ namespace lumen::protocol_v3::media {
     }
 
     bool valid_config(const NegotiatedMediaConfig &config) noexcept {
-      const auto mode_admission = start_mode::admit({
+      const auto mode_admission = start_mode::admit(start_mode::Mode {
         config.width,
         config.height,
         config.refresh_numerator,
