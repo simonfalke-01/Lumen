@@ -10,6 +10,7 @@
 #include "utility.h"
 
 #include <bitset>
+#include <memory>
 
 namespace audio {
   /**
@@ -91,15 +92,49 @@ namespace audio {
    * @brief Byte buffer used for encoded audio packet payloads.
    */
   using buffer_t = util::buffer_t<std::uint8_t>;
+
   /**
-   * @brief Encoded audio packet paired with platform channel metadata.
+   * @brief Encoded audio packet ready for a protocol-specific destination.
    */
   struct packet_t {
-    void *channel_data {};  ///< Owning stream/session route.
     buffer_t payload;  ///< Encoded Opus packet.
     std::uint64_t sample_position {};  ///< Exact 48 kHz first-sample position.
     bool discontinuity {};  ///< Reset/flush decoder before this packet.
   };
+
+  /**
+   * @brief Typed lifetime and backpressure boundary for encoded audio packets.
+   */
+  class AudioPacketDestination {
+  public:
+    /**
+     * @brief Result of offering one packet to the protocol-owned destination.
+     */
+    enum class enqueue_result_e : std::uint8_t {
+      enqueued,  ///< The destination accepted ownership of the packet.
+      closed,  ///< The destination is closing or no longer exists.
+      backpressure  ///< The bounded destination queue has no remaining capacity.
+    };
+
+    virtual ~AudioPacketDestination() = default;
+
+    /**
+     * @brief Offer one encoded packet without blocking the encoder thread.
+     * @param packet Encoded Opus packet whose ownership transfers on success.
+     * @return Exact destination admission result.
+     */
+    [[nodiscard]] virtual enqueue_result_e enqueue(packet_t packet) = 0;
+
+    /**
+     * @brief Stop accepting packets and wake any destination consumer.
+     */
+    virtual void close() noexcept = 0;
+  };
+
+  /**
+   * @brief Non-owning destination reference retained by capture and encode workers.
+   */
+  using packet_destination_t = std::weak_ptr<AudioPacketDestination>;
   /**
    * @brief Shared mailbox reference to the global audio context.
    */
@@ -110,9 +145,9 @@ namespace audio {
    *
    * @param mail Mailbox used to publish encoded audio packets.
    * @param config Audio capture and encoder settings.
-   * @param channel_data Platform-specific capture channel pointer.
+   * @param destination Weak protocol-owned destination for encoded Opus packets.
    */
-  void capture(safe::mail_t mail, config_t config, void *channel_data);
+  void capture(safe::mail_t mail, config_t config, packet_destination_t destination);
 
   /**
    * @brief Get the reference to the audio context.

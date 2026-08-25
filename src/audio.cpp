@@ -110,10 +110,18 @@ namespace audio {
    *
    * @param samples Queue of captured PCM sample buffers to encode.
    * @param config Audio stream settings negotiated with the client.
-   * @param channel_data Platform-specific audio capture context passed to packet metadata.
+   * @param destination Weak protocol-owned destination for encoded packets.
+   * @param encoding True until this worker exits, allowing capture to detect delivery failure.
    */
-  void encodeThread(sample_queue_t samples, config_t config, void *channel_data) {
-    auto packets = mail::man->queue<packet_t>(mail::audio_packets);
+  void encodeThread(
+    sample_queue_t samples,
+    config_t config,
+    packet_destination_t destination,
+    const std::shared_ptr<std::atomic_bool> &encoding
+  ) {
+    auto encoding_guard = util::fail_guard([&encoding]() {
+      encoding->store(false, std::memory_order_release);
+    });
     auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];
     if (config.flags[config_t::CUSTOM_SURROUND_PARAMS]) {
       apply_surround_params(stream, config.customStreamParams);
@@ -122,7 +130,6 @@ namespace audio {
       const auto maximum_bitrate = std::min(2'048'000, stream.streams * 512'000);
       if (config.bitrate < 6'000 || config.bitrate > maximum_bitrate) {
         BOOST_LOG(error) << "Rejected invalid negotiated Opus bitrate: "sv << config.bitrate;
-        packets->stop();
         return;
       }
       stream.bitrate = config.bitrate;
@@ -158,31 +165,43 @@ namespace audio {
       );
       if (bytes < 0) {
         BOOST_LOG(error) << "Couldn't encode audio: "sv << opus_strerror(bytes);
-        return false;
+        return std::optional<AudioPacketDestination::enqueue_result_e> {};
       }
       packet.fake_resize(bytes);
-      return packets->raise(packet_t {
-        .channel_data = channel_data,
+      const auto locked_destination = destination.lock();
+      if (!locked_destination) {
+        return std::optional {AudioPacketDestination::enqueue_result_e::closed};
+      }
+      return std::optional {locked_destination->enqueue(packet_t {
         .payload = std::move(packet),
         .sample_position = sample_position,
         .discontinuity = discontinuity,
-      });
+      })};
     };
     std::vector<float> silence(static_cast<std::size_t>(frame_size * stream.channelCount), 0.0f);
     while (auto sample = samples->pop()) {
       const auto first_gap_position = sample->sample_position -
                                       static_cast<std::uint64_t>(sample->gap_frames) * frame_size;
       for (std::uint32_t gap = 0; gap < sample->gap_frames; ++gap) {
-        if (!encode_and_publish(silence, first_gap_position + static_cast<std::uint64_t>(gap) * frame_size,
-                                gap == 0)) {
-          BOOST_LOG(error) << "Audio packet queue overflow while preserving a capture gap"sv;
-          packets->stop();
+        const auto result = encode_and_publish(
+          silence,
+          first_gap_position + static_cast<std::uint64_t>(gap) * frame_size,
+          gap == 0
+        );
+        if (!result || *result == AudioPacketDestination::enqueue_result_e::closed) {
+          return;
+        }
+        if (*result == AudioPacketDestination::enqueue_result_e::backpressure) {
+          BOOST_LOG(error) << "Audio destination backpressure while preserving a capture gap"sv;
           return;
         }
       }
-      if (!encode_and_publish(sample->samples, sample->sample_position, false)) {
-        BOOST_LOG(error) << "Audio packet queue overflow"sv;
-        packets->stop();
+      const auto result = encode_and_publish(sample->samples, sample->sample_position, false);
+      if (!result || *result == AudioPacketDestination::enqueue_result_e::closed) {
+        return;
+      }
+      if (*result == AudioPacketDestination::enqueue_result_e::backpressure) {
+        BOOST_LOG(error) << "Audio destination backpressure"sv;
         return;
       }
     }
@@ -191,7 +210,7 @@ namespace audio {
   /**
    * @brief Run the capture loop for this backend.
    */
-  void capture(safe::mail_t mail, config_t config, void *channel_data) {
+  void capture(safe::mail_t mail, config_t config, packet_destination_t destination) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     if (!config::audio.stream) {
       shutdown_event->view();
@@ -274,20 +293,24 @@ namespace audio {
       std::max(1, 120 / std::max(config.packetDuration, 1))
     );
     auto samples = std::make_shared<sample_queue_t::element_type>(maximum_queue_frames);
-    std::jthread thread {encodeThread, samples, config, channel_data};
+    auto encoding = std::make_shared<std::atomic_bool>(true);
+    std::jthread thread {encodeThread, samples, config, std::move(destination), encoding};
+    bool wait_for_shutdown_after_cleanup = true;
 
     auto fg = util::fail_guard([&]() {
       samples->stop();
       thread.join();
 
-      shutdown_event->view();
+      if (wait_for_shutdown_after_cleanup) {
+        shutdown_event->view();
+      }
     });
 
     int samples_per_frame = frame_size * stream.channelCount;
 
     std::uint64_t next_sample_position {};
     std::uint32_t pending_gap_frames {};
-    while (!shutdown_event->peek()) {
+    while (!shutdown_event->peek() && encoding->load(std::memory_order_acquire)) {
       std::vector<float> sample_buffer;
       sample_buffer.resize(samples_per_frame);
 
@@ -322,6 +345,9 @@ namespace audio {
         ++pending_gap_frames;
       }
       next_sample_position += static_cast<std::uint64_t>(frame_size);
+    }
+    if (!encoding->load(std::memory_order_acquire)) {
+      wait_for_shutdown_after_cleanup = false;
     }
   }
 

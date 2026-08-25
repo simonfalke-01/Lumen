@@ -526,6 +526,67 @@ namespace stream {
   using microphone_queue_t = std::shared_ptr<safe::queue_t<microphone_datagram_t>>;
 
   /**
+   * @brief Bounded queue with exact audio-destination admission semantics.
+   */
+  template<class Packet>
+  class audio_packet_queue_t {
+  public:
+    explicit audio_packet_queue_t(const std::size_t capacity = 32):
+        capacity_ {capacity} {
+    }
+
+    [[nodiscard]] audio::AudioPacketDestination::enqueue_result_e enqueue(Packet packet) {
+      std::lock_guard lock {mutex_};
+      if (closed_) {
+        return audio::AudioPacketDestination::enqueue_result_e::closed;
+      }
+      if (packets_.size() >= capacity_) {
+        return audio::AudioPacketDestination::enqueue_result_e::backpressure;
+      }
+      packets_.push(std::move(packet));
+      changed_.notify_one();
+      return audio::AudioPacketDestination::enqueue_result_e::enqueued;
+    }
+
+    [[nodiscard]] std::optional<Packet> pop() {
+      std::unique_lock lock {mutex_};
+      changed_.wait(lock, [this]() {
+        return closed_ || !packets_.empty();
+      });
+      if (closed_) {
+        return std::nullopt;
+      }
+      auto packet = std::move(packets_.front());
+      packets_.pop();
+      return packet;
+    }
+
+    void close() noexcept {
+      std::lock_guard lock {mutex_};
+      closed_ = true;
+      packets_ = {};
+      changed_.notify_all();
+    }
+
+  private:
+    std::size_t capacity_;
+    std::queue<Packet> packets_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool closed_ {};
+  };
+
+  /**
+   * @brief Encoded legacy packet paired with a typed, non-owning session route.
+   */
+  struct legacy_audio_packet_t {
+    std::weak_ptr<session_t> session;
+    audio::packet_t packet;
+  };
+
+  using legacy_audio_packet_queue_t = audio_packet_queue_t<legacy_audio_packet_t>;
+
+  /**
    * @brief Convert a binary microphone session identifier into a map key.
    *
    * @param session_id Exact 16-byte session identifier.
@@ -554,6 +615,7 @@ namespace stream {
     udp::socket microphone_sock {io_context};  ///< UDP socket bound for client microphone input.
 
     video::egress_queue_t video_egress;  ///< Fair bounded per-session encoded-video scheduler.
+    std::shared_ptr<legacy_audio_packet_queue_t> audio_packets {std::make_shared<legacy_audio_packet_queue_t>()};  ///< Encoded legacy audio waiting for UDP transmission.
 
     sync_util::sync_t<std::unordered_map<std::string, std::weak_ptr<session_t>>> microphone_routes;  ///< Session-ID routes for reverse microphone UDP traffic.
     std::atomic_bool microphone_bound {};  ///< Whether the optional microphone UDP socket is bound and accepting datagrams.
@@ -615,6 +677,7 @@ namespace stream {
 
       audio_fec_packet_t fec_packet;
       std::unique_ptr<platf::deinit_t> qos;
+      std::shared_ptr<audio::AudioPacketDestination> destination;  ///< Typed weak route from the encoder to this legacy session.
     } audio;  ///< Audio capture configuration for the stream..
 
     struct {
@@ -656,6 +719,44 @@ namespace stream {
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
 
     std::atomic<session::state_e> state;  ///< Current lifecycle state observed by stream workers.
+  };
+
+  /**
+   * @brief Legacy GameStream adapter for the shared UDP audio sender.
+   */
+  class legacy_audio_packet_destination final: public audio::AudioPacketDestination {
+  public:
+    legacy_audio_packet_destination(
+      std::weak_ptr<session_t> session,
+      std::weak_ptr<legacy_audio_packet_queue_t> packets
+    ):
+        session_ {std::move(session)},
+        packets_ {std::move(packets)} {
+    }
+
+    [[nodiscard]] enqueue_result_e enqueue(audio::packet_t packet) override {
+      std::lock_guard lock {mutex_};
+      if (closed_) {
+        return enqueue_result_e::closed;
+      }
+      auto packets = packets_.lock();
+      if (!packets || session_.expired()) {
+        closed_ = true;
+        return enqueue_result_e::closed;
+      }
+      return packets->enqueue({session_, std::move(packet)});
+    }
+
+    void close() noexcept override {
+      std::lock_guard lock {mutex_};
+      closed_ = true;
+    }
+
+  private:
+    std::weak_ptr<session_t> session_;
+    std::weak_ptr<legacy_audio_packet_queue_t> packets_;
+    std::mutex mutex_;
+    bool closed_ {};
   };
 
   /**
@@ -1888,9 +1989,8 @@ namespace stream {
    *
    * @param sock Socket used to read or write the protocol message.
    */
-  void audioBroadcastThread(udp::socket &sock) {
+  void audioBroadcastThread(udp::socket &sock, legacy_audio_packet_queue_t &packets) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
-    auto packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
 
     audio_packet_t audio_packet;
     fec::rs_t rs {reed_solomon_new(RTPA_DATA_SHARDS, RTPA_FEC_SHARDS)};
@@ -1912,13 +2012,16 @@ namespace stream {
     platf::set_thread_name("stream::audioBroadcast");
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
-    while (auto packet = packets->pop()) {
+    while (auto routed_packet = packets.pop()) {
       if (shutdown_event->peek()) {
         break;
       }
 
-      auto session = static_cast<session_t *>(packet->channel_data);
-      auto &packet_data = packet->payload;
+      auto session = routed_packet->session.lock();
+      if (!session || session->state.load(std::memory_order_acquire) != session::state_e::RUNNING) {
+        continue;
+      }
+      auto &packet_data = routed_packet->packet.payload;
 
       auto sequenceNumber = session->audio.sequenceNumber;
       auto timestamp = session->audio.timestamp;
@@ -2304,7 +2407,7 @@ namespace stream {
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
     ctx.video_thread = std::jthread {videoBroadcastThread, std::ref(ctx.video_sock), std::ref(ctx.video_egress)};
-    ctx.audio_thread = std::jthread {audioBroadcastThread, std::ref(ctx.audio_sock)};
+    ctx.audio_thread = std::jthread {audioBroadcastThread, std::ref(ctx.audio_sock), std::ref(*ctx.audio_packets)};
     ctx.control_thread = std::jthread {controlBroadcastThread, &ctx.control_server};
 
     ctx.recv_thread = std::jthread {recvThread, std::ref(ctx)};
@@ -2320,11 +2423,9 @@ namespace stream {
 
     broadcast_shutdown_event->raise(true);
 
-    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
-
     // Minimize delay stopping video/audio threads
     ctx.video_egress.stop();
-    audio_packets->stop();
+    ctx.audio_packets->close();
 
     ctx.message_queue_queue->stop();
     ctx.io_context.stop();
@@ -2335,8 +2436,6 @@ namespace stream {
       boost::system::error_code error;
       ctx.microphone_sock.close(error);
     }
-
-    audio_packets.reset();
 
     BOOST_LOG(debug) << "Waiting for main listening thread to end..."sv;
     ctx.recv_thread.join();
@@ -2524,7 +2623,7 @@ namespace stream {
     session->audio.qos = platf::enable_socket_qos(ref->audio_sock.native_handle(), address, session->audio.peer.port(), platf::qos_data_type_e::audio, session->config.audioQosType != 0);
 
     BOOST_LOG(debug) << "Start capturing Audio"sv;
-    audio::capture(session->mail, session->config.audio, session);
+    audio::capture(session->mail, session->config.audio, session->audio.destination);
   }
 
   namespace session {
@@ -2566,6 +2665,9 @@ namespace stream {
         return;
       }
 
+      if (session.audio.destination) {
+        session.audio.destination->close();
+      }
       input::begin_close(session.input);
       session.shutdown_event->raise(true);
     }
@@ -2609,6 +2711,7 @@ namespace stream {
       session.videoThread.join();
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
+      session.audio.destination.reset();
       input::begin_close(session.input);
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
@@ -2655,6 +2758,10 @@ namespace stream {
       if (!session.broadcast_ref) {
         return -1;
       }
+      session.audio.destination = std::make_shared<legacy_audio_packet_destination>(
+        session_ptr,
+        session.broadcast_ref->audio_packets
+      );
 
       if (session.config.client_microphone &&
           (!session.broadcast_ref->microphone_bound.load(std::memory_order_acquire) ||
@@ -2903,6 +3010,27 @@ namespace stream {
       std::ranges::copy(selection.audio.mapping, output.customStreamParams.mapping);
     }
 
+    /**
+     * @brief Per-v3-session adapter owning its bounded encoded-audio queue.
+     */
+    class v3_audio_packet_destination final: public audio::AudioPacketDestination {
+    public:
+      [[nodiscard]] enqueue_result_e enqueue(audio::packet_t packet) override {
+        return packets_.enqueue(std::move(packet));
+      }
+
+      void close() noexcept override {
+        packets_.close();
+      }
+
+      [[nodiscard]] std::optional<audio::packet_t> pop() {
+        return packets_.pop();
+      }
+
+    private:
+      audio_packet_queue_t<audio::packet_t> packets_;
+    };
+
     class native_v3_session_resources final:
         public v3_runtime::SessionResources,
         private v3_media::InputSink,
@@ -2920,7 +3048,7 @@ namespace stream {
           terminal_failure_ {std::move(terminal_failure)},
           mail_ {std::make_shared<safe::mail_raw_t>()},
           input_ {input::alloc(mail_)},
-          audio_packets_ {mail_->queue<audio::packet_t>(mail::audio_packets)},
+          audio_destination_ {std::make_shared<v3_audio_packet_destination>()},
           feedback_packets_ {mail_->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)},
           video_egress_ {selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ? 1U : 2U},
           transport_ {transport},
@@ -3148,7 +3276,7 @@ namespace stream {
             }};
             audio_capture_ = std::jthread {[this] {
               try {
-                audio::capture(mail_, stream_config_.audio, this);
+                audio::capture(mail_, stream_config_.audio, audio_destination_);
               } catch (...) {
               }
               report_terminal_failure();
@@ -3216,7 +3344,7 @@ namespace stream {
           input::begin_close(input_);
           input::reset(input_);
           mail_->event<bool>(mail::shutdown)->raise(true);
-          audio_packets_->stop();
+          audio_destination_->close();
           feedback_packets_->stop();
           video_egress_.stop();
           if (video_capture_.joinable()) {
@@ -3518,10 +3646,7 @@ namespace stream {
       }
 
       void consume_audio() {
-        while (const auto packet = audio_packets_->pop()) {
-          if (packet->channel_data != this) {
-            continue;
-          }
+        while (const auto packet = audio_destination_->pop()) {
           const auto result = pipeline_->submit_audio({
             .capture_time_microseconds = v3_microseconds(std::chrono::steady_clock::now()),
             .first_sample_position = packet->sample_position,
@@ -4343,7 +4468,7 @@ namespace stream {
       std::vector<std::uint8_t> codec_initialization_;
       safe::mail_t mail_;
       std::shared_ptr<input::input_t> input_;
-      safe::mail_raw_t::queue_t<audio::packet_t> audio_packets_;
+      std::shared_ptr<v3_audio_packet_destination> audio_destination_;
       safe::mail_raw_t::queue_t<platf::gamepad_feedback_msg_t> feedback_packets_;
       video::egress_queue_t video_egress_;
       v3_media::TransportSink &transport_;  ///< Live QUIC sink used after platform media activation.
