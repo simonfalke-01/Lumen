@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numbers>
 #include <span>
 #include <stdexcept>
@@ -25,12 +27,12 @@
 
 namespace {
   using namespace std::chrono_literals;
-  using client_microphone::clock_t;
+  using microphone_clock_t = client_microphone::clock_t;
   using client_microphone::packet_kind_e;
   using client_microphone::packet_t;
   using client_microphone::submit_result_e;
 
-  constexpr auto START = clock_t::time_point {};  ///< Deterministic origin used by receiver tests.
+  constexpr auto START = microphone_clock_t::time_point {};  ///< Deterministic origin used by receiver tests.
 
   /**
    * @brief One invocation recorded by the fake decoder.
@@ -113,6 +115,71 @@ namespace {
     std::vector<std::uint64_t> end_generations;  ///< Generations passed to end.
     bool begin_result {true};  ///< Result returned by begin.
     bool write_result {true};  ///< Result returned by write.
+  };
+
+  /** @brief Thread-safe sink used to observe the real clocked playout worker. */
+  class clocked_sink_t final: public client_microphone::sink_t {
+  public:
+    bool begin(std::uint64_t generation, std::uint32_t, std::uint8_t) override {
+      std::lock_guard lock {mutex};
+      active_generation = generation;
+      return true;
+    }
+
+    bool write(std::uint64_t generation, std::span<const std::int16_t> samples) override {
+      std::lock_guard lock {mutex};
+      if (generation != active_generation) {
+        return false;
+      }
+      frames.emplace_back(samples.begin(), samples.end());
+      write_times.push_back(microphone_clock_t::now());
+      changed.notify_all();
+      return true;
+    }
+
+    void end(std::uint64_t generation) override {
+      std::lock_guard lock {mutex};
+      if (generation == active_generation) {
+        active_generation = 0;
+        ++end_calls;
+      }
+      changed.notify_all();
+    }
+
+    bool wait_for_frames(const std::size_t count, const std::chrono::milliseconds timeout) {
+      std::unique_lock lock {mutex};
+      return changed.wait_for(lock, timeout, [&]() {
+        return frames.size() >= count;
+      });
+    }
+
+    std::vector<std::vector<std::int16_t>> frame_snapshot() const {
+      std::lock_guard lock {mutex};
+      return frames;
+    }
+
+    std::vector<microphone_clock_t::time_point> write_time_snapshot() const {
+      std::lock_guard lock {mutex};
+      return write_times;
+    }
+
+    std::uint64_t active_generation_snapshot() const {
+      std::lock_guard lock {mutex};
+      return active_generation;
+    }
+
+    std::size_t end_call_count() const {
+      std::lock_guard lock {mutex};
+      return end_calls;
+    }
+
+  private:
+    mutable std::mutex mutex;  ///< Protects observations shared with the playout worker.
+    std::condition_variable changed;  ///< Wakes bounded test waits after writes and stop.
+    std::uint64_t active_generation {};  ///< Generation accepted by the sink.
+    std::vector<std::vector<std::int16_t>> frames;  ///< Complete frames written by the worker.
+    std::vector<microphone_clock_t::time_point> write_times;  ///< Monotonic time of each completed write.
+    std::size_t end_calls {};  ///< Balanced sink end calls.
   };
 
   /**
@@ -226,6 +293,103 @@ TEST(ClientMicrophoneOpusDecoder, RejectsInvalidBufferShapes) {
   EXPECT_EQ(decoder.decode(oversized, false, output), OPUS_BAD_ARG);
   EXPECT_EQ(decoder.decode(std::array<std::uint8_t, 1> {1}, false, short_output), OPUS_BAD_ARG);
   EXPECT_EQ(decoder.conceal(short_output), OPUS_BAD_ARG);
+}
+
+TEST(ClientMicrophoneClockedReceiver, DrivesReorderFecAndPlcFromIndependentTwentyMillisecondClock) {
+  clocked_sink_t sink;
+  auto decoder = std::make_unique<fake_decoder_t>();
+  auto *decoder_observer = decoder.get();
+  client_microphone::clocked_receiver_t receiver {std::move(decoder), sink};
+
+  const auto submitted_at = microphone_clock_t::now();
+  ASSERT_TRUE(receiver.reset(77));
+  EXPECT_EQ(receiver.submit(opus_packet(76, 10, 1000, 10)), submit_result_e::wrong_generation);
+  ASSERT_EQ(receiver.submit(opus_packet(77, 10, 1000, 10)), submit_result_e::accepted);
+  ASSERT_EQ(receiver.submit(opus_packet(77, 12, 2920, 12)), submit_result_e::accepted);
+  ASSERT_EQ(receiver.submit(opus_packet(77, 15, 5800, 15)), submit_result_e::accepted);
+
+  ASSERT_TRUE(sink.wait_for_frames(6, 750ms));
+  receiver.shutdown();
+
+  const auto frames = sink.frame_snapshot();
+  const auto write_times = sink.write_time_snapshot();
+  ASSERT_EQ(frames.size(), 6U);
+  ASSERT_EQ(write_times.size(), 6U);
+  EXPECT_EQ(frames[0].front(), 10);
+  EXPECT_EQ(frames[1].front(), 1012);
+  EXPECT_EQ(frames[2].front(), 12);
+  EXPECT_EQ(frames[3].front(), -1);
+  EXPECT_EQ(frames[4].front(), 1015);
+  EXPECT_EQ(frames[5].front(), 15);
+  EXPECT_GE(write_times[0] - submitted_at, 45ms);
+  for (std::size_t index = 1; index < write_times.size(); ++index) {
+    EXPECT_GE(write_times[index] - write_times[index - 1], 10ms);
+  }
+  ASSERT_EQ(decoder_observer->calls.size(), 6U);
+  EXPECT_FALSE(decoder_observer->calls[0].fec);
+  EXPECT_TRUE(decoder_observer->calls[1].fec);
+  EXPECT_FALSE(decoder_observer->calls[2].fec);
+  EXPECT_TRUE(decoder_observer->calls[3].conceal);
+  EXPECT_TRUE(decoder_observer->calls[4].fec);
+  EXPECT_FALSE(decoder_observer->calls[5].fec);
+  EXPECT_EQ(receiver.statistics().fec_frames, 2U);
+  EXPECT_EQ(receiver.statistics().plc_frames, 1U);
+  EXPECT_FALSE(receiver.active());
+  EXPECT_EQ(receiver.submit(opus_packet(77, 13, 3880, 13)), submit_result_e::inactive);
+  EXPECT_EQ(sink.active_generation_snapshot(), 0U);
+  EXPECT_EQ(sink.end_call_count(), 1U);
+}
+
+TEST(ClientMicrophoneClockedReceiver, StopIsReusableAndShutdownJoinsWithinBound) {
+  clocked_sink_t sink;
+  client_microphone::clocked_receiver_t receiver {std::make_unique<fake_decoder_t>(), sink};
+  ASSERT_TRUE(receiver.reset(80));
+  ASSERT_EQ(receiver.submit(opus_packet(80, 1, 100, 1)), submit_result_e::accepted);
+  receiver.stop();
+  EXPECT_FALSE(receiver.active());
+  EXPECT_EQ(receiver.queued_packets(), 0U);
+
+  ASSERT_TRUE(receiver.reset(81));
+  ASSERT_EQ(receiver.submit(silence_packet(81, 1, 100)), submit_result_e::accepted);
+  ASSERT_TRUE(sink.wait_for_frames(1, 500ms));
+
+  const auto shutdown_started = microphone_clock_t::now();
+  receiver.shutdown();
+  EXPECT_LT(microphone_clock_t::now() - shutdown_started, 2s);
+  EXPECT_FALSE(receiver.reset(82));
+  EXPECT_EQ(sink.end_call_count(), 2U);
+}
+
+TEST(ClientMicrophoneWriter, ArbitratesLegacyAndV3WithTaggedStableOwnership) {
+  const auto legacy = client_microphone::writer_owner_t::legacy(0x2001);
+  const auto same_numeric_v3 = client_microphone::writer_owner_t::protocol_v3(0x2001);
+  const auto second_v3 = client_microphone::writer_owner_t::protocol_v3(0x2002);
+
+  client_microphone::release_writer(legacy);
+  client_microphone::release_writer(same_numeric_v3);
+  client_microphone::release_writer(second_v3);
+
+  ASSERT_TRUE(client_microphone::claim_writer(legacy));
+  EXPECT_TRUE(client_microphone::claim_writer(legacy));
+  EXPECT_FALSE(client_microphone::claim_writer(same_numeric_v3));
+  EXPECT_FALSE(client_microphone::claim_writer(second_v3));
+
+  client_microphone::release_writer(same_numeric_v3);
+  EXPECT_FALSE(client_microphone::claim_writer(second_v3));
+  client_microphone::release_writer(legacy);
+
+  ASSERT_TRUE(client_microphone::claim_writer(same_numeric_v3));
+  EXPECT_TRUE(client_microphone::claim_writer(same_numeric_v3));
+  EXPECT_FALSE(client_microphone::claim_writer(legacy));
+  EXPECT_FALSE(client_microphone::claim_writer(second_v3));
+
+  client_microphone::release_writer(legacy);
+  EXPECT_FALSE(client_microphone::claim_writer(second_v3));
+  client_microphone::release_writer(same_numeric_v3);
+  ASSERT_TRUE(client_microphone::claim_writer(second_v3));
+  client_microphone::release_writer(second_v3);
+
+  EXPECT_FALSE(client_microphone::claim_writer(client_microphone::writer_owner_t::protocol_v3(0)));
 }
 
 TEST(ClientMicrophoneReceiver, RejectsNullDecoder) {

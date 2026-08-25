@@ -6,10 +6,14 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <ranges>
 #include <span>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -20,12 +24,23 @@
 #include <src/client_microphone.h>
 #include <src/client_microphone_protocol.h>
 #include <src/crypto.h>
+#include <src/protocol_v3/media_pipeline.h>
 #include <src/rtsp.h>
 #include <src/stream.h>
 
 using namespace std::literals;
 
 namespace {
+  namespace v3_media = lumen::protocol_v3::media;
+  namespace v3_quic = lumen::protocol_v3::quic_server;
+
+  template<class Integer>
+  void append_be(std::vector<std::uint8_t> &bytes, const Integer value) {
+    for (std::size_t index = 0; index < sizeof(Integer); ++index) {
+      bytes.push_back(static_cast<std::uint8_t>(value >> ((sizeof(Integer) - index - 1U) * 8U)));
+    }
+  }
+
   /** Decoder seam used by the authenticated integration test. */
   class integration_decoder_t final: public client_microphone::decoder_t {
   public:
@@ -69,6 +84,199 @@ namespace {
     std::uint64_t active_generation {};  ///< Generation currently accepted by the fake sink.
     std::vector<std::vector<std::int16_t>> frames;  ///< Complete PCM frames written by the receiver.
   };
+
+  /** @brief Minimal transport boundary required by the receive-only microphone composition. */
+  class microphone_transport_t final: public v3_media::TransportSink {
+  public:
+    bool update_policy(std::uint64_t, v3_quic::Profile, std::uint64_t) noexcept override {
+      return true;
+    }
+
+    v3_quic::EnqueueResult enqueue(std::uint64_t, v3_quic::Packet) override {
+      return v3_quic::EnqueueResult::queued;
+    }
+
+    v3_quic::EnqueueResult enqueue_video_frame(
+      std::uint64_t,
+      std::shared_ptr<const v3_quic::LazyVideoFrame>
+    ) override {
+      return v3_quic::EnqueueResult::queued;
+    }
+  };
+
+  class microphone_input_t final: public v3_media::InputSink {
+  public:
+    bool submit(const v3_media::InputBatch &) override {
+      return true;
+    }
+
+    void reset() noexcept override {
+    }
+  };
+
+  class microphone_feedback_t final: public v3_media::VideoFeedbackSink {
+  public:
+    void submit(const v3_media::VideoFeedback &) override {
+    }
+  };
+
+  /** @brief Thread-safe disposable endpoint recording PCM from the real playout clock. */
+  class clocked_integration_sink_t final: public client_microphone::sink_t {
+  public:
+    bool begin(std::uint64_t generation, std::uint32_t, std::uint8_t) override {
+      std::lock_guard lock {mutex_};
+      active_generation_ = generation;
+      return true;
+    }
+
+    bool write(std::uint64_t generation, std::span<const std::int16_t> samples) override {
+      std::lock_guard lock {mutex_};
+      if (generation != active_generation_) {
+        return false;
+      }
+      frames_.emplace_back(samples.begin(), samples.end());
+      changed_.notify_all();
+      return true;
+    }
+
+    void end(std::uint64_t generation) override {
+      std::lock_guard lock {mutex_};
+      if (generation == active_generation_) {
+        active_generation_ = 0;
+        ++end_calls_;
+      }
+      changed_.notify_all();
+    }
+
+    bool wait_for_frames(const std::size_t count, const std::chrono::milliseconds timeout) {
+      std::unique_lock lock {mutex_};
+      return changed_.wait_for(lock, timeout, [&]() {
+        return frames_.size() >= count;
+      });
+    }
+
+    std::vector<std::vector<std::int16_t>> frames() const {
+      std::lock_guard lock {mutex_};
+      return frames_;
+    }
+
+    std::size_t end_calls() const {
+      std::lock_guard lock {mutex_};
+      return end_calls_;
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    std::uint64_t active_generation_ {};
+    std::vector<std::vector<std::int16_t>> frames_;
+    std::size_t end_calls_ {};
+  };
+
+  /** @brief Marker decoder exposing reorder, FEC, and PLC choices in recorded PCM. */
+  class clocked_integration_decoder_t final: public client_microphone::decoder_t {
+  public:
+    int reset() override {
+      return 0;
+    }
+
+    int decode(
+      std::span<const std::uint8_t> payload,
+      const bool use_fec,
+      std::span<std::int16_t> output
+    ) override {
+      std::ranges::fill(output, static_cast<std::int16_t>(payload.front() + (use_fec ? 1000 : 0)));
+      return static_cast<int>(client_microphone::SAMPLES_PER_FRAME);
+    }
+
+    int conceal(std::span<std::int16_t> output) override {
+      std::ranges::fill(output, std::int16_t {-1});
+      return static_cast<int>(client_microphone::SAMPLES_PER_FRAME);
+    }
+  };
+
+  /** @brief Exact production-shaped v3 packet translation into the clocked receiver. */
+  class clocked_pipeline_microphone_t final: public v3_media::MicrophoneSink {
+  public:
+    explicit clocked_pipeline_microphone_t(const v3_media::NegotiatedMediaConfig &config):
+        generation_ {config.microphone_generation},
+        frame_samples_ {config.microphone.frame_samples},
+        receiver_ {std::make_unique<clocked_integration_decoder_t>(), sink_} {
+      started_ = receiver_.reset(generation_);
+    }
+
+    bool submit(const v3_media::MicrophonePacket &packet) override {
+      if (!started_) {
+        return false;
+      }
+      if ((packet.flags & 0x04U) != 0) {
+        receiver_.stop();
+        return true;
+      }
+      if ((packet.flags & 0x02U) != 0 && !receiver_.reset(packet.generation)) {
+        return false;
+      }
+      return receiver_.submit({
+               .generation = packet.generation,
+               .sequence = packet.first_sample_position / frame_samples_,
+               .timestamp = static_cast<std::uint32_t>(packet.first_sample_position),
+               .kind = (packet.flags & 0x01U) != 0 ?
+                         client_microphone::packet_kind_e::silence :
+                         client_microphone::packet_kind_e::opus,
+               .payload = {packet.opus.begin(), packet.opus.end()},
+             }) == client_microphone::submit_result_e::accepted;
+    }
+
+    void stop() noexcept override {
+      receiver_.stop();
+    }
+
+    bool wait_for_frames(std::size_t count, std::chrono::milliseconds timeout) {
+      return sink_.wait_for_frames(count, timeout);
+    }
+
+    std::vector<std::vector<std::int16_t>> frames() const {
+      return sink_.frames();
+    }
+
+    client_microphone::statistics_t statistics() const {
+      return receiver_.statistics();
+    }
+
+    std::size_t end_calls() const {
+      return sink_.end_calls();
+    }
+
+  private:
+    std::uint64_t generation_;
+    std::uint16_t frame_samples_;
+    clocked_integration_sink_t sink_;
+    client_microphone::clocked_receiver_t receiver_;
+    bool started_ {};
+  };
+
+  std::vector<std::uint8_t> microphone_payload(
+    const v3_media::NegotiatedMediaConfig &config,
+    const std::uint64_t first_sample_position,
+    const std::uint8_t marker
+  ) {
+    std::vector<std::uint8_t> payload;
+    append_be(payload, std::uint64_t {100});
+    append_be(payload, first_sample_position);
+    append_be(payload, config.microphone_generation);
+    append_be(payload, config.microphone.frame_samples);
+    payload.push_back(config.microphone.channels);
+    payload.push_back(config.microphone.layout);
+    payload.push_back(1);
+    payload.push_back(0);
+    payload.push_back(config.microphone.streams);
+    payload.push_back(config.microphone.coupled_streams);
+    payload.insert(payload.end(), config.microphone.mapping.begin(), config.microphone.mapping.end());
+    append_be(payload, config.microphone.bitrate_bps);
+    append_be(payload, std::uint64_t {0});
+    payload.push_back(marker);
+    return payload;
+  }
 }  // namespace
 
 TEST(ClientMicrophoneIntegrationTest, AdvertisesTheExactVersionOneCapability) {
@@ -382,4 +590,43 @@ TEST(ClientMicrophoneIntegrationTest, AuthenticatesAndDeliversSilenceThroughTheC
   EXPECT_TRUE(std::ranges::all_of(sink.frames.front(), [](std::int16_t sample) {
     return sample == 0;
   }));
+}
+
+TEST(ClientMicrophoneIntegrationTest, V3DatagramsDriveIndependentClockToRecordedDisposableEndpoint) {
+  using namespace std::chrono_literals;
+
+  v3_media::NegotiatedMediaConfig config;
+  config.session_id.fill(0xA5);
+  config.microphone_enabled = true;
+  microphone_transport_t transport;
+  microphone_input_t input;
+  microphone_feedback_t feedback;
+  clocked_pipeline_microphone_t microphone {config};
+  v3_media::SessionPipeline pipeline {config, transport, input, microphone, feedback};
+  ASSERT_TRUE(pipeline.bind_connection(1));
+
+  const auto submit = [&](const std::uint64_t semantic_sequence, const std::uint64_t sample, const std::uint8_t marker) {
+    const auto payload = microphone_payload(config, sample, marker);
+    return pipeline.receive({4, 1, 0, config.session_id, semantic_sequence, sample, payload});
+  };
+  ASSERT_EQ(submit(1, 10 * config.microphone.frame_samples, 10), v3_media::ReceiveResult::accepted);
+  ASSERT_EQ(submit(2, 12 * config.microphone.frame_samples, 12), v3_media::ReceiveResult::accepted);
+  ASSERT_EQ(submit(3, 15 * config.microphone.frame_samples, 15), v3_media::ReceiveResult::accepted);
+
+  ASSERT_TRUE(microphone.wait_for_frames(6, 750ms));
+  const auto frames = microphone.frames();
+  ASSERT_GE(frames.size(), 6U);
+  EXPECT_EQ(frames[0].front(), 10);
+  EXPECT_EQ(frames[1].front(), 1012);
+  EXPECT_EQ(frames[2].front(), 12);
+  EXPECT_EQ(frames[3].front(), -1);
+  EXPECT_EQ(frames[4].front(), 1015);
+  EXPECT_EQ(frames[5].front(), 15);
+  EXPECT_EQ(microphone.statistics().fec_frames, 2U);
+  EXPECT_EQ(microphone.statistics().plc_frames, 1U);
+
+  std::this_thread::sleep_for(client_microphone::INACTIVITY_TIMEOUT + 25ms);
+  EXPECT_EQ(microphone.statistics().inactivity_flushes, 1U);
+  pipeline.stop();
+  EXPECT_EQ(microphone.end_calls(), 1U);
 }

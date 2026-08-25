@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -24,6 +25,32 @@ namespace client_microphone {
   constexpr std::chrono::milliseconds INACTIVITY_TIMEOUT {500};  ///< Time without packets before state is flushed.
   constexpr std::size_t MAX_OPUS_PAYLOAD_SIZE = 1275;  ///< Maximum accepted Opus packet size in bytes.
   static_assert(JITTER_WINDOW == FRAME_DURATION * JITTER_TARGET_FRAMES);
+
+  /** @brief Protocol family competing for the single host microphone writer. */
+  enum class writer_protocol_e : std::uint8_t {
+    legacy,
+    protocol_v3,
+  };
+
+  /** @brief Collision-free writer identity shared by legacy and protocol v3. */
+  struct writer_owner_t {
+    writer_protocol_e protocol;  ///< Protocol family that acquired the writer.
+    std::uint64_t id;  ///< Nonzero family-local owner identifier.
+
+    friend bool operator==(const writer_owner_t &, const writer_owner_t &) = default;
+
+    /** @return Owner identity for a legacy RTSP launch session. */
+    static writer_owner_t legacy(std::uint32_t launch_session_id);
+
+    /** @return Owner identity for a protocol-v3 authenticated connection. */
+    static writer_owner_t protocol_v3(std::uint64_t connection_id);
+  };
+
+  /** @brief Claim the process-wide writer for an exact tagged owner. */
+  [[nodiscard]] bool claim_writer(writer_owner_t owner);
+
+  /** @brief Release the writer only when held by the exact tagged owner. */
+  void release_writer(writer_owner_t owner);
 
   /**
    * @brief Monotonic clock used by the externally driven playout scheduler.
@@ -298,6 +325,13 @@ namespace client_microphone {
     std::size_t poll(clock_t::time_point now);
 
     /**
+     * @brief Return the next monotonic deadline at which playout must run.
+     * @return Next 20 ms playout deadline, or no value before the first packet
+     *         or after the active generation stops.
+     */
+    std::optional<clock_t::time_point> next_poll_time() const;
+
+    /**
      * @brief Determine whether a generation is currently active.
      *
      * @return `true` after a successful reset and before stop.
@@ -328,5 +362,53 @@ namespace client_microphone {
   private:
     struct impl_t;
     std::unique_ptr<impl_t> impl_;  ///< Receiver implementation and bounded packet storage.
+  };
+
+  /**
+   * @brief Thread-safe receiver driven by an independent monotonic playout worker.
+   *
+   * Packet arrival only updates the bounded jitter buffer. A private worker waits
+   * for the receiver's exact next deadline and calls `poll()` independently, so
+   * arrival bursts cannot force immediate `now + JITTER_WINDOW` playout. `stop()`
+   * ends the current generation while keeping the worker reusable for reconnect;
+   * `shutdown()` joins the worker and permanently closes the wrapper.
+   */
+  class clocked_receiver_t {
+  public:
+    clocked_receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink);
+    ~clocked_receiver_t();
+
+    clocked_receiver_t(const clocked_receiver_t &) = delete;
+    clocked_receiver_t &operator=(const clocked_receiver_t &) = delete;
+    clocked_receiver_t(clocked_receiver_t &&) = delete;
+    clocked_receiver_t &operator=(clocked_receiver_t &&) = delete;
+
+    /** @brief Start or replace the active generation at the current monotonic time. */
+    bool reset(std::uint64_t generation);
+
+    /** @brief Submit one packet using its real monotonic arrival time. */
+    submit_result_e submit(packet_t packet);
+
+    /** @brief End the current generation without destroying the reusable worker. */
+    void stop();
+
+    /** @brief Permanently stop the generation and join the playout worker. */
+    void shutdown();
+
+    /** @return Whether a generation is active and the wrapper is not shut down. */
+    bool active() const;
+
+    /** @return Current generation identifier. */
+    std::uint64_t generation() const;
+
+    /** @return Number of queued packets, bounded by `MAX_QUEUED_PACKETS`. */
+    std::size_t queued_packets() const;
+
+    /** @return Thread-safe statistics snapshot for the current generation. */
+    statistics_t statistics() const;
+
+  private:
+    struct impl_t;
+    std::unique_ptr<impl_t> impl_;  ///< Synchronization, receiver, and playout worker state.
   };
 }  // namespace client_microphone
