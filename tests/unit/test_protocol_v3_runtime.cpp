@@ -16,6 +16,8 @@
 #include <fstream>
 #include <future>
 #include <gtest/gtest.h>
+#include <mutex>
+#include <new>
 #include <span>
 #include <thread>
 
@@ -82,18 +84,9 @@ namespace {
 
     void stop() noexcept override {
       ++state_->stop_calls;
-      auto completion = std::make_shared<std::promise<void>>();
-      auto completed = completion->get_future();
-      std::thread failure {[terminal_failure = terminal_failure_, completion]() noexcept {
-        terminal_failure();
-        completion->set_value();
-      }};
-      if (completed.wait_for(std::chrono::seconds {1}) == std::future_status::ready) {
-        failure.join();
-      } else {
-        state_->lock_inversion_observed.store(true);
-        failure.detach();
-      }
+      ++state_->callback_calls;
+      terminal_failure_();
+      state_->callback_finished.store(true);
     }
 
   private:
@@ -139,7 +132,7 @@ namespace {
     std::expected<std::unique_ptr<runtime::SessionResources>, std::uint8_t> create(
       const media::NegotiatedMediaConfig &,
       std::uint64_t,
-      std::function<void()>
+      std::weak_ptr<runtime::TerminalFailureDispatcher>
     ) override {
       return std::unexpected(std::uint8_t {8});
     }
@@ -178,7 +171,7 @@ namespace {
     std::expected<std::unique_ptr<runtime::SessionResources>, std::uint8_t> create(
       const media::NegotiatedMediaConfig &config,
       std::uint64_t,
-      std::function<void()>
+      std::weak_ptr<runtime::TerminalFailureDispatcher>
     ) override {
       auto effective = config;
       effective.static_hdr_metadata = resolved_metadata;
@@ -228,7 +221,7 @@ namespace {
     std::expected<std::unique_ptr<runtime::SessionResources>, std::uint8_t> create(
       const media::NegotiatedMediaConfig &config,
       std::uint64_t,
-      std::function<void()>
+      std::weak_ptr<runtime::TerminalFailureDispatcher>
     ) override {
       ++create_calls;
       events_.emplace_back("resource.create");
@@ -285,6 +278,239 @@ namespace {
     bool update_policy(std::uint64_t, quic::Profile, std::uint64_t) noexcept override {
       return true;
     }
+  };
+
+  struct LifetimeFailureState {
+    void record(std::string value) {
+      std::scoped_lock lock {events_mutex};
+      events.push_back(std::move(value));
+    }
+
+    std::vector<std::string> snapshot() const {
+      std::scoped_lock lock {events_mutex};
+      return events;
+    }
+
+    std::atomic_int resource_stops {};
+    std::atomic_int resource_destructions {};
+    std::atomic_int failure_attempts {};
+    mutable std::mutex events_mutex;
+    std::vector<std::string> events;
+  };
+
+  class LifetimeFailureResources final: public runtime::SessionResources {
+  public:
+    LifetimeFailureResources(
+      media::NegotiatedMediaConfig effective,
+      std::shared_ptr<LifetimeFailureState> state,
+      std::weak_ptr<runtime::TerminalFailureDispatcher> terminal_failure,
+      const bool report_while_stopping
+    ):
+        effective_ {std::move(effective)},
+        state_ {std::move(state)},
+        terminal_failure_ {std::move(terminal_failure)},
+        report_while_stopping_ {report_while_stopping} {
+    }
+
+    ~LifetimeFailureResources() override {
+      ++state_->resource_destructions;
+      state_->record("resource.destroy");
+    }
+
+    const media::NegotiatedMediaConfig &effective_media_config() const noexcept override {
+      return effective_;
+    }
+
+    std::span<const std::uint8_t> video_codec_initialization() const noexcept override {
+      return initialization_;
+    }
+
+    bool reset_input(std::span<const std::uint8_t>, std::uint32_t) override {
+      return true;
+    }
+
+    bool apply_text(const control::cbor::Value::Map &) override {
+      return true;
+    }
+
+    media::ReceiveResult datagram(const quic::DatagramRecord &) override {
+      return media::ReceiveResult::accepted;
+    }
+
+    bool start_media() override {
+      return true;
+    }
+
+    void detach_connection() noexcept override {}
+
+    bool attach_connection(std::uint64_t) override {
+      return true;
+    }
+
+    void stop() noexcept override {
+      bool expected = false;
+      if (!stopped_.compare_exchange_strong(expected, true)) {
+        return;
+      }
+      ++state_->resource_stops;
+      state_->record("resource.stop");
+      if (report_while_stopping_) {
+        ++state_->failure_attempts;
+        if (const auto terminal_failure = terminal_failure_.lock()) {
+          terminal_failure->report();
+        }
+      }
+    }
+
+  private:
+    media::NegotiatedMediaConfig effective_;
+    std::shared_ptr<LifetimeFailureState> state_;
+    std::weak_ptr<runtime::TerminalFailureDispatcher> terminal_failure_;
+    const std::array<std::uint8_t, 1> initialization_ {0x01};
+    bool report_while_stopping_ {};
+    std::atomic_bool stopped_ {};
+  };
+
+  enum class LifetimeFactoryMode {
+    success,
+    report_and_succeed,
+    report_and_error,
+    null_resource,
+    throw_allocation,
+  };
+
+  class LifetimeFailureFactory final: public runtime::SessionResourceFactory {
+  public:
+    LifetimeFailureFactory(
+      std::shared_ptr<LifetimeFailureState> state,
+      const LifetimeFactoryMode mode = LifetimeFactoryMode::success,
+      const bool report_while_stopping = false
+    ):
+        state_ {std::move(state)},
+        mode_ {mode},
+        report_while_stopping_ {report_while_stopping} {
+    }
+
+    std::expected<std::unique_ptr<runtime::SessionResources>, std::uint8_t> create(
+      const media::NegotiatedMediaConfig &config,
+      std::uint64_t,
+      std::weak_ptr<runtime::TerminalFailureDispatcher> terminal_failure
+    ) override {
+      terminal_failure_ = terminal_failure;
+      state_->record("resource.create");
+      if (mode_ == LifetimeFactoryMode::throw_allocation) {
+        throw std::bad_alloc {};
+      }
+      if (mode_ == LifetimeFactoryMode::report_and_succeed ||
+          mode_ == LifetimeFactoryMode::report_and_error) {
+        trigger_failure();
+      }
+      if (mode_ == LifetimeFactoryMode::report_and_error) {
+        return std::unexpected(static_cast<std::uint8_t>(ProtocolStatus::resource_failure));
+      }
+      if (mode_ == LifetimeFactoryMode::null_resource) {
+        return std::unique_ptr<runtime::SessionResources> {};
+      }
+      return std::make_unique<LifetimeFailureResources>(
+        config,
+        state_,
+        terminal_failure,
+        report_while_stopping_
+      );
+    }
+
+    bool trigger_failure() noexcept {
+      ++state_->failure_attempts;
+      if (const auto terminal_failure = terminal_failure_.lock()) {
+        terminal_failure->report();
+        return true;
+      }
+      return false;
+    }
+
+  private:
+    std::shared_ptr<LifetimeFailureState> state_;
+    LifetimeFactoryMode mode_;
+    bool report_while_stopping_ {};
+    std::weak_ptr<runtime::TerminalFailureDispatcher> terminal_failure_;
+  };
+
+  class LifetimeApplicationBridge final: public runtime::ApplicationBridge {
+  public:
+    explicit LifetimeApplicationBridge(std::shared_ptr<LifetimeFailureState> state):
+        state_ {std::move(state)} {
+    }
+
+    std::expected<runtime::ApplicationSnapshot, std::uint8_t> snapshot() override {
+      return std::unexpected(static_cast<std::uint8_t>(ProtocolStatus::resource_failure));
+    }
+
+    std::expected<runtime::ApplicationAsset, std::uint8_t> asset(
+      std::uint64_t,
+      const control::Bytes32 &
+    ) override {
+      return std::unexpected(static_cast<std::uint8_t>(ProtocolStatus::resource_failure));
+    }
+
+    std::expected<bool, std::uint8_t> start(const runtime::ApplicationLaunch &) override {
+      ++start_calls;
+      state_->record("application.start");
+      return true;
+    }
+
+    bool stop(bool) noexcept override {
+      ++stop_calls;
+      state_->record("application.stop");
+      return true;
+    }
+
+    bool running() noexcept override {
+      return false;
+    }
+
+    std::atomic_int start_calls {};
+    std::atomic_int stop_calls {};
+
+  private:
+    std::shared_ptr<LifetimeFailureState> state_;
+  };
+
+  class LifetimeTransport final: public runtime::QuicTransportSink {
+  public:
+    explicit LifetimeTransport(std::shared_ptr<LifetimeFailureState> state):
+        state_ {std::move(state)} {
+    }
+
+    bool update_policy(std::uint64_t, quic::Profile, std::uint64_t) noexcept override {
+      ++update_calls;
+      state_->record("transport.update");
+      return true;
+    }
+
+    bool reset_policy(std::uint64_t) noexcept override {
+      ++reset_calls;
+      state_->record("transport.reset");
+      return true;
+    }
+
+    bool revoke(std::uint64_t) noexcept override {
+      ++revoke_calls;
+      state_->record("transport.revoke");
+      return true;
+    }
+
+    quic::EnqueueResult enqueue(std::uint64_t, quic::Packet) override {
+      ++enqueue_calls;
+      return quic::EnqueueResult::queued;
+    }
+
+    std::atomic_int update_calls {};
+    std::atomic_int reset_calls {};
+    std::atomic_int revoke_calls {};
+    std::atomic_int enqueue_calls {};
+
+  private:
+    std::shared_ptr<LifetimeFailureState> state_;
   };
 
   const control::cbor::Value *map_field(
@@ -391,6 +617,28 @@ namespace {
     }
     const auto *status = std::get_if<std::uint64_t>(&result.response_fields.front().second.storage);
     return status ? *status : UINT64_MAX;
+  }
+
+  control::ClientRecord start_client(const std::uint8_t identity_byte = 0x81) {
+    control::ClientRecord client {
+      .client_id = control::Identifier {},
+      .permissions = control::start_permission | control::stop_permission,
+      .generation = 1,
+    };
+    client.client_id.fill(identity_byte);
+    return client;
+  }
+
+  template<typename Predicate>
+  bool wait_for(const std::chrono::milliseconds timeout, Predicate &&predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds {1});
+    }
+    return true;
   }
 
   template<std::size_t Size>
@@ -855,10 +1103,8 @@ TEST(ProtocolV3Runtime, StopDetachesOwnershipBeforeTerminalCallbackAndRemainsReu
 
   const auto run_stop = [&](const std::uint8_t intent_byte) {
     auto state = std::make_shared<StopRaceState>();
-    auto resources = std::make_unique<StopRaceResources>(state, [&, state]() noexcept {
-      ++state->callback_calls;
+    auto resources = std::make_unique<StopRaceResources>(state, [&]() noexcept {
       backend.mark_failed_for_test(session_id);
-      state->callback_finished.store(true);
     });
     EXPECT_TRUE(backend.install_session_for_test(client.client_id, session_id, 41, std::move(resources)));
 
@@ -910,4 +1156,261 @@ TEST(ProtocolV3Runtime, StopDetachesOwnershipBeforeTerminalCallbackAndRemainsReu
   EXPECT_EQ(first->callback_calls.load(), 1);
   EXPECT_EQ(second->callback_calls.load(), 1);
   EXPECT_EQ(applications.stop_calls.load(), 2);
+}
+
+TEST(ProtocolV3Runtime, LifeU03LatchesFailureDuringFactoryCreateBeforeCommit) {
+  const auto state = std::make_shared<LifetimeFailureState>();
+  control::SecureRandom random;
+  LifetimeApplicationBridge applications {state};
+  LifetimeFailureFactory factory {state, LifetimeFactoryMode::report_and_succeed};
+  LifetimeTransport transport {state};
+  runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+  const auto client = start_client();
+
+  const auto started_at = std::chrono::steady_clock::now();
+  const auto started = backend.start(
+    client,
+    sdr_h264_start_fields(1920, 1080),
+    81,
+    quic::maximum_semantic_datagram_bytes
+  );
+  const auto elapsed = std::chrono::steady_clock::now() - started_at;
+
+  ASSERT_FALSE(started.has_value());
+  EXPECT_EQ(started.error(), static_cast<std::uint8_t>(ProtocolStatus::resource_failure));
+  EXPECT_LT(elapsed, std::chrono::seconds {2});
+  EXPECT_EQ(applications.start_calls.load(), 0);
+  EXPECT_EQ(applications.stop_calls.load(), 0);
+  EXPECT_EQ(state->resource_stops.load(), 1);
+  EXPECT_EQ(state->resource_destructions.load(), 1);
+  EXPECT_EQ(transport.update_calls.load(), 1);
+  EXPECT_EQ(transport.reset_calls.load(), 1);
+  EXPECT_FALSE(backend.owned_session(client).has_value());
+  EXPECT_FALSE(factory.trigger_failure());
+}
+
+TEST(ProtocolV3Runtime, LifeI01FactoryFailureModesRollbackPolicyWithoutPublication) {
+  const std::array modes {
+    LifetimeFactoryMode::report_and_error,
+    LifetimeFactoryMode::null_resource,
+    LifetimeFactoryMode::throw_allocation,
+  };
+  for (std::size_t index = 0; index < modes.size(); ++index) {
+    SCOPED_TRACE(index);
+    const auto state = std::make_shared<LifetimeFailureState>();
+    control::SecureRandom random;
+    LifetimeApplicationBridge applications {state};
+    LifetimeFailureFactory factory {state, modes[index]};
+    LifetimeTransport transport {state};
+    runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+    const auto client = start_client(static_cast<std::uint8_t>(0x82 + index));
+
+    const auto started = backend.start(
+      client,
+      sdr_h264_start_fields(1920, 1080),
+      82 + index,
+      quic::maximum_semantic_datagram_bytes
+    );
+
+    ASSERT_FALSE(started.has_value());
+    EXPECT_EQ(started.error(), static_cast<std::uint8_t>(ProtocolStatus::resource_failure));
+    EXPECT_EQ(applications.start_calls.load(), 0);
+    EXPECT_EQ(applications.stop_calls.load(), 0);
+    EXPECT_EQ(state->resource_stops.load(), 0);
+    EXPECT_EQ(transport.update_calls.load(), 1);
+    EXPECT_EQ(transport.reset_calls.load(), 1);
+    EXPECT_FALSE(backend.owned_session(client).has_value());
+    EXPECT_FALSE(factory.trigger_failure());
+  }
+}
+
+TEST(ProtocolV3Runtime, LifeU01PostCommitFailureTerminatesExactlyOnce) {
+  const auto state = std::make_shared<LifetimeFailureState>();
+  control::SecureRandom random;
+  LifetimeApplicationBridge applications {state};
+  LifetimeFailureFactory factory {state};
+  LifetimeTransport transport {state};
+  runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+  const auto client = start_client(0x91);
+
+  const auto started = backend.start(
+    client,
+    sdr_h264_start_fields(1920, 1080),
+    91,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_TRUE(started.has_value());
+  ASSERT_TRUE(backend.owned_session(client).has_value());
+
+  const auto failed_at = std::chrono::steady_clock::now();
+  EXPECT_TRUE(factory.trigger_failure());
+  EXPECT_TRUE(factory.trigger_failure());
+  ASSERT_TRUE(wait_for(std::chrono::seconds {2}, [&]() {
+    return !backend.owned_session(client).has_value() && state->resource_destructions.load() == 1;
+  }));
+  EXPECT_LT(std::chrono::steady_clock::now() - failed_at, std::chrono::seconds {2});
+  EXPECT_EQ(state->resource_stops.load(), 1);
+  EXPECT_EQ(state->resource_destructions.load(), 1);
+  EXPECT_EQ(applications.stop_calls.load(), 0);
+  EXPECT_EQ(transport.enqueue_calls.load(), 2);
+  EXPECT_FALSE(factory.trigger_failure());
+}
+
+TEST(ProtocolV3Runtime, LifeU02StopRevokesFailureBeforeResourceJoin) {
+  const auto state = std::make_shared<LifetimeFailureState>();
+  control::SecureRandom random;
+  LifetimeApplicationBridge applications {state};
+  LifetimeFailureFactory factory {state, LifetimeFactoryMode::success, true};
+  LifetimeTransport transport {state};
+  runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+  const auto client = start_client(0x92);
+  const auto started = backend.start(
+    client,
+    sdr_h264_start_fields(1920, 1080),
+    92,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_TRUE(started.has_value());
+
+  const auto stopped_at = std::chrono::steady_clock::now();
+  const auto stopped = backend.control(
+    client,
+    control::AuthenticatedControl::stop,
+    stop_fields(started->session_id, 0x92),
+    92,
+    92,
+    1
+  );
+  const auto elapsed = std::chrono::steady_clock::now() - stopped_at;
+
+  ASSERT_TRUE(stopped.has_value());
+  EXPECT_EQ(result_status(*stopped), 0U);
+  EXPECT_LT(elapsed, std::chrono::seconds {2});
+  EXPECT_EQ(state->failure_attempts.load(), 1);
+  EXPECT_EQ(state->resource_stops.load(), 1);
+  EXPECT_EQ(state->resource_destructions.load(), 1);
+  EXPECT_EQ(applications.stop_calls.load(), 1);
+  EXPECT_EQ(transport.reset_calls.load(), 1);
+  EXPECT_EQ(transport.enqueue_calls.load(), 0);
+  EXPECT_FALSE(backend.owned_session(client).has_value());
+}
+
+TEST(ProtocolV3Runtime, LifeU03BackendDestructionRevokesAndCompletesWithinStopBound) {
+  const auto state = std::make_shared<LifetimeFailureState>();
+  control::SecureRandom random;
+  LifetimeApplicationBridge applications {state};
+  LifetimeFailureFactory factory {state, LifetimeFactoryMode::success, true};
+  LifetimeTransport transport {state};
+  const auto client = start_client(0x93);
+
+  const auto destroyed_at = std::chrono::steady_clock::now();
+  {
+    runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+    const auto started = backend.start(
+      client,
+      sdr_h264_start_fields(1920, 1080),
+      93,
+      quic::maximum_semantic_datagram_bytes
+    );
+    ASSERT_TRUE(started.has_value());
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - destroyed_at;
+
+  EXPECT_LT(elapsed, std::chrono::seconds {5});
+  EXPECT_EQ(state->failure_attempts.load(), 1);
+  EXPECT_EQ(state->resource_stops.load(), 1);
+  EXPECT_EQ(state->resource_destructions.load(), 1);
+  EXPECT_EQ(applications.stop_calls.load(), 1);
+  EXPECT_EQ(transport.revoke_calls.load(), 1);
+  EXPECT_EQ(transport.enqueue_calls.load(), 0);
+  EXPECT_FALSE(factory.trigger_failure());
+}
+
+TEST(ProtocolV3Runtime, LifeU01ConcurrentFailureAndBackendDestructionRemainGenerationSafe) {
+  const auto state = std::make_shared<LifetimeFailureState>();
+  control::SecureRandom random;
+  LifetimeApplicationBridge applications {state};
+  LifetimeFailureFactory factory {state, LifetimeFactoryMode::success, true};
+  LifetimeTransport transport {state};
+  const auto client = start_client(0x95);
+  auto backend = std::make_unique<runtime::ProductionSessionBackend>(
+    random,
+    applications,
+    factory,
+    transport
+  );
+  const auto started = backend->start(
+    client,
+    sdr_h264_start_fields(1920, 1080),
+    95,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_TRUE(started.has_value());
+
+  std::atomic_bool release_reporter {};
+  std::atomic_bool reporter_ready {};
+  std::jthread reporter {[&]() noexcept {
+    reporter_ready.store(true, std::memory_order_release);
+    while (!release_reporter.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    static_cast<void>(factory.trigger_failure());
+    static_cast<void>(factory.trigger_failure());
+  }};
+  ASSERT_TRUE(wait_for(std::chrono::seconds {1}, [&]() {
+    return reporter_ready.load(std::memory_order_acquire);
+  }));
+
+  const auto destroyed_at = std::chrono::steady_clock::now();
+  release_reporter.store(true, std::memory_order_release);
+  backend.reset();
+  reporter.join();
+  const auto elapsed = std::chrono::steady_clock::now() - destroyed_at;
+
+  EXPECT_LT(elapsed, std::chrono::seconds {5});
+  EXPECT_EQ(state->resource_stops.load(), 1);
+  EXPECT_EQ(state->resource_destructions.load(), 1);
+  EXPECT_LE(applications.stop_calls.load(), 1);
+  EXPECT_FALSE(factory.trigger_failure());
+}
+
+TEST(ProtocolV3Runtime, LifeI02PostApplicationPreCommitFailureRollsBackExactlyOnce) {
+  const auto state = std::make_shared<LifetimeFailureState>();
+  control::SecureRandom random;
+  LifetimeApplicationBridge applications {state};
+  LifetimeFailureFactory factory {state};
+  LifetimeTransport transport {state};
+  runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+  const auto client = start_client(0x94);
+  backend.fail_next_start_before_commit_for_test();
+
+  const auto started = backend.start(
+    client,
+    sdr_h264_start_fields(1920, 1080),
+    94,
+    quic::maximum_semantic_datagram_bytes
+  );
+
+  ASSERT_FALSE(started.has_value());
+  EXPECT_EQ(started.error(), static_cast<std::uint8_t>(ProtocolStatus::resource_failure));
+  EXPECT_EQ(state->resource_stops.load(), 1);
+  EXPECT_EQ(state->resource_destructions.load(), 1);
+  EXPECT_EQ(applications.start_calls.load(), 1);
+  EXPECT_EQ(applications.stop_calls.load(), 1);
+  EXPECT_EQ(transport.update_calls.load(), 1);
+  EXPECT_EQ(transport.reset_calls.load(), 1);
+  EXPECT_FALSE(backend.owned_session(client).has_value());
+  EXPECT_EQ(
+    state->snapshot(),
+    (std::vector<std::string> {
+      "transport.update",
+      "resource.create",
+      "application.start",
+      "resource.stop",
+      "application.stop",
+      "transport.reset",
+      "resource.destroy",
+    })
+  );
+  EXPECT_FALSE(factory.trigger_failure());
 }

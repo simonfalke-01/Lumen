@@ -3061,7 +3061,7 @@ namespace stream {
         v3_media::NegotiatedMediaConfig selection,
         const std::uint64_t connection_id,
         v3_media::TransportSink &transport,
-        std::function<void()> terminal_failure
+        std::weak_ptr<v3_runtime::TerminalFailureDispatcher> terminal_failure
       ):
           selection_ {std::move(selection)},
           session_owner_id_ {connection_id},
@@ -3080,7 +3080,7 @@ namespace stream {
           }
         });
   #endif
-        if (!terminal_failure_ || !input_) {
+        if (terminal_failure_.expired() || !input_) {
           throw std::runtime_error {"protocol-v3 native resource allocation"};
         }
         if (selection_.fidelity == 3 &&
@@ -4419,30 +4419,13 @@ namespace stream {
         if (!claim_terminal_failure()) {
           return;
         }
-        try {
-          terminal_failure_();
-        } catch (...) {
+        if (const auto terminal_failure = terminal_failure_.lock()) {
+          terminal_failure->report();
         }
       }
 
       void report_terminal_failure_async() noexcept {
-        if (!claim_terminal_failure()) {
-          return;
-        }
-        auto callback = terminal_failure_;
-        try {
-          std::thread([callback]() mutable noexcept {
-            try {
-              callback();
-            } catch (...) {
-            }
-          }).detach();
-        } catch (...) {
-          try {
-            callback();
-          } catch (...) {
-          }
-        }
+        report_terminal_failure();
       }
 
       bool claim_terminal_failure() noexcept {
@@ -4483,7 +4466,7 @@ namespace stream {
 
       v3_media::NegotiatedMediaConfig selection_;
       [[maybe_unused]] std::uint64_t session_owner_id_ {};  ///< Nonzero exact owner for VDD and runtime resources.
-      std::function<void()> terminal_failure_;
+      std::weak_ptr<v3_runtime::TerminalFailureDispatcher> terminal_failure_;
       std::vector<std::uint8_t> codec_initialization_;
       safe::mail_t mail_;
       std::shared_ptr<input::input_t> input_;
@@ -4533,7 +4516,7 @@ namespace stream {
       std::expected<std::unique_ptr<v3_runtime::SessionResources>, std::uint8_t> create(
         const v3_media::NegotiatedMediaConfig &config,
         const std::uint64_t connection_id,
-        std::function<void()> terminal_failure
+        std::weak_ptr<v3_runtime::TerminalFailureDispatcher> terminal_failure
       ) override {
         try {
           return std::make_unique<native_v3_session_resources>(

@@ -8,7 +8,9 @@
 #include "control_session.h"
 #include "media_pipeline.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -227,6 +229,43 @@ namespace lumen::protocol_v3::runtime {
     bool running() noexcept override;
   };
 
+  /**
+   * @brief Revocable, generation-scoped terminal-failure latch for one START transaction.
+   *
+   * The backend owns the strong dispatcher reference while a START is staging or
+   * committed. Native resources receive only a weak reference, so a late report
+   * cannot extend or dereference backend lifetime. Reporting is allocation-free
+   * and only wakes the backend watchdog; terminal work never runs inline.
+   */
+  class TerminalFailureDispatcher final {
+  public:
+    /**
+     * @brief Construct one dispatcher bound to a backend watchdog control block.
+     *
+     * @param generation Nonzero monotonically increasing dispatcher generation.
+     * @param watchdog Backend-owned watchdog wakeup control block.
+     */
+    TerminalFailureDispatcher(
+      std::uint64_t generation,
+      std::weak_ptr<std::condition_variable_any> watchdog
+    ) noexcept;
+
+    /** @brief Latch and enqueue one terminal failure without blocking or allocating. */
+    void report() noexcept;
+    /** @brief Revoke the dispatcher before resource stop/join begins. */
+    void revoke() noexcept;
+    /** @brief Return whether a terminal failure was latched for this generation. */
+    [[nodiscard]] bool reported() const noexcept;
+    /** @brief Return the immutable nonzero dispatcher generation. */
+    [[nodiscard]] std::uint64_t generation() const noexcept;
+
+  private:
+    std::uint64_t generation_ {};  ///< Immutable backend-issued lifetime generation.
+    std::weak_ptr<std::condition_variable_any> watchdog_;  ///< Weak backend watchdog control block.
+    std::atomic_bool revoked_ {};  ///< True once backend ownership is withdrawn.
+    std::atomic_bool reported_ {};  ///< One-way terminal-failure latch.
+  };
+
   /** @brief START-owned live resources behind the authenticated control backend. */
   class SessionResources {
   public:
@@ -260,7 +299,7 @@ namespace lumen::protocol_v3::runtime {
     virtual std::expected<std::unique_ptr<SessionResources>, std::uint8_t> create(
       const media::NegotiatedMediaConfig &config,
       std::uint64_t connection_id,
-      std::function<void()> terminal_failure
+      std::weak_ptr<TerminalFailureDispatcher> terminal_failure
     ) = 0;
   };
 
@@ -278,9 +317,9 @@ namespace lumen::protocol_v3::runtime {
       std::uint64_t default_video_bitrate_kbps
     ) noexcept;
     /** @brief Revoke a replaced connection and all queued transport work. */
-    bool revoke(std::uint64_t connection_id) noexcept;
+    virtual bool revoke(std::uint64_t connection_id) noexcept;
     /** @brief Restore a retained authenticated connection to listener defaults. */
-    bool reset_policy(std::uint64_t connection_id) noexcept;
+    virtual bool reset_policy(std::uint64_t connection_id) noexcept;
     bool update_policy(
       std::uint64_t connection_id,
       quic_server::Profile profile,
@@ -366,6 +405,8 @@ namespace lumen::protocol_v3::runtime {
      * @param session_id Exact session identifier to mark failed.
      */
     void mark_failed_for_test(const control::Identifier &session_id) noexcept;
+    /** @brief Inject one post-application, pre-commit resource failure. */
+    void fail_next_start_before_commit_for_test() noexcept;
 #endif
 
   private:

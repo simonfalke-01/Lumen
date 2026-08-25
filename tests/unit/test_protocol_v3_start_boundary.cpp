@@ -160,7 +160,7 @@ namespace {
     std::expected<std::unique_ptr<runtime::SessionResources>, std::uint8_t> create(
       const media::NegotiatedMediaConfig &config,
       std::uint64_t,
-      std::function<void()>
+      std::weak_ptr<runtime::TerminalFailureDispatcher>
     ) override {
       ++create_calls;
       selected = config;

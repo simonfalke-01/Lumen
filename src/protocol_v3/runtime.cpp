@@ -1158,6 +1158,42 @@ namespace lumen::protocol_v3::runtime {
                      quic_server::EnqueueResult::shutting_down;
   }
 
+  TerminalFailureDispatcher::TerminalFailureDispatcher(
+    const std::uint64_t generation,
+    std::weak_ptr<std::condition_variable_any> watchdog
+  ) noexcept:
+      generation_ {generation},
+      watchdog_ {std::move(watchdog)} {
+  }
+
+  void TerminalFailureDispatcher::report() noexcept {
+    if (revoked_.load(std::memory_order_acquire)) {
+      return;
+    }
+    bool expected = false;
+    if (!reported_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      return;
+    }
+    if (revoked_.load(std::memory_order_acquire)) {
+      return;
+    }
+    if (const auto watchdog = watchdog_.lock()) {
+      watchdog->notify_all();
+    }
+  }
+
+  void TerminalFailureDispatcher::revoke() noexcept {
+    revoked_.store(true, std::memory_order_release);
+  }
+
+  bool TerminalFailureDispatcher::reported() const noexcept {
+    return reported_.load(std::memory_order_acquire);
+  }
+
+  std::uint64_t TerminalFailureDispatcher::generation() const noexcept {
+    return generation_;
+  }
+
   struct ProductionSessionBackend::Impl {
     struct ActiveSession {
       control::Identifier owner_client_id {};
@@ -1181,6 +1217,8 @@ namespace lumen::protocol_v3::runtime {
       quic_server::MonotonicClock::time_point configuration_deadline {};
       std::optional<quic_server::MonotonicClock::time_point> attach_deadline;
       AttachIntentCache attach_outcomes;
+      std::uint64_t terminal_failure_generation {};
+      std::shared_ptr<TerminalFailureDispatcher> terminal_failure;
       std::unique_ptr<SessionResources> resources;
     };
 
@@ -1200,15 +1238,48 @@ namespace lumen::protocol_v3::runtime {
     }
 
     ~Impl() {
+      struct StoppedSession {
+        std::unique_ptr<SessionResources> resources;
+        std::uint64_t connection_id {};
+        bool launched_application {};
+      };
+
+      std::array<StoppedSession, 8> stopped_sessions;
+      std::size_t stopped_session_count {};
+      {
+        std::scoped_lock lock {mutex};
+        shutting_down = true;
+        for (auto &[_, session] : sessions) {
+          if (session.terminal_failure) {
+            session.terminal_failure->revoke();
+          }
+          if (session.resources && stopped_session_count < stopped_sessions.size()) {
+            stopped_sessions[stopped_session_count++] = {
+              std::move(session.resources),
+              session.connection_id,
+              session.launched_application,
+            };
+          }
+        }
+        sessions.clear();
+        terminal_closures.clear();
+        watchdog_wakeup->notify_all();
+      }
+      for (std::size_t index = 0; index < stopped_session_count; ++index) {
+        auto &session = stopped_sessions[index];
+        session.resources->stop();
+        if (session.launched_application) {
+          applications.stop(true);
+        }
+        if (session.connection_id != 0) {
+          static_cast<void>(transport.revoke(session.connection_id));
+        }
+      }
       watchdog.request_stop();
-      watchdog_wakeup.notify_all();
+      watchdog_wakeup->notify_all();
       if (watchdog.joinable()) {
         watchdog.join();
       }
-      for (auto &[_, session] : sessions) {
-        session.resources->stop();
-      }
-      sessions.clear();
     }
 
     void run_watchdog(const std::stop_token stop_token) noexcept {
@@ -1239,18 +1310,27 @@ namespace lumen::protocol_v3::runtime {
             return earliest;
           }();
           if (deadline == quic_server::MonotonicClock::time_point::max()) {
-            watchdog_wakeup.wait(lock, stop_token, [&]() {
-              return stop_token.stop_requested() || std::ranges::any_of(sessions, [](const auto &entry) {
+            watchdog_wakeup->wait(lock, stop_token, [&]() {
+              return stop_token.stop_requested() || shutting_down || std::ranges::any_of(sessions, [](const auto &entry) {
                        return !entry.second.media_started || entry.second.attach_deadline.has_value();
                      }) ||
-                     !failed_sessions.empty() || !terminal_closures.empty();
+                     std::ranges::any_of(sessions, [](const auto &entry) {
+                       return entry.second.terminal_failure &&
+                              entry.second.terminal_failure->generation() == entry.second.terminal_failure_generation &&
+                              entry.second.terminal_failure->reported();
+                     }) ||
+                     !terminal_closures.empty();
             });
           } else {
-            watchdog_wakeup.wait_until(lock, stop_token, deadline, []() {
-              return false;
+            watchdog_wakeup->wait_until(lock, stop_token, deadline, [this]() {
+              return shutting_down || std::ranges::any_of(sessions, [](const auto &entry) {
+                       return entry.second.terminal_failure &&
+                              entry.second.terminal_failure->generation() == entry.second.terminal_failure_generation &&
+                              entry.second.terminal_failure->reported();
+                     });
             });
           }
-          if (stop_token.stop_requested()) {
+          if (stop_token.stop_requested() || shutting_down) {
             return;
           }
           const auto now = quic_server::MonotonicClock::now();
@@ -1264,10 +1344,16 @@ namespace lumen::protocol_v3::runtime {
             }
           }
           for (auto session = sessions.begin(); session != sessions.end();) {
-            const auto terminal_failure = failed_sessions.erase(session->first) != 0;
+            const auto terminal_failure = session->second.terminal_failure &&
+                                          session->second.terminal_failure->generation() ==
+                                            session->second.terminal_failure_generation &&
+                                          session->second.terminal_failure->reported();
             if (terminal_failure ||
                 (!session->second.media_started && now >= session->second.configuration_deadline) ||
                 (session->second.attach_deadline && now >= *session->second.attach_deadline)) {
+              if (session->second.terminal_failure) {
+                session->second.terminal_failure->revoke();
+              }
               expired.push_back({
                 std::move(session->second.resources),
                 session->first,
@@ -1329,7 +1415,7 @@ namespace lumen::protocol_v3::runtime {
             std::scoped_lock lock {mutex};
             terminal_closures[session.connection_id] =
               quic_server::MonotonicClock::now() + std::chrono::milliseconds {250};
-            watchdog_wakeup.notify_all();
+            watchdog_wakeup->notify_all();
           } else if (session.connection_id != 0) {
             static_cast<void>(transport.revoke(session.connection_id));
           }
@@ -1337,12 +1423,12 @@ namespace lumen::protocol_v3::runtime {
       }
     }
 
-    void mark_failed(const control::Identifier &session_id) noexcept {
-      std::scoped_lock lock {mutex};
-      if (sessions.contains(session_id)) {
-        failed_sessions.insert(session_id);
-        watchdog_wakeup.notify_all();
+    std::shared_ptr<TerminalFailureDispatcher> make_terminal_failure_dispatcher() {
+      if (next_terminal_failure_generation == UINT64_MAX) {
+        return {};
       }
+      const auto generation = next_terminal_failure_generation++;
+      return std::make_shared<TerminalFailureDispatcher>(generation, watchdog_wakeup);
     }
 
     template<std::size_t Size>
@@ -1371,12 +1457,18 @@ namespace lumen::protocol_v3::runtime {
     SessionResourceFactory &factory;
     QuicTransportSink &transport;
     std::mutex mutex;
-    std::condition_variable_any watchdog_wakeup;
+    std::shared_ptr<std::condition_variable_any> watchdog_wakeup {
+      std::make_shared<std::condition_variable_any>()
+    };
     std::map<control::Identifier, ActiveSession> sessions;
     std::map<std::pair<control::Identifier, control::Identifier>, quic_server::MonotonicClock::time_point> expired_intents;
-    std::set<control::Identifier> failed_sessions;
     std::map<std::uint64_t, quic_server::MonotonicClock::time_point> terminal_closures;
     std::uint64_t next_authority_generation {1};
+    std::uint64_t next_terminal_failure_generation {1};
+#ifdef SUNSHINE_TESTS
+    bool fail_start_before_commit_for_test {};
+#endif
+    bool shutting_down {};
     std::jthread watchdog;
   };
 
@@ -1402,19 +1494,45 @@ namespace lumen::protocol_v3::runtime {
       return false;
     }
     std::scoped_lock lock {impl_->mutex};
+    std::shared_ptr<TerminalFailureDispatcher> terminal_failure;
+    try {
+      terminal_failure = impl_->make_terminal_failure_dispatcher();
+    } catch (...) {
+      return false;
+    }
+    if (!terminal_failure) {
+      return false;
+    }
     return impl_->sessions.emplace(session_id, Impl::ActiveSession {
                                                  .owner_client_id = client_id,
                                                  .start_intent_id = session_id,
                                                  .connection_id = connection_id,
                                                  .authority_generation = 1,
                                                  .media_started = true,
+                                                 .terminal_failure_generation = terminal_failure->generation(),
+                                                 .terminal_failure = std::move(terminal_failure),
                                                  .resources = std::move(resources),
                                                })
       .second;
   }
 
   void ProductionSessionBackend::mark_failed_for_test(const control::Identifier &session_id) noexcept {
-    impl_->mark_failed(session_id);
+    std::shared_ptr<TerminalFailureDispatcher> terminal_failure;
+    {
+      std::scoped_lock lock {impl_->mutex};
+      const auto session = impl_->sessions.find(session_id);
+      if (session != impl_->sessions.end()) {
+        terminal_failure = session->second.terminal_failure;
+      }
+    }
+    if (terminal_failure) {
+      terminal_failure->report();
+    }
+  }
+
+  void ProductionSessionBackend::fail_next_start_before_commit_for_test() noexcept {
+    std::scoped_lock lock {impl_->mutex};
+    impl_->fail_start_before_commit_for_test = true;
   }
 #endif
 
@@ -1773,7 +1891,17 @@ namespace lumen::protocol_v3::runtime {
     bool launched_application = false;
     bool session_committed = false;
     std::unique_ptr<SessionResources> staged_resources;
+    std::shared_ptr<TerminalFailureDispatcher> terminal_failure;
+    try {
+      terminal_failure = impl_->make_terminal_failure_dispatcher();
+    } catch (...) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
+    if (!terminal_failure) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
     auto rollback = util::fail_guard([&]() noexcept {
+      terminal_failure->revoke();
       if (session_committed) {
         const auto committed = impl_->sessions.find(selected.session_id);
         if (committed != impl_->sessions.end()) {
@@ -1804,17 +1932,20 @@ namespace lumen::protocol_v3::runtime {
     }
     policy_updated = true;
 
-    auto resources = impl_->factory.create(
-      selected,
-      connection_id,
-      [backend = impl_.get(), session_id = selected.session_id]() noexcept {
-        backend->mark_failed(session_id);
-      }
-    );
+    std::expected<std::unique_ptr<SessionResources>, std::uint8_t> resources =
+      std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    try {
+      resources = impl_->factory.create(selected, connection_id, terminal_failure);
+    } catch (...) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
     if (!resources || !*resources) {
       return std::unexpected(resources ? static_cast<std::uint8_t>(Status::resource_failure) : resources.error());
     }
     staged_resources = std::move(*resources);
+    if (terminal_failure->reported()) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
     const auto &effective = staged_resources->effective_media_config();
     const auto immutable_selection_matches =
       effective.session_id == selected.session_id && effective.profile == selected.profile &&
@@ -1892,11 +2023,26 @@ namespace lumen::protocol_v3::runtime {
       .audio = selected.audio,
       .resume = *resume_value,
     };
-    auto application = impl_->applications.start(launch);
+    std::expected<bool, std::uint8_t> application =
+      std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    try {
+      application = impl_->applications.start(launch);
+    } catch (...) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
     if (!application) {
       return std::unexpected(application.error());
     }
     launched_application = *application;
+    if (terminal_failure->reported()) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
+#ifdef SUNSHINE_TESTS
+    if (impl_->fail_start_before_commit_for_test) {
+      impl_->fail_start_before_commit_for_test = false;
+      return std::unexpected(static_cast<std::uint8_t>(Status::resource_failure));
+    }
+#endif
     try {
       std::vector<control::HostControlRequest> host_requests;
       host_requests.reserve(selected.microphone_enabled ? 3 : 2);
@@ -1940,9 +2086,11 @@ namespace lumen::protocol_v3::runtime {
       active.launched_application = launched_application;
       active.microphone_required = selected.microphone_enabled;
       active.configuration_deadline = quic_server::MonotonicClock::now() + std::chrono::seconds {3};
+      active.terminal_failure_generation = terminal_failure->generation();
+      active.terminal_failure = terminal_failure;
       active.resources = std::move(staged_resources);
       ++impl_->next_authority_generation;
-      impl_->watchdog_wakeup.notify_all();
+      impl_->watchdog_wakeup->notify_all();
       rollback.disable();
       return control::StartResult {selected.session_id, std::move(response), std::move(host_requests)};
     } catch (...) {
@@ -2109,11 +2257,13 @@ namespace lumen::protocol_v3::runtime {
           }
           // Remove callback-visible authority before crossing the blocking
           // native teardown barrier. Capture threads may report terminal
-          // failure while stop() joins them, and that callback takes mutex.
+          // failure while stop() joins them; revocation makes those reports inert.
+          if (session->second.terminal_failure) {
+            session->second.terminal_failure->revoke();
+          }
           auto stopped_session = std::move(session->second);
           impl_->sessions.erase(session);
-          impl_->failed_sessions.erase(*session_id);
-          impl_->watchdog_wakeup.notify_all();
+          impl_->watchdog_wakeup->notify_all();
           lock.unlock();
 
           stopped_session.resources->stop();
@@ -2304,7 +2454,7 @@ namespace lumen::protocol_v3::runtime {
           session->second.attach_deadline.reset();
           ++session->second.authority_generation;
           session->second.input_baseline_required = true;
-          impl_->watchdog_wakeup.notify_all();
+          impl_->watchdog_wakeup->notify_all();
           Map response_fields {
             {1, 0U},
             {2, bytes(*session_id)},
@@ -2412,7 +2562,7 @@ namespace lumen::protocol_v3::runtime {
       return false;
     }
     session->second.media_started = true;
-    impl_->watchdog_wakeup.notify_all();
+    impl_->watchdog_wakeup->notify_all();
     return true;
   }
 
@@ -2426,7 +2576,7 @@ namespace lumen::protocol_v3::runtime {
           session.attach_deadline = quic_server::MonotonicClock::now() + std::chrono::seconds {2};
         }
       }
-      impl_->watchdog_wakeup.notify_all();
+      impl_->watchdog_wakeup->notify_all();
     }
     static_cast<void>(impl_->transport.revoke(connection_id));
   }
@@ -2444,7 +2594,7 @@ namespace lumen::protocol_v3::runtime {
       session->second.resources->detach_connection();
       session->second.connection_id = 0;
       session->second.attach_deadline = quic_server::MonotonicClock::now() + std::chrono::seconds {2};
-      impl_->watchdog_wakeup.notify_all();
+      impl_->watchdog_wakeup->notify_all();
     }
   }
 
@@ -2460,6 +2610,9 @@ namespace lumen::protocol_v3::runtime {
       std::scoped_lock lock {impl_->mutex};
       for (auto session = impl_->sessions.begin(); session != impl_->sessions.end();) {
         if (session->second.owner_client_id == client_id) {
+          if (session->second.terminal_failure) {
+            session->second.terminal_failure->revoke();
+          }
           revoked.push_back({
             std::move(session->second.resources),
             session->second.connection_id,
@@ -2470,7 +2623,7 @@ namespace lumen::protocol_v3::runtime {
           ++session;
         }
       }
-      impl_->watchdog_wakeup.notify_all();
+      impl_->watchdog_wakeup->notify_all();
     }
     for (auto &session : revoked) {
       session.resources->stop();
