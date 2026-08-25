@@ -200,7 +200,8 @@ if(WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC)
             "${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.cpp"
             "${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.h"
             "${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.cpp"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h")
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h"
+            "${CMAKE_SOURCE_DIR}/src/protocol_v3/start_mode_contract.h")
     list(APPEND SUNSHINE_EXTERNAL_LIBRARIES Lumen::MsQuicShim)
     list(APPEND SUNSHINE_DEFINITIONS
             LUMEN_EXPERIMENTAL_MSQUIC=1

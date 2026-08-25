@@ -264,6 +264,11 @@ TEST(VirtualDisplayValidation, RejectsEveryUnsupportedExactModeBoundary) {
   limits.supports_hdr10 = true;
   limits.supports_10bit = false;
   EXPECT_EQ(validate_mode(mode, limits), validation_error_e::unsupported_bit_depth);
+
+  mode = mode_4k120;
+  mode.bits_per_channel = 10;
+  limits = capable_limits();
+  EXPECT_EQ(validate_mode(mode, limits), validation_error_e::unsupported_bit_depth);
 }
 
 TEST(VirtualDisplayValidation, IntersectsAllAuthoritativeLimitsAndRejectsDisjointDomains) {

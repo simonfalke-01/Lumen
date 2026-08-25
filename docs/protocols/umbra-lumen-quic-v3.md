@@ -316,6 +316,16 @@ continues locally while the selected audio tuple is captured; missing, null,
 integer, or other non-boolean values are malformed. FEC is implicitly scheme
 zero and has no offer key.
 
+The canonical START/mode boundary is checked in at
+`vectors/start_mode_vectors.json`. Width is even and within 320-7680, height is
+even and within 200-4320, and refresh is a reduced positive uint32 rational
+within 10-480 Hz using overflow-safe comparison. H.264 is limited to
+4096x4096 SDR8. The VDD contract admits SDR8 or HDR10 only; SDR10, HDR8, RGB,
+and codec-lossless offers without 4:4:4 plus explicit host proof are rejected
+before application launch or VDD/resource mutation. Resource activation and
+exact display readiness precede application launch; any later launch failure
+rolls back the staged resource lease and topology.
+
 `START_RESPONSE` (`0x0101`): 1 status, 2 start-intent ID, 3 session ID bstr16,
 4 selected profile, 5 codec tuple, 6 width, 7 height, 8 refresh numerator,
 9 denominator, 10 bitrate kbps, 11 semantic cap (`1152`), 12 audio tuple,
@@ -1017,7 +1027,7 @@ input-to-photon, and optical validation remains required.
 | input retained edges | host 256, client 512 |
 | input rate | 60-2000/s |
 | width/height | even; 320-7680 / 200-4320 |
-| refresh rational | 1-480 Hz after numerator/denominator validation |
+| refresh rational | reduced uint32 numerator/denominator, 10-480 Hz |
 | video bitrate | 1,000-500,000 kbps |
 | pairing failures | bounded per source prefix; security failures collapse |
 

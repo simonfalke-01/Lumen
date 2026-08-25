@@ -258,6 +258,14 @@ namespace lumen::protocol_v3::control_session {
     std::uint64_t idle_timeout_ms() const noexcept override;
     void datagram_maximum_changed(std::uint16_t maximum_bytes) override;
     void disconnect() noexcept override;
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Install one authorized client at the real post-authentication boundary for wire tests.
+     * @param client Exact paired client record with START permission.
+     * @return True when a connection-authority generation was claimed and the session entered ready state.
+     */
+    bool install_authenticated_client_for_test(const ClientRecord &client) noexcept;
+#endif
 
   private:
     struct Impl;

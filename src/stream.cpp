@@ -45,6 +45,7 @@ extern "C" {
   #include "protocol_v3/runtime.h"
 #endif
 #include "stream.h"
+#include "protocol_v3/start_mode_contract.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
@@ -2938,6 +2939,20 @@ namespace stream {
             !video::current_nvenc_lossless_capability(selection_.codec_id - 1)) {
           throw std::runtime_error {"protocol-v3 NVENC lossless proof unavailable"};
         }
+        if (lumen::protocol_v3::start_mode::admit({
+              selection_.width,
+              selection_.height,
+              selection_.refresh_numerator,
+              selection_.refresh_denominator,
+              selection_.codec_id,
+              selection_.bit_depth,
+              selection_.chroma_layout,
+              selection_.transfer,
+              selection_.codec_flags,
+              selection_.fidelity,
+            }) != lumen::protocol_v3::start_mode::AdmissionError::none) {
+          throw std::runtime_error {"protocol-v3 canonical mode admission rejected resources"};
+        }
         const auto behavior = selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ?
                                 video::egress_queue_t::behavior_e::latency :
                                 video::egress_queue_t::behavior_e::fifo;
@@ -3272,8 +3287,10 @@ namespace stream {
         stream_config_.client_microphone = selection_.microphone_enabled;
         stream_config_.monitor.width = static_cast<int>(selection_.width);
         stream_config_.monitor.height = static_cast<int>(selection_.height);
+        const auto refresh_whole = selection_.refresh_numerator / selection_.refresh_denominator;
+        const auto refresh_remainder = selection_.refresh_numerator % selection_.refresh_denominator;
         stream_config_.monitor.framerate = static_cast<int>(
-          selection_.refresh_numerator / selection_.refresh_denominator
+          refresh_whole + (refresh_remainder * 2U >= selection_.refresh_denominator ? 1U : 0U)
         );
         stream_config_.monitor.framerateX100 = 0;
         stream_config_.monitor.refreshNumerator = static_cast<int>(selection_.refresh_numerator);

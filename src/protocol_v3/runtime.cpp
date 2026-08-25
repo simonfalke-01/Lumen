@@ -4,6 +4,7 @@
  */
 
 #include "runtime.h"
+#include "start_mode_contract.h"
 
 #include "../file_handler.h"
 #include "../httpcommon.h"
@@ -1595,6 +1596,20 @@ namespace lumen::protocol_v3::runtime {
     selected.fidelity = static_cast<std::uint8_t>(*fidelity);
     selected.audio = *audio;
     selected.host_audio = *host_audio_value;
+    if (start_mode::admit({
+          selected.width,
+          selected.height,
+          selected.refresh_numerator,
+          selected.refresh_denominator,
+          selected.codec_id,
+          selected.bit_depth,
+          selected.chroma_layout,
+          selected.transfer,
+          selected.codec_flags,
+          selected.fidelity,
+        }) != start_mode::AdmissionError::none) {
+      return std::unexpected(static_cast<std::uint8_t>(Status::unsupported_media));
+    }
     if (const auto *microphone_map = std::get_if<Map>(&microphone_value->storage)) {
       if ((client.permissions & control::microphone_permission) == 0) {
         return std::unexpected(static_cast<std::uint8_t>(Status::unauthorized));
@@ -1775,22 +1790,6 @@ namespace lumen::protocol_v3::runtime {
     }
     policy_updated = true;
 
-    ApplicationLaunch launch {
-      .application_id = static_cast<std::uint32_t>(*app),
-      .width = static_cast<std::uint32_t>(*width),
-      .height = static_cast<std::uint32_t>(*height),
-      .refresh_numerator = static_cast<std::uint32_t>(*refresh_numerator),
-      .refresh_denominator = static_cast<std::uint32_t>(*refresh_denominator),
-      .host_audio = *host_audio_value,
-      .enable_hdr = selected.transfer != 1,
-      .audio = selected.audio,
-      .resume = *resume_value,
-    };
-    auto application = impl_->applications.start(launch);
-    if (!application) {
-      return std::unexpected(application.error());
-    }
-    launched_application = *application;
     auto resources = impl_->factory.create(
       selected,
       connection_id,
@@ -1868,6 +1867,22 @@ namespace lumen::protocol_v3::runtime {
       codec_initialization_view.begin(),
       codec_initialization_view.end()
     };
+    ApplicationLaunch launch {
+      .application_id = static_cast<std::uint32_t>(*app),
+      .width = selected.width,
+      .height = selected.height,
+      .refresh_numerator = selected.refresh_numerator,
+      .refresh_denominator = selected.refresh_denominator,
+      .host_audio = selected.host_audio,
+      .enable_hdr = selected.transfer != 1,
+      .audio = selected.audio,
+      .resume = *resume_value,
+    };
+    auto application = impl_->applications.start(launch);
+    if (!application) {
+      return std::unexpected(application.error());
+    }
+    launched_application = *application;
     try {
       std::vector<control::HostControlRequest> host_requests;
       host_requests.reserve(selected.microphone_enabled ? 3 : 2);

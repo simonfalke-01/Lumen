@@ -214,7 +214,8 @@ if(NOT (WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC))
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.cpp
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.h
             ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.cpp
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h)
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h
+            ${CMAKE_SOURCE_DIR}/src/protocol_v3/start_mode_contract.h)
 endif()
 
 # The Windows gamepad router, dynamic-session state machine, and report adapter
@@ -321,6 +322,8 @@ target_link_libraries(${PROJECT_NAME} ${TEST_LINK_LIBRARIES})
 target_compile_definitions(${PROJECT_NAME} PUBLIC ${SUNSHINE_DEFINITIONS} ${TEST_DEFINITIONS})
 target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SUNSHINE_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
 target_link_options(${PROJECT_NAME} PRIVATE ${SUNSHINE_LINK_OPTIONS})
+add_test(NAME ${PROJECT_NAME} COMMAND ${PROJECT_NAME})
+set_tests_properties(${PROJECT_NAME} PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 if (WIN32)
     # prefer static libraries since we're linking statically

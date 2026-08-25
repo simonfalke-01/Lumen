@@ -190,6 +190,96 @@ namespace {
     std::optional<media::StaticHDRMetadata> resolved_metadata;
   };
 
+  class OrderingResources final: public runtime::SessionResources {
+  public:
+    OrderingResources(media::NegotiatedMediaConfig effective, std::vector<std::string> &events):
+        effective_ {std::move(effective)},
+        events_ {events} {
+    }
+
+    const media::NegotiatedMediaConfig &effective_media_config() const noexcept override { return effective_; }
+    std::span<const std::uint8_t> video_codec_initialization() const noexcept override { return initialization_; }
+    bool reset_input(std::span<const std::uint8_t>, std::uint32_t) override { return true; }
+    bool apply_text(const control::cbor::Value::Map &) override { return true; }
+    media::ReceiveResult datagram(const quic::DatagramRecord &) override { return media::ReceiveResult::accepted; }
+    bool start_media() override { return true; }
+    void detach_connection() noexcept override {}
+    bool attach_connection(std::uint64_t) override { return true; }
+    void stop() noexcept override {
+      if (!stopped_) {
+        events_.emplace_back("resource.stop");
+        stopped_ = true;
+      }
+    }
+
+  private:
+    media::NegotiatedMediaConfig effective_;
+    std::vector<std::string> &events_;
+    const std::array<std::uint8_t, 1> initialization_ {0x01};
+    bool stopped_ {};
+  };
+
+  class OrderingResourceFactory final: public runtime::SessionResourceFactory {
+  public:
+    explicit OrderingResourceFactory(std::vector<std::string> &events):
+        events_ {events} {
+    }
+
+    std::expected<std::unique_ptr<runtime::SessionResources>, std::uint8_t> create(
+      const media::NegotiatedMediaConfig &config,
+      std::uint64_t,
+      std::function<void()>
+    ) override {
+      ++create_calls;
+      events_.emplace_back("resource.create");
+      return std::make_unique<OrderingResources>(config, events_);
+    }
+
+    int create_calls {};
+
+  private:
+    std::vector<std::string> &events_;
+  };
+
+  class OrderingApplicationBridge final: public runtime::ApplicationBridge {
+  public:
+    OrderingApplicationBridge(std::vector<std::string> &events, const bool fail_start):
+        events_ {events},
+        fail_start_ {fail_start} {
+    }
+
+    std::expected<runtime::ApplicationSnapshot, std::uint8_t> snapshot() override {
+      return std::unexpected(std::uint8_t {8});
+    }
+    std::expected<runtime::ApplicationAsset, std::uint8_t> asset(
+      std::uint64_t,
+      const control::Bytes32 &
+    ) override {
+      return std::unexpected(std::uint8_t {8});
+    }
+    std::expected<bool, std::uint8_t> start(const runtime::ApplicationLaunch &launch) override {
+      ++start_calls;
+      last_launch = launch;
+      events_.emplace_back("application.start");
+      if (fail_start_) {
+        return std::unexpected(static_cast<std::uint8_t>(ProtocolStatus::application_not_found));
+      }
+      return true;
+    }
+    bool stop(bool) noexcept override {
+      events_.emplace_back("application.stop");
+      return true;
+    }
+    bool running() noexcept override { return false; }
+
+    int start_calls {};
+    std::optional<runtime::ApplicationLaunch> last_launch;
+
+  private:
+    std::vector<std::string> &events_;
+    bool fail_start_ {};
+  };
+
   class AcceptingTransport final: public runtime::QuicTransportSink {
   public:
     bool update_policy(std::uint64_t, quic::Profile, std::uint64_t) noexcept override {
@@ -246,6 +336,36 @@ namespace {
            }},
       {18, Value {host_audio}},
     };
+  }
+
+  control::cbor::Value *mutable_map_field(control::cbor::Value::Map &map, const std::uint64_t key) {
+    const auto found = std::ranges::find_if(map, [key](const auto &entry) {
+      return entry.first == key;
+    });
+    return found == map.end() ? nullptr : &found->second;
+  }
+
+  control::cbor::Value::Map sdr_h264_start_fields(const std::uint64_t width, const std::uint64_t height) {
+    auto fields = start_fields(18);
+    *mutable_map_field(fields, 4) = width;
+    *mutable_map_field(fields, 5) = height;
+    auto *codec_array = std::get_if<control::cbor::Value::Array>(&mutable_map_field(fields, 9)->storage);
+    auto *codec = std::get_if<control::cbor::Value::Map>(&codec_array->front().storage);
+    *mutable_map_field(*codec, 1) = 1U;
+    *mutable_map_field(*codec, 3) = 8U;
+    *mutable_map_field(*codec, 4) = 1U;
+    *mutable_map_field(*codec, 5) = 1U;
+    *mutable_map_field(*codec, 6) = 1U;
+    *mutable_map_field(*codec, 7) = 1U;
+    *mutable_map_field(*codec, 8) = 0U;
+    *mutable_map_field(*codec, 9) = 0U;
+    *mutable_map_field(*codec, 10) = 1U;
+    auto *quality = std::get_if<control::cbor::Value::Map>(&mutable_map_field(fields, 17)->storage);
+    *mutable_map_field(*quality, 1) = 1U;
+    for (std::uint64_t key = 2; key <= 5; ++key) {
+      *mutable_map_field(*quality, key) = control::cbor::Value {false};
+    }
+    return fields;
   }
 
   std::uint64_t unsigned_value(const control::cbor::Value *value) {
@@ -621,6 +741,101 @@ TEST(ProtocolV3Runtime, RequiresAndCarriesExplicitHostAudioSelection) {
   ASSERT_NE(host_audio, malformed.end());
   host_audio->second = control::cbor::Value {0U};
   expect_malformed(std::move(malformed), 54);
+}
+
+TEST(ProtocolV3Runtime, RejectsCanonicalModeViolationsBeforeResourcesOrApplicationMutation) {
+  control::ClientRecord client {
+    .client_id = control::Identifier {},
+    .permissions = control::start_permission,
+    .generation = 1,
+  };
+  client.client_id.fill(0x61);
+
+  std::vector<control::cbor::Value::Map> invalid;
+  invalid.push_back(sdr_h264_start_fields(4098, 2160));
+  invalid.push_back(sdr_h264_start_fields(3840, 4098));
+
+  auto unreduced = sdr_h264_start_fields(1920, 1080);
+  *mutable_map_field(unreduced, 6) = 60'000U;
+  *mutable_map_field(unreduced, 7) = 1'000U;
+  invalid.push_back(std::move(unreduced));
+
+  auto below_minimum = sdr_h264_start_fields(1920, 1080);
+  *mutable_map_field(below_minimum, 6) = 9'999U;
+  *mutable_map_field(below_minimum, 7) = 1'000U;
+  invalid.push_back(std::move(below_minimum));
+
+  auto sdr10 = sdr_h264_start_fields(1920, 1080);
+  auto *codec_array = std::get_if<control::cbor::Value::Array>(&mutable_map_field(sdr10, 9)->storage);
+  auto *codec = std::get_if<control::cbor::Value::Map>(&codec_array->front().storage);
+  *mutable_map_field(*codec, 1) = 2U;
+  *mutable_map_field(*codec, 3) = 10U;
+  invalid.push_back(std::move(sdr10));
+
+  const auto prior_hevc_mode = video::active_hevc_mode;
+  video::active_hevc_mode = 3;
+  const auto restore_hevc = std::unique_ptr<void, std::function<void(void *)>> {
+    reinterpret_cast<void *>(1),
+    [&](void *) {
+      video::active_hevc_mode = prior_hevc_mode;
+    },
+  };
+
+  for (std::size_t index = 0; index < invalid.size(); ++index) {
+    client.client_id.back() = static_cast<std::uint8_t>(0x61 + index);
+    control::SecureRandom random;
+    std::vector<std::string> events;
+    OrderingApplicationBridge applications {events, false};
+    OrderingResourceFactory factory {events};
+    AcceptingTransport transport;
+    runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+
+    const auto started = backend.start(
+      client,
+      invalid[index],
+      61 + index,
+      quic::maximum_semantic_datagram_bytes
+    );
+    ASSERT_FALSE(started.has_value()) << index;
+    EXPECT_EQ(started.error(), static_cast<std::uint8_t>(ProtocolStatus::unsupported_media)) << index;
+    EXPECT_EQ(factory.create_calls, 0) << index;
+    EXPECT_EQ(applications.start_calls, 0) << index;
+    EXPECT_TRUE(events.empty()) << index;
+  }
+}
+
+TEST(ProtocolV3Runtime, ActivatesExactResourcesBeforeApplicationAndRollsBackLaunchFailure) {
+  control::SecureRandom random;
+  std::vector<std::string> events;
+  OrderingApplicationBridge applications {events, true};
+  OrderingResourceFactory factory {events};
+  AcceptingTransport transport;
+  runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+  control::ClientRecord client {
+    .client_id = control::Identifier {},
+    .permissions = control::start_permission,
+    .generation = 1,
+  };
+  client.client_id.fill(0x71);
+
+  const auto started = backend.start(
+    client,
+    sdr_h264_start_fields(4096, 4096),
+    71,
+    quic::maximum_semantic_datagram_bytes
+  );
+
+  ASSERT_FALSE(started.has_value());
+  EXPECT_EQ(started.error(), static_cast<std::uint8_t>(ProtocolStatus::application_not_found));
+  ASSERT_TRUE(applications.last_launch.has_value());
+  EXPECT_EQ(applications.last_launch->width, 4096U);
+  EXPECT_EQ(applications.last_launch->height, 4096U);
+  EXPECT_EQ(applications.last_launch->refresh_numerator, 60'000U);
+  EXPECT_EQ(applications.last_launch->refresh_denominator, 1'001U);
+  EXPECT_EQ(
+    events,
+    (std::vector<std::string> {"resource.create", "application.start", "resource.stop"})
+  );
 }
 
 TEST(ProtocolV3Runtime, StopDetachesOwnershipBeforeTerminalCallbackAndRemainsReusable) {

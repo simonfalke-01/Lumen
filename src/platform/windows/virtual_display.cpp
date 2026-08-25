@@ -230,7 +230,8 @@ namespace platf::virtual_display {
     }
     if ((mode.bits_per_channel == 10 && !limits.supports_10bit) ||
         (mode.bits_per_channel != 8 && mode.bits_per_channel != 10) ||
-        (mode.dynamic_range == dynamic_range_e::hdr10 && mode.bits_per_channel != 10)) {
+        (mode.dynamic_range == dynamic_range_e::hdr10 && mode.bits_per_channel != 10) ||
+        (mode.dynamic_range == dynamic_range_e::sdr && mode.bits_per_channel != 8)) {
       return validation_error_e::unsupported_bit_depth;
     }
     if (required_fidelity != fidelity_e::lossless && required_fidelity != fidelity_e::visually_lossless) {

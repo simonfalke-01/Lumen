@@ -4,6 +4,7 @@
  */
 
 #include "control_session.h"
+#include "start_mode_contract.h"
 
 #include "../protocol_common/crypto.h"
 
@@ -205,7 +206,7 @@ namespace lumen::protocol_v3::control_session {
     }
 
     bool valid_start_request(const Map &fields, const std::uint16_t datagram_maximum) noexcept {
-      if (!exact_keys(fields, 1, 17) || datagram_maximum < quic_server::maximum_semantic_datagram_bytes) {
+      if (!exact_keys(fields, 1, 18) || datagram_maximum < quic_server::maximum_semantic_datagram_bytes) {
         return false;
       }
       const auto intent = fixed_field<16>(fields, 1);
@@ -219,18 +220,18 @@ namespace lumen::protocol_v3::control_session {
       const auto semantic_cap = unsigned_field(fields, 12);
       const auto trace = fixed_field<16>(fields, 13);
       const auto resume = bool_field(fields, 16);
+      const auto host_audio = bool_field(fields, 18);
       const auto *codecs = array_field(fields, 9);
       const auto *audio = array_field(fields, 10);
       const auto *hdr = array_field(fields, 14);
       const auto *presentation = array_field(fields, 15);
+      const auto mode_shape = width && height && refresh_numerator && refresh_denominator ?
+                                start_mode::admit_shape({*width, *height, *refresh_numerator, *refresh_denominator}) :
+                                start_mode::AdmissionError::dimensions;
       return intent && nonzero(*intent) && application && *application <= UINT32_MAX && profile &&
-             (*profile == 1 || *profile == 2) && width && *width >= 320 && *width <= 7'680 && *width % 2 == 0 &&
-             height && *height >= 200 && *height <= 4'320 && *height % 2 == 0 && refresh_numerator &&
-             *refresh_numerator > 0 && *refresh_numerator <= 480'000 && refresh_denominator &&
-             *refresh_denominator > 0 && *refresh_denominator <= 1'000 &&
-             *refresh_numerator / *refresh_denominator >= 1 && *refresh_numerator / *refresh_denominator <= 480 &&
+             (*profile == 1 || *profile == 2) && mode_shape == start_mode::AdmissionError::none &&
              bitrate && *bitrate >= 1'000 && *bitrate <= 500'000 && semantic_cap &&
-             *semantic_cap == quic_server::maximum_semantic_datagram_bytes && trace && nonzero(*trace) && resume &&
+             *semantic_cap == quic_server::maximum_semantic_datagram_bytes && trace && nonzero(*trace) && resume && host_audio &&
              codecs && !codecs->empty() && codecs->size() <= 16 && audio && !audio->empty() && audio->size() <= 6 &&
              (is_null(fields, 11) || map_field(fields, 11)) && hdr && hdr->size() <= 16 &&
              presentation && !presentation->empty() && presentation->size() <= 3 && map_field(fields, 17);
@@ -999,6 +1000,23 @@ namespace lumen::protocol_v3::control_session {
   void ControlSession::disconnect() noexcept {
     impl_->close();
   }
+
+#ifdef SUNSHINE_TESTS
+  bool ControlSession::install_authenticated_client_for_test(const ClientRecord &client) noexcept {
+    if (impl_->state != Impl::State::hello || !nonzero(client.client_id) ||
+        (client.permissions & start_permission) == 0 || impl_->connection.connection_id == 0) {
+      return false;
+    }
+    const auto claim = impl_->authorities.claim(client.client_id, impl_->connection.connection_id, false);
+    if (!claim || claim->generation == 0) {
+      return false;
+    }
+    impl_->client_record = client;
+    impl_->authority_generation = claim->generation;
+    impl_->state = Impl::State::ready;
+    return true;
+  }
+#endif
 
   SessionFactory::SessionFactory(
     Config config,

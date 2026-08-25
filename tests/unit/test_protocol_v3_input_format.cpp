@@ -132,6 +132,7 @@ TEST(ProtocolV3HdrSelection, RequiresStaticMetadataForPqAndForbidsItForHlg) {
   feedback_t feedback;
 
   auto pq = config();
+  pq.codec_id = 2;
   pq.transfer = 2;
   pq.bit_depth = 10;
   pq.primaries = 9;
@@ -144,6 +145,7 @@ TEST(ProtocolV3HdrSelection, RequiresStaticMetadataForPqAndForbidsItForHlg) {
   EXPECT_NO_THROW(media::SessionPipeline(pq, transport, input, microphone, feedback));
 
   auto hlg = config();
+  hlg.codec_id = 2;
   hlg.transfer = 3;
   hlg.bit_depth = 10;
   hlg.primaries = 9;

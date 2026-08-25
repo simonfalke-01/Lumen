@@ -4,6 +4,7 @@
  */
 
 #include "media_pipeline.h"
+#include "start_mode_contract.h"
 
 #include <algorithm>
 #include <limits>
@@ -98,21 +99,24 @@ namespace lumen::protocol_v3::media {
     }
 
     bool valid_config(const NegotiatedMediaConfig &config) noexcept {
+      const auto mode_admission = start_mode::admit({
+        config.width,
+        config.height,
+        config.refresh_numerator,
+        config.refresh_denominator,
+        config.codec_id,
+        config.bit_depth,
+        config.chroma_layout,
+        config.transfer,
+        config.codec_flags,
+        config.fidelity,
+      });
       return nonzero(config.session_id) &&
              config.semantic_datagram_bytes >= quic_server::datagram_header_bytes +
                                                    audio_payload_header_bytes &&
              config.semantic_datagram_bytes <= quic_server::maximum_semantic_datagram_bytes &&
              config.video_bitrate_kbps >= 1'000 && config.video_bitrate_kbps <= 500'000 &&
-             config.width >= 320 && config.width <= 7'680 && config.width % 2 == 0 &&
-             config.height >= 200 && config.height <= 4'320 && config.height % 2 == 0 &&
-             config.refresh_numerator != 0 && config.refresh_denominator != 0 &&
-             config.refresh_numerator / config.refresh_denominator >= 1 &&
-             config.refresh_numerator / config.refresh_denominator <= 480 &&
-             config.codec_id >= 1 && config.codec_id <= 3 &&
-             (config.bit_depth == 8 || config.bit_depth == 10) &&
-             config.chroma_layout >= 1 && config.chroma_layout <= 3 &&
-             config.transfer >= 1 && config.transfer <= 3 && config.range <= 1 &&
-             (config.transfer == 1 || config.bit_depth == 10) &&
+             mode_admission == start_mode::AdmissionError::none && config.range <= 1 &&
              (config.matrix_code == 1 || config.matrix_code == 5 ||
               config.matrix_code == 6 || config.matrix_code == 9) &&
              (config.transfer == 1 || (config.primaries == 9 && config.matrix_code == 9)) &&
