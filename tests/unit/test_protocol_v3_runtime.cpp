@@ -1020,6 +1020,8 @@ TEST(ProtocolV3Runtime, UndefinedPersistedPermissionBitsAreRemovedAndCommitted) 
       std::filesystem::remove_all(directory, ignored);
     },
   };
+  constexpr std::string_view legacy_seed_hex =
+    "0101010101010101010101010101010101010101010101010101010101010101";
   std::ofstream(state_file)
     << R"JSON({
   "protocol_v3": {
@@ -1041,18 +1043,47 @@ TEST(ProtocolV3Runtime, UndefinedPersistedPermissionBitsAreRemovedAndCommitted) 
 
   control::Identifier client_id {};
   client_id.fill(0x02);
+  control::Bytes32 expected_seed {};
+  expected_seed.fill(0x01);
+  const auto identity_paths = runtime::host_identity_paths_for_state_file(state_file);
   {
     runtime::PersistentAuthorizationStore store {state_file.string(), true};
     ASSERT_TRUE(store.ready());
     const auto client = store.paired_client(client_id);
     ASSERT_TRUE(client.has_value());
     EXPECT_EQ(client->permissions, control::defined_permission_mask);
+
+    std::ifstream before_protection {state_file, std::ios::binary};
+    const std::string serialized_before {
+      std::istreambuf_iterator<char> {before_protection},
+      std::istreambuf_iterator<char> {}
+    };
+    EXPECT_NE(serialized_before.find(legacy_seed_hex), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(identity_paths.identity));
+    EXPECT_FALSE(std::filesystem::exists(identity_paths.journal));
+
+    const auto protected_seed = store.host_identity_seed(random);
+    ASSERT_TRUE(protected_seed.has_value());
+    EXPECT_EQ(*protected_seed, expected_seed);
+
+    std::ifstream after_protection {state_file, std::ios::binary};
+    const std::string serialized_after {
+      std::istreambuf_iterator<char> {after_protection},
+      std::istreambuf_iterator<char> {}
+    };
+    EXPECT_EQ(serialized_after.find(legacy_seed_hex), std::string::npos);
+    EXPECT_TRUE(std::filesystem::is_regular_file(identity_paths.identity));
+    EXPECT_TRUE(std::filesystem::is_regular_file(identity_paths.journal));
+    EXPECT_FALSE(std::filesystem::exists(identity_paths.temporary));
   }
   runtime::PersistentAuthorizationStore reopened {state_file.string(), true};
   ASSERT_TRUE(reopened.ready());
   const auto client = reopened.paired_client(client_id);
   ASSERT_TRUE(client.has_value());
   EXPECT_EQ(client->permissions, control::defined_permission_mask);
+  const auto reopened_seed = reopened.host_identity_seed(random);
+  ASSERT_TRUE(reopened_seed.has_value());
+  EXPECT_EQ(*reopened_seed, expected_seed);
 }
 
 TEST(ProtocolV3Runtime, AttachIntentCacheReturnsExactCommittedOutcomeBeforeExpiry) {

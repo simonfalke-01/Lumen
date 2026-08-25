@@ -179,11 +179,13 @@ i2j7w5vhA66Ep18oU6mfswVI
     explicit TestSession(
       const bool active,
       const std::optional<quic::ApplicationCloseCode> close_code = std::nullopt,
-      const std::chrono::milliseconds deadline_timeout = std::chrono::seconds {120}
+      const std::chrono::milliseconds deadline_timeout = std::chrono::seconds {120},
+      std::shared_ptr<std::atomic_size_t> begin_control_calls = {}
     ):
         active_ {active},
         close_code_ {close_code},
         deadline_timeout_ {deadline_timeout},
+        begin_control_calls_ {std::move(begin_control_calls)},
         deadline_ {quic::MonotonicClock::now() + deadline_timeout_} {
     }
 
@@ -197,6 +199,9 @@ i2j7w5vhA66Ep18oU6mfswVI
     }
 
     quic::MonotonicClock::time_point begin_control(const quic::ControlFrame &) noexcept override {
+      if (begin_control_calls_) {
+        ++*begin_control_calls_;
+      }
       deadline_ = quic::MonotonicClock::now() + deadline_timeout_;
       return deadline_;
     }
@@ -234,6 +239,7 @@ i2j7w5vhA66Ep18oU6mfswVI
     bool active_;
     std::optional<quic::ApplicationCloseCode> close_code_;
     std::chrono::milliseconds deadline_timeout_;
+    std::shared_ptr<std::atomic_size_t> begin_control_calls_;
     quic::MonotonicClock::time_point deadline_;
   };
 
@@ -243,11 +249,12 @@ i2j7w5vhA66Ep18oU6mfswVI
     }
 
     std::unique_ptr<quic::ControlSessionV3> create(const quic::ConnectionContext &) override {
-      return std::make_unique<TestSession>(active_, close_code, deadline_timeout);
+      return std::make_unique<TestSession>(active_, close_code, deadline_timeout, begin_control_calls);
     }
 
     std::optional<quic::ApplicationCloseCode> close_code;
     std::chrono::milliseconds deadline_timeout {std::chrono::seconds {120}};
+    std::shared_ptr<std::atomic_size_t> begin_control_calls {std::make_shared<std::atomic_size_t>()};
 
   private:
     bool active_;
@@ -469,6 +476,11 @@ i2j7w5vhA66Ep18oU6mfswVI
           return shutdown.second == error;
         });
       });
+    }
+
+    std::size_t connection_shutdown_count() {
+      std::lock_guard lock {connection_shutdown_mutex};
+      return connection_shutdowns.size();
     }
 
     ListenerCallback listener_callback;
@@ -847,7 +859,7 @@ i2j7w5vhA66Ep18oU6mfswVI
     }
   }
 
-  TEST(ProtocolV3Security, PinnedDeadlineDefaultsRemainExactAndAuthenticatedIdleIsNonzero) {
+  TEST(ProtocolV3Security, EveryPinnedPhaseDeadlineIsExactAndTransportZeroIsRejected) {
     const quic::Config transport;
     EXPECT_EQ(transport.handshake_timeout, std::chrono::seconds {5});
     EXPECT_EQ(transport.hello_timeout, std::chrono::seconds {2});
@@ -862,7 +874,20 @@ i2j7w5vhA66Ep18oU6mfswVI
     EXPECT_EQ(session.stop_response_timeout, std::chrono::seconds {2});
     EXPECT_EQ(session.teardown_timeout, std::chrono::seconds {5});
     EXPECT_EQ(session.authenticated_idle_timeout, std::chrono::seconds {120});
-    EXPECT_NE(session.authenticated_idle_timeout.count(), 0);
+    EXPECT_EQ(session.authenticated_idle_timeout.count(), 120'000);
+
+    for (const auto zero_handshake : {false, true}) {
+      TestMsQuicApi api;
+      TestSessionFactory factory;
+      auto invalid = test_config();
+      if (zero_handshake) {
+        invalid.handshake_timeout = std::chrono::milliseconds {0};
+      } else {
+        invalid.hello_timeout = std::chrono::milliseconds {0};
+      }
+      quic::QuicServer server {api, std::move(invalid), factory};
+      EXPECT_EQ(server.start(), quic::ApiStatus::invalid_state);
+    }
   }
 
   TEST(ProtocolV3Transport, SchedulerLanesMatchTheFiveProductionProducers) {
@@ -936,6 +961,65 @@ i2j7w5vhA66Ep18oU6mfswVI
     EXPECT_TRUE(std::ranges::all_of(api.idle_timeouts, [](const auto &entry) {
       return entry.second != 0;
     }));
+  }
+
+  TEST(ProtocolV3Security, DeadlineExpiresAtInclusiveBoundaryWithOneTerminalOutcome) {
+    TestMsQuicApi api;
+    TestSessionFactory factory;
+    factory.deadline_timeout = std::chrono::milliseconds {0};
+    quic::QuicServer server {api, test_config(), factory};
+    connect_test_server(api, server);
+    constexpr quic::Handle control_stream = 20;
+    ASSERT_EQ(
+      api.connection_event({
+        .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+        .stream = control_stream,
+        .stream_id = 0,
+      }),
+      quic::ApiStatus::success
+    );
+    const auto hello = control_frame(0x0001, 1);
+    const quic::Buffer buffer {hello.data(), hello.size()};
+    static_cast<void>(api.stream_event(control_stream, {
+                                                         .kind = quic::StreamEvent::Kind::receive,
+                                                         .buffers = std::span {&buffer, 1},
+                                                         .total_buffer_bytes = hello.size(),
+                                                       }));
+    EXPECT_TRUE(api.wait_for_connection_shutdown(
+      static_cast<std::uint64_t>(quic::ApplicationCloseCode::phase_timeout),
+      std::chrono::seconds {1}
+    ));
+    std::this_thread::sleep_for(std::chrono::milliseconds {20});
+    EXPECT_EQ(api.connection_shutdown_count(), 1U);
+  }
+
+  TEST(ProtocolV3Security, MalformedTrafficCannotExtendTheActiveDeadline) {
+    TestMsQuicApi api;
+    TestSessionFactory factory;
+    factory.deadline_timeout = std::chrono::milliseconds {80};
+    quic::QuicServer server {api, test_config(), factory};
+    connect_test_server(api, server);
+    authenticate_test_server(api);
+    ASSERT_EQ(factory.begin_control_calls->load(), 1U);
+
+    auto malformed = control_frame(0x0005, 3);
+    malformed[5] = 0x08;
+    const quic::Buffer buffer {malformed.data(), malformed.size()};
+    EXPECT_EQ(
+      api.stream_event(20, {
+                             .kind = quic::StreamEvent::Kind::receive,
+                             .buffers = std::span {&buffer, 1},
+                             .total_buffer_bytes = malformed.size(),
+                           }),
+      quic::ApiStatus::success
+    );
+    EXPECT_EQ(factory.begin_control_calls->load(), 1U);
+    EXPECT_TRUE(api.wait_for_connection_shutdown(
+      static_cast<std::uint64_t>(quic::ApplicationCloseCode::phase_timeout),
+      std::chrono::seconds {1}
+    ));
+    std::this_thread::sleep_for(std::chrono::milliseconds {20});
+    EXPECT_EQ(api.connection_shutdown_count(), 1U);
   }
 
   TEST(ProtocolV3Security, SynchronousListenerStopCompletionDoesNotReenterTheServerLock) {
