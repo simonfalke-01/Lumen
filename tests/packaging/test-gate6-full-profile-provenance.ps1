@@ -160,7 +160,8 @@ try {
         -EvidenceRoot $bindingEvidence `
         -SharedSourceFreezeManifestPath $sharedManifestPath `
         -SignedReturnReceiptPath $bindingReceiptPath)
-    $foreignShared = Get-Content $sharedManifestPath -Raw | ConvertFrom-Json
+    $sharedManifestOriginal = Get-Content $sharedManifestPath -Raw
+    $foreignShared = $sharedManifestOriginal | ConvertFrom-Json
     $foreignShared.release_id = 'foreign'
     Write-Gate6Json $sharedManifestPath $foreignShared
     Assert-ThrowsLike {
@@ -169,6 +170,11 @@ try {
             -SharedSourceFreezeManifestPath $sharedManifestPath `
             -SignedReturnReceiptPath $bindingReceiptPath)
     } 'not bound to the shared Gate6 Source Freeze Manifest' 'Foreign shared SFM binding'
+    [IO.File]::WriteAllText(
+        $sharedManifestPath,
+        $sharedManifestOriginal,
+        [Text.UTF8Encoding]::new($false)
+    )
 
     $pwsh = (Get-Process -Id $PID).Path
     $passing = Invoke-Gate6RecordedCommand `
@@ -190,6 +196,66 @@ try {
         Assert-Gate6MandatoryRunsPassed @($passing)
     } 'stream identity mismatch' 'Post-validation run-log mutation'
     Write-TestFile $passing.StdoutPath 'out'
+
+    $lumenArtifactManifestPath = Join-Path $root 'lumen-artifact-manifest.json'
+    Write-Gate6Json $lumenArtifactManifestPath ([ordered]@{
+            schema = 'lumen-gate6-artifact-manifest/1'
+        })
+    $toolchainIdentitiesPath = Join-Path $root 'toolchain-identities.json'
+    Write-Gate6Json $toolchainIdentitiesPath ([ordered]@{
+            schema = 'lumen-gate6-toolchain-identities/1'
+            sourceCommit = '1' * 40
+            sharedSourceFreezeManifestSha256 = Get-Gate6Sha256 $sharedManifestPath
+            tools = @([ordered]@{
+                    id = 'portable-pwsh'
+                    path = $pwsh
+                    bytes = ([IO.FileInfo]::new($pwsh)).Length
+                    sha256 = Get-Gate6Sha256 $pwsh
+                    fileVersion = ''
+                    productVersion = ''
+                })
+        })
+    $fragmentRoot = Join-Path $root 'assembly-fragment'
+    $fragment = New-Gate6AssemblyFragment `
+        -FragmentRoot $fragmentRoot `
+        -SharedSourceFreezeManifestPath $sharedManifestPath `
+        -SignedReturnReceiptPath $bindingReceiptPath `
+        -LumenArtifactManifestPath $lumenArtifactManifestPath `
+        -ToolchainIdentitiesPath $toolchainIdentitiesPath `
+        -Runs @($passing)
+    [void](Assert-Gate6AssemblyFragment `
+        -FragmentRoot $fragmentRoot `
+        -ManifestPath $fragment.ManifestPath)
+    & (Join-Path $lumenRoot 'scripts/windows/validate-gate6-assembly-fragment.ps1') `
+        -FragmentRoot $fragmentRoot | Out-Null
+
+    foreach ($target in @(
+            'bindings/shared-source-freeze-manifest.json',
+            'bindings/signed-return-receipt.json',
+            'bindings/toolchain-identities.json',
+            'runs/passing/run.json',
+            'runs/passing/stdout.bin',
+            'runs/passing/stderr.bin'
+        )) {
+        foreach ($operation in @('mutation', 'deletion')) {
+            $variant = Join-Path `
+                $root `
+                ("fragment-{0}-{1}" -f ($target -replace '[^A-Za-z0-9]', '-'), $operation)
+            Copy-Item -LiteralPath $fragmentRoot -Destination $variant -Recurse
+            $targetPath = Join-Path $variant $target
+            if ($operation -eq 'mutation') {
+                Write-TestFile $targetPath 'post-generation-mutation'
+            } else {
+                Remove-Item -LiteralPath $targetPath -Force
+            }
+            Assert-ThrowsLike {
+                [void](Assert-Gate6AssemblyFragment `
+                    -FragmentRoot $variant `
+                    -ManifestPath (Join-Path $variant 'lumen-gate6-assembly-fragment.json'))
+            } '(identity mismatch|is missing|unexpected file count)' `
+                "Assembly fragment $operation for $target"
+        }
+    }
 
     $failing = Invoke-Gate6RecordedCommand `
         -RunId failing `

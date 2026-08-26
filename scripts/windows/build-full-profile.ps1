@@ -21,6 +21,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Gate6EvidenceRoot,
 
+    [Parameter(Mandatory = $true)]
+    [string]$Gate6AssemblyFragmentRoot,
+
     [string]$PythonPath,
 
     [string]$DotNetRoot,
@@ -58,6 +61,7 @@ $Msys2Root = Resolve-ExistingDirectory $Msys2Root "MSYS2"
 $MsQuicPackageRoot = Resolve-ExistingDirectory $MsQuicPackageRoot "MsQuic package"
 $StagingRoot = [IO.Path]::GetFullPath($StagingRoot)
 $Gate6EvidenceRoot = [IO.Path]::GetFullPath($Gate6EvidenceRoot)
+$Gate6AssemblyFragmentRoot = [IO.Path]::GetFullPath($Gate6AssemblyFragmentRoot)
 if ($StagingRoot -eq $SourceRoot -or
     $SourceRoot.StartsWith(
         $StagingRoot + [IO.Path]::DirectorySeparatorChar,
@@ -85,8 +89,11 @@ if (Test-Path -LiteralPath $pendingManifestPath) {
 . (Join-Path $SourceRoot "scripts\windows\gate6-evidence.ps1")
 
 if (-not (Test-FullProfilePathsDisjoint $Gate6EvidenceRoot $SourceRoot) -or
-    -not (Test-FullProfilePathsDisjoint $Gate6EvidenceRoot $StagingRoot)) {
-    throw 'Gate6EvidenceRoot must be disjoint from both source and staging/build roots.'
+    -not (Test-FullProfilePathsDisjoint $Gate6EvidenceRoot $StagingRoot) -or
+    -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $SourceRoot) -or
+    -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $StagingRoot) -or
+    -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $Gate6EvidenceRoot)) {
+    throw 'Gate6 evidence and assembly-fragment roots must be mutually disjoint from source and staging/build roots.'
 }
 
 $gitCommand = Get-Command git.exe, git -CommandType Application -ErrorAction SilentlyContinue |
@@ -926,6 +933,13 @@ $gate6ArtifactManifest = New-Gate6ArtifactManifest `
     -Runs @($gate6Runs) `
     -SharedSourceFreezeManifestPath $sharedSourceFreeze.Path `
     -SignedReturnReceiptPath $signedReturnReceiptPath
+$gate6AssemblyFragment = New-Gate6AssemblyFragment `
+    -FragmentRoot $Gate6AssemblyFragmentRoot `
+    -SharedSourceFreezeManifestPath $sharedSourceFreeze.Path `
+    -SignedReturnReceiptPath $signedReturnReceiptPath `
+    -LumenArtifactManifestPath $gate6ArtifactManifestPath `
+    -ToolchainIdentitiesPath $toolIdentityPath `
+    -Runs @($gate6Runs)
 
 Write-Output "FULL_PROFILE_MSI=$versionedMsi"
 Write-Output "FULL_PROFILE_MSI_SHA256=$((Get-FileHash $versionedMsi -Algorithm SHA256).Hash)"
@@ -938,3 +952,6 @@ Write-Output "GATE6_SIGNED_RETURN_RECEIPT=$signedReturnReceiptPath"
 Write-Output "GATE6_ARTIFACT_EVIDENCE=$Gate6EvidenceRoot"
 Write-Output "GATE6_ARTIFACT_MANIFEST=$gate6ArtifactManifestPath"
 Write-Output "GATE6_ARTIFACT_FILE_COUNT=$($gate6ArtifactManifest.FileCount)"
+Write-Output "GATE6_ASSEMBLY_FRAGMENT_ROOT=$Gate6AssemblyFragmentRoot"
+Write-Output "GATE6_ASSEMBLY_FRAGMENT_MANIFEST=$($gate6AssemblyFragment.ManifestPath)"
+Write-Output "GATE6_ASSEMBLY_FRAGMENT_MANIFEST_SHA256=$((Get-FileHash $gate6AssemblyFragment.ManifestPath -Algorithm SHA256).Hash)"
