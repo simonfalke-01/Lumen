@@ -803,14 +803,26 @@ namespace lumen::protocol_v3::quic_server {
     }
 
     ~Impl() {
-      deadline_thread_.request_stop();
-      deadline_condition_.notify_all();
+      {
+        // Synchronize the stop request with the mutex used by the deadline
+        // condition. Otherwise the worker can observe the old stop state,
+        // lose this notification, and enter wait_until() for a long-lived
+        // application deadline while destruction blocks in join().
+        std::lock_guard lock {mutex_};
+        deadline_thread_.request_stop();
+        deadline_condition_.notify_all();
+      }
       if (deadline_thread_.joinable()) {
         deadline_thread_.join();
       }
       force_close_all();
-      teardown_thread_.request_stop();
-      teardown_condition_.notify_all();
+      {
+        // The teardown worker has the same check-then-wait boundary. Hold its
+        // condition mutex while publishing stop so the wake cannot be lost.
+        std::lock_guard lock {teardown_mutex_};
+        teardown_thread_.request_stop();
+        teardown_condition_.notify_all();
+      }
       if (teardown_thread_.joinable()) {
         teardown_thread_.join();
       }

@@ -928,6 +928,25 @@ i2j7w5vhA66Ep18oU6mfswVI
     }
   }
 
+  TEST(ProtocolV3Transport, RepeatedStopAndDestructionWakeBackgroundWorkers) {
+    constexpr std::size_t iterations = 256;
+    for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+      TestMsQuicApi api;
+      api.complete_listener_stop_synchronously = true;
+      TestSessionFactory factory;
+      factory.deadline_timeout = std::chrono::hours {24};
+      {
+        quic::QuicServer server {api, test_config(), factory};
+        connect_test_server(api, server);
+        authenticate_test_server(api);
+        if ((iteration & 1U) != 0) {
+          server.stop();
+          EXPECT_FALSE(server.running());
+        }
+      }
+    }
+  }
+
   TEST(ProtocolV3Security, ApplicationDeadlineClosesWithPhaseTimeoutWithoutMorePeerTraffic) {
     TestMsQuicApi api;
     TestSessionFactory factory;
