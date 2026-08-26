@@ -42,6 +42,138 @@ function ConvertTo-NormalizedProductCode {
     return $normalized
 }
 
+function Resolve-VirtualDisplayOwnership {
+    param(
+        [AllowNull()]
+        [string]$OwnedProductCode,
+
+        [string]$CurrentProductCode,
+
+        [AllowNull()]
+        [string]$RelatedUpgradeOwnerProductCode,
+
+        [bool]$InstalledDevicePresent
+    )
+    $current = ConvertTo-NormalizedProductCode -Value $CurrentProductCode
+    $related = if ([string]::IsNullOrWhiteSpace($RelatedUpgradeOwnerProductCode)) {
+        $null
+    } else {
+        ConvertTo-NormalizedProductCode -Value $RelatedUpgradeOwnerProductCode
+    }
+    if ([string]::IsNullOrWhiteSpace($OwnedProductCode)) {
+        if ($null -ne $related) {
+            return [pscustomobject]@{
+                Disposition = "related-upgrade-transfer"
+                PreviousOwnerProductCode = $related
+            }
+        }
+        if ($InstalledDevicePresent) {
+            throw "Refusing to adopt a Virtual Display device without durable ProductCode ownership or verified related-upgrade ownership."
+        }
+        return [pscustomobject]@{
+            Disposition = "unowned"
+            PreviousOwnerProductCode = $null
+        }
+    }
+
+    $owner = ConvertTo-NormalizedProductCode -Value $OwnedProductCode
+    if ($owner -ceq $current) {
+        if ($null -ne $related -and $related -cne $current) {
+            throw "The related-upgrade VDD owner conflicts with the durable ProductCode ownership manifest."
+        }
+        return [pscustomobject]@{
+            Disposition = "current-product"
+            PreviousOwnerProductCode = $owner
+        }
+    }
+    if ($null -eq $related -or $owner -cne $related) {
+        throw "Refusing to mutate a Virtual Display owned by another ProductCode: $owner"
+    }
+    return [pscustomobject]@{
+        Disposition = "related-upgrade-transfer"
+        PreviousOwnerProductCode = $owner
+    }
+}
+
+function New-VirtualDisplayTransactionIdentity {
+    param(
+        [string]$CurrentProductCode,
+        [string]$CurrentTransactionKind
+    )
+    $product = ConvertTo-NormalizedProductCode -Value $CurrentProductCode
+    if ($CurrentTransactionKind -notin @("install", "uninstall")) {
+        throw "Virtual Display transaction kind is invalid."
+    }
+    $token = $product.Trim("{}").Replace("-", "")
+    return [pscustomobject]@{
+        ResumeTaskName = "Lumen Virtual Display Resume $token $CurrentTransactionKind"
+        RebootMarkerSuffix = "$token\$CurrentTransactionKind"
+    }
+}
+
+function Resolve-OwnershipCommitAction {
+    param(
+        [bool]$OwnershipCommitted,
+        [AllowEmptyString()]
+        [string]$PreviousManifestSha256,
+        [AllowEmptyString()]
+        [string]$CurrentManifestSha256,
+        [bool]$IntendedOwnershipMatches
+    )
+    foreach ($hash in @($PreviousManifestSha256, $CurrentManifestSha256)) {
+        if (-not [string]::IsNullOrEmpty($hash) -and $hash -cnotmatch '^[0-9A-F]{64}$') {
+            throw "Virtual Display ownership manifest state contains an invalid SHA-256."
+        }
+    }
+    if ($OwnershipCommitted) {
+        if (-not $IntendedOwnershipMatches) {
+            throw "Committed Virtual Display ownership no longer matches the transaction result."
+        }
+        return "already-committed"
+    }
+    if ($IntendedOwnershipMatches) {
+        return "record-committed"
+    }
+    if ($CurrentManifestSha256 -cne $PreviousManifestSha256) {
+        throw "The durable Virtual Display ownership manifest changed during the transaction."
+    }
+    return "apply"
+}
+
+function Resolve-OwnershipRollbackAction {
+    param(
+        [bool]$TransactionCommitted,
+        [bool]$OwnershipCommitted,
+        [AllowEmptyString()]
+        [string]$PreviousManifestSha256,
+        [AllowEmptyString()]
+        [string]$CurrentManifestSha256
+    )
+    if ($TransactionCommitted) {
+        return "complete-commit"
+    }
+    if ($OwnershipCommitted) {
+        throw "Uncommitted Virtual Display state cannot own the committed manifest."
+    }
+    if ($CurrentManifestSha256 -cne $PreviousManifestSha256) {
+        throw "The durable Virtual Display ownership manifest changed before rollback."
+    }
+    return "retain-previous"
+}
+
+function Assert-VirtualDisplayResumeAfterRestart {
+    param(
+        [string]$PendingBootIdentifier,
+        [string]$CurrentBootIdentifier
+    )
+    if ($PendingBootIdentifier -cnotmatch '^\d+$' -or $CurrentBootIdentifier -cnotmatch '^\d+$') {
+        throw "Virtual Display resume state has an invalid boot identifier."
+    }
+    if ($PendingBootIdentifier -ceq $CurrentBootIdentifier) {
+        throw "Virtual Display resume is waiting for Windows to restart."
+    }
+}
+
 Assert-Administrator
 $ProductCode = ConvertTo-NormalizedProductCode -Value $ProductCode
 if (-not [string]::IsNullOrWhiteSpace($UpgradeOwnerProductCode)) {
@@ -64,9 +196,11 @@ $rollbackScript = Join-Path $rollbackDirectory "virtual-display-setup.ps1"
 $rollbackHelper = Join-Path $rollbackDirectory "lumen-vddctl.exe"
 $packageInf = Join-Path $RootDir "drivers\virtual-display\LumenVirtualDisplay.inf"
 $installedHelper = Join-Path $RootDir "tools\lumen-vddctl.exe"
-$taskIdentity = $ProductCode.Trim("{}").Replace("-", "")
-$resumeTaskName = "Lumen Virtual Display Resume $taskIdentity $TransactionKind"
-$rebootMarker = "HKLM:\SOFTWARE\Lumen\Installer\PendingReboot\$taskIdentity\$TransactionKind"
+$transactionIdentity = New-VirtualDisplayTransactionIdentity `
+    -CurrentProductCode $ProductCode `
+    -CurrentTransactionKind $TransactionKind
+$resumeTaskName = $transactionIdentity.ResumeTaskName
+$rebootMarker = "HKLM:\SOFTWARE\Lumen\Installer\PendingReboot\$($transactionIdentity.RebootMarkerSuffix)"
 
 function New-SecureDirectoryAcl {
     $system = [Security.Principal.SecurityIdentifier]::new("S-1-5-18")
@@ -470,6 +604,24 @@ function Assert-DriverIdentityFields {
     }
 }
 
+function Assert-OwnedDriverManifestSchema {
+    param([psobject]$Manifest)
+    $expectedProperties = @(
+        "CatalogSignerThumbprint",
+        "InfSha256",
+        "ManifestSha256",
+        "ProductCode",
+        "PublishedInfName",
+        "Schema"
+    )
+    $actualProperties = @($Manifest.PSObject.Properties.Name | Sort-Object)
+    if ([int]$Manifest.Schema -ne 1 -or
+        $actualProperties.Count -ne $expectedProperties.Count -or
+        @(Compare-Object $actualProperties $expectedProperties).Count -ne 0) {
+        throw "The Lumen Virtual Display ownership manifest schema is invalid."
+    }
+}
+
 function Assert-SecureOwnershipAcl {
     param([string]$Path)
     $allowed = @("S-1-5-18", "S-1-5-32-544")
@@ -505,12 +657,25 @@ function Read-OwnedDriverIdentity {
     Assert-SecureOwnershipAcl -Path $rollbackRoot
     Assert-SecureOwnershipAcl -Path $ownershipFile
     $saved = Get-Content -LiteralPath $ownershipFile -Raw | ConvertFrom-Json
-    if ([int]$saved.Schema -ne 1) {
-        throw "The Lumen Virtual Display ownership manifest schema is invalid."
-    }
+    Assert-OwnedDriverManifestSchema -Manifest $saved
     $saved.ProductCode = ConvertTo-NormalizedProductCode -Value ([string]$saved.ProductCode)
     Assert-DriverIdentityFields -Identity $saved
     return $saved
+}
+
+function Get-OwnershipManifestSha256 {
+    if (-not (Test-Path -LiteralPath $ownershipFile -PathType Leaf)) {
+        return ""
+    }
+    $manifest = Get-Item -LiteralPath $ownershipFile -Force -ErrorAction Stop
+    if ($manifest.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "The Lumen Virtual Display ownership manifest is a reparse point."
+    }
+    $hash = (Get-FileHash -LiteralPath $ownershipFile -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($hash -cnotmatch '^[0-9A-F]{64}$') {
+        throw "The Lumen Virtual Display ownership manifest SHA-256 is invalid."
+    }
+    return $hash
 }
 
 function Write-OwnedDriverIdentity {
@@ -589,9 +754,31 @@ function Read-State {
         [string]$state.ResultPublishedInfSha256 -cmatch '^[0-9A-F]{64}$' -and
         [string]$state.ResultPackageManifestSha256 -cmatch '^[0-9A-F]{64}$' -and
         [string]$state.ResultCatalogSignerThumbprint -cmatch '^[0-9A-F]{40,128}$'
-    if ([int]$state.Schema -ne 5 -or
+    $previousOwner = [string]$state.PreviousOwnerProductCode
+    $ownershipDisposition = [string]$state.OwnershipDisposition
+    $previousOwnerAbsent = [string]::IsNullOrEmpty($previousOwner)
+    $previousOwnerValid = $previousOwner -cmatch '^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$'
+    $ownershipValid =
+        ($ownershipDisposition -ceq "unowned" -and $previousOwnerAbsent -and
+            [string]::IsNullOrEmpty([string]$state.PreviousOwnershipManifestSha256)) -or
+        ($ownershipDisposition -ceq "current-product" -and $previousOwner -ceq $ProductCode -and
+            [string]$state.PreviousOwnershipManifestSha256 -cmatch '^[0-9A-F]{64}$') -or
+        ($ownershipDisposition -ceq "related-upgrade-transfer" -and
+            $previousOwnerValid -and $previousOwner -cne $ProductCode)
+    $previousOwnershipManifestSha256 = [string]$state.PreviousOwnershipManifestSha256
+    $previousOwnershipHashValid = [string]::IsNullOrEmpty($previousOwnershipManifestSha256) -or
+        $previousOwnershipManifestSha256 -cmatch '^[0-9A-F]{64}$'
+    $pendingPhase = [string]$state.PendingPhase
+    $pendingBootIdentifier = [string]$state.PendingBootIdentifier
+    $pendingBootValid = if ($pendingPhase -in @("none", "commit-ownership")) {
+        [string]::IsNullOrEmpty($pendingBootIdentifier)
+    } else {
+        $pendingBootIdentifier -cmatch '^\d+$'
+    }
+    if ([int]$state.Schema -ne 6 -or
         [string]$state.ProductCode -cne $ProductCode -or
         [string]$state.TransactionKind -cne $TransactionKind -or
+        -not $ownershipValid -or -not $previousOwnershipHashValid -or -not $pendingBootValid -or
         -not [IO.Path]::GetFullPath([string]$state.RootDir).Equals(
             [IO.Path]::GetFullPath($RootDir),
             [StringComparison]::OrdinalIgnoreCase) -or
@@ -603,11 +790,15 @@ function Read-State {
         (-not $resultIdentityAbsent -and -not $resultIdentityValid) -or
         ([bool]$state.DeferredPreviousPackageRemoval -and
             (-not [bool]$state.PackageWasPresent -or [bool]$state.DriverWasPresent)) -or
-        [string]$state.PendingPhase -notin @(
+        ([bool]$state.OwnershipCommitted -and -not [bool]$state.Committed) -or
+        ([bool]$state.OwnershipCommitted -and $pendingPhase -cne "none") -or
+        ($pendingPhase -ceq "commit-ownership" -and -not [bool]$state.Committed) -or
+        $pendingPhase -notin @(
             "none",
             "forward-remove",
             "forward-verify",
             "commit-remove-previous",
+            "commit-ownership",
             "rollback-remove",
             "rollback-verify"
         )) {
@@ -646,14 +837,16 @@ function Start-Transaction {
         Copy-Item -LiteralPath $script:CurrentScriptPath -Destination $rollbackScript -Force
         Copy-Item -LiteralPath $installedHelper -Destination $rollbackHelper -Force
         $current = Get-InstalledVirtualDisplay
+        $previousOwnershipManifestSha256 = Get-OwnershipManifestSha256
         $owned = Read-OwnedDriverIdentity
-        if ($null -ne $owned -and
-            [string]$owned.ProductCode -cne $ProductCode -and
-            ([string]::IsNullOrWhiteSpace($UpgradeOwnerProductCode) -or
-                [string]$owned.ProductCode -cne $UpgradeOwnerProductCode)) {
-            Write-Warning "Ignoring a VDD ownership manifest belonging to a different Lumen product."
-            $owned = $null
+        if ((Get-OwnershipManifestSha256) -cne $previousOwnershipManifestSha256) {
+            throw "The durable Virtual Display ownership manifest changed while it was read."
         }
+        $ownership = Resolve-VirtualDisplayOwnership `
+            -OwnedProductCode $(if ($null -eq $owned) { $null } else { [string]$owned.ProductCode }) `
+            -CurrentProductCode $ProductCode `
+            -RelatedUpgradeOwnerProductCode $UpgradeOwnerProductCode `
+            -InstalledDevicePresent ($null -ne $current)
         $packageInfName = $null
         if ($null -ne $current) {
             $packageInfName = $current.InfName
@@ -685,10 +878,13 @@ function Start-Transaction {
             $backup = Export-InstalledDriver -InfName $packageInfName
         }
         Save-State -State ([ordered]@{
-            Schema = 5
+            Schema = 6
             ProductCode = $ProductCode
             TransactionKind = $TransactionKind
             RootDir = $RootDir
+            OwnershipDisposition = [string]$ownership.Disposition
+            PreviousOwnerProductCode = [string]$ownership.PreviousOwnerProductCode
+            PreviousOwnershipManifestSha256 = $previousOwnershipManifestSha256
             DriverWasPresent = $null -ne $current
             PackageWasPresent = $null -ne $backup
             DesiredPresent = $DesiredPresent
@@ -721,6 +917,7 @@ function Start-Transaction {
             PendingBootIdentifier = $null
             RollbackComplete = $false
             Committed = $false
+            OwnershipCommitted = $false
         })
     } catch {
         $bootstrapError = $_
@@ -908,6 +1105,47 @@ function Apply-CommittedOwnership {
     }
 }
 
+function Test-CommittedOwnershipMatches {
+    param([psobject]$State)
+    if (-not [bool]$State.DesiredPresent) {
+        return -not (Test-Path -LiteralPath $ownershipFile -PathType Leaf)
+    }
+    $owned = Read-OwnedDriverIdentity
+    if ($null -eq $owned) {
+        return $false
+    }
+    $identity = Get-ResultDriverIdentity -State $State
+    return [string]$owned.ProductCode -ceq $ProductCode -and
+        [string]$owned.PublishedInfName -ceq [string]$identity.PublishedInfName -and
+        [string]$owned.InfSha256 -ceq [string]$identity.InfSha256 -and
+        [string]$owned.ManifestSha256 -ceq [string]$identity.ManifestSha256 -and
+        [string]$owned.CatalogSignerThumbprint -ceq [string]$identity.CatalogSignerThumbprint
+}
+
+function Complete-OwnershipCommit {
+    param([psobject]$State)
+    $currentManifestSha256 = Get-OwnershipManifestSha256
+    $matches = Test-CommittedOwnershipMatches -State $State
+    $action = Resolve-OwnershipCommitAction `
+        -OwnershipCommitted ([bool]$State.OwnershipCommitted) `
+        -PreviousManifestSha256 ([string]$State.PreviousOwnershipManifestSha256) `
+        -CurrentManifestSha256 $currentManifestSha256 `
+        -IntendedOwnershipMatches $matches
+    if ($action -ceq "apply") {
+        if ((Get-OwnershipManifestSha256) -cne $currentManifestSha256) {
+            throw "The durable Virtual Display ownership manifest changed before the atomic commit."
+        }
+        Apply-CommittedOwnership -State $State
+        if (-not (Test-CommittedOwnershipMatches -State $State)) {
+            throw "Virtual Display ownership did not reach its committed state."
+        }
+    }
+    $State.OwnershipCommitted = $true
+    $State.PendingPhase = "none"
+    $State.PendingBootIdentifier = $null
+    Save-State -State $State
+}
+
 function Remove-RollbackArtifacts {
     if (-not (Test-Path -LiteralPath $rollbackDirectory)) {
         return
@@ -993,19 +1231,30 @@ function Assert-DesiredState {
 
 function Complete-ForwardOperation {
     param([psobject]$State)
-    $State.PendingPhase = "none"
-    $State.PendingBootIdentifier = $null
-    Save-State -State $State
+    if ([bool]$State.Committed) {
+        $State.PendingPhase = "commit-ownership"
+        $State.PendingBootIdentifier = $null
+        Save-State -State $State
+        Complete-OwnershipCommit -State $State
+    } else {
+        $State.PendingPhase = "none"
+        $State.PendingBootIdentifier = $null
+        Save-State -State $State
+    }
     Clear-RebootMarker
     Unregister-ResumeTask
     if ([bool]$State.Committed) {
-        Apply-CommittedOwnership -State $State
         Remove-RollbackArtifacts
     }
 }
 
 function Complete-RollbackOperation {
     param([psobject]$State)
+    Resolve-OwnershipRollbackAction `
+        -TransactionCommitted ([bool]$State.Committed) `
+        -OwnershipCommitted ([bool]$State.OwnershipCommitted) `
+        -PreviousManifestSha256 ([string]$State.PreviousOwnershipManifestSha256) `
+        -CurrentManifestSha256 (Get-OwnershipManifestSha256) | Out-Null
     $State.PendingPhase = "none"
     $State.PendingBootIdentifier = $null
     $State.RollbackComplete = $true
@@ -1086,12 +1335,20 @@ function Invoke-Rollback {
     }
     $state = Read-State
     if ([bool]$state.Committed) {
-        if ([string]$state.PendingPhase -ne "none") {
+        if ([string]$state.PendingPhase -notin @("none", "commit-ownership")) {
             throw "A committed Virtual Display change is waiting for post-restart verification."
         }
+        $state.PendingPhase = "commit-ownership"
+        Save-State -State $state
+        Complete-OwnershipCommit -State $state
         Remove-RollbackArtifacts
         return
     }
+    Resolve-OwnershipRollbackAction `
+        -TransactionCommitted $false `
+        -OwnershipCommitted ([bool]$state.OwnershipCommitted) `
+        -PreviousManifestSha256 ([string]$state.PreviousOwnershipManifestSha256) `
+        -CurrentManifestSha256 (Get-OwnershipManifestSha256) | Out-Null
     if ([bool]$state.RollbackComplete) {
         Remove-RollbackArtifacts
         return
@@ -1158,12 +1415,22 @@ function Invoke-Commit {
         return
     }
     $state = Read-State
+    if ([string]$state.PendingPhase -ceq "commit-ownership") {
+        Complete-OwnershipCommit -State $state
+        Remove-RollbackArtifacts
+        return
+    }
     if ([string]$state.PendingPhase -ne "none") {
         $state.Committed = $true
         Save-State -State $state
         $script:RebootRequired = $true
         return
     }
+    Resolve-OwnershipCommitAction `
+        -OwnershipCommitted ([bool]$state.OwnershipCommitted) `
+        -PreviousManifestSha256 ([string]$state.PreviousOwnershipManifestSha256) `
+        -CurrentManifestSha256 (Get-OwnershipManifestSha256) `
+        -IntendedOwnershipMatches (Test-CommittedOwnershipMatches -State $state) | Out-Null
     $deleteNeedsReboot = Remove-DeferredPreviousPackage -State $state
     if ($deleteNeedsReboot) {
         $state.Committed = $true
@@ -1171,8 +1438,9 @@ function Invoke-Commit {
         return
     }
     $state.Committed = $true
+    $state.PendingPhase = "commit-ownership"
     Save-State -State $state
-    Apply-CommittedOwnership -State $state
+    Complete-OwnershipCommit -State $state
     Remove-RollbackArtifacts
 }
 
@@ -1183,17 +1451,28 @@ function Invoke-Resume {
     $state = Read-State
     $phase = [string]$state.PendingPhase
     if ($phase -eq "none") {
-        if ([bool]$state.Committed -or [bool]$state.RollbackComplete) {
+        if ([bool]$state.Committed) {
+            $state.PendingPhase = "commit-ownership"
+            Save-State -State $state
+            Complete-OwnershipCommit -State $state
+            Remove-RollbackArtifacts
+        } elseif ([bool]$state.RollbackComplete) {
             Remove-RollbackArtifacts
         }
         return
     }
-    if ([string]$state.PendingBootIdentifier -eq (Get-BootIdentifier)) {
-        throw "Virtual Display resume is waiting for Windows to restart."
+    if ($phase -cne "commit-ownership") {
+        Assert-VirtualDisplayResumeAfterRestart `
+            -PendingBootIdentifier ([string]$state.PendingBootIdentifier) `
+            -CurrentBootIdentifier (Get-BootIdentifier)
     }
 
     if ([bool]$state.Committed) {
-        if ($phase -eq "commit-remove-previous") {
+        if ($phase -eq "commit-ownership") {
+            Complete-OwnershipCommit -State $state
+            Remove-RollbackArtifacts
+            return
+        } elseif ($phase -eq "commit-remove-previous") {
             $deleteNeedsReboot = Remove-PublishedDriverPackage `
                 -InfName ([string]$state.PreviousPublishedInfName) `
                 -ExpectedInfSha256 ([string]$state.PreviousPublishedInfSha256) `

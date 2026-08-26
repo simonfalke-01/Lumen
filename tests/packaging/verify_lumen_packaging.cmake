@@ -24,6 +24,25 @@ function(assert_file_contains_literal relative_path expected_text description)
     endif()
 endfunction()
 
+function(assert_file_literal_count relative_path expected_text expected_count description)
+    file(READ "${LUMEN_ROOT}/${relative_path}" remaining_contents)
+    set(actual_count 0)
+    string(LENGTH "${expected_text}" expected_length)
+    while(TRUE)
+        string(FIND "${remaining_contents}" "${expected_text}" match_offset)
+        if(match_offset EQUAL -1)
+            break()
+        endif()
+        math(EXPR actual_count "${actual_count} + 1")
+        math(EXPR next_offset "${match_offset} + ${expected_length}")
+        string(SUBSTRING "${remaining_contents}" ${next_offset} -1 remaining_contents)
+    endwhile()
+    if(NOT actual_count EQUAL expected_count)
+        message(FATAL_ERROR
+            "${description}: expected ${expected_count}, found ${actual_count}: ${relative_path}")
+    endif()
+endfunction()
+
 assert_file_contains_literal(
     "cmake/packaging/common.cmake"
     [=[set(CPACK_PACKAGE_VERSION ${LUMEN_VERSION_CORE})]=]
@@ -413,12 +432,22 @@ foreach(vdd_upgrade_contract IN ITEMS
         [=[LumenResolveUpgradeVddOwnership]=]
         [=[MsiEnumRelatedProductsW]=]
         [=[MsiQueryFeatureStateW]=]
-        [=[LUMEN_UPGRADE_OWNED_VDD]=])
+        [=[LUMEN_UPGRADE_OWNED_VDD]=]
+        [=[lumen_vdd_owner_selection_add]=]
+        [=[LUMEN_VDD_OWNER_SELECTION_AMBIGUOUS]=])
     assert_file_contains_literal(
         "tools/lumen-msica.c"
         "${vdd_upgrade_contract}"
         "MSI upgrade ownership resolution must retain ${vdd_upgrade_contract}")
 endforeach()
+assert_file_contains_literal(
+    "tools/lumen-msica-ownership.h"
+    [=[Retain exactly one normalized related ProductCode and reject ambiguity.]=]
+    "MSI owner selection must be portable and executable offline")
+assert_file_contains_literal(
+    "tests/packaging/test-lumen-msica-owner-selection.c"
+    [=[multiple related feature owners must fail closed]=]
+    "The offline C fixture must reject ambiguous related owners")
 assert_file_contains_literal(
     "cmake/packaging/wix_resources/sunshine-installer.wxs"
     [=[-UpgradeOwnedVirtualDisplay [LUMEN_UPGRADE_OWNED_VDD]]=]
@@ -427,6 +456,15 @@ assert_file_contains_literal(
     "src_assets/windows/misc/sunshine-setup.ps1"
     [=[$upgradeOwnedVirtualDisplaySelected]=]
     "Setup must remove a replaced product's VDD when the new feature is absent")
+foreach(vdd_upgrade_authority_contract IN ITEMS
+        [=[$upgradeOwnerRequired = $Msi -and $TransactionKind -eq "install"]=]
+        [=[UpgradeVddOwnerProduct is valid only for a verified related MSI ownership transaction.]=]
+        [=[A verified related MSI VDD owner ProductCode is required for ownership transfer.]=])
+    assert_file_contains_literal(
+        "src_assets/windows/misc/sunshine-setup.ps1"
+        "${vdd_upgrade_authority_contract}"
+        "MSI ownership transfer authority must retain ${vdd_upgrade_authority_contract}")
+endforeach()
 assert_file_contains_literal(
     "src_assets/windows/misc/virtual-display-setup.ps1"
     [=[LumenVirtualDisplayInstallerV1]=]
@@ -460,12 +498,53 @@ foreach(vdd_durable_ownership_contract IN ITEMS
         [=[Remove-DeferredPreviousPackage]=]
         [=[Set-PendingReboot -State $state -Phase "commit-remove-previous"]=]
         [=[UpgradeOwnerProductCode]=]
+        [=[Resolve-VirtualDisplayOwnership]=]
+        [=[PreviousOwnershipManifestSha256]=]
+        [=[Resolve-OwnershipCommitAction]=]
+        [=[Resolve-OwnershipRollbackAction]=]
+        [=[Assert-VirtualDisplayResumeAfterRestart]=]
+        [=[PendingPhase = "commit-ownership"]=]
+        [=[OwnershipCommitted]=]
         [=[No device or durable VDD ownership manifest exists]=])
     assert_file_contains_literal(
         "src_assets/windows/misc/virtual-display-setup.ps1"
         "${vdd_durable_ownership_contract}"
         "Durable device-absent VDD cleanup must retain ${vdd_durable_ownership_contract}")
 endforeach()
+assert_file_excludes(
+    "src_assets/windows/misc/virtual-display-setup.ps1"
+    [=[Ignoring a VDD ownership manifest belonging to a different Lumen product.]=]
+    "A foreign ProductCode manifest must never be downgraded to unowned hardware")
+assert_file_contains_literal(
+    "tests/packaging/test-virtual-display-ownership-contract.ps1"
+    [=[ProductCode ownership transfer/refusal contract]=]
+    "The offline PowerShell fixture must execute ownership, rollback, and resume decisions")
+assert_file_contains_literal(
+    "tests/packaging/run-gate5-msi-offline-fixtures.cmake"
+    [=[Verified Gate 5 MSI ownership fixtures.]=]
+    "Gate 5 MSI fixtures must have one portable runner")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/sunshine-installer.wxs"
+    [=[<Custom Action="CA_LumenResolveUpgradeVddOwnership" After="CostFinalize"
+              Condition="NOT (REMOVE=&quot;ALL&quot;)"/>]=]
+    "MSI owner resolution must precede every deferred ownership action")
+foreach(vdd_transaction_order_contract IN ITEMS
+        [=[<Custom Action="CA_LumenInstallRollback" After="SetLumenInstallCommitData"]=]
+        [=[<Custom Action="CA_LumenInstall" After="CA_LumenInstallRollback"]=]
+        [=[<Custom Action="CA_LumenInstallCommit" After="CA_LumenInstall"]=]
+        [=[After="InstallFiles" Sequence="execute"]=]
+        [=[After="SetLumenInstallRollbackData" Sequence="execute"]=]
+        [=[After="SetLumenInstallData" Sequence="execute"]=])
+    assert_file_contains_literal(
+        "cmake/packaging/wix_resources/sunshine-installer.wxs"
+        "${vdd_transaction_order_contract}"
+        "MSI ownership transaction ordering must retain ${vdd_transaction_order_contract}")
+endforeach()
+assert_file_literal_count(
+    "cmake/packaging/wix_resources/sunshine-installer.wxs"
+    [=[-UpgradeVddOwnerProduct &quot;[LUMEN_UPGRADE_VDD_OWNER_PRODUCT]&quot;]=]
+    3
+    "Install rollback/forward/commit must receive the same verified prior ProductCode")
 assert_file_contains_literal(
     ".github/workflows/ci-windows.yml"
     [=[EXPECT_VDD_FEATURE: ${{ inputs.release_tag != '' && 'true' || 'false' }}]=]

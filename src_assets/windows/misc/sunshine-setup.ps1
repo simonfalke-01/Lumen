@@ -1212,6 +1212,16 @@ if (($TransactionKind -eq "uninstall" -and $IdentityDisposition -ne "remove") -o
     ($TransactionKind -eq "install" -and $IdentityDisposition -ne "preserve")) {
     throw "Identity disposition '$IdentityDisposition' does not match transaction '$TransactionKind'."
 }
+$upgradeOwnerProvided = -not [string]::IsNullOrWhiteSpace($UpgradeVddOwnerProduct)
+$upgradeOwnerRequired = $Msi -and $TransactionKind -eq "install" -and
+    $Action -in @("install", "rollback", "commit") -and
+    $UpgradeOwnedVirtualDisplay -eq "1"
+if ($upgradeOwnerProvided -and -not $upgradeOwnerRequired) {
+    throw "UpgradeVddOwnerProduct is valid only for a verified related MSI ownership transaction."
+}
+if ($upgradeOwnerRequired -and -not $upgradeOwnerProvided) {
+    throw "A verified related MSI VDD owner ProductCode is required for ownership transfer."
+}
 $virtualHidSelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualHid)) {
     $true
 } else {

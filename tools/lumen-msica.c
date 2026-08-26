@@ -12,6 +12,8 @@
 #include <wchar.h>
 #include <wctype.h>
 
+#include "lumen-msica-ownership.h"
+
 #define LUMEN_UPGRADE_CODE L"{89721553-C582-4D70-8BBF-1E6C5431C8D5}"
 #define LUMEN_VDD_FEATURE L"CM_C_virtual_display_driver"
 
@@ -117,6 +119,7 @@ static BOOL product_token(const wchar_t *product_code, wchar_t token[33]) {
 __declspec(dllexport) UINT __stdcall LumenResolveUpgradeVddOwnership(MSIHANDLE installation) {
   wchar_t *detected = NULL;
   wchar_t *cursor;
+  lumen_vdd_owner_selection owner = {0};
   UINT result = read_property(installation, L"WIX_UPGRADE_DETECTED", &detected);
   if (result != ERROR_SUCCESS) {
     return result;
@@ -154,17 +157,18 @@ __declspec(dllexport) UINT __stdcall LumenResolveUpgradeVddOwnership(MSIHANDLE i
 
     feature_state = MsiQueryFeatureStateW(product_code, LUMEN_VDD_FEATURE);
     if (feature_state == INSTALLSTATE_LOCAL) {
-      result = MsiSetPropertyW(installation, L"LUMEN_UPGRADE_OWNED_VDD", L"1");
-      if (result == ERROR_SUCCESS) {
-        result = MsiSetPropertyW(installation, L"LUMEN_UPGRADE_VDD_OWNER_PRODUCT", product_code);
+      const lumen_vdd_owner_selection_result selection_result =
+        lumen_vdd_owner_selection_add(&owner, product_code);
+      if (selection_result == LUMEN_VDD_OWNER_SELECTION_AMBIGUOUS) {
+        log_message(installation, L"Multiple replaced Lumen products claim Virtual Display ownership; refusing an ambiguous transfer.");
+        HeapFree(GetProcessHeap(), 0, detected);
+        return ERROR_INVALID_DATA;
       }
-      if (result == ERROR_SUCCESS) {
-        log_message(installation, L"The replaced Lumen product owns Virtual Display; cleanup is enabled if the new feature is absent.");
+      if (selection_result != LUMEN_VDD_OWNER_SELECTION_OK) {
+        HeapFree(GetProcessHeap(), 0, detected);
+        return ERROR_INVALID_DATA;
       }
-      HeapFree(GetProcessHeap(), 0, detected);
-      return result;
-    }
-    if (feature_state != INSTALLSTATE_UNKNOWN &&
+    } else if (feature_state != INSTALLSTATE_UNKNOWN &&
         feature_state != INSTALLSTATE_ABSENT &&
         feature_state != INSTALLSTATE_ADVERTISED) {
       HeapFree(GetProcessHeap(), 0, detected);
@@ -179,8 +183,17 @@ __declspec(dllexport) UINT __stdcall LumenResolveUpgradeVddOwnership(MSIHANDLE i
       return ERROR_INVALID_DATA;
     }
   }
+  if (owner.count == 1u) {
+    result = MsiSetPropertyW(installation, L"LUMEN_UPGRADE_OWNED_VDD", L"1");
+    if (result == ERROR_SUCCESS) {
+      result = MsiSetPropertyW(installation, L"LUMEN_UPGRADE_VDD_OWNER_PRODUCT", owner.product_code);
+    }
+    if (result == ERROR_SUCCESS) {
+      log_message(installation, L"Exactly one replaced Lumen product owns Virtual Display; explicit ownership transfer is enabled.");
+    }
+  }
   HeapFree(GetProcessHeap(), 0, detected);
-  return ERROR_SUCCESS;
+  return result;
 }
 
 /** Emit one informational record to the MSI log. */
