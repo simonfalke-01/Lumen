@@ -1,0 +1,105 @@
+{
+  "schema": "lumen-vdd-gate5/1",
+  "producer": {
+    "repository": "Lumen",
+    "source_baseline": "c581323405375a82c9243181a1361ac22fcc1b40",
+    "task": "Ultragoal G006 Gate5 Task6"
+  },
+  "contract": {
+    "minimum_width": 320,
+    "maximum_width": 7680,
+    "minimum_height": 200,
+    "maximum_height": 4320,
+    "minimum_refresh_hz": 10,
+    "maximum_refresh_hz": 480,
+    "sdr": {
+      "bits_per_channel": 8,
+      "texture_format": "bgra8",
+      "surface_color_space": "srgb"
+    },
+    "hdr10": {
+      "bits_per_channel": 10,
+      "texture_format": "rgba16_float",
+      "surface_color_space": "scrgb"
+    },
+    "capture_states": [
+      "inactive",
+      "direct",
+      "fallback",
+      "quarantined",
+      "unavailable"
+    ]
+  },
+  "modes": [
+    {
+      "id": "sdr-120",
+      "width": 3456,
+      "height": 2160,
+      "refresh_numerator": 120,
+      "refresh_denominator": 1,
+      "dynamic_range": "sdr",
+      "bits_per_channel": 8,
+      "admitted": true
+    },
+    {
+      "id": "hdr-60000-over-1001",
+      "width": 3456,
+      "height": 2160,
+      "refresh_numerator": 60000,
+      "refresh_denominator": 1001,
+      "dynamic_range": "hdr10",
+      "bits_per_channel": 10,
+      "admitted": true
+    },
+    {
+      "id": "below-refresh",
+      "width": 1920,
+      "height": 1080,
+      "refresh_numerator": 9,
+      "refresh_denominator": 1,
+      "dynamic_range": "sdr",
+      "bits_per_channel": 8,
+      "admitted": false
+    },
+    {
+      "id": "above-refresh",
+      "width": 1920,
+      "height": 1080,
+      "refresh_numerator": 481,
+      "refresh_denominator": 1,
+      "dynamic_range": "sdr",
+      "bits_per_channel": 8,
+      "admitted": false
+    },
+    {
+      "id": "unreduced-refresh",
+      "width": 1920,
+      "height": 1080,
+      "refresh_numerator": 120,
+      "refresh_denominator": 2,
+      "dynamic_range": "sdr",
+      "bits_per_channel": 8,
+      "admitted": false
+    },
+    {
+      "id": "sdr10-rejected",
+      "width": 1920,
+      "height": 1080,
+      "refresh_numerator": 60,
+      "refresh_denominator": 1,
+      "dynamic_range": "sdr",
+      "bits_per_channel": 10,
+      "admitted": false
+    },
+    {
+      "id": "hdr8-rejected",
+      "width": 1920,
+      "height": 1080,
+      "refresh_numerator": 60,
+      "refresh_denominator": 1,
+      "dynamic_range": "hdr10",
+      "bits_per_channel": 8,
+      "admitted": false
+    }
+  ]
+}

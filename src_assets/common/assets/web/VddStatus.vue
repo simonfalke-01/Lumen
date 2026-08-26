@@ -126,12 +126,7 @@ export default {
       return this.$t('index.vdd_unavailable_state');
     },
     captureUnavailable() {
-      return Boolean(
-        this.status?.active &&
-        !this.status.directFrameBound &&
-        !this.status.fallback &&
-        !this.status.quarantined
-      );
+      return this.status?.captureState === 'unavailable';
     },
     showDiagnostic() {
       return this.stale || this.status.quarantined || this.status.fallback || this.captureUnavailable;

@@ -612,6 +612,7 @@ TEST_F(ConfigHttpTest, VddStatusRequiresAuthenticationAndReturnsStableSchema) {
          "directFrameBound",
          "quarantined",
          "fallback",
+         "captureState",
          "diagnostic",
        }) {
     EXPECT_TRUE(body.contains(field)) << field;
@@ -623,6 +624,12 @@ TEST_F(ConfigHttpTest, VddStatusRequiresAuthenticationAndReturnsStableSchema) {
   EXPECT_TRUE(body["directFrameBound"].is_boolean());
   EXPECT_TRUE(body["quarantined"].is_boolean());
   EXPECT_TRUE(body["fallback"].is_boolean());
+  EXPECT_TRUE(body["captureState"].is_string());
+  EXPECT_TRUE(
+    body["captureState"] == "inactive" || body["captureState"] == "direct" ||
+    body["captureState"] == "fallback" || body["captureState"] == "quarantined" ||
+    body["captureState"] == "unavailable"
+  );
   EXPECT_TRUE(body["deliveryPolicy"].is_null() || body["deliveryPolicy"].is_string());
   if (body["deliveryPolicy"].is_string()) {
     EXPECT_TRUE(body["deliveryPolicy"] == "latency" || body["deliveryPolicy"] == "quality");

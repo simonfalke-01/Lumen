@@ -55,6 +55,11 @@ TEST(VirtualDisplayStatus, ActiveUnboundCaptureIsUnavailableInsteadOfHealthy) {
   EXPECT_EQ(classify_capture_path(true, {true, false, false}), capture_path_status_e::direct);
   EXPECT_EQ(classify_capture_path(true, {false, false, true}), capture_path_status_e::fallback);
   EXPECT_EQ(classify_capture_path(true, {true, true, true}), capture_path_status_e::quarantined);
+  EXPECT_EQ(capture_path_status_name(capture_path_status_e::inactive), "inactive");
+  EXPECT_EQ(capture_path_status_name(capture_path_status_e::direct), "direct");
+  EXPECT_EQ(capture_path_status_name(capture_path_status_e::fallback), "fallback");
+  EXPECT_EQ(capture_path_status_name(capture_path_status_e::quarantined), "quarantined");
+  EXPECT_EQ(capture_path_status_name(capture_path_status_e::unavailable), "unavailable");
 }
 
 TEST(VirtualDisplayStatus, DirectFrameStateIsGenerationScopedAndAbaSafe) {

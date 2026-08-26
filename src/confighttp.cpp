@@ -1922,6 +1922,7 @@ namespace confighttp {
       {"directFrameBound", false},
       {"quarantined", false},
       {"fallback", false},
+      {"captureState", "inactive"},
       {"diagnostic", "Lumen Virtual Display is available only on Windows."},
     };
 
@@ -1936,6 +1937,7 @@ namespace confighttp {
     output_tree["directFrameBound"] = status.direct_frame_bound;
     output_tree["quarantined"] = status.direct_frame_quarantined;
     output_tree["fallback"] = status.fallback;
+    output_tree["captureState"] = std::string {platf::virtual_display::capture_path_status_name(status.capture_path)};
     output_tree["diagnostic"] = status.diagnostic;
     if (status.active) {
       output_tree["active"] = true;

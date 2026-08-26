@@ -263,7 +263,7 @@ namespace platf::virtual_display {
       status.fallback = direct_frame.fallback && !status.direct_frame_quarantined;
     }
 
-    const auto capture_path = classify_capture_path(
+    status.capture_path = classify_capture_path(
       status.active.has_value(),
       {status.direct_frame_bound, status.direct_frame_quarantined, status.fallback}
     );
@@ -272,7 +272,7 @@ namespace platf::virtual_display {
                             "Windows reports a problem with Lumen Virtual Display." :
                             "Lumen Virtual Display is installed but not started.";
     } else {
-      switch (capture_path) {
+      switch (status.capture_path) {
         case capture_path_status_e::quarantined:
           status.diagnostic = "Direct-frame capture stopped after a runtime failure. Restart Lumen before retrying.";
           break;

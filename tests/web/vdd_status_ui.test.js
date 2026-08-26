@@ -36,7 +36,7 @@ test('VDD status is a compact semantic ledger backed by every production field',
   assert.match(component, /status\.quarantined/);
   assert.match(component, /status\.fallback/);
   assert.match(component, /captureUnavailable/);
-  assert.match(component, /!this\.status\.directFrameBound/);
+  assert.match(component, /status\?\.captureState === 'unavailable'/);
   assert.match(component, /this\.captureUnavailable\) return this\.\$t\('index\.vdd_unavailable_state'\)/);
   assert.match(component, /status\.diagnostic/);
   assert.match(component, /status\?\.deliveryPolicy/);
