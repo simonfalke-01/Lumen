@@ -29,6 +29,24 @@ try {
         "frozen-content",
         [Text.UTF8Encoding]::new($false)
     )
+    $shaderRoot = Join-Path $sourceRoot "src_assets/windows/assets/shaders/directx"
+    foreach ($shader in @(
+            'convert_yuv420_packed_uv_type0_ps_vdd_color_transform.hlsl',
+            'convert_yuv420_packed_uv_type0s_ps_vdd_color_transform.hlsl',
+            'convert_yuv420_planar_y_ps_vdd_color_transform.hlsl',
+            'convert_yuv444_packed_ayuv_ps_vdd_color_transform.hlsl',
+            'convert_yuv444_packed_y410_ps_vdd_color_transform.hlsl',
+            'convert_yuv444_planar_ps_vdd_color_transform.hlsl',
+            'include/convert_vdd_color_transform_base.hlsl'
+        )) {
+        $shaderPath = Join-Path $shaderRoot $shader
+        New-Item -ItemType Directory -Path (Split-Path -Parent $shaderPath) -Force | Out-Null
+        [IO.File]::WriteAllText(
+            $shaderPath,
+            "fixture:$shader",
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
     $scriptsRoot = Join-Path $sourceRoot "scripts/windows"
     New-Item -ItemType Directory -Path $scriptsRoot -Force | Out-Null
     [IO.File]::WriteAllText(
@@ -53,9 +71,11 @@ try {
         [Text.UTF8Encoding]::new($false)
     )
 
+    $sharedSourceFreezeManifestSha256 = 'd' * 64
     & (Join-Path $root "scripts/windows/freeze-full-profile-source.ps1") `
         -SourceRoot $sourceRoot `
-        -OutputDirectory $freezeRoot | Out-Null
+        -OutputDirectory $freezeRoot `
+        -SharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256 | Out-Null
     [IO.File]::WriteAllText(
         (Join-Path $sourceRoot "product-source.txt"),
         "mutable-content",
@@ -65,7 +85,8 @@ try {
     $provenance = Expand-VerifiedFullProfileSource `
         -FreezeDirectory $freezeRoot `
         -DestinationDirectory $verifiedRoot `
-        -MutableSourceRoot $sourceRoot
+        -MutableSourceRoot $sourceRoot `
+        -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256
     $verifiedContent = Get-Content -LiteralPath (Join-Path $verifiedRoot "product-source.txt") -Raw
     if ($verifiedContent -cne "frozen-content") {
         throw "Verified build source was read from the mutable source tree."
@@ -83,7 +104,7 @@ try {
         throw "Source freeze removed a checked-in nested build asset directory."
     }
     if ($provenance.SourceRoot -cne (Resolve-Path -LiteralPath $verifiedRoot).Path -or
-        $provenance.FileCount -ne 5 -or
+        $provenance.FileCount -ne 12 -or
         $provenance.FilesManifestSha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $provenance.ArchiveSha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw "Verified source provenance result is incomplete."
@@ -95,7 +116,8 @@ try {
         Expand-VerifiedFullProfileSource `
             -FreezeDirectory $freezeRoot `
             -DestinationDirectory $tamperRoot `
-            -MutableSourceRoot $sourceRoot | Out-Null
+            -MutableSourceRoot $sourceRoot `
+            -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256 | Out-Null
     } catch {
         $tamperRejected = $_.Exception.Message -eq
             "Source file manifest hash does not match the source-freeze manifest."

@@ -1,5 +1,174 @@
 Set-StrictMode -Version Latest
 
+$script:FullProfileExcludedDirectoryNames = @(
+    '.git',
+    '.omx',
+    '.venv',
+    '.wix',
+    'node_modules'
+)
+
+function Test-FullProfileExcludedPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath
+    )
+
+    $segments = @($RelativePath -split '[/\\]')
+    for ($index = 0; $index -lt $segments.Count - 1; $index++) {
+        $segment = $segments[$index]
+        if ($segment -in $script:FullProfileExcludedDirectoryNames -or
+            $segment -like 'cmake-build-*' -or
+            ($index -eq 0 -and (
+                $segment -eq 'build' -or
+                $segment -eq 'build-deps' -or
+                $segment -like 'build-*'
+            ))) {
+            return $true
+        }
+    }
+    $name = $segments[-1]
+    return $name -eq '.git' -or
+        $name -eq '.DS_Store' -or
+        $name -eq 'sunshine_state.json' -or
+        $name -like 'test_sunshine.log*' -or
+        $name -like 'write_file_test_*.txt' -or
+        $name -like '*.gcda' -or
+        $name -like '*.gcno'
+}
+
+function Get-FullProfileSourceFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceRoot
+    )
+
+    $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path
+    $rootPrefix = $SourceRoot + [IO.Path]::DirectorySeparatorChar
+    $reparsePoints = @(
+        Get-ChildItem -LiteralPath $SourceRoot -Recurse -Force | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        } | ForEach-Object {
+            $relative = $_.FullName.Substring($SourceRoot.Length).TrimStart(
+                [IO.Path]::DirectorySeparatorChar,
+                [IO.Path]::AltDirectorySeparatorChar
+            ) -replace '\\', '/'
+            if (-not (Test-FullProfileExcludedPath $relative)) {
+                $_
+            }
+        }
+    )
+    if ($reparsePoints.Count -ne 0) {
+        throw "Full-profile source contains a reparse point: $($reparsePoints[0].FullName)"
+    }
+
+    $files = @(
+        Get-ChildItem -LiteralPath $SourceRoot -File -Recurse -Force | ForEach-Object {
+            if (-not $_.FullName.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Source enumeration escaped SourceRoot.'
+            }
+            $relative = $_.FullName.Substring($SourceRoot.Length).TrimStart(
+                [IO.Path]::DirectorySeparatorChar,
+                [IO.Path]::AltDirectorySeparatorChar
+            ) -replace '\\', '/'
+            if (-not (Test-FullProfileExcludedPath $relative)) {
+                if ($relative.Contains("`n") -or $relative.Contains("`r")) {
+                    throw 'Source bundle does not support newline characters in paths.'
+                }
+                [pscustomobject]@{
+                    RelativePath = $relative
+                    FullName = $_.FullName
+                    Bytes = $_.Length
+                    Sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+            }
+        } | Sort-Object RelativePath
+    )
+    if ($files.Count -eq 0) {
+        throw 'Full-profile source selected no files.'
+    }
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $pathsIgnoreCase = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $files) {
+        if (-not $paths.Add([string]$file.RelativePath) -or
+            -not $pathsIgnoreCase.Add([string]$file.RelativePath)) {
+            throw "Full-profile source contains a duplicate or case-colliding path: $($file.RelativePath)"
+        }
+    }
+    return $files
+}
+
+function Read-FullProfileFilesManifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilesManifestPath
+    )
+
+    if (-not (Test-Path -LiteralPath $FilesManifestPath -PathType Leaf)) {
+        throw "Source files manifest is missing: $FilesManifestPath"
+    }
+    $rows = [object[]](Get-Content -LiteralPath $FilesManifestPath -Raw | ConvertFrom-Json)
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $pathsIgnoreCase = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $rows) {
+        $relativePath = [string]$row.path
+        $segments = @($relativePath -split '/')
+        if ([string]::IsNullOrWhiteSpace($relativePath) -or
+            [IO.Path]::IsPathRooted($relativePath) -or
+            $relativePath.Contains('\\') -or
+            $segments.Count -eq 0 -or
+            @($segments | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' }).Count -ne 0) {
+            throw "Source file manifest contains an unsafe path: $relativePath"
+        }
+        if ([string]$row.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$row.bytes -lt 0) {
+            throw "Source file manifest contains invalid metadata for: $relativePath"
+        }
+        if (-not $paths.Add($relativePath) -or -not $pathsIgnoreCase.Add($relativePath)) {
+            throw "Source file manifest contains a duplicate path: $relativePath"
+        }
+    }
+    return $rows
+}
+
+function Assert-FullProfileSourceSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FilesManifestPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Boundary
+    )
+
+    $expectedRows = @(Read-FullProfileFilesManifest $FilesManifestPath)
+    $actualFiles = @(Get-FullProfileSourceFiles $SourceRoot)
+    if ($actualFiles.Count -ne $expectedRows.Count) {
+        throw "Full-profile source changed before ${Boundary}: expected $($expectedRows.Count) files, found $($actualFiles.Count)."
+    }
+    $actualByPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($file in $actualFiles) {
+        $actualByPath.Add([string]$file.RelativePath, $file)
+    }
+    foreach ($row in $expectedRows) {
+        $relativePath = [string]$row.path
+        if (-not $actualByPath.ContainsKey($relativePath)) {
+            throw "Full-profile source changed before ${Boundary}: missing $relativePath"
+        }
+        $actual = $actualByPath[$relativePath]
+        if ([int64]$actual.Bytes -ne [int64]$row.bytes -or
+            [string]$actual.Sha256 -cne [string]$row.sha256) {
+            throw "Full-profile source changed before ${Boundary}: identity mismatch for $relativePath"
+        }
+    }
+    return [pscustomobject]@{
+        Boundary = $Boundary
+        FileCount = $actualFiles.Count
+        FilesManifestSha256 = (Get-FileHash -LiteralPath $FilesManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+
 function Test-FullProfilePathsDisjoint {
     param(
         [Parameter(Mandatory = $true)]
@@ -34,7 +203,10 @@ function Expand-VerifiedFullProfileSource {
         [string]$DestinationDirectory,
 
         [Parameter(Mandatory = $true)]
-        [string]$MutableSourceRoot
+        [string]$MutableSourceRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSharedSourceFreezeManifestSha256
     )
 
     $FreezeDirectory = (Resolve-Path -LiteralPath $FreezeDirectory).Path
@@ -52,7 +224,12 @@ function Expand-VerifiedFullProfileSource {
         throw "Source-freeze manifest is missing: $freezeManifestPath"
     }
     $freezeManifest = Get-Content -LiteralPath $freezeManifestPath -Raw | ConvertFrom-Json
-    if ([int]$freezeManifest.schema -ne 1 -or [int64]$freezeManifest.fileCount -le 0) {
+    if ([int]$freezeManifest.schema -ne 1 -or
+        [int64]$freezeManifest.fileCount -le 0 -or
+        [string]$freezeManifest.sharedSourceFreezeSchema -cne
+            'umbra-lumen/source-freeze-manifest/1' -or
+        [string]$freezeManifest.sharedSourceFreezeManifestSha256 -cne
+            $ExpectedSharedSourceFreezeManifestSha256) {
         throw "Source-freeze manifest is invalid."
     }
     if ([string]$freezeManifest.filesManifest.name -cne "full-profile-files.json" -or
@@ -80,32 +257,13 @@ function Expand-VerifiedFullProfileSource {
     # Windows PowerShell 5.1 preserves a top-level JSON array as one pipeline
     # object. The explicit object-array cast gives both 5.1 and PowerShell 7
     # the same row collection.
-    $fileRows = [object[]](Get-Content -LiteralPath $filesManifestPath -Raw | ConvertFrom-Json)
+    $fileRows = @(Read-FullProfileFilesManifest $filesManifestPath)
     if ($fileRows.Count -ne [int]$freezeManifest.fileCount) {
         throw "Source file manifest count $($fileRows.Count) does not match the source-freeze manifest count $($freezeManifest.fileCount)."
     }
 
     $expectedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $expectedPathsIgnoreCase = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($row in $fileRows) {
-        $relativePath = [string]$row.path
-        $sha256 = [string]$row.sha256
-        $segments = @($relativePath -split '/')
-        if ([string]::IsNullOrWhiteSpace($relativePath) -or
-            [IO.Path]::IsPathRooted($relativePath) -or
-            $relativePath.Contains('\') -or
-            $segments.Count -eq 0 -or
-            @($segments | Where-Object { $_ -eq "" -or $_ -eq "." -or $_ -eq ".." }).Count -ne 0) {
-            throw "Source file manifest contains an unsafe path: $relativePath"
-        }
-        if ($sha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$row.bytes -lt 0) {
-            throw "Source file manifest contains invalid metadata for: $relativePath"
-        }
-        if (-not $expectedPaths.Add($relativePath) -or
-            -not $expectedPathsIgnoreCase.Add($relativePath)) {
-            throw "Source file manifest contains a duplicate path: $relativePath"
-        }
-    }
+    foreach ($row in $fileRows) { [void]$expectedPaths.Add([string]$row.path) }
 
     $archiveEntries = @(& tar -tzf $archivePath)
     if ($LASTEXITCODE -ne 0) {
@@ -131,29 +289,10 @@ function Expand-VerifiedFullProfileSource {
     }
     $DestinationDirectory = (Resolve-Path -LiteralPath $DestinationDirectory).Path
 
-    $reparsePoints = @(
-        Get-ChildItem -LiteralPath $DestinationDirectory -Recurse -Force |
-            Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 }
-    )
-    if ($reparsePoints.Count -ne 0) {
-        throw "Extracted source contains a reparse point: $($reparsePoints[0].FullName)"
-    }
-    $actualFiles = @(Get-ChildItem -LiteralPath $DestinationDirectory -File -Recurse -Force)
-    if ($actualFiles.Count -ne $fileRows.Count) {
-        throw "Extracted source file count does not match the source file manifest."
-    }
-    foreach ($row in $fileRows) {
-        $relativePath = [string]$row.path
-        $path = Join-Path $DestinationDirectory ($relativePath -replace '/', [IO.Path]::DirectorySeparatorChar)
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            throw "Extracted source file is missing: $relativePath"
-        }
-        $fileInfo = [IO.FileInfo]::new($path)
-        if ($fileInfo.Length -ne [int64]$row.bytes -or
-            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$row.sha256) {
-            throw "Extracted source file identity mismatch: $relativePath"
-        }
-    }
+    [void](Assert-FullProfileSourceSnapshot `
+        -SourceRoot $DestinationDirectory `
+        -FilesManifestPath $filesManifestPath `
+        -Boundary 'verified-source extraction')
 
     $msquicManifestPath = Join-Path $DestinationDirectory "src/platform/windows/msquic_shim/manifest.json"
     $vddProtocolPath = Join-Path $DestinationDirectory "src/platform/windows/virtual_display_driver/LumenVirtualDisplayProtocol.h"
@@ -177,5 +316,9 @@ function Expand-VerifiedFullProfileSource {
         FilesManifestSha256 = $filesManifestHash
         ArchiveSha256 = $archiveHash
         FreezeManifestSha256 = (Get-FileHash -LiteralPath $freezeManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        FilesManifestPath = $filesManifestPath
+        FreezeManifestPath = $freezeManifestPath
+        ArchivePath = $archivePath
+        SharedSourceFreezeManifestSha256 = $ExpectedSharedSourceFreezeManifestSha256
     }
 }

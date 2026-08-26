@@ -180,11 +180,25 @@ function New-Gate6Fixture {
     $filesManifestSha256 = Get-Gate6Sha256 $filesManifestPath
     $archiveSha256 = Get-Gate6Sha256 $archivePath
 
+    $sharedSourceFreezePath = Resolve-Gate6EvidencePath `
+        $evidenceRoot `
+        'source-freeze/umbra-lumen-source-freeze-manifest.json'
+    Save-Json $sharedSourceFreezePath ([ordered]@{
+        schema = 'umbra-lumen/source-freeze-manifest/1'
+        kind = 'source_freeze'
+        release_id = 'fixture'
+        digest_algorithm = 'sha256'
+        repositories = @()
+    })
+    $sharedSourceFreezeSha256 = Get-Gate6Sha256 $sharedSourceFreezePath
+
     $sourceFreezePath = Resolve-Gate6EvidencePath `
         $evidenceRoot `
         'source-freeze/full-profile-source-freeze.json'
     Save-Json $sourceFreezePath ([ordered]@{
         schema = 1
+        sharedSourceFreezeSchema = 'umbra-lumen/source-freeze-manifest/1'
+        sharedSourceFreezeManifestSha256 = $sharedSourceFreezeSha256
         fileCount = 1
         filesManifest = [ordered]@{
             name = 'full-profile-files.json'
@@ -484,6 +498,24 @@ try {
         (Get-FixtureRow $manifest 'app/Lumen.exe').sourceFreezeManifestSha256 = 'e' * 64
         Save-Json $fixture.ManifestPath $manifest
     } 'foreign source freeze'
+
+    Invoke-HostileFixture 'foreign-shared-source-freeze' {
+        param($fixture)
+        $path = 'source-freeze/umbra-lumen-source-freeze-manifest.json'
+        $fullPath = Resolve-Gate6EvidencePath $fixture.EvidenceRoot $path
+        Save-Json $fullPath ([ordered]@{
+            schema = 'umbra-lumen/source-freeze-manifest/1'
+            kind = 'source_freeze'
+            release_id = 'foreign'
+            digest_algorithm = 'sha256'
+            repositories = @()
+        })
+        $manifest = Get-FixtureManifest $fixture
+        $row = Get-FixtureRow $manifest $path
+        $row.bytes = ([IO.FileInfo]::new($fullPath)).Length
+        $row.sha256 = Get-Gate6Sha256 $fullPath
+        Save-Json $fixture.ManifestPath $manifest
+    } 'not bound to the shared Gate6 Source Freeze Manifest'
 
     Invoke-HostileFixture 'zip-driver-payload' {
         param($fixture)

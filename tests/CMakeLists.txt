@@ -330,6 +330,28 @@ add_test(NAME ${PROJECT_NAME} COMMAND ${PROJECT_NAME})
 set_tests_properties(${PROJECT_NAME} PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 if (WIN32)
+    find_program(LUMEN_POWERSHELL_EXECUTABLE NAMES pwsh powershell REQUIRED)
+    add_test(
+        NAME gate6_artifact_manifest
+        COMMAND "${LUMEN_POWERSHELL_EXECUTABLE}"
+            -NoLogo -NoProfile -NonInteractive
+            -File "${CMAKE_SOURCE_DIR}/tests/packaging/test-gate6-artifact-manifest.ps1")
+    add_test(
+        NAME gate6_full_profile_provenance
+        COMMAND "${LUMEN_POWERSHELL_EXECUTABLE}"
+            -NoLogo -NoProfile -NonInteractive
+            -File "${CMAKE_SOURCE_DIR}/tests/packaging/test-gate6-full-profile-provenance.ps1")
+    add_test(
+        NAME gate6_source_freeze_provenance
+        COMMAND "${LUMEN_POWERSHELL_EXECUTABLE}"
+            -NoLogo -NoProfile -NonInteractive
+            -File "${CMAKE_SOURCE_DIR}/tests/packaging/test-full-profile-source-provenance.ps1")
+    set_tests_properties(
+        gate6_artifact_manifest
+        gate6_full_profile_provenance
+        gate6_source_freeze_provenance
+        PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # prefer static libraries since we're linking statically
     # this fixes libcurl linking errors when using non MSYS2 version of CMake
     set_target_properties(${PROJECT_NAME} PROPERTIES LINK_SEARCH_START_STATIC 1)

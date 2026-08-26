@@ -42,9 +42,11 @@
       "root": "",
       "exactFiles": [
         { "path": "source-freeze/full-profile-source-freeze.json", "kind": "source-freeze-manifest" },
+        { "path": "source-freeze/umbra-lumen-source-freeze-manifest.json", "kind": "source-freeze-manifest" },
         { "path": "source-freeze/full-profile-files.json", "kind": "source-files-manifest" },
         { "path": "source-freeze/lumen-full-profile-source.tar.gz", "kind": "source-archive" },
         { "path": "full-profile-driver-manifest.json", "kind": "driver-manifest" },
+        { "path": "signed-return-receipt.json", "kind": "driver-manifest" },
         { "path": "shim/lumen_msquic_shim.dll", "kind": "shim" },
         { "path": "shim/lumen_msquic_shim.lib", "kind": "shim" },
         { "path": "shim/manifest.json", "kind": "shim-manifest" },

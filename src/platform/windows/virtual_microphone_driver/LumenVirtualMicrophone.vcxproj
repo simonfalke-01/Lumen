@@ -54,8 +54,9 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <WarningLevel>Level3</WarningLevel>
-      <TreatWarningAsError>false</TreatWarningAsError>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <EnablePREfast>true</EnablePREfast>
       <PreprocessorDefinitions>_WIN32;_UNICODE;UNICODE;LUMEN_VMIC_KERNEL;PC_IMPLEMENTATION;DEBUG_LEVEL=DEBUGLVL_TERSE;_USE_WAVERT_;_NEW_DELETE_OPERATORS_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(DDK_INC_PATH)crt;$(DDK_INC_PATH);$(ProjectDir)wavert\Inc;$(ProjectDir)wavert\Main;$(ProjectDir)wavert\Filters;$(ProjectDir)wavert\Utilities;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <SDLCheck>true</SDLCheck>

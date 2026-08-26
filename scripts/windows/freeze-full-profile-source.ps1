@@ -4,7 +4,11 @@ param(
     [string]$SourceRoot,
 
     [Parameter(Mandatory = $true)]
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{64}$')]
+    [string]$SharedSourceFreezeManifestSha256
 )
 
 Set-StrictMode -Version Latest
@@ -25,72 +29,16 @@ if ($OutputDirectory -eq $SourceRoot -or
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
-$excludedDirectoryNames = @(
-    ".git",
-    ".omx",
-    ".venv",
-    ".wix",
-    "node_modules"
-)
-function Test-ExcludedPath {
-    param([string]$RelativePath)
-    $segments = $RelativePath -split '[/\\]'
-    for ($index = 0; $index -lt $segments.Count - 1; $index++) {
-        $segment = $segments[$index]
-        if ($segment -in $excludedDirectoryNames -or
-            $segment -like "cmake-build-*" -or
-            ($index -eq 0 -and (
-                $segment -eq "build" -or
-                $segment -eq "build-deps" -or
-                $segment -like "build-*"
-            ))) {
-            return $true
-        }
-    }
-    $name = $segments[-1]
-    return $name -eq ".git" -or
-        $name -eq ".DS_Store" -or
-        $name -eq "sunshine_state.json" -or
-        $name -like "test_sunshine.log*" -or
-        $name -like "write_file_test_*.txt" -or
-        $name -like "*.gcda" -or
-        $name -like "*.gcno"
-}
-
-$files = @(
-    Get-ChildItem -LiteralPath $SourceRoot -File -Recurse -Force | ForEach-Object {
-        if (-not $_.FullName.StartsWith(
-                $SourceRoot + [IO.Path]::DirectorySeparatorChar,
-                [StringComparison]::OrdinalIgnoreCase
-            )) {
-            throw "Source enumeration escaped SourceRoot."
-        }
-        $relative = $_.FullName.Substring($SourceRoot.Length).TrimStart(
-            [IO.Path]::DirectorySeparatorChar,
-            [IO.Path]::AltDirectorySeparatorChar
-        ) -replace '\\', '/'
-        if (-not (Test-ExcludedPath $relative)) {
-            if ($relative.Contains("`n") -or $relative.Contains("`r")) {
-                throw "Source bundle does not support newline characters in paths."
-            }
-            [pscustomobject]@{
-                RelativePath = $relative
-                FullName = $_.FullName
-            }
-        }
-    } | Sort-Object RelativePath
-)
-if ($files.Count -eq 0) {
-    throw "Source freeze selected no files."
-}
+. (Join-Path $PSScriptRoot 'full-profile-source-provenance.ps1')
+$files = @(Get-FullProfileSourceFiles $SourceRoot)
 
 $hashRows = @(
     $files | ForEach-Object {
         $file = $_
         [ordered]@{
             path = $file.RelativePath
-            sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            bytes = ([IO.FileInfo]::new($file.FullName)).Length
+            sha256 = $file.Sha256
+            bytes = $file.Bytes
         }
     }
 )
@@ -118,8 +66,40 @@ if (-not $vddMatch.Success) {
     throw "Unable to read LUMEN_VDD_ABI_VERSION."
 }
 
+$vddShaderPaths = @(
+    'src_assets/windows/assets/shaders/directx/convert_yuv420_packed_uv_type0_ps_vdd_color_transform.hlsl',
+    'src_assets/windows/assets/shaders/directx/convert_yuv420_packed_uv_type0s_ps_vdd_color_transform.hlsl',
+    'src_assets/windows/assets/shaders/directx/convert_yuv420_planar_y_ps_vdd_color_transform.hlsl',
+    'src_assets/windows/assets/shaders/directx/convert_yuv444_packed_ayuv_ps_vdd_color_transform.hlsl',
+    'src_assets/windows/assets/shaders/directx/convert_yuv444_packed_y410_ps_vdd_color_transform.hlsl',
+    'src_assets/windows/assets/shaders/directx/convert_yuv444_planar_ps_vdd_color_transform.hlsl',
+    'src_assets/windows/assets/shaders/directx/include/convert_vdd_color_transform_base.hlsl'
+)
+$vddShaderRows = @(
+    foreach ($path in $vddShaderPaths) {
+        $matches = @($hashRows | Where-Object { [string]$_.path -ceq $path })
+        if ($matches.Count -ne 1) {
+            throw "The Gate6 source freeze is missing exact VDD shader source: $path"
+        }
+        $matches[0]
+    }
+)
+$vddShaderInventoryText = (($vddShaderRows | ForEach-Object {
+            "$([string]$_.path)`t$([int64]$_.bytes)`t$([string]$_.sha256)"
+        }) -join "`n") + "`n"
+$vddShaderInventoryBytes = [Text.UTF8Encoding]::new($false).GetBytes($vddShaderInventoryText)
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try {
+    $vddShaderInventorySha256 = (($sha256.ComputeHash($vddShaderInventoryBytes) |
+        ForEach-Object { '{0:x2}' -f $_ }) -join '')
+} finally {
+    $sha256.Dispose()
+}
+
 $freeze = [ordered]@{
     schema = 1
+    sharedSourceFreezeSchema = 'umbra-lumen/source-freeze-manifest/1'
+    sharedSourceFreezeManifestSha256 = $SharedSourceFreezeManifestSha256
     fileCount = $files.Count
     filesManifest = [ordered]@{
         name = [IO.Path]::GetFileName($fileManifestPath)
@@ -137,6 +117,8 @@ $freeze = [ordered]@{
         msquicProjectSha256 = [string]$msquicManifest.project_sha256
         virtualDisplayAbi = [int]$vddMatch.Groups[1].Value
         virtualDisplayProtocolSha256 = (Get-FileHash $vddProtocolPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        vddShaderCount = $vddShaderRows.Count
+        vddShaderInventorySha256 = $vddShaderInventorySha256
     }
     pendingRuntimePins = @(
         "LUMEN_MSQUIC_SHIM_DLL_SHA256",
