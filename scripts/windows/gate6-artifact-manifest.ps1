@@ -387,22 +387,6 @@ function Assert-Gate6SourceFreezeReference {
         [int64]$freeze.archive.bytes -ne ([IO.FileInfo]::new($archivePath)).Length) {
         throw 'Gate6 source archive does not match the source-freeze manifest.'
     }
-    $sharedManifestPath = Resolve-Gate6EvidencePath `
-        $EvidenceRoot `
-        'source-freeze/umbra-lumen-source-freeze-manifest.json'
-    if (-not (Test-Path -LiteralPath $sharedManifestPath -PathType Leaf) -or
-        $null -eq $freeze.PSObject.Properties['sharedSourceFreezeSchema'] -or
-        $null -eq $freeze.PSObject.Properties['sharedSourceFreezeManifestSha256'] -or
-        [string]$freeze.sharedSourceFreezeSchema -cne 'umbra-lumen/source-freeze-manifest/1' -or
-        [string]$freeze.sharedSourceFreezeManifestSha256 -cne
-            (Get-Gate6Sha256 $sharedManifestPath)) {
-        throw 'Lumen source freeze is not bound to the shared Gate6 Source Freeze Manifest.'
-    }
-    $sharedManifest = Read-Gate6Json $sharedManifestPath 'Shared Gate6 Source Freeze Manifest'
-    if ([string]$sharedManifest.schema -cne 'umbra-lumen/source-freeze-manifest/1' -or
-        [string]$sharedManifest.kind -cne 'source_freeze') {
-        throw 'Shared Gate6 Source Freeze Manifest has an unsupported schema.'
-    }
 }
 
 function Assert-Gate6DriverSubmissionReference {

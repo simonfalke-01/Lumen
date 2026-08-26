@@ -275,6 +275,73 @@ function Test-Gate6DriverBoundEvidencePath {
     return $false
 }
 
+function Assert-Gate6ExternalArtifactBindings {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$EvidenceRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SharedSourceFreezeManifestPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SignedReturnReceiptPath
+    )
+
+    $sourceFreezePath = Resolve-Gate6EvidencePath `
+        $EvidenceRoot 'source-freeze/full-profile-source-freeze.json'
+    $driverManifestPath = Resolve-Gate6EvidencePath `
+        $EvidenceRoot 'full-profile-driver-manifest.json'
+    $sourceFreeze = Read-Gate6Json $sourceFreezePath 'Lumen full-profile source freeze'
+    $sharedSourceFreeze = Read-Gate6Json `
+        $SharedSourceFreezeManifestPath `
+        'Shared Gate6 Source Freeze Manifest'
+    $driverManifest = Read-Gate6Json $driverManifestPath 'Full-profile driver manifest'
+    $receipt = Read-Gate6Json $SignedReturnReceiptPath 'Signed driver return receipt'
+    $sharedHash = Get-Gate6Sha256 $SharedSourceFreezeManifestPath
+    $sourceFreezeHash = Get-Gate6Sha256 $sourceFreezePath
+    $driverManifestHash = Get-Gate6Sha256 $driverManifestPath
+    if ([string]$sharedSourceFreeze.schema -cne 'umbra-lumen/source-freeze-manifest/1' -or
+        [string]$sharedSourceFreeze.kind -cne 'source_freeze' -or
+        [string]$sourceFreeze.sharedSourceFreezeSchema -cne
+            'umbra-lumen/source-freeze-manifest/1' -or
+        [string]$sourceFreeze.sharedSourceFreezeManifestSha256 -cne $sharedHash) {
+        throw 'Lumen source freeze is not bound to the shared Gate6 Source Freeze Manifest.'
+    }
+    if ([string]$receipt.schema -cne 'lumen-gate6-signed-driver-return/1' -or
+        [string]$receipt.sharedSourceFreezeManifestSha256 -cne $sharedHash -or
+        [string]$receipt.sourceFreezeManifestSha256 -cne $sourceFreezeHash -or
+        [string]$receipt.sourceFilesManifestSha256 -cne
+            [string]$driverManifest.sourceFilesManifestSha256 -or
+        [string]$receipt.sourceArchiveSha256 -cne
+            [string]$driverManifest.sourceArchiveSha256 -or
+        [string]$receipt.submissionManifestSha256 -cne $driverManifestHash) {
+        throw 'Signed driver return receipt is not bound to the exact shared and Lumen source freezes.'
+    }
+    $expectedPackages = @('virtual-display', 'virtual-hid', 'virtual-microphone')
+    $packageNames = @($receipt.packages.PSObject.Properties.Name | Sort-Object)
+    if (($packageNames -join '|') -cne ($expectedPackages -join '|')) {
+        throw 'Signed driver return receipt does not contain the exact three driver packages.'
+    }
+    foreach ($name in $expectedPackages) {
+        $package = $receipt.packages.$name
+        if (@($package.submitted).Count -lt 2 -or @($package.returned).Count -ne 3) {
+            throw "Signed driver return receipt is incomplete: $name"
+        }
+        foreach ($row in @($package.submitted) + @($package.returned)) {
+            if ([string]::IsNullOrWhiteSpace([string]$row.name) -or
+                [string]$row.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                throw "Signed driver return receipt contains invalid bytes: $name"
+            }
+        }
+    }
+    return [pscustomobject]@{
+        SharedSourceFreezeManifestSha256 = $sharedHash
+        LumenSourceFreezeManifestSha256 = $sourceFreezeHash
+        DriverSubmissionManifestSha256 = $driverManifestHash
+        SignedReturnReceiptSha256 = Get-Gate6Sha256 $SignedReturnReceiptPath
+    }
+}
+
 function New-Gate6ArtifactManifest {
     param(
         [Parameter(Mandatory = $true)]
@@ -286,11 +353,21 @@ function New-Gate6ArtifactManifest {
         [Parameter(Mandatory = $true)]
         [object[]]$Runs,
 
+        [Parameter(Mandatory = $true)]
+        [string]$SharedSourceFreezeManifestPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SignedReturnReceiptPath,
+
         [string]$PolicyPath = (Join-Path $PSScriptRoot 'gate6-artifact-inventory.json')
     )
 
     Assert-Gate6MandatoryRunsPassed $Runs
     $EvidenceRoot = (Resolve-Path -LiteralPath $EvidenceRoot).Path
+    [void](Assert-Gate6ExternalArtifactBindings `
+        -EvidenceRoot $EvidenceRoot `
+        -SharedSourceFreezeManifestPath $SharedSourceFreezeManifestPath `
+        -SignedReturnReceiptPath $SignedReturnReceiptPath)
     $PolicyPath = (Resolve-Path -LiteralPath $PolicyPath).Path
     $policy = Read-Gate6Json $PolicyPath 'Gate6 inventory policy'
     Assert-Gate6InventoryPolicy $policy

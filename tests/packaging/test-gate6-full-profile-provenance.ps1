@@ -115,6 +115,61 @@ try {
         throw 'Shared SFM validation did not return its exact hash.'
     }
 
+    $bindingEvidence = Join-Path $root 'binding-evidence'
+    $bindingSourceFreezePath = Join-Path `
+        $bindingEvidence `
+        'source-freeze/full-profile-source-freeze.json'
+    $bindingDriverManifestPath = Join-Path $bindingEvidence 'full-profile-driver-manifest.json'
+    $bindingReceiptPath = Join-Path $root 'signed-return-receipt.json'
+    Write-Gate6Json $bindingSourceFreezePath ([ordered]@{
+            schema = 1
+            sharedSourceFreezeSchema = 'umbra-lumen/source-freeze-manifest/1'
+            sharedSourceFreezeManifestSha256 = $shared.Sha256
+        })
+    Write-Gate6Json $bindingDriverManifestPath ([ordered]@{
+            schema = 1
+            sourceFilesManifestSha256 = '2' * 64
+            sourceArchiveSha256 = '3' * 64
+        })
+    $packageReceipt = [ordered]@{
+        submitted = @(
+            [ordered]@{ name = 'driver.inf'; sha256 = '4' * 64 },
+            [ordered]@{ name = 'driver.bin'; sha256 = '5' * 64 }
+        )
+        returned = @(
+            [ordered]@{ name = 'driver.inf'; sha256 = '4' * 64 },
+            [ordered]@{ name = 'driver.bin'; sha256 = '6' * 64 },
+            [ordered]@{ name = 'driver.cat'; sha256 = '7' * 64 }
+        )
+        signaturePolicy = '/kp'
+    }
+    Write-Gate6Json $bindingReceiptPath ([ordered]@{
+            schema = 'lumen-gate6-signed-driver-return/1'
+            sourceFilesManifestSha256 = '2' * 64
+            sourceArchiveSha256 = '3' * 64
+            sourceFreezeManifestSha256 = Get-Gate6Sha256 $bindingSourceFreezePath
+            sharedSourceFreezeManifestSha256 = $shared.Sha256
+            submissionManifestSha256 = Get-Gate6Sha256 $bindingDriverManifestPath
+            packages = [ordered]@{
+                'virtual-display' = $packageReceipt
+                'virtual-hid' = $packageReceipt
+                'virtual-microphone' = $packageReceipt
+            }
+        })
+    [void](Assert-Gate6ExternalArtifactBindings `
+        -EvidenceRoot $bindingEvidence `
+        -SharedSourceFreezeManifestPath $sharedManifestPath `
+        -SignedReturnReceiptPath $bindingReceiptPath)
+    $foreignShared = Get-Content $sharedManifestPath -Raw | ConvertFrom-Json
+    $foreignShared.release_id = 'foreign'
+    Write-Gate6Json $sharedManifestPath $foreignShared
+    Assert-ThrowsLike {
+        [void](Assert-Gate6ExternalArtifactBindings `
+            -EvidenceRoot $bindingEvidence `
+            -SharedSourceFreezeManifestPath $sharedManifestPath `
+            -SignedReturnReceiptPath $bindingReceiptPath)
+    } 'not bound to the shared Gate6 Source Freeze Manifest' 'Foreign shared SFM binding'
+
     $pwsh = (Get-Process -Id $PID).Path
     $passing = Invoke-Gate6RecordedCommand `
         -RunId passing `

@@ -882,9 +882,7 @@ $msiContentRoot = Get-Gate6PackageContentRoot $msiExtractionRoot 'MSI'
 $zipContentRoot = Get-Gate6PackageContentRoot $zipExtractionRoot 'ZIP'
 
 Copy-Gate6EvidenceTree $freezeDirectory 'source-freeze'
-Copy-Gate6EvidenceFile $sharedSourceFreeze.Path 'source-freeze/umbra-lumen-source-freeze-manifest.json'
 Copy-Gate6EvidenceFile $signedSubmissionManifestPath 'full-profile-driver-manifest.json'
-Copy-Gate6EvidenceFile $signedReturnReceiptPath 'signed-return-receipt.json'
 Copy-Gate6EvidenceFile $shimDll 'shim/lumen_msquic_shim.dll'
 Copy-Gate6EvidenceFile $shimLib 'shim/lumen_msquic_shim.lib'
 Copy-Gate6EvidenceFile $shimManifest 'shim/manifest.json'
@@ -925,7 +923,9 @@ $gate6ArtifactManifestPath = Join-Path $StagingRoot 'lumen-gate6-artifact-manife
 $gate6ArtifactManifest = New-Gate6ArtifactManifest `
     -EvidenceRoot $Gate6EvidenceRoot `
     -ManifestPath $gate6ArtifactManifestPath `
-    -Runs @($gate6Runs)
+    -Runs @($gate6Runs) `
+    -SharedSourceFreezeManifestPath $sharedSourceFreeze.Path `
+    -SignedReturnReceiptPath $signedReturnReceiptPath
 
 Write-Output "FULL_PROFILE_MSI=$versionedMsi"
 Write-Output "FULL_PROFILE_MSI_SHA256=$((Get-FileHash $versionedMsi -Algorithm SHA256).Hash)"
@@ -933,6 +933,8 @@ Write-Output "FULL_PROFILE_ZIP=$versionedZip"
 Write-Output "FULL_PROFILE_ZIP_SHA256=$((Get-FileHash $versionedZip -Algorithm SHA256).Hash)"
 Write-Output "GATE6_RUN_EVIDENCE=$runEvidenceRoot"
 Write-Output "GATE6_TOOLCHAIN_IDENTITIES=$toolIdentityPath"
+Write-Output "GATE6_SHARED_SOURCE_FREEZE_MANIFEST=$($sharedSourceFreeze.Path)"
+Write-Output "GATE6_SIGNED_RETURN_RECEIPT=$signedReturnReceiptPath"
 Write-Output "GATE6_ARTIFACT_EVIDENCE=$Gate6EvidenceRoot"
 Write-Output "GATE6_ARTIFACT_MANIFEST=$gate6ArtifactManifestPath"
 Write-Output "GATE6_ARTIFACT_FILE_COUNT=$($gate6ArtifactManifest.FileCount)"
