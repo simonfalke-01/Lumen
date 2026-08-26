@@ -235,8 +235,18 @@ TEST_P(MouseHIDTest, MoveInputTest) {
   EXPECT_TRUE(has_input_moved);
 
   // Verify we moved as much as we requested
+#ifdef __APPLE__
+  // CoreGraphics reports the live cursor in logical points after asynchronous
+  // event delivery. Sub-point quantization and concurrent physical cursor
+  // updates can make that observation differ slightly from the exact delta
+  // carried by the injected event, so retain a tight two-point tolerance.
+  constexpr double cursor_observation_tolerance = 2.0;
+  EXPECT_NEAR(new_loc.x - old_loc.x, mouse_delta.x, cursor_observation_tolerance);
+  EXPECT_NEAR(new_loc.y - old_loc.y, mouse_delta.y, cursor_observation_tolerance);
+#else
   EXPECT_EQ(new_loc.x - old_loc.x, mouse_delta.x);
   EXPECT_EQ(new_loc.y - old_loc.y, mouse_delta.y);
+#endif
 }
 
 TEST_P(MouseHIDTest, AbsMoveInputTest) {
