@@ -5,6 +5,7 @@
 #include "LumenColorTransformPolicy.h"
 #include "LumenDirectFrameSlotPolicy.h"
 #include "LumenHdrModePolicy.h"
+#include "LumenModeTimingPolicy.h"
 #include "LumenModeValidationPolicy.h"
 #include "LumenSingleDeleteOwner.h"
 #include "LumenVirtualDisplayProtocol.h"
@@ -854,31 +855,16 @@ namespace {
 
   /** @brief Fill exact signal metadata for a dynamic mode. */
   DISPLAYCONFIG_VIDEO_SIGNAL_INFO signal_info(const LUMEN_VDD_MODE &mode, bool monitor_mode) noexcept {
+    const auto timing = lumen::vdd::timing::make(mode, monitor_mode);
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO signal {};
-    signal.activeSize = {mode.width, mode.height};
-    if (mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 &&
-        lumen::vdd::hdr::modes_equal(mode, lumen::vdd::hdr::baseline_mode)) {
-      signal.totalSize = {2200, 1125};
-      signal.vSyncFreq = {60, 1};
-      signal.hSyncFreq = {67500, 1};
-      signal.pixelRate = 148500000;
-      signal.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-      signal.AdditionalSignalInfo.videoStandard = 16;
-      signal.AdditionalSignalInfo.vSyncFreqDivider = monitor_mode ? 0 : 1;
-      return signal;
-    }
-    signal.totalSize = signal.activeSize;
-    signal.vSyncFreq = {mode.refresh_numerator, mode.refresh_denominator};
-    const auto scan_lines_per_second =
-      (static_cast<std::uint64_t>(mode.refresh_numerator) * mode.height + mode.refresh_denominator / 2U) /
-      mode.refresh_denominator;
-    signal.hSyncFreq = {static_cast<UINT32>(scan_lines_per_second), 1};
-    signal.pixelRate =
-      (static_cast<UINT64>(mode.width) * mode.height * mode.refresh_numerator + mode.refresh_denominator / 2U) /
-      mode.refresh_denominator;
+    signal.activeSize = {timing.active_width, timing.active_height};
+    signal.totalSize = {timing.total_width, timing.total_height};
+    signal.vSyncFreq = {timing.refresh_numerator, timing.refresh_denominator};
+    signal.hSyncFreq = {timing.horizontal_numerator, timing.horizontal_denominator};
+    signal.pixelRate = timing.pixel_rate;
     signal.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    signal.AdditionalSignalInfo.videoStandard = 255;
-    signal.AdditionalSignalInfo.vSyncFreqDivider = monitor_mode ? 0 : 1;
+    signal.AdditionalSignalInfo.videoStandard = timing.video_standard;
+    signal.AdditionalSignalInfo.vSyncFreqDivider = timing.vertical_sync_divider;
     return signal;
   }
 
@@ -1327,7 +1313,8 @@ _Use_decl_annotations_
     capabilities.Flags = IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
   }
   capabilities.MaxMonitorsSupported = 1;
-  capabilities.MaxDisplayPipelineRate = static_cast<UINT64>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT * 480ULL;
+  capabilities.MaxDisplayPipelineRate =
+    static_cast<UINT64>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT * LUMEN_VDD_MAX_REFRESH_HZ;
   capabilities.EndPointDiagnostics.Size = sizeof(capabilities.EndPointDiagnostics);
   capabilities.EndPointDiagnostics.GammaSupport = hdr_runtime_available() ?
                                                     IDDCX_FEATURE_IMPLEMENTATION_SOFTWARE :
@@ -1432,16 +1419,16 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         *output = {
           LUMEN_VDD_ABI_VERSION,
           capability_flags,
-          256,
+          LUMEN_VDD_MIN_WIDTH,
           LUMEN_VDD_MAX_WIDTH,
-          200,
+          LUMEN_VDD_MIN_HEIGHT,
           LUMEN_VDD_MAX_HEIGHT,
-          10,
+          LUMEN_VDD_MIN_REFRESH_HZ,
           1,
-          480,
+          LUMEN_VDD_MAX_REFRESH_HZ,
           1,
           static_cast<std::uint64_t>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT,
-          static_cast<std::uint64_t>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT * 480ULL,
+          static_cast<std::uint64_t>(LUMEN_VDD_MAX_WIDTH) * LUMEN_VDD_MAX_HEIGHT * LUMEN_VDD_MAX_REFRESH_HZ,
         };
         information = sizeof(*output);
         break;

@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
@@ -3487,35 +3488,7 @@ namespace stream {
         stream_config_.video_path_budget_bps = static_cast<std::uint64_t>(selection_.video_bitrate_kbps) * 1'000U;
         stream_config_.encryptionFlagsEnabled = 0;
         stream_config_.client_microphone = selection_.microphone_enabled;
-        stream_config_.monitor.width = static_cast<int>(selection_.width);
-        stream_config_.monitor.height = static_cast<int>(selection_.height);
-        const auto refresh_whole = selection_.refresh_numerator / selection_.refresh_denominator;
-        const auto refresh_remainder = selection_.refresh_numerator % selection_.refresh_denominator;
-        stream_config_.monitor.framerate = static_cast<int>(
-          refresh_whole + (refresh_remainder * 2U >= selection_.refresh_denominator ? 1U : 0U)
-        );
-        stream_config_.monitor.framerateX100 = 0;
-        stream_config_.monitor.refreshNumerator = static_cast<int>(selection_.refresh_numerator);
-        stream_config_.monitor.refreshDenominator = static_cast<int>(selection_.refresh_denominator);
-        stream_config_.monitor.bitrate = static_cast<int>(selection_.video_bitrate_kbps);
-        stream_config_.monitor.slicesPerFrame = 1;
-        stream_config_.monitor.numRefFrames = 0;
-        stream_config_.monitor.encoderCscMode = selection_.matrix_code == 9 ?
-                                                  (4 | selection_.range) :
-                                                selection_.matrix_code == 1 ?
-                                                  (2 | selection_.range) :
-                                                  selection_.range;
-        stream_config_.monitor.videoFormat = selection_.codec_id - 1;
-        stream_config_.monitor.dynamicRange = selection_.bit_depth == 10 ? 1 : 0;
-        stream_config_.monitor.chromaSamplingType = selection_.chroma_layout == 2 ? 1 : 0;
-        stream_config_.monitor.enableIntraRefresh = 0;
-        stream_config_.monitor.protocolV3Colorimetry = true;
-        stream_config_.monitor.colorPrimaries = selection_.primaries;
-        stream_config_.monitor.colorTransfer = selection_.transfer == 2 ? 16 :
-                                                 selection_.transfer == 3 ? 18 :
-                                                                            1;
-        stream_config_.monitor.colorMatrix = selection_.matrix_code;
-        stream_config_.monitor.colorRange = selection_.range;
+        configure_protocol_v3_video(stream_config_.monitor, selection_);
         stream_config_.monitor.output_name = config::video.output_name;
         stream_config_.monitor.optimization_policy = stream_config_.optimization_policy;
         stream_config_.monitor.client_protocol = stream_policy::ClientProtocol::umbra_v3;
@@ -4620,6 +4593,44 @@ namespace stream {
     const lumen::protocol_v3::media::NegotiatedMediaConfig &selection
   ) {
     configure_v3_audio(output, selection);
+  }
+
+  void configure_protocol_v3_video(
+    video::config_t &output,
+    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection
+  ) {
+    if (selection.refresh_numerator > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+        selection.refresh_denominator > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+      throw std::overflow_error {"protocol-v3 refresh exceeds capture/encoder rational representation"};
+    }
+    output.width = static_cast<int>(selection.width);
+    output.height = static_cast<int>(selection.height);
+    const auto refresh_whole = selection.refresh_numerator / selection.refresh_denominator;
+    const auto refresh_remainder = selection.refresh_numerator % selection.refresh_denominator;
+    output.framerate = static_cast<int>(
+      refresh_whole + (refresh_remainder * 2U >= selection.refresh_denominator ? 1U : 0U)
+    );
+    output.framerateX100 = 0;
+    output.refreshNumerator = static_cast<int>(selection.refresh_numerator);
+    output.refreshDenominator = static_cast<int>(selection.refresh_denominator);
+    output.bitrate = static_cast<int>(selection.video_bitrate_kbps);
+    output.slicesPerFrame = 1;
+    output.numRefFrames = 0;
+    output.encoderCscMode = selection.matrix_code == 9 ?
+                              (4 | selection.range) :
+                            selection.matrix_code == 1 ?
+                              (2 | selection.range) :
+                              selection.range;
+    output.videoFormat = selection.codec_id - 1;
+    output.dynamicRange = selection.bit_depth == 10 ? 1 : 0;
+    output.chromaSamplingType = selection.chroma_layout == 2 ? 1 : 0;
+    output.enableIntraRefresh = 0;
+    output.protocolV3Colorimetry = true;
+    output.colorPrimaries = selection.primaries;
+    output.colorTransfer = selection.transfer == 2 ? 16 : selection.transfer == 3 ? 18 :
+                                                                                    1;
+    output.colorMatrix = selection.matrix_code;
+    output.colorRange = selection.range;
   }
 
 #ifdef SUNSHINE_TESTS

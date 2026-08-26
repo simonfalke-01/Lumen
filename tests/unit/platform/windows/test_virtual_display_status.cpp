@@ -49,6 +49,14 @@ TEST(VirtualDisplayStatus, InactiveDriverStateHasNoPolicyPlaceholder) {
   );
 }
 
+TEST(VirtualDisplayStatus, ActiveUnboundCaptureIsUnavailableInsteadOfHealthy) {
+  EXPECT_EQ(classify_capture_path(false, {}), capture_path_status_e::inactive);
+  EXPECT_EQ(classify_capture_path(true, {}), capture_path_status_e::unavailable);
+  EXPECT_EQ(classify_capture_path(true, {true, false, false}), capture_path_status_e::direct);
+  EXPECT_EQ(classify_capture_path(true, {false, false, true}), capture_path_status_e::fallback);
+  EXPECT_EQ(classify_capture_path(true, {true, true, true}), capture_path_status_e::quarantined);
+}
+
 TEST(VirtualDisplayStatus, DirectFrameStateIsGenerationScopedAndAbaSafe) {
   report_direct_frame_bound(41);
   EXPECT_TRUE(direct_frame_status_for_generation(41).bound);

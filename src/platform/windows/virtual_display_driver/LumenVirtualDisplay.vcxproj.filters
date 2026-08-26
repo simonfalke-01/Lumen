@@ -9,6 +9,7 @@
   <ItemGroup>
     <ClInclude Include="LumenColorTransformPolicy.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="LumenHdrModePolicy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="LumenModeTimingPolicy.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="LumenModeValidationPolicy.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="LumenSingleDeleteOwner.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="LumenVirtualDisplayProtocol.h"><Filter>Header Files</Filter></ClInclude>

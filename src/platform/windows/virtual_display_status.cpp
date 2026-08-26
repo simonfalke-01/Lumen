@@ -263,18 +263,32 @@ namespace platf::virtual_display {
       status.fallback = direct_frame.fallback && !status.direct_frame_quarantined;
     }
 
+    const auto capture_path = classify_capture_path(
+      status.active.has_value(),
+      {status.direct_frame_bound, status.direct_frame_quarantined, status.fallback}
+    );
     if (!status.device_healthy) {
       status.diagnostic = status.device_problem ?
                             "Windows reports a problem with Lumen Virtual Display." :
                             "Lumen Virtual Display is installed but not started.";
-    } else if (status.direct_frame_quarantined) {
-      status.diagnostic = "Direct-frame capture stopped after a runtime failure. Restart Lumen before retrying.";
-    } else if (status.active && status.fallback) {
-      status.diagnostic = "The virtual display is active through desktop capture.";
-    } else if (status.active) {
-      status.diagnostic = "Direct-frame capture is active.";
     } else {
-      status.diagnostic = "Ready.";
+      switch (capture_path) {
+        case capture_path_status_e::quarantined:
+          status.diagnostic = "Direct-frame capture stopped after a runtime failure. Restart Lumen before retrying.";
+          break;
+        case capture_path_status_e::fallback:
+          status.diagnostic = "The virtual display is active through desktop capture.";
+          break;
+        case capture_path_status_e::direct:
+          status.diagnostic = "Direct-frame capture is active.";
+          break;
+        case capture_path_status_e::unavailable:
+          status.diagnostic = "The virtual display is active, but no capture path is bound.";
+          break;
+        case capture_path_status_e::inactive:
+          status.diagnostic = "Ready.";
+          break;
+      }
     }
 #else
     status.diagnostic = "Lumen Virtual Display is available only on Windows.";

@@ -31,9 +31,10 @@
 
 // local includes
 #include "src/platform/windows/virtual_display.h"
-#include "src/platform/windows/virtual_display_driver/LumenDirectFrameSlotPolicy.h"
 #include "src/platform/windows/virtual_display_driver/LumenColorTransformPolicy.h"
+#include "src/platform/windows/virtual_display_driver/LumenDirectFrameSlotPolicy.h"
 #include "src/platform/windows/virtual_display_driver/LumenHdrModePolicy.h"
+#include "src/platform/windows/virtual_display_driver/LumenModeTimingPolicy.h"
 #include "src/platform/windows/virtual_display_driver/LumenModeValidationPolicy.h"
 #include "src/platform/windows/virtual_display_driver/LumenSingleDeleteOwner.h"
 #include "src/platform/windows/virtual_display_driver/LumenVirtualDisplayProtocol.h"
@@ -147,18 +148,23 @@ namespace {
   class recording_display_t final: public display_config_t {
   public:
     bool snapshot(display_snapshot_t &snapshot) override {
-      snapshot.paths.assign(1, std::byte {1});
+      snapshot.paths.assign(1, std::byte {static_cast<unsigned char>(++snapshot_sequence)});
       return snapshot_ok;
     }
     bool commit(const std::string &, const vdd_mode_t &mode, display_commit_t &applied) override {
-      applied = {mode, "\\\\.\\DISPLAY77"};
+      committed_modes.push_back(mode);
+      applied = {committed_override.value_or(mode), "\\\\.\\DISPLAY77"};
       return commit_ok;
     }
-    bool await_stable(const std::string &, const vdd_mode_t &, std::chrono::milliseconds) override {
+
+    bool await_stable(const std::string &, const vdd_mode_t &mode, std::chrono::milliseconds) override {
+      stable_modes.push_back(mode);
       return stable_ok;
     }
-    bool restore(const display_snapshot_t &) noexcept override {
+
+    bool restore(const display_snapshot_t &snapshot) noexcept override {
       ++restore_calls;
+      restored_snapshots.push_back(snapshot);
       if (restore_results.empty()) {
         return true;
       }
@@ -168,7 +174,12 @@ namespace {
     }
 
     std::deque<bool> restore_results;
+    std::vector<vdd_mode_t> committed_modes;
+    std::vector<vdd_mode_t> stable_modes;
+    std::vector<display_snapshot_t> restored_snapshots;
+    std::optional<vdd_mode_t> committed_override;
     unsigned restore_calls {};
+    unsigned snapshot_sequence {};
     bool snapshot_ok {true};
     bool commit_ok {true};
     bool stable_ok {true};
@@ -220,7 +231,7 @@ TEST(VirtualDisplayRational, ReducesAndRejectsHostileComponents) {
   EXPECT_EQ((rational_t {120, 2}.normalized()), (rational_t {60, 1}));
   EXPECT_FALSE((rational_t {0, 1}.normalized()));
   EXPECT_FALSE((rational_t {1, 0}.normalized()));
-  EXPECT_FALSE((rational_t {LUMEN_VDD_MAX_RATIONAL_COMPONENT + 1U, 1}.normalized()));
+  EXPECT_EQ(LUMEN_VDD_MAX_RATIONAL_COMPONENT, std::numeric_limits<std::uint32_t>::max());
 }
 
 TEST(VirtualDisplayDeviceBinding, RequiresExactlyOneMatchingTarget) {
@@ -237,6 +248,45 @@ TEST(VirtualDisplayValidation, AcceptsExactPracticalEvenRationalMode) {
   auto mode = mode_4k120;
   mode.refresh = {60000, 1001};
   EXPECT_EQ(validate_mode(mode, capable_limits()), validation_error_e::none);
+}
+
+TEST(VirtualDisplayValidation, SharesCanonicalStartBoundsWithDriverAdmission) {
+  namespace start_mode = lumen::protocol_v3::start_mode;
+  const mode_limits_t limits;
+  EXPECT_EQ(limits.minimum_width, start_mode::minimum_width);
+  EXPECT_EQ(limits.maximum_width, start_mode::maximum_width);
+  EXPECT_EQ(limits.minimum_height, start_mode::minimum_height);
+  EXPECT_EQ(limits.maximum_height, start_mode::maximum_height);
+  EXPECT_EQ(limits.minimum_refresh, (rational_t {start_mode::minimum_refresh_hz, 1}));
+  EXPECT_EQ(limits.maximum_refresh, (rational_t {start_mode::maximum_refresh_hz, 1}));
+
+  LUMEN_VDD_MODE mode {
+    start_mode::minimum_width,
+    start_mode::minimum_height,
+    60000,
+    1001,
+    LUMEN_VDD_DYNAMIC_RANGE_SDR,
+    8,
+    LUMEN_VDD_POLICY_LATENCY,
+    LUMEN_VDD_FIDELITY_LOSSLESS,
+  };
+  EXPECT_TRUE(lumen::vdd::mode::valid(mode));
+  mode.width = start_mode::minimum_width - 2;
+  EXPECT_FALSE(lumen::vdd::mode::valid(mode));
+  mode.width = start_mode::maximum_width + 2;
+  EXPECT_FALSE(lumen::vdd::mode::valid(mode));
+  mode.width = start_mode::maximum_width;
+  mode.height = start_mode::maximum_height + 2;
+  EXPECT_FALSE(lumen::vdd::mode::valid(mode));
+  mode.height = start_mode::maximum_height;
+  mode.refresh_numerator = 9999;
+  mode.refresh_denominator = 1000;
+  EXPECT_FALSE(lumen::vdd::mode::valid(mode));
+  mode.refresh_numerator = 480001;
+  EXPECT_FALSE(lumen::vdd::mode::valid(mode));
+  mode.refresh_numerator = 120;
+  mode.refresh_denominator = 2;
+  EXPECT_FALSE(lumen::vdd::mode::valid(mode));
 }
 
 TEST(VirtualDisplayValidation, RejectsEveryUnsupportedExactModeBoundary) {
@@ -477,6 +527,38 @@ TEST(VirtualDisplayCoordinator, GenerationsRemainMonotonicAboveDriverFloor) {
   EXPECT_TRUE(std::ranges::adjacent_find(channel->generations, std::greater_equal {}) == channel->generations.end());
 }
 
+TEST(VirtualDisplayCoordinator, RestoresExactTopologyAcrossSdrHdrSessionsAndRejectsAdjustedTiming) {
+  auto channel = std::make_shared<recording_channel_t>();
+  auto display = std::make_shared<recording_display_t>();
+  coordinator_t coordinator(channel, display);
+
+  const auto sdr = mode_4k120;
+  ASSERT_EQ(coordinator.start(modern_stream_request(701, sdr, delivery_policy_e::latency), capable_limits()).error, start_error_e::none);
+  ASSERT_TRUE(coordinator.stop(701));
+
+  auto hdr = mode_4k120;
+  hdr.refresh = {60000, 1001};
+  hdr.dynamic_range = dynamic_range_e::hdr10;
+  hdr.bits_per_channel = 10;
+  ASSERT_EQ(coordinator.start(modern_stream_request(702, hdr, delivery_policy_e::quality), capable_limits()).error, start_error_e::none);
+  ASSERT_TRUE(coordinator.stop(702));
+
+  EXPECT_EQ(display->committed_modes, (std::vector<vdd_mode_t> {sdr, hdr}));
+  EXPECT_EQ(display->stable_modes, (std::vector<vdd_mode_t> {sdr, hdr}));
+  ASSERT_EQ(display->restored_snapshots.size(), 2U);
+  EXPECT_EQ(display->restored_snapshots[0].paths, (std::vector<std::byte> {std::byte {1}}));
+  EXPECT_EQ(display->restored_snapshots[1].paths, (std::vector<std::byte> {std::byte {2}}));
+  ASSERT_EQ(channel->generations.size(), 2U);
+  EXPECT_LT(channel->generations[0], channel->generations[1]);
+
+  auto adjusted = hdr;
+  adjusted.refresh = {60, 1};
+  display->committed_override = adjusted;
+  EXPECT_EQ(coordinator.start(modern_stream_request(703, hdr, delivery_policy_e::quality), capable_limits()).error, start_error_e::implicit_adjustment_rejected);
+  EXPECT_EQ(display->restore_calls, 3U);
+  EXPECT_FALSE(coordinator.active_selection());
+}
+
 TEST(VirtualDisplayLease, ConcurrentFinalReleaseStopsOnceAndFailedCleanupRetries) {
   auto backend = std::make_shared<lease_backend_t>();
   const auto request = modern_stream_request(71, mode_4k120, delivery_policy_e::latency);
@@ -658,6 +740,29 @@ TEST(VirtualDisplayHdrModePolicy, AddsExactDriverModeBesideStableBaseline) {
   EXPECT_EQ(quality_baseline_only.count, 1U);
 }
 
+TEST(VirtualDisplayTimingPolicy, RetainsExact120And60000Over1001Refresh) {
+  auto exact = lumen::vdd::hdr::baseline_mode;
+  exact.dynamic_range = LUMEN_VDD_DYNAMIC_RANGE_SDR;
+  exact.bits_per_channel = 8;
+  exact.width = 3456;
+  exact.height = 2160;
+  exact.refresh_numerator = 120;
+  exact.refresh_denominator = 1;
+  const auto integral = lumen::vdd::timing::make(exact, false);
+  EXPECT_EQ(integral.refresh_numerator, 120U);
+  EXPECT_EQ(integral.refresh_denominator, 1U);
+  EXPECT_EQ(integral.vertical_sync_divider, 1U);
+
+  exact.refresh_numerator = 60000;
+  exact.refresh_denominator = 1001;
+  const auto fractional = lumen::vdd::timing::make(exact, true);
+  EXPECT_EQ(fractional.refresh_numerator, 60000U);
+  EXPECT_EQ(fractional.refresh_denominator, 1001U);
+  EXPECT_EQ(fractional.total_width, exact.width);
+  EXPECT_EQ(fractional.total_height, exact.height);
+  EXPECT_EQ(fractional.vertical_sync_divider, 0U);
+}
+
 TEST(VirtualDisplayHdrMetadataPolicy, RejectsInvalidChromaticityAndLuminanceRelationships) {
   LUMEN_VDD_HDR10_METADATA metadata {
     {35400, 14600},
@@ -749,6 +854,11 @@ TEST(VirtualDisplayDirectFrameValidation, RequiresExactUniqueTwoSlotResources) {
     {frame_color_space_e::srgb, 80, hdr_metadata_type_e::none, {}},
   };
   EXPECT_TRUE(valid_frame_resources(resources, 9, mode_4k120));
+  resources.format = frame_format_e::rgba16_float;
+  resources.initial_color_metadata.surface_color_space = frame_color_space_e::scrgb;
+  EXPECT_FALSE(valid_frame_resources(resources, 9, mode_4k120));
+  resources.format = frame_format_e::bgra8;
+  resources.initial_color_metadata.surface_color_space = frame_color_space_e::srgb;
   resources.generation = 8;
   EXPECT_FALSE(valid_frame_resources(resources, 9, mode_4k120));
   resources.generation = 9;
@@ -771,7 +881,7 @@ TEST(VirtualDisplayFrameAbi5Policy, ValidatesSdrHdrFormatsMetadataAndPixelPitch)
   EXPECT_TRUE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::bgra8));
   EXPECT_FALSE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::rgba16_float));
   sdr.surface_color_space = frame_color_space_e::scrgb;
-  EXPECT_TRUE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::rgba16_float));
+  EXPECT_FALSE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::rgba16_float));
   sdr.sdr_white_level_nits = 79;
   EXPECT_FALSE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::rgba16_float));
 

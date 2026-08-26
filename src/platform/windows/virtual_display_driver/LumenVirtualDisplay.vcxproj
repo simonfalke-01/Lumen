@@ -67,6 +67,7 @@
   <ItemGroup>
     <ClInclude Include="LumenColorTransformPolicy.h" />
     <ClInclude Include="LumenHdrModePolicy.h" />
+    <ClInclude Include="LumenModeTimingPolicy.h" />
     <ClInclude Include="LumenModeValidationPolicy.h" />
     <ClInclude Include="LumenSingleDeleteOwner.h" />
     <ClInclude Include="LumenVirtualDisplayProtocol.h" />

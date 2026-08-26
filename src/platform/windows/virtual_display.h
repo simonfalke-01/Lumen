@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include "../../protocol_common/start_mode_limits.h"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -71,14 +73,14 @@ namespace platf::virtual_display {
 
   /** @brief Intersectable practical limits from the driver, OS, GPU, and encoder. */
   struct mode_limits_t {
-    std::uint32_t minimum_width {256};  ///< Smallest even width.
-    std::uint32_t maximum_width {8192};  ///< Largest even width.
-    std::uint32_t minimum_height {200};  ///< Smallest even height.
-    std::uint32_t maximum_height {8192};  ///< Largest even height.
-    rational_t minimum_refresh {10, 1};  ///< Minimum refresh.
-    rational_t maximum_refresh {480, 1};  ///< Maximum refresh.
-    std::uint64_t maximum_pixels {8192ULL * 8192ULL};  ///< Maximum active pixels.
-    std::uint64_t maximum_pixel_rate {8192ULL * 8192ULL * 480ULL};  ///< Maximum active pixels per second.
+    std::uint32_t minimum_width {LUMEN_START_MODE_MIN_WIDTH};  ///< Smallest even width.
+    std::uint32_t maximum_width {LUMEN_START_MODE_MAX_WIDTH};  ///< Largest even width.
+    std::uint32_t minimum_height {LUMEN_START_MODE_MIN_HEIGHT};  ///< Smallest even height.
+    std::uint32_t maximum_height {LUMEN_START_MODE_MAX_HEIGHT};  ///< Largest even height.
+    rational_t minimum_refresh {LUMEN_START_MODE_MIN_REFRESH_HZ, 1};  ///< Minimum refresh.
+    rational_t maximum_refresh {LUMEN_START_MODE_MAX_REFRESH_HZ, 1};  ///< Maximum refresh.
+    std::uint64_t maximum_pixels {static_cast<std::uint64_t>(LUMEN_START_MODE_MAX_WIDTH) * LUMEN_START_MODE_MAX_HEIGHT};  ///< Maximum active pixels.
+    std::uint64_t maximum_pixel_rate {static_cast<std::uint64_t>(LUMEN_START_MODE_MAX_WIDTH) * LUMEN_START_MODE_MAX_HEIGHT * LUMEN_START_MODE_MAX_REFRESH_HZ};  ///< Maximum active pixels per second.
     bool require_even_dimensions {true};  ///< Whether both dimensions must be even.
     bool supports_hdr10 {};  ///< Whether the full active path supports HDR10.
     bool supports_10bit {};  ///< Whether the full active path supports 10-bit surfaces.

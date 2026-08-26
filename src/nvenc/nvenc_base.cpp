@@ -369,7 +369,7 @@ namespace NVENC_NAMESPACE {
     enc_config.rcParams.enableAQ = config.adaptive_quantization;
     enc_config.rcParams.averageBitRate = client_config.bitrate * 1000;
     if (get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE)) {
-      enc_config.rcParams.vbvBufferSize = client_config.bitrate * 1000 / client_config.framerate;
+      enc_config.rcParams.vbvBufferSize = video::vbv_frame_size_bits(client_config);
       if (config.vbv_percentage_increase > 0) {
         enc_config.rcParams.vbvBufferSize += enc_config.rcParams.vbvBufferSize * config.vbv_percentage_increase / 100;
       }

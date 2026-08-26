@@ -7,8 +7,9 @@
 #include <functional>
 #include <future>
 #include <src/input.h>
-#include <src/stream.h>
 #include <src/protocol_v3/media_pipeline.h>
+#include <src/stream.h>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,49 @@ TEST(ProtocolV3AudioConfigurationTest, AppliesExplicitHostPlaybackPolicyAndExact
       selection.audio.mapping
     ));
   }
+}
+
+TEST(ProtocolV3VideoConfigurationTest, PreservesExactRefreshAcrossCaptureEncoderAndVbv) {
+  lumen::protocol_v3::media::NegotiatedMediaConfig selection;
+  selection.width = 3456;
+  selection.height = 2160;
+  selection.refresh_numerator = 60000;
+  selection.refresh_denominator = 1001;
+  selection.video_bitrate_kbps = 80000;
+  selection.codec_id = 2;
+  selection.bit_depth = 10;
+  selection.chroma_layout = 1;
+  selection.primaries = 9;
+  selection.transfer = 2;
+  selection.matrix_code = 9;
+  selection.range = 0;
+
+  video::config_t configured {};
+  stream::configure_protocol_v3_video(configured, selection);
+  EXPECT_EQ(configured.width, 3456);
+  EXPECT_EQ(configured.height, 2160);
+  EXPECT_EQ(configured.framerate, 60);
+  EXPECT_EQ(configured.refreshNumerator, 60000);
+  EXPECT_EQ(configured.refreshDenominator, 1001);
+  EXPECT_EQ(video::framerate_to_rational(configured).num, 60000);
+  EXPECT_EQ(video::framerate_to_rational(configured).den, 1001);
+  EXPECT_EQ(video::capture_frame_interval(configured), std::chrono::nanoseconds {(1001LL * 1'000'000'000LL) / 60000LL});
+  EXPECT_EQ(video::vbv_frame_size_bits(configured), 1'334'666U);
+  EXPECT_TRUE(configured.protocolV3Colorimetry);
+  EXPECT_EQ(configured.colorTransfer, 16U);
+
+  selection.refresh_numerator = 3'000'000'001U;
+  selection.refresh_denominator = 50'000'000U;
+  EXPECT_THROW(stream::configure_protocol_v3_video(configured, selection), std::overflow_error);
+}
+
+TEST(VirtualDisplayDirectLossContract, V3TerminatesWhileLegacyFallbackRequiresSafeRollback) {
+  video::config_t v3 {};
+  v3.virtual_display_direct_required = true;
+  EXPECT_EQ(video::capture_reinitialization_action(v3), video::capture_reinitialization_e::terminate);
+  EXPECT_FALSE(stream::allow_legacy_physical_hdr_fallback(false, true, true));
+  EXPECT_FALSE(stream::allow_legacy_physical_hdr_fallback(true, false, true));
+  EXPECT_TRUE(stream::allow_legacy_physical_hdr_fallback(true, true, true));
 }
 
 TEST(StreamAudioPacketQueueProductionTest, EnforcesCapacityAndCloseWakeup) {

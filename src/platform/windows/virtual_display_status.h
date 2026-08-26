@@ -38,6 +38,40 @@ namespace platf::virtual_display {
     bool fallback {};  ///< That generation explicitly failed direct-frame initialization.
   };
 
+  /** @brief Stable capture-path classification for one current VDD generation. */
+  enum class capture_path_status_e {
+    inactive,  ///< No VDD generation is active.
+    direct,  ///< The active generation owns a healthy direct-frame source.
+    fallback,  ///< The active generation explicitly uses desktop capture.
+    quarantined,  ///< Direct-frame capture failed and the generation is quarantined.
+    unavailable,  ///< A generation is active but no capture path is bound.
+  };
+
+  /**
+   * @brief Classify active capture availability without treating an unbound generation as healthy.
+   * @param active Whether the driver reports an active monitor generation.
+   * @param direct Exact process-local direct-frame state for that generation.
+   * @return Stable capture-path status.
+   */
+  [[nodiscard]] constexpr capture_path_status_e classify_capture_path(
+    const bool active,
+    const direct_frame_generation_status_t direct
+  ) noexcept {
+    if (!active) {
+      return capture_path_status_e::inactive;
+    }
+    if (direct.quarantined) {
+      return capture_path_status_e::quarantined;
+    }
+    if (direct.bound) {
+      return capture_path_status_e::direct;
+    }
+    if (direct.fallback) {
+      return capture_path_status_e::fallback;
+    }
+    return capture_path_status_e::unavailable;
+  }
+
   /**
    * @brief Record successful direct-frame ownership for one exact generation.
    * @param generation Active nonzero VDD generation.

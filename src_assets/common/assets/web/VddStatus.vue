@@ -73,7 +73,7 @@ export default {
       if (this.failed || !this.status || !this.status.installed || !this.status.compatible || !this.status.deviceHealthy) {
         return 'error';
       }
-      if (this.stale || this.status.quarantined || this.status.fallback) return 'warning';
+      if (this.stale || this.status.quarantined || this.status.fallback || this.captureUnavailable) return 'warning';
       return 'ok';
     },
     stateLabel() {
@@ -84,6 +84,7 @@ export default {
       if (!this.status.deviceHealthy) return this.$t('index.vdd_driver_issue');
       if (this.stale) return this.$t('index.vdd_update_delayed');
       if (this.status.quarantined) return this.$t('index.vdd_restart_required');
+      if (this.captureUnavailable) return this.$t('index.vdd_unavailable_state');
       if (this.status.active) {
         return this.$t('index.vdd_streaming_policy', { policy: this.deliveryPolicyLabel });
       }
@@ -124,8 +125,16 @@ export default {
       if (this.status?.deliveryPolicy === 'quality') return this.$t('index.vdd_policy_quality');
       return this.$t('index.vdd_unavailable_state');
     },
+    captureUnavailable() {
+      return Boolean(
+        this.status?.active &&
+        !this.status.directFrameBound &&
+        !this.status.fallback &&
+        !this.status.quarantined
+      );
+    },
     showDiagnostic() {
-      return this.stale || this.status.quarantined;
+      return this.stale || this.status.quarantined || this.status.fallback || this.captureUnavailable;
     },
     diagnosticText() {
       return this.stale ? this.$t('index.vdd_showing_last_status') : this.status.diagnostic;

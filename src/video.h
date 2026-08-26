@@ -7,6 +7,7 @@
 // standard includes
 #include <chrono>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -864,6 +865,32 @@ namespace video {
       return framerateX100_to_rational(config.framerateX100);
     }
     return AVRational {config.framerate, 1};
+  }
+
+  /**
+   * @brief Exact nominal encoded bits per frame for NVENC custom VBV sizing.
+   * @param config Stream bitrate and exact refresh rational.
+   * @return Floor of bitrate divided by exact refresh, saturated to uint32.
+   */
+  [[nodiscard]] inline std::uint32_t vbv_frame_size_bits(const config_t &config) noexcept {
+    const auto fps = framerate_to_rational(config);
+    if (config.bitrate <= 0 || fps.num <= 0 || fps.den <= 0) {
+      return 0;
+    }
+    const auto scaled_bitrate = static_cast<std::uint64_t>(config.bitrate) * 1000U;
+    const auto numerator = static_cast<std::uint64_t>(fps.num);
+    const auto denominator = static_cast<std::uint64_t>(fps.den);
+    const auto maximum = static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max());
+    const auto whole = scaled_bitrate / numerator;
+    if (whole > maximum / denominator) {
+      return std::numeric_limits<std::uint32_t>::max();
+    }
+    const auto integral = whole * denominator;
+    const auto fractional = (scaled_bitrate % numerator) * denominator / numerator;
+    if (integral > maximum - fractional) {
+      return std::numeric_limits<std::uint32_t>::max();
+    }
+    return static_cast<std::uint32_t>(integral + fractional);
   }
 
   /**

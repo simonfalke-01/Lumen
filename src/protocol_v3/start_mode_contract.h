@@ -4,18 +4,20 @@
  */
 #pragma once
 
+#include "../protocol_common/start_mode_limits.h"
+
 #include <cstdint>
 #include <limits>
 #include <numeric>
 #include <string_view>
 
 namespace lumen::protocol_v3::start_mode {
-  inline constexpr std::uint32_t minimum_width = 320;  ///< Smallest client-visible even width.
-  inline constexpr std::uint32_t maximum_width = 7680;  ///< Largest client-visible even width.
-  inline constexpr std::uint32_t minimum_height = 200;  ///< Smallest client-visible even height.
-  inline constexpr std::uint32_t maximum_height = 4320;  ///< Largest client-visible even height.
-  inline constexpr std::uint32_t minimum_refresh_hz = 10;  ///< Smallest exact refresh rate.
-  inline constexpr std::uint32_t maximum_refresh_hz = 480;  ///< Largest exact refresh rate.
+  inline constexpr std::uint32_t minimum_width = LUMEN_START_MODE_MIN_WIDTH;  ///< Smallest client-visible even width.
+  inline constexpr std::uint32_t maximum_width = LUMEN_START_MODE_MAX_WIDTH;  ///< Largest client-visible even width.
+  inline constexpr std::uint32_t minimum_height = LUMEN_START_MODE_MIN_HEIGHT;  ///< Smallest client-visible even height.
+  inline constexpr std::uint32_t maximum_height = LUMEN_START_MODE_MAX_HEIGHT;  ///< Largest client-visible even height.
+  inline constexpr std::uint32_t minimum_refresh_hz = LUMEN_START_MODE_MIN_REFRESH_HZ;  ///< Smallest exact refresh rate.
+  inline constexpr std::uint32_t maximum_refresh_hz = LUMEN_START_MODE_MAX_REFRESH_HZ;  ///< Largest exact refresh rate.
   inline constexpr std::uint32_t h264_maximum_dimension = 4096;  ///< NVENC H.264 per-axis limit.
 
   /** @brief Stable rejection class shared by control, runtime, and resource admission. */

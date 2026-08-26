@@ -199,10 +199,8 @@ namespace platf::virtual_display {
       return false;
     }
     if (dynamic_range == dynamic_range_e::sdr) {
-      const auto expected_color_space = format == frame_format_e::rgba16_float ?
-                                          frame_color_space_e::scrgb :
-                                          frame_color_space_e::srgb;
-      return metadata.surface_color_space == expected_color_space &&
+      return format == frame_format_e::bgra8 &&
+             metadata.surface_color_space == frame_color_space_e::srgb &&
              metadata.hdr_metadata_type == hdr_metadata_type_e::none &&
              zero_hdr10_metadata(metadata.hdr10_metadata);
     }
@@ -222,8 +220,7 @@ namespace platf::virtual_display {
         resources.width != mode.width || resources.height != mode.height ||
         resources.dynamic_range != mode.dynamic_range ||
         (mode.dynamic_range == dynamic_range_e::hdr10 && resources.format != frame_format_e::rgba16_float) ||
-        (mode.dynamic_range == dynamic_range_e::sdr &&
-         resources.format != frame_format_e::bgra8 && resources.format != frame_format_e::rgba16_float) ||
+        (mode.dynamic_range == dynamic_range_e::sdr && resources.format != frame_format_e::bgra8) ||
         resources.initial_color_transform_version == 0 ||
         !valid_frame_color_metadata(resources.initial_color_metadata, mode.dynamic_range, resources.format) ||
         resources.slot_count != direct_frame_slot_count) {

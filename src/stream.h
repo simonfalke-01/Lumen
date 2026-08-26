@@ -300,6 +300,16 @@ namespace stream {
 
 #if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
   /**
+   * @brief Apply the exact negotiated v3 video tuple to the capture/encoder configuration.
+   * @param output Video configuration updated in place.
+   * @param selection Immutable v3 media selection.
+   */
+  void configure_protocol_v3_video(
+    video::config_t &output,
+    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection
+  );
+
+  /**
    * @brief Apply the exact negotiated v3 Opus tuple and host-playback policy.
    * @param output Audio capture configuration updated in place.
    * @param selection Immutable v3 media selection.

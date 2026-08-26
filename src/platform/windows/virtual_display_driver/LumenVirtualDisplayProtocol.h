@@ -5,6 +5,8 @@
 #ifndef LUMEN_PLATFORM_WINDOWS_VIRTUAL_DISPLAY_PROTOCOL_H
 #define LUMEN_PLATFORM_WINDOWS_VIRTUAL_DISPLAY_PROTOCOL_H
 
+#include "../../../protocol_common/start_mode_limits.h"
+
 #include <stdint.h>
 
 /** Platform-independent values used to encode the private buffered IOCTLs. */
@@ -21,12 +23,20 @@ extern "C" {
 
 /** Fixed driver ABI version. */
 #define LUMEN_VDD_ABI_VERSION 5u
-/** Maximum supported width. */
-#define LUMEN_VDD_MAX_WIDTH 8192u
-/** Maximum supported height. */
-#define LUMEN_VDD_MAX_HEIGHT 8192u
+/** Minimum supported width shared with protocol-v3 START admission. */
+#define LUMEN_VDD_MIN_WIDTH LUMEN_START_MODE_MIN_WIDTH
+/** Maximum supported width shared with protocol-v3 START admission. */
+#define LUMEN_VDD_MAX_WIDTH LUMEN_START_MODE_MAX_WIDTH
+/** Minimum supported height shared with protocol-v3 START admission. */
+#define LUMEN_VDD_MIN_HEIGHT LUMEN_START_MODE_MIN_HEIGHT
+/** Maximum supported height shared with protocol-v3 START admission. */
+#define LUMEN_VDD_MAX_HEIGHT LUMEN_START_MODE_MAX_HEIGHT
+/** Minimum supported refresh rate shared with protocol-v3 START admission. */
+#define LUMEN_VDD_MIN_REFRESH_HZ LUMEN_START_MODE_MIN_REFRESH_HZ
+/** Maximum supported refresh rate shared with protocol-v3 START admission. */
+#define LUMEN_VDD_MAX_REFRESH_HZ LUMEN_START_MODE_MAX_REFRESH_HZ
 /** Maximum rational component accepted at the trust boundary. */
-#define LUMEN_VDD_MAX_RATIONAL_COMPONENT 1000000000u
+#define LUMEN_VDD_MAX_RATIONAL_COMPONENT LUMEN_START_MODE_MAX_RATIONAL_COMPONENT
 /** Driver capability: exact dynamic target-mode update. */
 #define LUMEN_VDD_CAP_DYNAMIC_MODES 0x00000001u
 /** Driver capability: SDR 8-bit surfaces. */

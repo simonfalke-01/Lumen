@@ -4,6 +4,8 @@
  */
 #include "virtual_display.h"
 
+#include "../../protocol_v3/start_mode_contract.h"
+
 #ifndef _WIN32
   #include "virtual_display_driver/LumenVirtualDisplayProtocol.h"
 #endif
@@ -32,8 +34,6 @@
 
 namespace platf::virtual_display {
   namespace {
-    constexpr std::uint32_t maximum_rational_component = LUMEN_VDD_MAX_RATIONAL_COMPONENT;
-
     /** @brief Compare positive rationals without overflow. */
     int compare(const rational_t &left, const rational_t &right) noexcept {
       const auto left_product = static_cast<std::uint64_t>(left.numerator) * right.denominator;
@@ -180,7 +180,7 @@ namespace platf::virtual_display {
   }
 
   std::optional<rational_t> rational_t::normalized() const noexcept {
-    if (numerator == 0 || denominator == 0 || numerator > maximum_rational_component || denominator > maximum_rational_component) {
+    if (numerator == 0 || denominator == 0) {
       return std::nullopt;
     }
     const auto divisor = std::gcd(numerator, denominator);
@@ -825,7 +825,17 @@ namespace platf::virtual_display {
         mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 ? dynamic_range_e::hdr10 : dynamic_range_e::sdr,
         mode.bits_per_channel,
       };
-      if (converted.refresh.normalized() != converted.refresh) {
+      const auto shape = lumen::protocol_v3::start_mode::admit_shape({
+        converted.width,
+        converted.height,
+        converted.refresh.numerator,
+        converted.refresh.denominator,
+      });
+      const auto exact_color_mode =
+        (converted.dynamic_range == dynamic_range_e::sdr && converted.bits_per_channel == 8) ||
+        (converted.dynamic_range == dynamic_range_e::hdr10 && converted.bits_per_channel == 10);
+      if (shape != lumen::protocol_v3::start_mode::AdmissionError::none || !exact_color_mode ||
+          converted.refresh.normalized() != converted.refresh) {
         return std::nullopt;
       }
       return converted;
