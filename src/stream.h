@@ -255,6 +255,43 @@ namespace stream {
      * @return Deterministic observations from an early worker stop interleaving.
      */
     [[nodiscard]] startup_order_probe_t startup_order_probe_for_test();
+
+    /** @brief Observations from a deterministic throw after one worker is constructed. */
+    struct startup_failure_probe_t {
+      state_e final_state {state_e::STOPPED};  ///< Terminal state that released the STARTING waiter.
+      bool controlled_failure {};  ///< Whether the construction exception reached the startup caller.
+      bool worker_joined {};  ///< Whether the already-constructed worker joined promptly.
+      bool worker_entered_body {};  ///< Whether the worker incorrectly entered RUNNING-only work.
+      bool commit_called {};  ///< Whether startup side effects ran after worker construction failed.
+    };
+
+    /**
+     * @brief Throw after one worker and observe the exact production startup rollback boundary.
+     *
+     * @param fail_during_commit Whether to fail after construction inside startup commit.
+     * @return Deterministic terminal-state, join, worker-gate, and side-effect observations.
+     */
+    [[nodiscard]] startup_failure_probe_t startup_failure_probe_for_test(bool fail_during_commit);
+
+    /** @brief Observations from control admission racing failed startup rollback. */
+    struct control_rollback_probe_t {
+      bool controlled_failure {};  ///< Whether the deterministic startup failure reached the caller.
+      bool unclaimed_session_rejected_while_starting {};  ///< Whether slow-path admission rejected the STARTING session.
+      bool peer_alias_rejected_while_starting {};  ///< Whether fast-path admission rejected a STARTING peer alias.
+      bool session_registration_removed {};  ///< Whether rollback erased the raw session registration.
+      bool peer_alias_removed {};  ///< Whether rollback erased every peer alias targeting the session.
+      bool all_bound_peers_disconnected {};  ///< Whether rollback disconnected every bound peer alias.
+      bool bound_peer_cleared {};  ///< Whether rollback cleared the session's bound peer field.
+      bool lookup_after_owner_release_rejected {};  ///< Whether lookup remained safe after destroying the session owner.
+    };
+
+    /**
+     * @brief Race control admission against construction or commit failure and exercise rollback.
+     *
+     * @param fail_during_commit Whether startup fails during commit rather than worker construction.
+     * @return Registry, peer cleanup, and post-destruction lookup observations.
+     */
+    [[nodiscard]] control_rollback_probe_t control_rollback_probe_for_test(bool fail_during_commit);
 #endif
 
     /**

@@ -75,6 +75,52 @@ TEST(StreamSessionLifecycleTest, PublishesStartingBeforeWorkersAndCommittedState
   EXPECT_EQ(probe.final_state, stream::session::state_e::STOPPING);
 }
 
+TEST(StreamSessionLifecycleTest, ThrowAfterOneWorkerRollsBackPromptlyWithoutEnteringWorkerBody) {
+  const auto probe = stream::session::startup_failure_probe_for_test(false);
+
+  EXPECT_TRUE(probe.controlled_failure);
+  EXPECT_TRUE(probe.worker_joined);
+  EXPECT_FALSE(probe.worker_entered_body);
+  EXPECT_FALSE(probe.commit_called);
+  EXPECT_EQ(probe.final_state, stream::session::state_e::STOPPED);
+}
+
+TEST(StreamSessionLifecycleTest, CommitFailureRollsBackConstructedWorkerWithoutEnteringBody) {
+  const auto probe = stream::session::startup_failure_probe_for_test(true);
+
+  EXPECT_TRUE(probe.controlled_failure);
+  EXPECT_TRUE(probe.worker_joined);
+  EXPECT_FALSE(probe.worker_entered_body);
+  EXPECT_TRUE(probe.commit_called);
+  EXPECT_EQ(probe.final_state, stream::session::state_e::STOPPED);
+}
+
+TEST(StreamSessionLifecycleTest, ConstructionFailureRejectsControlClaimAndRemovesEveryPeerAlias) {
+  const auto probe = stream::session::control_rollback_probe_for_test(false);
+
+  EXPECT_TRUE(probe.controlled_failure);
+  EXPECT_TRUE(probe.unclaimed_session_rejected_while_starting);
+  EXPECT_TRUE(probe.peer_alias_rejected_while_starting);
+  EXPECT_TRUE(probe.session_registration_removed);
+  EXPECT_TRUE(probe.peer_alias_removed);
+  EXPECT_TRUE(probe.all_bound_peers_disconnected);
+  EXPECT_TRUE(probe.bound_peer_cleared);
+  EXPECT_TRUE(probe.lookup_after_owner_release_rejected);
+}
+
+TEST(StreamSessionLifecycleTest, CommitFailureRejectsControlClaimAndRemovesEveryPeerAlias) {
+  const auto probe = stream::session::control_rollback_probe_for_test(true);
+
+  EXPECT_TRUE(probe.controlled_failure);
+  EXPECT_TRUE(probe.unclaimed_session_rejected_while_starting);
+  EXPECT_TRUE(probe.peer_alias_rejected_while_starting);
+  EXPECT_TRUE(probe.session_registration_removed);
+  EXPECT_TRUE(probe.peer_alias_removed);
+  EXPECT_TRUE(probe.all_bound_peers_disconnected);
+  EXPECT_TRUE(probe.bound_peer_cleared);
+  EXPECT_TRUE(probe.lookup_after_owner_release_rejected);
+}
+
 TEST(ProtocolV3AudioConfigurationTest, AppliesExplicitHostPlaybackPolicyAndExactTuple) {
   lumen::protocol_v3::media::NegotiatedMediaConfig selection;
   selection.audio = {

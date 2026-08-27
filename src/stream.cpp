@@ -417,6 +417,17 @@ namespace stream {
   }
 
   /**
+   * @brief Wait for startup publication and admit work only for RUNNING sessions.
+   *
+   * @param state Session lifecycle state shared with a worker.
+   * @return `true` only when startup committed RUNNING.
+   */
+  [[nodiscard]] bool wait_for_running_session(std::atomic<session::state_e> &state) {
+    while_starting_do_nothing(state);
+    return state.load(std::memory_order_acquire) == session::state_e::RUNNING;
+  }
+
+  /**
    * @brief Publish session startup around worker construction and committed side effects.
    *
    * @tparam LaunchWorkers Callable that creates all session workers.
@@ -432,9 +443,14 @@ namespace stream {
     CommitStartup &&commit_startup
   ) {
     state.store(session::state_e::STARTING, std::memory_order_release);
-    std::forward<LaunchWorkers>(launch_workers)();
-    std::forward<CommitStartup>(commit_startup)();
-    state.store(session::state_e::RUNNING, std::memory_order_release);
+    try {
+      std::forward<LaunchWorkers>(launch_workers)();
+      std::forward<CommitStartup>(commit_startup)();
+      state.store(session::state_e::RUNNING, std::memory_order_release);
+    } catch (...) {
+      state.store(session::state_e::STOPPING, std::memory_order_release);
+      throw;
+    }
   }
 
   /**
@@ -539,6 +555,23 @@ namespace stream {
     void flush() {
       enet_host_flush(_host.get());
     }
+
+    /**
+     * @brief Remove a partially started session from peer discovery.
+     *
+     * @param session Session whose worker construction did not commit.
+     */
+    void remove_session(session_t *session);
+
+    /**
+     * @brief Remove a session and disconnect every peer alias that targets it.
+     *
+     * @tparam DisconnectPeer Callable used to disconnect a bound peer.
+     * @param session Session being removed from discovery.
+     * @param disconnect_peer Callable invoked once for each bound peer.
+     */
+    template<class DisconnectPeer>
+    void remove_session(session_t *session, DisconnectPeer &&disconnect_peer);
 
     // Callbacks
     std::unordered_map<std::uint16_t, std::function<void(session_t *, const std::string_view &)>> _map_type_cb;  ///< Control-message handlers keyed by packet type.
@@ -764,6 +797,42 @@ namespace stream {
     std::atomic<session::state_e> state;  ///< Current lifecycle state observed by stream workers.
   };
 
+  template<class DisconnectPeer>
+  void control_server_t::remove_session(session_t *session, DisconnectPeer &&disconnect_peer) {
+    std::vector<net::peer_t> peers_to_disconnect;
+    {
+      auto sessions = _sessions.lock();
+      std::erase(*_sessions, session);
+
+      auto peer_sessions = _peer_to_session.lock();
+      for (auto it = _peer_to_session->begin(); it != _peer_to_session->end();) {
+        if (it->second != session) {
+          ++it;
+          continue;
+        }
+
+        peers_to_disconnect.push_back(it->first);
+        it = _peer_to_session->erase(it);
+      }
+
+      if (session->control.peer &&
+          std::ranges::find(peers_to_disconnect, session->control.peer) == peers_to_disconnect.end()) {
+        peers_to_disconnect.push_back(session->control.peer);
+      }
+      session->control.peer = nullptr;
+    }
+
+    for (const auto peer : peers_to_disconnect) {
+      disconnect_peer(peer);
+    }
+  }
+
+  void control_server_t::remove_session(session_t *session) {
+    remove_session(session, [](const net::peer_t peer) {
+      enet_peer_disconnect_now(peer, 0);
+    });
+  }
+
   /**
    * @brief Legacy GameStream adapter for the shared UDP audio sender.
    */
@@ -881,7 +950,8 @@ namespace stream {
       auto lg = _peer_to_session.lock();
       auto it = _peer_to_session->find(peer);
       if (it != _peer_to_session->end()) {
-        return it->second;
+        auto *const session = it->second;
+        return session->state.load(std::memory_order_acquire) == session::state_e::RUNNING ? session : nullptr;
       }
     }
 
@@ -890,6 +960,13 @@ namespace stream {
     auto lg = _sessions.lock();
     for (auto pos = std::begin(*_sessions); pos != std::end(*_sessions); ++pos) {
       auto session_p = *pos;
+
+      // A raw session pointer is published before worker construction so the
+      // control server can observe shutdown. It must not be claimable until
+      // every worker and startup side effect has committed.
+      if (session_p->state.load(std::memory_order_acquire) != session::state_e::RUNNING) {
+        continue;
+      }
 
       // Skip sessions that are already established
       if (session_p->control.peer) {
@@ -2195,6 +2272,10 @@ namespace stream {
       session::release_client_microphone(session->launch_session_id);
     });
 
+    if (!wait_for_running_session(session->state)) {
+      return;
+    }
+
     try {
       while (!session->shutdown_event->peek() && !session->microphone.ended) {
         const auto datagram = session->microphone.datagrams->pop(5ms);
@@ -2576,7 +2657,9 @@ namespace stream {
       session::stop(*session);
     });
 
-    while_starting_do_nothing(session->state);
+    if (!wait_for_running_session(session->state)) {
+      return;
+    }
 
     auto ref = broadcast.ref();
     auto ping_error = recv_ping(session, ref, socket_e::video, session->video.ping_payload, session->video.peer, config::stream.ping_timeout);
@@ -2657,7 +2740,9 @@ namespace stream {
       session::stop(*session);
     });
 
-    while_starting_do_nothing(session->state);
+    if (!wait_for_running_session(session->state)) {
+      return;
+    }
 
     auto ref = broadcast.ref();
     auto error = recv_ping(session, ref, socket_e::audio, session->audio.ping_payload, session->audio.peer, config::stream.ping_timeout);
@@ -2819,13 +2904,12 @@ namespace stream {
       session.control.expected_peer_address = addr_string;
       BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
 
-      // Insert this session into the session list
-      {
-        auto lg = session.broadcast_ref->control_server._sessions.lock();
-        session.broadcast_ref->control_server._sessions->push_back(&session);
+      boost::system::error_code address_error;
+      auto addr = boost::asio::ip::make_address(addr_string, address_error);
+      if (address_error) {
+        BOOST_LOG(error) << "Invalid streaming peer address: "sv << address_error.message();
+        return -1;
       }
-
-      auto addr = boost::asio::ip::make_address(addr_string);
       session.video.peer.address(addr);
       session.video.peer.port(0);
 
@@ -2834,29 +2918,76 @@ namespace stream {
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
-      start_session_workers_ordered(
-        session.state,
-        [&]() {
-          if (session.config.client_microphone) {
-            register_client_microphone_route(*session.broadcast_ref.get(), session_ptr);
-            session.microphoneThread = std::jthread {clientMicrophoneThread, &session};
-          }
-
-          session.audioThread = std::jthread {audioThread, &session};
-          session.videoThread = std::jthread {videoThread, &session};
-        },
-        [&]() {
-          // Commit counters and callbacks before RUNNING releases workers.
-          if (++running_sessions == 1) {
-            platf::streaming_will_start();
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-            system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
-#endif
-          }
+      bool control_session_registered {};
+      bool running_session_counted {};
+      bool platform_start_attempted {};
+      try {
+        {
+          auto control_sessions = session.broadcast_ref->control_server._sessions.lock();
+          session.broadcast_ref->control_server._sessions->push_back(&session);
+          control_session_registered = true;
         }
-      );
 
-      return 0;
+        start_session_workers_ordered(
+          session.state,
+          [&]() {
+            if (session.config.client_microphone) {
+              register_client_microphone_route(*session.broadcast_ref.get(), session_ptr);
+              session.microphoneThread = std::jthread {clientMicrophoneThread, &session};
+            }
+
+            session.audioThread = std::jthread {audioThread, &session};
+            session.videoThread = std::jthread {videoThread, &session};
+          },
+          [&]() {
+            // Commit counters and callbacks before RUNNING releases workers.
+            const auto first_session = ++running_sessions == 1;
+            running_session_counted = true;
+            if (first_session) {
+              platform_start_attempted = true;
+              platf::streaming_will_start();
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+              system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
+#endif
+            }
+          }
+        );
+      } catch (const std::exception &startup_error) {
+        BOOST_LOG(error) << "Failed to construct streaming session workers: "sv << startup_error.what();
+      } catch (...) {
+        BOOST_LOG(error) << "Failed to construct streaming session workers with an unknown exception"sv;
+      }
+
+      if (session.state.load(std::memory_order_acquire) == state_e::RUNNING) {
+        return 0;
+      }
+
+      // Construction or commit failed. STARTING has already been released to
+      // STOPPING by start_session_workers_ordered(), so no worker may enter its
+      // RUNNING-only body while we remove pre-publication side effects.
+      if (session.config.client_microphone && session.broadcast_ref) {
+        unregister_client_microphone_route(*session.broadcast_ref.get(), session.microphone.session_id);
+      }
+      if (control_session_registered) {
+        session.broadcast_ref->control_server.remove_session(&session);
+      }
+      if (session.microphoneThread.joinable()) {
+        session.microphoneThread.join();
+      }
+      if (session.audioThread.joinable()) {
+        session.audioThread.join();
+      }
+      if (session.videoThread.joinable()) {
+        session.videoThread.join();
+      }
+      if (running_session_counted && --running_sessions == 0 && platform_start_attempted) {
+        platf::streaming_will_stop();
+      }
+      session.audio.destination.reset();
+      input::reset(session.input);
+      session.state.store(state_e::STOPPED, std::memory_order_release);
+
+      return -1;
     }
 
 #ifdef SUNSHINE_TESTS
@@ -2892,6 +3023,152 @@ namespace stream {
         .final_state = state.load(std::memory_order_acquire),
         .stop_transitioned = stop_transitioned,
         .worker_observed_committed_startup = worker_observed_committed_startup,
+      };
+    }
+
+    startup_failure_probe_t startup_failure_probe_for_test(const bool fail_during_commit) {
+      std::atomic state {state_e::STOPPED};
+      std::promise<void> worker_launched;
+      auto worker_ready = worker_launched.get_future();
+      bool controlled_failure {};
+      bool worker_entered_body {};
+      bool commit_called {};
+      bool worker_joined {};
+      std::jthread worker;
+
+      try {
+        start_session_workers_ordered(
+          state,
+          [&]() {
+            worker = std::jthread([&]() {
+              worker_launched.set_value();
+              if (wait_for_running_session(state)) {
+                worker_entered_body = true;
+              }
+            });
+            worker_ready.wait();
+            if (!fail_during_commit) {
+              throw std::runtime_error {"deterministic worker-construction failure"};
+            }
+          },
+          [&]() {
+            commit_called = true;
+            throw std::runtime_error {"deterministic startup-commit failure"};
+          }
+        );
+      } catch (const std::runtime_error &) {
+        controlled_failure = true;
+      }
+
+      if (worker.joinable()) {
+        worker.join();
+        worker_joined = true;
+      }
+      state.store(state_e::STOPPED, std::memory_order_release);
+      return {
+        .final_state = state.load(std::memory_order_acquire),
+        .controlled_failure = controlled_failure,
+        .worker_joined = worker_joined,
+        .worker_entered_body = worker_entered_body,
+        .commit_called = commit_called,
+      };
+    }
+
+    control_rollback_probe_t control_rollback_probe_for_test(const bool fail_during_commit) {
+      control_server_t server;
+      auto owner = std::make_unique<session_t>();
+      constexpr std::uint32_t connect_data = 0x4c554d45;
+      owner->config.mlFeatureFlags = ML_FF_SESSION_ID_V1;
+      owner->control.connect_data = connect_data;
+
+      ENetPeer peer {};
+      ENetPeer alias_peer {};
+      const auto initialize_address = [](ENetAddress &address, const std::uint16_t port) {
+        auto *const ipv4 = reinterpret_cast<sockaddr_in *>(&address.address);
+        ipv4->sin_family = AF_INET;
+        ipv4->sin_port = htons(port);
+        ipv4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.addressLength = sizeof(*ipv4);
+      };
+      initialize_address(peer.address, 47999);
+      initialize_address(peer.localAddress, 47998);
+
+      {
+        auto sessions = server._sessions.lock();
+        server._sessions->push_back(owner.get());
+      }
+
+      bool controlled_failure {};
+      bool unclaimed_session_rejected_while_starting {};
+      bool peer_alias_rejected_while_starting {};
+      std::jthread claimant;
+      try {
+        start_session_workers_ordered(
+          owner->state,
+          [&]() {
+            claimant = std::jthread([&]() {
+              unclaimed_session_rejected_while_starting = server.get_session(&peer, connect_data) == nullptr;
+              {
+                auto peer_sessions = server._peer_to_session.lock();
+                server._peer_to_session->emplace(&peer, owner.get());
+              }
+              peer_alias_rejected_while_starting = server.get_session(&peer, connect_data) == nullptr;
+            });
+            claimant.join();
+            if (!fail_during_commit) {
+              throw std::runtime_error {"deterministic control-race construction failure"};
+            }
+          },
+          [&]() {
+            throw std::runtime_error {"deterministic control-race commit failure"};
+          }
+        );
+      } catch (const std::runtime_error &) {
+        controlled_failure = true;
+      }
+
+      // Exercise defensive cleanup of a peer alias that may have been bound by
+      // an older caller or by a claim that won immediately before STOPPING.
+      owner->control.peer = &peer;
+      {
+        auto peer_sessions = server._peer_to_session.lock();
+        server._peer_to_session->emplace(&alias_peer, owner.get());
+      }
+
+      bool primary_peer_disconnected {};
+      bool alias_peer_disconnected {};
+      server.remove_session(owner.get(), [&](const net::peer_t disconnected_peer) {
+        primary_peer_disconnected |= disconnected_peer == &peer;
+        alias_peer_disconnected |= disconnected_peer == &alias_peer;
+      });
+
+      bool session_registration_removed {};
+      {
+        auto sessions = server._sessions.lock();
+        session_registration_removed = std::ranges::find(*server._sessions, owner.get()) == server._sessions->end();
+      }
+      bool peer_alias_removed {};
+      {
+        auto peer_sessions = server._peer_to_session.lock();
+        peer_alias_removed = std::ranges::none_of(*server._peer_to_session, [&](const auto &entry) {
+          return entry.second == owner.get();
+        });
+      }
+      const bool bound_peer_cleared = owner->control.peer == nullptr;
+      const bool all_bound_peers_disconnected = primary_peer_disconnected && alias_peer_disconnected;
+
+      owner.reset();
+      const bool lookup_after_owner_release_rejected = server.get_session(&peer, connect_data) == nullptr;
+
+      return {
+        .controlled_failure = controlled_failure,
+        .unclaimed_session_rejected_while_starting = unclaimed_session_rejected_while_starting,
+        .peer_alias_rejected_while_starting = peer_alias_rejected_while_starting,
+        .session_registration_removed = session_registration_removed,
+        .peer_alias_removed = peer_alias_removed,
+        .all_bound_peers_disconnected = all_bound_peers_disconnected,
+        .bound_peer_cleared = bound_peer_cleared,
+        .lookup_after_owner_release_rejected = lookup_after_owner_release_rejected,
       };
     }
 #endif
