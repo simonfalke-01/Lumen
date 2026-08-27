@@ -13,6 +13,8 @@
 #endif
 
 // standard includes
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -146,8 +148,38 @@ namespace proc {
      * @brief Allow a verified legacy client certificate to cancel the current application.
      *
      * @param client_certificate Verified certificate associated with a launched or attached session.
+     * @param process_generation Generation captured by the legacy launch or resume request.
+     * @return `true` when the generation is current and legacy attachment is permitted.
      */
-    void authorize_cancel_by_certificate(std::string_view client_certificate);
+    bool authorize_cancel_by_certificate(
+      std::string_view client_certificate,
+      std::uint64_t process_generation
+    );
+
+    /**
+     * @brief Return the monotonically increasing current process generation.
+     *
+     * @return Current process generation under the serialized lifecycle boundary.
+     */
+    [[nodiscard]] std::uint64_t generation();
+
+    /**
+     * @brief Publish one legacy session only when its process generation is current.
+     *
+     * The callback runs while the process lifecycle boundary is held, preventing
+     * a replacement or protocol-v3 launch from interleaving between generation
+     * validation, active-session publication, and certificate authorization.
+     *
+     * @param process_generation Generation captured by the pending legacy launch.
+     * @param client_certificate Verified legacy client certificate.
+     * @param publish Callback that starts and publishes the active legacy session.
+     * @return `true` when the generation was eligible and publication succeeded.
+     */
+    bool publish_legacy_session(
+      std::uint64_t process_generation,
+      std::string_view client_certificate,
+      const std::function<bool()> &publish
+    );
 
     /**
      * @brief Terminate the current application only for an authorized legacy client.
@@ -156,6 +188,25 @@ namespace proc {
      * @return `true` when an owned running application was terminated.
      */
     bool terminate_if_owned_by_certificate(std::string_view client_certificate);
+
+    /** @brief Result of generation-qualified owner cleanup. */
+    struct owner_cleanup_result_t {
+      bool generation_matched {};  ///< Whether the supplied generation is still current.
+      bool process_running {};  ///< Whether a process was running before owner-qualified cleanup.
+      bool process_terminated {};  ///< Whether an owned running process was terminated.
+    };
+
+    /**
+     * @brief Terminate an owned process only when the pending generation is current.
+     *
+     * @param client_certificate Verified certificate requesting cleanup.
+     * @param process_generation Generation captured by the RTSP state being removed.
+     * @return Generation-match and process-termination observations.
+     */
+    [[nodiscard]] owner_cleanup_result_t cleanup_owned_process_generation(
+      std::string_view client_certificate,
+      std::uint64_t process_generation
+    );
 
     ~proc_t();
 
@@ -196,9 +247,16 @@ namespace proc {
     std::vector<ctx_t> _apps;
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;
-    using cancel_client_certificates_t = sync_util::sync_t<std::unordered_set<std::string>, std::recursive_mutex>;  ///< Synchronized legacy cancel owners.
-    std::unique_ptr<cancel_client_certificates_t> _cancel_client_certificates =
-      std::make_unique<cancel_client_certificates_t>();  ///< Verified clients allowed to cancel the current application.
+
+    /** @brief Process state serialized with generation-qualified legacy cancel owners. */
+    struct lifecycle_state_t {
+      std::uint64_t generation {};  ///< Monotonic application process generation.
+      bool legacy_attachable {};  ///< Whether the current running process permits legacy session attachment.
+      std::unordered_set<std::string> cancel_client_certificates;  ///< Verified legacy cancel owners for this generation.
+    };
+
+    using lifecycle_t = sync_util::sync_t<lifecycle_state_t, std::recursive_mutex>;  ///< Serialized process lifecycle boundary.
+    std::unique_ptr<lifecycle_t> _lifecycle = std::make_unique<lifecycle_t>();  ///< Shared generation and owner state.
 
     // If no command associated with _app_id, yet it's still running
     bool placebo {};

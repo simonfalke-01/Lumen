@@ -8,6 +8,7 @@
 // standard imports
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -128,10 +129,104 @@ TEST(ProcessLifecycleTest, CancellationRequiresAnAuthorizedLegacyCertificate) {
 
   EXPECT_FALSE(process.terminate_if_owned_by_certificate("certificate-b"));
   EXPECT_EQ(process.running(), 881);
-  process.authorize_cancel_by_certificate("certificate-b");
+  process.authorize_cancel_by_certificate("certificate-b", launch->process_generation);
   EXPECT_TRUE(process.terminate_if_owned_by_certificate("certificate-b"));
   EXPECT_EQ(process.running(), 0);
   EXPECT_FALSE(process.terminate_if_owned_by_certificate("certificate-a"));
+}
+
+TEST(ProcessLifecycleTest, GenerationFencesLateLegacyOwnersFromReplacementAndProtocolV3Processes) {
+  boost::process::v1::environment env {boost::this_process::environment()};
+  proc::ctx_t desktop {};
+  desktop.name = "Desktop";
+  desktop.id = "881";
+  desktop.exit_timeout = std::chrono::seconds {0};
+  std::vector<proc::ctx_t> apps;
+  apps.emplace_back(std::move(desktop));
+  proc::proc_t process {std::move(env), std::move(apps)};
+
+  auto legacy = std::make_shared<rtsp_stream::launch_session_t>();
+  legacy->client_cert = "certificate-a";
+  ASSERT_EQ(process.execute(881, legacy), 0);
+  const auto legacy_generation = legacy->process_generation;
+
+  auto protocol_v3 = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(process.execute(881, protocol_v3), 0);
+  const auto protocol_v3_generation = protocol_v3->process_generation;
+  ASSERT_GT(protocol_v3_generation, legacy_generation);
+
+  bool stale_publish_called {};
+  EXPECT_FALSE(process.publish_legacy_session(
+    legacy_generation,
+    "certificate-a",
+    [&]() {
+      stale_publish_called = true;
+      return true;
+    }
+  ));
+  EXPECT_FALSE(stale_publish_called);
+  EXPECT_FALSE(process.authorize_cancel_by_certificate("certificate-a", legacy_generation));
+  EXPECT_FALSE(process.terminate_if_owned_by_certificate("certificate-a"));
+
+  bool cross_protocol_publish_called {};
+  EXPECT_FALSE(process.publish_legacy_session(
+    protocol_v3_generation,
+    "certificate-a",
+    [&]() {
+      cross_protocol_publish_called = true;
+      return true;
+    }
+  ));
+  EXPECT_FALSE(cross_protocol_publish_called);
+  EXPECT_EQ(process.running(), 881);
+}
+
+TEST(ProcessLifecycleTest, ActivePublicationSerializesAgainstConcurrentProcessReplacement) {
+  boost::process::v1::environment env {boost::this_process::environment()};
+  proc::ctx_t desktop {};
+  desktop.name = "Desktop";
+  desktop.id = "881";
+  desktop.exit_timeout = std::chrono::seconds {0};
+  std::vector<proc::ctx_t> apps;
+  apps.emplace_back(std::move(desktop));
+  proc::proc_t process {std::move(env), std::move(apps)};
+
+  auto legacy = std::make_shared<rtsp_stream::launch_session_t>();
+  legacy->client_cert = "certificate-a";
+  ASSERT_EQ(process.execute(881, legacy), 0);
+
+  std::promise<void> publish_entered;
+  auto publish_started = publish_entered.get_future();
+  std::promise<void> release_publish;
+  auto publish_release = release_publish.get_future().share();
+  auto publication = std::async(std::launch::async, [&]() {
+    return process.publish_legacy_session(
+      legacy->process_generation,
+      legacy->client_cert,
+      [&]() {
+        publish_entered.set_value();
+        publish_release.wait();
+        return true;
+      }
+    );
+  });
+  ASSERT_EQ(publish_started.wait_for(std::chrono::seconds {1}), std::future_status::ready);
+
+  auto protocol_v3 = std::make_shared<rtsp_stream::launch_session_t>();
+  std::promise<void> replacement_entered;
+  auto replacement_started = replacement_entered.get_future();
+  auto replacement = std::async(std::launch::async, [&]() {
+    replacement_entered.set_value();
+    return process.execute(881, protocol_v3);
+  });
+  ASSERT_EQ(replacement_started.wait_for(std::chrono::seconds {1}), std::future_status::ready);
+  EXPECT_EQ(replacement.wait_for(std::chrono::milliseconds {20}), std::future_status::timeout);
+
+  release_publish.set_value();
+  EXPECT_TRUE(publication.get());
+  EXPECT_EQ(replacement.get(), 0);
+  EXPECT_GT(protocol_v3->process_generation, legacy->process_generation);
+  EXPECT_FALSE(process.terminate_if_owned_by_certificate(legacy->client_cert));
 }
 
 TEST_F(ProcessPNGTest, CheckValidPNG_WrongSignature) {

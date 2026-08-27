@@ -136,6 +136,8 @@ namespace rtsp_stream {
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
     std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+    std::uint64_t process_generation {};  ///< Process generation captured before RTSP publication.
+    std::uint64_t pending_launch_generation {};  ///< Monotonic pending-slot generation used by timeout removal.
   };
 
   /**
@@ -148,8 +150,12 @@ namespace rtsp_stream {
   /**
    * @brief Clear state for the specified launch session.
    * @param launch_session_id The ID of the session to clear.
+   * @param pending_launch_generation Exact pending-slot generation claimed by the session.
    */
-  void launch_session_clear(uint32_t launch_session_id);
+  void launch_session_clear(
+    uint32_t launch_session_id,
+    std::uint64_t pending_launch_generation
+  );
 
   /**
    * @brief Get the number of active sessions.
@@ -162,16 +168,60 @@ namespace rtsp_stream {
    */
   bool has_session_or_pending_launch();
 
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Expire the current pending launch through the production timeout cleanup path.
+   *
+   * @return `true` when a pending launch was expired.
+   */
+  [[nodiscard]] bool expire_pending_launch_for_tests();
+
+  /** @brief Return the current pending-slot generation for deterministic race tests. */
+  [[nodiscard]] std::uint64_t pending_launch_generation_for_tests();
+
+  /** @brief Claim the current pending launch without creating a network socket. */
+  [[nodiscard]] std::shared_ptr<launch_session_t> claim_pending_launch_for_tests();
+
+  /** @brief Check whether a previously claimed launch remains publishable. */
+  [[nodiscard]] bool claimed_launch_publishable_for_tests(const std::shared_ptr<launch_session_t> &launch_session);
+
+  /** @brief Expire exactly one pending generation without touching its replacement. */
+  [[nodiscard]] bool expire_pending_launch_generation_for_tests(std::uint64_t pending_generation);
+
+  /** @brief Return how many no-process RTSP cleanup paths explicitly reverted display state. */
+  [[nodiscard]] std::size_t idle_display_revert_count_for_tests();
+
+  /** @brief Reset the no-process display-revert observation counter. */
+  void reset_idle_display_revert_count_for_tests();
+#endif
+
   /**
    * @brief Terminates all running streaming sessions.
    */
   void terminate_sessions();
   /**
-   * @brief Terminate active sessions associated with a client certificate.
+   * @brief Cancel certificate-owned RTSP state and idle process/display state.
    *
-   * @param cert Certificate data or object used by the operation.
+   * @param cert Verified legacy client certificate.
+   * @return Number of matching pending and active RTSP states removed.
    */
   std::size_t terminate_sessions_by_cert(std::string_view cert);
+
+  /**
+   * @brief Atomically cancel owner RTSP state and idle process/display state.
+   *
+   * @param cert Verified legacy client certificate.
+   * @return Number of matching pending and active RTSP states removed.
+   */
+  std::size_t cancel_sessions_and_process_by_cert(std::string_view cert);
+
+  /**
+   * @brief Terminate an owner process only while the serialized RTSP boundary is idle.
+   *
+   * @param cert Verified legacy client certificate.
+   * @return `true` when an owned process was terminated.
+   */
+  bool cancel_process_for_client_if_idle(std::string_view cert);
 
   [[nodiscard]] inline bool session_owned_by_certificate(
     std::string_view session_certificate,

@@ -417,6 +417,44 @@ namespace stream {
   }
 
   /**
+   * @brief Publish session startup around worker construction and committed side effects.
+   *
+   * @tparam LaunchWorkers Callable that creates all session workers.
+   * @tparam CommitStartup Callable that publishes counters and platform callbacks.
+   * @param state Session lifecycle state shared with workers.
+   * @param launch_workers Worker construction callable.
+   * @param commit_startup Startup side effects completed before RUNNING is released.
+   */
+  template<class LaunchWorkers, class CommitStartup>
+  void start_session_workers_ordered(
+    std::atomic<session::state_e> &state,
+    LaunchWorkers &&launch_workers,
+    CommitStartup &&commit_startup
+  ) {
+    state.store(session::state_e::STARTING, std::memory_order_release);
+    std::forward<LaunchWorkers>(launch_workers)();
+    std::forward<CommitStartup>(commit_startup)();
+    state.store(session::state_e::RUNNING, std::memory_order_release);
+  }
+
+  /**
+   * @brief Wait for startup publication and transition one running session to stopping.
+   *
+   * @param state Session lifecycle state shared with workers.
+   * @return `true` only for the caller that advances RUNNING to STOPPING.
+   */
+  [[nodiscard]] bool transition_session_to_stopping(std::atomic<session::state_e> &state) {
+    while_starting_do_nothing(state);
+    auto expected = session::state_e::RUNNING;
+    return state.compare_exchange_strong(
+      expected,
+      session::state_e::STOPPING,
+      std::memory_order_acq_rel,
+      std::memory_order_acquire
+    );
+  }
+
+  /**
    * @brief ENet control server that routes incoming control packets to stream sessions.
    */
   class control_server_t {
@@ -716,7 +754,9 @@ namespace stream {
     } microphone;  ///< Optional client-to-host microphone runtime state.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+    std::uint64_t pending_launch_generation {};  ///< Exact pending RTSP slot claimed by this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
+    std::uint64_t process_generation {};  ///< Application process generation captured by the RTSP launch.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
@@ -873,7 +913,10 @@ namespace stream {
       }
 
       // Once the control stream connection is established, RTSP session state can be torn down
-      rtsp_stream::launch_session_clear(session_p->launch_session_id);
+      rtsp_stream::launch_session_clear(
+        session_p->launch_session_id,
+        session_p->pending_launch_generation
+      );
 
       session_p->control.peer = peer;
 
@@ -2645,7 +2688,7 @@ namespace stream {
      * @brief Platform handle returned from stream setup.
      */
     state_e state(session_t &session) {
-      return session.state.load(std::memory_order_relaxed);
+      return session.state.load(std::memory_order_acquire);
     }
 
     /**
@@ -2655,14 +2698,15 @@ namespace stream {
       return session.client_cert;
     }
 
+    std::uint64_t process_generation(session_t &session) {
+      return session.process_generation;
+    }
+
     /**
      * @brief Stop the active streaming session and prevent new packets from being queued.
      */
     void stop(session_t &session) {
-      while_starting_do_nothing(session.state);
-      auto expected = state_e::RUNNING;
-      auto already_stopping = !session.state.compare_exchange_strong(expected, state_e::STOPPING);
-      if (already_stopping) {
+      if (!transition_session_to_stopping(session.state)) {
         return;
       }
 
@@ -2790,26 +2834,67 @@ namespace stream {
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
-      if (session.config.client_microphone) {
-        register_client_microphone_route(*session.broadcast_ref.get(), session_ptr);
-        session.microphoneThread = std::jthread {clientMicrophoneThread, &session};
-      }
+      start_session_workers_ordered(
+        session.state,
+        [&]() {
+          if (session.config.client_microphone) {
+            register_client_microphone_route(*session.broadcast_ref.get(), session_ptr);
+            session.microphoneThread = std::jthread {clientMicrophoneThread, &session};
+          }
 
-      session.audioThread = std::jthread {audioThread, &session};
-      session.videoThread = std::jthread {videoThread, &session};
-
-      session.state.store(state_e::RUNNING, std::memory_order_relaxed);
-
-      // If this is the first session, invoke the platform callbacks
-      if (++running_sessions == 1) {
-        platf::streaming_will_start();
+          session.audioThread = std::jthread {audioThread, &session};
+          session.videoThread = std::jthread {videoThread, &session};
+        },
+        [&]() {
+          // Commit counters and callbacks before RUNNING releases workers.
+          if (++running_sessions == 1) {
+            platf::streaming_will_start();
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-        system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
+            system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
 #endif
-      }
+          }
+        }
+      );
 
       return 0;
     }
+
+#ifdef SUNSHINE_TESTS
+    startup_order_probe_t startup_order_probe_for_test() {
+      std::atomic state {state_e::STOPPED};
+      std::promise<void> worker_launched;
+      auto worker_ready = worker_launched.get_future();
+      state_e worker_observed_state {state_e::STOPPED};
+      bool stop_transitioned {};
+      bool startup_committed {};
+      bool worker_observed_committed_startup {};
+      std::jthread worker;
+
+      start_session_workers_ordered(
+        state,
+        [&]() {
+          worker = std::jthread([&]() {
+            worker_observed_state = state.load(std::memory_order_acquire);
+            worker_launched.set_value();
+            stop_transitioned = transition_session_to_stopping(state);
+            worker_observed_committed_startup = startup_committed;
+          });
+          worker_ready.wait();
+        },
+        [&]() {
+          startup_committed = true;
+        }
+      );
+      worker.join();
+
+      return {
+        .worker_observed_state = worker_observed_state,
+        .final_state = state.load(std::memory_order_acquire),
+        .stop_transitioned = stop_transitioned,
+        .worker_observed_committed_startup = worker_observed_committed_startup,
+      };
+    }
+#endif
 
     /**
      * @brief Allocate and initialize platform input state for a stream.
@@ -2826,7 +2911,9 @@ namespace stream {
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+      session->pending_launch_generation = launch_session.pending_launch_generation;
       session->client_cert = launch_session.client_cert;
+      session->process_generation = launch_session.process_generation;
 
       session->config = config;
       session->config.monitor.optimization_policy = session->config.optimization_policy;

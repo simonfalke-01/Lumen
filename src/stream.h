@@ -240,6 +240,23 @@ namespace stream {
       RUNNING,  ///< The session is running
     };
 
+#ifdef SUNSHINE_TESTS
+    /** @brief Observations from the production ordered worker-start boundary. */
+    struct startup_order_probe_t {
+      state_e worker_observed_state {state_e::STOPPED};  ///< State observed immediately after the worker is launched.
+      state_e final_state {state_e::STOPPED};  ///< State after the early worker requests stop.
+      bool stop_transitioned {};  ///< Whether the early stop advanced RUNNING to STOPPING.
+      bool worker_observed_committed_startup {};  ///< Whether RUNNING acquire observed prior startup side effects.
+    };
+
+    /**
+     * @brief Exercise the exact STARTING, worker launch, startup commit, and RUNNING boundary.
+     *
+     * @return Deterministic observations from an early worker stop interleaving.
+     */
+    [[nodiscard]] startup_order_probe_t startup_order_probe_for_test();
+#endif
+
     /**
      * @brief Allocate and initialize platform input state for a stream.
      *
@@ -282,6 +299,14 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+
+    /**
+     * @brief Return the application process generation captured by a stream session.
+     *
+     * @param session Active streaming session.
+     * @return Monotonic process generation associated with the RTSP launch.
+     */
+    std::uint64_t process_generation(session_t &session);
 
     /**
      * @brief Claim the single global client-microphone owner slot.

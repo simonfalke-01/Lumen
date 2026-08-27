@@ -13,8 +13,10 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <condition_variable>
 #include <format>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -25,6 +27,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -602,7 +605,15 @@ namespace rtsp_stream {
 
       auto socket = std::move(next_socket);
 
-      auto launch_session {launch_event.view(0s)};
+      std::shared_ptr<launch_session_t> launch_session;
+      {
+        std::unique_lock lifecycle {lifecycle_mutex_};
+        wait_for_teardown_locked(lifecycle);
+        if (pending_launch_ && !pending_launch_claimed_) {
+          pending_launch_claimed_ = true;
+          launch_session = pending_launch_;
+        }
+      }
       if (launch_session) {
         // Associate the current RTSP session with this socket and start reading
         socket->session = launch_session;
@@ -642,42 +653,82 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
       // If a launch event is still pending, don't overwrite it.
-      if (launch_event.view(0s)) {
+      if (pending_launch_) {
         return;
       }
 
-      // Raise the new launch session to prepare for the RTSP handshake
-      launch_event.raise(std::move(launch_session));
+      // Publish a new generation-qualified pending launch.
+      launch_session->pending_launch_generation = ++pending_launch_generation_;
+      const auto pending_generation = launch_session->pending_launch_generation;
+      pending_launch_ = std::move(launch_session);
+      pending_launch_claimed_ = false;
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this](const boost::system::error_code &ec) {
+      raised_timer.async_wait([this, pending_generation](const boost::system::error_code &ec) {
         if (!ec) {
-          auto discarded = launch_event.pop(0s);
-          if (discarded) {
-            BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
-          }
+          static_cast<void>(expire_pending_launch(pending_generation, false));
         }
       });
     }
 
     /**
+     * @brief Expire the pending launch and release its owner-matched idle process.
+     *
+     * The lifecycle boundary serializes timeout cleanup with pending claim and
+     * active publication. Process teardown then reuses the generation- and
+     * certificate-qualified process boundary before display restoration.
+     *
+     * @param pending_generation Exact pending generation to remove.
+     * @param cancel_timer Whether to cancel the armed timeout before expiring.
+     * @return `true` when a pending launch was expired.
+     */
+    bool expire_pending_launch(const std::uint64_t pending_generation, bool cancel_timer = true) {
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
+      if (!pending_launch_ || pending_launch_->pending_launch_generation != pending_generation) {
+        return false;
+      }
+      if (cancel_timer) {
+        raised_timer.cancel();
+      }
+      auto discarded = std::exchange(pending_launch_, {});
+      pending_launch_claimed_ = false;
+
+      BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+      cleanup_idle_launch_locked(*discarded);
+      return true;
+    }
+
+    /**
      * @brief Clear state for the oldest launch session.
      * @param launch_session_id The ID of the session to clear.
+     * @param pending_launch_generation Exact pending-slot generation claimed by the session.
      */
-    void session_clear(uint32_t launch_session_id) {
-      // We currently only support a single pending RTSP session,
-      // so the ID should always match the one for that session.
-      auto launch_session = launch_event.view(0s);
-      if (launch_session) {
-        if (launch_session->id != launch_session_id) {
-          BOOST_LOG(error) << "Attempted to clear unexpected session: "sv << launch_session_id << " vs "sv << launch_session->id;
-        } else {
-          raised_timer.cancel();
-          launch_event.pop();
-        }
+    void session_clear(
+      const uint32_t launch_session_id,
+      const std::uint64_t pending_launch_generation
+    ) {
+      std::lock_guard lifecycle {lifecycle_mutex_};
+      if (teardown_in_progress_) {
+        return;
       }
+      if (!pending_launch_) {
+        return;
+      }
+      if (pending_launch_->id != launch_session_id ||
+          pending_launch_->pending_launch_generation != pending_launch_generation) {
+        BOOST_LOG(error) << "Attempted to clear unexpected pending session generation: "sv
+                         << launch_session_id << '/' << pending_launch_generation << " vs "sv
+                         << pending_launch_->id << '/' << pending_launch_->pending_launch_generation;
+        return;
+      }
+      raised_timer.cancel();
+      pending_launch_.reset();
+      pending_launch_claimed_ = false;
     }
 
     /**
@@ -685,18 +736,16 @@ namespace rtsp_stream {
      * @return Count of active sessions.
      */
     int session_count() {
-      auto lg = _session_slots.lock();
-      return (int) _session_slots->size();
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
+      return static_cast<int>(_session_slots.size());
     }
 
     bool has_session_or_pending_launch() {
-      if (launch_event.view(0s)) {
-        return true;
-      }
-      return session_count() > 0;
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
+      return pending_launch_ || !_session_slots.empty();
     }
-
-    safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
 
     /**
      * @brief Clear launch sessions.
@@ -706,70 +755,193 @@ namespace rtsp_stream {
      * @examples_end
      */
     void clear(bool all = true) {
-      auto lg = _session_slots.lock();
-
-      for (auto i = _session_slots->begin(); i != _session_slots->end();) {
-        auto &slot = *(*i);
-        if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
-          stream::session::stop(slot);
-          stream::session::join(slot);
-
-          i = _session_slots->erase(i);
-        } else {
-          i++;
+      std::vector<std::shared_ptr<stream::session_t>> removed;
+      {
+        std::unique_lock lifecycle {lifecycle_mutex_};
+        wait_for_teardown_locked(lifecycle);
+        teardown_in_progress_ = true;
+        if (all && pending_launch_) {
+          raised_timer.cancel();
+          pending_launch_.reset();
+          pending_launch_claimed_ = false;
         }
+        for (auto i = _session_slots.begin(); i != _session_slots.end();) {
+          auto &slot = *(*i);
+          if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
+            removed.push_back(*i);
+            i = _session_slots.erase(i);
+          } else {
+            ++i;
+          }
+        }
+      }
+      auto teardown_guard = util::fail_guard([this]() {
+        finish_teardown();
+      });
+      for (const auto &session : removed) {
+        stream::session::stop(*session);
+        stream::session::join(*session);
       }
     }
 
     /**
-     * @brief Clear by cert state.
+     * @brief Cancel owner RTSP state and process/display state under one boundary.
      *
-     * @param cert Certificate data or object used by the operation.
+     * @param cert Verified legacy client certificate.
+     * @return Number of matching pending and active RTSP states removed.
      */
-    std::size_t clear_by_cert(std::string_view cert) {
+    std::size_t cancel_owner(std::string_view cert) {
       if (cert.empty()) {
         return 0;
       }
+      std::vector<std::uint64_t> removed_generations;
+      std::vector<std::shared_ptr<stream::session_t>> removed;
       std::size_t cleared {};
-      auto pending = launch_event.view(0s);
-      if (pending && session_owned_by_certificate(pending->client_cert, cert)) {
-        raised_timer.cancel();
-        launch_event.pop();
-        ++cleared;
-      }
-      auto lg = _session_slots.lock();
-      for (auto i = _session_slots->begin(); i != _session_slots->end();) {
-        auto &slot = *(*i);
-        if (session_owned_by_certificate(stream::session::client_cert(slot), cert)) {
-          stream::session::stop(slot);
-          stream::session::join(slot);
-          i = _session_slots->erase(i);
+      {
+        std::unique_lock lifecycle {lifecycle_mutex_};
+        wait_for_teardown_locked(lifecycle);
+        teardown_in_progress_ = true;
+        if (pending_launch_ && session_owned_by_certificate(pending_launch_->client_cert, cert)) {
+          removed_generations.push_back(pending_launch_->process_generation);
+          raised_timer.cancel();
+          pending_launch_.reset();
+          pending_launch_claimed_ = false;
           ++cleared;
-        } else {
-          i++;
+        }
+        for (auto i = _session_slots.begin(); i != _session_slots.end();) {
+          auto &slot = *(*i);
+          if (session_owned_by_certificate(stream::session::client_cert(slot), cert)) {
+            removed_generations.push_back(stream::session::process_generation(slot));
+            removed.push_back(*i);
+            i = _session_slots.erase(i);
+            ++cleared;
+          } else {
+            ++i;
+          }
+        }
+      }
+      auto teardown_guard = util::fail_guard([this]() {
+        finish_teardown();
+      });
+      for (const auto &session : removed) {
+        stream::session::stop(*session);
+        stream::session::join(*session);
+      }
+      {
+        std::lock_guard lifecycle {lifecycle_mutex_};
+        bool generation_matched {};
+        bool process_running {};
+        bool process_terminated {};
+        if (_session_slots.empty() && !pending_launch_) {
+          for (const auto generation : removed_generations) {
+            const auto cleanup = proc::proc.cleanup_owned_process_generation(cert, generation);
+            generation_matched = generation_matched || cleanup.generation_matched;
+            process_running = process_running || cleanup.process_running;
+            process_terminated = process_terminated || cleanup.process_terminated;
+          }
+          if (removed_generations.empty()) {
+            process_terminated = proc::proc.terminate_if_owned_by_certificate(cert);
+          }
+          if (process_terminated || (generation_matched && !process_running)) {
+            revert_idle_display_locked();
+          }
         }
       }
       return cleared;
     }
 
     /**
-     * @brief Removes the provided session from the set of sessions.
-     * @param session The session to remove.
+     * @brief Terminate an owner process only while no RTSP state exists.
+     *
+     * @param cert Verified legacy client certificate.
+     * @return `true` when an owned process was terminated.
      */
-    void remove(const std::shared_ptr<stream::session_t> &session) {
-      auto lg = _session_slots.lock();
-      _session_slots->erase(session);
+    bool cancel_idle_process(std::string_view cert) {
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
+      if (pending_launch_ || !_session_slots.empty()) {
+        return false;
+      }
+      const auto terminated = proc::proc.terminate_if_owned_by_certificate(cert);
+      if (terminated) {
+        revert_idle_display_locked();
+      }
+      return terminated;
     }
 
     /**
-     * @brief Inserts the provided session into the set of sessions.
-     * @param session The session to insert.
+     * @brief Start and publish a claimed session under the serialized boundary.
+     *
+     * @param stream_session Session allocated from the claimed launch.
+     * @param launch_session Claimed launch state retained by the RTSP socket.
+     * @param peer_address Remote peer address used by the stream workers.
+     * @return `true` when generation validation, worker startup, publication, and authorization succeed.
      */
-    void insert(const std::shared_ptr<stream::session_t> &session) {
-      auto lg = _session_slots.lock();
-      _session_slots->emplace(session);
-      BOOST_LOG(info) << "New streaming session started [active sessions: "sv << _session_slots->size() << ']';
+    bool start_and_insert(
+      const std::shared_ptr<stream::session_t> &stream_session,
+      const launch_session_t &launch_session,
+      const std::string &peer_address
+    ) {
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
+      if (!claimed_launch_publishable_locked(launch_session)) {
+        return false;
+      }
+      const auto published = proc::proc.publish_legacy_session(
+        launch_session.process_generation,
+        launch_session.client_cert,
+        [&]() {
+          if (stream::session::start(stream_session, peer_address)) {
+            return false;
+          }
+          _session_slots.emplace(stream_session);
+          pending_launch_.reset();
+          pending_launch_claimed_ = false;
+          raised_timer.cancel();
+          return true;
+        }
+      );
+      if (published) {
+        BOOST_LOG(info) << "New streaming session started [active sessions: "sv << _session_slots.size() << ']';
+      }
+      return published;
     }
+
+#ifdef SUNSHINE_TESTS
+    /** @brief Return the current pending generation under the lifecycle boundary. */
+    std::uint64_t pending_launch_generation_for_tests() {
+      std::lock_guard lifecycle {lifecycle_mutex_};
+      return pending_launch_ ? pending_launch_->pending_launch_generation : 0;
+    }
+
+    /** @brief Claim the current pending launch under the lifecycle boundary. */
+    std::shared_ptr<launch_session_t> claim_pending_launch_for_tests() {
+      std::lock_guard lifecycle {lifecycle_mutex_};
+      if (!pending_launch_ || pending_launch_claimed_) {
+        return {};
+      }
+      pending_launch_claimed_ = true;
+      return pending_launch_;
+    }
+
+    /** @brief Check whether a claimed launch still owns the current pending slot. */
+    bool claimed_launch_publishable_for_tests(const std::shared_ptr<launch_session_t> &launch_session) {
+      std::lock_guard lifecycle {lifecycle_mutex_};
+      return launch_session && claimed_launch_publishable_locked(*launch_session);
+    }
+
+    /** @brief Return the explicit idle display-revert observation count. */
+    std::size_t idle_display_revert_count_for_tests() {
+      std::lock_guard lifecycle {lifecycle_mutex_};
+      return idle_display_revert_count_;
+    }
+
+    /** @brief Reset the explicit idle display-revert observation count. */
+    void reset_idle_display_revert_count_for_tests() {
+      std::lock_guard lifecycle {lifecycle_mutex_};
+      idle_display_revert_count_ = 0;
+    }
+#endif
 
     /**
      * @brief Runs an iteration of the RTSP server loop
@@ -794,9 +966,63 @@ namespace rtsp_stream {
     }
 
   private:
+    /** @brief Wait until any join-based teardown releases the lifecycle boundary. */
+    void wait_for_teardown_locked(std::unique_lock<std::recursive_mutex> &lifecycle) {
+      lifecycle_changed_.wait(lifecycle, [this]() {
+        return !teardown_in_progress_;
+      });
+    }
+
+    /** @brief Publish completion of join-based teardown and wake lifecycle waiters. */
+    void finish_teardown() {
+      {
+        std::lock_guard lifecycle {lifecycle_mutex_};
+        teardown_in_progress_ = false;
+      }
+      lifecycle_changed_.notify_all();
+    }
+
+    /** @brief Test whether one claimed socket still owns the current pending slot. */
+    bool claimed_launch_publishable_locked(const launch_session_t &launch_session) const {
+      return pending_launch_ && pending_launch_claimed_ &&
+             pending_launch_.get() == &launch_session &&
+             pending_launch_->pending_launch_generation == launch_session.pending_launch_generation;
+    }
+
+    /** @brief Restore display state for a generation-matched idle RTSP cleanup. */
+    void revert_idle_display_locked() {
+#ifdef SUNSHINE_TESTS
+      ++idle_display_revert_count_;
+#endif
+      display_device::revert_configuration();
+    }
+
+    /** @brief Release process/display state for one removed pending launch when idle. */
+    void cleanup_idle_launch_locked(const launch_session_t &launch_session) {
+      if (!_session_slots.empty() || pending_launch_) {
+        return;
+      }
+      const auto cleanup = proc::proc.cleanup_owned_process_generation(
+        launch_session.client_cert,
+        launch_session.process_generation
+      );
+      if (cleanup.process_terminated || (cleanup.generation_matched && !cleanup.process_running)) {
+        revert_idle_display_locked();
+      }
+    }
+
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
 
-    sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> _session_slots;
+    std::recursive_mutex lifecycle_mutex_;  ///< Serialized pending, active, process-owner, and teardown boundary.
+    std::condition_variable_any lifecycle_changed_;  ///< Wakes pending/claim/publication work after joins finish.
+    bool teardown_in_progress_ {};  ///< Whether matched sessions were unpublished for out-of-lock joins.
+    std::set<std::shared_ptr<stream::session_t>> _session_slots;  ///< Active sessions guarded by lifecycle_mutex_.
+    std::shared_ptr<launch_session_t> pending_launch_;  ///< Pending or claimed launch guarded by lifecycle_mutex_.
+    std::uint64_t pending_launch_generation_ {};  ///< Monotonic pending-slot generation.
+    bool pending_launch_claimed_ {};  ///< Whether an accepted RTSP socket claimed the pending slot.
+#ifdef SUNSHINE_TESTS
+    std::size_t idle_display_revert_count_ {};  ///< Explicit no-process display cleanup observations.
+#endif
 
     boost::asio::io_context io_context;
     tcp::acceptor acceptor {io_context};
@@ -814,8 +1040,11 @@ namespace rtsp_stream {
     server.session_raise(std::move(launch_session));
   }
 
-  void launch_session_clear(uint32_t launch_session_id) {
-    server.session_clear(launch_session_id);
+  void launch_session_clear(
+    const uint32_t launch_session_id,
+    const std::uint64_t pending_launch_generation
+  ) {
+    server.session_clear(launch_session_id, pending_launch_generation);
   }
 
   int session_count() {
@@ -830,6 +1059,37 @@ namespace rtsp_stream {
     return server.has_session_or_pending_launch();
   }
 
+#ifdef SUNSHINE_TESTS
+  bool expire_pending_launch_for_tests() {
+    const auto pending_generation = server.pending_launch_generation_for_tests();
+    return pending_generation != 0 && server.expire_pending_launch(pending_generation);
+  }
+
+  std::uint64_t pending_launch_generation_for_tests() {
+    return server.pending_launch_generation_for_tests();
+  }
+
+  std::shared_ptr<launch_session_t> claim_pending_launch_for_tests() {
+    return server.claim_pending_launch_for_tests();
+  }
+
+  bool claimed_launch_publishable_for_tests(const std::shared_ptr<launch_session_t> &launch_session) {
+    return server.claimed_launch_publishable_for_tests(launch_session);
+  }
+
+  bool expire_pending_launch_generation_for_tests(const std::uint64_t pending_generation) {
+    return server.expire_pending_launch(pending_generation);
+  }
+
+  std::size_t idle_display_revert_count_for_tests() {
+    return server.idle_display_revert_count_for_tests();
+  }
+
+  void reset_idle_display_revert_count_for_tests() {
+    server.reset_idle_display_revert_count_for_tests();
+  }
+#endif
+
   void terminate_sessions() {
     server.clear(true);
   }
@@ -838,7 +1098,15 @@ namespace rtsp_stream {
    * @brief Terminate active sessions associated with a client certificate.
    */
   std::size_t terminate_sessions_by_cert(std::string_view cert) {
-    return server.clear_by_cert(cert);
+    return server.cancel_owner(cert);
+  }
+
+  std::size_t cancel_sessions_and_process_by_cert(std::string_view cert) {
+    return server.cancel_owner(cert);
+  }
+
+  bool cancel_process_for_client_if_idle(std::string_view cert) {
+    return server.cancel_idle_process(cert);
   }
 
   /**
@@ -1669,17 +1937,13 @@ namespace rtsp_stream {
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;
     }
-    server->insert(stream_session);
-
-    if (stream::session::start(stream_session, sock.remote_endpoint().address().to_string())) {
+    if (!server->start_and_insert(stream_session, session, sock.remote_endpoint().address().to_string())) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
-      server->remove(stream_session);
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;
     }
 
-    proc::proc.authorize_cancel_by_certificate(session.client_cert);
     microphone_claim_guard.disable();
 #ifdef _WIN32
     virtual_display_cleanup.disable();

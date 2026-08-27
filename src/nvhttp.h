@@ -405,6 +405,14 @@ namespace nvhttp {
    */
   bool cancel_process_for_client_if_idle(std::string_view client_certificate);
 
+  /**
+   * @brief Cancel one verified client's RTSP and idle process/display state atomically.
+   *
+   * @param client_certificate Verified legacy client certificate.
+   * @return Number of matching pending and active RTSP states removed.
+   */
+  std::size_t cancel_sessions_and_process_for_client(std::string_view client_certificate);
+
 #ifdef SUNSHINE_TESTS
   pairing_session_manager_t &pairing_sessions_for_tests();
 

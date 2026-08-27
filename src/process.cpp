@@ -217,8 +217,12 @@ namespace proc {
   }
 
   int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    auto lifecycle = _lifecycle->lock();
     // Ensure starting from a clean slate
     terminate();
+    const auto process_generation = ++(*_lifecycle)->generation;
+    (*_lifecycle)->legacy_attachable = false;
+    launch_session->process_generation = process_generation;
 
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
       return app.id == std::to_string(app_id);
@@ -228,6 +232,7 @@ namespace proc {
       BOOST_LOG(error) << "Couldn't find app with ID ["sv << app_id << ']';
       return 404;
     }
+    (*_lifecycle)->legacy_attachable = !launch_session->client_cert.empty();
 
     _app_id = app_id;
     _app = *iter;
@@ -323,7 +328,7 @@ namespace proc {
     }
 
     _app_launch_time = std::chrono::steady_clock::now();
-    authorize_cancel_by_certificate(launch_session->client_cert);
+    static_cast<void>(authorize_cancel_by_certificate(launch_session->client_cert, process_generation));
 
     fg.disable();
 
@@ -331,6 +336,7 @@ namespace proc {
   }
 
   int proc_t::running() {
+    auto lifecycle = _lifecycle->lock();
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
@@ -365,16 +371,48 @@ namespace proc {
     return 0;
   }
 
-  void proc_t::authorize_cancel_by_certificate(const std::string_view client_certificate) {
-    if (!client_certificate.empty()) {
-      auto guard = _cancel_client_certificates->lock();
-      (*_cancel_client_certificates)->emplace(client_certificate);
+  bool proc_t::authorize_cancel_by_certificate(
+    const std::string_view client_certificate,
+    const std::uint64_t process_generation
+  ) {
+    auto lifecycle = _lifecycle->lock();
+    if (client_certificate.empty() || process_generation != (*_lifecycle)->generation || !(*_lifecycle)->legacy_attachable) {
+      return false;
     }
+    (*_lifecycle)->cancel_client_certificates.emplace(client_certificate);
+    return true;
+  }
+
+  std::uint64_t proc_t::generation() {
+    auto lifecycle = _lifecycle->lock();
+    return (*_lifecycle)->generation;
+  }
+
+  bool proc_t::publish_legacy_session(
+    const std::uint64_t process_generation,
+    const std::string_view client_certificate,
+    const std::function<bool()> &publish
+  ) {
+    auto lifecycle = _lifecycle->lock();
+    if (process_generation != (*_lifecycle)->generation) {
+      return false;
+    }
+    const auto current_app = running();
+    if (current_app > 0 && !(*_lifecycle)->legacy_attachable) {
+      return false;
+    }
+    if (!publish()) {
+      return false;
+    }
+    if (current_app > 0 && !client_certificate.empty()) {
+      (*_lifecycle)->cancel_client_certificates.emplace(client_certificate);
+    }
+    return true;
   }
 
   bool proc_t::terminate_if_owned_by_certificate(const std::string_view client_certificate) {
-    auto guard = _cancel_client_certificates->lock();
-    if (client_certificate.empty() || !(*_cancel_client_certificates)->contains(std::string {client_certificate})) {
+    auto lifecycle = _lifecycle->lock();
+    if (client_certificate.empty() || !(*_lifecycle)->cancel_client_certificates.contains(std::string {client_certificate})) {
       return false;
     }
     if (running() <= 0) {
@@ -384,13 +422,28 @@ namespace proc {
     return true;
   }
 
+  proc_t::owner_cleanup_result_t proc_t::cleanup_owned_process_generation(
+    const std::string_view client_certificate,
+    const std::uint64_t process_generation
+  ) {
+    auto lifecycle = _lifecycle->lock();
+    if (process_generation != (*_lifecycle)->generation) {
+      return {};
+    }
+    const auto process_running = running() > 0;
+    return {
+      .generation_matched = true,
+      .process_running = process_running,
+      .process_terminated = process_running && terminate_if_owned_by_certificate(client_certificate),
+    };
+  }
+
   void proc_t::terminate() {
+    auto lifecycle = _lifecycle->lock();
     std::error_code ec;
     placebo = false;
-    {
-      auto guard = _cancel_client_certificates->lock();
-      (*_cancel_client_certificates)->clear();
-    }
+    (*_lifecycle)->legacy_attachable = false;
+    (*_lifecycle)->cancel_client_certificates.clear();
     terminate_process_group(_process, _process_group, _app.exit_timeout);
     _process = boost::process::v1::child();
     _process_group = boost::process::v1::group();
@@ -459,6 +512,7 @@ namespace proc {
   }
 
   std::string proc_t::get_last_run_app_name() {
+    auto lifecycle = _lifecycle->lock();
     return _app.name;
   }
 

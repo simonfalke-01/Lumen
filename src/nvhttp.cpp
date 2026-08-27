@@ -894,6 +894,7 @@ namespace nvhttp {
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
     launch_session->client_cert = std::move(client_certificate);
+    launch_session->process_generation = proc::proc.generation();
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     unsigned char raw_payload[8];
@@ -1456,8 +1457,11 @@ namespace nvhttp {
   }
 
   bool cancel_process_for_client_if_idle(const std::string_view client_certificate) {
-    return !rtsp_stream::has_session_or_pending_launch() &&
-           proc::proc.terminate_if_owned_by_certificate(client_certificate);
+    return rtsp_stream::cancel_process_for_client_if_idle(client_certificate);
+  }
+
+  std::size_t cancel_sessions_and_process_for_client(const std::string_view client_certificate) {
+    return rtsp_stream::cancel_sessions_and_process_by_cert(client_certificate);
   }
 
 #ifdef SUNSHINE_TESTS
@@ -1956,10 +1960,7 @@ namespace nvhttp {
     }
 
     tree = build_cancel_tree();
-    static_cast<void>(rtsp_stream::terminate_sessions_by_cert(client_certificate));
-    if (cancel_process_for_client_if_idle(client_certificate)) {
-      display_device::revert_configuration();
-    }
+    static_cast<void>(cancel_sessions_and_process_for_client(client_certificate));
   }
 
   /**

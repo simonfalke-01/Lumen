@@ -66,6 +66,15 @@ TEST(VirtualDisplayCleanupTest, LegacyHdrFallsBackOnlyAfterSafeOptionalRollback)
   EXPECT_FALSE(stream::allow_legacy_physical_hdr_fallback(true, true, false));
 }
 
+TEST(StreamSessionLifecycleTest, PublishesStartingBeforeWorkersAndCommittedStateBeforeRunning) {
+  const auto probe = stream::session::startup_order_probe_for_test();
+
+  EXPECT_EQ(probe.worker_observed_state, stream::session::state_e::STARTING);
+  EXPECT_TRUE(probe.stop_transitioned);
+  EXPECT_TRUE(probe.worker_observed_committed_startup);
+  EXPECT_EQ(probe.final_state, stream::session::state_e::STOPPING);
+}
+
 TEST(ProtocolV3AudioConfigurationTest, AppliesExplicitHostPlaybackPolicyAndExactTuple) {
   lumen::protocol_v3::media::NegotiatedMediaConfig selection;
   selection.audio = {
