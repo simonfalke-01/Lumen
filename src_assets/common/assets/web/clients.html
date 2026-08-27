@@ -73,14 +73,15 @@
               </div>
             </div>
           </div>
-          <fieldset class="mt-4">
+          <fieldset class="mt-4" :aria-busy="permissionPolicyLoading.toString()">
             <legend class="h6">{{ $t('clients.permissions') }}</legend>
             <div class="v3-permissions">
               <div v-for="permission in permissionOptions" :key="permission.bit" class="form-check">
                 <input :id="'invitePermission' + permission.bit" class="form-check-input" type="checkbox"
                        :checked="hasPermission(invitationPermissions, permission.bit)"
-                       :disabled="permission.required || !hasPermission(allowedPermissions, permission.bit)"
-                       @change="toggleInvitationPermission(permission.bit)" />
+                       :disabled="invitationPermissionDisabled(permission)"
+                       aria-describedby="v3PermissionPolicyStatus"
+                       @change="setInvitationPermission(permission.bit, $event.target.checked)" />
                 <label class="form-check-label" :for="'invitePermission' + permission.bit">
                   {{ $t(permission.label) }}
                 </label>
@@ -88,13 +89,27 @@
             </div>
           </fieldset>
           <div class="mt-4 d-flex align-items-center gap-3">
-            <button class="btn btn-primary" type="submit" :disabled="invitationBusy || !hostname">
+            <button class="btn btn-primary" type="submit"
+                    :disabled="invitationBusy || permissionPolicyLoading || !!permissionPolicyError || !hostname">
               <qr-code :size="18" class="icon"></qr-code>
               {{ invitationBusy ? $t('_common.loading') : $t('clients.issue_invitation') }}
             </button>
             <span v-if="invitationError" class="text-danger" role="alert">{{ invitationError }}</span>
           </div>
         </form>
+        <div id="v3PermissionPolicyStatus" class="form-text mt-3" aria-live="polite">
+          <span v-if="permissionPolicyLoading">{{ $t('clients.permission_policy_loading') }}</span>
+          <span v-else-if="permissionPolicyError" class="text-danger">
+            {{ $t('clients.permission_policy_unavailable') }}
+          </span>
+          <span v-else-if="invitation && invitationError" class="text-danger" role="alert">
+            {{ invitationError }}
+          </span>
+          <span v-else-if="permissionPolicyRestricted">
+            {{ $t('clients.permission_policy_restricted') }}
+            <a href="./config.html">{{ $t('clients.permission_policy_configure') }}</a>
+          </span>
+        </div>
       </div>
     </section>
 
@@ -110,6 +125,7 @@
         </button>
       </div>
 
+      <div v-if="clientActionError" class="alert alert-danger" role="alert">{{ clientActionError }}</div>
       <div v-if="clientsLoading" class="card"><div class="card-body py-5 text-center text-body-secondary">{{ $t('_common.loading') }}</div></div>
       <div v-else-if="clientsError" class="alert alert-danger" role="alert">{{ clientsError }}</div>
       <div v-else-if="clients.length === 0" class="card"><div class="card-body py-5 text-center text-body-secondary">{{ $t('clients.empty') }}</div></div>
@@ -134,8 +150,9 @@
                   <div v-for="permission in permissionOptions" :key="permission.bit" class="form-check">
                     <input :id="client.clientId + permission.bit" class="form-check-input" type="checkbox"
                            :checked="hasPermission(client.permissions, permission.bit)"
-                           :disabled="client.pending"
-                           @change="toggleClientPermission(client, permission.bit)" />
+                           :disabled="client.pending || clientPermissionDisabled(client, permission)"
+                           aria-describedby="v3PermissionPolicyStatus"
+                           @change="setClientPermission(client, permission.bit, $event.target.checked)" />
                     <label class="form-check-label small" :for="client.clientId + permission.bit">
                       {{ $t(permission.label) }}
                     </label>
@@ -175,6 +192,14 @@
   import { initApp } from './init'
   import Navbar from './Navbar.vue'
   import { apiFetch } from './fetch_utils'
+  import {
+    hasProtocolV3Permission,
+    normalizeInvitationPermissionMask,
+    normalizeProtocolV3PermissionMask,
+    PROTOCOL_V3_DEFINED_PERMISSION_MASK,
+    PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
+    setProtocolV3Permission,
+  } from './protocol_v3_permissions'
   import { drawInvitationQr } from './qr_v3'
   import { Copy, QrCode, RefreshCw, Trash2 } from '@lucide/vue'
 
@@ -194,15 +219,18 @@
         permissionOptions,
         hostname: window.location.hostname || '',
         hostnameIsIP: /^[\d.:]+$/.test(window.location.hostname),
-        invitationPermissions: 0x17,
-        allowedPermissions: 0x17,
+        invitationPermissions: PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
+        allowedPermissions: null,
         invitation: null,
         invitationBusy: false,
         invitationError: '',
+        permissionPolicyLoading: true,
+        permissionPolicyError: '',
         copied: false,
         clients: [],
         clientsLoading: true,
         clientsError: '',
+        clientActionError: '',
         pendingRevokeId: null,
       }
     },
@@ -210,26 +238,67 @@
       this.loadInvitation()
       this.loadClients()
     },
+    computed: {
+      permissionPolicyRestricted() {
+        return this.allowedPermissions !== null &&
+          this.allowedPermissions !== PROTOCOL_V3_DEFINED_PERMISSION_MASK
+      },
+    },
     methods: {
-      hasPermission(mask, bit) { return (Number(mask) & (1 << bit)) !== 0 },
-      toggleInvitationPermission(bit) { this.invitationPermissions ^= 1 << bit },
+      hasPermission: hasProtocolV3Permission,
+      invitationPermissionDisabled(permission) {
+        return permission.required || this.permissionPolicyLoading || !!this.permissionPolicyError ||
+          !hasProtocolV3Permission(this.allowedPermissions, permission.bit)
+      },
+      clientPermissionDisabled(client, permission) {
+        if (this.permissionPolicyLoading || this.permissionPolicyError) return true
+        return !hasProtocolV3Permission(client.permissions, permission.bit) &&
+          !hasProtocolV3Permission(this.allowedPermissions, permission.bit)
+      },
+      setInvitationPermission(bit, enabled) {
+        const updated = setProtocolV3Permission(
+          this.invitationPermissions,
+          bit,
+          enabled,
+          PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
+        )
+        this.invitationPermissions = updated & (this.allowedPermissions ?? 0)
+      },
       async json(url, options) {
         const response = await apiFetch(url, options)
-        if (!response.ok) throw new Error(this.$t('clients.request_failed'))
+        if (!response.ok) {
+          if (response.status === 401 || response.status === 403) {
+            throw new Error(this.$t('clients.admin_unauthorized'))
+          }
+          throw new Error(this.$t('clients.request_failed'))
+        }
         return response.json()
       },
       async loadInvitation() {
+        this.permissionPolicyLoading = true
+        this.permissionPolicyError = ''
+        this.invitationError = ''
         try {
           const result = await this.json('./api/protocol-v3/invitation')
-          this.allowedPermissions = Number(result.approvedPermissions || 0x17)
+          const allowedPermissions = normalizeProtocolV3PermissionMask(result.approvedPermissions)
+          if (allowedPermissions === null ||
+              (allowedPermissions & PROTOCOL_V3_REQUIRED_PERMISSION_MASK) !== PROTOCOL_V3_REQUIRED_PERMISSION_MASK) {
+            throw new Error(this.$t('clients.permission_policy_unavailable'))
+          }
+          this.allowedPermissions = allowedPermissions
+          this.invitationPermissions = normalizeInvitationPermissionMask(this.invitationPermissions)
           this.invitationPermissions &= this.allowedPermissions
           this.invitation = result.status ? result.invitation : null
           if (this.invitation) await nextTick(() => drawInvitationQr(this.$refs.qrCanvas, this.invitation))
         } catch (error) {
-          this.invitationError = error.message
+          this.allowedPermissions = null
+          this.permissionPolicyError = error.message
+        } finally {
+          this.permissionPolicyLoading = false
         }
       },
       async issueInvitation() {
+        if (this.permissionPolicyLoading || this.permissionPolicyError || this.allowedPermissions === null) return
         this.invitationBusy = true
         this.invitationError = ''
         try {
@@ -251,6 +320,8 @@
           await this.json('./api/protocol-v3/invitation', { method: 'DELETE' })
           this.invitation = null
           this.copied = false
+        } catch (error) {
+          this.invitationError = error.message
         } finally {
           this.invitationBusy = false
         }
@@ -273,24 +344,32 @@
         }
       },
       async updateClient(client, patch) {
+        const previous = Object.fromEntries(Object.keys(patch).map(key => [key, client[key]]))
+        Object.assign(client, patch)
         client.pending = true
+        this.clientActionError = ''
         try {
           const result = await this.json('./api/protocol-v3/clients', {
             method: 'PATCH', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ clientId: client.clientId, ...patch }),
           })
           if (!result.status) throw new Error(this.$t('clients.request_failed'))
-          Object.assign(client, patch)
         } catch (error) {
-          this.clientsError = error.message
+          Object.assign(client, previous)
+          this.clientActionError = error.message
         } finally {
           client.pending = false
         }
       },
       setClientEnabled(client, enabled) { return this.updateClient(client, { enabled }) },
-      toggleClientPermission(client, bit) { return this.updateClient(client, { permissions: Number(client.permissions) ^ (1 << bit) }) },
+      setClientPermission(client, bit, enabled) {
+        if (this.clientPermissionDisabled(client, { bit })) return
+        const permissions = setProtocolV3Permission(client.permissions, bit, enabled)
+        return this.updateClient(client, { permissions })
+      },
       async revokeClient(client) {
         client.pending = true
+        this.clientActionError = ''
         try {
           const result = await this.json('./api/protocol-v3/clients', {
             method: 'DELETE', headers: { 'Content-Type': 'application/json' },
@@ -300,7 +379,7 @@
           this.clients = this.clients.filter(item => item.clientId !== client.clientId)
           this.pendingRevokeId = null
         } catch (error) {
-          this.clientsError = error.message
+          this.clientActionError = error.message
           client.pending = false
         }
       },

@@ -5,6 +5,12 @@ import {
   TriangleAlert,
 } from '@lucide/vue'
 import Checkbox from "../../Checkbox.vue";
+import {
+  hasProtocolV3Permission,
+  normalizeInvitationPermissionMask,
+  PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
+  setProtocolV3Permission,
+} from '../../protocol_v3_permissions'
 
 const props = defineProps([
   'platform',
@@ -15,11 +21,22 @@ const defaultMoonlightPort = 47989
 
 const config = ref(props.config)
 const effectivePort = computed(() => +config.value?.port ?? defaultMoonlightPort)
-const protocolV3Permissions = computed(() => Number(config.value?.protocol_v3_pairing_permissions ?? 0x17) | 0x17)
-const protocolV3PermissionEnabled = bit => (protocolV3Permissions.value & (1 << bit)) !== 0
-const toggleProtocolV3Permission = bit => {
-  config.value.protocol_v3_pairing_permissions = protocolV3Permissions.value ^ (1 << bit)
-}
+const protocolV3Permissions = computed(() =>
+  normalizeInvitationPermissionMask(config.value?.protocol_v3_pairing_permissions)
+)
+const protocolV3PermissionModel = bit => computed({
+  get: () => hasProtocolV3Permission(protocolV3Permissions.value, bit),
+  set: enabled => {
+    config.value.protocol_v3_pairing_permissions = setProtocolV3Permission(
+      protocolV3Permissions.value,
+      bit,
+      enabled,
+      PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
+    )
+  },
+})
+const protocolV3MicrophonePermission = protocolV3PermissionModel(3)
+const protocolV3QuitPermission = protocolV3PermissionModel(5)
 </script>
 
 <template>
@@ -224,19 +241,19 @@ const toggleProtocolV3Permission = bit => {
       <legend class="h6">{{ $t('config.protocol_v3_optional_permissions') }}</legend>
       <div class="form-check">
         <input id="protocol_v3_permission_microphone" class="form-check-input" type="checkbox"
-               :checked="protocolV3PermissionEnabled(3)" @change="toggleProtocolV3Permission(3)" />
+               v-model="protocolV3MicrophonePermission" aria-describedby="protocol-v3-permission-help" />
         <label for="protocol_v3_permission_microphone" class="form-check-label">
           {{ $t('config.protocol_v3_permission_microphone') }}
         </label>
       </div>
       <div class="form-check mt-2">
         <input id="protocol_v3_permission_quit" class="form-check-input" type="checkbox"
-               :checked="protocolV3PermissionEnabled(5)" @change="toggleProtocolV3Permission(5)" />
+               v-model="protocolV3QuitPermission" aria-describedby="protocol-v3-permission-help" />
         <label for="protocol_v3_permission_quit" class="form-check-label">
           {{ $t('config.protocol_v3_permission_quit') }}
         </label>
       </div>
-      <div class="form-text">{{ $t('config.protocol_v3_optional_permissions_desc') }}</div>
+      <div id="protocol-v3-permission-help" class="form-text">{{ $t('config.protocol_v3_optional_permissions_desc') }}</div>
     </fieldset>
 
   </div>

@@ -108,6 +108,7 @@
   "clients": {
     "access": "Access",
     "actions": "Actions",
+    "admin_unauthorized": "This session is not authorized to administer protocol-v3 clients.",
     "client": "Client",
     "confirm_revoke": "Confirm revoke",
     "copied": "Copied",
@@ -128,6 +129,10 @@
     "permission_browse": "Browse apps",
     "permission_input": "Input",
     "permission_microphone": "Microphone",
+    "permission_policy_configure": "Open Network configuration.",
+    "permission_policy_loading": "Loading the host's effective permission policy…",
+    "permission_policy_restricted": "Microphone or application quit cannot be granted until the host approves it in Network configuration and the configuration is applied.",
+    "permission_policy_unavailable": "The effective permission policy is unavailable. Permission controls remain disabled to avoid granting an unverified state.",
     "permission_quit": "Quit apps",
     "permission_start": "Start streams",
     "permission_stop": "Stop streams",
