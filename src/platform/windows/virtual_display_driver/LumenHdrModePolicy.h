@@ -12,6 +12,23 @@
 #include <cstdint>
 
 namespace lumen::vdd::hdr {
+  /** Return the exact driver capability bitmap for the available runtime seams. */
+  [[nodiscard]] constexpr std::uint32_t driver_capability_flags(
+    const bool hdr_runtime_available,
+    const bool render_adapter_preference_available
+  ) noexcept {
+    auto flags = LUMEN_VDD_CAP_DYNAMIC_MODES | LUMEN_VDD_CAP_SDR8 | LUMEN_VDD_CAP_DIRECT_FRAME_V1 |
+                 LUMEN_VDD_CAP_LOSSLESS | LUMEN_VDD_CAP_FRAME_METADATA_V2 |
+                 LUMEN_VDD_CAP_COLOR_TRANSFORM_V1;
+    if (hdr_runtime_available) {
+      flags |= LUMEN_VDD_CAP_HDR10 | LUMEN_VDD_CAP_10BIT | LUMEN_VDD_CAP_DIRECT_FRAME_FP16;
+    }
+    if (render_adapter_preference_available) {
+      flags |= LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE;
+    }
+    return flags;
+  }
+
   /** Standards-valid EDID 1.4 plus CTA-861 PQ/BT.2020 data and one 1080p60 baseline timing. */
   inline constexpr std::array<std::uint8_t, 256> edid {
     0x00,

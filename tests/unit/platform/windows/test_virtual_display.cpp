@@ -697,6 +697,30 @@ TEST(VirtualDisplayHdrEdidPolicy, UsesStandardHdr10Bt2020CtaWithoutVendorPayload
   EXPECT_FALSE(lumen::vdd::hdr::contains_vendor_specific_data_block());
 }
 
+TEST(VirtualDisplayCapabilityPolicy, AdvertisesDirectSdrMetadataWithoutHdrRuntime) {
+  constexpr auto base_flags = LUMEN_VDD_CAP_DYNAMIC_MODES | LUMEN_VDD_CAP_SDR8 |
+                              LUMEN_VDD_CAP_DIRECT_FRAME_V1 | LUMEN_VDD_CAP_LOSSLESS |
+                              LUMEN_VDD_CAP_FRAME_METADATA_V2 | LUMEN_VDD_CAP_COLOR_TRANSFORM_V1;
+  const auto flags = lumen::vdd::hdr::driver_capability_flags(false, false);
+
+  EXPECT_EQ(flags, base_flags);
+  EXPECT_EQ(flags & (LUMEN_VDD_CAP_HDR10 | LUMEN_VDD_CAP_10BIT | LUMEN_VDD_CAP_DIRECT_FRAME_FP16), 0U);
+  EXPECT_EQ(flags & LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE, 0U);
+}
+
+TEST(VirtualDisplayCapabilityPolicy, AddsHdrAndRenderPreferenceIndependently) {
+  constexpr auto hdr_flags = LUMEN_VDD_CAP_HDR10 | LUMEN_VDD_CAP_10BIT | LUMEN_VDD_CAP_DIRECT_FRAME_FP16;
+  const auto hdr_only = lumen::vdd::hdr::driver_capability_flags(true, false);
+  const auto preference_only = lumen::vdd::hdr::driver_capability_flags(false, true);
+
+  EXPECT_EQ(hdr_only & hdr_flags, hdr_flags);
+  EXPECT_EQ(hdr_only & LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE, 0U);
+  EXPECT_EQ(preference_only & hdr_flags, 0U);
+  EXPECT_NE(preference_only & LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE, 0U);
+  EXPECT_NE(hdr_only & LUMEN_VDD_CAP_FRAME_METADATA_V2, 0U);
+  EXPECT_NE(preference_only & LUMEN_VDD_CAP_COLOR_TRANSFORM_V1, 0U);
+}
+
 TEST(VirtualDisplayModePolicy, HandlesLargeReducedDenominatorsWithoutOverflow) {
   LUMEN_VDD_MODE mode {
     LUMEN_VDD_MAX_WIDTH,

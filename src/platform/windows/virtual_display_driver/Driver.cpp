@@ -1408,14 +1408,10 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         if (output == nullptr) {
           break;
         }
-        const auto capability_flags =
-          LUMEN_VDD_CAP_DYNAMIC_MODES | LUMEN_VDD_CAP_SDR8 | LUMEN_VDD_CAP_DIRECT_FRAME_V1 |
-          LUMEN_VDD_CAP_LOSSLESS |
-          (IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter) ? LUMEN_VDD_CAP_RENDER_ADAPTER_PREFERENCE : 0U) |
-          (hdr_runtime_available() ?
-             LUMEN_VDD_CAP_HDR10 | LUMEN_VDD_CAP_10BIT | LUMEN_VDD_CAP_DIRECT_FRAME_FP16 |
-               LUMEN_VDD_CAP_FRAME_METADATA_V2 | LUMEN_VDD_CAP_COLOR_TRANSFORM_V1 :
-             0U);
+        const auto capability_flags = lumen::vdd::hdr::driver_capability_flags(
+          hdr_runtime_available(),
+          IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)
+        );
         *output = {
           LUMEN_VDD_ABI_VERSION,
           capability_flags,
