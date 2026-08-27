@@ -129,6 +129,7 @@
     "paired_clients_desc": "Permission changes and revocation immediately close that client's authenticated connections.",
     "permission_browse": "Browse apps",
     "permission_input": "Input",
+    "permission_mask_required": "A client must keep at least one permission. Enable another permission before clearing this one.",
     "permission_microphone": "Microphone",
     "permission_policy_configure": "Open Network configuration.",
     "permission_policy_loading": "Loading the host's effective permission policy…",

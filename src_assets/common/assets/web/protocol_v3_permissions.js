@@ -14,7 +14,8 @@ export function normalizeProtocolV3PermissionMask(value) {
   if (value === null || value === undefined || value === '') return null
   const mask = Number(value)
   if (!Number.isSafeInteger(mask) || mask < 0) return null
-  return mask & PROTOCOL_V3_DEFINED_PERMISSION_MASK
+  if (mask > PROTOCOL_V3_DEFINED_PERMISSION_MASK) return null
+  return mask
 }
 
 /**

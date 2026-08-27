@@ -6,6 +6,7 @@ import {
   isCurrentClientRefresh,
   normalizeProtocolV3Client,
   persistOptimisticClientPatch,
+  protocolV3AdminErrorKey,
   revokeProtocolV3Invitation,
 } from '../../src_assets/common/assets/web/protocol_v3_client_state.js';
 
@@ -22,15 +23,26 @@ test('normalizes client API masks and fails closed on invalid permissions', () =
     permissionsValid: false,
     pending: false,
   });
+  assert.equal(normalizeProtocolV3Client({ permissions: 0xff }).permissionsValid, false);
+  assert.equal(normalizeProtocolV3Client({ permissions: 0x40 }).permissionsValid, false);
+  assert.equal(normalizeProtocolV3Client({ permissions: 0 }).permissionsValid, false);
 });
 
 test('atomically clamps persisted grants when the host ceiling is lowered', () => {
-  assert.equal(buildClientPermissionUpdate(0x3f, 0x17, 3, false), 0x17);
-  assert.equal(buildClientPermissionUpdate(0x3f, 0x17, 5, false), 0x17);
-  assert.equal(buildClientPermissionUpdate(0x17, 0x1f, 3, true), 0x1f);
-  assert.equal(buildClientPermissionUpdate(0x17, 0x17, 3, true), null);
-  assert.equal(buildClientPermissionUpdate(null, 0x3f, 3, false), null);
-  assert.equal(buildClientPermissionUpdate(0x3f, undefined, 3, false), null);
+  assert.deepEqual(buildClientPermissionUpdate(0x3f, 0x17, 3, false), { permissions: 0x17, error: null });
+  assert.deepEqual(buildClientPermissionUpdate(0x3f, 0x17, 5, false), { permissions: 0x17, error: null });
+  assert.deepEqual(buildClientPermissionUpdate(0x17, 0x1f, 3, true), { permissions: 0x1f, error: null });
+  assert.deepEqual(buildClientPermissionUpdate(0x17, 0x17, 3, true), { permissions: null, error: 'unauthorized' });
+  assert.deepEqual(buildClientPermissionUpdate(null, 0x3f, 3, false), { permissions: null, error: 'invalid' });
+  assert.deepEqual(buildClientPermissionUpdate(0x3f, undefined, 3, false), { permissions: null, error: 'invalid' });
+  assert.deepEqual(buildClientPermissionUpdate(0x01, 0x17, 0, false), { permissions: null, error: 'empty' });
+  assert.deepEqual(buildClientPermissionUpdate(0x08, 0x17, 3, false), { permissions: null, error: 'empty' });
+});
+
+test('maps both authorization statuses to the specific localized error key', () => {
+  assert.equal(protocolV3AdminErrorKey(401), 'clients.admin_unauthorized');
+  assert.equal(protocolV3AdminErrorKey(403), 'clients.admin_unauthorized');
+  assert.equal(protocolV3AdminErrorKey(500), 'clients.request_failed');
 });
 
 test('invitation DELETE requires explicit status true before callers clear state', async () => {

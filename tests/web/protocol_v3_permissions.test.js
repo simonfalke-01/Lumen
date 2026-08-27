@@ -12,7 +12,8 @@ import {
 
 test('normalizes API and configuration permission masks to defined bits', () => {
   assert.equal(normalizeProtocolV3PermissionMask('63'), PROTOCOL_V3_DEFINED_PERMISSION_MASK);
-  assert.equal(normalizeProtocolV3PermissionMask(255), PROTOCOL_V3_DEFINED_PERMISSION_MASK);
+  assert.equal(normalizeProtocolV3PermissionMask(0xff), null);
+  assert.equal(normalizeProtocolV3PermissionMask(0x40), null);
   assert.equal(normalizeProtocolV3PermissionMask(null), null);
   assert.equal(normalizeProtocolV3PermissionMask(undefined), null);
   assert.equal(normalizeProtocolV3PermissionMask(''), null);
@@ -46,5 +47,5 @@ test('sets optional permissions immediately while preserving required bits', () 
     PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
   );
   assert.equal(setProtocolV3Permission('invalid', 5, true), null);
-  assert.equal(setProtocolV3Permission(0xff, 5, false), 0x1f);
+  assert.equal(setProtocolV3Permission(0xff, 5, false), null);
 });

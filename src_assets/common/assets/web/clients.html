@@ -100,7 +100,7 @@
         <div id="v3PermissionPolicyStatus" class="form-text mt-3" aria-live="polite">
           <span v-if="permissionPolicyLoading">{{ $t('clients.permission_policy_loading') }}</span>
           <span v-else-if="permissionPolicyError" class="text-danger">
-            {{ $t('clients.permission_policy_unavailable') }}
+            {{ permissionPolicyError }}
           </span>
           <span v-else-if="invitation && invitationError" class="text-danger" role="alert">
             {{ invitationError }}
@@ -203,6 +203,7 @@
     isCurrentClientRefresh,
     normalizeProtocolV3Client,
     persistOptimisticClientPatch,
+    protocolV3AdminErrorKey,
     revokeProtocolV3Invitation,
   } from './protocol_v3_client_state'
   import {
@@ -284,10 +285,7 @@
       async json(url, options) {
         const response = await apiFetch(url, options)
         if (!response.ok) {
-          if (response.status === 401 || response.status === 403) {
-            throw new Error(this.$t('clients.admin_unauthorized'))
-          }
-          throw new Error(this.$t('clients.request_failed'))
+          throw new Error(this.$t(protocolV3AdminErrorKey(response.status)))
         }
         return response.json()
       },
@@ -387,12 +385,14 @@
       setClientEnabled(client, enabled) { return this.updateClient(client, { enabled }) },
       setClientPermission(client, bit, enabled) {
         if (this.clientPermissionDisabled(client, { bit })) return
-        const permissions = buildClientPermissionUpdate(client.permissions, this.allowedPermissions, bit, enabled)
-        if (permissions === null) {
-          this.clientActionError = this.$t('clients.permission_policy_unavailable')
+        const update = buildClientPermissionUpdate(client.permissions, this.allowedPermissions, bit, enabled)
+        if (update.error) {
+          this.clientActionError = this.$t(
+            update.error === 'empty' ? 'clients.permission_mask_required' : 'clients.permission_policy_unavailable'
+          )
           return
         }
-        return this.updateClient(client, { permissions })
+        return this.updateClient(client, { permissions: update.permissions })
       },
       async revokeClient(client) {
         this.clientMutationRevision += 1

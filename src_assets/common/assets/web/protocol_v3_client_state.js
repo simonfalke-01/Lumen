@@ -14,7 +14,7 @@ export function normalizeProtocolV3Client(client) {
   return {
     ...client,
     permissions: permissions ?? 0,
-    permissionsValid: permissions !== null,
+    permissionsValid: permissions !== null && permissions !== 0,
     pending: false,
   }
 }
@@ -29,14 +29,26 @@ export function normalizeProtocolV3Client(client) {
  * @param {unknown} allowedPermissions Effective host permission ceiling.
  * @param {number} bit Zero-based permission bit being changed.
  * @param {boolean} enabled Desired permission state.
- * @returns {number|null} Bounded outgoing mask, or `null` when unauthorized or invalid.
+ * @returns {{permissions: number|null, error: string|null}} Bounded update result.
  */
 export function buildClientPermissionUpdate(currentPermissions, allowedPermissions, bit, enabled) {
   const current = normalizeProtocolV3PermissionMask(currentPermissions)
   const allowed = normalizeProtocolV3PermissionMask(allowedPermissions)
-  if (current === null || allowed === null) return null
-  if (enabled && (allowed & (1 << bit)) === 0) return null
-  return setProtocolV3Permission(current & allowed, bit, enabled)
+  if (current === null || allowed === null) return { permissions: null, error: 'invalid' }
+  if (enabled && (allowed & (1 << bit)) === 0) return { permissions: null, error: 'unauthorized' }
+  const permissions = setProtocolV3Permission(current & allowed, bit, enabled)
+  if (permissions === 0) return { permissions: null, error: 'empty' }
+  return { permissions, error: null }
+}
+
+/**
+ * Select the localized admin API error key for an HTTP status.
+ *
+ * @param {number} status HTTP response status.
+ * @returns {string} Translation key for the visible error.
+ */
+export function protocolV3AdminErrorKey(status) {
+  return status === 401 || status === 403 ? 'clients.admin_unauthorized' : 'clients.request_failed'
 }
 
 /**

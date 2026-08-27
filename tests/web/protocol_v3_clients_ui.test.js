@@ -47,9 +47,12 @@ test('permission controls model effective loading, error, and authorization stat
   assert.match(clientsPage, /permissionsValid/);
   assert.match(clientsPage, /role="status"/);
   assert.match(clientsPage, /clientMutationPending/);
-  assert.match(clientsPage, /response\.status === 401 \|\| response\.status === 403/);
+  assert.match(clientsPage, /protocolV3AdminErrorKey\(response\.status\)/);
+  assert.match(clientsPage, /\{\{ permissionPolicyError \}\}/);
   assert.doesNotMatch(clientsPage, /approvedPermissions \|\| 0x17/);
   assert.match(englishLocale.clients.permission_policy_unavailable, /remain disabled/);
+  assert.match(englishLocale.clients.admin_unauthorized, /authenticated local-network administrator/);
+  assert.match(englishLocale.clients.permission_mask_required, /keep at least one permission/);
 });
 
 test('permission mutations are immediate, rollback-safe, and preserve host policy', () => {
