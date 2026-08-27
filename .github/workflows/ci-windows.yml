@@ -45,11 +45,11 @@ on:
         required: false
         type: string
       artifact_run_id:
-        description: Existing successful run ID; skips build/bootstrap and only validates its MSI
+        description: Existing successful full-profile run ID; skips build/bootstrap and validates its MSI
         required: false
         type: string
       artifact_name:
-        description: Artifact name in artifact_run_id (supports validation of older runs)
+        description: Full-profile artifact name in artifact_run_id
         required: false
         default: Lumen-Windows-AMD64
         type: string
@@ -206,7 +206,7 @@ jobs:
           }
 
       - name: Test full-profile source provenance
-        shell: powershell
+        shell: pwsh
         run: .\tests\packaging\test-full-profile-source-provenance.ps1
 
       - name: Cache CMake dependency tree
@@ -302,6 +302,107 @@ jobs:
           if ($toolsetProps.Count -eq 0) {
             throw "WDK MSBuild toolset is not registered for x64: $toolsetPattern"
           }
+
+      - name: Cache project-local WDK validation tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/lumen-wdk-nuget
+          key: windows-wdk-validation-nuget-10.0.26100.1-v1
+
+      - name: Prepare project-local WDK validation tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $installedApiValidator = Get-ChildItem $kitsRoot `
+            -Recurse -File -Filter ApiValidator.exe -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match '\\x64\\(?:ApiValidator\\)?ApiValidator\.exe$'
+            } | Sort-Object FullName -Descending | Select-Object -First 1
+          $installedUniversalDdis = Get-ChildItem $kitsRoot `
+            -Recurse -File -Filter UniversalDDIs.xml -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match '\\universalDDIs\\x64\\UniversalDDIs\.xml$'
+            } | Sort-Object FullName -Descending | Select-Object -First 1
+
+          $installedRequiredPaths = @()
+          if ($installedApiValidator -and $installedUniversalDdis) {
+            $installedApiValidatorBinRoot = $installedApiValidator.Directory.FullName
+            $installedUniversalDdisRoot = $installedUniversalDdis.Directory.FullName
+            $installedRequiredPaths = @(
+              (Join-Path $installedApiValidatorBinRoot 'apivalidator.exe'),
+              (Join-Path $installedApiValidatorBinRoot 'aitstatic.exe'),
+              (Join-Path $installedApiValidatorBinRoot 'microsoft.kits.drivers.apivalidator.dll'),
+              (Join-Path $installedApiValidatorBinRoot 'BinaryExclusionlist.xml'),
+              (Join-Path $installedUniversalDdisRoot 'UniversalDDIs.xml'),
+              (Join-Path $installedUniversalDdisRoot 'ModuleWhitelist.xml')
+            )
+          }
+          $installedMissingPaths = @($installedRequiredPaths | Where-Object {
+              -not (Test-Path -LiteralPath $_ -PathType Leaf)
+            })
+
+          if ($installedRequiredPaths.Count -eq 6 -and $installedMissingPaths.Count -eq 0) {
+            $apiValidatorBinRoot = $installedApiValidatorBinRoot
+            $universalDdisRoot = $installedUniversalDdisRoot
+            Write-Host 'Using validation tools from the installed Windows WDK.'
+          } else {
+            $root = Join-Path $env:RUNNER_TEMP 'lumen-wdk-nuget'
+            $packagePath = Join-Path $root 'Microsoft.Windows.WDK.x64.10.0.26100.1.nupkg'
+            $archivePath = Join-Path $root 'Microsoft.Windows.WDK.x64.10.0.26100.1.zip'
+            $payloadRoot = Join-Path $root 'package'
+            New-Item -ItemType Directory -Path $root -Force | Out-Null
+            if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+              Invoke-WebRequest `
+                -UseBasicParsing `
+                -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/10.0.26100.1/microsoft.windows.wdk.x64.10.0.26100.1.nupkg' `
+                -OutFile $packagePath
+            }
+            $expectedPackageBytes = 110015300
+            $expectedPackageSha256 = '247B2919AE451F65BA5F1CD51C7C39730FB0FC383D607F3E8AB317FDDC8A8239'
+            $expectedPackageSha512 = '5aHxX9Jh7tv9wqfXR2taMxP0LOwz1t/2UwAx70Z3uyKlkkYmNOxCTQ3rod1mShsJJ63e6Nmq/53gPJkcLOQIAg=='
+            if ((Get-Item $packagePath).Length -ne $expectedPackageBytes -or
+                (Get-FileHash $packagePath -Algorithm SHA256).Hash -ne $expectedPackageSha256) {
+              throw 'Microsoft.Windows.WDK.x64 10.0.26100.1 package identity mismatch.'
+            }
+            $stream = [IO.File]::OpenRead($packagePath)
+            $sha512 = [Security.Cryptography.SHA512]::Create()
+            try {
+              $actualPackageSha512 = [Convert]::ToBase64String($sha512.ComputeHash($stream))
+            } finally {
+              $sha512.Dispose()
+              $stream.Dispose()
+            }
+            if ($actualPackageSha512 -cne $expectedPackageSha512) {
+              throw 'Microsoft.Windows.WDK.x64 10.0.26100.1 SHA512 mismatch.'
+            }
+
+            $apiValidatorBinRoot = Join-Path $payloadRoot 'c\bin\10.0.26100.0\x64'
+            $universalDdisRoot = Join-Path $payloadRoot 'c\build\10.0.26100.0\universalDDIs\x64'
+            $requiredPaths = @(
+              (Join-Path $apiValidatorBinRoot 'apivalidator.exe'),
+              (Join-Path $apiValidatorBinRoot 'aitstatic.exe'),
+              (Join-Path $apiValidatorBinRoot 'microsoft.kits.drivers.apivalidator.dll'),
+              (Join-Path $apiValidatorBinRoot 'BinaryExclusionlist.xml'),
+              (Join-Path $universalDdisRoot 'UniversalDDIs.xml'),
+              (Join-Path $universalDdisRoot 'ModuleWhitelist.xml')
+            )
+            $missingPaths = @($requiredPaths | Where-Object {
+                -not (Test-Path -LiteralPath $_ -PathType Leaf)
+              })
+            if ($missingPaths.Count -ne 0) {
+              Remove-Item $payloadRoot -Recurse -Force -ErrorAction SilentlyContinue
+              Copy-Item $packagePath $archivePath -Force
+              Expand-Archive -LiteralPath $archivePath -DestinationPath $payloadRoot -Force
+            }
+            foreach ($path in $requiredPaths) {
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "Microsoft.Windows.WDK.x64 payload is incomplete: $path"
+              }
+            }
+          }
+          "WDK_API_VALIDATOR_BIN_ROOT=$apiValidatorBinRoot" >> $env:GITHUB_ENV
+          "WDK_UNIVERSAL_DDIS_ROOT=$universalDdisRoot" >> $env:GITHUB_ENV
 
       - name: Build Virtual HID driver
         if: inputs.release_tag == ''
@@ -760,6 +861,7 @@ jobs:
         run: uv sync --locked --no-python-downloads --no-install-project
 
       - name: Test release and updater contracts
+        if: github.event_name != 'workflow_dispatch' || inputs.release_tag != ''
         shell: msys2 {0}
         run: |
           export PATH="$(cygpath --unix "$NODEJS_PATH"):$PATH"
@@ -772,22 +874,24 @@ jobs:
             exit 1
           fi
 
-      - name: Restore immutable release sources
-        if: inputs.release_tag != ''
+      - name: Restore exact clean sources
         shell: msys2 {0}
         run: |
           git status --short
           git submodule foreach --recursive 'git reset --hard HEAD'
+          git submodule foreach --recursive 'git clean -dff'
           git reset --hard HEAD
+          git clean -dff
           git diff --quiet --exit-code
           git diff --cached --quiet --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-      - name: Build complete signed Windows release profile
-        if: inputs.release_tag != ''
+      - name: Build complete Windows profile
         shell: pwsh
         env:
           PYTHON_PATH: ${{ steps.setup-python.outputs.python-path }}
           SIGNED_DRIVER_ROOT: ${{ runner.temp }}\lumen-signed-drivers
+          IS_RELEASE: ${{ inputs.release_tag != '' && 'true' || 'false' }}
         run: |
           $ErrorActionPreference = 'Stop'
           $staging = Join-Path $env:RUNNER_TEMP 'lumen-full-profile'
@@ -807,111 +911,55 @@ jobs:
           Copy-Item $nupkg $zip -Force
           Expand-Archive -LiteralPath $zip -DestinationPath $msquic -Force
 
-          & .\scripts\windows\build-full-profile.ps1 `
-            -SourceRoot $env:GITHUB_WORKSPACE `
-            -StagingRoot $staging `
-            -Msys2Root 'C:\msys64' `
-            -MsQuicPackageRoot $msquic `
-            -PythonPath $env:PYTHON_PATH `
-            -DotNetRoot $env:DOTNET_ROOT `
-            -NodeRoot $env:NODEJS_PATH `
-            -SignedDriverRoot $env:SIGNED_DRIVER_ROOT `
-            -BuildVersion $env:LUMEN_BUILD_VERSION
+          if ($env:IS_RELEASE -eq 'true') {
+            & .\scripts\windows\build-full-profile.ps1 `
+              -SourceRoot $env:GITHUB_WORKSPACE `
+              -StagingRoot $staging `
+              -Msys2Root 'C:\msys64' `
+              -MsQuicPackageRoot $msquic `
+              -PythonPath $env:PYTHON_PATH `
+              -DotNetRoot $env:DOTNET_ROOT `
+              -NodeRoot $env:NODEJS_PATH `
+              -WdkApiValidatorBinRoot $env:WDK_API_VALIDATOR_BIN_ROOT `
+              -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
+              -BuildVersion $env:LUMEN_BUILD_VERSION `
+              -BuildOnly `
+              -SignedDriverRoot $env:SIGNED_DRIVER_ROOT
+          } else {
+            & .\scripts\windows\build-full-profile.ps1 `
+              -SourceRoot $env:GITHUB_WORKSPACE `
+              -StagingRoot $staging `
+              -Msys2Root 'C:\msys64' `
+              -MsQuicPackageRoot $msquic `
+              -PythonPath $env:PYTHON_PATH `
+              -DotNetRoot $env:DOTNET_ROOT `
+              -NodeRoot $env:NODEJS_PATH `
+              -WdkApiValidatorBinRoot $env:WDK_API_VALIDATOR_BIN_ROOT `
+              -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
+              -BuildVersion $env:LUMEN_BUILD_VERSION `
+              -BuildOnly
+            & .\scripts\windows\sign-full-profile-local-test.ps1 `
+              -StagingRoot $staging `
+              -OutputRoot $env:SIGNED_DRIVER_ROOT
+            & .\scripts\windows\build-full-profile.ps1 `
+              -SourceRoot $env:GITHUB_WORKSPACE `
+              -StagingRoot $staging `
+              -Msys2Root 'C:\msys64' `
+              -MsQuicPackageRoot $msquic `
+              -PythonPath $env:PYTHON_PATH `
+              -DotNetRoot $env:DOTNET_ROOT `
+              -NodeRoot $env:NODEJS_PATH `
+              -WdkApiValidatorBinRoot $env:WDK_API_VALIDATOR_BIN_ROOT `
+              -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
+              -BuildVersion $env:LUMEN_BUILD_VERSION `
+              -BuildOnly `
+              -UsePreparedDriverSubmission `
+              -SignedDriverRoot $env:SIGNED_DRIVER_ROOT `
+              -AllowTestSignedDrivers
+          }
+
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
           Copy-Item (Join-Path $staging 'artifacts\*') artifacts -Force
-
-      - name: Build Windows
-        if: inputs.release_tag == ''
-        shell: msys2 {0}
-        env:
-          BRANCH: ${{ github.ref_name }}
-          BUILD_VERSION: ${{ needs.validate_version.outputs.build_version }}
-          CLONE_URL: ${{ github.server_url }}/${{ github.repository }}
-          COMMIT: ${{ needs.validate_version.outputs.source_commit }}
-          TAG: ${{ inputs.release_tag }}
-        run: |
-          NODEJS_PATH=$(cygpath "$NODEJS_PATH")
-          export PATH="$PATH:$NODEJS_PATH"
-          DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$DRIVER_PACKAGE_DIR")
-          VMIC_DRIVER_PACKAGE_CMAKE_PATH=$(cygpath -m "$VMIC_DRIVER_PACKAGE_DIR")
-          SCCACHE_CMAKE_PATH=$(cygpath -m "$SCCACHE_PATH")
-
-          VMIC_PACKAGE_ARGS=()
-          if [[ -z "$TAG" ]]; then
-            VMIC_PACKAGE_ARGS+=(
-              -DSUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR="$VMIC_DRIVER_PACKAGE_CMAKE_PATH"
-            )
-          fi
-
-          cmake \
-            -B cmake-build-windows \
-            -G Ninja \
-            -S . \
-            -DBUILD_DOCS=OFF \
-            -DBUILD_TESTS=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER_LAUNCHER="$SCCACHE_CMAKE_PATH" \
-            -DCMAKE_CXX_COMPILER_LAUNCHER="$SCCACHE_CMAKE_PATH" \
-            -DSUNSHINE_ASSETS_DIR=assets \
-            -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR="$DRIVER_PACKAGE_CMAKE_PATH" \
-            -DSUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON \
-            "${VMIC_PACKAGE_ARGS[@]}" \
-            -DSUNSHINE_PUBLISHER_NAME="simonfalke" \
-            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/${GITHUB_REPOSITORY}" \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/${GITHUB_REPOSITORY}/issues"
-          ninja -C cmake-build-windows
-
-      - name: Run targeted Windows tests
-        if: inputs.release_tag == ''
-        shell: msys2 {0}
-        run: |
-          cmake-build-windows/tests/test_sunshine.exe \
-            --gtest_filter='VirtualHidProtocolTest.*:VirtualHidKeyMappingTest.*:VirtualHidGamepadProtocolTest.*:VirtualHidDriverIsolationTest.*:VirtualHidReportQueueTest.*:DynamicGamepad*.*:GamepadRouterTest.*:VirtualHidGamepadTest.*:VirtualHidSessionTest.*:Libvirtualhid*.*:GamepadBackendValues/*.*:*virtual_hid_input_test.*:*virtual_hid_mouse_button_test.*:*send_input_transport_test.*:*send_input_mouse_button_test.*:InputBatchingTest.*:VirtualMicrophone*.*:ClientMicrophone*.*:client_microphone_test.*'
-
-      - name: Package Windows
-        if: inputs.release_tag == ''
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-
-          dump_wix_log() {
-            find ./cpack_artifacts/_CPack_Packages/win64/WIX \
-              -type f -name wix.log \
-              -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \; 2>/dev/null || true
-          }
-          trap dump_wix_log ERR
-
-          mkdir -p artifacts
-          cd cmake-build-windows
-          cpack -G WIX
-          cpack -G ZIP
-
-          mapfile -t msi_files < <(find ./cpack_artifacts -maxdepth 1 -type f -name '*.msi')
-          mapfile -t zip_files < <(find ./cpack_artifacts -maxdepth 1 -type f -name '*.zip')
-          test "${#msi_files[@]}" -eq 1
-          test "${#zip_files[@]}" -eq 1
-          mv \
-            "${msi_files[0]}" \
-            "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-installer.msi"
-          mv \
-            "${zip_files[0]}" \
-            "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-lite.zip"
-
-          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'lumen-vhidctl.exe' | wc -l)" -ge 1
-          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.inf' | wc -l)" -eq 1
-          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.cat' | wc -l)" -eq 1
-          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.dll' | wc -l)" -eq 1
-          test "$(find ./cpack_artifacts/_CPack_Packages/win64/WIX -type f -iname 'LumenVirtualHid.cer' | wc -l)" -eq 1
-          if 7z l "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-lite.zip" | grep -Eiq \
-            'lumen-vhidctl\.exe|drivers[/\\]virtual-hid|lumenvirtualhid\.(inf|cat|dll|cer)'; then
-            echo 'The lite ZIP unexpectedly contains Virtual HID installation files.'
-            exit 1
-          fi
-          if 7z l "../artifacts/Lumen-${LUMEN_BUILD_VERSION}-Windows-AMD64-lite.zip" | grep -Eiq \
-              'lumen-vmicctl\.exe|drivers[/\\]virtual-microphone|lumenvirtualmicrophone\.(inf|cat|sys)'; then
-            echo 'The lite ZIP unexpectedly contains Virtual Microphone installation files.'
-            exit 1
-          fi
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -946,9 +994,7 @@ jobs:
           compression-level: 0
 
   validate_msi:
-    name: >-
-      Windows MSI (${{ matrix.scenario }},
-      ${{ matrix.scenario == 'install-no-vhid' && 'Windows Server 2022' || 'Windows Server 2025' }})
+    name: Windows MSI validation
     needs: build_windows
     if: >-
       always() &&
@@ -966,9 +1012,7 @@ jobs:
             inputs.validation_scenario == 'release' &&
             '["install-no-vhid","install-vdd","driver-reboot","upgrade","legacy-import"]' ||
             (inputs.validation_scenario == '' || inputs.validation_scenario == 'all') &&
-            (inputs.release_tag != '' &&
-              '["install-no-vhid","install-vhid","install-vmic","install-vdd","driver-reboot","upgrade","legacy-import"]' ||
-              '["install-no-vhid","install-vhid","install-vmic","driver-reboot","upgrade","legacy-import"]') ||
+            '["install-no-vhid","install-vhid","install-vmic","install-vdd","driver-reboot","upgrade","legacy-import"]' ||
             format('["{0}"]', inputs.validation_scenario)
           ) }}
     steps:
@@ -988,26 +1032,24 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.artifact_run_id || github.run_id }}
 
-      - name: Download Virtual Microphone driver trust artifact
-        if: matrix.scenario == 'install-vmic'
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3  # v8.0.0
-        with:
-          name: Lumen-Virtual-Microphone-AMD64
-          path: artifacts/vmic-driver
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ inputs.artifact_run_id || github.run_id }}
-
-      - name: Trust Virtual Microphone test certificate
-        if: matrix.scenario == 'install-vmic'
+      - name: Trust local-test full-profile driver certificate
         shell: pwsh
         run: |
-          $certificate = Get-ChildItem artifacts/vmic-driver -Recurse -File -Filter 'LumenVirtualMicrophone.cer'
-          if (@($certificate).Count -ne 1) {
-            throw "Expected exactly one Virtual Microphone test certificate; found $(@($certificate).Count)."
+          $markers = @(Get-ChildItem artifacts -Recurse -File -Filter 'LOCAL-TEST-SIGNED.json')
+          $certificates = @(Get-ChildItem artifacts -Recurse -File -Filter 'local-test-signing.cer')
+          if ($markers.Count -eq 0) {
+            if ($certificates.Count -ne 0) {
+              throw 'A local-test certificate was published without its signing marker.'
+            }
+            'EXPECT_LOCAL_TEST_SIGNED=false' >> $env:GITHUB_ENV
+          } elseif ($markers.Count -eq 1 -and $certificates.Count -eq 1) {
+            $certificate = $certificates[0]
+            Import-Certificate -FilePath $certificate.FullName -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+            Import-Certificate -FilePath $certificate.FullName -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+            'EXPECT_LOCAL_TEST_SIGNED=true' >> $env:GITHUB_ENV
+          } else {
+            throw "Expected one marker and certificate or neither; found $($markers.Count) marker(s) and $($certificates.Count) certificate(s)."
           }
-          Import-Certificate -FilePath $certificate.FullName -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
-          Import-Certificate -FilePath $certificate.FullName -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
 
       - name: Enable Windows audio services for Virtual Microphone
         if: matrix.scenario == 'install-vmic'
@@ -1137,15 +1179,15 @@ jobs:
         env:
           EXPECT_VHID_FEATURE: 'true'
           EXPECT_VMIC_FEATURE: 'true'
-          EXPECT_VDD_FEATURE: ${{ inputs.release_tag != '' && 'true' || 'false' }}
-          EXPECT_MSQUIC: ${{ inputs.release_tag != '' && 'true' || 'false' }}
+          EXPECT_VDD_FEATURE: 'true'
+          EXPECT_MSQUIC: 'true'
         run: ./.github/scripts/validate-windows-msi.ps1
 
       - name: Run ${{ matrix.scenario }} MSI scenario
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          EXPECT_VDD_FEATURE: ${{ inputs.release_tag != '' && 'true' || 'false' }}
+          EXPECT_VDD_FEATURE: 'true'
         run: ./.github/scripts/test-windows-msi.ps1 -Scenario '${{ matrix.scenario }}'
 
       - name: Collect MSI and UMDF diagnostics

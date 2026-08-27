@@ -24,11 +24,67 @@ try {
         "#define LUMEN_VDD_ABI_VERSION 3u`n",
         [Text.UTF8Encoding]::new($false)
     )
+    $productSourcePath = Join-Path $sourceRoot "product-source.txt"
     [IO.File]::WriteAllText(
-        (Join-Path $sourceRoot "product-source.txt"),
+        $productSourcePath,
         "frozen-content",
         [Text.UTF8Encoding]::new($false)
     )
+    $safeLinkPath = Join-Path $sourceRoot "product-source-link.txt"
+    New-Item -ItemType SymbolicLink -Path $safeLinkPath -Target $productSourcePath | Out-Null
+
+    $directoryTargetPath = Join-Path $testRoot "outside-directory"
+    New-Item -ItemType Directory -Path $directoryTargetPath | Out-Null
+    $directoryLinkPath = Join-Path $sourceRoot "directory-link"
+    New-Item -ItemType SymbolicLink -Path $directoryLinkPath -Target $directoryTargetPath | Out-Null
+    $directoryLinkRejected = $false
+    try {
+        Get-FullProfileSourceFiles $sourceRoot | Out-Null
+    } catch {
+        $directoryLinkRejected = $_.Exception.Message -eq
+            "Full-profile source contains a directory reparse point: $directoryLinkPath"
+    }
+    if (-not $directoryLinkRejected) {
+        throw "Source enumeration did not reject a directory symlink."
+    }
+    Remove-Item -LiteralPath $directoryLinkPath -Force
+
+    $missingTargetPath = Join-Path $testRoot "missing-target.txt"
+    $brokenLinkPath = Join-Path $sourceRoot "broken-link.txt"
+    New-Item -ItemType SymbolicLink -Path $brokenLinkPath -Target $missingTargetPath | Out-Null
+    $brokenLinkRejected = $false
+    try {
+        Get-FullProfileSourceFiles $sourceRoot | Out-Null
+    } catch {
+        $brokenLinkRejected = $_.Exception.Message -in @(
+            "Full-profile source contains an unresolvable file reparse point: $brokenLinkPath",
+            "Full-profile source contains a broken file reparse point: $brokenLinkPath"
+        )
+    }
+    if (-not $brokenLinkRejected) {
+        throw "Source enumeration did not reject a dangling file symlink."
+    }
+    Remove-Item -LiteralPath $brokenLinkPath -Force
+
+    $outsideFilePath = Join-Path $testRoot "outside-source.txt"
+    [IO.File]::WriteAllText(
+        $outsideFilePath,
+        "outside-content",
+        [Text.UTF8Encoding]::new($false)
+    )
+    $escapingLinkPath = Join-Path $sourceRoot "escaping-link.txt"
+    New-Item -ItemType SymbolicLink -Path $escapingLinkPath -Target $outsideFilePath | Out-Null
+    $escapingLinkRejected = $false
+    try {
+        Get-FullProfileSourceFiles $sourceRoot | Out-Null
+    } catch {
+        $escapingLinkRejected = $_.Exception.Message -eq
+            "Full-profile source file reparse point escapes SourceRoot: $escapingLinkPath"
+    }
+    if (-not $escapingLinkRejected) {
+        throw "Source enumeration did not reject a file symlink escaping SourceRoot."
+    }
+    Remove-Item -LiteralPath $escapingLinkPath -Force
     $shaderRoot = Join-Path $sourceRoot "src_assets/windows/assets/shaders/directx"
     foreach ($shader in @(
             'convert_yuv420_packed_uv_type0_ps_vdd_color_transform.hlsl',
@@ -71,6 +127,26 @@ try {
         [Text.UTF8Encoding]::new($false)
     )
 
+    $fixtureSourceFiles = @(Get-FullProfileSourceFiles $sourceRoot)
+    $tarListRegressionPath = Join-Path $testRoot "full-profile-files-regression.txt"
+    Write-FullProfileTarList `
+        -Paths ([string[]]$fixtureSourceFiles.RelativePath) `
+        -ListPath $tarListRegressionPath
+    $tarListBytes = [IO.File]::ReadAllBytes($tarListRegressionPath)
+    $tarListText = [Text.UTF8Encoding]::new($false).GetString($tarListBytes)
+    $tarListLines = @($tarListText.Split("`n", [StringSplitOptions]::None))
+    $hasUtf8Bom = $tarListBytes.Length -ge 3 -and
+        $tarListBytes[0] -eq 0xef -and
+        $tarListBytes[1] -eq 0xbb -and
+        $tarListBytes[2] -eq 0xbf
+    if ($hasUtf8Bom -or
+        $tarListBytes -contains 0x0d -or
+        $tarListBytes[-1] -eq 0x0a -or
+        $tarListLines.Count -ne $fixtureSourceFiles.Count -or
+        @($tarListLines | Where-Object { $_ -eq '' }).Count -ne 0) {
+        throw "Full-profile tar list is not exact LF-only UTF-8 without an empty record."
+    }
+
     $sharedSourceFreezeManifestSha256 = 'd' * 64
     & (Join-Path $root "scripts/windows/freeze-full-profile-source.ps1") `
         -SourceRoot $sourceRoot `
@@ -91,6 +167,15 @@ try {
     if ($verifiedContent -cne "frozen-content") {
         throw "Verified build source was read from the mutable source tree."
     }
+    $verifiedLinkedContent = Get-Content `
+        -LiteralPath (Join-Path $verifiedRoot "product-source-link.txt") `
+        -Raw
+    $verifiedLinkedItem = Get-Item -LiteralPath (Join-Path $verifiedRoot "product-source-link.txt")
+    if ($verifiedLinkedContent -cne "frozen-content" -or
+        $verifiedLinkedItem.LinkType -or
+        $verifiedLinkedItem.Length -ne ([Text.UTF8Encoding]::new($false).GetByteCount("frozen-content"))) {
+        throw "Verified source did not safely dereference an internal file symlink."
+    }
     $buildEntryPoint = Join-Path $verifiedRoot "scripts/windows/build-full-profile.ps1"
     if (-not (Test-Path -LiteralPath $buildEntryPoint -PathType Leaf)) {
         throw "Source freeze treated a build-prefixed file as a generated build directory."
@@ -104,7 +189,7 @@ try {
         throw "Source freeze removed a checked-in nested build asset directory."
     }
     if ($provenance.SourceRoot -cne (Resolve-Path -LiteralPath $verifiedRoot).Path -or
-        $provenance.FileCount -ne 12 -or
+        $provenance.FileCount -ne 13 -or
         $provenance.FilesManifestSha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $provenance.ArchiveSha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw "Verified source provenance result is incomplete."

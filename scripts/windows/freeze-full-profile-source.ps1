@@ -46,15 +46,81 @@ $fileManifestPath = Join-Path $OutputDirectory "full-profile-files.json"
 $hashRows | ConvertTo-Json -Depth 4 | Set-Content $fileManifestPath -Encoding UTF8
 
 $listPath = Join-Path $OutputDirectory "full-profile-files.txt"
-[IO.File]::WriteAllLines(
-    $listPath,
-    [string[]]$files.RelativePath,
-    [Text.UTF8Encoding]::new($false)
-)
+Write-FullProfileTarList -Paths ([string[]]$files.RelativePath) -ListPath $listPath
 $archivePath = Join-Path $OutputDirectory "lumen-full-profile-source.tar.gz"
-& tar -czhf $archivePath -C $SourceRoot -T $listPath
-if ($LASTEXITCODE -ne 0) {
-    throw "tar failed with exit code $LASTEXITCODE."
+$tarCommand = Get-Command tar.exe, tar -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($null -eq $tarCommand) {
+    throw 'tar is required for full-profile source freezing.'
+}
+$tarStartInfo = [Diagnostics.ProcessStartInfo]::new()
+$tarStartInfo.FileName = $tarCommand.Source
+$tarStartInfo.UseShellExecute = $false
+$tarStartInfo.RedirectStandardOutput = $true
+$tarStartInfo.RedirectStandardError = $true
+foreach ($argument in @('-czh', '-f', '-', '-C', $SourceRoot, '-T', $listPath)) {
+    $tarStartInfo.ArgumentList.Add($argument)
+}
+$tarProcess = [Diagnostics.Process]::new()
+$tarProcess.StartInfo = $tarStartInfo
+$archiveStream = $null
+$stderrTask = $null
+$tarStarted = $false
+$tarExitCode = $null
+$tarError = $null
+$tarFailure = $null
+try {
+    $archiveStream = [IO.File]::Open(
+        $archivePath,
+        [IO.FileMode]::Create,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    $tarStarted = $tarProcess.Start()
+    if (-not $tarStarted) {
+        throw 'tar did not start.'
+    }
+    $stderrTask = $tarProcess.StandardError.ReadToEndAsync()
+    $tarProcess.StandardOutput.BaseStream.CopyTo($archiveStream)
+    $archiveStream.Flush()
+    $tarProcess.WaitForExit()
+    $tarExitCode = $tarProcess.ExitCode
+    $tarError = $stderrTask.GetAwaiter().GetResult()
+} catch {
+    $tarFailure = $_
+    $tarExitedAfterFailure = $false
+    if ($tarStarted) {
+        try {
+            if (-not $tarProcess.HasExited) {
+                $tarProcess.Kill($true)
+                [void]$tarProcess.WaitForExit(5000)
+            }
+            $tarExitedAfterFailure = $tarProcess.HasExited
+        } catch {
+            # The original archive failure remains authoritative.
+        }
+    }
+    if ($null -ne $stderrTask -and $tarExitedAfterFailure) {
+        try { $tarError = $stderrTask.GetAwaiter().GetResult() } catch {}
+    }
+} finally {
+    if ($null -ne $archiveStream) { $archiveStream.Dispose() }
+    $tarProcess.Dispose()
+}
+if (-not [string]::IsNullOrWhiteSpace([string]$tarError)) {
+    [Console]::Error.Write([string]$tarError)
+}
+if ($null -ne $tarFailure -or $tarExitCode -ne 0) {
+    Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    if ($null -ne $tarFailure) {
+        throw "tar failed while streaming the source archive: $($tarFailure.Exception.Message)"
+    }
+    throw "tar failed with exit code $tarExitCode."
+}
+if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
+    (Get-Item -LiteralPath $archivePath).Length -le 0) {
+    Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    throw 'tar produced an empty source archive.'
 }
 
 $msquicManifestPath = Join-Path $SourceRoot "src/platform/windows/msquic_shim/manifest.json"

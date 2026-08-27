@@ -15,13 +15,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BuildVersion,
 
-    [Parameter(Mandatory = $true)]
     [string]$SharedSourceFreezeManifestPath,
 
-    [Parameter(Mandatory = $true)]
     [string]$Gate6EvidenceRoot,
 
-    [Parameter(Mandatory = $true)]
     [string]$Gate6AssemblyFragmentRoot,
 
     [string]$PythonPath,
@@ -30,9 +27,17 @@ param(
 
     [string]$NodeRoot,
 
+    [string]$WdkApiValidatorBinRoot,
+
+    [string]$WdkUniversalDdisRoot,
+
     [string]$SignedDriverRoot,
 
     [switch]$AllowTestSignedDrivers,
+
+    [switch]$BuildOnly,
+
+    [switch]$UsePreparedDriverSubmission,
 
     [string]$Configuration = "Release"
 )
@@ -60,8 +65,29 @@ $SourceRoot = Resolve-ExistingDirectory $SourceRoot "Source"
 $Msys2Root = Resolve-ExistingDirectory $Msys2Root "MSYS2"
 $MsQuicPackageRoot = Resolve-ExistingDirectory $MsQuicPackageRoot "MsQuic package"
 $StagingRoot = [IO.Path]::GetFullPath($StagingRoot)
-$Gate6EvidenceRoot = [IO.Path]::GetFullPath($Gate6EvidenceRoot)
-$Gate6AssemblyFragmentRoot = [IO.Path]::GetFullPath($Gate6AssemblyFragmentRoot)
+if ($UsePreparedDriverSubmission -and
+    (-not $BuildOnly -or [string]::IsNullOrWhiteSpace($SignedDriverRoot))) {
+    throw '-UsePreparedDriverSubmission requires -BuildOnly and -SignedDriverRoot.'
+}
+if ($BuildOnly) {
+    if (-not [string]::IsNullOrWhiteSpace($SharedSourceFreezeManifestPath) -or
+        -not [string]::IsNullOrWhiteSpace($Gate6EvidenceRoot) -or
+        -not [string]::IsNullOrWhiteSpace($Gate6AssemblyFragmentRoot)) {
+        throw 'Gate6 qualification inputs must not be passed with -BuildOnly.'
+    }
+} else {
+    foreach ($requiredGate6Argument in @(
+            @{ Name = 'SharedSourceFreezeManifestPath'; Value = $SharedSourceFreezeManifestPath },
+            @{ Name = 'Gate6EvidenceRoot'; Value = $Gate6EvidenceRoot },
+            @{ Name = 'Gate6AssemblyFragmentRoot'; Value = $Gate6AssemblyFragmentRoot }
+        )) {
+        if ([string]::IsNullOrWhiteSpace([string]$requiredGate6Argument.Value)) {
+            throw "$($requiredGate6Argument.Name) is required unless -BuildOnly is specified."
+        }
+    }
+    $Gate6EvidenceRoot = [IO.Path]::GetFullPath($Gate6EvidenceRoot)
+    $Gate6AssemblyFragmentRoot = [IO.Path]::GetFullPath($Gate6AssemblyFragmentRoot)
+}
 if ($StagingRoot -eq $SourceRoot -or
     $SourceRoot.StartsWith(
         $StagingRoot + [IO.Path]::DirectorySeparatorChar,
@@ -74,26 +100,29 @@ if ($StagingRoot -eq $SourceRoot -or
     throw "StagingRoot and SourceRoot must be disjoint."
 }
 New-Item -ItemType Directory -Path $StagingRoot -Force | Out-Null
-$runEvidenceRoot = Join-Path $StagingRoot 'gate6-runs'
+$runDirectoryName = if ($BuildOnly) { 'build-runs' } else { 'gate6-runs' }
+$runEvidenceRoot = Join-Path $StagingRoot $runDirectoryName
 if (Test-Path -LiteralPath $runEvidenceRoot) {
     Remove-Item -LiteralPath $runEvidenceRoot -Recurse -Force
 }
 New-Item -ItemType Directory -Path $runEvidenceRoot -Force | Out-Null
 $powerShellExecutable = (Get-Process -Id $PID).Path
 $pendingManifestPath = Join-Path $StagingRoot "full-profile-driver-manifest.json"
-if (Test-Path -LiteralPath $pendingManifestPath) {
+if (-not $UsePreparedDriverSubmission -and (Test-Path -LiteralPath $pendingManifestPath)) {
     Remove-Item -LiteralPath $pendingManifestPath -Force
 }
 
 . (Join-Path $SourceRoot "scripts\windows\full-profile-source-provenance.ps1")
 . (Join-Path $SourceRoot "scripts\windows\gate6-evidence.ps1")
 
-if (-not (Test-FullProfilePathsDisjoint $Gate6EvidenceRoot $SourceRoot) -or
-    -not (Test-FullProfilePathsDisjoint $Gate6EvidenceRoot $StagingRoot) -or
-    -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $SourceRoot) -or
-    -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $StagingRoot) -or
-    -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $Gate6EvidenceRoot)) {
-    throw 'Gate6 evidence and assembly-fragment roots must be mutually disjoint from source and staging/build roots.'
+if (-not $BuildOnly) {
+    if (-not (Test-FullProfilePathsDisjoint $Gate6EvidenceRoot $SourceRoot) -or
+        -not (Test-FullProfilePathsDisjoint $Gate6EvidenceRoot $StagingRoot) -or
+        -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $SourceRoot) -or
+        -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $StagingRoot) -or
+        -not (Test-FullProfilePathsDisjoint $Gate6AssemblyFragmentRoot $Gate6EvidenceRoot)) {
+        throw 'Gate6 evidence and assembly-fragment roots must be mutually disjoint from source and staging/build roots.'
+    }
 }
 
 $gitCommand = Get-Command git.exe, git -CommandType Application -ErrorAction SilentlyContinue |
@@ -116,11 +145,18 @@ if ($LASTEXITCODE -ne 0 -or @($submoduleStatus | Where-Object {
         }).Count -ne 0) {
     throw 'Every recursive Lumen submodule must be initialized at its exact clean gitlink before Gate6 freezing.'
 }
-$sharedSourceFreeze = Assert-Gate6SharedSourceFreezeManifest `
-    -ManifestPath $SharedSourceFreezeManifestPath `
-    -RepositoryName 'Lumen' `
-    -ExpectedCommit $sourceCommit
-$sharedSourceFreezeManifestSha256 = $sharedSourceFreeze.Sha256
+if ($BuildOnly) {
+    # Build-only CI still freezes and verifies exact clean source, but deliberately
+    # does not claim qualification against Umbra's shared SFM/AM evidence chain.
+    $sharedSourceFreeze = $null
+    $sharedSourceFreezeManifestSha256 = '0' * 64
+} else {
+    $sharedSourceFreeze = Assert-Gate6SharedSourceFreezeManifest `
+        -ManifestPath $SharedSourceFreezeManifestPath `
+        -RepositoryName 'Lumen' `
+        -ExpectedCommit $sourceCommit
+    $sharedSourceFreezeManifestSha256 = $sharedSourceFreeze.Sha256
+}
 $gate6Runs = [Collections.Generic.List[object]]::new()
 
 function Invoke-MandatoryGate6Command {
@@ -170,16 +206,41 @@ $inf2Cat = Get-ChildItem (Join-Path $kitsRoot "bin") -Recurse -File -Filter Inf2
 $signTool = Get-ChildItem (Join-Path $kitsRoot "bin") -Recurse -File -Filter signtool.exe |
     Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
     Sort-Object FullName -Descending | Select-Object -First 1
-$apiValidator = Get-ChildItem (Join-Path $kitsRoot 'bin') -Recurse -File -Filter ApiValidator.exe |
-    Where-Object { $_.FullName -match '\\x64\\ApiValidator\.exe$' } |
-    Sort-Object FullName -Descending | Select-Object -First 1
-$universalDdis = Get-ChildItem (Join-Path $kitsRoot 'build\universalDDIs') `
-    -Recurse -File -Filter UniversalDDIs.xml |
-    Where-Object { $_.FullName -match '\\x64\\UniversalDDIs\.xml$' } |
-    Sort-Object FullName -Descending | Select-Object -First 1
-if ($null -eq $infVerif -or $null -eq $inf2Cat -or $null -eq $signTool -or
-    $null -eq $apiValidator -or $null -eq $universalDdis) {
-    throw 'The x64 WDK InfVerif, Inf2Cat, SignTool, ApiValidator, and UniversalDDIs.xml tools are required.'
+if ([string]::IsNullOrWhiteSpace($WdkApiValidatorBinRoot)) {
+    $apiValidator = Get-ChildItem $kitsRoot -Recurse -File -Filter ApiValidator.exe `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\x64\\(?:ApiValidator\\)?ApiValidator\.exe$' } |
+        Sort-Object FullName -Descending | Select-Object -First 1
+} else {
+    $WdkApiValidatorBinRoot = Resolve-ExistingDirectory `
+        $WdkApiValidatorBinRoot `
+        'WDK ApiValidator binary root'
+    $apiValidator = Get-Item (Resolve-Tool `
+            (Join-Path $WdkApiValidatorBinRoot 'apivalidator.exe') `
+            'x64 WDK ApiValidator')
+}
+if ([string]::IsNullOrWhiteSpace($WdkUniversalDdisRoot)) {
+    $universalDdis = Get-ChildItem $kitsRoot -Recurse -File -Filter UniversalDDIs.xml `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\universalDDIs\\x64\\UniversalDDIs\.xml$' } |
+        Sort-Object FullName -Descending | Select-Object -First 1
+} else {
+    $WdkUniversalDdisRoot = Resolve-ExistingDirectory `
+        $WdkUniversalDdisRoot `
+        'WDK Universal DDI root'
+    $universalDdis = Get-Item (Resolve-Tool `
+            (Join-Path $WdkUniversalDdisRoot 'UniversalDDIs.xml') `
+            'x64 WDK UniversalDDIs.xml')
+}
+$missingWdkTools = @(
+    if ($null -eq $infVerif) { 'InfVerif.exe' }
+    if ($null -eq $inf2Cat) { 'Inf2Cat.exe' }
+    if ($null -eq $signTool) { 'SignTool.exe' }
+    if ($null -eq $apiValidator) { 'ApiValidator.exe' }
+    if ($null -eq $universalDdis) { 'UniversalDDIs.xml' }
+)
+if ($missingWdkTools.Count -ne 0) {
+    throw "Required x64 WDK tools are missing: $($missingWdkTools -join ', ')"
 }
 $msysShell = Resolve-Tool (Join-Path $Msys2Root "msys2_shell.cmd") "MSYS2 shell"
 
@@ -252,27 +313,31 @@ if ([string]::IsNullOrWhiteSpace($uvExecutablePath)) {
 $uvExecutable = Resolve-Tool $uvExecutablePath "uv"
 
 $freezeDirectory = Join-Path $StagingRoot "source-freeze"
-if (Test-Path -LiteralPath $freezeDirectory) {
-    Remove-Item -LiteralPath $freezeDirectory -Recurse -Force
+if (-not $UsePreparedDriverSubmission) {
+    if (Test-Path -LiteralPath $freezeDirectory) {
+        Remove-Item -LiteralPath $freezeDirectory -Recurse -Force
+    }
+    [void](Invoke-MandatoryGate6Command `
+        -RunId 'lumen-source-freeze' `
+        -FilePath $powerShellExecutable `
+        -Arguments @(
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-File',
+            (Join-Path $SourceRoot 'scripts\windows\freeze-full-profile-source.ps1'),
+            '-SourceRoot',
+            $SourceRoot,
+            '-OutputDirectory',
+            $freezeDirectory,
+            '-SharedSourceFreezeManifestSha256',
+            $sharedSourceFreezeManifestSha256
+        ) `
+        -WorkingDirectory $SourceRoot `
+        -ToolchainIds @('windows-powershell'))
+} elseif (-not (Test-Path -LiteralPath $freezeDirectory -PathType Container)) {
+    throw "Prepared source freeze is missing: $freezeDirectory"
 }
-[void](Invoke-MandatoryGate6Command `
-    -RunId 'lumen-source-freeze' `
-    -FilePath $powerShellExecutable `
-    -Arguments @(
-        '-NoLogo',
-        '-NoProfile',
-        '-NonInteractive',
-        '-File',
-        (Join-Path $SourceRoot 'scripts\windows\freeze-full-profile-source.ps1'),
-        '-SourceRoot',
-        $SourceRoot,
-        '-OutputDirectory',
-        $freezeDirectory,
-        '-SharedSourceFreezeManifestSha256',
-        $sharedSourceFreezeManifestSha256
-    ) `
-    -WorkingDirectory $SourceRoot `
-    -ToolchainIds @('windows-powershell'))
 $mutableSourceRoot = $SourceRoot
 $sourceProvenance = Expand-VerifiedFullProfileSource `
     -FreezeDirectory $freezeDirectory `
@@ -379,50 +444,56 @@ $rawDriverRoot = Join-Path $StagingRoot "unsigned-driver-submissions"
 $vhidRaw = Join-Path $rawDriverRoot "virtual-hid"
 $vmicRaw = Join-Path $rawDriverRoot "virtual-microphone"
 $vddRaw = Join-Path $rawDriverRoot "virtual-display"
-Invoke-DriverBuild `
-    -Name "virtual-hid" `
-    -Project (Join-Path $SourceRoot "src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj") `
-    -BinaryName "LumenVirtualHid.dll" `
-    -InfName "LumenVirtualHid.inf" `
-    -PackageDirectory $vhidRaw
-Invoke-DriverBuild `
-    -Name "virtual-microphone" `
-    -Project (Join-Path $SourceRoot "src\platform\windows\virtual_microphone_driver\LumenVirtualMicrophone.vcxproj") `
-    -BinaryName "LumenVirtualMicrophone.sys" `
-    -InfName "LumenVirtualMicrophone.inf" `
-    -PackageDirectory $vmicRaw
-Invoke-DriverBuild `
-    -Name "virtual-display" `
-    -Project (Join-Path $SourceRoot "src\platform\windows\virtual_display_driver\LumenVirtualDisplay.vcxproj") `
-    -BinaryName "LumenVirtualDisplay.dll" `
-    -InfName "LumenVirtualDisplay.inf" `
-    -PackageDirectory $vddRaw
+if (-not $UsePreparedDriverSubmission) {
+    Invoke-DriverBuild `
+        -Name "virtual-hid" `
+        -Project (Join-Path $SourceRoot "src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj") `
+        -BinaryName "LumenVirtualHid.dll" `
+        -InfName "LumenVirtualHid.inf" `
+        -PackageDirectory $vhidRaw
+    Invoke-DriverBuild `
+        -Name "virtual-microphone" `
+        -Project (Join-Path $SourceRoot "src\platform\windows\virtual_microphone_driver\LumenVirtualMicrophone.vcxproj") `
+        -BinaryName "LumenVirtualMicrophone.sys" `
+        -InfName "LumenVirtualMicrophone.inf" `
+        -PackageDirectory $vmicRaw
+    Invoke-DriverBuild `
+        -Name "virtual-display" `
+        -Project (Join-Path $SourceRoot "src\platform\windows\virtual_display_driver\LumenVirtualDisplay.vcxproj") `
+        -BinaryName "LumenVirtualDisplay.dll" `
+        -InfName "LumenVirtualDisplay.inf" `
+        -PackageDirectory $vddRaw
+}
 
 $shimProject = Join-Path $SourceRoot "src\platform\windows\msquic_shim\LumenMsQuicShim.vcxproj"
 [void](Assert-FullProfileSourceSnapshot `
     -SourceRoot $SourceRoot `
     -FilesManifestPath $sourceProvenance.FilesManifestPath `
-    -Boundary 'MsQuic shim build')
+    -Boundary $(if ($UsePreparedDriverSubmission) { 'prepared driver reuse' } else { 'MsQuic shim build' }))
 $shimOutput = Join-Path $StagingRoot "msquic-shim"
-if (Test-Path -LiteralPath $shimOutput) {
-    Remove-Item -LiteralPath $shimOutput -Recurse -Force
+if (-not $UsePreparedDriverSubmission) {
+    if (Test-Path -LiteralPath $shimOutput) {
+        Remove-Item -LiteralPath $shimOutput -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $shimOutput -Force | Out-Null
+    [void](Invoke-MandatoryGate6Command `
+        -RunId 'msquic-shim-msbuild' `
+        -FilePath $msbuild `
+        -Arguments @(
+            $shimProject,
+            '/m',
+            '/t:Rebuild',
+            '/warnaserror',
+            '/p:Configuration=Release',
+            '/p:Platform=x64',
+            "/p:MsQuicRoot=$MsQuicPackageRoot",
+            "/p:OutDir=$shimOutput\"
+        ) `
+        -WorkingDirectory $SourceRoot `
+        -ToolchainIds @('windows-msbuild-wdk'))
+} elseif (-not (Test-Path -LiteralPath $shimOutput -PathType Container)) {
+    throw "Prepared MsQuic shim directory is missing: $shimOutput"
 }
-New-Item -ItemType Directory -Path $shimOutput -Force | Out-Null
-[void](Invoke-MandatoryGate6Command `
-    -RunId 'msquic-shim-msbuild' `
-    -FilePath $msbuild `
-    -Arguments @(
-        $shimProject,
-        '/m',
-        '/t:Rebuild',
-        '/warnaserror',
-        '/p:Configuration=Release',
-        '/p:Platform=x64',
-        "/p:MsQuicRoot=$MsQuicPackageRoot",
-        "/p:OutDir=$shimOutput\"
-    ) `
-    -WorkingDirectory $SourceRoot `
-    -ToolchainIds @('windows-msbuild-wdk'))
 $shimDll = Join-Path $shimOutput "lumen_msquic_shim.dll"
 $shimLib = Join-Path $shimOutput "lumen_msquic_shim.lib"
 $shimManifest = Join-Path $shimOutput "manifest.json"
@@ -443,33 +514,79 @@ if ([int]$manifest.abi -ne 3 -or
 }
 
 $sourceFreezeManifest = Get-Content $sourceProvenance.FreezeManifestPath -Raw | ConvertFrom-Json
-$pendingManifest = [ordered]@{
-    schema = 1
-    sourceRoot = $SourceRoot
-    sourceFileCount = $sourceProvenance.FileCount
-    sourceFilesManifestSha256 = $sourceFilesManifestSha256
-    sourceArchiveSha256 = $sourceProvenance.ArchiveSha256
-    sourceFreezeManifestSha256 = $sourceProvenance.FreezeManifestSha256
-    sharedSourceFreezeManifestSha256 = $sharedSourceFreezeManifestSha256
-    vddShaderCount = 7
-    vddShaderInventorySha256 = [string]$sourceFreezeManifest.identities.vddShaderInventorySha256
-    msquicShim = @{
-        abi = 3
-        dllSha256 = $shimDllHash
-        libSha256 = $shimLibHash
-    }
-    unsignedDriverSubmissions = @{}
-}
+$currentDriverSubmissions = [ordered]@{}
 foreach ($directory in @($vhidRaw, $vmicRaw, $vddRaw)) {
-    $pendingManifest.unsignedDriverSubmissions[(Split-Path -Leaf $directory)] = @(
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        throw "Prepared driver submission is missing: $directory"
+    }
+    $currentDriverSubmissions[(Split-Path -Leaf $directory)] = @(
         Get-ChildItem $directory -File | Sort-Object Name | ForEach-Object {
             @{ name = $_.Name; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
         }
     )
 }
-$pendingManifest | ConvertTo-Json -Depth 8 | Set-Content $pendingManifestPath -Encoding UTF8
+if ($UsePreparedDriverSubmission) {
+    if (-not (Test-Path -LiteralPath $pendingManifestPath -PathType Leaf)) {
+        throw "Prepared driver manifest is missing: $pendingManifestPath"
+    }
+    $pendingManifest = Get-Content $pendingManifestPath -Raw | ConvertFrom-Json
+    if ([int]$pendingManifest.schema -ne 1 -or
+        [string]$pendingManifest.sourceRoot -cne $SourceRoot -or
+        [int]$pendingManifest.sourceFileCount -ne $sourceProvenance.FileCount -or
+        [string]$pendingManifest.sourceFilesManifestSha256 -cne $sourceFilesManifestSha256 -or
+        [string]$pendingManifest.sourceArchiveSha256 -cne $sourceProvenance.ArchiveSha256 -or
+        [string]$pendingManifest.sourceFreezeManifestSha256 -cne $sourceProvenance.FreezeManifestSha256 -or
+        [string]$pendingManifest.sharedSourceFreezeManifestSha256 -cne $sharedSourceFreezeManifestSha256 -or
+        [int]$pendingManifest.vddShaderCount -ne 7 -or
+        [string]$pendingManifest.vddShaderInventorySha256 -cne
+            [string]$sourceFreezeManifest.identities.vddShaderInventorySha256 -or
+        [int]$pendingManifest.msquicShim.abi -ne 3 -or
+        [string]$pendingManifest.msquicShim.dllSha256 -cne $shimDllHash -or
+        [string]$pendingManifest.msquicShim.libSha256 -cne $shimLibHash) {
+        throw 'Prepared driver manifest is not bound to the current source freeze and MsQuic shim.'
+    }
+    foreach ($name in @('virtual-hid', 'virtual-microphone', 'virtual-display')) {
+        $expectedRows = @($pendingManifest.unsignedDriverSubmissions.$name | Sort-Object name)
+        $actualRows = @($currentDriverSubmissions[$name] | Sort-Object name)
+        if ($expectedRows.Count -ne $actualRows.Count) {
+            throw "Prepared $name driver submission file count changed."
+        }
+        for ($index = 0; $index -lt $expectedRows.Count; $index++) {
+            if ([string]$expectedRows[$index].name -cne [string]$actualRows[$index].name -or
+                [string]$expectedRows[$index].sha256 -cne [string]$actualRows[$index].sha256) {
+                throw "Prepared $name driver submission identity changed."
+            }
+        }
+    }
+} else {
+    $pendingManifest = [ordered]@{
+        schema = 1
+        sourceRoot = $SourceRoot
+        sourceFileCount = $sourceProvenance.FileCount
+        sourceFilesManifestSha256 = $sourceFilesManifestSha256
+        sourceArchiveSha256 = $sourceProvenance.ArchiveSha256
+        sourceFreezeManifestSha256 = $sourceProvenance.FreezeManifestSha256
+        sharedSourceFreezeManifestSha256 = $sharedSourceFreezeManifestSha256
+        vddShaderCount = 7
+        vddShaderInventorySha256 = [string]$sourceFreezeManifest.identities.vddShaderInventorySha256
+        msquicShim = @{
+            abi = 3
+            dllSha256 = $shimDllHash
+            libSha256 = $shimLibHash
+        }
+        unsignedDriverSubmissions = $currentDriverSubmissions
+    }
+    $pendingManifest | ConvertTo-Json -Depth 8 | Set-Content $pendingManifestPath -Encoding UTF8
+}
 
 if ([string]::IsNullOrWhiteSpace($SignedDriverRoot)) {
+    if ($BuildOnly) {
+        Write-Output "FULL_PROFILE_BUILD_STATUS=driver-submission-ready"
+        Write-Output "FULL_PROFILE_DRIVER_STAGING_ROOT=$StagingRoot"
+        Write-Output "FULL_PROFILE_DRIVER_MANIFEST=$pendingManifestPath"
+        Write-Output "FULL_PROFILE_DRIVER_MANIFEST_SHA256=$((Get-FileHash $pendingManifestPath -Algorithm SHA256).Hash)"
+        return
+    }
     throw "SignedDriverRoot is required to finish the full profile. Submit the three packages under '$rawDriverRoot' for Microsoft driver signing, then rerun with signed subdirectories virtual-hid, virtual-microphone, and virtual-display. Manifest: $pendingManifestPath"
 }
 $SignedDriverRoot = Resolve-ExistingDirectory $SignedDriverRoot "Signed driver package"
@@ -632,6 +749,7 @@ if (Test-Path -LiteralPath $artifacts) {
 New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
 $buildMsys = Convert-ToMsysPath $buildRoot
 $pythonCmake = Convert-ToCMakePath $PythonPath
+$pythonRootCmake = Convert-ToCMakePath (Split-Path -Parent $PythonPath)
 $pythonMsys = Convert-ToMsysPath $PythonPath
 $dotnetMsys = Convert-ToMsysPath $DotNetRoot
 $dotnetExecutableMsys = Convert-ToMsysPath $dotnetExecutable
@@ -696,6 +814,8 @@ export PATH='$shimMsys':'$msquicRuntimeMsys':'$dotnetMsys':'$nodeMsys':"`$PATH"
 '$uvMsys' sync --locked --no-python-downloads --no-install-project
 cmake -S . -B '$buildMsys' -G Ninja \
   -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_WERROR=ON -DCMAKE_BUILD_TYPE=Release \
+  -DPython3_ROOT_DIR='$pythonRootCmake' \
+  -DPython3_EXECUTABLE='$pythonCmake' \
   -DDOTNET_EXECUTABLE='$dotnetCmake' \
   -DNPM='$npmCmake' \
   -DLUMEN_WINDOWS_FULL_PROFILE=ON -DLUMEN_EXPERIMENTAL_MSQUIC=ON \
@@ -783,41 +903,44 @@ $env:LUMEN_MSI_PATH = $versionedMsi
     -WorkingDirectory $SourceRoot `
     -ToolchainIds @('windows-wix'))
 
-$toolIdentityPath = Join-Path $runEvidenceRoot 'toolchain-identities.json'
-$nativeTools = @(
-    [ordered]@{ id = 'git'; path = $gitExecutable },
-    [ordered]@{ id = 'vswhere'; path = $vswhere },
-    [ordered]@{ id = 'msbuild'; path = $msbuild },
-    [ordered]@{ id = 'infverif'; path = $infVerif.FullName },
-    [ordered]@{ id = 'inf2cat'; path = $inf2Cat.FullName },
-    [ordered]@{ id = 'apivalidator'; path = $apiValidator.FullName },
-    [ordered]@{ id = 'universal-ddis'; path = $universalDdis.FullName },
-    [ordered]@{ id = 'signtool'; path = $signTool.FullName },
-    [ordered]@{ id = 'msys2-shell'; path = $msysShell },
-    [ordered]@{ id = 'python'; path = $PythonPath },
-    [ordered]@{ id = 'dotnet'; path = $dotnetExecutable },
-    [ordered]@{ id = 'npm'; path = $npmExecutable },
-    [ordered]@{ id = 'uv'; path = $uvExecutable }
-)
-$toolIdentities = @(
-    foreach ($tool in $nativeTools) {
-        $item = Get-Item -LiteralPath $tool.path
-        [ordered]@{
-            id = $tool.id
-            path = $item.FullName
-            bytes = $item.Length
-            sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            fileVersion = [string]$item.VersionInfo.FileVersion
-            productVersion = [string]$item.VersionInfo.ProductVersion
+$toolIdentityPath = $null
+if (-not $BuildOnly) {
+    $toolIdentityPath = Join-Path $runEvidenceRoot 'toolchain-identities.json'
+    $nativeTools = @(
+        [ordered]@{ id = 'git'; path = $gitExecutable },
+        [ordered]@{ id = 'vswhere'; path = $vswhere },
+        [ordered]@{ id = 'msbuild'; path = $msbuild },
+        [ordered]@{ id = 'infverif'; path = $infVerif.FullName },
+        [ordered]@{ id = 'inf2cat'; path = $inf2Cat.FullName },
+        [ordered]@{ id = 'apivalidator'; path = $apiValidator.FullName },
+        [ordered]@{ id = 'universal-ddis'; path = $universalDdis.FullName },
+        [ordered]@{ id = 'signtool'; path = $signTool.FullName },
+        [ordered]@{ id = 'msys2-shell'; path = $msysShell },
+        [ordered]@{ id = 'python'; path = $PythonPath },
+        [ordered]@{ id = 'dotnet'; path = $dotnetExecutable },
+        [ordered]@{ id = 'npm'; path = $npmExecutable },
+        [ordered]@{ id = 'uv'; path = $uvExecutable }
+    )
+    $toolIdentities = @(
+        foreach ($tool in $nativeTools) {
+            $item = Get-Item -LiteralPath $tool.path
+            [ordered]@{
+                id = $tool.id
+                path = $item.FullName
+                bytes = $item.Length
+                sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                fileVersion = [string]$item.VersionInfo.FileVersion
+                productVersion = [string]$item.VersionInfo.ProductVersion
+            }
         }
-    }
-)
-Write-Gate6Json $toolIdentityPath ([ordered]@{
-        schema = 'lumen-gate6-toolchain-identities/1'
-        sourceCommit = $sourceCommit
-        sharedSourceFreezeManifestSha256 = $sharedSourceFreezeManifestSha256
-        tools = $toolIdentities
-    })
+    )
+    Write-Gate6Json $toolIdentityPath ([ordered]@{
+            schema = 'lumen-gate6-toolchain-identities/1'
+            sourceCommit = $sourceCommit
+            sharedSourceFreezeManifestSha256 = $sharedSourceFreezeManifestSha256
+            tools = $toolIdentities
+        })
+}
 
 function Copy-Gate6EvidenceFile {
     param([string]$Source, [string]$RelativeDestination)
@@ -850,15 +973,17 @@ function Get-Gate6PackageContentRoot {
     return $executables[0].Directory.FullName
 }
 
-if (Test-Path -LiteralPath $Gate6EvidenceRoot) {
-    if (@(Get-ChildItem -LiteralPath $Gate6EvidenceRoot -Force).Count -ne 0) {
-        throw "Gate6EvidenceRoot must be absent or empty: $Gate6EvidenceRoot"
+if (-not $BuildOnly) {
+    if (Test-Path -LiteralPath $Gate6EvidenceRoot) {
+        if (@(Get-ChildItem -LiteralPath $Gate6EvidenceRoot -Force).Count -ne 0) {
+            throw "Gate6EvidenceRoot must be absent or empty: $Gate6EvidenceRoot"
+        }
+    } else {
+        New-Item -ItemType Directory -Path $Gate6EvidenceRoot -Force | Out-Null
     }
-} else {
-    New-Item -ItemType Directory -Path $Gate6EvidenceRoot -Force | Out-Null
 }
 
-$packageExtractionRoot = Join-Path $StagingRoot 'gate6-package-extraction'
+$packageExtractionRoot = Join-Path $StagingRoot 'full-profile-package-extraction'
 if (Test-Path -LiteralPath $packageExtractionRoot) {
     Remove-Item -LiteralPath $packageExtractionRoot -Recurse -Force
 }
@@ -872,7 +997,7 @@ $msiexec = Resolve-Tool (Join-Path $env:SystemRoot 'System32\msiexec.exe') 'Wind
     -Arguments @('/a', $versionedMsi, '/qn', "TARGETDIR=$msiExtractionRoot") `
     -WorkingDirectory $StagingRoot `
     -ToolchainIds @('windows-wix'))
-$zipExtractionScript = Join-Path $StagingRoot 'extract-gate6-zip.ps1'
+$zipExtractionScript = Join-Path $StagingRoot 'extract-full-profile-zip.ps1'
 [IO.File]::WriteAllText(
     $zipExtractionScript,
     "param([string]`$Archive,[string]`$Destination) Expand-Archive -LiteralPath `$Archive -DestinationPath `$Destination -Force",
@@ -888,70 +1013,173 @@ $zipExtractionScript = Join-Path $StagingRoot 'extract-gate6-zip.ps1'
 $msiContentRoot = Get-Gate6PackageContentRoot $msiExtractionRoot 'MSI'
 $zipContentRoot = Get-Gate6PackageContentRoot $zipExtractionRoot 'ZIP'
 
-Copy-Gate6EvidenceTree $freezeDirectory 'source-freeze'
-Copy-Gate6EvidenceFile $signedSubmissionManifestPath 'full-profile-driver-manifest.json'
-Copy-Gate6EvidenceFile $shimDll 'shim/lumen_msquic_shim.dll'
-Copy-Gate6EvidenceFile $shimLib 'shim/lumen_msquic_shim.lib'
-Copy-Gate6EvidenceFile $shimManifest 'shim/manifest.json'
-foreach ($path in @(
-        'Lumen.exe',
-        'zlib1.dll',
-        'msquic.dll',
-        'lumen_msquic_shim.dll',
-        'MsQuic-LICENSE.txt',
-        'tools/sunshinesvc.exe',
-        'tools/lumen-vddctl.exe'
+$requiredApplicationPaths = @(
+    'Lumen.exe',
+    'zlib1.dll',
+    'msquic.dll',
+    'lumen_msquic_shim.dll',
+    'MsQuic-LICENSE.txt',
+    'tools/sunshinesvc.exe',
+    'tools/lumen-vddctl.exe'
+)
+$requiredMsiDriverPaths = @(
+    'tools/lumen-vhidctl.exe',
+    'tools/lumen-vmicctl.exe',
+    'drivers/virtual-hid/LumenVirtualHid.inf',
+    'drivers/virtual-hid/LumenVirtualHid.cat',
+    'drivers/virtual-hid/LumenVirtualHid.dll',
+    'drivers/virtual-microphone/LumenVirtualMicrophone.inf',
+    'drivers/virtual-microphone/LumenVirtualMicrophone.cat',
+    'drivers/virtual-microphone/LumenVirtualMicrophone.sys',
+    'drivers/virtual-display/LumenVirtualDisplay.inf',
+    'drivers/virtual-display/LumenVirtualDisplay.cat',
+    'drivers/virtual-display/LumenVirtualDisplay.dll'
+)
+$requiredShaderPaths = @(
+    'assets/shaders/directx/convert_yuv420_packed_uv_type0_ps_vdd_color_transform.hlsl',
+    'assets/shaders/directx/convert_yuv420_packed_uv_type0s_ps_vdd_color_transform.hlsl',
+    'assets/shaders/directx/convert_yuv420_planar_y_ps_vdd_color_transform.hlsl',
+    'assets/shaders/directx/convert_yuv444_packed_ayuv_ps_vdd_color_transform.hlsl',
+    'assets/shaders/directx/convert_yuv444_packed_y410_ps_vdd_color_transform.hlsl',
+    'assets/shaders/directx/convert_yuv444_planar_ps_vdd_color_transform.hlsl',
+    'assets/shaders/directx/include/convert_vdd_color_transform_base.hlsl'
+)
+foreach ($package in @(
+        @{ Name = 'MSI'; Root = $msiContentRoot; Paths = @($requiredApplicationPaths + $requiredMsiDriverPaths + $requiredShaderPaths) },
+        @{ Name = 'ZIP'; Root = $zipContentRoot; Paths = @($requiredApplicationPaths + $requiredShaderPaths) }
     )) {
-    Copy-Gate6EvidenceFile (Join-Path $msiContentRoot $path) "app/$($path -replace '\\', '/')"
+    foreach ($path in $package.Paths) {
+        if (-not (Test-Path -LiteralPath (Join-Path $package.Root $path) -PathType Leaf)) {
+            throw "$($package.Name) full-profile inventory is missing: $path"
+        }
+    }
+    if ($AllowTestSignedDrivers -and
+        -not (Test-Path -LiteralPath (Join-Path $package.Root 'metadata/LOCAL-TEST-SIGNED.json') -PathType Leaf)) {
+        throw "$($package.Name) full-profile inventory is missing its non-production signing marker."
+    }
 }
-foreach ($driver in @(
-        @{ Name = 'virtual-hid'; Root = $vhidSigned },
-        @{ Name = 'virtual-microphone'; Root = $vmicSigned },
-        @{ Name = 'virtual-display'; Root = $vddSigned }
-    )) {
-    Copy-Gate6EvidenceTree $driver.Root "drivers/$($driver.Name)"
+
+$standaloneExe = Join-Path $artifacts "Lumen-$BuildVersion-Windows-AMD64.exe"
+Copy-Item (Join-Path $msiContentRoot 'Lumen.exe') $standaloneExe -Force
+
+$shimArtifactRoot = Join-Path $artifacts 'msquic-shim'
+New-Item -ItemType Directory -Path $shimArtifactRoot -Force | Out-Null
+Copy-Item -LiteralPath $shimDll, $shimLib, $shimManifest -Destination $shimArtifactRoot -Force
+
+$driverArtifactRoot = Join-Path $artifacts 'drivers'
+New-Item -ItemType Directory -Path $driverArtifactRoot -Force | Out-Null
+foreach ($driverRoot in @($vhidSigned, $vmicSigned, $vddSigned)) {
+    Copy-Item -LiteralPath $driverRoot -Destination $driverArtifactRoot -Recurse -Force
 }
-foreach ($vector in @('quic_v3_vectors.json', 'start_mode_vectors.json', 'vdd_gate5_contract.json')) {
-    Copy-Gate6EvidenceFile `
-        (Join-Path $SourceRoot "docs\protocols\vectors\$vector") `
-        "vectors/$vector"
+Copy-Item $signedSubmissionManifestPath $artifacts -Force
+
+$sourceIdentityArtifactRoot = Join-Path $artifacts 'source-identity'
+New-Item -ItemType Directory -Path $sourceIdentityArtifactRoot -Force | Out-Null
+Copy-Item `
+    $sourceProvenance.FilesManifestPath, `
+    $sourceProvenance.FreezeManifestPath `
+    -Destination $sourceIdentityArtifactRoot `
+    -Force
+$sourceFileRows = @(Read-FullProfileFilesManifest $sourceProvenance.FilesManifestPath)
+$vddShaderRows = @(
+    foreach ($packagePath in $requiredShaderPaths) {
+        $sourcePath = "src_assets/windows/$packagePath"
+        $matches = @($sourceFileRows | Where-Object { [string]$_.path -ceq $sourcePath })
+        if ($matches.Count -ne 1) {
+            throw "Source freeze VDD shader inventory is missing: $sourcePath"
+        }
+        $matches[0]
+    }
+)
+$vddShaderInventoryPath = Join-Path $sourceIdentityArtifactRoot 'vdd-shader-inventory.json'
+[ordered]@{
+    schema = 'lumen-vdd-shader-inventory/1'
+    count = $vddShaderRows.Count
+    inventorySha256 = [string]$sourceFreezeManifest.identities.vddShaderInventorySha256
+    files = $vddShaderRows
+} | ConvertTo-Json -Depth 6 | Set-Content $vddShaderInventoryPath -Encoding UTF8
+
+if ($AllowTestSignedDrivers) {
+    Copy-Item `
+        (Join-Path $SignedDriverRoot 'LOCAL-TEST-SIGNED.json'), `
+        (Join-Path $SignedDriverRoot 'local-test-signing.cer') `
+        -Destination $artifacts `
+        -Force
+    @'
+NON-PRODUCTION ARTIFACT
+The bundled Windows drivers are locally test-signed for CI validation only.
+Do not publish or deploy these artifacts as a production release.
+'@ | Set-Content (Join-Path $artifacts 'NON-PRODUCTION-SIGNING.txt') -Encoding UTF8
 }
-Copy-Gate6EvidenceFile $versionedMsi "artifacts/$([IO.Path]::GetFileName($versionedMsi))"
-Copy-Gate6EvidenceFile $versionedZip "artifacts/$([IO.Path]::GetFileName($versionedZip))"
-Copy-Gate6EvidenceTree $msiContentRoot 'inventories/msi'
-Copy-Gate6EvidenceTree $zipContentRoot 'inventories/zip'
 
 [void](Assert-FullProfileSourceSnapshot `
     -SourceRoot $SourceRoot `
     -FilesManifestPath $sourceProvenance.FilesManifestPath `
-    -Boundary 'Gate6 artifact manifest generation')
+    -Boundary 'full-profile package inventory validation')
 Assert-Gate6MandatoryRunsPassed @($gate6Runs)
-$gate6ArtifactManifestPath = Join-Path $StagingRoot 'lumen-gate6-artifact-manifest.json'
-$gate6ArtifactManifest = New-Gate6ArtifactManifest `
-    -EvidenceRoot $Gate6EvidenceRoot `
-    -ManifestPath $gate6ArtifactManifestPath `
-    -Runs @($gate6Runs) `
-    -SharedSourceFreezeManifestPath $sharedSourceFreeze.Path `
-    -SignedReturnReceiptPath $signedReturnReceiptPath
-$gate6AssemblyFragment = New-Gate6AssemblyFragment `
-    -FragmentRoot $Gate6AssemblyFragmentRoot `
-    -SharedSourceFreezeManifestPath $sharedSourceFreeze.Path `
-    -SignedReturnReceiptPath $signedReturnReceiptPath `
-    -LumenArtifactManifestPath $gate6ArtifactManifestPath `
-    -ToolchainIdentitiesPath $toolIdentityPath `
-    -Runs @($gate6Runs)
+
+if (-not $BuildOnly) {
+    Copy-Gate6EvidenceTree $freezeDirectory 'source-freeze'
+    Copy-Gate6EvidenceFile $signedSubmissionManifestPath 'full-profile-driver-manifest.json'
+    Copy-Gate6EvidenceFile $shimDll 'shim/lumen_msquic_shim.dll'
+    Copy-Gate6EvidenceFile $shimLib 'shim/lumen_msquic_shim.lib'
+    Copy-Gate6EvidenceFile $shimManifest 'shim/manifest.json'
+    foreach ($path in $requiredApplicationPaths) {
+        Copy-Gate6EvidenceFile (Join-Path $msiContentRoot $path) "app/$($path -replace '\\', '/')"
+    }
+    foreach ($driver in @(
+            @{ Name = 'virtual-hid'; Root = $vhidSigned },
+            @{ Name = 'virtual-microphone'; Root = $vmicSigned },
+            @{ Name = 'virtual-display'; Root = $vddSigned }
+        )) {
+        Copy-Gate6EvidenceTree $driver.Root "drivers/$($driver.Name)"
+    }
+    foreach ($vector in @('quic_v3_vectors.json', 'start_mode_vectors.json', 'vdd_gate5_contract.json')) {
+        Copy-Gate6EvidenceFile `
+            (Join-Path $SourceRoot "docs\protocols\vectors\$vector") `
+            "vectors/$vector"
+    }
+    Copy-Gate6EvidenceFile $versionedMsi "artifacts/$([IO.Path]::GetFileName($versionedMsi))"
+    Copy-Gate6EvidenceFile $versionedZip "artifacts/$([IO.Path]::GetFileName($versionedZip))"
+    Copy-Gate6EvidenceTree $msiContentRoot 'inventories/msi'
+    Copy-Gate6EvidenceTree $zipContentRoot 'inventories/zip'
+
+    $gate6ArtifactManifestPath = Join-Path $StagingRoot 'lumen-gate6-artifact-manifest.json'
+    $gate6ArtifactManifest = New-Gate6ArtifactManifest `
+        -EvidenceRoot $Gate6EvidenceRoot `
+        -ManifestPath $gate6ArtifactManifestPath `
+        -Runs @($gate6Runs) `
+        -SharedSourceFreezeManifestPath $sharedSourceFreeze.Path `
+        -SignedReturnReceiptPath $signedReturnReceiptPath
+    $gate6AssemblyFragment = New-Gate6AssemblyFragment `
+        -FragmentRoot $Gate6AssemblyFragmentRoot `
+        -SharedSourceFreezeManifestPath $sharedSourceFreeze.Path `
+        -SignedReturnReceiptPath $signedReturnReceiptPath `
+        -LumenArtifactManifestPath $gate6ArtifactManifestPath `
+        -ToolchainIdentitiesPath $toolIdentityPath `
+        -Runs @($gate6Runs)
+}
 
 Write-Output "FULL_PROFILE_MSI=$versionedMsi"
 Write-Output "FULL_PROFILE_MSI_SHA256=$((Get-FileHash $versionedMsi -Algorithm SHA256).Hash)"
 Write-Output "FULL_PROFILE_ZIP=$versionedZip"
 Write-Output "FULL_PROFILE_ZIP_SHA256=$((Get-FileHash $versionedZip -Algorithm SHA256).Hash)"
-Write-Output "GATE6_RUN_EVIDENCE=$runEvidenceRoot"
-Write-Output "GATE6_TOOLCHAIN_IDENTITIES=$toolIdentityPath"
-Write-Output "GATE6_SHARED_SOURCE_FREEZE_MANIFEST=$($sharedSourceFreeze.Path)"
-Write-Output "GATE6_SIGNED_RETURN_RECEIPT=$signedReturnReceiptPath"
-Write-Output "GATE6_ARTIFACT_EVIDENCE=$Gate6EvidenceRoot"
-Write-Output "GATE6_ARTIFACT_MANIFEST=$gate6ArtifactManifestPath"
-Write-Output "GATE6_ARTIFACT_FILE_COUNT=$($gate6ArtifactManifest.FileCount)"
-Write-Output "GATE6_ASSEMBLY_FRAGMENT_ROOT=$Gate6AssemblyFragmentRoot"
-Write-Output "GATE6_ASSEMBLY_FRAGMENT_MANIFEST=$($gate6AssemblyFragment.ManifestPath)"
-Write-Output "GATE6_ASSEMBLY_FRAGMENT_MANIFEST_SHA256=$((Get-FileHash $gate6AssemblyFragment.ManifestPath -Algorithm SHA256).Hash)"
+Write-Output "FULL_PROFILE_EXE=$standaloneExe"
+Write-Output "FULL_PROFILE_EXE_SHA256=$((Get-FileHash $standaloneExe -Algorithm SHA256).Hash)"
+Write-Output "FULL_PROFILE_MSQUIC_SHIM_DLL_SHA256=$((Get-FileHash $shimDll -Algorithm SHA256).Hash)"
+Write-Output "FULL_PROFILE_MSQUIC_SHIM_LIB_SHA256=$((Get-FileHash $shimLib -Algorithm SHA256).Hash)"
+Write-Output "FULL_PROFILE_VDD_SHADER_INVENTORY=$vddShaderInventoryPath"
+Write-Output "FULL_PROFILE_VDD_SHADER_INVENTORY_SHA256=$((Get-FileHash $vddShaderInventoryPath -Algorithm SHA256).Hash)"
+Write-Output "FULL_PROFILE_SIGNING=$(if ($AllowTestSignedDrivers) { 'local-test-only-non-production' } else { 'production-driver-signing' })"
+if (-not $BuildOnly) {
+    Write-Output "GATE6_RUN_EVIDENCE=$runEvidenceRoot"
+    Write-Output "GATE6_TOOLCHAIN_IDENTITIES=$toolIdentityPath"
+    Write-Output "GATE6_SHARED_SOURCE_FREEZE_MANIFEST=$($sharedSourceFreeze.Path)"
+    Write-Output "GATE6_SIGNED_RETURN_RECEIPT=$signedReturnReceiptPath"
+    Write-Output "GATE6_ARTIFACT_EVIDENCE=$Gate6EvidenceRoot"
+    Write-Output "GATE6_ARTIFACT_MANIFEST=$gate6ArtifactManifestPath"
+    Write-Output "GATE6_ARTIFACT_FILE_COUNT=$($gate6ArtifactManifest.FileCount)"
+    Write-Output "GATE6_ASSEMBLY_FRAGMENT_ROOT=$Gate6AssemblyFragmentRoot"
+    Write-Output "GATE6_ASSEMBLY_FRAGMENT_MANIFEST=$($gate6AssemblyFragment.ManifestPath)"
+    Write-Output "GATE6_ASSEMBLY_FRAGMENT_MANIFEST_SHA256=$((Get-FileHash $gate6AssemblyFragment.ManifestPath -Algorithm SHA256).Hash)"
+}

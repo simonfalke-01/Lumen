@@ -1,5 +1,9 @@
 Set-StrictMode -Version Latest
 
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw 'Full-profile source provenance requires PowerShell 7 or newer.'
+}
+
 $script:FullProfileExcludedDirectoryNames = @(
     '.git',
     '.omx',
@@ -7,6 +11,25 @@ $script:FullProfileExcludedDirectoryNames = @(
     '.wix',
     'node_modules'
 )
+
+function Write-FullProfileTarList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Paths,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ListPath
+    )
+
+    if ($Paths.Count -eq 0 -or @($Paths | Where-Object { $_ -eq '' }).Count -ne 0) {
+        throw 'Full-profile tar list requires nonempty paths.'
+    }
+    [IO.File]::WriteAllText(
+        $ListPath,
+        [string]::Join("`n", $Paths),
+        [Text.UTF8Encoding]::new($false)
+    )
+}
 
 function Test-FullProfileExcludedPath {
     param(
@@ -45,21 +68,44 @@ function Get-FullProfileSourceFiles {
 
     $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path
     $rootPrefix = $SourceRoot + [IO.Path]::DirectorySeparatorChar
-    $reparsePoints = @(
-        Get-ChildItem -LiteralPath $SourceRoot -Recurse -Force | Where-Object {
-            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
-        } | ForEach-Object {
-            $relative = $_.FullName.Substring($SourceRoot.Length).TrimStart(
-                [IO.Path]::DirectorySeparatorChar,
-                [IO.Path]::AltDirectorySeparatorChar
-            ) -replace '\\', '/'
-            if (-not (Test-FullProfileExcludedPath $relative)) {
-                $_
-            }
-        }
+    $resolvedFileReparseTargets = [Collections.Generic.Dictionary[string, IO.FileInfo]]::new(
+        [StringComparer]::OrdinalIgnoreCase
     )
-    if ($reparsePoints.Count -ne 0) {
-        throw "Full-profile source contains a reparse point: $($reparsePoints[0].FullName)"
+    $reparsePoints = @(Get-ChildItem -LiteralPath $SourceRoot -Recurse -Force | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        })
+    foreach ($reparsePoint in $reparsePoints) {
+        $relative = $reparsePoint.FullName.Substring($SourceRoot.Length).TrimStart(
+            [IO.Path]::DirectorySeparatorChar,
+            [IO.Path]::AltDirectorySeparatorChar
+        ) -replace '\\', '/'
+        if (Test-FullProfileExcludedPath $relative) {
+            continue
+        }
+        if ($reparsePoint -is [IO.DirectoryInfo]) {
+            throw "Full-profile source contains a directory reparse point: $($reparsePoint.FullName)"
+        }
+        if ([string]$reparsePoint.LinkType -cne 'SymbolicLink') {
+            throw "Full-profile source contains an unsupported file reparse point: $($reparsePoint.FullName)"
+        }
+        try {
+            $resolvedTarget = $reparsePoint.ResolveLinkTarget($true)
+        } catch {
+            throw "Full-profile source contains an unresolvable file reparse point: $($reparsePoint.FullName)"
+        }
+        if ($null -eq $resolvedTarget -or
+            $resolvedTarget -isnot [IO.FileInfo] -or
+            -not $resolvedTarget.Exists) {
+            throw "Full-profile source contains a broken file reparse point: $($reparsePoint.FullName)"
+        }
+        $resolvedTargetPath = [IO.Path]::GetFullPath($resolvedTarget.FullName)
+        if (-not $resolvedTargetPath.StartsWith(
+                $rootPrefix,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "Full-profile source file reparse point escapes SourceRoot: $($reparsePoint.FullName)"
+        }
+        $resolvedFileReparseTargets.Add($reparsePoint.FullName, $resolvedTarget)
     }
 
     $files = @(
@@ -75,11 +121,16 @@ function Get-FullProfileSourceFiles {
                 if ($relative.Contains("`n") -or $relative.Contains("`r")) {
                     throw 'Source bundle does not support newline characters in paths.'
                 }
+                $identityFile = if ($resolvedFileReparseTargets.ContainsKey($_.FullName)) {
+                    $resolvedFileReparseTargets[$_.FullName]
+                } else {
+                    $_
+                }
                 [pscustomobject]@{
                     RelativePath = $relative
                     FullName = $_.FullName
-                    Bytes = $_.Length
-                    Sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    Bytes = $identityFile.Length
+                    Sha256 = (Get-FileHash -LiteralPath $identityFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
                 }
             }
         } | Sort-Object RelativePath

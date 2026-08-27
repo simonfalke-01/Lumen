@@ -110,7 +110,7 @@ if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
 
     install(TARGETS lumen-vhidctl
             RUNTIME DESTINATION "tools"
-            COMPONENT virtual_hid_driver)
+            COMPONENT application)
     install(FILES ${VIRTUAL_HID_DRIVER_FILES}
             DESTINATION "drivers/virtual-hid"
             COMPONENT virtual_hid_driver)

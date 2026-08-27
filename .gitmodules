@@ -42,7 +42,7 @@
 	branch = master
 [submodule "third-party/Simple-Web-Server"]
 	path = third-party/Simple-Web-Server
-	url = https://github.com/LizardByte-infrastructure/Simple-Web-Server.git
+	url = https://github.com/simonfalke-01/Simple-Web-Server.git
 	branch = master
 [submodule "third-party/TPCircularBuffer"]
 	path = third-party/TPCircularBuffer

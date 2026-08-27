@@ -547,7 +547,7 @@ assert_file_literal_count(
     "Install rollback/forward/commit must receive the same verified prior ProductCode")
 assert_file_contains_literal(
     ".github/workflows/ci-windows.yml"
-    [=[EXPECT_VDD_FEATURE: ${{ inputs.release_tag != '' && 'true' || 'false' }}]=]
+    [=[EXPECT_VDD_FEATURE: 'true']=]
     "The live MSI scenario must receive the same VDD payload expectation as table validation")
 assert_file_contains_literal(
     "src_assets/windows/misc/virtual-display-setup.ps1"
@@ -642,15 +642,68 @@ foreach(full_profile_clean_boundary IN ITEMS
         "${full_profile_clean_boundary}"
         "The full-profile builder must clean generated boundary ${full_profile_clean_boundary}")
 endforeach()
+foreach(full_profile_archive_stream_contract IN ITEMS
+        [=[Write-FullProfileTarList -Paths ([string[]]$files.RelativePath)]=]
+        [=[$tarStartInfo.RedirectStandardOutput = $true]=]
+        [=[$tarStartInfo.RedirectStandardError = $true]=]
+        [=[@('-czh', '-f', '-', '-C', $SourceRoot, '-T', $listPath)]=]
+        [=[$tarProcess.StandardError.ReadToEndAsync()]=]
+        [=[$tarProcess.StandardOutput.BaseStream.CopyTo($archiveStream)]=]
+        [=[$tarProcess.WaitForExit(5000)]=]
+        [=[if ($null -ne $stderrTask -and $tarExitedAfterFailure)]=]
+        [=[Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue]=])
+    assert_file_contains_literal(
+        "scripts/windows/freeze-full-profile-source.ps1"
+        "${full_profile_archive_stream_contract}"
+        "Source freeze must retain streamed archive contract ${full_profile_archive_stream_contract}")
+endforeach()
+assert_file_excludes(
+    "scripts/windows/freeze-full-profile-source.ps1"
+    [=[-czhf $archivePath]=]
+    "Source freeze must not let bsdtar open its output filename directly")
+assert_file_excludes(
+    "scripts/windows/freeze-full-profile-source.ps1"
+    [=[WriteAllLines]=]
+    "Source freeze tar list must not use platform-native line endings or a trailing record")
 foreach(full_profile_workflow_contract IN ITEMS
         [=[steps.setup-python.outputs.python-path]=]
         [=[-PythonPath $env:PYTHON_PATH]=]
         [=[-DotNetRoot $env:DOTNET_ROOT]=]
-        [=[-NodeRoot $env:NODEJS_PATH]=])
+        [=[-NodeRoot $env:NODEJS_PATH]=]
+        [=[-WdkApiValidatorBinRoot $env:WDK_API_VALIDATOR_BIN_ROOT]=]
+        [=[-WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT]=]
+        [=[Microsoft.Windows.WDK.x64.10.0.26100.1.nupkg]=]
+        [=[$expectedPackageBytes = 110015300]=]
+        [=[247B2919AE451F65BA5F1CD51C7C39730FB0FC383D607F3E8AB317FDDC8A8239]=]
+        [=[5aHxX9Jh7tv9wqfXR2taMxP0LOwz1t/2UwAx70Z3uyKlkkYmNOxCTQ3rod1mShsJJ63e6Nmq/53gPJkcLOQIAg==]=]
+        [=[$installedApiValidator = Get-ChildItem $kitsRoot]=]
+        [=[$installedUniversalDdis = Get-ChildItem $kitsRoot]=]
+        [=[-BuildOnly]=]
+        [=[sign-full-profile-local-test.ps1]=])
     assert_file_contains_literal(
         ".github/workflows/ci-windows.yml"
         "${full_profile_workflow_contract}"
         "Windows CI must pass exact toolchain contract ${full_profile_workflow_contract}")
+endforeach()
+assert_file_excludes(
+    ".github/workflows/ci-windows.yml"
+    [=[LUMEN_BUILD_PROFILE=legacy]=]
+    "Windows CI must never downgrade the canonical build to the legacy profile")
+foreach(full_profile_build_only_contract IN ITEMS
+        [=[FULL_PROFILE_BUILD_STATUS=driver-submission-ready]=]
+        [=[-DPython3_ROOT_DIR=]=]
+        [=[-DPython3_EXECUTABLE=]=]
+        [=[[string]$WdkApiValidatorBinRoot]=]
+        [=[[string]$WdkUniversalDdisRoot]=]
+        [=[full-profile inventory is missing]=]
+        [=[UsePreparedDriverSubmission]=]
+        [=[FULL_PROFILE_MSQUIC_SHIM_LIB_SHA256]=]
+        [=[vdd-shader-inventory.json]=]
+        [=[local-test-only-non-production]=])
+    assert_file_contains_literal(
+        "scripts/windows/build-full-profile.ps1"
+        "${full_profile_build_only_contract}"
+        "The build-only full-profile lane must retain ${full_profile_build_only_contract}")
 endforeach()
 assert_file_contains_literal(
     "scripts/windows/sign-full-profile-local-test.ps1"
