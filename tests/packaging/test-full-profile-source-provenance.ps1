@@ -8,6 +8,9 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("lumen-source-provenance-" + [
 $sourceRoot = Join-Path $testRoot "mutable-source"
 $freezeRoot = Join-Path $testRoot "freeze"
 $verifiedRoot = Join-Path $testRoot "verified-source"
+$explicitTarFreezeRoot = Join-Path $testRoot "freeze-explicit-tar"
+$explicitTarVerifiedRoot = Join-Path $testRoot "verified-source-explicit-tar"
+$directManifestRoot = Join-Path $testRoot "direct-source-manifest"
 $tamperRoot = Join-Path $testRoot "tamper-output"
 
 try {
@@ -152,11 +155,85 @@ try {
         -SourceRoot $sourceRoot `
         -OutputDirectory $freezeRoot `
         -SharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256 | Out-Null
+    & (Join-Path $root "scripts/windows/freeze-full-profile-source.ps1") `
+        -SourceRoot $sourceRoot `
+        -OutputDirectory $directManifestRoot `
+        -SharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256 `
+        -SkipArchive | Out-Null
+    $directProvenance = Get-FullProfileDirectSourceProvenance `
+        -SourceRoot $sourceRoot `
+        -ManifestDirectory $directManifestRoot `
+        -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256
+    if ($directProvenance.SourceRoot -cne (Resolve-Path -LiteralPath $sourceRoot).Path -or
+        $directProvenance.FileCount -ne 13 -or
+        $directProvenance.ArchiveSha256 -cne $script:FullProfileSkippedArchiveSha256 -or
+        $null -ne $directProvenance.ArchivePath -or
+        (Test-Path -LiteralPath (Join-Path $directManifestRoot "full-profile-files.txt")) -or
+        (Test-Path -LiteralPath (Join-Path $directManifestRoot "lumen-full-profile-source.tar.gz"))) {
+        throw "Build-only direct source manifest unexpectedly created an archive boundary."
+    }
+    $gnuTarCandidates = @(
+        Get-Command gtar, tar.exe, tar -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Source
+    )
+    if ($IsWindows) {
+        $gnuTarCandidates += @(
+            (Join-Path $env:ProgramFiles "Git\usr\bin\tar.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "Git\usr\bin\tar.exe"),
+            "C:\msys64\usr\bin\tar.exe"
+        )
+    }
+    $localGnuTar = @($gnuTarCandidates | Select-Object -Unique |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Where-Object {
+            $candidate = $_
+            try {
+                $version = @(& $candidate --version 2>$null | Select-Object -First 1)
+                $version.Count -eq 1 -and $version[0] -match 'GNU tar'
+            } catch {
+                $false
+            }
+        } | Select-Object -First 1)
+    if ($localGnuTar.Count -eq 1) {
+        & (Join-Path $root "scripts/windows/freeze-full-profile-source.ps1") `
+            -SourceRoot $sourceRoot `
+            -OutputDirectory $explicitTarFreezeRoot `
+            -SharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256 `
+            -ArchiveCreateTarPath $localGnuTar[0] | Out-Null
+        $explicitTarProvenance = Expand-VerifiedFullProfileSource `
+            -FreezeDirectory $explicitTarFreezeRoot `
+            -DestinationDirectory $explicitTarVerifiedRoot `
+            -MutableSourceRoot $sourceRoot `
+            -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256
+        $explicitTarSourcePath = Join-Path $explicitTarVerifiedRoot "product-source.txt"
+        $explicitTarLinkPath = Join-Path $explicitTarVerifiedRoot "product-source-link.txt"
+        $explicitTarLinkItem = Get-Item -LiteralPath $explicitTarLinkPath
+        if ($explicitTarProvenance.FileCount -ne 13 -or
+            -not (Test-Path -LiteralPath $explicitTarSourcePath -PathType Leaf) -or
+            (Get-Content -LiteralPath $explicitTarLinkPath -Raw) -cne "frozen-content" -or
+            $explicitTarLinkItem.LinkType -or
+            $explicitTarLinkItem.Length -ne ([Text.UTF8Encoding]::new($false).GetByteCount("frozen-content"))) {
+            throw "Explicit GNU archive creation did not preserve the dereferenced safe-link contract."
+        }
+    }
     [IO.File]::WriteAllText(
         (Join-Path $sourceRoot "product-source.txt"),
         "mutable-content",
         [Text.UTF8Encoding]::new($false)
     )
+    $directMutationRejected = $false
+    try {
+        Get-FullProfileDirectSourceProvenance `
+            -SourceRoot $sourceRoot `
+            -ManifestDirectory $directManifestRoot `
+            -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256 | Out-Null
+    } catch {
+        $directMutationRejected = $_.Exception.Message -like
+            'Full-profile source changed before direct source manifest validation:*'
+    }
+    if (-not $directMutationRejected) {
+        throw "Direct source manifest did not reject checkout mutation."
+    }
 
     $provenance = Expand-VerifiedFullProfileSource `
         -FreezeDirectory $freezeRoot `

@@ -504,7 +504,7 @@ function Read-ExportedDriverPackage {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "The exported Lumen Virtual Display package contains a reparse point."
         }
-        [ordered]@{
+        [pscustomobject][ordered]@{
             RelativePath = $fullPath.Substring($backupRoot.Length)
             FileName = [IO.Path]::GetFileName($fullPath)
             Sha256 = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash.ToUpperInvariant()

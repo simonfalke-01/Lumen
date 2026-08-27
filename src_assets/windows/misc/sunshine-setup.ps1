@@ -20,6 +20,9 @@ param(
     [switch]$Msi,
 
     [Parameter(Mandatory=$false)]
+    [string]$InstallRoot,
+
+    [Parameter(Mandatory=$false)]
     [string]$ProductCode,
 
     [Parameter(Mandatory=$false)]
@@ -332,7 +335,27 @@ if (-not $isAdmin) {
 
 # Get the script directory and root directory
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RootDir = Split-Path -Parent $ScriptDir
+$RootDir = if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
+    [IO.Path]::GetFullPath($InstallRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+} else {
+    Split-Path -Parent $ScriptDir
+}
+if ([string]::IsNullOrWhiteSpace($InstallRoot) -and
+    $Action -in @("rollback", "commit", "resume")) {
+    $persistedIdentityState = Join-Path $ScriptDir "protocol-v3-identity-rollback.json"
+    if (Test-Path -LiteralPath $persistedIdentityState -PathType Leaf) {
+        $persistedInstallRoot = [string](
+            Get-Content -LiteralPath $persistedIdentityState -Raw | ConvertFrom-Json
+        ).InstallRoot
+        if (-not [string]::IsNullOrWhiteSpace($persistedInstallRoot)) {
+            $RootDir = [IO.Path]::GetFullPath($persistedInstallRoot).TrimEnd(
+                [IO.Path]::DirectorySeparatorChar,
+                [IO.Path]::AltDirectorySeparatorChar)
+        }
+    }
+}
 
 # Set up transcript logging
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -1344,6 +1367,7 @@ function Register-DriverResumeTask {
         "-File", ('"{0}"' -f $resumeScript),
         "-Action", "resume",
         "-Silent",
+        "-InstallRoot", ('"{0}"' -f $RootDir),
         "-ProductCode", ('"{0}"' -f $ProductCode),
         "-TransactionKind", $TransactionKind,
         "-InstallVirtualHid", $(if ($virtualHidSelected) { "1" } else { "0" }),

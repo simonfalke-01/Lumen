@@ -643,10 +643,14 @@ foreach(full_profile_clean_boundary IN ITEMS
         "The full-profile builder must clean generated boundary ${full_profile_clean_boundary}")
 endforeach()
 foreach(full_profile_archive_stream_contract IN ITEMS
+        [=[[string]$ArchiveCreateTarPath]=]
         [=[Write-FullProfileTarList -Paths ([string[]]$files.RelativePath)]=]
+        [=[$tarStartInfo.Environment['PATH']]=]
+        [=[$tarDirectory + [IO.Path]::PathSeparator]=]
         [=[$tarStartInfo.RedirectStandardOutput = $true]=]
         [=[$tarStartInfo.RedirectStandardError = $true]=]
         [=[@('-czh', '-f', '-', '-C', $SourceRoot, '-T', $listPath)]=]
+        [=[@('-czh', '--hard-dereference', '-f', '-', '-C', $SourceRoot, '-T', $listPath)]=]
         [=[$tarProcess.StandardError.ReadToEndAsync()]=]
         [=[$tarProcess.StandardOutput.BaseStream.CopyTo($archiveStream)]=]
         [=[$tarProcess.WaitForExit(5000)]=]
@@ -656,6 +660,15 @@ foreach(full_profile_archive_stream_contract IN ITEMS
         "scripts/windows/freeze-full-profile-source.ps1"
         "${full_profile_archive_stream_contract}"
         "Source freeze must retain streamed archive contract ${full_profile_archive_stream_contract}")
+endforeach()
+foreach(full_profile_archive_builder_contract IN ITEMS
+        [=[Join-Path $Msys2Root "usr\bin\tar.exe"]=]
+        [=['-ArchiveCreateTarPath']=]
+        [=[msys2-tar]=])
+    assert_file_contains_literal(
+        "scripts/windows/build-full-profile.ps1"
+        "${full_profile_archive_builder_contract}"
+        "Full-profile builds must retain archive creator contract ${full_profile_archive_builder_contract}")
 endforeach()
 assert_file_excludes(
     "scripts/windows/freeze-full-profile-source.ps1"
@@ -691,6 +704,12 @@ assert_file_excludes(
     "Windows CI must never downgrade the canonical build to the legacy profile")
 foreach(full_profile_build_only_contract IN ITEMS
         [=[FULL_PROFILE_BUILD_STATUS=driver-submission-ready]=]
+        [=[[switch]$SkipSourceArchive]=]
+        [=[-SkipSourceArchive is permitted only with -BuildOnly.]=]
+        [=[Get-FullProfileDirectSourceProvenance]=]
+        [=['-SkipArchive']=]
+        [=[/p:IntDir=$shimIntermediateOutput\]=]
+        [=[MsQuic shim output validation]=]
         [=[-DPython3_ROOT_DIR=]=]
         [=[-DPython3_EXECUTABLE=]=]
         [=[[string]$WdkApiValidatorBinRoot]=]
@@ -705,6 +724,10 @@ foreach(full_profile_build_only_contract IN ITEMS
         "${full_profile_build_only_contract}"
         "The build-only full-profile lane must retain ${full_profile_build_only_contract}")
 endforeach()
+assert_file_contains_literal(
+    "scripts/windows/freeze-full-profile-source.ps1"
+    [=[SKIPPED-BUILD-ONLY]=]
+    "Build-only direct source manifests must use the explicit skipped-archive sentinel")
 assert_file_contains_literal(
     "scripts/windows/sign-full-profile-local-test.ps1"
     [=[purpose = "local-test-only"]=]

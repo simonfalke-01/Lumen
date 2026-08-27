@@ -90,6 +90,10 @@ if(NOT Boost_FOUND)
     set(Boost_FOUND TRUE)  # cmake-lint: disable=C0103
     set(Boost_INCLUDE_DIRS  # cmake-lint: disable=C0103
             "$<BUILD_INTERFACE:${Boost_SOURCE_DIR}/libs/headers/include>")
+    foreach(component IN LISTS BOOST_COMPONENTS)
+        list(APPEND Boost_INCLUDE_DIRS
+                "$<BUILD_INTERFACE:${Boost_SOURCE_DIR}/libs/${component}/include>")
+    endforeach()
 
     if(WIN32)
         # Windows build is failing to create .h file in this directory

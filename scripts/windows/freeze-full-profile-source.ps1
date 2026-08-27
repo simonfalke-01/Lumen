@@ -8,7 +8,11 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-f]{64}$')]
-    [string]$SharedSourceFreezeManifestSha256
+    [string]$SharedSourceFreezeManifestSha256,
+
+    [string]$ArchiveCreateTarPath,
+
+    [switch]$SkipArchive
 )
 
 Set-StrictMode -Version Latest
@@ -45,82 +49,106 @@ $hashRows = @(
 $fileManifestPath = Join-Path $OutputDirectory "full-profile-files.json"
 $hashRows | ConvertTo-Json -Depth 4 | Set-Content $fileManifestPath -Encoding UTF8
 
-$listPath = Join-Path $OutputDirectory "full-profile-files.txt"
-Write-FullProfileTarList -Paths ([string[]]$files.RelativePath) -ListPath $listPath
-$archivePath = Join-Path $OutputDirectory "lumen-full-profile-source.tar.gz"
-$tarCommand = Get-Command tar.exe, tar -CommandType Application -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-if ($null -eq $tarCommand) {
-    throw 'tar is required for full-profile source freezing.'
-}
-$tarStartInfo = [Diagnostics.ProcessStartInfo]::new()
-$tarStartInfo.FileName = $tarCommand.Source
-$tarStartInfo.UseShellExecute = $false
-$tarStartInfo.RedirectStandardOutput = $true
-$tarStartInfo.RedirectStandardError = $true
-foreach ($argument in @('-czh', '-f', '-', '-C', $SourceRoot, '-T', $listPath)) {
-    $tarStartInfo.ArgumentList.Add($argument)
-}
-$tarProcess = [Diagnostics.Process]::new()
-$tarProcess.StartInfo = $tarStartInfo
-$archiveStream = $null
-$stderrTask = $null
-$tarStarted = $false
-$tarExitCode = $null
-$tarError = $null
-$tarFailure = $null
-try {
-    $archiveStream = [IO.File]::Open(
-        $archivePath,
-        [IO.FileMode]::Create,
-        [IO.FileAccess]::Write,
-        [IO.FileShare]::None
-    )
-    $tarStarted = $tarProcess.Start()
-    if (-not $tarStarted) {
-        throw 'tar did not start.'
-    }
-    $stderrTask = $tarProcess.StandardError.ReadToEndAsync()
-    $tarProcess.StandardOutput.BaseStream.CopyTo($archiveStream)
-    $archiveStream.Flush()
-    $tarProcess.WaitForExit()
-    $tarExitCode = $tarProcess.ExitCode
-    $tarError = $stderrTask.GetAwaiter().GetResult()
-} catch {
-    $tarFailure = $_
-    $tarExitedAfterFailure = $false
-    if ($tarStarted) {
-        try {
-            if (-not $tarProcess.HasExited) {
-                $tarProcess.Kill($true)
-                [void]$tarProcess.WaitForExit(5000)
-            }
-            $tarExitedAfterFailure = $tarProcess.HasExited
-        } catch {
-            # The original archive failure remains authoritative.
+$listPath = $null
+$archivePath = $null
+if (-not $SkipArchive) {
+    $listPath = Join-Path $OutputDirectory "full-profile-files.txt"
+    Write-FullProfileTarList -Paths ([string[]]$files.RelativePath) -ListPath $listPath
+    $archivePath = Join-Path $OutputDirectory "lumen-full-profile-source.tar.gz"
+    if ([string]::IsNullOrWhiteSpace($ArchiveCreateTarPath)) {
+        $tarCommand = Get-Command tar.exe, tar -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -eq $tarCommand) {
+            throw 'tar is required for full-profile source freezing.'
         }
+        $archiveCreateTar = $tarCommand.Source
+    } else {
+        if (-not (Test-Path -LiteralPath $ArchiveCreateTarPath -PathType Leaf)) {
+            throw "Archive creation tar is missing: $ArchiveCreateTarPath"
+        }
+        $archiveCreateTar = (Resolve-Path -LiteralPath $ArchiveCreateTarPath).Path
     }
-    if ($null -ne $stderrTask -and $tarExitedAfterFailure) {
-        try { $tarError = $stderrTask.GetAwaiter().GetResult() } catch {}
+    $tarStartInfo = [Diagnostics.ProcessStartInfo]::new()
+    $tarStartInfo.FileName = $archiveCreateTar
+    $tarStartInfo.UseShellExecute = $false
+    $tarStartInfo.RedirectStandardOutput = $true
+    $tarStartInfo.RedirectStandardError = $true
+    $tarDirectory = Split-Path -Parent $archiveCreateTar
+    $existingChildPath = [string]$tarStartInfo.Environment['PATH']
+    $tarStartInfo.Environment['PATH'] = if ([string]::IsNullOrWhiteSpace($existingChildPath)) {
+        $tarDirectory
+    } else {
+        $tarDirectory + [IO.Path]::PathSeparator + $existingChildPath
     }
-} finally {
-    if ($null -ne $archiveStream) { $archiveStream.Dispose() }
-    $tarProcess.Dispose()
-}
-if (-not [string]::IsNullOrWhiteSpace([string]$tarError)) {
-    [Console]::Error.Write([string]$tarError)
-}
-if ($null -ne $tarFailure -or $tarExitCode -ne 0) {
-    Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
-    if ($null -ne $tarFailure) {
-        throw "tar failed while streaming the source archive: $($tarFailure.Exception.Message)"
+    $tarArguments = if ([string]::IsNullOrWhiteSpace($ArchiveCreateTarPath)) {
+        @('-czh', '-f', '-', '-C', $SourceRoot, '-T', $listPath)
+    } else {
+        @('-czh', '--hard-dereference', '-f', '-', '-C', $SourceRoot, '-T', $listPath)
     }
-    throw "tar failed with exit code $tarExitCode."
-}
-if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
-    (Get-Item -LiteralPath $archivePath).Length -le 0) {
-    Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
-    throw 'tar produced an empty source archive.'
+    foreach ($argument in $tarArguments) {
+        $tarStartInfo.ArgumentList.Add($argument)
+    }
+    $tarProcess = [Diagnostics.Process]::new()
+    $tarProcess.StartInfo = $tarStartInfo
+    $archiveStream = $null
+    $stderrTask = $null
+    $tarStarted = $false
+    $tarExitCode = $null
+    $tarError = $null
+    $tarFailure = $null
+    try {
+        $archiveStream = [IO.File]::Open(
+            $archivePath,
+            [IO.FileMode]::Create,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        $tarStarted = $tarProcess.Start()
+        if (-not $tarStarted) {
+            throw 'tar did not start.'
+        }
+        $stderrTask = $tarProcess.StandardError.ReadToEndAsync()
+        $tarProcess.StandardOutput.BaseStream.CopyTo($archiveStream)
+        $archiveStream.Flush()
+        $tarProcess.WaitForExit()
+        $tarExitCode = $tarProcess.ExitCode
+        $tarError = $stderrTask.GetAwaiter().GetResult()
+    } catch {
+        $tarFailure = $_
+        $tarExitedAfterFailure = $false
+        if ($tarStarted) {
+            try {
+                if (-not $tarProcess.HasExited) {
+                    $tarProcess.Kill($true)
+                    [void]$tarProcess.WaitForExit(5000)
+                }
+                $tarExitedAfterFailure = $tarProcess.HasExited
+            } catch {
+                # The original archive failure remains authoritative.
+            }
+        }
+        if ($null -ne $stderrTask -and $tarExitedAfterFailure) {
+            try { $tarError = $stderrTask.GetAwaiter().GetResult() } catch {}
+        }
+    } finally {
+        if ($null -ne $archiveStream) { $archiveStream.Dispose() }
+        $tarProcess.Dispose()
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$tarError)) {
+        [Console]::Error.Write([string]$tarError)
+    }
+    if ($null -ne $tarFailure -or $tarExitCode -ne 0) {
+        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+        if ($null -ne $tarFailure) {
+            throw "tar failed while streaming the source archive: $($tarFailure.Exception.Message)"
+        }
+        throw "tar failed with exit code $tarExitCode."
+    }
+    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
+        (Get-Item -LiteralPath $archivePath).Length -le 0) {
+        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+        throw 'tar produced an empty source archive.'
+    }
 }
 
 $msquicManifestPath = Join-Path $SourceRoot "src/platform/windows/msquic_shim/manifest.json"
@@ -171,10 +199,18 @@ $freeze = [ordered]@{
         name = [IO.Path]::GetFileName($fileManifestPath)
         sha256 = (Get-FileHash $fileManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    archive = [ordered]@{
-        name = [IO.Path]::GetFileName($archivePath)
-        bytes = (Get-Item $archivePath).Length
-        sha256 = (Get-FileHash $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    archive = if ($SkipArchive) {
+        [ordered]@{
+            name = 'SKIPPED-BUILD-ONLY'
+            bytes = 0
+            sha256 = $script:FullProfileSkippedArchiveSha256
+        }
+    } else {
+        [ordered]@{
+            name = [IO.Path]::GetFileName($archivePath)
+            bytes = (Get-Item $archivePath).Length
+            sha256 = (Get-FileHash $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
     }
     identities = [ordered]@{
         msquicShimAbi = [int]$msquicManifest.abi
@@ -196,8 +232,10 @@ $freeze = [ordered]@{
 }
 $freezePath = Join-Path $OutputDirectory "full-profile-source-freeze.json"
 $freeze | ConvertTo-Json -Depth 8 | Set-Content $freezePath -Encoding UTF8
-Remove-Item -LiteralPath $listPath -Force
+if ($null -ne $listPath) {
+    Remove-Item -LiteralPath $listPath -Force
+}
 
-Write-Output "SOURCE_ARCHIVE=$archivePath"
+Write-Output "SOURCE_ARCHIVE=$(if ($SkipArchive) { 'SKIPPED-BUILD-ONLY' } else { $archivePath })"
 Write-Output "SOURCE_ARCHIVE_SHA256=$($freeze.archive.sha256)"
 Write-Output "SOURCE_FREEZE=$freezePath"

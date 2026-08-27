@@ -81,7 +81,7 @@ file(SHA256 "${CMAKE_SOURCE_DIR}/src/platform/windows/msquic_shim/LumenMsQuicShi
 if(NOT _lumen_msquic_shim_header_sha256 STREQUAL
        "0649ca20aeb3a883200842456ffee4ac1e76f07144a41b972d666c4cb10267fa" OR
    NOT _lumen_msquic_shim_source_sha256 STREQUAL
-       "72ded95fa3d1f57846c1b22186aa79c4e1f1a50062534492c80d94747c032db1" OR
+       "68339e438be01d01fc99cf4a43a154e69a336ee8197768d1e928e7ded6a216a4" OR
    NOT _lumen_msquic_shim_cng_journal_sha256 STREQUAL
        "7fb567a6ac16050bc7b2b4bd1da650644a49958bae6aed0b683ca37b69d24962" OR
    NOT _lumen_msquic_shim_project_sha256 STREQUAL

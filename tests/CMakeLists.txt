@@ -88,6 +88,7 @@ target_include_directories(lumen_video_egress_queue_tests PRIVATE ${CMAKE_SOURCE
 target_link_libraries(lumen_video_egress_queue_tests PRIVATE
         gtest_main
         Threads::Threads
+        ${Boost_LIBRARIES}
         ${FFMPEG_LIBRARIES})
 if(WIN32)
     target_link_libraries(lumen_video_egress_queue_tests PRIVATE bcrypt)

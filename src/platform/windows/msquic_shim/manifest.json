@@ -4,7 +4,7 @@
   "toolset": "v143",
   "msquic_version": "2.6.0",
   "header_sha256": "0649ca20aeb3a883200842456ffee4ac1e76f07144a41b972d666c4cb10267fa",
-  "source_sha256": "72ded95fa3d1f57846c1b22186aa79c4e1f1a50062534492c80d94747c032db1",
+  "source_sha256": "68339e438be01d01fc99cf4a43a154e69a336ee8197768d1e928e7ded6a216a4",
   "cng_key_journal_sha256": "7fb567a6ac16050bc7b2b4bd1da650644a49958bae6aed0b683ca37b69d24962",
   "project_sha256": "36be00e3274561990716bd952c8f7d178feb898b3cd2c64acba7956e57f90aef",
   "msquic_header_sha256": "ebd3499686c2b3008ed0ee5b06dae1a62a50192816abfe9a67bbbba97cabb861",

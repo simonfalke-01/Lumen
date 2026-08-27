@@ -239,7 +239,7 @@
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
     <SetProperty Id="CA_LumenUninstallCommit"
                  Action="SetLumenUninstallCommitData"
-                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\lumen-setup.ps1&quot; -Action commit -Silent -Msi -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID] -InstallVirtualMicrophone [LUMEN_INSTALL_VMIC] -InstallVirtualDisplay [LUMEN_INSTALL_VDD] -RemoveVirtualDisplay [LUMEN_REMOVE_VDD] -IdentityDisposition remove -UpgradeOwnedVirtualDisplay 0 -UpgradeVddOwnerProduct &quot;&quot;"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[CommonAppDataFolder]LumenVirtualHidInstallerV2\[ProductCode]\uninstall\lumen-setup.ps1&quot; -Action commit -Silent -Msi -InstallRoot &quot;[INSTALL_ROOT]&quot; -ProductCode &quot;[ProductCode]&quot; -TransactionKind uninstall -InstallVirtualHid [LUMEN_INSTALL_VHID] -InstallVirtualMicrophone [LUMEN_INSTALL_VMIC] -InstallVirtualDisplay [LUMEN_INSTALL_VDD] -RemoveVirtualDisplay [LUMEN_REMOVE_VDD] -IdentityDisposition remove -UpgradeOwnedVirtualDisplay 0 -UpgradeVddOwnerProduct &quot;&quot;"
                  After="SetLumenUninstallData" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"/>
   </Fragment>

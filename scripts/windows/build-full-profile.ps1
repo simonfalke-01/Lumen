@@ -37,6 +37,8 @@ param(
 
     [switch]$BuildOnly,
 
+    [switch]$SkipSourceArchive,
+
     [switch]$UsePreparedDriverSubmission,
 
     [string]$Configuration = "Release"
@@ -68,6 +70,9 @@ $StagingRoot = [IO.Path]::GetFullPath($StagingRoot)
 if ($UsePreparedDriverSubmission -and
     (-not $BuildOnly -or [string]::IsNullOrWhiteSpace($SignedDriverRoot))) {
     throw '-UsePreparedDriverSubmission requires -BuildOnly and -SignedDriverRoot.'
+}
+if ($SkipSourceArchive -and -not $BuildOnly) {
+    throw '-SkipSourceArchive is permitted only with -BuildOnly.'
 }
 if ($BuildOnly) {
     if (-not [string]::IsNullOrWhiteSpace($SharedSourceFreezeManifestPath) -or
@@ -243,6 +248,11 @@ if ($missingWdkTools.Count -ne 0) {
     throw "Required x64 WDK tools are missing: $($missingWdkTools -join ', ')"
 }
 $msysShell = Resolve-Tool (Join-Path $Msys2Root "msys2_shell.cmd") "MSYS2 shell"
+$msysTar = if ($SkipSourceArchive) {
+    $null
+} else {
+    Resolve-Tool (Join-Path $Msys2Root "usr\bin\tar.exe") "MSYS2 tar"
+}
 
 if ([string]::IsNullOrWhiteSpace($PythonPath)) {
     $pythonCommand = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue |
@@ -317,33 +327,46 @@ if (-not $UsePreparedDriverSubmission) {
     if (Test-Path -LiteralPath $freezeDirectory) {
         Remove-Item -LiteralPath $freezeDirectory -Recurse -Force
     }
+    $freezeArguments = @(
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-File',
+        (Join-Path $SourceRoot 'scripts\windows\freeze-full-profile-source.ps1'),
+        '-SourceRoot',
+        $SourceRoot,
+        '-OutputDirectory',
+        $freezeDirectory,
+        '-SharedSourceFreezeManifestSha256',
+        $sharedSourceFreezeManifestSha256
+    )
+    if ($SkipSourceArchive) {
+        $freezeArguments += '-SkipArchive'
+    } else {
+        $freezeArguments += @('-ArchiveCreateTarPath', $msysTar)
+    }
     [void](Invoke-MandatoryGate6Command `
         -RunId 'lumen-source-freeze' `
         -FilePath $powerShellExecutable `
-        -Arguments @(
-            '-NoLogo',
-            '-NoProfile',
-            '-NonInteractive',
-            '-File',
-            (Join-Path $SourceRoot 'scripts\windows\freeze-full-profile-source.ps1'),
-            '-SourceRoot',
-            $SourceRoot,
-            '-OutputDirectory',
-            $freezeDirectory,
-            '-SharedSourceFreezeManifestSha256',
-            $sharedSourceFreezeManifestSha256
-        ) `
+        -Arguments $freezeArguments `
         -WorkingDirectory $SourceRoot `
         -ToolchainIds @('windows-powershell'))
 } elseif (-not (Test-Path -LiteralPath $freezeDirectory -PathType Container)) {
     throw "Prepared source freeze is missing: $freezeDirectory"
 }
 $mutableSourceRoot = $SourceRoot
-$sourceProvenance = Expand-VerifiedFullProfileSource `
-    -FreezeDirectory $freezeDirectory `
-    -DestinationDirectory (Join-Path $StagingRoot "verified-source") `
-    -MutableSourceRoot $mutableSourceRoot `
-    -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256
+$sourceProvenance = if ($SkipSourceArchive) {
+    Get-FullProfileDirectSourceProvenance `
+        -SourceRoot $mutableSourceRoot `
+        -ManifestDirectory $freezeDirectory `
+        -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256
+} else {
+    Expand-VerifiedFullProfileSource `
+        -FreezeDirectory $freezeDirectory `
+        -DestinationDirectory (Join-Path $StagingRoot "verified-source") `
+        -MutableSourceRoot $mutableSourceRoot `
+        -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256
+}
 $SourceRoot = $sourceProvenance.SourceRoot
 $sourceFilesManifestSha256 = $sourceProvenance.FilesManifestSha256
 
@@ -471,11 +494,12 @@ $shimProject = Join-Path $SourceRoot "src\platform\windows\msquic_shim\LumenMsQu
     -FilesManifestPath $sourceProvenance.FilesManifestPath `
     -Boundary $(if ($UsePreparedDriverSubmission) { 'prepared driver reuse' } else { 'MsQuic shim build' }))
 $shimOutput = Join-Path $StagingRoot "msquic-shim"
+$shimIntermediateOutput = Join-Path $shimOutput "obj"
 if (-not $UsePreparedDriverSubmission) {
     if (Test-Path -LiteralPath $shimOutput) {
         Remove-Item -LiteralPath $shimOutput -Recurse -Force
     }
-    New-Item -ItemType Directory -Path $shimOutput -Force | Out-Null
+    New-Item -ItemType Directory -Path $shimOutput, $shimIntermediateOutput -Force | Out-Null
     [void](Invoke-MandatoryGate6Command `
         -RunId 'msquic-shim-msbuild' `
         -FilePath $msbuild `
@@ -487,13 +511,18 @@ if (-not $UsePreparedDriverSubmission) {
             '/p:Configuration=Release',
             '/p:Platform=x64',
             "/p:MsQuicRoot=$MsQuicPackageRoot",
-            "/p:OutDir=$shimOutput\"
+            "/p:OutDir=$shimOutput\",
+            "/p:IntDir=$shimIntermediateOutput\"
         ) `
         -WorkingDirectory $SourceRoot `
         -ToolchainIds @('windows-msbuild-wdk'))
 } elseif (-not (Test-Path -LiteralPath $shimOutput -PathType Container)) {
     throw "Prepared MsQuic shim directory is missing: $shimOutput"
 }
+[void](Assert-FullProfileSourceSnapshot `
+    -SourceRoot $SourceRoot `
+    -FilesManifestPath $sourceProvenance.FilesManifestPath `
+    -Boundary 'MsQuic shim output validation')
 $shimDll = Join-Path $shimOutput "lumen_msquic_shim.dll"
 $shimLib = Join-Path $shimOutput "lumen_msquic_shim.lib"
 $shimManifest = Join-Path $shimOutput "manifest.json"
@@ -916,6 +945,7 @@ if (-not $BuildOnly) {
         [ordered]@{ id = 'universal-ddis'; path = $universalDdis.FullName },
         [ordered]@{ id = 'signtool'; path = $signTool.FullName },
         [ordered]@{ id = 'msys2-shell'; path = $msysShell },
+        [ordered]@{ id = 'msys2-tar'; path = $msysTar },
         [ordered]@{ id = 'python'; path = $PythonPath },
         [ordered]@{ id = 'dotnet'; path = $dotnetExecutable },
         [ordered]@{ id = 'npm'; path = $npmExecutable },

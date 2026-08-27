@@ -93,6 +93,7 @@ if(WIN32)
                 NVENC_NAMESPACE=nvenc_${sdk_version}
                 NVENC_SDK_VERSION=${sdk_version}
         )
+        target_link_libraries(${target_name} PRIVATE ${Boost_LIBRARIES})
         target_compile_options(${target_name} PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
     endfunction()
 

@@ -475,7 +475,12 @@ namespace {
     const probe_result &control,
     const pnp_diagnostic &pnp
   ) {
-    std::wcerr << L"result=error code=" << static_cast<int>(exit_code::mutation_failed)
+    const exit_code result = root_count == 1 ?
+                               exit_code::reboot_required :
+                               exit_code::mutation_failed;
+    std::wcerr << L"result="
+               << (result == exit_code::reboot_required ? L"reboot-required" : L"error")
+               << L" code=" << static_cast<int>(result)
                << L" operation=verify-driver-readiness win32=" << ERROR_NOT_READY
                << L" roots_ready=" << (root_count == 1 ? 1 : 0)
                << L" tree_ready=" << (tree_started ? 1 : 0)
@@ -516,7 +521,7 @@ namespace {
       std::wcerr << L" cm_error=" << pnp.error;
     }
     std::wcerr << L'\n';
-    return static_cast<int>(exit_code::mutation_failed);
+    return static_cast<int>(result);
   }
 
   /** Query and validate the exact control-device ABI. */

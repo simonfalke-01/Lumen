@@ -11,6 +11,7 @@ $script:FullProfileExcludedDirectoryNames = @(
     '.wix',
     'node_modules'
 )
+$script:FullProfileSkippedArchiveSha256 = '0' * 64
 
 function Write-FullProfileTarList {
     param(
@@ -217,6 +218,70 @@ function Assert-FullProfileSourceSnapshot {
         Boundary = $Boundary
         FileCount = $actualFiles.Count
         FilesManifestSha256 = (Get-FileHash -LiteralPath $FilesManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+
+function Get-FullProfileDirectSourceProvenance {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSharedSourceFreezeManifestSha256
+    )
+
+    $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path
+    $ManifestDirectory = (Resolve-Path -LiteralPath $ManifestDirectory).Path
+    $freezeManifestPath = Join-Path $ManifestDirectory 'full-profile-source-freeze.json'
+    $filesManifestPath = Join-Path $ManifestDirectory 'full-profile-files.json'
+    foreach ($path in @($freezeManifestPath, $filesManifestPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Direct source manifest is missing: $path"
+        }
+    }
+
+    $freezeManifest = Get-Content -LiteralPath $freezeManifestPath -Raw | ConvertFrom-Json
+    if ([int]$freezeManifest.schema -ne 1 -or
+        [int64]$freezeManifest.fileCount -le 0 -or
+        [string]$freezeManifest.sharedSourceFreezeSchema -cne
+            'umbra-lumen/source-freeze-manifest/1' -or
+        [string]$freezeManifest.sharedSourceFreezeManifestSha256 -cne
+            $ExpectedSharedSourceFreezeManifestSha256 -or
+        [string]$freezeManifest.filesManifest.name -cne 'full-profile-files.json' -or
+        [string]$freezeManifest.archive.name -cne 'SKIPPED-BUILD-ONLY' -or
+        [int64]$freezeManifest.archive.bytes -ne 0 -or
+        [string]$freezeManifest.archive.sha256 -cne $script:FullProfileSkippedArchiveSha256) {
+        throw 'Direct source manifest is invalid.'
+    }
+
+    $filesManifestSha256 =
+        (Get-FileHash -LiteralPath $filesManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ([string]$freezeManifest.filesManifest.sha256 -cne $filesManifestSha256) {
+        throw 'Direct source file manifest hash does not match the source manifest.'
+    }
+    $fileRows = @(Read-FullProfileFilesManifest $filesManifestPath)
+    if ($fileRows.Count -ne [int]$freezeManifest.fileCount) {
+        throw 'Direct source file manifest count does not match the source manifest.'
+    }
+    [void](Assert-FullProfileSourceSnapshot `
+        -SourceRoot $SourceRoot `
+        -FilesManifestPath $filesManifestPath `
+        -Boundary 'direct source manifest validation')
+
+    return [pscustomobject]@{
+        SourceRoot = $SourceRoot
+        FileCount = $fileRows.Count
+        FilesManifestSha256 = $filesManifestSha256
+        ArchiveSha256 = $script:FullProfileSkippedArchiveSha256
+        FreezeManifestSha256 =
+            (Get-FileHash -LiteralPath $freezeManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        FilesManifestPath = $filesManifestPath
+        FreezeManifestPath = $freezeManifestPath
+        ArchivePath = $null
+        SharedSourceFreezeManifestSha256 = $ExpectedSharedSourceFreezeManifestSha256
     }
 }
 
