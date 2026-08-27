@@ -958,4 +958,17 @@ namespace platf::dxgi {
    * @brief Return the exact adapter, driver, and output opened by the latest successful display initialization.
    */
   std::optional<::video::encoder_probe_device_identity_t> encoder_probe_device_identity();
+
+  /**
+   * @brief Record the exact adapter/output held by a successfully initialized capture backend.
+   *
+   * @param adapter Opened DXGI adapter.
+   * @param output Opened DXGI output.
+   * @param selection_intent Selection policy that produced the concrete binding.
+   */
+  void record_opened_encoder_device_identity(
+    IDXGIAdapter1 &adapter,
+    IDXGIOutput &output,
+    ::video::encoder_probe_selection_intent_t selection_intent
+  );
 }  // namespace platf::dxgi

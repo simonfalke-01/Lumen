@@ -890,6 +890,141 @@ TEST(VirtualDisplayDirectFrameValidation, RequiresExactUniqueTwoSlotResources) {
   EXPECT_FALSE(valid_frame_resources(resources, 9, mode_4k120));
 }
 
+TEST(VirtualDisplayDirectFrameValidation, ValidatesInitializationTransportPublisherAndImportedTexture) {
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::not_ready),
+    frame_io_e::empty
+  );
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::no_more_items),
+    frame_io_e::empty
+  );
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::retry),
+    frame_io_e::empty
+  );
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::revision_mismatch),
+    frame_io_e::stale_generation
+  );
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::invalid_state),
+    frame_io_e::stale_generation
+  );
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::invalid_data),
+    frame_io_e::invalid_data
+  );
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::invalid_parameter),
+    frame_io_e::invalid_data
+  );
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::not_supported),
+    frame_io_e::unsupported
+  );
+  EXPECT_EQ(
+    frame_io_from_transport_error(frame_transport_error_e::other),
+    frame_io_e::transport_error
+  );
+
+  constexpr std::uint32_t required_capabilities = 0b0111;
+  EXPECT_EQ(
+    validate_frame_abi_contract(frame_io_e::ok, 5, 5, 0b1111, required_capabilities),
+    frame_io_e::ok
+  );
+  EXPECT_EQ(
+    validate_frame_abi_contract(frame_io_e::transport_error, 5, 5, 0b1111, required_capabilities),
+    frame_io_e::transport_error
+  );
+  EXPECT_EQ(
+    validate_frame_abi_contract(frame_io_e::ok, 4, 5, 0b1111, required_capabilities),
+    frame_io_e::unsupported
+  );
+  EXPECT_EQ(
+    validate_frame_abi_contract(frame_io_e::ok, 5, 5, 0b0011, required_capabilities),
+    frame_io_e::unsupported
+  );
+
+  frame_channel_source_identity_t publisher {9, 42, 0, 1001, 0};
+  EXPECT_TRUE(valid_frame_channel_source_identity(publisher, 9));
+  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 0));
+  publisher.generation = 8;
+  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
+  publisher.generation = 9;
+  publisher.process_id = 0;
+  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
+  publisher.process_id = 42;
+  publisher.process_creation_time = 0;
+  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
+  publisher.process_creation_time = 1001;
+  publisher.source_reserved = 1;
+  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
+  publisher.source_reserved = 0;
+  publisher.response_reserved = 1;
+  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
+
+  const frame_resources_t resources {
+    9,
+    123,
+    mode_4k120.width,
+    mode_4k120.height,
+    frame_format_e::bgra8,
+    dynamic_range_e::sdr,
+    2,
+    {10, 11},
+    {12, 13},
+    1,
+    {frame_color_space_e::srgb, 80, hdr_metadata_type_e::none, {}},
+  };
+  frame_texture_descriptor_t descriptor {
+    resources.width,
+    resources.height,
+    resources.format,
+    1,
+    1,
+    1,
+    true,
+    true,
+    true,
+    true,
+    true,
+  };
+  EXPECT_TRUE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.width -= 2;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.width = resources.width;
+  descriptor.height -= 2;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.height = resources.height;
+  descriptor.format = frame_format_e::rgba16_float;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.format = resources.format;
+  descriptor.mip_levels = 2;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.mip_levels = 1;
+  descriptor.array_size = 2;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.array_size = 1;
+  descriptor.sample_count = 2;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.sample_count = 1;
+  descriptor.default_usage = false;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.default_usage = true;
+  descriptor.shader_resource = false;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.shader_resource = true;
+  descriptor.no_cpu_access = false;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.no_cpu_access = true;
+  descriptor.shared_nt_handle = false;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+  descriptor.shared_nt_handle = true;
+  descriptor.shared_keyed_mutex = false;
+  EXPECT_FALSE(valid_frame_texture_descriptor(descriptor, resources));
+}
+
 TEST(VirtualDisplayFrameAbi5Policy, ValidatesSdrHdrFormatsMetadataAndPixelPitch) {
   EXPECT_EQ(frame_format_pixel_pitch(frame_format_e::bgra8), 4U);
   EXPECT_EQ(frame_format_pixel_pitch(frame_format_e::rgba16_float), 8U);

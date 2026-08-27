@@ -88,6 +88,28 @@ TEST(VideoCaptureRecoveryTest, RequiredDirectSourceLossTerminatesInsteadOfReinit
     video::capture_reinitialization_e::terminate
   );
   EXPECT_EQ(video::display_initialization_attempts(direct_required), 1);
+
+  auto optional_sdr_vdd = ordinary;
+  optional_sdr_vdd.virtual_display_active = true;
+  EXPECT_EQ(
+    video::capture_reinitialization_action(optional_sdr_vdd),
+    video::capture_reinitialization_e::retry
+  );
+  EXPECT_EQ(video::display_initialization_attempts(optional_sdr_vdd), 2);
+
+  auto active_hdr_vdd = optional_sdr_vdd;
+  active_hdr_vdd.dynamicRange = 1;
+  EXPECT_EQ(
+    video::capture_reinitialization_action(active_hdr_vdd),
+    video::capture_reinitialization_e::terminate
+  );
+  EXPECT_EQ(video::display_initialization_attempts(active_hdr_vdd), 1);
+
+  active_hdr_vdd.virtual_display_active = false;
+  EXPECT_EQ(
+    video::capture_reinitialization_action(active_hdr_vdd),
+    video::capture_reinitialization_e::retry
+  );
 }
 
 TEST(VideoCodecInitializationTest, ExtractsOnlyH264ParameterSets) {
@@ -352,6 +374,21 @@ TEST(EncoderProbeCacheTest, AutomaticIntentSurvivesConcreteStreamOpenAndInvalida
   auto current = cached;
   current.device_identity = *launch_selection.selected();
   EXPECT_FALSE(cache.can_reuse(true, false, false, current));
+}
+
+TEST(EncoderProbeCacheTest, RetainedCaptureTargetSkipsDuplicateOutputSelfProbe) {
+  const auto opened = device_identity(2);
+  auto earlier = device_identity(1);
+  earlier.output_name = "\\\\.\\DISPLAY1";
+
+  EXPECT_FALSE(video::encoder_probe_capture_validation_required(opened, opened, true));
+  EXPECT_TRUE(video::encoder_probe_candidate_capture_supported(opened, opened, true, false));
+  EXPECT_FALSE(video::encoder_probe_candidate_capture_supported(opened, opened, false, true));
+
+  EXPECT_TRUE(video::encoder_probe_capture_validation_required(earlier, opened, true));
+  EXPECT_FALSE(video::encoder_probe_candidate_capture_supported(earlier, opened, true, false));
+  EXPECT_TRUE(video::encoder_probe_candidate_capture_supported(earlier, opened, true, true));
+  EXPECT_FALSE(video::encoder_probe_capture_validation_required(earlier, opened, false));
 }
 
 TEST(EncoderProbeCacheTest, ExplicitSelectionIgnoresUnmatchedEarlierOutput) {

@@ -172,6 +172,100 @@ namespace platf::virtual_display {
     stopped,  ///< Source was closed or quarantined.
   };
 
+  /** @brief Semantic platform error reported by the direct-frame device transport. */
+  enum class frame_transport_error_e {
+    not_ready,  ///< Driver resources are not published yet.
+    no_more_items,  ///< No completed frame is currently available.
+    retry,  ///< Driver explicitly requests a bounded retry.
+    revision_mismatch,  ///< Generation or lease revision is stale.
+    invalid_state,  ///< Driver generation state no longer matches the request.
+    invalid_data,  ///< Driver rejected malformed data.
+    invalid_parameter,  ///< Driver rejected an invalid request field.
+    not_supported,  ///< Required ABI or hardware behavior is unavailable.
+    other,  ///< Unclassified transport failure.
+  };
+
+  /**
+   * @brief Map a platform transport failure into the stable direct-frame contract.
+   *
+   * @param error Semantic platform transport error.
+   * @return Stable frame I/O result consumed by initialization and dequeue logic.
+   */
+  [[nodiscard]] constexpr frame_io_e frame_io_from_transport_error(
+    const frame_transport_error_e error
+  ) noexcept {
+    switch (error) {
+      case frame_transport_error_e::not_ready:
+      case frame_transport_error_e::no_more_items:
+      case frame_transport_error_e::retry:
+        return frame_io_e::empty;
+      case frame_transport_error_e::revision_mismatch:
+      case frame_transport_error_e::invalid_state:
+        return frame_io_e::stale_generation;
+      case frame_transport_error_e::invalid_data:
+      case frame_transport_error_e::invalid_parameter:
+        return frame_io_e::invalid_data;
+      case frame_transport_error_e::not_supported:
+        return frame_io_e::unsupported;
+      case frame_transport_error_e::other:
+        return frame_io_e::transport_error;
+    }
+    return frame_io_e::transport_error;
+  }
+
+  /**
+   * @brief Validate the direct-frame ABI response while preserving transport failures.
+   *
+   * @param transport_status Result of the ABI device request.
+   * @param actual_version Driver ABI version.
+   * @param expected_version Host ABI version.
+   * @param actual_capabilities Driver capability bitmap.
+   * @param required_capabilities Capabilities required by the selected SDR/HDR mode.
+   * @return Ok for an exact compatible ABI, transport status on I/O failure, or unsupported on mismatch.
+   */
+  [[nodiscard]] constexpr frame_io_e validate_frame_abi_contract(
+    const frame_io_e transport_status,
+    const std::uint32_t actual_version,
+    const std::uint32_t expected_version,
+    const std::uint32_t actual_capabilities,
+    const std::uint32_t required_capabilities
+  ) noexcept {
+    if (transport_status != frame_io_e::ok) {
+      return transport_status;
+    }
+    return actual_version == expected_version &&
+               (actual_capabilities & required_capabilities) == required_capabilities ?
+             frame_io_e::ok :
+             frame_io_e::unsupported;
+  }
+
+  /** @brief Generation and publisher identity returned by one frame-channel operation. */
+  struct frame_channel_source_identity_t {
+    std::uint64_t generation {};  ///< Exact active VDD generation.
+    std::uint32_t process_id {};  ///< Live WUDFHost publisher process.
+    std::uint32_t source_reserved {};  ///< Must be zero.
+    std::uint64_t process_creation_time {};  ///< PID-reuse-safe process creation time.
+    std::uint64_t response_reserved {};  ///< Must be zero.
+
+    bool operator==(const frame_channel_source_identity_t &) const = default;
+  };
+
+  /**
+   * @brief Validate a nonzero generation-scoped frame publisher identity.
+   *
+   * @param source Driver response identity.
+   * @param expected_generation Active host generation.
+   * @return True only for the exact generation, live publisher fields, and zero reserved fields.
+   */
+  [[nodiscard]] constexpr bool valid_frame_channel_source_identity(
+    const frame_channel_source_identity_t &source,
+    const std::uint64_t expected_generation
+  ) noexcept {
+    return expected_generation != 0 && source.generation == expected_generation &&
+           source.process_id != 0 && source.process_creation_time != 0 &&
+           source.source_reserved == 0 && source.response_reserved == 0;
+  }
+
   /** @brief Driver-owned persistent resources duplicated into the Lumen process. */
   struct frame_resources_t {
     std::uint64_t generation {};  ///< Exact active VDD generation.
@@ -186,6 +280,39 @@ namespace platf::virtual_display {
     std::uint64_t initial_color_transform_version {};  ///< Version required before encoder creation.
     frame_color_metadata_t initial_color_metadata;  ///< Initial resolved color/white/HDR state.
   };
+
+  /** @brief Normalized imported shared-texture descriptor used by portable validation. */
+  struct frame_texture_descriptor_t {
+    std::uint32_t width {};  ///< Texture width.
+    std::uint32_t height {};  ///< Texture height.
+    frame_format_e format {frame_format_e::bgra8};  ///< Imported DXGI texture format.
+    std::uint32_t mip_levels {};  ///< Must equal one.
+    std::uint32_t array_size {};  ///< Must equal one.
+    std::uint32_t sample_count {};  ///< Must equal one.
+    bool default_usage {};  ///< Whether the resource uses GPU-default allocation.
+    bool shader_resource {};  ///< Whether shader-resource binding is present.
+    bool no_cpu_access {};  ///< Whether CPU access flags are zero.
+    bool shared_nt_handle {};  ///< Whether NT-handle sharing is present.
+    bool shared_keyed_mutex {};  ///< Whether keyed-mutex sharing is present.
+  };
+
+  /**
+   * @brief Validate an imported shared texture against immutable channel resources.
+   *
+   * @param descriptor Normalized D3D11 texture descriptor.
+   * @param resources Validated frame-channel resources.
+   * @return True only for the exact dimensions, format, allocation, binding, and sharing contract.
+   */
+  [[nodiscard]] constexpr bool valid_frame_texture_descriptor(
+    const frame_texture_descriptor_t &descriptor,
+    const frame_resources_t &resources
+  ) noexcept {
+    return descriptor.width == resources.width && descriptor.height == resources.height &&
+           descriptor.format == resources.format && descriptor.mip_levels == 1 &&
+           descriptor.array_size == 1 && descriptor.sample_count == 1 &&
+           descriptor.default_usage && descriptor.shader_resource && descriptor.no_cpu_access &&
+           descriptor.shared_nt_handle && descriptor.shared_keyed_mutex;
+  }
 
   /** @brief Adapter identity required at the VDD-import and active-NVENC boundary. */
   struct direct_frame_adapter_identity_t {

@@ -3076,7 +3076,22 @@ namespace platf::dxgi {
     display_refresh_rate_rounded = config.framerate;
     client_frame_rate = config.framerate;
     client_frame_rate_strict = display_refresh_rate;
-    return timer && *timer ? 0 : -1;
+    if (!timer || !*timer) {
+      source_->stop();
+      return -1;
+    }
+    record_opened_encoder_device_identity(
+      *adapter.get(),
+      *output.get(),
+      ::video::encoder_probe_selection_intent_t {
+        config::video.adapter_name,
+        display_name,
+        display_name,
+        false,
+        false,
+      }
+    );
+    return 0;
   }
 
   capture_e display_vdd_vram_t::snapshot(

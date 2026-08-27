@@ -914,16 +914,18 @@ namespace video {
   /**
    * @brief Decide whether a capture backend may be recreated after source loss.
    *
-   * Required Lumen VDD sessions are generation-bound. Recreating their display
-   * would either spin on the stopped source or cross into DDA/WGC fallback.
+   * Required Lumen VDD sessions and every active HDR VDD are generation-bound.
+   * Recreating their display would either spin on the stopped source or cross
+   * into an invalid DDA/WGC fallback.
    *
    * @param config Active stream configuration.
-   * @return Retry for ordinary capture, or terminate for required direct capture.
+   * @return Retry for ordinary/optional SDR capture, or terminate for required or active HDR VDD capture.
    */
   [[nodiscard]] constexpr capture_reinitialization_e capture_reinitialization_action(
     const config_t &config
   ) noexcept {
-    return config.virtual_display_direct_required ?
+    const bool active_hdr_vdd = config.virtual_display_active && config.dynamicRange != 0;
+    return config.virtual_display_direct_required || active_hdr_vdd ?
              capture_reinitialization_e::terminate :
              capture_reinitialization_e::retry;
   }
@@ -931,9 +933,9 @@ namespace video {
   /**
    * @brief Return the bounded display-open attempt count for one capture path.
    * @param config Active stream configuration.
-   * @return One attempt for generation-bound direct capture, otherwise two.
+   * @return One attempt for generation-bound required/HDR VDD capture, otherwise two.
    */
   [[nodiscard]] constexpr int display_initialization_attempts(const config_t &config) noexcept {
-    return config.virtual_display_direct_required ? 1 : 2;
+    return capture_reinitialization_action(config) == capture_reinitialization_e::terminate ? 1 : 2;
   }
 }  // namespace video

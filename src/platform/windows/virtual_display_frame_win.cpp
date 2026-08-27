@@ -179,22 +179,36 @@ namespace platf::virtual_display {
 
     /** @brief Map one Win32 device-IO failure into the stable frame contract. */
     frame_io_e frame_error(const DWORD error) noexcept {
+      auto semantic_error = frame_transport_error_e::other;
       switch (error) {
         case ERROR_NOT_READY:
+          semantic_error = frame_transport_error_e::not_ready;
+          break;
         case ERROR_NO_MORE_ITEMS:
+          semantic_error = frame_transport_error_e::no_more_items;
+          break;
         case ERROR_RETRY:
-          return frame_io_e::empty;
+          semantic_error = frame_transport_error_e::retry;
+          break;
         case ERROR_REVISION_MISMATCH:
+          semantic_error = frame_transport_error_e::revision_mismatch;
+          break;
         case ERROR_INVALID_STATE:
-          return frame_io_e::stale_generation;
+          semantic_error = frame_transport_error_e::invalid_state;
+          break;
         case ERROR_INVALID_DATA:
+          semantic_error = frame_transport_error_e::invalid_data;
+          break;
         case ERROR_INVALID_PARAMETER:
-          return frame_io_e::invalid_data;
+          semantic_error = frame_transport_error_e::invalid_parameter;
+          break;
         case ERROR_NOT_SUPPORTED:
-          return frame_io_e::unsupported;
+          semantic_error = frame_transport_error_e::not_supported;
+          break;
         default:
-          return frame_io_e::transport_error;
+          break;
       }
+      return frame_io_from_transport_error(semantic_error);
     }
 
     /** @brief Open exactly one secured Lumen VDD device interface. */
@@ -342,10 +356,16 @@ namespace platf::virtual_display {
                                                        LUMEN_VDD_CAP_10BIT |
                                                        LUMEN_VDD_CAP_DIRECT_FRAME_FP16 :
                                                      LUMEN_VDD_CAP_SDR8);
-      if (abi_status != frame_io_e::ok || abi.abi_version != LUMEN_VDD_ABI_VERSION ||
-          (abi.capability_flags & required_capabilities) != required_capabilities) {
+      const auto abi_contract = validate_frame_abi_contract(
+        abi_status,
+        abi.abi_version,
+        LUMEN_VDD_ABI_VERSION,
+        abi.capability_flags,
+        required_capabilities
+      );
+      if (abi_contract != frame_io_e::ok) {
         stop();
-        return abi_status == frame_io_e::ok ? frame_io_e::unsupported : abi_status;
+        return abi_contract;
       }
 
       cancel_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -366,10 +386,16 @@ namespace platf::virtual_display {
         &event_response,
         sizeof(event_response)
       );
-      if (event_status != frame_io_e::ok || event_response.generation != generation ||
-          event_response.source_process_id == 0 || event_response.source_reserved != 0 ||
-          event_response.source_process_creation_time == 0 || event_response.event_handle == 0 ||
-          event_response.reserved != 0 ||
+      const frame_channel_source_identity_t event_source {
+        event_response.generation,
+        event_response.source_process_id,
+        event_response.source_reserved,
+        event_response.source_process_creation_time,
+        event_response.reserved,
+      };
+      if (event_status != frame_io_e::ok ||
+          !valid_frame_channel_source_identity(event_source, generation) ||
+          event_response.event_handle == 0 ||
           !bind_source_process(
             event_response.source_process_id,
             event_response.source_process_creation_time
@@ -408,12 +434,19 @@ namespace platf::virtual_display {
         }
       }
 
-      if (response.generation != generation || response.source_process_id != source_process_id ||
-          response.source_reserved != 0 || response.source_process_creation_time != source_process_creation_time ||
+      const frame_channel_source_identity_t channel_source {
+        response.generation,
+        response.source_process_id,
+        response.source_reserved,
+        response.source_process_creation_time,
+        response.reserved,
+      };
+      if (!valid_frame_channel_source_identity(channel_source, generation) ||
+          channel_source != event_source ||
           response.slot_count != LUMEN_VDD_FRAME_SLOT_COUNT ||
           (response.texture_format != LUMEN_VDD_FRAME_FORMAT_BGRA8 &&
            response.texture_format != LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT) ||
-          response.color_transform_version == 0 || response.reserved != 0) {
+          response.color_transform_version == 0) {
         stop();
         return frame_io_e::invalid_data;
       }
@@ -581,18 +614,26 @@ namespace platf::virtual_display {
         }
         D3D11_TEXTURE2D_DESC texture_desc {};
         textures[slot]->GetDesc(&texture_desc);
+        const frame_texture_descriptor_t descriptor {
+          texture_desc.Width,
+          texture_desc.Height,
+          texture_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ?
+            frame_format_e::rgba16_float :
+            frame_format_e::bgra8,
+          texture_desc.MipLevels,
+          texture_desc.ArraySize,
+          texture_desc.SampleDesc.Count,
+          texture_desc.Usage == D3D11_USAGE_DEFAULT,
+          (texture_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0,
+          texture_desc.CPUAccessFlags == 0,
+          (texture_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) != 0,
+          (texture_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) != 0,
+        };
         const auto expected_texture_format = resources.format == frame_format_e::rgba16_float ?
                                                DXGI_FORMAT_R16G16B16A16_FLOAT :
                                                DXGI_FORMAT_B8G8R8A8_UNORM;
-        if (texture_desc.Width != resources.width || texture_desc.Height != resources.height ||
-            texture_desc.Format != expected_texture_format ||
-            texture_desc.MipLevels != 1 || texture_desc.ArraySize != 1 ||
-            texture_desc.SampleDesc.Count != 1 || texture_desc.Usage != D3D11_USAGE_DEFAULT ||
-            (texture_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
-            texture_desc.CPUAccessFlags != 0 ||
-            (texture_desc.MiscFlags &
-             (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) !=
-              (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) {
+        if (texture_desc.Format != expected_texture_format ||
+            !valid_frame_texture_descriptor(descriptor, resources)) {
           stop();
           return frame_io_e::invalid_data;
         }

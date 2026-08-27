@@ -65,6 +65,44 @@ namespace video {
   };
 
   /**
+   * @brief Decide whether cache validation must open a fresh capture probe for one candidate.
+   *
+   * The exact output already held by the active capture backend must not be duplicated again.
+   * Doing so can fail with `E_INVALIDARG` while the retained duplication is healthy and would
+   * incorrectly invalidate the encoder cache.
+   *
+   * @param candidate Candidate adapter/output identity in current enumeration order.
+   * @param opened Exact adapter/output identity already held by the active capture backend.
+   * @param attached Whether the candidate remains attached to the desktop.
+   * @return True only for a different attached candidate that needs a fresh eligibility probe.
+   */
+  [[nodiscard]] constexpr bool encoder_probe_capture_validation_required(
+    const encoder_probe_device_identity_t &candidate,
+    const encoder_probe_device_identity_t &opened,
+    const bool attached
+  ) noexcept {
+    return attached && candidate != opened;
+  }
+
+  /**
+   * @brief Resolve candidate capture support without re-opening the active capture target.
+   *
+   * @param candidate Candidate adapter/output identity in current enumeration order.
+   * @param opened Exact adapter/output identity already held by the active capture backend.
+   * @param attached Whether the candidate remains attached to the desktop.
+   * @param fresh_probe_supported Result of a fresh capture probe for a different candidate.
+   * @return True for the retained attached target or for another attached candidate that probed successfully.
+   */
+  [[nodiscard]] constexpr bool encoder_probe_candidate_capture_supported(
+    const encoder_probe_device_identity_t &candidate,
+    const encoder_probe_device_identity_t &opened,
+    const bool attached,
+    const bool fresh_probe_supported
+  ) noexcept {
+    return attached && (candidate == opened || fresh_probe_supported);
+  }
+
+  /**
    * @brief Configured adapter/output selection policy, independent of the concrete opened target.
    */
   struct encoder_probe_selection_intent_t {

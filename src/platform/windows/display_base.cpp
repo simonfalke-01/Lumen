@@ -109,24 +109,25 @@ namespace platf::dxgi {
       };
     }
 
-    void record_opened_encoder_device_identity(
-      IDXGIAdapter1 &adapter,
-      IDXGIOutput &output,
-      ::video::encoder_probe_selection_intent_t selection_intent
-    ) {
-      auto &state = encoder_reenumeration_state();
-      auto identity = query_encoder_device_identity(adapter, output);
-      auto lock = std::lock_guard(state.mutex);
-      if (!identity) {
-        state.opened_device_baseline.reset();
-        return;
-      }
-      state.opened_device_baseline = ::video::encoder_probe_opened_device_baseline_t {
-        std::move(*identity),
-        std::move(selection_intent),
-      };
-    }
   }  // namespace
+
+  void record_opened_encoder_device_identity(
+    IDXGIAdapter1 &adapter,
+    IDXGIOutput &output,
+    ::video::encoder_probe_selection_intent_t selection_intent
+  ) {
+    auto &state = encoder_reenumeration_state();
+    auto identity = query_encoder_device_identity(adapter, output);
+    auto lock = std::lock_guard(state.mutex);
+    if (!identity) {
+      state.opened_device_baseline.reset();
+      return;
+    }
+    state.opened_device_baseline = ::video::encoder_probe_opened_device_baseline_t {
+      std::move(*identity),
+      std::move(selection_intent),
+    };
+  }
 
   std::optional<::video::encoder_probe_device_identity_t> encoder_probe_device_identity() {
     auto &state = encoder_reenumeration_state();
@@ -1419,18 +1420,34 @@ namespace platf {
             continue;
           }
 
-          const bool capture_supported = selection_output_desc.AttachedToDesktop &&
-                                         dxgi::test_dxgi_duplication(selection_adapter, selection_output, false);
           auto candidate_identity = dxgi::query_encoder_device_identity(*selection_adapter.get(), *selection_output.get());
           if (!candidate_identity) {
             return true;
           }
+          const bool attached = selection_output_desc.AttachedToDesktop != FALSE;
+          const bool fresh_probe_required = ::video::encoder_probe_capture_validation_required(
+            *candidate_identity,
+            expected_identity,
+            attached
+          );
+          const bool fresh_probe_supported = fresh_probe_required &&
+                                             dxgi::test_dxgi_duplication(
+                                               selection_adapter,
+                                               selection_output,
+                                               false
+                                             );
+          const bool capture_supported = ::video::encoder_probe_candidate_capture_supported(
+            *candidate_identity,
+            expected_identity,
+            attached,
+            fresh_probe_supported
+          );
 
           current_selection.observe(::video::encoder_probe_device_candidate_t {
             std::move(*candidate_identity),
             true,
             true,
-            selection_output_desc.AttachedToDesktop != FALSE,
+            attached,
             capture_supported,
           });
         }
