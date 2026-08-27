@@ -60,6 +60,9 @@ param(
 # Constants
 $DocsUrl = "https://github.com/simonfalke-01/Lumen"
 $virtualHidCertificateSubject = "CN=Lumen Virtual HID Driver"
+$vbCablePackageUrl = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip"
+$vbCablePackageSha256 = "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb"
+$vbCablePackageVersion = "4.5"
 
 # Set preference variables for output streams
 $InformationPreference = 'Continue'
@@ -964,6 +967,245 @@ function Get-VirtualMicrophoneInfPath {
     return $infFiles[0].FullName
 }
 
+function Test-LumenLocalTestPackage {
+    $markerPath = Join-Path $RootDir "metadata\LOCAL-TEST-SIGNED.json"
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        return [string]$marker.purpose -ceq "local-test-only"
+    } catch {
+        throw "The local-test signing marker is invalid: $($_.Exception.Message)"
+    }
+}
+
+function Test-SecureBootEnabled {
+    try {
+        return [bool](Confirm-SecureBootUEFI -ErrorAction Stop)
+    } catch {
+        $registryValue = Get-ItemPropertyValue `
+            -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" `
+            -Name "UEFISecureBootEnabled" `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $registryValue) {
+            return $false
+        }
+        return [int]$registryValue -eq 1
+    }
+}
+
+function Get-VbCableEndpointState {
+    $namesByDirection = [ordered]@{
+        Render = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::Ordinal)
+        Capture = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::Ordinal)
+    }
+    $audioRoot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio"
+    foreach ($direction in @("Render", "Capture")) {
+        $directionRoot = Join-Path $audioRoot $direction
+        if (-not (Test-Path -LiteralPath $directionRoot -PathType Container)) {
+            continue
+        }
+        foreach ($propertiesKey in @(
+            Get-ChildItem -LiteralPath $directionRoot -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.PSPath "Properties" } |
+                Where-Object { Test-Path -LiteralPath $_ -PathType Container }
+        )) {
+            $properties = Get-ItemProperty -LiteralPath $propertiesKey -ErrorAction SilentlyContinue
+            if ($null -eq $properties) {
+                continue
+            }
+            foreach ($property in $properties.PSObject.Properties) {
+                if ($property.Name -like "PS*") {
+                    continue
+                }
+                foreach ($value in @($property.Value)) {
+                    if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) {
+                        [void]$namesByDirection[$direction].Add($value.Trim())
+                    }
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        InputPresent = $namesByDirection.Render.Contains("CABLE Input") -or
+            $namesByDirection.Render.Contains("CABLE Input (VB-Audio Virtual Cable)")
+        OutputPresent = $namesByDirection.Capture.Contains("CABLE Output") -or
+            $namesByDirection.Capture.Contains("CABLE Output (VB-Audio Virtual Cable)")
+        RenderNames = @($namesByDirection.Render)
+        CaptureNames = @($namesByDirection.Capture)
+    }
+}
+
+function Read-VbCableOwnershipMarker {
+    if (-not (Test-Path -LiteralPath $vbCableOwnershipMarkerPath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        return Get-Content -LiteralPath $vbCableOwnershipMarkerPath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "The VB-CABLE ownership marker is invalid: $($_.Exception.Message)"
+    }
+}
+
+function Test-LumenOwnedVbCableMarker {
+    $marker = Read-VbCableOwnershipMarker
+    if ($null -eq $marker -or [string]$marker.OwnerProductCode -cne $ProductCode) {
+        return $false
+    }
+    if ([int]$marker.Schema -ne 1 -or
+        [string]$marker.OriginUrl -cne $vbCablePackageUrl -or
+        [string]$marker.PackageVersion -cne $vbCablePackageVersion -or
+        [string]$marker.PackageSha256 -cne $vbCablePackageSha256) {
+        throw "The VB-CABLE ownership marker does not match the pinned package."
+    }
+    return $true
+}
+
+function Invoke-VbCableSetup {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$PackagePath,
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("install", "uninstall")]
+        [string]$Operation
+    )
+
+    $actualHash = (Get-FileHash -LiteralPath $PackagePath -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($actualHash -ine $vbCablePackageSha256) {
+        throw "VB-CABLE package hash mismatch: $actualHash"
+    }
+    $expandRoot = Join-Path ([IO.Path]::GetTempPath()) ("Lumen-VBCable-" + [Guid]::NewGuid())
+    New-Item -ItemType Directory -Path $expandRoot -Force -ErrorAction Stop | Out-Null
+    try {
+        Expand-Archive -LiteralPath $PackagePath -DestinationPath $expandRoot -Force
+        $setups = @(Get-ChildItem -LiteralPath $expandRoot -Filter "VBCABLE_Setup_x64.exe" -File -Recurse)
+        if ($setups.Count -ne 1) {
+            throw "Expected exactly one VBCABLE_Setup_x64.exe; found $($setups.Count)."
+        }
+        $switches = if ($Operation -eq "install") { @("-i", "-h") } else { @("-u", "-h") }
+        Write-LogMessage `
+            -Message "Executing explicitly authorized VB-CABLE ${Operation}: $($setups[0].FullName) $($switches -join ' ')" `
+            -Level "Information"
+        $process = Start-Process `
+            -FilePath $setups[0].FullName `
+            -ArgumentList $switches `
+            -WorkingDirectory $setups[0].DirectoryName `
+            -Wait `
+            -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "VB-CABLE $Operation failed with exit code $($process.ExitCode)."
+        }
+    } finally {
+        Remove-Item -LiteralPath $expandRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Install-VbCableFallback {
+    if ([string]::IsNullOrWhiteSpace($ProductCode)) {
+        throw "VB-CABLE fallback installation requires a scoped Lumen ProductCode."
+    }
+
+    $existingMarker = Read-VbCableOwnershipMarker
+    $endpoints = Get-VbCableEndpointState
+    if ($endpoints.InputPresent -and $endpoints.OutputPresent) {
+        $ownershipDescription = if ($null -eq $existingMarker) {
+            "pre-existing"
+        } elseif ([string]$existingMarker.OwnerProductCode -ceq $ProductCode) {
+            "already Lumen-owned"
+        } else {
+            "owned outside this Lumen ProductCode"
+        }
+        Write-LogMessage `
+            -Message "Preserving $ownershipDescription VB-CABLE endpoints; Lumen will not reinstall them." `
+            -Level "Information"
+        return
+    }
+    if ($endpoints.InputPresent -or $endpoints.OutputPresent) {
+        throw "VB-CABLE has an incomplete exact endpoint pair; refusing to claim or replace it."
+    }
+    if ($null -ne $existingMarker -and [string]$existingMarker.OwnerProductCode -cne $ProductCode) {
+        throw "VB-CABLE is owned by a different Lumen ProductCode; refusing to replace it."
+    }
+
+    $downloadRoot = Join-Path ([IO.Path]::GetTempPath()) ("Lumen-VBCable-download-" + [Guid]::NewGuid())
+    New-Item -ItemType Directory -Path $downloadRoot -Force -ErrorAction Stop | Out-Null
+    $downloadPath = Join-Path $downloadRoot "VBCABLE_Driver_Pack45.zip"
+    try {
+        $previousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest `
+                -Uri $vbCablePackageUrl `
+                -OutFile $downloadPath `
+                -UseBasicParsing `
+                -ErrorAction Stop
+        } finally {
+            [Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol
+        }
+        $actualHash = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash
+        if ($actualHash -ine $vbCablePackageSha256) {
+            throw "Downloaded VB-CABLE package hash mismatch: $actualHash"
+        }
+        Invoke-VbCableSetup -PackagePath $downloadPath -Operation "install"
+
+        New-Item -ItemType Directory -Path $vbCableOwnershipDirectory -Force -ErrorAction Stop | Out-Null
+        Copy-Item -LiteralPath $downloadPath -Destination $vbCableOwnedPackagePath -Force -ErrorAction Stop
+        $marker = [ordered]@{
+            Schema = 1
+            OriginUrl = $vbCablePackageUrl
+            PackageVersion = $vbCablePackageVersion
+            PackageSha256 = $vbCablePackageSha256
+            OwnerProductCode = $ProductCode
+            InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
+            InstallArguments = @("-i", "-h")
+            UninstallArguments = @("-u", "-h")
+        }
+        $pendingMarker = "$vbCableOwnershipMarkerPath.pending"
+        $marker | ConvertTo-Json | Set-Content -LiteralPath $pendingMarker -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $pendingMarker -Destination $vbCableOwnershipMarkerPath -Force -ErrorAction Stop
+        $script:RebootRequired = $true
+        Write-LogMessage `
+            -Message "Installed Lumen-owned VB-CABLE fallback; Windows must be restarted." `
+            -Level "Warning"
+    } finally {
+        Remove-Item -LiteralPath $downloadRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Uninstall-LumenOwnedVbCable {
+    if ([string]::IsNullOrWhiteSpace($ProductCode)) {
+        Write-LogMessage `
+            -Message "No scoped Lumen ProductCode is available; preserving VB-CABLE." `
+            -Level "Information"
+        return
+    }
+
+    $marker = Read-VbCableOwnershipMarker
+    if ($null -eq $marker -or [string]$marker.OwnerProductCode -cne $ProductCode) {
+        Write-LogMessage `
+            -Message "VB-CABLE is not owned by this Lumen ProductCode; preserving it." `
+            -Level "Information"
+        return
+    }
+    if ([int]$marker.Schema -ne 1 -or
+        [string]$marker.OriginUrl -cne $vbCablePackageUrl -or
+        [string]$marker.PackageVersion -cne $vbCablePackageVersion -or
+        [string]$marker.PackageSha256 -cne $vbCablePackageSha256) {
+        throw "The VB-CABLE ownership marker does not match the pinned package."
+    }
+    if (-not (Test-Path -LiteralPath $vbCableOwnedPackagePath -PathType Leaf)) {
+        throw "The Lumen-owned VB-CABLE package is missing; refusing an unverified uninstall."
+    }
+    Invoke-VbCableSetup -PackagePath $vbCableOwnedPackagePath -Operation "uninstall"
+    $script:RebootRequired = $true
+    Remove-Item -LiteralPath $vbCableOwnershipDirectory -Recurse -Force -ErrorAction Stop
+}
+
 function Get-VirtualHidCertificatePath {
     $driverDirectory = Join-Path $RootDir "drivers\virtual-hid"
     if (-not (Test-Path $driverDirectory -PathType Container)) {
@@ -1255,6 +1497,8 @@ $virtualMicrophoneSelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualMic
 } else {
     $InstallVirtualMicrophone -eq "1"
 }
+$virtualMicrophoneUsesVbCable = $virtualMicrophoneSelected -and
+    (Test-LumenLocalTestPackage) -and (Test-SecureBootEnabled)
 $virtualDisplaySelected = if ([string]::IsNullOrWhiteSpace($InstallVirtualDisplay)) {
     Test-Path -LiteralPath (Join-Path $RootDir "drivers\virtual-display\LumenVirtualDisplay.inf") `
         -PathType Leaf
@@ -1300,6 +1544,11 @@ $virtualMicrophoneRollbackDriverDirectory = Join-Path `
 $virtualMicrophoneRollbackScriptPath = Join-Path `
     $virtualMicrophoneRollbackDirectory `
     "lumen-setup.ps1"
+$vbCableOwnershipDirectory = Join-Path $programDataDirectory "Lumen\Installer\VBCable"
+$vbCableOwnershipMarkerPath = Join-Path $vbCableOwnershipDirectory "ownership.json"
+$vbCableOwnedPackagePath = Join-Path $vbCableOwnershipDirectory "VBCABLE_Driver_Pack45.zip"
+$virtualMicrophoneOwnsVbCable = $Action -eq "uninstall" -and
+    (Test-LumenOwnedVbCableMarker)
 $script:RebootRequired = $false
 
 function Set-PendingDriverRebootMarker {
@@ -3086,7 +3335,11 @@ if ($Action -eq "install") {
     }
     $virtualMicrophoneInfPath = $null
     $virtualMicrophoneStatus = 2
-    if ($virtualMicrophoneSelected) {
+    if ($virtualMicrophoneUsesVbCable) {
+        Write-LogMessage `
+            -Message "Secure Boot with local-test VMIC selected; routing to VB-CABLE fallback." `
+            -Level "Information"
+    } elseif ($virtualMicrophoneSelected) {
         $virtualMicrophoneStatus = Invoke-VirtualMicrophoneCtl `
             -Arguments @("status") `
             -Description "Checking Lumen Virtual Microphone driver status" `
@@ -3119,7 +3372,7 @@ if ($Action -eq "install") {
         -PreviousDriverSignerThumbprint $previousDriverSignerThumbprint `
         -DriverRollbackComplete (-not $virtualHidSelected) `
         -ServiceRollbackComplete $serviceRollbackComplete
-    if ($virtualMicrophoneSelected) {
+    if ($virtualMicrophoneSelected -and -not $virtualMicrophoneUsesVbCable) {
         Start-PersistedVirtualMicrophoneTransaction `
             -TransactionKind "install" `
             -DriverWasPresent $virtualMicrophoneWasPresent
@@ -3151,7 +3404,9 @@ if ($Action -eq "install") {
                 -Description "Verifying the Lumen Virtual HID control protocol" | Out-Null
         }
     }
-    if ($virtualMicrophoneSelected) {
+    if ($virtualMicrophoneUsesVbCable) {
+        Install-VbCableFallback
+    } elseif ($virtualMicrophoneSelected) {
         $virtualMicrophoneInstallExit = Invoke-VirtualMicrophoneCtl `
             -Arguments @("install-or-update", "`"$virtualMicrophoneInfPath`"") `
             -Description "Installing or updating the Lumen Virtual Microphone driver"
@@ -3261,14 +3516,19 @@ if ($Action -eq "install") {
     }
     $uninstallDriverWasPresent = $virtualHidSelected -and $driverStatus -in @(0, 4)
     $virtualMicrophoneStatus = 2
-    if ($virtualMicrophoneSelected) {
+    if ($virtualMicrophoneUsesVbCable -or $virtualMicrophoneOwnsVbCable) {
+        Write-LogMessage `
+            -Message "Lumen VMIC uses the VB-CABLE ownership marker." `
+            -Level "Information"
+    } elseif ($virtualMicrophoneSelected) {
         $virtualMicrophoneStatus = Invoke-VirtualMicrophoneCtl `
             -Arguments @("status") `
             -Description "Checking Lumen Virtual Microphone driver status before uninstall" `
             -AllowNotInstalled
     }
     $uninstallVirtualMicrophoneWasPresent = `
-        $virtualMicrophoneSelected -and $virtualMicrophoneStatus -in @(0, 3, 4)
+        $virtualMicrophoneSelected -and -not $virtualMicrophoneUsesVbCable -and `
+        $virtualMicrophoneStatus -in @(0, 3, 4)
     $serviceSnapshot = Get-ServiceSnapshot
     $existingService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
     $uninstallServiceWasPresent = -not $Msi -and $serviceSnapshot.Present
@@ -3286,7 +3546,8 @@ if ($Action -eq "install") {
         -PreviousDriverSignerThumbprint (Get-InstalledVirtualHidSignerThumbprint) `
         -DriverRollbackComplete (-not $virtualHidSelected) `
         -ServiceRollbackComplete ([bool]$Msi)
-    if ($virtualMicrophoneSelected) {
+    if ($virtualMicrophoneSelected -and -not $virtualMicrophoneUsesVbCable -and
+        -not $virtualMicrophoneOwnsVbCable) {
         Start-PersistedVirtualMicrophoneTransaction `
             -TransactionKind "uninstall" `
             -DriverWasPresent $uninstallVirtualMicrophoneWasPresent
@@ -3339,7 +3600,9 @@ if ($Action -eq "install") {
     } else {
         Write-LogMessage -Message "Lumen Virtual Display feature was not owned by this product." -Level "Information"
     }
-    if ($virtualMicrophoneSelected) {
+    if ($virtualMicrophoneOwnsVbCable -or $virtualMicrophoneUsesVbCable) {
+        Uninstall-LumenOwnedVbCable
+    } elseif ($virtualMicrophoneSelected) {
         $virtualMicrophoneUninstallExit = Invoke-VirtualMicrophoneCtl `
             -Arguments @("uninstall") `
             -Description "Removing the Lumen Virtual Microphone device and driver package"

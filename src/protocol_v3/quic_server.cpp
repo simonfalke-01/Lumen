@@ -835,7 +835,12 @@ namespace lumen::protocol_v3::quic_server {
         startup_stage_ = StartupStage::ready;
         return ApiStatus::success;
       }
-      if (!valid_config(config_) || !api_.is_schannel()) {
+      if (!valid_config(config_)) {
+        std::fputs("Lumen protocol v3 listener configuration validation failed\n", stderr);
+        return ApiStatus::invalid_state;
+      }
+      if (!api_.is_schannel()) {
+        std::fputs("Lumen protocol v3 requires the Schannel MsQuic provider\n", stderr);
         return ApiStatus::invalid_state;
       }
 

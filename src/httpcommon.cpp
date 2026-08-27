@@ -250,6 +250,10 @@ namespace http {
     if ((!fs::exists(config::nvhttp.pkey) || !fs::exists(config::nvhttp.cert)) && create_creds(config::nvhttp.pkey, config::nvhttp.cert)) {
       return -1;
     }
+    if (!lumen::protocol_v3::runtime::secure_private_key_file(config::nvhttp.pkey)) {
+      BOOST_LOG(error) << "Couldn't apply and verify private-key security for ["sv << config::nvhttp.pkey << ']';
+      return -1;
+    }
     if (!user_creds_exist(config::sunshine.credentials_file)) {
       BOOST_LOG(info) << "Open the Web UI to set your new username and password and getting started";
     } else if (reload_user_creds(config::sunshine.credentials_file)) {
