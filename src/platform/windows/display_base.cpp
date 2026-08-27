@@ -47,6 +47,7 @@ typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE: DWORD {
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/video.h"
+#include "virtual_display_status.h"
 
 namespace platf {
   using namespace std::literals;
@@ -1124,15 +1125,26 @@ namespace platf {
       return {};
     }
     if (hwdevice_type == mem_type_e::dxgi && config.virtual_display_frame_source) {
+      const auto frame_generation = config.virtual_display_frame_source->resources().generation;
+      const auto desktop_fallback_permitted = virtual_display::direct_frame_desktop_fallback_permitted(
+        config.virtual_display_direct_required,
+        config.dynamicRange != 0 ?
+          virtual_display::dynamic_range_e::hdr10 :
+          virtual_display::dynamic_range_e::sdr
+      );
       auto direct = std::make_shared<dxgi::display_vdd_vram_t>();
       if (!direct->init(config, display_name)) {
         return direct;
       }
       config.virtual_display_frame_source->stop();
-      if (config.virtual_display_direct_required) {
+      if (!desktop_fallback_permitted) {
         BOOST_LOG(error) << "Required Lumen VDD direct-frame initialization failed; refusing capture fallback"sv;
         return {};
       }
+      virtual_display::report_direct_frame_initialization_failure(
+        frame_generation,
+        desktop_fallback_permitted
+      );
       BOOST_LOG(warning) << "Lumen VDD direct-frame initialization failed; falling back to DDA/WGC"sv;
     }
 

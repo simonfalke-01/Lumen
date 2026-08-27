@@ -49,6 +49,20 @@ namespace platf::virtual_display {
     return !direct_required || (dxgi_capture && has_vdd_source);
   }
 
+  /**
+   * @brief Decide whether a failed direct-frame source may use desktop capture on the active VDD.
+   *
+   * @param direct_required Whether the session requires the direct-frame boundary.
+   * @param dynamic_range Exact prepared VDD dynamic range.
+   * @return True only for an optional SDR session.
+   */
+  [[nodiscard]] constexpr bool direct_frame_desktop_fallback_permitted(
+    const bool direct_required,
+    const dynamic_range_e dynamic_range
+  ) noexcept {
+    return !direct_required && dynamic_range == dynamic_range_e::sdr;
+  }
+
   /** @brief Resolved surface color space carried with each leased frame. */
   enum class frame_color_space_e : std::uint32_t {
     srgb = 1,
@@ -328,7 +342,8 @@ namespace platf::virtual_display {
     friend class frame_lease_t;
     friend std::shared_ptr<frame_source_t> make_system_frame_source(
       const stream_selection_t &selection,
-      std::chrono::milliseconds timeout
+      std::chrono::milliseconds timeout,
+      bool desktop_fallback_permitted
     );
 
     class impl_t;
@@ -342,11 +357,13 @@ namespace platf::virtual_display {
    * @brief Open the production Windows direct-frame channel for one active VDD selection.
    * @param selection Exact active VDD generation and mode.
    * @param timeout Bounded driver-resource publication/import deadline.
+   * @param desktop_fallback_permitted Whether initialization failure leaves optional SDR desktop capture active.
    * @return Healthy source, or empty when any capability/hardware/import gate fails.
    */
   [[nodiscard]] std::shared_ptr<frame_source_t> make_system_frame_source(
     const stream_selection_t &selection,
-    std::chrono::milliseconds timeout
+    std::chrono::milliseconds timeout,
+    bool desktop_fallback_permitted = false
   );
 
   /** @brief Permanently disable the direct-frame path for this host process. */

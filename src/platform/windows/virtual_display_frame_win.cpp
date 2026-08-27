@@ -1032,12 +1032,16 @@ namespace platf::virtual_display {
 
   std::shared_ptr<frame_source_t> make_system_frame_source(
     const stream_selection_t &selection,
-    const std::chrono::milliseconds timeout
+    const std::chrono::milliseconds timeout,
+    const bool desktop_fallback_permitted
   ) {
     auto impl = std::make_unique<frame_source_t::impl_t>(selection);
     if (impl->initialize(timeout) != frame_io_e::ok) {
       impl.reset();
-      report_direct_frame_fallback(selection.generation);
+      report_direct_frame_initialization_failure(
+        selection.generation,
+        desktop_fallback_permitted
+      );
       return {};
     }
     auto source = std::shared_ptr<frame_source_t> {new frame_source_t(std::move(impl))};

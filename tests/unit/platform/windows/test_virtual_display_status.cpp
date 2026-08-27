@@ -106,6 +106,38 @@ TEST(VirtualDisplayStatus, FailedSourceReportsFallbackOnlyForItsActiveGeneration
   report_direct_frame_stopped(52, false);
 }
 
+TEST(VirtualDisplayStatus, InitializationFailureSeparatesRequiredFallbackAndQuarantine) {
+  report_direct_frame_bound(61);
+  report_direct_frame_initialization_failure(61, false);
+  const auto required = direct_frame_status_for_generation(61);
+  EXPECT_FALSE(required.bound);
+  EXPECT_FALSE(required.quarantined);
+  EXPECT_FALSE(required.fallback);
+
+  report_direct_frame_initialization_failure(62, true);
+  const auto optional_sdr = direct_frame_status_for_generation(62);
+  EXPECT_FALSE(optional_sdr.bound);
+  EXPECT_FALSE(optional_sdr.quarantined);
+  EXPECT_TRUE(optional_sdr.fallback);
+
+  report_direct_frame_bound(63);
+  report_direct_frame_quarantined();
+  report_direct_frame_initialization_failure(63, true);
+  report_direct_frame_fallback(63);
+  const auto quarantined = direct_frame_status_for_generation(63);
+  EXPECT_FALSE(quarantined.bound);
+  EXPECT_TRUE(quarantined.quarantined);
+  EXPECT_FALSE(quarantined.fallback);
+
+  report_direct_frame_bound(65);
+  report_direct_frame_initialization_failure(64, true);
+  EXPECT_TRUE(direct_frame_status_for_generation(65).bound);
+  EXPECT_FALSE(direct_frame_status_for_generation(64).fallback);
+
+  report_direct_frame_bound(66);
+  report_direct_frame_stopped(66, false);
+}
+
 TEST(VirtualDisplayStatus, ExplicitQuarantineOnlyMarksTheCurrentGeneration) {
   report_direct_frame_quarantined();
   EXPECT_FALSE(direct_frame_status_for_generation(0).quarantined);
