@@ -8,6 +8,8 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("lumen-source-provenance-" + [
 $sourceRoot = Join-Path $testRoot "mutable-source"
 $freezeRoot = Join-Path $testRoot "freeze"
 $verifiedRoot = Join-Path $testRoot "verified-source"
+$explicitTarFreezeRoot = Join-Path $testRoot "freeze-explicit-tar"
+$explicitTarVerifiedRoot = Join-Path $testRoot "verified-source-explicit-tar"
 $tamperRoot = Join-Path $testRoot "tamper-output"
 
 try {
@@ -152,6 +154,27 @@ try {
         -SourceRoot $sourceRoot `
         -OutputDirectory $freezeRoot `
         -SharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256 | Out-Null
+    $localTar = Get-Command tar.exe, tar -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $localTar) {
+        throw "No local tar executable is available for the explicit archive creator regression."
+    }
+    & (Join-Path $root "scripts/windows/freeze-full-profile-source.ps1") `
+        -SourceRoot $sourceRoot `
+        -OutputDirectory $explicitTarFreezeRoot `
+        -SharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256 `
+        -ArchiveCreateTarPath $localTar.Source | Out-Null
+    $explicitTarProvenance = Expand-VerifiedFullProfileSource `
+        -FreezeDirectory $explicitTarFreezeRoot `
+        -DestinationDirectory $explicitTarVerifiedRoot `
+        -MutableSourceRoot $sourceRoot `
+        -ExpectedSharedSourceFreezeManifestSha256 $sharedSourceFreezeManifestSha256
+    if ($explicitTarProvenance.FileCount -ne 13 -or
+        -not (Test-Path -LiteralPath `
+            (Join-Path $explicitTarVerifiedRoot "product-source.txt") `
+            -PathType Leaf)) {
+        throw "Explicit archive creation tar did not interoperate with default list/extract tar."
+    }
     [IO.File]::WriteAllText(
         (Join-Path $sourceRoot "product-source.txt"),
         "mutable-content",

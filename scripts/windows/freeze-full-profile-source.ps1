@@ -8,7 +8,9 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-f]{64}$')]
-    [string]$SharedSourceFreezeManifestSha256
+    [string]$SharedSourceFreezeManifestSha256,
+
+    [string]$ArchiveCreateTarPath
 )
 
 Set-StrictMode -Version Latest
@@ -48,16 +50,31 @@ $hashRows | ConvertTo-Json -Depth 4 | Set-Content $fileManifestPath -Encoding UT
 $listPath = Join-Path $OutputDirectory "full-profile-files.txt"
 Write-FullProfileTarList -Paths ([string[]]$files.RelativePath) -ListPath $listPath
 $archivePath = Join-Path $OutputDirectory "lumen-full-profile-source.tar.gz"
-$tarCommand = Get-Command tar.exe, tar -CommandType Application -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-if ($null -eq $tarCommand) {
-    throw 'tar is required for full-profile source freezing.'
+if ([string]::IsNullOrWhiteSpace($ArchiveCreateTarPath)) {
+    $tarCommand = Get-Command tar.exe, tar -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $tarCommand) {
+        throw 'tar is required for full-profile source freezing.'
+    }
+    $archiveCreateTar = $tarCommand.Source
+} else {
+    if (-not (Test-Path -LiteralPath $ArchiveCreateTarPath -PathType Leaf)) {
+        throw "Archive creation tar is missing: $ArchiveCreateTarPath"
+    }
+    $archiveCreateTar = (Resolve-Path -LiteralPath $ArchiveCreateTarPath).Path
 }
 $tarStartInfo = [Diagnostics.ProcessStartInfo]::new()
-$tarStartInfo.FileName = $tarCommand.Source
+$tarStartInfo.FileName = $archiveCreateTar
 $tarStartInfo.UseShellExecute = $false
 $tarStartInfo.RedirectStandardOutput = $true
 $tarStartInfo.RedirectStandardError = $true
+$tarDirectory = Split-Path -Parent $archiveCreateTar
+$existingChildPath = [string]$tarStartInfo.Environment['PATH']
+$tarStartInfo.Environment['PATH'] = if ([string]::IsNullOrWhiteSpace($existingChildPath)) {
+    $tarDirectory
+} else {
+    $tarDirectory + [IO.Path]::PathSeparator + $existingChildPath
+}
 foreach ($argument in @('-czh', '-f', '-', '-C', $SourceRoot, '-T', $listPath)) {
     $tarStartInfo.ArgumentList.Add($argument)
 }

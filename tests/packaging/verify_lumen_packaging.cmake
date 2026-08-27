@@ -643,7 +643,10 @@ foreach(full_profile_clean_boundary IN ITEMS
         "The full-profile builder must clean generated boundary ${full_profile_clean_boundary}")
 endforeach()
 foreach(full_profile_archive_stream_contract IN ITEMS
+        [=[[string]$ArchiveCreateTarPath]=]
         [=[Write-FullProfileTarList -Paths ([string[]]$files.RelativePath)]=]
+        [=[$tarStartInfo.Environment['PATH']]=]
+        [=[$tarDirectory + [IO.Path]::PathSeparator]=]
         [=[$tarStartInfo.RedirectStandardOutput = $true]=]
         [=[$tarStartInfo.RedirectStandardError = $true]=]
         [=[@('-czh', '-f', '-', '-C', $SourceRoot, '-T', $listPath)]=]
@@ -656,6 +659,15 @@ foreach(full_profile_archive_stream_contract IN ITEMS
         "scripts/windows/freeze-full-profile-source.ps1"
         "${full_profile_archive_stream_contract}"
         "Source freeze must retain streamed archive contract ${full_profile_archive_stream_contract}")
+endforeach()
+foreach(full_profile_archive_builder_contract IN ITEMS
+        [=[Join-Path $Msys2Root "usr\bin\tar.exe"]=]
+        [=['-ArchiveCreateTarPath']=]
+        [=[msys2-tar]=])
+    assert_file_contains_literal(
+        "scripts/windows/build-full-profile.ps1"
+        "${full_profile_archive_builder_contract}"
+        "Full-profile builds must retain archive creator contract ${full_profile_archive_builder_contract}")
 endforeach()
 assert_file_excludes(
     "scripts/windows/freeze-full-profile-source.ps1"

@@ -243,6 +243,7 @@ if ($missingWdkTools.Count -ne 0) {
     throw "Required x64 WDK tools are missing: $($missingWdkTools -join ', ')"
 }
 $msysShell = Resolve-Tool (Join-Path $Msys2Root "msys2_shell.cmd") "MSYS2 shell"
+$msysTar = Resolve-Tool (Join-Path $Msys2Root "usr\bin\tar.exe") "MSYS2 tar"
 
 if ([string]::IsNullOrWhiteSpace($PythonPath)) {
     $pythonCommand = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue |
@@ -331,7 +332,9 @@ if (-not $UsePreparedDriverSubmission) {
             '-OutputDirectory',
             $freezeDirectory,
             '-SharedSourceFreezeManifestSha256',
-            $sharedSourceFreezeManifestSha256
+            $sharedSourceFreezeManifestSha256,
+            '-ArchiveCreateTarPath',
+            $msysTar
         ) `
         -WorkingDirectory $SourceRoot `
         -ToolchainIds @('windows-powershell'))
@@ -916,6 +919,7 @@ if (-not $BuildOnly) {
         [ordered]@{ id = 'universal-ddis'; path = $universalDdis.FullName },
         [ordered]@{ id = 'signtool'; path = $signTool.FullName },
         [ordered]@{ id = 'msys2-shell'; path = $msysShell },
+        [ordered]@{ id = 'msys2-tar'; path = $msysTar },
         [ordered]@{ id = 'python'; path = $PythonPath },
         [ordered]@{ id = 'dotnet'; path = $dotnetExecutable },
         [ordered]@{ id = 'npm'; path = $npmExecutable },
