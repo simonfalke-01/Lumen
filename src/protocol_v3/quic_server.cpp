@@ -768,6 +768,8 @@ namespace lumen::protocol_v3::quic_server {
       std::size_t bulk_transfer_count {};
       std::size_t bulk_buffered_bytes {};
       Handle control_stream {invalid_handle};
+      std::uint64_t control_stream_id {UINT64_MAX};
+      Handle reserved_control_stream {invalid_handle};
       std::vector<std::uint8_t> control_receive;
       std::shared_ptr<ControlSessionV3> session;
       std::optional<std::array<std::uint8_t, 16>> active_session_id;
@@ -857,7 +859,7 @@ namespace lumen::protocol_v3::quic_server {
       status = api_.configuration_open(
         registration_,
         required_alpn,
-        1,
+        2,
         0,
         static_cast<std::uint64_t>(config_.handshake_timeout.count()),
         static_cast<std::uint64_t>(config_.handshake_timeout.count()),
@@ -1726,9 +1728,16 @@ namespace lumen::protocol_v3::quic_server {
             return ApiStatus::success;
           }
 
-        case ConnectionEvent::Kind::peer_stream_started:
-          if (event.stream == invalid_handle || event.stream_id != 0 || event.peer_stream_unidirectional ||
-              connection.control_stream != invalid_handle) {
+        case ConnectionEvent::Kind::peer_stream_started: {
+          // NWMultiplexGroup consumes stream 0 for its tunnel flow, so its first
+          // application-created client bidirectional stream is stream 4.
+          const auto replaces_reserved_control =
+            event.stream_id == 4 && connection.control_stream_id == 0 &&
+            connection.control_stream != invalid_handle && !connection.hello_received &&
+            connection.control_receive.empty() && connection.reserved_control_stream == invalid_handle;
+          if (event.stream == invalid_handle || (event.stream_id != 0 && event.stream_id != 4) ||
+              event.peer_stream_unidirectional ||
+              (connection.control_stream != invalid_handle && !replaces_reserved_control)) {
             if (event.stream != invalid_handle) {
               const std::weak_ptr<Impl> weak = weak_from_this();
               static_cast<void>(api_.stream_set_callback(
@@ -1750,7 +1759,27 @@ namespace lumen::protocol_v3::quic_server {
             }
             return ApiStatus::aborted;
           }
-          connection.control_stream = event.stream;
+          if (replaces_reserved_control) {
+            const auto reserved_control_stream = connection.control_stream;
+            const std::weak_ptr<Impl> weak = weak_from_this();
+            const auto callback = api_.stream_set_callback(
+              reserved_control_stream,
+              [weak, id, stream = reserved_control_stream](const StreamEvent &stream_event) {
+                if (const auto self = weak.lock()) {
+                  return self->on_stream_event(id, stream, false, stream_event);
+                }
+                return ApiStatus::aborted;
+              }
+            );
+            if (!accepted(callback)) {
+              api_.stream_close(event.stream);
+              begin_shutdown_locked(connection, shutdown_internal_error);
+              return callback;
+            }
+            connection.reserved_control_stream = reserved_control_stream;
+            connection.control_stream = invalid_handle;
+            connection.control_stream_id = UINT64_MAX;
+          }
           {
             const std::weak_ptr<Impl> weak = weak_from_this();
             const auto callback = api_.stream_set_callback(
@@ -1763,13 +1792,17 @@ namespace lumen::protocol_v3::quic_server {
               }
             );
             if (!accepted(callback)) {
+              api_.stream_close(event.stream);
               begin_shutdown_locked(connection, shutdown_internal_error);
               return callback;
             }
           }
+          connection.control_stream = event.stream;
+          connection.control_stream_id = event.stream_id;
           static_cast<void>(api_.stream_set_priority(event.stream, 0));
           drain_locked(connection_owner, lock);
           return ApiStatus::success;
+        }
 
         case ConnectionEvent::Kind::shutdown_by_transport:
         case ConnectionEvent::Kind::shutdown_by_peer:
@@ -2175,7 +2208,7 @@ namespace lumen::protocol_v3::quic_server {
         case StreamEvent::Kind::shutdown_complete:
           if (connection.force_closing) {
             send_drain_condition_.notify_all();
-            if (!is_control) {
+            if (!is_control && stream != connection.reserved_control_stream) {
               lock.unlock();
               api_.stream_close(stream);
             }
@@ -2184,6 +2217,10 @@ namespace lumen::protocol_v3::quic_server {
           api_.stream_close(stream);
           if (connection.control_stream == stream) {
             connection.control_stream = invalid_handle;
+            connection.control_stream_id = UINT64_MAX;
+          }
+          if (connection.reserved_control_stream == stream) {
+            connection.reserved_control_stream = invalid_handle;
           }
           return ApiStatus::success;
       }
@@ -2926,6 +2963,11 @@ namespace lumen::protocol_v3::quic_server {
       if (connection->control_stream != invalid_handle) {
         api_.stream_close(connection->control_stream);
         connection->control_stream = invalid_handle;
+        connection->control_stream_id = UINT64_MAX;
+      }
+      if (connection->reserved_control_stream != invalid_handle) {
+        api_.stream_close(connection->reserved_control_stream);
+        connection->reserved_control_stream = invalid_handle;
       }
       for (const auto &[stream, _] : connection->bulk_streams) {
         api_.stream_close(stream);
@@ -2999,6 +3041,9 @@ namespace lumen::protocol_v3::quic_server {
           DetachedConnection handles {.owner = connection, .streams = {}};
           if (connection->control_stream != invalid_handle) {
             handles.streams.push_back(connection->control_stream);
+          }
+          if (connection->reserved_control_stream != invalid_handle) {
+            handles.streams.push_back(connection->reserved_control_stream);
           }
           for (const auto &[stream, _] : connection->bulk_streams) {
             handles.streams.push_back(stream);

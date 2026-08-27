@@ -283,12 +283,13 @@ i2j7w5vhA66Ep18oU6mfswVI
     quic::ApiStatus configuration_open(
       quic::Handle,
       std::string_view,
-      std::uint16_t,
+      const std::uint16_t peer_bidirectional_stream_count_value,
       std::uint16_t,
       std::uint64_t,
       std::uint64_t,
       quic::Handle &configuration
     ) override {
+      peer_bidirectional_stream_count = peer_bidirectional_stream_count_value;
       configuration = 2;
       return quic::ApiStatus::success;
     }
@@ -390,6 +391,10 @@ i2j7w5vhA66Ep18oU6mfswVI
     }
 
     quic::ApiStatus stream_set_callback(const quic::Handle stream, StreamCallback callback) override {
+      if (fail_next_stream_callback_for == stream) {
+        fail_next_stream_callback_for.reset();
+        return stream_callback_failure_status;
+      }
       stream_callbacks.insert_or_assign(stream, std::move(callback));
       return quic::ApiStatus::success;
     }
@@ -413,9 +418,16 @@ i2j7w5vhA66Ep18oU6mfswVI
 
     void stream_shutdown(const quic::Handle stream, const std::uint64_t error) noexcept override {
       stream_shutdowns.emplace_back(stream, error);
+      if (complete_stream_shutdown_synchronously) {
+        const auto callback = stream_callbacks.find(stream);
+        if (callback != stream_callbacks.end()) {
+          static_cast<void>(callback->second({.kind = quic::StreamEvent::Kind::shutdown_complete}));
+        }
+      }
     }
 
-    void stream_close(quic::Handle) noexcept override {
+    void stream_close(const quic::Handle stream) noexcept override {
+      stream_closes.push_back(stream);
     }
 
     quic::ApiStatus datagram_send(
@@ -483,18 +495,27 @@ i2j7w5vhA66Ep18oU6mfswVI
       return connection_shutdowns.size();
     }
 
+    std::size_t stream_close_count(const quic::Handle stream) const {
+      return static_cast<std::size_t>(std::ranges::count(stream_closes, stream));
+    }
+
     ListenerCallback listener_callback;
     ConnectionCallback connection_callback;
     std::map<quic::Handle, StreamCallback> stream_callbacks;
     std::vector<std::pair<quic::Handle, std::uint64_t>> connection_shutdowns;
     std::vector<std::pair<quic::Handle, std::uint64_t>> idle_timeouts;
     std::vector<std::pair<quic::Handle, std::uint64_t>> stream_shutdowns;
+    std::vector<quic::Handle> stream_closes;
     std::vector<DatagramSend> datagram_sends;
     std::optional<quic::CongestionSample> congestion;
+    std::optional<quic::Handle> fail_next_stream_callback_for;
     quic::Handle next_stream {100};
+    std::uint16_t peer_bidirectional_stream_count {};
     std::atomic_size_t listener_stop_calls {};
     bool complete_listener_stop_synchronously {};
+    bool complete_stream_shutdown_synchronously {};
     quic::ApiStatus configuration_load_status {quic::ApiStatus::success};
+    quic::ApiStatus stream_callback_failure_status {quic::ApiStatus::transport_error};
     std::mutex listener_stop_mutex;
     std::condition_variable listener_stop_condition;
     std::mutex connection_shutdown_mutex;
@@ -840,7 +861,7 @@ i2j7w5vhA66Ep18oU6mfswVI
         api.connection_event({
           .kind = quic::ConnectionEvent::Kind::peer_stream_started,
           .stream = control_stream,
-          .stream_id = 0,
+          .stream_id = 4,
         }),
         quic::ApiStatus::success
       );
@@ -926,6 +947,130 @@ i2j7w5vhA66Ep18oU6mfswVI
         quic::EnqueueResult::invalid_packet
       );
     }
+  }
+
+  TEST(ProtocolV3Transport, NetworkFrameworkReservedStreamClosurePreservesApplicationControlStream) {
+    constexpr quic::Handle reserved_stream = 20;
+    constexpr quic::Handle application_stream = 24;
+    TestMsQuicApi api;
+    TestSessionFactory factory;
+    quic::QuicServer server {api, test_config(), factory};
+    connect_test_server(api, server);
+    EXPECT_EQ(api.peer_bidirectional_stream_count, 2U);
+
+    ASSERT_EQ(
+      api.connection_event({
+        .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+        .stream = reserved_stream,
+        .stream_id = 0,
+      }),
+      quic::ApiStatus::success
+    );
+    ASSERT_EQ(
+      api.connection_event({
+        .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+        .stream = application_stream,
+        .stream_id = 4,
+      }),
+      quic::ApiStatus::success
+    );
+
+    const auto hello = control_frame(0x0001, 1);
+    const quic::Buffer hello_buffer {hello.data(), hello.size()};
+    ASSERT_EQ(
+      api.stream_event(application_stream, {
+                                             .kind = quic::StreamEvent::Kind::receive,
+                                             .buffers = std::span {&hello_buffer, 1},
+                                             .total_buffer_bytes = hello.size(),
+                                           }),
+      quic::ApiStatus::success
+    );
+    EXPECT_EQ(factory.begin_control_calls->load(), 1U);
+
+    ASSERT_EQ(
+      api.stream_event(reserved_stream, {.kind = quic::StreamEvent::Kind::shutdown_complete}),
+      quic::ApiStatus::success
+    );
+
+    const auto follow_up = control_frame(0x0005, 2);
+    const quic::Buffer follow_up_buffer {follow_up.data(), follow_up.size()};
+    EXPECT_EQ(
+      api.stream_event(application_stream, {
+                                             .kind = quic::StreamEvent::Kind::receive,
+                                             .buffers = std::span {&follow_up_buffer, 1},
+                                             .total_buffer_bytes = follow_up.size(),
+                                           }),
+      quic::ApiStatus::success
+    );
+    EXPECT_EQ(factory.begin_control_calls->load(), 2U);
+    EXPECT_TRUE(api.connection_shutdowns.empty());
+  }
+
+  TEST(ProtocolV3Transport, ForceCloseAfterControlPromotionClosesEachStreamExactlyOnce) {
+    constexpr quic::Handle reserved_stream = 20;
+    constexpr quic::Handle application_stream = 24;
+    TestMsQuicApi api;
+    api.complete_stream_shutdown_synchronously = true;
+    TestSessionFactory factory;
+    {
+      quic::QuicServer server {api, test_config(), factory};
+      connect_test_server(api, server);
+      ASSERT_EQ(
+        api.connection_event({
+          .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+          .stream = reserved_stream,
+          .stream_id = 0,
+        }),
+        quic::ApiStatus::success
+      );
+      ASSERT_EQ(
+        api.connection_event({
+          .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+          .stream = application_stream,
+          .stream_id = 4,
+        }),
+        quic::ApiStatus::success
+      );
+    }
+
+    EXPECT_EQ(api.stream_close_count(reserved_stream), 1U);
+    EXPECT_EQ(api.stream_close_count(application_stream), 1U);
+  }
+
+  TEST(ProtocolV3Transport, FailedReservedStreamCallbackRegistrationDoesNotAliasOwnedHandles) {
+    constexpr quic::Handle reserved_stream = 20;
+    constexpr quic::Handle application_stream = 24;
+    TestMsQuicApi api;
+    TestSessionFactory factory;
+    {
+      quic::QuicServer server {api, test_config(), factory};
+      connect_test_server(api, server);
+      ASSERT_EQ(
+        api.connection_event({
+          .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+          .stream = reserved_stream,
+          .stream_id = 0,
+        }),
+        quic::ApiStatus::success
+      );
+      api.fail_next_stream_callback_for = reserved_stream;
+      EXPECT_EQ(
+        api.connection_event({
+          .kind = quic::ConnectionEvent::Kind::peer_stream_started,
+          .stream = application_stream,
+          .stream_id = 4,
+        }),
+        quic::ApiStatus::transport_error
+      );
+      ASSERT_EQ(api.connection_shutdowns.size(), 1U);
+      EXPECT_EQ(
+        api.connection_shutdowns.front().second,
+        static_cast<std::uint64_t>(quic::ApplicationCloseCode::internal_failure)
+      );
+    }
+
+    EXPECT_EQ(api.stream_close_count(reserved_stream), 1U);
+    EXPECT_EQ(api.stream_close_count(application_stream), 1U);
   }
 
   TEST(ProtocolV3Transport, RepeatedStopAndDestructionWakeBackgroundWorkers) {
@@ -1112,7 +1257,7 @@ i2j7w5vhA66Ep18oU6mfswVI
         api.connection_event({
           .kind = quic::ConnectionEvent::Kind::peer_stream_started,
           .stream = 24,
-          .stream_id = 4,
+          .stream_id = 8,
         }),
         quic::ApiStatus::aborted
       );
