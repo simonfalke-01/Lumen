@@ -108,7 +108,7 @@
   "clients": {
     "access": "Access",
     "actions": "Actions",
-    "admin_unauthorized": "This session is not authorized to administer protocol-v3 clients.",
+    "admin_unauthorized": "Only an authenticated local-network administrator can manage protocol-v3 clients.",
     "client": "Client",
     "confirm_revoke": "Confirm revoke",
     "copied": "Copied",
@@ -123,6 +123,7 @@
     "hostname_is_ip": "This is an IP address",
     "hostname_placeholder": "simon or 192.168.1.236",
     "invitation_uri": "Invitation URI",
+    "invitation_revoke_failed": "The host did not revoke this invitation. It remains active; try again.",
     "issue_invitation": "Issue QR invitation",
     "paired_clients": "Paired protocol-v3 clients",
     "paired_clients_desc": "Permission changes and revocation immediately close that client's authenticated connections.",
@@ -142,7 +143,8 @@
     "request_failed": "The request could not be completed. Check that protocol v3 is running and try again.",
     "revoke_client": "Revoke",
     "revoke_invitation": "Revoke invitation",
-    "title": "Clients"
+    "title": "Clients",
+    "updating": "Updating"
   },
   "config": {
     "adapter_name": "Adapter Name",

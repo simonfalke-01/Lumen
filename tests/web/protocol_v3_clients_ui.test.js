@@ -10,6 +10,10 @@ const networkConfig = await readFile(
   new URL('../../src_assets/common/assets/web/configs/tabs/Network.vue', import.meta.url),
   'utf8',
 );
+const clientState = await readFile(
+  new URL('../../src_assets/common/assets/web/protocol_v3_client_state.js', import.meta.url),
+  'utf8',
+);
 const englishLocale = JSON.parse(await readFile(
   new URL('../../src_assets/common/assets/web/public/assets/locale/en.json', import.meta.url),
   'utf8',
@@ -40,19 +44,25 @@ test('permission controls model effective loading, error, and authorization stat
   assert.match(clientsPage, /permissionPolicyError: ''/);
   assert.match(clientsPage, /clientPermissionDisabled/);
   assert.match(clientsPage, /clientActionError/);
+  assert.match(clientsPage, /permissionsValid/);
+  assert.match(clientsPage, /role="status"/);
+  assert.match(clientsPage, /clientMutationPending/);
   assert.match(clientsPage, /response\.status === 401 \|\| response\.status === 403/);
   assert.doesNotMatch(clientsPage, /approvedPermissions \|\| 0x17/);
   assert.match(englishLocale.clients.permission_policy_unavailable, /remain disabled/);
 });
 
 test('permission mutations are immediate, rollback-safe, and preserve host policy', () => {
-  const optimisticUpdate = clientsPage.indexOf('Object.assign(client, patch)');
-  const request = clientsPage.indexOf("method: 'PATCH'");
-  const rollback = clientsPage.indexOf('Object.assign(client, previous)');
+  const optimisticUpdate = clientState.indexOf('Object.assign(client, patch)');
+  const request = clientState.indexOf('await request(patch)');
+  const rollback = clientState.indexOf('Object.assign(client, previous)');
   assert.ok(optimisticUpdate >= 0 && optimisticUpdate < request);
   assert.ok(rollback > request);
   assert.match(clientsPage, /\$event\.target\.checked/);
   assert.match(clientsPage, /permissionPolicyRestricted/);
+  assert.match(clientsPage, /buildClientPermissionUpdate/);
+  assert.match(clientsPage, /isCurrentClientRefresh/);
+  assert.match(clientsPage, /revokeProtocolV3Invitation/);
   assert.match(clientsPage, /clients\.permission_policy_configure/);
   assert.match(englishLocale.clients.permission_policy_configure, /Network configuration/);
 });

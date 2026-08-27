@@ -45,6 +45,6 @@ test('sets optional permissions immediately while preserving required bits', () 
     setProtocolV3Permission(microphone, 3, false, PROTOCOL_V3_REQUIRED_PERMISSION_MASK),
     PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
   );
-  assert.equal(setProtocolV3Permission('invalid', 5, true), 0x20);
+  assert.equal(setProtocolV3Permission('invalid', 5, true), null);
   assert.equal(setProtocolV3Permission(0xff, 5, false), 0x1f);
 });

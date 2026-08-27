@@ -119,7 +119,8 @@
           <h2 id="v3-clients-title" class="h4 mb-1">{{ $t('clients.paired_clients') }}</h2>
           <p class="text-body-secondary mb-0">{{ $t('clients.paired_clients_desc') }}</p>
         </div>
-        <button class="btn btn-outline-secondary" type="button" :disabled="clientsLoading" @click="loadClients">
+        <button class="btn btn-outline-secondary" type="button"
+                :disabled="clientsLoading || clientMutationPending" @click="loadClients">
           <refresh-cw :size="17" class="icon"></refresh-cw>
           {{ $t('clients.refresh') }}
         </button>
@@ -140,9 +141,14 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="client in clients" :key="client.clientId">
+            <tr v-for="client in clients" :key="client.clientId" :aria-busy="client.pending.toString()">
               <td>
-                <div class="fw-semibold">{{ client.name }}</div>
+                <div class="fw-semibold">
+                  {{ client.name }}
+                  <span v-if="client.pending" class="badge text-bg-secondary ms-2" role="status">
+                    {{ $t('clients.updating') }}
+                  </span>
+                </div>
                 <div class="small text-body-secondary font-monospace v3-client-id" :title="client.clientId">{{ client.clientId }}</div>
               </td>
               <td>
@@ -193,6 +199,13 @@
   import Navbar from './Navbar.vue'
   import { apiFetch } from './fetch_utils'
   import {
+    buildClientPermissionUpdate,
+    isCurrentClientRefresh,
+    normalizeProtocolV3Client,
+    persistOptimisticClientPatch,
+    revokeProtocolV3Invitation,
+  } from './protocol_v3_client_state'
+  import {
     hasProtocolV3Permission,
     normalizeInvitationPermissionMask,
     normalizeProtocolV3PermissionMask,
@@ -231,6 +244,7 @@
         clientsLoading: true,
         clientsError: '',
         clientActionError: '',
+        clientMutationRevision: 0,
         pendingRevokeId: null,
       }
     },
@@ -243,6 +257,9 @@
         return this.allowedPermissions !== null &&
           this.allowedPermissions !== PROTOCOL_V3_DEFINED_PERMISSION_MASK
       },
+      clientMutationPending() {
+        return this.clients.some(client => client.pending)
+      },
     },
     methods: {
       hasPermission: hasProtocolV3Permission,
@@ -251,7 +268,7 @@
           !hasProtocolV3Permission(this.allowedPermissions, permission.bit)
       },
       clientPermissionDisabled(client, permission) {
-        if (this.permissionPolicyLoading || this.permissionPolicyError) return true
+        if (!client.permissionsValid || this.permissionPolicyLoading || this.permissionPolicyError) return true
         return !hasProtocolV3Permission(client.permissions, permission.bit) &&
           !hasProtocolV3Permission(this.allowedPermissions, permission.bit)
       },
@@ -316,8 +333,12 @@
       },
       async revokeInvitation() {
         this.invitationBusy = true
+        this.invitationError = ''
         try {
-          await this.json('./api/protocol-v3/invitation', { method: 'DELETE' })
+          await revokeProtocolV3Invitation(
+            () => this.json('./api/protocol-v3/invitation', { method: 'DELETE' }),
+            new Error(this.$t('clients.invitation_revoke_failed')),
+          )
           this.invitation = null
           this.copied = false
         } catch (error) {
@@ -332,11 +353,14 @@
         window.setTimeout(() => { this.copied = false }, 1800)
       },
       async loadClients() {
+        if (this.clientMutationPending) return
+        const refreshRevision = this.clientMutationRevision
         this.clientsLoading = true
         this.clientsError = ''
         try {
           const result = await this.json('./api/protocol-v3/clients')
-          this.clients = (result.clients || []).map(client => ({ ...client, pending: false }))
+          if (!isCurrentClientRefresh(refreshRevision, this.clientMutationRevision)) return
+          this.clients = (result.clients || []).map(normalizeProtocolV3Client)
         } catch (error) {
           this.clientsError = error.message
         } finally {
@@ -344,30 +368,34 @@
         }
       },
       async updateClient(client, patch) {
-        const previous = Object.fromEntries(Object.keys(patch).map(key => [key, client[key]]))
-        Object.assign(client, patch)
-        client.pending = true
+        this.clientMutationRevision += 1
         this.clientActionError = ''
         try {
-          const result = await this.json('./api/protocol-v3/clients', {
-            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ clientId: client.clientId, ...patch }),
-          })
-          if (!result.status) throw new Error(this.$t('clients.request_failed'))
+          await persistOptimisticClientPatch(
+            client,
+            patch,
+            effectivePatch => this.json('./api/protocol-v3/clients', {
+              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ clientId: client.clientId, ...effectivePatch }),
+            }),
+            new Error(this.$t('clients.request_failed')),
+          )
         } catch (error) {
-          Object.assign(client, previous)
           this.clientActionError = error.message
-        } finally {
-          client.pending = false
         }
       },
       setClientEnabled(client, enabled) { return this.updateClient(client, { enabled }) },
       setClientPermission(client, bit, enabled) {
         if (this.clientPermissionDisabled(client, { bit })) return
-        const permissions = setProtocolV3Permission(client.permissions, bit, enabled)
+        const permissions = buildClientPermissionUpdate(client.permissions, this.allowedPermissions, bit, enabled)
+        if (permissions === null) {
+          this.clientActionError = this.$t('clients.permission_policy_unavailable')
+          return
+        }
         return this.updateClient(client, { permissions })
       },
       async revokeClient(client) {
+        this.clientMutationRevision += 1
         client.pending = true
         this.clientActionError = ''
         try {

@@ -47,10 +47,11 @@ export function normalizeInvitationPermissionMask(mask) {
  * @param {number} bit Zero-based permission bit to change.
  * @param {boolean} enabled Desired permission state.
  * @param {number} requiredMask Permissions that cannot be cleared.
- * @returns {number} The updated bounded permission mask.
+ * @returns {number|null} The updated bounded permission mask, or `null` for invalid state.
  */
 export function setProtocolV3Permission(mask, bit, enabled, requiredMask = 0) {
-  const normalized = normalizeProtocolV3PermissionMask(mask) ?? 0
+  const normalized = normalizeProtocolV3PermissionMask(mask)
+  if (normalized === null) return null
   const permission = 1 << bit
   const updated = enabled ? normalized | permission : normalized & ~permission
   return (updated | requiredMask) & PROTOCOL_V3_DEFINED_PERMISSION_MASK
