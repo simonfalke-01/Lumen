@@ -2276,6 +2276,7 @@ namespace rtsp_stream {
     const std::shared_ptr<launch_session_t> &replacement_launch,
     std::vector<bool> *action_results
   ) {
+    auto input_deinit_guard = input::init();
     rtsp_server_t test_server;
     test_server.map("OPTIONS"sv, &cmd_option);
     test_server.map("DESCRIBE"sv, &cmd_describe);
