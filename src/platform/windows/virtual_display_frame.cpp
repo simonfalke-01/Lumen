@@ -259,8 +259,7 @@ namespace platf::virtual_display {
 #if !defined(_WIN32)
   std::shared_ptr<frame_source_t> make_system_frame_source(
     const stream_selection_t &,
-    std::chrono::milliseconds,
-    const bool
+    std::chrono::milliseconds
   ) {
     return {};
   }

@@ -1039,6 +1039,13 @@ TEST(VirtualDisplayFrameAbi5Policy, ValidatesSdrHdrFormatsMetadataAndPixelPitch)
   EXPECT_FALSE(direct_frame_desktop_fallback_permitted(true, dynamic_range_e::sdr));
   EXPECT_FALSE(direct_frame_desktop_fallback_permitted(false, dynamic_range_e::hdr10));
   EXPECT_FALSE(direct_frame_desktop_fallback_permitted(true, dynamic_range_e::hdr10));
+  EXPECT_TRUE(direct_frame_fallback_publishable(9, true, true, false, dynamic_range_e::sdr, true));
+  EXPECT_FALSE(direct_frame_fallback_publishable(0, true, true, false, dynamic_range_e::sdr, true));
+  EXPECT_FALSE(direct_frame_fallback_publishable(9, false, true, false, dynamic_range_e::sdr, true));
+  EXPECT_FALSE(direct_frame_fallback_publishable(9, true, false, false, dynamic_range_e::sdr, true));
+  EXPECT_FALSE(direct_frame_fallback_publishable(9, true, true, true, dynamic_range_e::sdr, true));
+  EXPECT_FALSE(direct_frame_fallback_publishable(9, true, true, false, dynamic_range_e::hdr10, true));
+  EXPECT_FALSE(direct_frame_fallback_publishable(9, true, true, false, dynamic_range_e::sdr, false));
 
   frame_color_metadata_t sdr {frame_color_space_e::srgb, 80, hdr_metadata_type_e::none, {}};
   EXPECT_TRUE(valid_frame_color_metadata(sdr, dynamic_range_e::sdr, frame_format_e::bgra8));

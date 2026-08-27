@@ -75,6 +75,8 @@ namespace video {
     stream_policy::ClientProtocol client_protocol {stream_policy::ClientProtocol::vanilla};  ///< Exact negotiated client family.
     bool virtual_display_active {};  ///< An exact Lumen VDD generation owns `output_name` for this session.
     bool virtual_display_direct_required {};  ///< Reject capture if the active VDD direct-frame path cannot stay healthy.
+    std::uint64_t virtual_display_generation {};  ///< Exact active VDD generation retained across direct-source failure.
+    bool virtual_display_desktop_fallback_permitted {};  ///< Whether optional SDR may publish fallback after DDA/WGC succeeds.
     std::shared_ptr<platf::virtual_display::frame_source_t> virtual_display_frame_source;  ///< Production VDD direct-frame source, or empty for DDA/WGC.
     std::function<std::pair<std::uint64_t, std::uint64_t>()> capture_input_watermark;  ///< Applied input watermark sampled at capture submission.
   };

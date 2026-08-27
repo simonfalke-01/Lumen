@@ -1610,10 +1610,11 @@ namespace rtsp_stream {
             config.monitor.virtual_display_direct_required,
             requested_mode.dynamic_range
           );
+        config.monitor.virtual_display_generation = prepared.selection->generation;
+        config.monitor.virtual_display_desktop_fallback_permitted = desktop_fallback_permitted;
         config.monitor.virtual_display_frame_source = platf::virtual_display::make_system_frame_source(
           *prepared.selection,
-          std::chrono::milliseconds {250},
-          desktop_fallback_permitted
+          std::chrono::milliseconds {250}
         );
         if (!config.monitor.virtual_display_frame_source && config.monitor.virtual_display_direct_required) {
           const auto topology_restored = stream::cleanup_virtual_display(config);

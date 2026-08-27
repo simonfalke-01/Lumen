@@ -1117,6 +1117,21 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    const auto publish_desktop_fallback = [&config]() {
+      const auto dynamic_range = config.dynamicRange != 0 ?
+                                   virtual_display::dynamic_range_e::hdr10 :
+                                   virtual_display::dynamic_range_e::sdr;
+      if (virtual_display::direct_frame_fallback_publishable(
+            config.virtual_display_generation,
+            config.virtual_display_desktop_fallback_permitted,
+            config.virtual_display_active,
+            config.virtual_display_direct_required,
+            dynamic_range,
+            true
+          )) {
+        virtual_display::report_direct_frame_fallback(config.virtual_display_generation);
+      }
+    };
     if (!virtual_display::valid_required_direct_capture_request(
           config.virtual_display_direct_required,
           hwdevice_type == mem_type_e::dxgi,
@@ -1126,7 +1141,6 @@ namespace platf {
       return {};
     }
     if (hwdevice_type == mem_type_e::dxgi && config.virtual_display_frame_source) {
-      const auto frame_generation = config.virtual_display_frame_source->resources().generation;
       const auto desktop_fallback_permitted = virtual_display::direct_frame_desktop_fallback_permitted(
         config.virtual_display_direct_required,
         config.dynamicRange != 0 ?
@@ -1142,10 +1156,6 @@ namespace platf {
         BOOST_LOG(error) << "Required Lumen VDD direct-frame initialization failed; refusing capture fallback"sv;
         return {};
       }
-      virtual_display::report_direct_frame_initialization_failure(
-        frame_generation,
-        desktop_fallback_permitted
-      );
       BOOST_LOG(warning) << "Lumen VDD direct-frame initialization failed; falling back to DDA/WGC"sv;
     }
 
@@ -1154,12 +1164,14 @@ namespace platf {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
 
         if (!disp->init(config, display_name)) {
+          publish_desktop_fallback();
           return disp;
         }
       } else if (hwdevice_type == mem_type_e::system) {
         auto disp = std::make_shared<dxgi::display_ddup_ram_t>();
 
         if (!disp->init(config, display_name)) {
+          publish_desktop_fallback();
           return disp;
         }
       }
@@ -1170,6 +1182,7 @@ namespace platf {
         auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
 
         if (!disp->init(config, display_name)) {
+          publish_desktop_fallback();
           return disp;
         }
       } else if (hwdevice_type == mem_type_e::system) {

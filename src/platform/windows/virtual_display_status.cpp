@@ -149,13 +149,18 @@ namespace platf::virtual_display {
   }
 
   void report_direct_frame_fallback(const std::uint64_t generation) noexcept {
-    report_direct_frame_initialization_failure(generation, true);
+    if (generation == 0) {
+      return;
+    }
+    std::lock_guard lock(direct_frame_status_mutex);
+    if (direct_frame_status.generation > generation ||
+        (direct_frame_status.generation == generation && direct_frame_status.quarantined)) {
+      return;
+    }
+    direct_frame_status = {generation, false, false, true};
   }
 
-  void report_direct_frame_initialization_failure(
-    const std::uint64_t generation,
-    const bool desktop_fallback_permitted
-  ) noexcept {
+  void report_direct_frame_initialization_failure(const std::uint64_t generation) noexcept {
     if (generation == 0) {
       return;
     }
@@ -166,11 +171,7 @@ namespace platf::virtual_display {
     if (direct_frame_status.generation == generation && direct_frame_status.quarantined) {
       return;
     }
-    if (desktop_fallback_permitted) {
-      direct_frame_status = {generation, false, false, true};
-    } else if (direct_frame_status.generation == generation) {
-      direct_frame_status = {};
-    }
+    direct_frame_status = {generation, false, false, false};
   }
 
   void report_direct_frame_stopped(

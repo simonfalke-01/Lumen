@@ -109,16 +109,12 @@ namespace platf::virtual_display {
    * @brief Record direct-frame initialization failure without inventing a forbidden fallback.
    *
    * A quarantined generation remains quarantined, and an older completion cannot replace newer
-   * generation state. Otherwise, only an explicitly permitted optional SDR path is reported as
-   * desktop capture.
+   * generation state. Initialization failure itself is unavailable; fallback is reported only
+   * later through `report_direct_frame_fallback()` after a desktop backend succeeds.
    *
    * @param generation Active nonzero VDD generation whose source failed to initialize.
-   * @param desktop_fallback_permitted Whether desktop capture will remain active for this generation.
    */
-  void report_direct_frame_initialization_failure(
-    std::uint64_t generation,
-    bool desktop_fallback_permitted
-  ) noexcept;
+  void report_direct_frame_initialization_failure(std::uint64_t generation) noexcept;
 
   /**
    * @brief Record source teardown for an exact generation without allowing an older source to clear a newer one.

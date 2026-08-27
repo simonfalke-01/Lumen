@@ -63,6 +63,29 @@ namespace platf::virtual_display {
     return !direct_required && dynamic_range == dynamic_range_e::sdr;
   }
 
+  /**
+   * @brief Decide whether an initialized desktop backend may publish VDD fallback success.
+   *
+   * @param generation Exact active VDD generation carried by the stream.
+   * @param policy_permitted Whether the optional SDR policy permits desktop fallback.
+   * @param virtual_display_active Whether the stream still owns the VDD generation.
+   * @param direct_required Whether the stream requires direct-frame capture.
+   * @param dynamic_range Exact stream dynamic range.
+   * @param backend_initialized Whether DDA or WGC initialization actually succeeded.
+   * @return True only after a real optional SDR desktop backend is ready for this generation.
+   */
+  [[nodiscard]] constexpr bool direct_frame_fallback_publishable(
+    const std::uint64_t generation,
+    const bool policy_permitted,
+    const bool virtual_display_active,
+    const bool direct_required,
+    const dynamic_range_e dynamic_range,
+    const bool backend_initialized
+  ) noexcept {
+    return generation != 0 && policy_permitted && virtual_display_active && backend_initialized &&
+           direct_frame_desktop_fallback_permitted(direct_required, dynamic_range);
+  }
+
   /** @brief Resolved surface color space carried with each leased frame. */
   enum class frame_color_space_e : std::uint32_t {
     srgb = 1,
@@ -469,8 +492,7 @@ namespace platf::virtual_display {
     friend class frame_lease_t;
     friend std::shared_ptr<frame_source_t> make_system_frame_source(
       const stream_selection_t &selection,
-      std::chrono::milliseconds timeout,
-      bool desktop_fallback_permitted
+      std::chrono::milliseconds timeout
     );
 
     class impl_t;
@@ -484,13 +506,11 @@ namespace platf::virtual_display {
    * @brief Open the production Windows direct-frame channel for one active VDD selection.
    * @param selection Exact active VDD generation and mode.
    * @param timeout Bounded driver-resource publication/import deadline.
-   * @param desktop_fallback_permitted Whether initialization failure leaves optional SDR desktop capture active.
    * @return Healthy source, or empty when any capability/hardware/import gate fails.
    */
   [[nodiscard]] std::shared_ptr<frame_source_t> make_system_frame_source(
     const stream_selection_t &selection,
-    std::chrono::milliseconds timeout,
-    bool desktop_fallback_permitted = false
+    std::chrono::milliseconds timeout
   );
 
   /** @brief Permanently disable the direct-frame path for this host process. */
