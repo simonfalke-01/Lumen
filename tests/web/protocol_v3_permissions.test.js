@@ -3,7 +3,9 @@ import test from 'node:test';
 
 import {
   hasProtocolV3Permission,
+  normalizeConfiguredInvitationPermissionMask,
   normalizeInvitationPermissionMask,
+  normalizeProtocolV3ConfigPermissionMask,
   normalizeProtocolV3PermissionMask,
   PROTOCOL_V3_DEFINED_PERMISSION_MASK,
   PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
@@ -20,6 +22,20 @@ test('normalizes API and configuration permission masks to defined bits', () => 
   assert.equal(normalizeProtocolV3PermissionMask(Number.NaN), null);
   assert.equal(normalizeProtocolV3PermissionMask(-1), null);
   assert.equal(normalizeProtocolV3PermissionMask(1.5), null);
+});
+
+test('normalizes raw configuration bytes separately from strict client masks', () => {
+  assert.equal(normalizeProtocolV3ConfigPermissionMask('255'), PROTOCOL_V3_DEFINED_PERMISSION_MASK);
+  assert.equal(normalizeProtocolV3ConfigPermissionMask(0x40), 0);
+  assert.equal(normalizeProtocolV3ConfigPermissionMask(null), null);
+  assert.equal(normalizeProtocolV3ConfigPermissionMask(undefined), null);
+  assert.equal(normalizeProtocolV3ConfigPermissionMask(''), null);
+  assert.equal(normalizeProtocolV3ConfigPermissionMask(-1), null);
+  assert.equal(normalizeProtocolV3ConfigPermissionMask(1.5), null);
+  assert.equal(normalizeProtocolV3ConfigPermissionMask(0x100), null);
+  assert.equal(normalizeConfiguredInvitationPermissionMask('255'), PROTOCOL_V3_DEFINED_PERMISSION_MASK);
+  assert.equal(normalizeConfiguredInvitationPermissionMask(0x40), PROTOCOL_V3_REQUIRED_PERMISSION_MASK);
+  assert.equal(normalizeConfiguredInvitationPermissionMask(undefined), PROTOCOL_V3_REQUIRED_PERMISSION_MASK);
 });
 
 test('tests permissions without treating invalid API state as authorized', () => {

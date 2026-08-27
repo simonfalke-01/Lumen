@@ -19,6 +19,22 @@ export function normalizeProtocolV3PermissionMask(value) {
 }
 
 /**
+ * Normalize a raw one-byte permission value accepted by host configuration.
+ *
+ * Configuration parsing accepts values through 255 and masks undefined bits,
+ * unlike strict client/admin API masks which must already contain defined bits only.
+ *
+ * @param {unknown} value Candidate raw configuration permission mask.
+ * @returns {number|null} Effective defined permission bits, or `null` when invalid.
+ */
+export function normalizeProtocolV3ConfigPermissionMask(value) {
+  if (value === null || value === undefined || value === '') return null
+  const mask = Number(value)
+  if (!Number.isSafeInteger(mask) || mask < 0 || mask > 0xff) return null
+  return mask & PROTOCOL_V3_DEFINED_PERMISSION_MASK
+}
+
+/**
  * Test whether a protocol-v3 permission mask contains a bit.
  *
  * @param {unknown} mask Candidate permission mask.
@@ -38,6 +54,17 @@ export function hasProtocolV3Permission(mask, bit) {
  */
 export function normalizeInvitationPermissionMask(mask) {
   const normalized = normalizeProtocolV3PermissionMask(mask)
+  return (normalized ?? PROTOCOL_V3_REQUIRED_PERMISSION_MASK) | PROTOCOL_V3_REQUIRED_PERMISSION_MASK
+}
+
+/**
+ * Return an effective configured invitation mask with mandatory bits restored.
+ *
+ * @param {unknown} mask Raw configuration permission mask.
+ * @returns {number} Effective configured invitation mask.
+ */
+export function normalizeConfiguredInvitationPermissionMask(mask) {
+  const normalized = normalizeProtocolV3ConfigPermissionMask(mask)
   return (normalized ?? PROTOCOL_V3_REQUIRED_PERMISSION_MASK) | PROTOCOL_V3_REQUIRED_PERMISSION_MASK
 }
 

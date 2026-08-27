@@ -7,7 +7,7 @@ import {
 import Checkbox from "../../Checkbox.vue";
 import {
   hasProtocolV3Permission,
-  normalizeInvitationPermissionMask,
+  normalizeConfiguredInvitationPermissionMask,
   PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
   setProtocolV3Permission,
 } from '../../protocol_v3_permissions'
@@ -22,7 +22,7 @@ const defaultMoonlightPort = 47989
 const config = ref(props.config)
 const effectivePort = computed(() => +config.value?.port ?? defaultMoonlightPort)
 const protocolV3Permissions = computed(() =>
-  normalizeInvitationPermissionMask(config.value?.protocol_v3_pairing_permissions)
+  normalizeConfiguredInvitationPermissionMask(config.value?.protocol_v3_pairing_permissions)
 )
 const protocolV3PermissionModel = bit => computed({
   get: () => hasProtocolV3Permission(protocolV3Permissions.value, bit),

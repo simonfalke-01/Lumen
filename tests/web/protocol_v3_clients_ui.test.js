@@ -71,6 +71,7 @@ test('permission mutations are immediate, rollback-safe, and preserve host polic
 });
 
 test('Network configuration uses writable models for both optional permission bits', () => {
+  assert.match(networkConfig, /normalizeConfiguredInvitationPermissionMask/);
   assert.match(networkConfig, /protocolV3MicrophonePermission = protocolV3PermissionModel\(3\)/);
   assert.match(networkConfig, /protocolV3QuitPermission = protocolV3PermissionModel\(5\)/);
   assert.match(networkConfig, /v-model="protocolV3MicrophonePermission"/);
