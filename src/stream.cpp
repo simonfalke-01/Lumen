@@ -1472,7 +1472,7 @@ namespace stream {
 
     auto &io = ctx.io_context;
 
-    udp::endpoint peer;
+    std::array<udp::endpoint, 2> peers;  ///< Independent remote endpoints for video and audio receives.
 
     std::array<char, 2048> buf[2];
     std::function<void(const boost::system::error_code, size_t)> recv_func[2];
@@ -1505,6 +1505,7 @@ namespace stream {
 
     auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session) {
       recv_func[buf_elem] = [&, buf_elem](const boost::system::error_code &ec, size_t bytes) {
+        auto &peer = peers[buf_elem];
         auto fg = util::fail_guard([&]() {
           sock.async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
         });
@@ -1547,8 +1548,8 @@ namespace stream {
     recv_func_init(video_sock, 0, peer_to_video_session);
     recv_func_init(audio_sock, 1, peer_to_audio_session);
 
-    video_sock.async_receive_from(asio::buffer(buf[0]), peer, 0, recv_func[0]);
-    audio_sock.async_receive_from(asio::buffer(buf[1]), peer, 0, recv_func[1]);
+    video_sock.async_receive_from(asio::buffer(buf[0]), peers[0], 0, recv_func[0]);
+    audio_sock.async_receive_from(asio::buffer(buf[1]), peers[1], 0, recv_func[1]);
 
     while (!broadcast_shutdown_event->peek()) {
       io.run();
@@ -4777,6 +4778,115 @@ namespace stream {
         result.v3_second_after_close_tag = tag(*popped);
       }
     }
+    return result;
+  }
+
+  legacy_udp_peer_isolation_probe_t legacy_udp_peer_isolation_probe_for_test() {
+    constexpr std::size_t ping_count = 64;
+    constexpr auto receive_deadline = 2s;
+    constexpr auto poll_interval = 2ms;
+    const std::array<char, 4> ping {'P', 'I', 'N', 'G'};
+    const std::array<char, 5> audio_reply {'A', 'U', 'D', 'I', 'O'};
+    const auto loopback = asio::ip::address_v4::loopback();
+
+    legacy_udp_peer_isolation_probe_t result {
+      .every_video_peer_isolated = true,
+      .every_audio_peer_isolated = true,
+    };
+    broadcast_ctx_t context;
+    context.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(8);
+
+    asio::io_context client_io;
+    udp::socket video_client {client_io, udp::endpoint {loopback, 0}};
+    udp::socket audio_client {client_io, udp::endpoint {loopback, 0}};
+    result.video_source_port = video_client.local_endpoint().port();
+    result.audio_source_port = audio_client.local_endpoint().port();
+
+    context.audio_sock.open(udp::v4());
+    context.audio_sock.bind(udp::endpoint {loopback, 0});
+    context.video_sock.open(udp::v4());
+    context.video_sock.bind(udp::endpoint {loopback, 0});
+
+    auto video_messages = std::make_shared<message_queue_t::element_type>(ping_count * 2);
+    auto audio_messages = std::make_shared<message_queue_t::element_type>(ping_count * 2);
+    context.message_queue_queue->raise(socket_e::video, loopback, video_messages);
+    context.message_queue_queue->raise(socket_e::audio, loopback, audio_messages);
+
+    auto broadcast_shutdown = mail::man->event<bool>(mail::broadcast_shutdown);
+    broadcast_shutdown->reset();
+    std::jthread receiver {recvThread, std::ref(context)};
+    auto cleanup = util::fail_guard([&]() {
+      broadcast_shutdown->raise(true);
+      context.io_context.stop();
+      boost::system::error_code error;
+      context.video_sock.close(error);
+      context.audio_sock.close(error);
+      receiver.join();
+      broadcast_shutdown->reset();
+    });
+
+    std::this_thread::sleep_for(20ms);
+    for (std::size_t index = 0; index < ping_count; ++index) {
+      audio_client.send_to(asio::buffer(ping), context.audio_sock.local_endpoint());
+      video_client.send_to(asio::buffer(ping), context.video_sock.local_endpoint());
+    }
+
+    udp::endpoint routed_audio_peer;
+    const auto collect = [&](const message_queue_t &messages, const std::uint16_t expected_port, const bool video) {
+      const auto deadline = std::chrono::steady_clock::now() + receive_deadline;
+      while (std::chrono::steady_clock::now() < deadline) {
+        auto message = messages->pop(poll_interval);
+        if (!message) {
+          continue;
+        }
+        auto &[peer, payload] = *message;
+        if (payload != "PING"sv) {
+          continue;
+        }
+        if (video) {
+          ++result.video_ping_count;
+          result.routed_video_port = peer.port();
+          result.every_video_peer_isolated &= peer.port() == expected_port;
+        } else {
+          ++result.audio_ping_count;
+          result.routed_audio_port = peer.port();
+          result.every_audio_peer_isolated &= peer.port() == expected_port;
+          if (routed_audio_peer.port() == 0 || peer.port() != expected_port) {
+            routed_audio_peer = peer;
+          }
+        }
+        if ((video ? result.video_ping_count : result.audio_ping_count) == ping_count) {
+          break;
+        }
+      }
+    };
+    collect(audio_messages, result.audio_source_port, false);
+    collect(video_messages, result.video_source_port, true);
+
+    if (routed_audio_peer.port() != 0) {
+      context.audio_sock.send_to(asio::buffer(audio_reply), routed_audio_peer);
+    }
+    video_client.non_blocking(true);
+    audio_client.non_blocking(true);
+    const auto receive_reply = [&](udp::socket &socket) {
+      std::array<char, 16> bytes {};
+      udp::endpoint sender;
+      const auto deadline = std::chrono::steady_clock::now() + 250ms;
+      while (std::chrono::steady_clock::now() < deadline) {
+        boost::system::error_code error;
+        const auto received = socket.receive_from(asio::buffer(bytes), sender, 0, error);
+        if (!error) {
+          return std::ranges::equal(std::span<const char> {bytes.data(), received}, audio_reply);
+        }
+        if (error != asio::error::would_block && error != asio::error::try_again) {
+          return false;
+        }
+        std::this_thread::sleep_for(poll_interval);
+      }
+      return false;
+    };
+    result.audio_datagram_reached_audio_socket = receive_reply(audio_client);
+    result.audio_datagram_reached_video_socket = receive_reply(video_client);
     return result;
   }
 

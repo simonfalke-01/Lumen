@@ -6,6 +6,7 @@
 
 // standard includes
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -364,6 +365,29 @@ namespace stream {
 
   /** @brief Exercise exact legacy and protocol-v3 production destination isolation. */
   [[nodiscard]] audio_destination_isolation_probe_t audio_destination_isolation_probe_for_test();
+
+  /**
+   * @brief Raw observations from concurrent legacy video/audio UDP peer routing.
+   */
+  struct legacy_udp_peer_isolation_probe_t {
+    std::uint16_t video_source_port {};  ///< Source port owned by the video-side client socket.
+    std::uint16_t audio_source_port {};  ///< Source port owned by the audio-side client socket.
+    std::uint16_t routed_video_port {};  ///< Last source port routed through the video receive path.
+    std::uint16_t routed_audio_port {};  ///< Last source port routed through the audio receive path.
+    std::size_t video_ping_count {};  ///< Number of video pings delivered through the production router.
+    std::size_t audio_ping_count {};  ///< Number of audio pings delivered through the production router.
+    bool every_video_peer_isolated {};  ///< Whether every video ping retained the video source endpoint.
+    bool every_audio_peer_isolated {};  ///< Whether every audio ping retained the audio source endpoint.
+    bool audio_datagram_reached_audio_socket {};  ///< Whether an audio reply reached the audio client socket.
+    bool audio_datagram_reached_video_socket {};  ///< Whether an audio reply leaked to the video client socket.
+  };
+
+  /**
+   * @brief Exercise the production legacy UDP router with simultaneous video and audio peers.
+   *
+   * @return Source-port routing and reply-delivery observations.
+   */
+  [[nodiscard]] legacy_udp_peer_isolation_probe_t legacy_udp_peer_isolation_probe_for_test();
 
   /** @brief Raw observations from capture through the exact production v3 audio drain. */
   struct protocol_v3_audio_fixture_probe_t {

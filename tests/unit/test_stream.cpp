@@ -193,6 +193,22 @@ TEST(StreamAudioDestinationProductionTest, ProtocolV3OwnsPrivateQueuesAndIndepen
   EXPECT_EQ(probe.v3_second_after_close_tag, 0xb2);
 }
 
+TEST(StreamLegacyUdpPeerRoutingTest, ConcurrentVideoAndAudioPingsPreserveSocketSpecificPeers) {
+  const auto probe = stream::legacy_udp_peer_isolation_probe_for_test();
+
+  EXPECT_NE(probe.video_source_port, 0U);
+  EXPECT_NE(probe.audio_source_port, 0U);
+  EXPECT_NE(probe.video_source_port, probe.audio_source_port);
+  EXPECT_EQ(probe.video_ping_count, 64U);
+  EXPECT_EQ(probe.audio_ping_count, 64U);
+  EXPECT_TRUE(probe.every_video_peer_isolated);
+  EXPECT_TRUE(probe.every_audio_peer_isolated);
+  EXPECT_EQ(probe.routed_video_port, probe.video_source_port);
+  EXPECT_EQ(probe.routed_audio_port, probe.audio_source_port);
+  EXPECT_TRUE(probe.audio_datagram_reached_audio_socket);
+  EXPECT_FALSE(probe.audio_datagram_reached_video_socket);
+}
+
 TEST(ProtocolV3ControllerFeedbackTest, DelayedGenerationCannotRetargetAReusedControllerSlot) {
   const auto delayed = platf::gamepad_feedback_msg_t::make_rumble(
     {2, 7, 1},
