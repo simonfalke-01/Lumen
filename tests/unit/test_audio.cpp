@@ -179,8 +179,11 @@ namespace {
     std::atomic_size_t close_calls_ {};
   };
 
-  config_t stereo_config() {
-    return config_t {5, 2, 0x3, {0}, {}};
+  config_t destination_test_config(const int channels = 2, const int channel_mask = 0x3) {
+    auto config = config_t {5, channels, channel_mask, {0}, {}};
+    config.flags.set(config_t::HOST_AUDIO);
+    config.flags.set(config_t::CONTINUOUS_AUDIO);
+    return config;
   }
 
   void stop_capture(const safe::mail_t &mail) {
@@ -252,7 +255,7 @@ TEST_F(AudioPacketDestinationTest, DestinationCanBeDestroyedWhileEncodeIsInFligh
   auto destination = std::make_shared<blocking_destination_t>(state);
   const packet_destination_t weak_destination = destination;
   std::jthread capture([mail, weak_destination] {
-    audio::capture(mail, stereo_config(), weak_destination);
+    audio::capture(mail, destination_test_config(), weak_destination);
   });
 
   if (entered.wait_for(2s) != std::future_status::ready) {
@@ -281,7 +284,7 @@ TEST_F(AudioPacketDestinationTest, BackpressureAndClosedResultsStopFurtherPublic
     auto destination = std::make_shared<rejecting_destination_t>(result);
     auto called = destination->called_future();
     std::jthread capture([mail, destination] {
-      audio::capture(mail, stereo_config(), destination);
+      audio::capture(mail, destination_test_config(), destination);
     });
 
     if (called.wait_for(2s) != std::future_status::ready) {
@@ -313,9 +316,9 @@ TEST_F(AudioPacketDestinationTest, TwoProtocolV3AndOneLegacyDestinationRemainIso
     legacy,
   };
   std::array<config_t, 3> configs {
-    stereo_config(),
-    config_t {5, 6, 0x3f, {0}, {}},
-    config_t {5, 8, 0x63f, {0}, {}},
+    destination_test_config(),
+    destination_test_config(6, 0x3f),
+    destination_test_config(8, 0x63f),
   };
   std::array<std::jthread, 3> captures;
   for (std::size_t index = 0; index < captures.size(); ++index) {
@@ -342,8 +345,10 @@ TEST_F(AudioPacketDestinationTest, TwoProtocolV3AndOneLegacyDestinationRemainIso
   const auto first_v3_packets = first_v3->packets();
   const auto second_v3_packets = second_v3->packets();
   const auto legacy_packets = legacy->packets();
+  ASSERT_FALSE(first_v3_packets.empty());
+  ASSERT_FALSE(second_v3_packets.empty());
+  ASSERT_FALSE(legacy_packets.empty());
   const auto verify_route = [](const std::vector<routed_packet_t> &packets, const route_protocol_e protocol, const std::uint64_t owner_id) {
-    ASSERT_FALSE(packets.empty());
     EXPECT_TRUE(std::ranges::all_of(packets, [](const auto &packet) {
       return packet.packet.payload.size() != 0;
     }));

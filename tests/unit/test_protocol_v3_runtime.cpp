@@ -1053,12 +1053,14 @@ TEST(ProtocolV3Runtime, UndefinedPersistedPermissionBitsAreRemovedAndCommitted) 
     ASSERT_TRUE(client.has_value());
     EXPECT_EQ(client->permissions, control::defined_permission_mask);
 
-    std::ifstream before_protection {state_file, std::ios::binary};
-    const std::string serialized_before {
-      std::istreambuf_iterator<char> {before_protection},
-      std::istreambuf_iterator<char> {}
-    };
-    EXPECT_NE(serialized_before.find(legacy_seed_hex), std::string::npos);
+    {
+      std::ifstream before_protection {state_file, std::ios::binary};
+      const std::string serialized_before {
+        std::istreambuf_iterator<char> {before_protection},
+        std::istreambuf_iterator<char> {}
+      };
+      EXPECT_NE(serialized_before.find(legacy_seed_hex), std::string::npos);
+    }
     EXPECT_FALSE(std::filesystem::exists(identity_paths.identity));
     EXPECT_FALSE(std::filesystem::exists(identity_paths.journal));
 

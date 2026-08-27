@@ -439,6 +439,16 @@ namespace platf::audio {
     audio_notification_t() {
     }
 
+    /**
+     * @brief Ignore render-default notifications that already name the assigned endpoint.
+     *
+     * @param device_id Assigned render endpoint ID whose self-notifications are ignored.
+     * @pre The callback has not yet been registered with an endpoint enumerator.
+     */
+    void ignore_default_render_device(std::wstring device_id) {
+      ignored_default_render_device_id = std::move(device_id);
+    }
+
     // IUnknown implementation (unused by IMMDeviceEnumerator)
     /**
      * @brief Satisfy IUnknown reference counting for the notification callback.
@@ -490,7 +500,8 @@ namespace platf::audio {
      * @return S_OK after recording the render-device change notification.
      */
     HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDeviceId) {
-      if (flow == eRender) {
+      if (flow == eRender &&
+          (!pwstrDeviceId || ignored_default_render_device_id.empty() || ignored_default_render_device_id != pwstrDeviceId)) {
         default_render_device_changed_flag.store(true);
       }
       return S_OK;
@@ -553,8 +564,53 @@ namespace platf::audio {
     }
 
   private:
-    std::atomic_bool default_render_device_changed_flag;
+    std::wstring ignored_default_render_device_id;  ///< Assigned endpoint whose role-change notifications are self-generated.
+    std::atomic_bool default_render_device_changed_flag {false};  ///< Whether an actionable render-default change is pending.
   };
+
+  /**
+   * @brief Dispatch one pending render-default change to the audio controller.
+   *
+   * @param notification Endpoint notification state to consume.
+   * @param callback Optional callback that reasserts an assigned virtual sink.
+   * @return `true` when an actionable change was consumed and capture must reinitialize.
+   */
+  bool process_default_render_device_change(
+    audio_notification_t &notification,
+    const std::optional<std::function<void()>> &callback
+  ) {
+    if (!notification.check_default_render_device_changed()) {
+      return false;
+    }
+
+    if (callback) {
+      (*callback)();
+    }
+
+    return true;
+  }
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Exercise virtual-sink endpoint notification filtering for unit tests.
+   *
+   * @param assigned_device_id Assigned virtual render endpoint ID.
+   * @param notified_device_id Endpoint ID supplied by the Windows notification.
+   * @param reassert_sink Callback recording or performing virtual-sink reassertion.
+   * @return `true` when the notification is actionable and capture must reinitialize.
+   */
+  bool process_virtual_sink_default_device_change_for_test(
+    const std::wstring &assigned_device_id,
+    LPCWSTR notified_device_id,
+    const std::function<void()> &reassert_sink
+  ) {
+    audio_notification_t notification;
+    notification.ignore_default_render_device(assigned_device_id);
+    notification.OnDefaultDeviceChanged(eRender, eConsole, notified_device_id);
+
+    return process_default_render_device_change(notification, reassert_sink);
+  }
+#endif
 
   /**
    * @brief WASAPI microphone capture stream and endpoint notification state.
@@ -738,12 +794,7 @@ namespace platf::audio {
       } block_aligned;
 
       // Check if the default audio device has changed
-      if (endpt_notification.check_default_render_device_changed()) {
-        // Invoke the audio_control_t's callback if it wants one
-        if (default_endpt_changed_cb) {
-          (*default_endpt_changed_cb)();
-        }
-
+      if (process_default_render_device_change(endpt_notification, default_endpt_changed_cb)) {
         // Reinitialize to pick up the new default device
         return capture_e::reinit;
       }
@@ -939,17 +990,18 @@ namespace platf::audio {
     std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous_audio, [[maybe_unused]] bool host_audio_enabled) override {
       auto mic = std::make_unique<mic_wasapi_t>();
 
-      if (mic->init(sample_rate, frame_size, channels, continuous_audio)) {
-        return nullptr;
-      }
-
       // If this is a virtual sink, set a callback that will change the sink back if it's changed
       auto virtual_sink_info = extract_virtual_sink_info(assigned_sink);
       if (virtual_sink_info) {
+        mic->endpt_notification.ignore_default_render_device(virtual_sink_info->first);
         mic->default_endpt_changed_cb = [this] {
           BOOST_LOG(info) << "Resetting sink to ["sv << assigned_sink << "] after default changed";
           set_sink(assigned_sink);
         };
+      }
+
+      if (mic->init(sample_rate, frame_size, channels, continuous_audio)) {
+        return nullptr;
       }
 
       return mic;
