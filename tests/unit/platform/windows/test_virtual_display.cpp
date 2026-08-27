@@ -4,12 +4,15 @@
  */
 
 // standard includes
-#include <array>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <thread>
@@ -50,6 +53,18 @@ namespace platf::dxgi {
 namespace {
   using namespace platf::virtual_display;
   using vdd_mode_t = platf::virtual_display::mode_t;
+
+  /**
+   * @brief Read one repository source file for a portable production-branch contract test.
+   *
+   * @param relative Repository-relative source path.
+   * @return Complete source contents.
+   */
+  std::string read_source(const std::filesystem::path &relative) {
+    std::ifstream input {std::filesystem::path {SUNSHINE_SOURCE_DIR} / relative};
+    EXPECT_TRUE(input.is_open());
+    return {std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {}};
+  }
 
   constexpr vdd_mode_t mode_4k120 {
     3840,
@@ -1078,6 +1093,32 @@ TEST(VirtualDisplayFrameAbi5Policy, ValidatesSdrHdrFormatsMetadataAndPixelPitch)
   hdr.surface_color_space = frame_color_space_e::scrgb;
   hdr.hdr_metadata_type = hdr_metadata_type_e::none;
   EXPECT_FALSE(valid_frame_color_metadata(hdr, dynamic_range_e::hdr10, frame_format_e::rgba16_float));
+}
+
+TEST(VirtualDisplayFallbackFactoryContract, PublishesOnlyInsideEverySuccessfulDesktopBackendBranch) {
+  const auto factory = read_source("src/platform/windows/display_base.cpp");
+  const std::array<std::string_view, 4> branches {
+    "display_ddup_vram_t",
+    "display_ddup_ram_t",
+    "display_wgc_vram_t",
+    "display_wgc_ram_t",
+  };
+  for (std::size_t index = 0; index < branches.size(); ++index) {
+    const auto begin = factory.find("auto disp = std::make_shared<dxgi::" + std::string {branches[index]});
+    ASSERT_NE(begin, std::string::npos) << branches[index];
+    const auto end = index + 1 < branches.size() ?
+                       factory.find("auto disp = std::make_shared<dxgi::" + std::string {branches[index + 1]}, begin) :
+                       factory.find("// ddx and wgc failed", begin);
+    ASSERT_NE(end, std::string::npos) << branches[index];
+    const auto branch = factory.substr(begin, end - begin);
+    EXPECT_NE(branch.find("if (!disp->init(config, display_name))"), std::string::npos) << branches[index];
+    EXPECT_NE(branch.find("publish_desktop_fallback();"), std::string::npos) << branches[index];
+    EXPECT_LT(branch.find("publish_desktop_fallback();"), branch.find("return disp;")) << branches[index];
+  }
+
+  const auto rtsp = read_source("src/rtsp.cpp");
+  EXPECT_EQ(rtsp.find("using proven DDA/WGC capture"), std::string::npos);
+  EXPECT_NE(rtsp.find("DDA/WGC capture will be attempted"), std::string::npos);
 }
 
 TEST(VirtualDisplayFrameAbi5Policy, RetainsOnlyCurrentAndPreviousImmutableTransforms) {

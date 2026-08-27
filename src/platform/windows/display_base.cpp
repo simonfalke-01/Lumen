@@ -1156,7 +1156,7 @@ namespace platf {
         BOOST_LOG(error) << "Required Lumen VDD direct-frame initialization failed; refusing capture fallback"sv;
         return {};
       }
-      BOOST_LOG(warning) << "Lumen VDD direct-frame initialization failed; falling back to DDA/WGC"sv;
+      BOOST_LOG(warning) << "Lumen VDD direct-frame initialization failed; attempting DDA/WGC fallback"sv;
     }
 
     if (config::video.capture == "ddx" || config::video.capture.empty()) {
@@ -1189,6 +1189,7 @@ namespace platf {
         auto disp = std::make_shared<dxgi::display_wgc_ram_t>();
 
         if (!disp->init(config, display_name)) {
+          publish_desktop_fallback();
           return disp;
         }
       }

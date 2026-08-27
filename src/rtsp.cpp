@@ -1636,7 +1636,7 @@ namespace rtsp_stream {
             return;
           }
         } else if (!config.monitor.virtual_display_frame_source) {
-          BOOST_LOG(info) << "Lumen VDD direct-frame boundary unavailable; using proven DDA/WGC capture on the active VDD output"sv;
+          BOOST_LOG(info) << "Lumen VDD direct-frame boundary unavailable; DDA/WGC capture will be attempted on the active VDD output"sv;
         }
         if (config.monitor.virtual_display_active) {
           BOOST_LOG(info) << "Lumen VDD selected exact legacy mode "sv
