@@ -323,6 +323,7 @@ namespace proc {
     }
 
     _app_launch_time = std::chrono::steady_clock::now();
+    authorize_cancel_by_certificate(launch_session->client_cert);
 
     fg.disable();
 
@@ -364,9 +365,32 @@ namespace proc {
     return 0;
   }
 
+  void proc_t::authorize_cancel_by_certificate(const std::string_view client_certificate) {
+    if (!client_certificate.empty()) {
+      auto guard = _cancel_client_certificates->lock();
+      (*_cancel_client_certificates)->emplace(client_certificate);
+    }
+  }
+
+  bool proc_t::terminate_if_owned_by_certificate(const std::string_view client_certificate) {
+    auto guard = _cancel_client_certificates->lock();
+    if (client_certificate.empty() || !(*_cancel_client_certificates)->contains(std::string {client_certificate})) {
+      return false;
+    }
+    if (running() <= 0) {
+      return false;
+    }
+    terminate();
+    return true;
+  }
+
   void proc_t::terminate() {
     std::error_code ec;
     placebo = false;
+    {
+      auto guard = _cancel_client_certificates->lock();
+      (*_cancel_client_certificates)->clear();
+    }
     terminate_process_group(_process, _process_group, _app.exit_timeout);
     _process = boost::process::v1::child();
     _process_group = boost::process::v1::group();

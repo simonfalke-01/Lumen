@@ -29,6 +29,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "process.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -1677,6 +1678,7 @@ namespace rtsp_stream {
       return;
     }
 
+    proc::proc.authorize_cancel_by_certificate(session.client_cert);
     microphone_claim_guard.disable();
 #ifdef _WIN32
     virtual_display_cleanup.disable();

@@ -13,9 +13,11 @@
 #endif
 
 // standard includes
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 // lib includes
 #include <boost/process/v1.hpp>
@@ -24,6 +26,7 @@
 #include "config.h"
 #include "platform/common.h"
 #include "rtsp.h"
+#include "sync.h"
 #include "utility.h"
 
 /**
@@ -139,6 +142,21 @@ namespace proc {
      */
     int running();
 
+    /**
+     * @brief Allow a verified legacy client certificate to cancel the current application.
+     *
+     * @param client_certificate Verified certificate associated with a launched or attached session.
+     */
+    void authorize_cancel_by_certificate(std::string_view client_certificate);
+
+    /**
+     * @brief Terminate the current application only for an authorized legacy client.
+     *
+     * @param client_certificate Verified certificate requesting cancellation.
+     * @return `true` when an owned running application was terminated.
+     */
+    bool terminate_if_owned_by_certificate(std::string_view client_certificate);
+
     ~proc_t();
 
     /**
@@ -178,6 +196,9 @@ namespace proc {
     std::vector<ctx_t> _apps;
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;
+    using cancel_client_certificates_t = sync_util::sync_t<std::unordered_set<std::string>, std::recursive_mutex>;  ///< Synchronized legacy cancel owners.
+    std::unique_ptr<cancel_client_certificates_t> _cancel_client_certificates =
+      std::make_unique<cancel_client_certificates_t>();  ///< Verified clients allowed to cancel the current application.
 
     // If no command associated with _app_id, yet it's still running
     bool placebo {};

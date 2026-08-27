@@ -8,6 +8,8 @@
 // standard imports
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <vector>
 
 // local imports
 #include <src/process.h>
@@ -107,6 +109,29 @@ TEST(ProcessLaunchEnvironmentTest, LegacyLaunchFallsBackToIntegerRefreshRational
   EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_NUMERATOR"].to_string(), "120");
   EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_DENOMINATOR"].to_string(), "1");
   EXPECT_EQ(env["SUNSHINE_CLIENT_FPS"].to_string(), "120");
+}
+
+TEST(ProcessLifecycleTest, CancellationRequiresAnAuthorizedLegacyCertificate) {
+  boost::process::v1::environment env {boost::this_process::environment()};
+  proc::ctx_t desktop {};
+  desktop.name = "Desktop";
+  desktop.id = "881";
+  desktop.exit_timeout = std::chrono::seconds {0};
+  std::vector<proc::ctx_t> apps;
+  apps.emplace_back(std::move(desktop));
+  proc::proc_t process {std::move(env), std::move(apps)};
+
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  launch->client_cert = "certificate-a";
+  ASSERT_EQ(process.execute(881, launch), 0);
+  ASSERT_EQ(process.running(), 881);
+
+  EXPECT_FALSE(process.terminate_if_owned_by_certificate("certificate-b"));
+  EXPECT_EQ(process.running(), 881);
+  process.authorize_cancel_by_certificate("certificate-b");
+  EXPECT_TRUE(process.terminate_if_owned_by_certificate("certificate-b"));
+  EXPECT_EQ(process.running(), 0);
+  EXPECT_FALSE(process.terminate_if_owned_by_certificate("certificate-a"));
 }
 
 TEST_F(ProcessPNGTest, CheckValidPNG_WrongSignature) {

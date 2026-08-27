@@ -31,6 +31,7 @@ extern "C" {
 #include "src/httpcommon.h"
 #include "src/network.h"
 #include "src/nvhttp.h"
+#include "src/process.h"
 #include "src/protocol_v3/control_session.h"
 #include "src/rtsp.h"
 #include "src/stream_policy.h"
@@ -340,6 +341,53 @@ TEST(VanillaMoonlightCompatibility, OwnerScopedCancelCannotClearAnotherPendingLa
   EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert("certificate-b"), 0U);
   EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert("certificate-a"), 1U);
   EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert(""), 0U);
+}
+
+TEST(VanillaMoonlightCompatibility, IdleOwnerCancelClearsStaleDesktopAndServerInfoState) {
+  constexpr auto owner_certificate = "certificate-a"sv;
+  constexpr auto other_certificate = "certificate-b"sv;
+  static_cast<void>(rtsp_stream::terminate_sessions_by_cert(owner_certificate));
+  static_cast<void>(rtsp_stream::terminate_sessions_by_cert(other_certificate));
+  proc::proc.terminate();
+  auto saved_process = std::move(proc::proc);
+  auto restore = util::fail_guard([&]() {
+    static_cast<void>(rtsp_stream::terminate_sessions_by_cert(owner_certificate));
+    static_cast<void>(rtsp_stream::terminate_sessions_by_cert(other_certificate));
+    proc::proc.terminate();
+    proc::proc = std::move(saved_process);
+  });
+
+  boost::process::v1::environment env {boost::this_process::environment()};
+  proc::ctx_t desktop {};
+  desktop.name = "Desktop";
+  desktop.id = "881";
+  desktop.exit_timeout = std::chrono::seconds {0};
+  std::vector<proc::ctx_t> apps;
+  apps.emplace_back(std::move(desktop));
+  proc::proc = proc::proc_t {std::move(env), std::move(apps)};
+
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  launch->client_cert = owner_certificate;
+  ASSERT_EQ(proc::proc.execute(881, launch), 0);
+  auto state = parse_xml(nvhttp::legacy_server_state_xml_for_tests());
+  EXPECT_EQ(state.get<int>("root.currentgame"), 881);
+  EXPECT_EQ(state.get<std::string>("root.state"), "SUNSHINE_SERVER_BUSY");
+
+  EXPECT_FALSE(nvhttp::cancel_process_for_client_if_idle(other_certificate));
+  EXPECT_EQ(proc::proc.running(), 881);
+
+  auto pending = std::make_shared<rtsp_stream::launch_session_t>();
+  pending->id = 0xCA12;
+  pending->client_cert = other_certificate;
+  rtsp_stream::launch_session_raise(pending);
+  EXPECT_FALSE(nvhttp::cancel_process_for_client_if_idle(owner_certificate));
+  EXPECT_EQ(proc::proc.running(), 881);
+  EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert(other_certificate), 1U);
+
+  EXPECT_TRUE(nvhttp::cancel_process_for_client_if_idle(owner_certificate));
+  state = parse_xml(nvhttp::legacy_server_state_xml_for_tests());
+  EXPECT_EQ(state.get<int>("root.currentgame"), 0);
+  EXPECT_EQ(state.get<std::string>("root.state"), "SUNSHINE_SERVER_FREE");
 }
 
 TEST(VanillaMoonlightCompatibility, LegacyPairingSourcePolicyAllowsPrivateAndRejectsPublicAddresses) {

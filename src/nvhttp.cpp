@@ -316,6 +316,17 @@ namespace nvhttp {
       return tree;
     }
 
+    /**
+     * @brief Populate the legacy process state shared by serverinfo and regression tests.
+     *
+     * @param tree XML response tree updated with currentgame and FREE/BUSY state.
+     */
+    void populate_server_state(pt::ptree &tree) {
+      const auto current_appid = proc::proc.running();
+      tree.put("root.currentgame", current_appid);
+      tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
+    }
+
     bool has_held_pairing_response(const pair_session_t &session) {
       const auto &response = session.async_insert_pin.response;
       return response.has_left() || response.has_right();
@@ -1444,6 +1455,11 @@ namespace nvhttp {
     return pairing_sessions.cancel_by_request_id(request_id);
   }
 
+  bool cancel_process_for_client_if_idle(const std::string_view client_certificate) {
+    return !rtsp_stream::has_session_or_pending_launch() &&
+           proc::proc.terminate_if_owned_by_certificate(client_certificate);
+  }
+
 #ifdef SUNSHINE_TESTS
   pairing_session_manager_t &pairing_sessions_for_tests() {
     return pairing_sessions;
@@ -1470,6 +1486,12 @@ namespace nvhttp {
 
   std::string legacy_cancel_xml_for_tests() {
     return serialize_legacy_xml(build_cancel_tree());
+  }
+
+  std::string legacy_server_state_xml_for_tests() {
+    pt::ptree tree;
+    populate_server_state(tree);
+    return serialize_legacy_xml(tree);
   }
 
   std::string_view legacy_appasset_content_type_for_tests() {
@@ -1632,10 +1654,8 @@ namespace nvhttp {
       tree.put("root.ExternalIP", config::nvhttp.external_ip);
     }
 
-    auto current_appid = proc::proc.running();
     tree.put("root.PairStatus", pair_status);
-    tree.put("root.currentgame", current_appid);
-    tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
+    populate_server_state(tree);
 
     std::ostringstream data;
 
@@ -1936,11 +1956,8 @@ namespace nvhttp {
     }
 
     tree = build_cancel_tree();
-    const auto terminated = rtsp_stream::terminate_sessions_by_cert(client_certificate);
-    if (terminated > 0 && !rtsp_stream::has_session_or_pending_launch()) {
-      if (proc::proc.running() > 0) {
-        proc::proc.terminate();
-      }
+    static_cast<void>(rtsp_stream::terminate_sessions_by_cert(client_certificate));
+    if (cancel_process_for_client_if_idle(client_certificate)) {
       display_device::revert_configuration();
     }
   }

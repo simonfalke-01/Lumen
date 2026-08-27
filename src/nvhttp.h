@@ -397,6 +397,14 @@ namespace nvhttp {
    */
   bool cancel_pairing_request(std::string_view request_id);
 
+  /**
+   * @brief Terminate an idle legacy application only when owned by the requesting certificate.
+   *
+   * @param client_certificate Verified legacy client certificate requesting cancellation.
+   * @return `true` when a stale owned application was terminated.
+   */
+  bool cancel_process_for_client_if_idle(std::string_view client_certificate);
+
 #ifdef SUNSHINE_TESTS
   pairing_session_manager_t &pairing_sessions_for_tests();
 
@@ -408,6 +416,12 @@ namespace nvhttp {
   std::string legacy_launch_xml_for_tests(std::string_view session_url);
   std::string legacy_resume_xml_for_tests(std::string_view session_url);
   std::string legacy_cancel_xml_for_tests();
+  /**
+   * @brief Serialize the current legacy application ID and FREE/BUSY server state for tests.
+   *
+   * @return XML containing the exact serverinfo currentgame and state fields.
+   */
+  std::string legacy_server_state_xml_for_tests();
   std::string_view legacy_appasset_content_type_for_tests();
   std::string legacy_query_log_value_for_tests(std::string_view name, std::string_view value);
   void reset_paired_clients_for_tests();
