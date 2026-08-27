@@ -12,6 +12,7 @@ extern "C" {
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <format>
@@ -609,8 +610,7 @@ namespace rtsp_stream {
       {
         std::unique_lock lifecycle {lifecycle_mutex_};
         wait_for_teardown_locked(lifecycle);
-        if (pending_launch_ && !pending_launch_claimed_) {
-          pending_launch_claimed_ = true;
+        if (pending_launch_) {
           launch_session = pending_launch_;
         }
       }
@@ -664,7 +664,6 @@ namespace rtsp_stream {
       launch_session->pending_launch_generation = ++pending_launch_generation_;
       const auto pending_generation = launch_session->pending_launch_generation;
       pending_launch_ = std::move(launch_session);
-      pending_launch_claimed_ = false;
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
@@ -696,7 +695,6 @@ namespace rtsp_stream {
         raised_timer.cancel();
       }
       auto discarded = std::exchange(pending_launch_, {});
-      pending_launch_claimed_ = false;
 
       BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
       cleanup_idle_launch_locked(*discarded);
@@ -728,7 +726,6 @@ namespace rtsp_stream {
       }
       raised_timer.cancel();
       pending_launch_.reset();
-      pending_launch_claimed_ = false;
     }
 
     /**
@@ -763,7 +760,6 @@ namespace rtsp_stream {
         if (all && pending_launch_) {
           raised_timer.cancel();
           pending_launch_.reset();
-          pending_launch_claimed_ = false;
         }
         for (auto i = _session_slots.begin(); i != _session_slots.end();) {
           auto &slot = *(*i);
@@ -805,7 +801,6 @@ namespace rtsp_stream {
           removed_generations.push_back(pending_launch_->process_generation);
           raised_timer.cancel();
           pending_launch_.reset();
-          pending_launch_claimed_ = false;
           ++cleared;
         }
         for (auto i = _session_slots.begin(); i != _session_slots.end();) {
@@ -896,7 +891,6 @@ namespace rtsp_stream {
           }
           _session_slots.emplace(stream_session);
           pending_launch_.reset();
-          pending_launch_claimed_ = false;
           raised_timer.cancel();
           return true;
         }
@@ -917,11 +911,12 @@ namespace rtsp_stream {
     /** @brief Claim the current pending launch under the lifecycle boundary. */
     std::shared_ptr<launch_session_t> claim_pending_launch_for_tests() {
       std::lock_guard lifecycle {lifecycle_mutex_};
-      if (!pending_launch_ || pending_launch_claimed_) {
-        return {};
-      }
-      pending_launch_claimed_ = true;
       return pending_launch_;
+    }
+
+    /** @brief Return the bound listener endpoint for live protocol tests. */
+    tcp::endpoint local_endpoint_for_tests() const {
+      return acceptor.local_endpoint();
     }
 
     /** @brief Check whether a claimed launch still owns the current pending slot. */
@@ -982,10 +977,9 @@ namespace rtsp_stream {
       lifecycle_changed_.notify_all();
     }
 
-    /** @brief Test whether one claimed socket still owns the current pending slot. */
+    /** @brief Test whether one acquired launch still owns the current pending slot. */
     bool claimed_launch_publishable_locked(const launch_session_t &launch_session) const {
-      return pending_launch_ && pending_launch_claimed_ &&
-             pending_launch_.get() == &launch_session &&
+      return pending_launch_ && pending_launch_.get() == &launch_session &&
              pending_launch_->pending_launch_generation == launch_session.pending_launch_generation;
     }
 
@@ -1017,9 +1011,8 @@ namespace rtsp_stream {
     std::condition_variable_any lifecycle_changed_;  ///< Wakes pending/claim/publication work after joins finish.
     bool teardown_in_progress_ {};  ///< Whether matched sessions were unpublished for out-of-lock joins.
     std::set<std::shared_ptr<stream::session_t>> _session_slots;  ///< Active sessions guarded by lifecycle_mutex_.
-    std::shared_ptr<launch_session_t> pending_launch_;  ///< Pending or claimed launch guarded by lifecycle_mutex_.
+    std::shared_ptr<launch_session_t> pending_launch_;  ///< Pending launch shared by pre-ANNOUNCE sockets under lifecycle_mutex_.
     std::uint64_t pending_launch_generation_ {};  ///< Monotonic pending-slot generation.
-    bool pending_launch_claimed_ {};  ///< Whether an accepted RTSP socket claimed the pending slot.
 #ifdef SUNSHINE_TESTS
     std::size_t idle_display_revert_count_ {};  ///< Explicit no-process display cleanup observations.
 #endif
@@ -1970,6 +1963,69 @@ namespace rtsp_stream {
 
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Exchange requests over fresh TCP connections with a production RTSP listener.
+   *
+   * @param launch_session Pending launch shared by each pre-ANNOUNCE transaction.
+   * @param requests Plaintext RTSP requests, one per TCP connection.
+   * @return Complete response received for each request.
+   */
+  std::vector<std::string> exchange_preannounce_requests_for_tests(
+    std::shared_ptr<launch_session_t> launch_session,
+    const std::vector<std::string> &requests
+  ) {
+    rtsp_server_t test_server;
+    test_server.map("OPTIONS"sv, &cmd_option);
+    test_server.map("DESCRIBE"sv, &cmd_describe);
+    test_server.session_raise(std::move(launch_session));
+
+    boost::system::error_code ec;
+    if (test_server.bind(net::IPV4, 0, ec)) {
+      throw boost::system::system_error {ec};
+    }
+
+    auto endpoint = test_server.local_endpoint_for_tests();
+    if (endpoint.address().is_unspecified()) {
+      endpoint.address(boost::asio::ip::address_v4::loopback());
+    }
+
+    std::atomic_bool stopping {};
+    std::jthread listener {[&]() {
+      while (!stopping.load()) {
+        test_server.iterate();
+      }
+    }};
+    auto stop_listener = util::fail_guard([&]() {
+      stopping = true;
+      test_server.stop();
+      listener.join();
+    });
+
+    std::vector<std::string> responses;
+    responses.reserve(requests.size());
+    for (const auto &request : requests) {
+      boost::asio::io_context client_context;
+      tcp::socket client {client_context};
+      client.connect(endpoint);
+      boost::asio::write(client, boost::asio::buffer(request));
+
+      boost::asio::streambuf response;
+      boost::system::error_code read_error;
+      boost::asio::read(client, response, read_error);
+      if (read_error && read_error != boost::asio::error::eof) {
+        throw boost::system::system_error {read_error};
+      }
+      responses.emplace_back(
+        boost::asio::buffers_begin(response.data()),
+        boost::asio::buffers_end(response.data())
+      );
+    }
+
+    return responses;
+  }
+#endif
 
   void start() {
     platf::set_thread_name("rtsp");

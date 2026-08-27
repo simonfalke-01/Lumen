@@ -65,6 +65,10 @@ namespace rtsp_stream {
   void cmd_setup(rtsp_server_t *, boost::asio::ip::tcp::socket &, launch_session_t &, msg_t &&);
   void cmd_announce(rtsp_server_t *, boost::asio::ip::tcp::socket &, launch_session_t &, msg_t &&);
   void cmd_play(rtsp_server_t *, boost::asio::ip::tcp::socket &, launch_session_t &, msg_t &&);
+  std::vector<std::string> exchange_preannounce_requests_for_tests(
+    std::shared_ptr<launch_session_t> launch_session,
+    const std::vector<std::string> &requests
+  );
 }  // namespace rtsp_stream
 
 namespace {
@@ -507,6 +511,44 @@ TEST(VanillaMoonlightCompatibility, StaleTimeoutCannotRemoveReplacementPendingLa
   EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert("certificate-b"), 1U);
 }
 
+TEST(VanillaMoonlightCompatibility, PendingLaunchClaimsRemainGenerationQualifiedAfterCancelAndReplacement) {
+  constexpr auto first_owner = "repeatable-rtsp-owner-a"sv;
+  constexpr auto replacement_owner = "repeatable-rtsp-owner-b"sv;
+  rtsp_stream::terminate_sessions();
+  auto restore = util::fail_guard([&]() {
+    rtsp_stream::terminate_sessions();
+  });
+
+  auto first = std::make_shared<rtsp_stream::launch_session_t>();
+  first->id = 0xCA19;
+  first->client_cert = first_owner;
+  first->process_generation = proc::proc.generation();
+  rtsp_stream::launch_session_raise(first);
+
+  const auto options_claim = rtsp_stream::claim_pending_launch_for_tests();
+  const auto describe_claim = rtsp_stream::claim_pending_launch_for_tests();
+  ASSERT_EQ(options_claim, first);
+  ASSERT_EQ(describe_claim, first);
+  EXPECT_TRUE(rtsp_stream::claimed_launch_publishable_for_tests(options_claim));
+  EXPECT_TRUE(rtsp_stream::claimed_launch_publishable_for_tests(describe_claim));
+
+  ASSERT_EQ(rtsp_stream::terminate_sessions_by_cert(first_owner), 1U);
+  EXPECT_FALSE(rtsp_stream::claimed_launch_publishable_for_tests(options_claim));
+  EXPECT_FALSE(rtsp_stream::claimed_launch_publishable_for_tests(describe_claim));
+
+  auto replacement = std::make_shared<rtsp_stream::launch_session_t>();
+  replacement->id = first->id;
+  replacement->client_cert = replacement_owner;
+  replacement->process_generation = proc::proc.generation();
+  rtsp_stream::launch_session_raise(replacement);
+  const auto replacement_claim = rtsp_stream::claim_pending_launch_for_tests();
+  ASSERT_EQ(replacement_claim, replacement);
+  EXPECT_FALSE(rtsp_stream::claimed_launch_publishable_for_tests(options_claim));
+  EXPECT_FALSE(rtsp_stream::claimed_launch_publishable_for_tests(describe_claim));
+  EXPECT_TRUE(rtsp_stream::claimed_launch_publishable_for_tests(replacement_claim));
+  EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert(replacement_owner), 1U);
+}
+
 TEST(VanillaMoonlightCompatibility, StaleLegacyTimeoutCannotTearDownReplacementProtocolV3ProcessOrDisplay) {
   constexpr auto owner_certificate = "certificate-a"sv;
   rtsp_stream::terminate_sessions();
@@ -848,6 +890,37 @@ TEST(VanillaMoonlightCompatibility, LegacyOptionsAndDescribeHandlersReturnMoonli
   EXPECT_NE(describe_response.find("a=x-ss-general.encryptionSupported:"), std::string::npos);
   EXPECT_NE(describe_response.find("a=x-ss-general.encryptionRequested:"), std::string::npos);
   EXPECT_EQ(describe_response.find("x-lumen-"), std::string::npos);
+}
+
+TEST(VanillaMoonlightCompatibility, ProductionRtspListenerReusesPendingLaunchAcrossPreAnnounceConnections) {
+  const auto &rtsp = official_fixture().at("rtsp");
+  const auto target = rtsp.at("target").get<std::string>();
+  auto pending = std::make_shared<rtsp_stream::launch_session_t>();
+  pending->id = 0xCA21;
+
+  const auto saved_microphone = config::audio.client_microphone;
+  config::audio.client_microphone = false;
+  auto restore = util::fail_guard([&]() {
+    config::audio.client_microphone = saved_microphone;
+  });
+
+  const std::vector requests {
+    request_text("OPTIONS", target, 10),
+    request_text(
+      "DESCRIBE",
+      target,
+      11,
+      "Accept: application/sdp\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n"
+    ),
+  };
+  const auto responses = rtsp_stream::exchange_preannounce_requests_for_tests(pending, requests);
+
+  ASSERT_EQ(responses.size(), 2U);
+  EXPECT_NE(responses[0].find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  EXPECT_NE(responses[0].find("CSeq: 10\r\n"), std::string::npos);
+  EXPECT_NE(responses[1].find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  EXPECT_NE(responses[1].find("CSeq: 11\r\n"), std::string::npos);
+  EXPECT_NE(responses[1].find("a=x-ss-general.featureFlags:"), std::string::npos);
 }
 
 TEST(VanillaMoonlightCompatibility, LegacySetupAndPlayHandlersReturnMoonlightHeaders) {
