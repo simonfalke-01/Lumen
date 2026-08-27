@@ -49,6 +49,19 @@ namespace nvhttp {
     const args_t &args,
     std::string client_certificate
   );
+  bool resume_should_prepare_display_after_reservation(int active_sessions);
+  bool load_committed_host_audio(const std::atomic_bool &committed_host_audio);
+  void commit_host_audio(std::atomic_bool &committed_host_audio, bool candidate);
+  bool resolve_resume_host_audio_candidate(
+    const std::atomic_bool &committed_host_audio,
+    std::optional<bool> requested_host_audio,
+    int active_sessions
+  );
+  void rollback_launch_reservation_transaction(
+    const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
+    const std::function<void()> &process_cleanup,
+    const std::function<void()> &display_cleanup
+  );
   template<class T>
   void serverinfo(
     std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response,
@@ -65,9 +78,23 @@ namespace rtsp_stream {
   void cmd_setup(rtsp_server_t *, boost::asio::ip::tcp::socket &, launch_session_t &, msg_t &&);
   void cmd_announce(rtsp_server_t *, boost::asio::ip::tcp::socket &, launch_session_t &, msg_t &&);
   void cmd_play(rtsp_server_t *, boost::asio::ip::tcp::socket &, launch_session_t &, msg_t &&);
+  std::string encrypt_rtsp_request_for_tests(
+    const crypto::aes_t &key,
+    std::uint32_t sequence,
+    std::string_view plaintext
+  );
+  decrypted_rtsp_response_t decrypt_rtsp_response_for_tests(
+    const crypto::aes_t &key,
+    std::string_view message
+  );
   std::vector<std::string> exchange_preannounce_requests_for_tests(
     std::shared_ptr<launch_session_t> launch_session,
-    const std::vector<std::string> &requests
+    const std::vector<std::string> &requests,
+    const std::vector<std::string> &source_addresses = {},
+    std::vector<int> *active_counts = nullptr,
+    const std::vector<listener_lifecycle_action_e> &actions = {},
+    const std::shared_ptr<launch_session_t> &replacement_launch = {},
+    std::vector<bool> *action_results = nullptr
   );
 }  // namespace rtsp_stream
 
@@ -549,6 +576,247 @@ TEST(VanillaMoonlightCompatibility, PendingLaunchClaimsRemainGenerationQualified
   EXPECT_EQ(rtsp_stream::terminate_sessions_by_cert(replacement_owner), 1U);
 }
 
+TEST(VanillaMoonlightCompatibility, HttpLaunchResumeReservationConflictIsSideEffectFreeAndRollbackExact) {
+  rtsp_stream::terminate_sessions();
+  auto restore = util::fail_guard([&]() {
+    rtsp_stream::terminate_sessions();
+    rtsp_stream::reset_idle_display_revert_count_for_tests();
+  });
+  const auto process_generation = proc::proc.generation();
+  const auto running_app = proc::proc.running();
+  rtsp_stream::reset_idle_display_revert_count_for_tests();
+
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  launch->id = 0xCA1A;
+  launch->client_cert = "certificate-a";
+  launch->source_address = "127.0.0.1";
+  launch->process_generation = process_generation;
+  ASSERT_TRUE(rtsp_stream::launch_session_reserve(launch));
+  ASSERT_NE(launch->pending_launch_generation, 0U);
+  EXPECT_FALSE(rtsp_stream::claimed_launch_publishable_for_tests(launch));
+  EXPECT_FALSE(rtsp_stream::expire_pending_launch_for_tests());
+
+  auto conflicting_resume = std::make_shared<rtsp_stream::launch_session_t>();
+  conflicting_resume->id = 0xCA1B;
+  conflicting_resume->client_cert = "certificate-b";
+  conflicting_resume->source_address = "127.0.0.2";
+  conflicting_resume->process_generation = process_generation;
+  EXPECT_FALSE(rtsp_stream::launch_session_reserve(conflicting_resume));
+  EXPECT_EQ(conflicting_resume->pending_launch_generation, 0U);
+  EXPECT_EQ(proc::proc.generation(), process_generation);
+  EXPECT_EQ(proc::proc.running(), running_app);
+  EXPECT_EQ(rtsp_stream::idle_display_revert_count_for_tests(), 0U);
+
+  EXPECT_TRUE(rtsp_stream::launch_session_rollback(launch));
+  EXPECT_FALSE(rtsp_stream::has_session_or_pending_launch());
+  EXPECT_FALSE(rtsp_stream::launch_session_commit(launch));
+  EXPECT_EQ(rtsp_stream::idle_display_revert_count_for_tests(), 0U);
+}
+
+TEST(VanillaMoonlightCompatibility, CancelledReservationBlocksReplacementUntilExactHttpRollback) {
+  constexpr auto owner = "reservation-owner-a"sv;
+  constexpr auto replacement_owner = "reservation-owner-b"sv;
+  rtsp_stream::terminate_sessions();
+  auto restore = util::fail_guard([&]() {
+    rtsp_stream::terminate_sessions();
+    rtsp_stream::reset_idle_display_revert_count_for_tests();
+  });
+  const auto process_generation = proc::proc.generation();
+  const auto running_app = proc::proc.running();
+  rtsp_stream::reset_idle_display_revert_count_for_tests();
+
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  launch->id = 0xCA1C;
+  launch->client_cert = owner;
+  launch->source_address = "127.0.0.1";
+  launch->process_generation = process_generation;
+  ASSERT_TRUE(rtsp_stream::launch_session_reserve(launch));
+  const auto cancelled_generation = launch->pending_launch_generation;
+
+  EXPECT_EQ(rtsp_stream::cancel_sessions_and_process_by_cert(owner), 1U);
+  EXPECT_EQ(rtsp_stream::cancel_sessions_and_process_by_cert(owner), 0U);
+  EXPECT_FALSE(rtsp_stream::claimed_launch_publishable_for_tests(launch));
+
+  auto replacement = std::make_shared<rtsp_stream::launch_session_t>();
+  replacement->id = 0xCA1D;
+  replacement->client_cert = replacement_owner;
+  replacement->source_address = "192.0.2.2";
+  replacement->process_generation = process_generation;
+  EXPECT_FALSE(rtsp_stream::launch_session_reserve(replacement));
+  EXPECT_EQ(replacement->pending_launch_generation, 0U);
+  EXPECT_EQ(proc::proc.generation(), process_generation);
+  EXPECT_EQ(proc::proc.running(), running_app);
+  EXPECT_EQ(rtsp_stream::idle_display_revert_count_for_tests(), 0U);
+
+  EXPECT_FALSE(rtsp_stream::launch_session_commit(launch));
+  EXPECT_EQ(launch->pending_launch_generation, cancelled_generation);
+  EXPECT_TRUE(rtsp_stream::launch_session_rollback(launch));
+  ASSERT_TRUE(rtsp_stream::launch_session_reserve(replacement));
+  EXPECT_GT(replacement->pending_launch_generation, cancelled_generation);
+  EXPECT_TRUE(rtsp_stream::launch_session_commit(replacement));
+  EXPECT_TRUE(rtsp_stream::launch_session_rollback(replacement));
+  EXPECT_FALSE(rtsp_stream::has_session_or_pending_launch());
+  EXPECT_EQ(proc::proc.generation(), process_generation);
+  EXPECT_EQ(proc::proc.running(), running_app);
+  EXPECT_EQ(rtsp_stream::idle_display_revert_count_for_tests(), 0U);
+}
+
+TEST(VanillaMoonlightCompatibility, CancelledResumeReservationTerminatesOwnedProcessWhileRetainingFence) {
+  constexpr auto owner = "cancelled-resume-owner"sv;
+  rtsp_stream::terminate_sessions();
+  proc::proc.terminate();
+  auto saved_process = std::move(proc::proc);
+  auto restore = util::fail_guard([&]() {
+    rtsp_stream::terminate_sessions();
+    rtsp_stream::reset_idle_display_revert_count_for_tests();
+    proc::proc.terminate();
+    proc::proc = std::move(saved_process);
+  });
+
+  boost::process::v1::environment env {boost::this_process::environment()};
+  proc::ctx_t desktop {};
+  desktop.name = "Desktop";
+  desktop.id = "881";
+  desktop.exit_timeout = std::chrono::seconds {0};
+  std::vector<proc::ctx_t> apps;
+  apps.emplace_back(std::move(desktop));
+  proc::proc = proc::proc_t {std::move(env), std::move(apps)};
+  rtsp_stream::reset_idle_display_revert_count_for_tests();
+
+  auto process_launch = std::make_shared<rtsp_stream::launch_session_t>();
+  process_launch->client_cert = owner;
+  ASSERT_EQ(proc::proc.execute(881, process_launch), 0);
+  ASSERT_EQ(proc::proc.running(), 881);
+
+  auto resume = std::make_shared<rtsp_stream::launch_session_t>();
+  resume->id = 0xCA20;
+  resume->client_cert = owner;
+  resume->source_address = "127.0.0.1";
+  resume->process_generation = proc::proc.generation();
+  ASSERT_TRUE(rtsp_stream::launch_session_reserve(resume));
+
+  EXPECT_EQ(rtsp_stream::cancel_sessions_and_process_by_cert(owner), 1U);
+  EXPECT_EQ(proc::proc.running(), 0);
+  EXPECT_TRUE(rtsp_stream::has_session_or_pending_launch());
+  EXPECT_EQ(rtsp_stream::idle_display_revert_count_for_tests(), 1U);
+  EXPECT_EQ(rtsp_stream::cancel_sessions_and_process_by_cert(owner), 0U);
+  EXPECT_EQ(proc::proc.running(), 0);
+  EXPECT_EQ(rtsp_stream::idle_display_revert_count_for_tests(), 1U);
+
+  EXPECT_TRUE(rtsp_stream::launch_session_rollback(resume));
+  EXPECT_FALSE(rtsp_stream::has_session_or_pending_launch());
+  EXPECT_EQ(proc::proc.running(), 0);
+}
+
+TEST(VanillaMoonlightCompatibility, ResumeRechecksActiveSessionsAfterReservationBeforeDisplayPreparation) {
+  const bool no_active_sessions_at_request = true;
+  ASSERT_TRUE(no_active_sessions_at_request);
+  EXPECT_FALSE(nvhttp::resume_should_prepare_display_after_reservation(1));
+  EXPECT_FALSE(nvhttp::resume_should_prepare_display_after_reservation(2));
+  EXPECT_TRUE(nvhttp::resume_should_prepare_display_after_reservation(0));
+
+  std::atomic_bool committed_host_audio {false};
+  EXPECT_FALSE(nvhttp::resolve_resume_host_audio_candidate(committed_host_audio, true, 1));
+  EXPECT_TRUE(nvhttp::resolve_resume_host_audio_candidate(committed_host_audio, true, 0));
+  nvhttp::commit_host_audio(committed_host_audio, true);
+  EXPECT_TRUE(nvhttp::resolve_resume_host_audio_candidate(committed_host_audio, false, 1));
+  EXPECT_FALSE(nvhttp::resolve_resume_host_audio_candidate(committed_host_audio, false, 0));
+}
+
+TEST(VanillaMoonlightCompatibility, RejectedHostAudioCandidateDoesNotMutateCommittedBaseline) {
+  rtsp_stream::terminate_sessions();
+  auto restore = util::fail_guard([&]() {
+    rtsp_stream::terminate_sessions();
+  });
+  std::atomic_bool committed_host_audio {false};
+
+  auto blocker = std::make_shared<rtsp_stream::launch_session_t>();
+  blocker->id = 0xCA30;
+  blocker->source_address = "127.0.0.1";
+  ASSERT_TRUE(rtsp_stream::launch_session_reserve(blocker));
+
+  auto rejected = std::make_shared<rtsp_stream::launch_session_t>();
+  rejected->id = 0xCA31;
+  rejected->source_address = "192.0.2.4";
+  constexpr bool rejected_candidate = true;
+  rejected->host_audio = rejected_candidate;
+  EXPECT_FALSE(rtsp_stream::launch_session_reserve(rejected));
+  EXPECT_FALSE(nvhttp::load_committed_host_audio(committed_host_audio));
+
+  ASSERT_TRUE(rtsp_stream::launch_session_rollback(blocker));
+  ASSERT_TRUE(rtsp_stream::launch_session_reserve(rejected));
+  ASSERT_TRUE(rtsp_stream::launch_session_commit(rejected));
+  nvhttp::commit_host_audio(committed_host_audio, rejected_candidate);
+  EXPECT_TRUE(nvhttp::load_committed_host_audio(committed_host_audio));
+  EXPECT_TRUE(rtsp_stream::launch_session_rollback(rejected));
+}
+
+TEST(VanillaMoonlightCompatibility, CommittedHostAudioBaselineIsAtomicUnderConcurrentAccess) {
+  std::atomic_bool committed_host_audio {false};
+  constexpr int iterations = 1000;
+  std::array<std::future<void>, 6> tasks;
+  for (std::size_t task = 0; task < tasks.size(); ++task) {
+    tasks[task] = std::async(std::launch::async, [&, task]() {
+      for (int iteration = 0; iteration < iterations; ++iteration) {
+        if ((task & 1U) == 0) {
+          nvhttp::commit_host_audio(committed_host_audio, (iteration & 1) != 0);
+        } else {
+          static_cast<void>(nvhttp::load_committed_host_audio(committed_host_audio));
+          static_cast<void>(nvhttp::resolve_resume_host_audio_candidate(
+            committed_host_audio,
+            (iteration & 1) != 0,
+            iteration & 1
+          ));
+        }
+      }
+    });
+  }
+  for (auto &task : tasks) {
+    EXPECT_NO_THROW(task.get());
+  }
+  nvhttp::commit_host_audio(committed_host_audio, true);
+  EXPECT_TRUE(nvhttp::load_committed_host_audio(committed_host_audio));
+}
+
+TEST(VanillaMoonlightCompatibility, ReservationRollbackRetainsSlotThroughProcessAndDisplayCleanup) {
+  constexpr auto owner = "rollback-owner-a"sv;
+  rtsp_stream::terminate_sessions();
+  auto restore = util::fail_guard([&]() {
+    rtsp_stream::terminate_sessions();
+  });
+
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  launch->id = 0xCA1E;
+  launch->client_cert = owner;
+  launch->source_address = "127.0.0.1";
+  launch->process_generation = proc::proc.generation();
+  ASSERT_TRUE(rtsp_stream::launch_session_reserve(launch));
+  ASSERT_EQ(rtsp_stream::cancel_sessions_and_process_by_cert(owner), 1U);
+  ASSERT_FALSE(rtsp_stream::launch_session_commit(launch));
+
+  auto replacement = std::make_shared<rtsp_stream::launch_session_t>();
+  replacement->id = 0xCA1F;
+  replacement->client_cert = "rollback-owner-b";
+  replacement->source_address = "192.0.2.3";
+  replacement->process_generation = proc::proc.generation();
+  std::vector<std::string> events;
+  nvhttp::rollback_launch_reservation_transaction(
+    launch,
+    [&]() {
+      events.emplace_back("process");
+      EXPECT_FALSE(rtsp_stream::launch_session_reserve(replacement));
+    },
+    [&]() {
+      events.emplace_back("display");
+      EXPECT_FALSE(rtsp_stream::launch_session_reserve(replacement));
+    }
+  );
+
+  EXPECT_EQ(events, (std::vector<std::string> {"process", "display"}));
+  ASSERT_TRUE(rtsp_stream::launch_session_reserve(replacement));
+  EXPECT_TRUE(rtsp_stream::launch_session_rollback(replacement));
+}
+
 TEST(VanillaMoonlightCompatibility, StaleLegacyTimeoutCannotTearDownReplacementProtocolV3ProcessOrDisplay) {
   constexpr auto owner_certificate = "certificate-a"sv;
   rtsp_stream::terminate_sessions();
@@ -897,6 +1165,7 @@ TEST(VanillaMoonlightCompatibility, ProductionRtspListenerReusesPendingLaunchAcr
   const auto target = rtsp.at("target").get<std::string>();
   auto pending = std::make_shared<rtsp_stream::launch_session_t>();
   pending->id = 0xCA21;
+  pending->source_address = "127.0.0.1";
 
   const auto saved_microphone = config::audio.client_microphone;
   config::audio.client_microphone = false;
@@ -921,6 +1190,21 @@ TEST(VanillaMoonlightCompatibility, ProductionRtspListenerReusesPendingLaunchAcr
   EXPECT_NE(responses[1].find("RTSP/1.0 200 OK\r\n"), std::string::npos);
   EXPECT_NE(responses[1].find("CSeq: 11\r\n"), std::string::npos);
   EXPECT_NE(responses[1].find("a=x-ss-general.featureFlags:"), std::string::npos);
+}
+
+TEST(VanillaMoonlightCompatibility, ProductionRtspListenerRejectsWrongSourceBeforeDispatch) {
+  const auto target = official_fixture().at("rtsp").at("target").get<std::string>();
+  auto pending = std::make_shared<rtsp_stream::launch_session_t>();
+  pending->id = 0xCA22;
+  pending->source_address = "192.0.2.1";
+
+  const auto responses = rtsp_stream::exchange_preannounce_requests_for_tests(
+    pending,
+    {request_text("OPTIONS", target, 12)}
+  );
+
+  ASSERT_EQ(responses.size(), 1U);
+  EXPECT_TRUE(responses[0].empty());
 }
 
 TEST(VanillaMoonlightCompatibility, LegacySetupAndPlayHandlersReturnMoonlightHeaders) {
@@ -953,8 +1237,292 @@ TEST(VanillaMoonlightCompatibility, LegacySetupAndPlayHandlersReturnMoonlightHea
   ConnectedSockets sockets;
   rtsp_stream::cmd_play(nullptr, sockets.server(), session, std::move(play));
   const auto response = sockets.read_response();
-  EXPECT_NE(response.find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  EXPECT_NE(response.find("RTSP/1.0 403 Forbidden\r\n"), std::string::npos);
   EXPECT_NE(response.find("CSeq: " + std::to_string(cseq) + "\r\n"), std::string::npos);
+}
+
+TEST(VanillaMoonlightCompatibility, ProductionRtspListenerAcceptsFreshPostAnnouncePlayTransactions) {
+  const auto &rtsp = official_fixture().at("rtsp");
+  nvhttp::args_t args;
+  for (const auto &[name, value] : official_fixture().at("http").at("launchArguments").items()) {
+    args.emplace(name, value.get<std::string>());
+  }
+  auto launch = nvhttp::make_launch_session(false, args, "certificate-a");
+  launch->rtsp_cipher.reset();
+  launch->source_address = "127.0.0.1";
+
+  const auto saved_lan_mode = config::stream.lan_encryption_mode;
+  const auto saved_microphone = config::audio.client_microphone;
+  config::stream.lan_encryption_mode = config::ENCRYPTION_MODE_OPPORTUNISTIC;
+  config::audio.client_microphone = false;
+  auto restore = util::fail_guard([&]() {
+    config::stream.lan_encryption_mode = saved_lan_mode;
+    config::audio.client_microphone = saved_microphone;
+  });
+
+  const std::vector requests {
+    request_text(
+      "ANNOUNCE",
+      rtsp.at("announceTarget").get<std::string>(),
+      30,
+      "Session: DEADBEEFCAFE\r\n",
+      announce_payload()
+    ),
+    request_text("PLAY", rtsp.at("playTarget").get<std::string>(), 32, "Session: DEADBEEFCAFE\r\n"),
+    request_text("PLAY", rtsp.at("target").get<std::string>(), 33, "Session: DEADBEEFCAFE\r\n"),
+    request_text(
+      "ANNOUNCE",
+      rtsp.at("announceTarget").get<std::string>(),
+      34,
+      "Session: DEADBEEFCAFE\r\n",
+      announce_payload()
+    ),
+  };
+  std::vector<int> active_counts;
+  auto replacement = std::make_shared<rtsp_stream::launch_session_t>();
+  replacement->id = launch->id + 1;
+  replacement->source_address = launch->source_address;
+  const std::vector actions {
+    rtsp_stream::listener_lifecycle_action_e::attempt_same_address_replacement,
+  };
+  std::vector<bool> action_results;
+  const auto responses = rtsp_stream::exchange_preannounce_requests_for_tests(
+    launch,
+    requests,
+    {},
+    &active_counts,
+    actions,
+    replacement,
+    &action_results
+  );
+
+  ASSERT_EQ(responses.size(), requests.size());
+  ASSERT_EQ(active_counts.size(), requests.size());
+  ASSERT_EQ(action_results.size(), requests.size());
+  EXPECT_FALSE(action_results[0]);
+  for (std::size_t index = 0; index < responses.size(); ++index) {
+    EXPECT_NE(responses[index].find("RTSP/1.0 200 OK\r\n"), std::string::npos) << index;
+    EXPECT_EQ(active_counts[index], 1) << index;
+  }
+}
+
+TEST(VanillaMoonlightCompatibility, ProductionRtspListenerRejectsPlayAfterClearCancelAndReplacement) {
+  const auto &rtsp = official_fixture().at("rtsp");
+  nvhttp::args_t args;
+  for (const auto &[name, value] : official_fixture().at("http").at("launchArguments").items()) {
+    args.emplace(name, value.get<std::string>());
+  }
+  auto launch = nvhttp::make_launch_session(false, args, "certificate-a");
+  launch->rtsp_cipher.reset();
+  launch->source_address = "127.0.0.1";
+  auto replacement = nvhttp::make_launch_session(false, args, "certificate-b");
+  replacement->rtsp_cipher.reset();
+  replacement->source_address = launch->source_address;
+
+  const auto saved_lan_mode = config::stream.lan_encryption_mode;
+  const auto saved_microphone = config::audio.client_microphone;
+  config::stream.lan_encryption_mode = config::ENCRYPTION_MODE_OPPORTUNISTIC;
+  config::audio.client_microphone = false;
+  auto restore = util::fail_guard([&]() {
+    config::stream.lan_encryption_mode = saved_lan_mode;
+    config::audio.client_microphone = saved_microphone;
+  });
+
+  const std::vector requests {
+    request_text(
+      "ANNOUNCE",
+      rtsp.at("announceTarget").get<std::string>(),
+      40,
+      "Session: DEADBEEFCAFE\r\n",
+      announce_payload()
+    ),
+    request_text("PLAY", rtsp.at("playTarget").get<std::string>(), 41, "Session: DEADBEEFCAFE\r\n"),
+    request_text("PLAY", rtsp.at("playTarget").get<std::string>(), 42, "Session: DEADBEEFCAFE\r\n"),
+    request_text("OPTIONS", rtsp.at("target").get<std::string>(), 43),
+  };
+  const std::vector actions {
+    rtsp_stream::listener_lifecycle_action_e::clear_announced,
+    rtsp_stream::listener_lifecycle_action_e::cancel_replace_and_stale_clear,
+  };
+  std::vector<int> active_counts;
+  std::vector<bool> action_results;
+  const auto responses = rtsp_stream::exchange_preannounce_requests_for_tests(
+    launch,
+    requests,
+    {},
+    &active_counts,
+    actions,
+    replacement,
+    &action_results
+  );
+
+  ASSERT_EQ(responses.size(), requests.size());
+  ASSERT_EQ(active_counts.size(), requests.size());
+  ASSERT_EQ(action_results.size(), requests.size());
+  EXPECT_NE(responses[0].find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  EXPECT_TRUE(responses[1].empty());
+  EXPECT_NE(responses[2].find("RTSP/1.0 403 Forbidden\r\n"), std::string::npos);
+  EXPECT_NE(responses[3].find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  EXPECT_EQ(active_counts, (std::vector<int> {1, 0, 0, 0}));
+  EXPECT_TRUE(action_results[0]);
+  EXPECT_TRUE(action_results[1]);
+}
+
+TEST(VanillaMoonlightCompatibility, EncryptedFreshSocketAnnouncePlayPreservesSharedIvContinuity) {
+  const auto &rtsp = official_fixture().at("rtsp");
+  nvhttp::args_t args;
+  for (const auto &[name, value] : official_fixture().at("http").at("launchArguments").items()) {
+    args.emplace(name, value.get<std::string>());
+  }
+  auto launch = nvhttp::make_launch_session(false, args, "certificate-a");
+  launch->source_address = "127.0.0.1";
+  const auto key = launch->gcm_key;
+
+  const auto saved_lan_mode = config::stream.lan_encryption_mode;
+  const auto saved_microphone = config::audio.client_microphone;
+  config::stream.lan_encryption_mode = config::ENCRYPTION_MODE_OPPORTUNISTIC;
+  config::audio.client_microphone = false;
+  auto restore = util::fail_guard([&]() {
+    config::stream.lan_encryption_mode = saved_lan_mode;
+    config::audio.client_microphone = saved_microphone;
+  });
+
+  const std::vector requests {
+    rtsp_stream::encrypt_rtsp_request_for_tests(
+      key,
+      1,
+      request_text(
+        "ANNOUNCE",
+        rtsp.at("announceTarget").get<std::string>(),
+        50,
+        "Session: DEADBEEFCAFE\r\n",
+        announce_payload()
+      )
+    ),
+    rtsp_stream::encrypt_rtsp_request_for_tests(
+      key,
+      2,
+      request_text("PLAY", rtsp.at("playTarget").get<std::string>(), 51, "Session: DEADBEEFCAFE\r\n")
+    ),
+  };
+  const auto responses = rtsp_stream::exchange_preannounce_requests_for_tests(launch, requests);
+
+  ASSERT_EQ(responses.size(), requests.size());
+  const auto announce = rtsp_stream::decrypt_rtsp_response_for_tests(key, responses[0]);
+  const auto play = rtsp_stream::decrypt_rtsp_response_for_tests(key, responses[1]);
+  EXPECT_NE(announce.plaintext.find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  EXPECT_NE(play.plaintext.find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  EXPECT_EQ(announce.sequence, 1U);
+  EXPECT_EQ(play.sequence, 2U);
+}
+
+TEST(VanillaMoonlightCompatibility, DistinctAddressAnnouncedAndPendingRoutesCoexistThroughTimeout) {
+  const auto &rtsp = official_fixture().at("rtsp");
+  nvhttp::args_t args;
+  for (const auto &[name, value] : official_fixture().at("http").at("launchArguments").items()) {
+    args.emplace(name, value.get<std::string>());
+  }
+  auto launch = nvhttp::make_launch_session(false, args, "certificate-a");
+  launch->rtsp_cipher.reset();
+  launch->source_address = "127.0.0.1";
+  auto distinct_pending = nvhttp::make_launch_session(false, args, "certificate-b");
+  distinct_pending->rtsp_cipher.reset();
+  distinct_pending->source_address = "192.0.2.2";
+
+  const auto saved_lan_mode = config::stream.lan_encryption_mode;
+  const auto saved_microphone = config::audio.client_microphone;
+  config::stream.lan_encryption_mode = config::ENCRYPTION_MODE_OPPORTUNISTIC;
+  config::audio.client_microphone = false;
+  auto restore = util::fail_guard([&]() {
+    config::stream.lan_encryption_mode = saved_lan_mode;
+    config::audio.client_microphone = saved_microphone;
+  });
+
+  const std::vector requests {
+    request_text(
+      "ANNOUNCE",
+      rtsp.at("announceTarget").get<std::string>(),
+      60,
+      "Session: DEADBEEFCAFE\r\n",
+      announce_payload()
+    ),
+    request_text("PLAY", rtsp.at("playTarget").get<std::string>(), 61, "Session: DEADBEEFCAFE\r\n"),
+    request_text("PLAY", rtsp.at("playTarget").get<std::string>(), 62, "Session: DEADBEEFCAFE\r\n"),
+  };
+  const std::vector actions {
+    rtsp_stream::listener_lifecycle_action_e::attempt_distinct_address_pending,
+    rtsp_stream::listener_lifecycle_action_e::expire_replacement_pending,
+  };
+  std::vector<int> active_counts;
+  std::vector<bool> action_results;
+  const auto responses = rtsp_stream::exchange_preannounce_requests_for_tests(
+    launch,
+    requests,
+    {},
+    &active_counts,
+    actions,
+    distinct_pending,
+    &action_results
+  );
+
+  ASSERT_EQ(responses.size(), requests.size());
+  for (const auto &response : responses) {
+    EXPECT_NE(response.find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  }
+  EXPECT_EQ(active_counts, (std::vector<int> {1, 1, 1}));
+  ASSERT_GE(action_results.size(), 2U);
+  EXPECT_TRUE(action_results[0]);
+  EXPECT_TRUE(action_results[1]);
+}
+
+TEST(VanillaMoonlightCompatibility, ControlAttachClearAndStopEraseAnnouncedPlayRoute) {
+  const auto &rtsp = official_fixture().at("rtsp");
+  nvhttp::args_t args;
+  for (const auto &[name, value] : official_fixture().at("http").at("launchArguments").items()) {
+    args.emplace(name, value.get<std::string>());
+  }
+  auto launch = nvhttp::make_launch_session(false, args, "certificate-a");
+  launch->rtsp_cipher.reset();
+  launch->source_address = "127.0.0.1";
+
+  const auto saved_lan_mode = config::stream.lan_encryption_mode;
+  const auto saved_microphone = config::audio.client_microphone;
+  config::stream.lan_encryption_mode = config::ENCRYPTION_MODE_OPPORTUNISTIC;
+  config::audio.client_microphone = false;
+  auto restore = util::fail_guard([&]() {
+    config::stream.lan_encryption_mode = saved_lan_mode;
+    config::audio.client_microphone = saved_microphone;
+  });
+
+  const std::vector requests {
+    request_text(
+      "ANNOUNCE",
+      rtsp.at("announceTarget").get<std::string>(),
+      70,
+      "Session: DEADBEEFCAFE\r\n",
+      announce_payload()
+    ),
+    request_text("PLAY", rtsp.at("playTarget").get<std::string>(), 71, "Session: DEADBEEFCAFE\r\n"),
+    request_text("PLAY", rtsp.at("playTarget").get<std::string>(), 72, "Session: DEADBEEFCAFE\r\n"),
+  };
+  const std::vector actions {
+    rtsp_stream::listener_lifecycle_action_e::clear_announced,
+    rtsp_stream::listener_lifecycle_action_e::stop_all,
+  };
+  std::vector<int> active_counts;
+  const auto responses = rtsp_stream::exchange_preannounce_requests_for_tests(
+    launch,
+    requests,
+    {},
+    &active_counts,
+    actions
+  );
+
+  ASSERT_EQ(responses.size(), requests.size());
+  EXPECT_NE(responses[0].find("RTSP/1.0 200 OK\r\n"), std::string::npos);
+  EXPECT_TRUE(responses[1].empty());
+  EXPECT_TRUE(responses[2].empty());
+  EXPECT_EQ(active_counts, (std::vector<int> {1, 0, 0}));
 }
 
 TEST(VanillaMoonlightCompatibility, VanillaAnnounceReachesTheFinalPolicyGateWithoutExtensions) {

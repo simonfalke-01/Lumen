@@ -129,7 +129,7 @@ namespace rtsp_stream {
      *
      * @return Payload byte count with the encrypted-message flag masked out.
      */
-    std::uint32_t payload_length() {
+    std::uint32_t payload_length() const {
       return util::endian::big<std::uint32_t>(typeAndLength) & ~ENCRYPTED_MESSAGE_TYPE_BIT;
     }
 
@@ -138,7 +138,7 @@ namespace rtsp_stream {
      *
      * @return True when the RTSP connection is using TLS.
      */
-    bool is_encrypted() {
+    bool is_encrypted() const {
       return !!(util::endian::big<std::uint32_t>(typeAndLength) & ENCRYPTED_MESSAGE_TYPE_BIT);
     }
 
@@ -607,12 +607,13 @@ namespace rtsp_stream {
       auto socket = std::move(next_socket);
 
       std::shared_ptr<launch_session_t> launch_session;
+      boost::system::error_code endpoint_error;
+      const auto remote_endpoint = socket->sock.remote_endpoint(endpoint_error);
+      const auto peer_address = endpoint_error ? std::string {} : net::addr_to_normalized_string(remote_endpoint.address());
       {
         std::unique_lock lifecycle {lifecycle_mutex_};
         wait_for_teardown_locked(lifecycle);
-        if (pending_launch_) {
-          launch_session = pending_launch_;
-        }
+        launch_session = launch_for_peer_locked(peer_address);
       }
       if (launch_session) {
         // Associate the current RTSP session with this socket and start reading
@@ -647,31 +648,91 @@ namespace rtsp_stream {
     }
 
     /**
-     * @brief Launch a new streaming session.
-     * @note If the client does not begin streaming within the ping_timeout,
-     *       the session will be discarded.
+     * @brief Reserve an exact pending launch without exposing it to RTSP accepts.
+     *
      * @param launch_session Streaming session information.
+     * @return `true` when the generation-qualified reservation was created.
      */
-    void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    bool session_reserve(const std::shared_ptr<launch_session_t> &launch_session) {
       std::unique_lock lifecycle {lifecycle_mutex_};
       wait_for_teardown_locked(lifecycle);
-      // If a launch event is still pending, don't overwrite it.
       if (pending_launch_) {
-        return;
+        return false;
+      }
+      if (!launch_session->source_address.empty() && announced_routes_.contains(launch_session->source_address)) {
+        BOOST_LOG(warning) << "Rejected a new RTSP launch while its source address still has an announced route"sv;
+        return false;
       }
 
-      // Publish a new generation-qualified pending launch.
       launch_session->pending_launch_generation = ++pending_launch_generation_;
-      const auto pending_generation = launch_session->pending_launch_generation;
-      pending_launch_ = std::move(launch_session);
+      pending_launch_ = launch_session;
+      pending_launch_claimable_ = false;
+      pending_launch_cancelled_ = false;
+      return true;
+    }
 
-      // Arm the timer to expire this launch session if the client times out
+    /**
+     * @brief Make an exact reservation claimable and arm its timeout.
+     *
+     * @param launch_session Exact launch pointer previously reserved.
+     * @return `true` when the reservation became claimable.
+     */
+    bool session_commit(const std::shared_ptr<launch_session_t> &launch_session) {
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
+      if (!pending_launch_ || pending_launch_.get() != launch_session.get() ||
+          pending_launch_->pending_launch_generation != launch_session->pending_launch_generation ||
+          pending_launch_claimable_ || pending_launch_cancelled_) {
+        return false;
+      }
+      pending_launch_claimable_ = true;
+      const auto pending_generation = launch_session->pending_launch_generation;
+
       raised_timer.expires_after(config::stream.ping_timeout);
       raised_timer.async_wait([this, pending_generation](const boost::system::error_code &ec) {
         if (!ec) {
           static_cast<void>(expire_pending_launch(pending_generation, false));
         }
       });
+      return true;
+    }
+
+    /**
+     * @brief Remove an exact reserved or claimable pending launch.
+     *
+     * @param launch_session Exact launch pointer and generation to remove.
+     * @return `true` when the matching lifecycle was removed.
+     */
+    bool session_rollback(const std::shared_ptr<launch_session_t> &launch_session) {
+      std::lock_guard lifecycle {lifecycle_mutex_};
+      if (!pending_launch_ || pending_launch_.get() != launch_session.get() ||
+          pending_launch_->pending_launch_generation != launch_session->pending_launch_generation) {
+        return false;
+      }
+      if (pending_launch_claimable_) {
+        raised_timer.cancel();
+      }
+      pending_launch_.reset();
+      pending_launch_claimable_ = false;
+      pending_launch_cancelled_ = false;
+      return true;
+    }
+
+    /**
+     * @brief Reserve and immediately commit a launch for internal and test callers.
+     *
+     * @param launch_session Streaming session information.
+     * @return `true` when both lifecycle phases succeeded.
+     */
+    bool session_raise(const std::shared_ptr<launch_session_t> &launch_session) {
+      if (!session_reserve(launch_session)) {
+        return false;
+      }
+      if (session_commit(launch_session)) {
+        return true;
+      }
+      static_cast<void>(session_rollback(launch_session));
+      return false;
     }
 
     /**
@@ -688,13 +749,16 @@ namespace rtsp_stream {
     bool expire_pending_launch(const std::uint64_t pending_generation, bool cancel_timer = true) {
       std::unique_lock lifecycle {lifecycle_mutex_};
       wait_for_teardown_locked(lifecycle);
-      if (!pending_launch_ || pending_launch_->pending_launch_generation != pending_generation) {
+      if (!pending_launch_claimable_ || !pending_launch_ ||
+          pending_launch_->pending_launch_generation != pending_generation) {
         return false;
       }
       if (cancel_timer) {
         raised_timer.cancel();
       }
       auto discarded = std::exchange(pending_launch_, {});
+      pending_launch_claimable_ = false;
+      pending_launch_cancelled_ = false;
 
       BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
       cleanup_idle_launch_locked(*discarded);
@@ -711,21 +775,19 @@ namespace rtsp_stream {
       const std::uint64_t pending_launch_generation
     ) {
       std::lock_guard lifecycle {lifecycle_mutex_};
-      if (teardown_in_progress_) {
-        return;
+      if (pending_launch_ &&
+          pending_launch_->id == launch_session_id &&
+          pending_launch_->pending_launch_generation == pending_launch_generation) {
+        raised_timer.cancel();
+        pending_launch_.reset();
+        pending_launch_claimable_ = false;
+        pending_launch_cancelled_ = false;
       }
-      if (!pending_launch_) {
-        return;
-      }
-      if (pending_launch_->id != launch_session_id ||
-          pending_launch_->pending_launch_generation != pending_launch_generation) {
-        BOOST_LOG(error) << "Attempted to clear unexpected pending session generation: "sv
-                         << launch_session_id << '/' << pending_launch_generation << " vs "sv
-                         << pending_launch_->id << '/' << pending_launch_->pending_launch_generation;
-        return;
-      }
-      raised_timer.cancel();
-      pending_launch_.reset();
+      std::erase_if(announced_routes_, [&](const auto &entry) {
+        const auto &launch = entry.second.launch;
+        return launch && launch->id == launch_session_id &&
+               launch->pending_launch_generation == pending_launch_generation;
+      });
     }
 
     /**
@@ -760,11 +822,17 @@ namespace rtsp_stream {
         if (all && pending_launch_) {
           raised_timer.cancel();
           pending_launch_.reset();
+          pending_launch_claimable_ = false;
+          pending_launch_cancelled_ = false;
+        }
+        if (all) {
+          announced_routes_.clear();
         }
         for (auto i = _session_slots.begin(); i != _session_slots.end();) {
           auto &slot = *(*i);
           if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
             removed.push_back(*i);
+            erase_announced_route_for_active_locked(*i);
             i = _session_slots.erase(i);
           } else {
             ++i;
@@ -798,22 +866,35 @@ namespace rtsp_stream {
         wait_for_teardown_locked(lifecycle);
         teardown_in_progress_ = true;
         if (pending_launch_ && session_owned_by_certificate(pending_launch_->client_cert, cert)) {
-          removed_generations.push_back(pending_launch_->process_generation);
-          raised_timer.cancel();
-          pending_launch_.reset();
-          ++cleared;
+          if (!pending_launch_claimable_) {
+            if (!pending_launch_cancelled_) {
+              pending_launch_cancelled_ = true;
+              ++cleared;
+            }
+          } else {
+            removed_generations.push_back(pending_launch_->process_generation);
+            raised_timer.cancel();
+            pending_launch_.reset();
+            pending_launch_claimable_ = false;
+            pending_launch_cancelled_ = false;
+            ++cleared;
+          }
         }
         for (auto i = _session_slots.begin(); i != _session_slots.end();) {
           auto &slot = *(*i);
           if (session_owned_by_certificate(stream::session::client_cert(slot), cert)) {
             removed_generations.push_back(stream::session::process_generation(slot));
             removed.push_back(*i);
+            erase_announced_route_for_active_locked(*i);
             i = _session_slots.erase(i);
             ++cleared;
           } else {
             ++i;
           }
         }
+        std::erase_if(announced_routes_, [&](const auto &entry) {
+          return entry.second.launch && session_owned_by_certificate(entry.second.launch->client_cert, cert);
+        });
       }
       auto teardown_guard = util::fail_guard([this]() {
         finish_teardown();
@@ -827,15 +908,22 @@ namespace rtsp_stream {
         bool generation_matched {};
         bool process_running {};
         bool process_terminated {};
-        if (_session_slots.empty() && !pending_launch_) {
-          for (const auto generation : removed_generations) {
-            const auto cleanup = proc::proc.cleanup_owned_process_generation(cert, generation);
-            generation_matched = generation_matched || cleanup.generation_matched;
-            process_running = process_running || cleanup.process_running;
-            process_terminated = process_terminated || cleanup.process_terminated;
-          }
-          if (removed_generations.empty()) {
+        const bool cancelled_owner_fence = pending_launch_ && !pending_launch_claimable_ &&
+                                           pending_launch_cancelled_ &&
+                                           session_owned_by_certificate(pending_launch_->client_cert, cert);
+        if (_session_slots.empty() && (!pending_launch_ || cancelled_owner_fence)) {
+          if (cancelled_owner_fence) {
             process_terminated = proc::proc.terminate_if_owned_by_certificate(cert);
+          } else {
+            for (const auto generation : removed_generations) {
+              const auto cleanup = proc::proc.cleanup_owned_process_generation(cert, generation);
+              generation_matched = generation_matched || cleanup.generation_matched;
+              process_running = process_running || cleanup.process_running;
+              process_terminated = process_terminated || cleanup.process_terminated;
+            }
+            if (removed_generations.empty()) {
+              process_terminated = proc::proc.terminate_if_owned_by_certificate(cert);
+            }
           }
           if (process_terminated || (generation_matched && !process_running)) {
             revert_idle_display_locked();
@@ -879,18 +967,30 @@ namespace rtsp_stream {
     ) {
       std::unique_lock lifecycle {lifecycle_mutex_};
       wait_for_teardown_locked(lifecycle);
-      if (!claimed_launch_publishable_locked(launch_session)) {
+      if (!claimed_launch_publishable_locked(launch_session) ||
+          launch_session.source_address != peer_address ||
+          announced_routes_.contains(peer_address)) {
         return false;
       }
       const auto published = proc::proc.publish_legacy_session(
         launch_session.process_generation,
         launch_session.client_cert,
         [&]() {
+          const auto [route, inserted] = announced_routes_.try_emplace(
+            peer_address,
+            announced_route_t {pending_launch_, stream_session}
+          );
+          if (!inserted) {
+            return false;
+          }
           if (stream::session::start(stream_session, peer_address)) {
+            announced_routes_.erase(route);
             return false;
           }
           _session_slots.emplace(stream_session);
           pending_launch_.reset();
+          pending_launch_claimable_ = false;
+          pending_launch_cancelled_ = false;
           raised_timer.cancel();
           return true;
         }
@@ -899,6 +999,54 @@ namespace rtsp_stream {
         BOOST_LOG(info) << "New streaming session started [active sessions: "sv << _session_slots.size() << ']';
       }
       return published;
+    }
+
+    /**
+     * @brief Classify an ANNOUNCE against the exact address-bound launch lifecycle.
+     *
+     * @param launch_session Launch claimed by the accepted RTSP socket.
+     * @param peer_address Normalized remote RTSP address.
+     * @return Initial, duplicate, or rejected lifecycle state.
+     */
+    enum class announce_phase_e { initial, duplicate, rejected };
+
+    announce_phase_e announce_phase(
+      const launch_session_t &launch_session,
+      const std::string_view peer_address
+    ) {
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
+      if (launch_session.source_address != peer_address) {
+        return announce_phase_e::rejected;
+      }
+      if (claimed_launch_publishable_locked(launch_session)) {
+        return announce_phase_e::initial;
+      }
+      const auto route = announced_routes_.find(std::string {peer_address});
+      if (route != announced_routes_.end() && route_matches_launch_locked(route->second, launch_session)) {
+        return announce_phase_e::duplicate;
+      }
+      return announce_phase_e::rejected;
+    }
+
+    /**
+     * @brief Authorize a PLAY transaction against a live announced stream.
+     *
+     * @param launch_session Launch claimed by the accepted RTSP socket.
+     * @param peer_address Normalized remote RTSP address.
+     * @return `true` only for the exact generation-qualified live announced route.
+     */
+    bool authorize_play(
+      const launch_session_t &launch_session,
+      const std::string_view peer_address
+    ) {
+      std::unique_lock lifecycle {lifecycle_mutex_};
+      wait_for_teardown_locked(lifecycle);
+      if (launch_session.source_address != peer_address) {
+        return false;
+      }
+      const auto route = announced_routes_.find(std::string {peer_address});
+      return route != announced_routes_.end() && route_matches_launch_locked(route->second, launch_session);
     }
 
 #ifdef SUNSHINE_TESTS
@@ -961,6 +1109,12 @@ namespace rtsp_stream {
     }
 
   private:
+    /** @brief Address-bound linkage retained between ANNOUNCE and control-channel attachment. */
+    struct announced_route_t {
+      std::shared_ptr<launch_session_t> launch;  ///< Exact generation-qualified launch accepted by ANNOUNCE.
+      std::weak_ptr<stream::session_t> active_session;  ///< Live stream started for the announced launch.
+    };
+
     /** @brief Wait until any join-based teardown releases the lifecycle boundary. */
     void wait_for_teardown_locked(std::unique_lock<std::recursive_mutex> &lifecycle) {
       lifecycle_changed_.wait(lifecycle, [this]() {
@@ -979,8 +1133,51 @@ namespace rtsp_stream {
 
     /** @brief Test whether one acquired launch still owns the current pending slot. */
     bool claimed_launch_publishable_locked(const launch_session_t &launch_session) const {
-      return pending_launch_ && pending_launch_.get() == &launch_session &&
+      return pending_launch_claimable_ && pending_launch_ && pending_launch_.get() == &launch_session &&
              pending_launch_->pending_launch_generation == launch_session.pending_launch_generation;
+    }
+
+    /** @brief Return whether an announced route still links the exact live active stream. */
+    bool announced_route_live_locked(const announced_route_t &route) const {
+      const auto active = route.active_session.lock();
+      return active && _session_slots.contains(active) &&
+             stream::session::state(*active) == stream::session::state_e::RUNNING;
+    }
+
+    /** @brief Return whether a route belongs to the exact launch pointer and generation. */
+    bool route_matches_launch_locked(
+      const announced_route_t &route,
+      const launch_session_t &launch_session
+    ) const {
+      return route.launch && route.launch.get() == &launch_session &&
+             route.launch->pending_launch_generation == launch_session.pending_launch_generation &&
+             announced_route_live_locked(route);
+    }
+
+    /** @brief Select the pending or announced launch authorized for one normalized peer. */
+    std::shared_ptr<launch_session_t> launch_for_peer_locked(const std::string_view peer_address) {
+      if (peer_address.empty()) {
+        return {};
+      }
+      if (pending_launch_claimable_ && pending_launch_ && pending_launch_->source_address == peer_address) {
+        return pending_launch_;
+      }
+      const auto route = announced_routes_.find(std::string {peer_address});
+      if (route == announced_routes_.end()) {
+        return {};
+      }
+      if (!announced_route_live_locked(route->second)) {
+        announced_routes_.erase(route);
+        return {};
+      }
+      return route->second.launch;
+    }
+
+    /** @brief Erase the announced route linked to one exact active stream. */
+    void erase_announced_route_for_active_locked(const std::shared_ptr<stream::session_t> &active_session) {
+      std::erase_if(announced_routes_, [&](const auto &entry) {
+        return entry.second.active_session.lock() == active_session;
+      });
     }
 
     /** @brief Restore display state for a generation-matched idle RTSP cleanup. */
@@ -1012,6 +1209,9 @@ namespace rtsp_stream {
     bool teardown_in_progress_ {};  ///< Whether matched sessions were unpublished for out-of-lock joins.
     std::set<std::shared_ptr<stream::session_t>> _session_slots;  ///< Active sessions guarded by lifecycle_mutex_.
     std::shared_ptr<launch_session_t> pending_launch_;  ///< Pending launch shared by pre-ANNOUNCE sockets under lifecycle_mutex_.
+    bool pending_launch_claimable_ {};  ///< Whether the pending reservation is visible to accepted RTSP connections.
+    bool pending_launch_cancelled_ {};  ///< Whether cancellation awaits the reserving HTTP transaction's exact rollback.
+    std::unordered_map<std::string, announced_route_t> announced_routes_;  ///< Address-bound post-ANNOUNCE routes guarded by lifecycle_mutex_.
     std::uint64_t pending_launch_generation_ {};  ///< Monotonic pending-slot generation.
 #ifdef SUNSHINE_TESTS
     std::size_t idle_display_revert_count_ {};  ///< Explicit no-process display cleanup observations.
@@ -1026,11 +1226,24 @@ namespace rtsp_stream {
 
   rtsp_server_t server {};  ///< Singleton RTSP server used by GameStream launch sessions.
 
-  /**
-   * @brief Queue a launch session until the RTSP client connects.
-   */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.session_raise(std::move(launch_session));
+  /** @copydoc rtsp_stream::launch_session_reserve */
+  bool launch_session_reserve(const std::shared_ptr<launch_session_t> &launch_session) {
+    return server.session_reserve(launch_session);
+  }
+
+  /** @copydoc rtsp_stream::launch_session_commit */
+  bool launch_session_commit(const std::shared_ptr<launch_session_t> &launch_session) {
+    return server.session_commit(launch_session);
+  }
+
+  /** @copydoc rtsp_stream::launch_session_rollback */
+  bool launch_session_rollback(const std::shared_ptr<launch_session_t> &launch_session) {
+    return server.session_rollback(launch_session);
+  }
+
+  /** @copydoc rtsp_stream::launch_session_raise */
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.session_raise(launch_session);
   }
 
   void launch_session_clear(
@@ -1465,6 +1678,20 @@ namespace rtsp_stream {
 
     auto seqn_str = std::to_string(req->sequenceNumber);
     option.content = const_cast<char *>(seqn_str.c_str());
+
+    const auto peer_address = net::addr_to_normalized_string(sock.remote_endpoint().address());
+    if (server) {
+      switch (server->announce_phase(session, peer_address)) {
+        case rtsp_server_t::announce_phase_e::duplicate:
+          respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
+          return;
+        case rtsp_server_t::announce_phase_e::rejected:
+          respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});
+          return;
+        case rtsp_server_t::announce_phase_e::initial:
+          break;
+      }
+    }
 
     std::string_view payload {req->payload, (size_t) req->payloadLength};
 
@@ -1930,7 +2157,7 @@ namespace rtsp_stream {
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;
     }
-    if (!server->start_and_insert(stream_session, session, sock.remote_endpoint().address().to_string())) {
+    if (!server->start_and_insert(stream_session, session, peer_address)) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
@@ -1961,25 +2188,103 @@ namespace rtsp_stream {
     auto seqn_str = std::to_string(req->sequenceNumber);
     option.content = const_cast<char *>(seqn_str.c_str());
 
+    const auto peer_address = net::addr_to_normalized_string(sock.remote_endpoint().address());
+    if (!server || !server->authorize_play(session, peer_address)) {
+      respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});
+      return;
+    }
+
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 
 #ifdef SUNSHINE_TESTS
+  std::string encrypt_rtsp_request_for_tests(
+    const crypto::aes_t &key,
+    const std::uint32_t sequence,
+    const std::string_view plaintext
+  ) {
+    std::string message(sizeof(encrypted_rtsp_header_t) + plaintext.size(), '\0');
+    auto *header = reinterpret_cast<encrypted_rtsp_header_t *>(message.data());
+    header->typeAndLength = util::endian::big<std::uint32_t>(
+      encrypted_rtsp_header_t::ENCRYPTED_MESSAGE_TYPE_BIT + static_cast<std::uint32_t>(plaintext.size())
+    );
+    header->sequenceNumber = util::endian::big<std::uint32_t>(sequence);
+    std::copy(plaintext.begin(), plaintext.end(), reinterpret_cast<char *>(header->payload()));
+    crypto::aes_t iv(12);
+    std::copy_n(reinterpret_cast<const std::uint8_t *>(&sequence), sizeof(sequence), iv.begin());
+    iv[10] = 'C';
+    iv[11] = 'R';
+    crypto::cipher::gcm_t cipher {key, false};
+    cipher.encrypt(
+      std::string_view {reinterpret_cast<const char *>(header->payload()), plaintext.size()},
+      header->tag,
+      &iv
+    );
+    return message;
+  }
+
+  decrypted_rtsp_response_t decrypt_rtsp_response_for_tests(
+    const crypto::aes_t &key,
+    const std::string_view message
+  ) {
+    if (message.size() < sizeof(encrypted_rtsp_header_t)) {
+      return {};
+    }
+    const auto *header = reinterpret_cast<const encrypted_rtsp_header_t *>(message.data());
+    const auto payload_length = header->payload_length();
+    if (message.size() != sizeof(*header) + payload_length) {
+      return {};
+    }
+    const auto sequence = util::endian::big<std::uint32_t>(header->sequenceNumber);
+    crypto::aes_t iv(12);
+    std::copy_n(reinterpret_cast<const std::uint8_t *>(&sequence), sizeof(sequence), iv.begin());
+    iv[10] = 'H';
+    iv[11] = 'R';
+    crypto::cipher::gcm_t cipher {key, false};
+    std::vector<std::uint8_t> plaintext;
+    if (cipher.decrypt(
+          std::string_view {reinterpret_cast<const char *>(header->tag), sizeof(header->tag) + payload_length},
+          plaintext,
+          &iv
+        )) {
+      return {};
+    }
+    return {
+      .plaintext = std::string {plaintext.begin(), plaintext.end()},
+      .sequence = sequence,
+    };
+  }
+
   /**
    * @brief Exchange requests over fresh TCP connections with a production RTSP listener.
    *
    * @param launch_session Pending launch shared by each pre-ANNOUNCE transaction.
    * @param requests Plaintext RTSP requests, one per TCP connection.
+   * @param source_addresses Optional local source address for each client connection.
+   * @param active_counts Optional active-session count captured after each lifecycle action.
+   * @param actions Optional lifecycle mutation applied after each corresponding request.
+   * @param replacement_launch Optional launch used by replacement lifecycle actions.
+   * @param action_results Optional success result captured for each lifecycle action.
    * @return Complete response received for each request.
    */
   std::vector<std::string> exchange_preannounce_requests_for_tests(
     std::shared_ptr<launch_session_t> launch_session,
-    const std::vector<std::string> &requests
+    const std::vector<std::string> &requests,
+    const std::vector<std::string> &source_addresses,
+    std::vector<int> *active_counts,
+    const std::vector<listener_lifecycle_action_e> &actions,
+    const std::shared_ptr<launch_session_t> &replacement_launch,
+    std::vector<bool> *action_results
   ) {
     rtsp_server_t test_server;
     test_server.map("OPTIONS"sv, &cmd_option);
     test_server.map("DESCRIBE"sv, &cmd_describe);
-    test_server.session_raise(std::move(launch_session));
+    test_server.map("ANNOUNCE"sv, &cmd_announce);
+    test_server.map("PLAY"sv, &cmd_play);
+    const auto original_launch = launch_session;
+    if (!test_server.session_raise(std::move(launch_session))) {
+      throw std::runtime_error {"Unable to publish RTSP launch for listener test"};
+    }
 
     boost::system::error_code ec;
     if (test_server.bind(net::IPV4, 0, ec)) {
@@ -2005,22 +2310,70 @@ namespace rtsp_stream {
 
     std::vector<std::string> responses;
     responses.reserve(requests.size());
-    for (const auto &request : requests) {
+    const auto apply_action = [&](const std::size_t index) {
+      auto result = true;
+      const auto action = index < actions.size() ? actions[index] : listener_lifecycle_action_e::none;
+      switch (action) {
+        case listener_lifecycle_action_e::none:
+          break;
+        case listener_lifecycle_action_e::clear_announced:
+          test_server.session_clear(original_launch->id, original_launch->pending_launch_generation);
+          break;
+        case listener_lifecycle_action_e::attempt_same_address_replacement:
+          result = replacement_launch && test_server.session_raise(replacement_launch);
+          break;
+        case listener_lifecycle_action_e::attempt_distinct_address_pending:
+          result = replacement_launch && test_server.session_raise(replacement_launch);
+          break;
+        case listener_lifecycle_action_e::expire_replacement_pending:
+          result = replacement_launch &&
+                   test_server.expire_pending_launch(replacement_launch->pending_launch_generation);
+          break;
+        case listener_lifecycle_action_e::cancel_replace_and_stale_clear:
+          result = replacement_launch && test_server.cancel_owner(original_launch->client_cert) > 0 &&
+                   test_server.session_raise(replacement_launch);
+          test_server.session_clear(original_launch->id, original_launch->pending_launch_generation);
+          break;
+        case listener_lifecycle_action_e::stop_all:
+          test_server.clear(true);
+          break;
+      }
+      if (action_results) {
+        action_results->push_back(result);
+      }
+      if (active_counts) {
+        active_counts->push_back(test_server.session_count());
+      }
+    };
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+      const auto &request = requests[index];
       boost::asio::io_context client_context;
       tcp::socket client {client_context};
+      if (index < source_addresses.size() && !source_addresses[index].empty()) {
+        client.open(tcp::v4());
+        client.bind({boost::asio::ip::make_address(source_addresses[index]), 0});
+      }
       client.connect(endpoint);
-      boost::asio::write(client, boost::asio::buffer(request));
+      boost::system::error_code write_error;
+      boost::asio::write(client, boost::asio::buffer(request), write_error);
+      if (write_error) {
+        responses.emplace_back();
+        apply_action(index);
+        continue;
+      }
 
       boost::asio::streambuf response;
       boost::system::error_code read_error;
       boost::asio::read(client, response, read_error);
-      if (read_error && read_error != boost::asio::error::eof) {
+      if (read_error && read_error != boost::asio::error::eof &&
+          read_error != boost::asio::error::connection_reset) {
         throw boost::system::system_error {read_error};
       }
       responses.emplace_back(
         boost::asio::buffers_begin(response.data()),
         boost::asio::buffers_end(response.data())
       );
+      apply_action(index);
     }
 
     return responses;

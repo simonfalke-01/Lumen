@@ -136,16 +136,44 @@ namespace rtsp_stream {
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
     std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+    std::string source_address;  ///< Normalized HTTPS peer address authorized to complete this RTSP launch.
     std::uint64_t process_generation {};  ///< Process generation captured before RTSP publication.
     std::uint64_t pending_launch_generation {};  ///< Monotonic pending-slot generation used by timeout removal.
   };
 
   /**
+   * @brief Reserve the sole pending RTSP launch before mutating display or process state.
+   *
+   * A reservation owns an exact generation but is not visible to the RTSP listener and has no timeout.
+   *
+   * @param launch_session Session prepared by the GameStream launch handler.
+   * @return `true` when the exact address-bound reservation was created.
+   */
+  bool launch_session_reserve(const std::shared_ptr<launch_session_t> &launch_session);
+
+  /**
+   * @brief Commit an exact reserved launch for RTSP acceptance and arm its timeout.
+   *
+   * @param launch_session Exact session pointer previously reserved.
+   * @return `true` when the reservation became claimable.
+   */
+  bool launch_session_commit(const std::shared_ptr<launch_session_t> &launch_session);
+
+  /**
+   * @brief Roll back an exact uncommitted or committed pending launch.
+   *
+   * @param launch_session Exact session pointer and generation to remove.
+   * @return `true` when the matching pending lifecycle was removed.
+   */
+  bool launch_session_rollback(const std::shared_ptr<launch_session_t> &launch_session);
+
+  /**
    * @brief Queue a launch session until the RTSP client connects.
    *
    * @param launch_session Session state prepared by the GameStream launch handler.
+   * @return `true` when the exact address-bound pending slot was published.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
 
   /**
    * @brief Clear state for the specified launch session.
@@ -169,6 +197,23 @@ namespace rtsp_stream {
   bool has_session_or_pending_launch();
 
 #ifdef SUNSHINE_TESTS
+  /** @brief Lifecycle mutation applied after one production-listener test transaction. */
+  enum class listener_lifecycle_action_e {
+    none,  ///< Preserve the current listener lifecycle.
+    clear_announced,  ///< Apply the exact control-channel launch clear.
+    attempt_same_address_replacement,  ///< Attempt a replacement while the announced route is live.
+    attempt_distinct_address_pending,  ///< Publish a distinct-address pending launch beside an announced route.
+    expire_replacement_pending,  ///< Expire the exact replacement pending generation.
+    cancel_replace_and_stale_clear,  ///< Cancel the owner, publish a replacement, then clear the stale generation.
+    stop_all,  ///< Stop active sessions and erase their announced routes.
+  };
+
+  /** @brief Decrypted response and host-originated IV sequence observed by an encrypted listener test. */
+  struct decrypted_rtsp_response_t {
+    std::string plaintext;  ///< Authenticated plaintext RTSP response.
+    std::uint32_t sequence {};  ///< Host-originated RTSP IV sequence carried by the encrypted header.
+  };
+
   /**
    * @brief Expire the current pending launch through the production timeout cleanup path.
    *

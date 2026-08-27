@@ -841,7 +841,7 @@ namespace nvhttp {
   /**
    * @brief Create launch session.
    *
-   * @param host_audio Host audio.
+   * @param host_audio Host audio requested for the new session.
    * @param args Arguments forwarded to the callable or parser.
    * @return Constructed launch session object.
    */
@@ -907,6 +907,70 @@ namespace nvhttp {
     auto prepend_iv_p = (uint8_t *) &prepend_iv;
     std::copy(prepend_iv_p, prepend_iv_p + sizeof(prepend_iv), std::begin(launch_session->iv));
     return launch_session;
+  }
+
+  /**
+   * @brief Load the synchronized host-audio baseline committed by a successful launch transaction.
+   *
+   * @param committed_host_audio Shared committed host-audio state.
+   * @return Current committed host-audio value.
+   */
+  bool load_committed_host_audio(const std::atomic_bool &committed_host_audio) {
+    return committed_host_audio.load(std::memory_order_acquire);
+  }
+
+  /**
+   * @brief Publish a host-audio candidate after its launch transaction commits.
+   *
+   * @param committed_host_audio Shared committed host-audio state.
+   * @param candidate Transaction-local host-audio value to publish.
+   */
+  void commit_host_audio(std::atomic_bool &committed_host_audio, const bool candidate) {
+    committed_host_audio.store(candidate, std::memory_order_release);
+  }
+
+  /**
+   * @brief Resolve resume host audio from a fresh post-reservation active-session count.
+   *
+   * @param committed_host_audio Shared committed host-audio state.
+   * @param requested_host_audio Optional request override.
+   * @param active_sessions Fresh active-session count captured after reservation.
+   * @return Request override only while idle; otherwise the synchronized committed baseline.
+   */
+  bool resolve_resume_host_audio_candidate(
+    const std::atomic_bool &committed_host_audio,
+    const std::optional<bool> requested_host_audio,
+    const int active_sessions
+  ) {
+    const auto baseline = load_committed_host_audio(committed_host_audio);
+    return active_sessions == 0 && requested_host_audio ? *requested_host_audio : baseline;
+  }
+
+  /**
+   * @brief Decide whether resume may prepare display state after owning its RTSP reservation.
+   *
+   * @param active_sessions Fresh active-session count captured after reservation.
+   * @return `true` only while the post-reservation lifecycle is still idle.
+   */
+  bool resume_should_prepare_display_after_reservation(const int active_sessions) {
+    return active_sessions == 0;
+  }
+
+  /**
+   * @brief Roll back launch side effects while retaining the exact reservation until last.
+   *
+   * @param launch_session Exact reserved launch transaction.
+   * @param process_cleanup Generation-qualified launched-process cleanup callback.
+   * @param display_cleanup Display restoration callback for configuration mutated by this transaction.
+   */
+  void rollback_launch_reservation_transaction(
+    const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
+    const std::function<void()> &process_cleanup,
+    const std::function<void()> &display_cleanup
+  ) {
+    process_cleanup();
+    display_cleanup();
+    static_cast<void>(rtsp_stream::launch_session_rollback(launch_session));
   }
 
   void remove_session(const pair_session_t &sess) {
@@ -1712,11 +1776,11 @@ namespace nvhttp {
   /**
    * @brief Launch the requested application for a GameStream session.
    *
-   * @param host_audio Host audio.
+   * @param committed_host_audio Synchronized host-audio baseline from committed transactions.
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
    */
-  void launch(bool &host_audio, resp_https_t response, req_https_t request) {
+  void launch(std::atomic_bool &committed_host_audio, resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1731,10 +1795,6 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
-
-      if (revert_display_configuration) {
-        display_device::revert_configuration();
-      }
     });
 
     auto args = request->parse_query_string();
@@ -1762,7 +1822,7 @@ namespace nvhttp {
       return;
     }
 
-    host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+    const bool host_audio_candidate = util::from_view(get_arg(args, "localAudioPlayMode"));
     const auto client_certificate = verified_client_certificate(request);
     if (client_certificate.empty()) {
       tree.put("root.resume", 0);
@@ -1770,7 +1830,43 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Missing authenticated client identity");
       return;
     }
-    auto launch_session = make_launch_session(host_audio, args, client_certificate);
+    auto launch_session = make_launch_session(host_audio_candidate, args, client_certificate);
+    launch_session->source_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+
+    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
+      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
+      tree.put("root.gamesession", 0);
+      return;
+    }
+    if (!rtsp_stream::launch_session_reserve(launch_session)) {
+      tree = {};
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Another RTSP launch is already pending for this client");
+      tree.put("root.gamesession", 0);
+      return;
+    }
+    bool launched_process_owned {};
+    auto reservation_transaction_guard = util::fail_guard([&]() {
+      rollback_launch_reservation_transaction(
+        launch_session,
+        [&]() {
+          if (launched_process_owned) {
+            static_cast<void>(proc::proc.cleanup_owned_process_generation(
+              launch_session->client_cert,
+              launch_session->process_generation
+            ));
+          }
+        },
+        [&]() {
+          if (revert_display_configuration) {
+            display_device::revert_configuration();
+          }
+        }
+      );
+    });
 
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
@@ -1794,17 +1890,6 @@ namespace nvhttp {
       }
     }
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
-    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
-      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
-
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
-
-      return;
-    }
-
     if (appid > 0) {
       auto err = proc::proc.execute((int) appid, launch_session);
       if (err) {
@@ -1814,7 +1899,19 @@ namespace nvhttp {
 
         return;
       }
+      launched_process_owned = true;
     }
+
+    if (!rtsp_stream::launch_session_commit(launch_session)) {
+      tree = {};
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Another RTSP launch is already pending for this client");
+      tree.put("root.gamesession", 0);
+      return;
+    }
+    commit_host_audio(committed_host_audio, host_audio_candidate);
+    reservation_transaction_guard.disable();
+    launched_process_owned = false;
 
     tree = build_launch_tree(
       std::format(
@@ -1825,8 +1922,6 @@ namespace nvhttp {
       )
     );
 
-    rtsp_stream::launch_session_raise(launch_session);
-
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
   }
@@ -1834,14 +1929,15 @@ namespace nvhttp {
   /**
    * @brief Resume an existing GameStream session.
    *
-   * @param host_audio Host audio.
+   * @param committed_host_audio Synchronized host-audio baseline from committed transactions.
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
    */
-  void resume(bool &host_audio, resp_https_t response, req_https_t request) {
+  void resume(std::atomic_bool &committed_host_audio, resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
+    bool revert_display_configuration {false};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -1875,13 +1971,9 @@ namespace nvhttp {
       return;
     }
 
-    // Newer Moonlight clients send localAudioPlayMode on /resume too,
-    // so we should use it if it's present in the args and there are
-    // no active sessions we could be interfering with.
-    const bool no_active_sessions {rtsp_stream::session_count() == 0};
-    if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
-      host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    }
+    const auto requested_host_audio = args.find("localAudioPlayMode"s) != std::end(args) ?
+                                        std::optional<bool> {util::from_view(get_arg(args, "localAudioPlayMode"))} :
+                                        std::nullopt;
     const auto client_certificate = verified_client_certificate(request);
     if (client_certificate.empty()) {
       tree.put("root.resume", 0);
@@ -1889,9 +1981,52 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Missing authenticated client identity");
       return;
     }
-    const auto launch_session = make_launch_session(host_audio, args, client_certificate);
+    const auto launch_session = make_launch_session(
+      load_committed_host_audio(committed_host_audio),
+      args,
+      client_certificate
+    );
+    launch_session->source_address = net::addr_to_normalized_string(request->remote_endpoint().address());
 
-    if (no_active_sessions) {
+    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
+      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
+      tree.put("root.resume", 0);
+      return;
+    }
+    if (!rtsp_stream::launch_session_reserve(launch_session)) {
+      tree = {};
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Another RTSP launch is already pending for this client");
+      tree.put("root.resume", 0);
+      return;
+    }
+    auto reservation_transaction_guard = util::fail_guard([&]() {
+      rollback_launch_reservation_transaction(
+        launch_session,
+        []() {},
+        [&]() {
+          if (revert_display_configuration) {
+            display_device::revert_configuration();
+          }
+        }
+      );
+    });
+
+    const auto active_sessions_after_reservation = rtsp_stream::session_count();
+    const bool host_audio_candidate = resolve_resume_host_audio_candidate(
+      committed_host_audio,
+      requested_host_audio,
+      active_sessions_after_reservation
+    );
+    launch_session->host_audio = host_audio_candidate;
+    const bool prepare_display {
+      resume_should_prepare_display_after_reservation(active_sessions_after_reservation)
+    };
+    if (prepare_display) {
+      revert_display_configuration = true;
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
@@ -1910,16 +2045,16 @@ namespace nvhttp {
       }
     }
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
-    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
-      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
-
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
-
+    if (!rtsp_stream::launch_session_commit(launch_session)) {
+      tree = {};
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Another RTSP launch is already pending for this client");
+      tree.put("root.resume", 0);
       return;
     }
+    commit_host_audio(committed_host_audio, host_audio_candidate);
+    reservation_transaction_guard.disable();
+    revert_display_configuration = false;
 
     tree = build_resume_tree(
       std::format(
@@ -1929,8 +2064,6 @@ namespace nvhttp {
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
-
-    rtsp_stream::launch_session_raise(launch_session);
   }
 
   /**
@@ -2016,9 +2149,8 @@ namespace nvhttp {
 
     auto add_cert = std::make_shared<safe::queue_t<crypto::x509_t>>(30);
 
-    // resume doesn't always get the parameter "localAudioPlayMode"
-    // launch will store it in host_audio
-    bool host_audio {};
+    // Resume doesn't always get localAudioPlayMode, so committed launch state is retained atomically.
+    std::atomic_bool committed_host_audio {};
 
     https_server_t https_server {config::nvhttp.cert, config::nvhttp.pkey};
     http_server_t http_server;
@@ -2091,11 +2223,11 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
-    https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
-      launch(host_audio, resp, req);
+    https_server.resource["^/launch$"]["GET"] = [&committed_host_audio](auto resp, auto req) {
+      launch(committed_host_audio, resp, req);
     };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio](auto resp, auto req) {
-      resume(host_audio, resp, req);
+    https_server.resource["^/resume$"]["GET"] = [&committed_host_audio](auto resp, auto req) {
+      resume(committed_host_audio, resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
 
