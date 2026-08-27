@@ -227,6 +227,12 @@ jobs:
             windows-nuget-wix-v1-${{
             hashFiles('cmake/packaging/windows_wix.cmake') }}
 
+      - name: Cache MsQuic package
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/lumen-full-profile/downloads/Microsoft.Native.Quic.MsQuic.Schannel.2.6.0.nupkg
+          key: windows-msquic-schannel-2.6.0-37636DBC4FBB527F7A2F4505893BB2619862AA5879CC65499A048401C44EB590
+
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba  # v0.0.11
 
@@ -896,15 +902,18 @@ jobs:
           IS_RELEASE: ${{ inputs.release_tag != '' && 'true' || 'false' }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $sccache = (Get-Command sccache -ErrorAction Stop).Source
           $staging = Join-Path $env:RUNNER_TEMP 'lumen-full-profile'
           $downloads = Join-Path $staging 'downloads'
           $msquic = Join-Path $staging 'msquic-2.6.0'
           New-Item -ItemType Directory -Path $downloads, $msquic -Force | Out-Null
           $nupkg = Join-Path $downloads 'Microsoft.Native.Quic.MsQuic.Schannel.2.6.0.nupkg'
-          Invoke-WebRequest `
-            -UseBasicParsing `
-            -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.native.quic.msquic.schannel/2.6.0/microsoft.native.quic.msquic.schannel.2.6.0.nupkg' `
-            -OutFile $nupkg
+          if (-not (Test-Path -LiteralPath $nupkg -PathType Leaf)) {
+            Invoke-WebRequest `
+              -UseBasicParsing `
+              -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.native.quic.msquic.schannel/2.6.0/microsoft.native.quic.msquic.schannel.2.6.0.nupkg' `
+              -OutFile $nupkg
+          }
           $expected = '37636DBC4FBB527F7A2F4505893BB2619862AA5879CC65499A048401C44EB590'
           if ((Get-FileHash $nupkg -Algorithm SHA256).Hash -ne $expected) {
             throw 'MsQuic 2.6.0 NuGet package hash mismatch.'
@@ -924,6 +933,7 @@ jobs:
               -NodeRoot $env:NODEJS_PATH `
               -WdkApiValidatorBinRoot $env:WDK_API_VALIDATOR_BIN_ROOT `
               -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
+              -SccachePath $sccache `
               -BuildVersion $env:LUMEN_BUILD_VERSION `
               -BuildOnly `
               -SkipSourceArchive `
@@ -939,6 +949,7 @@ jobs:
               -NodeRoot $env:NODEJS_PATH `
               -WdkApiValidatorBinRoot $env:WDK_API_VALIDATOR_BIN_ROOT `
               -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
+              -SccachePath $sccache `
               -BuildVersion $env:LUMEN_BUILD_VERSION `
               -BuildOnly `
               -SkipSourceArchive
@@ -955,6 +966,7 @@ jobs:
               -NodeRoot $env:NODEJS_PATH `
               -WdkApiValidatorBinRoot $env:WDK_API_VALIDATOR_BIN_ROOT `
               -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
+              -SccachePath $sccache `
               -BuildVersion $env:LUMEN_BUILD_VERSION `
               -BuildOnly `
               -SkipSourceArchive `
@@ -964,7 +976,7 @@ jobs:
           }
 
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
-          Copy-Item (Join-Path $staging 'artifacts\*') artifacts -Force
+          Copy-Item (Join-Path $staging 'artifacts\*') artifacts -Recurse -Force
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -972,6 +984,7 @@ jobs:
           name: Lumen-Windows-AMD64
           path: artifacts/
           if-no-files-found: error
+          compression-level: 0
 
   publish_reused_windows_artifacts:
     name: Re-publish reused Windows artifacts

@@ -31,6 +31,8 @@ param(
 
     [string]$WdkUniversalDdisRoot,
 
+    [string]$SccachePath,
+
     [string]$SignedDriverRoot,
 
     [switch]$AllowTestSignedDrivers,
@@ -321,6 +323,11 @@ if ([string]::IsNullOrWhiteSpace($uvExecutablePath)) {
     throw "uv is required. Install it in MSYS2 UCRT64 or add uv.exe to PATH."
 }
 $uvExecutable = Resolve-Tool $uvExecutablePath "uv"
+$sccacheExecutable = if ([string]::IsNullOrWhiteSpace($SccachePath)) {
+    $null
+} else {
+    Resolve-Tool $SccachePath "sccache"
+}
 
 $freezeDirectory = Join-Path $StagingRoot "source-freeze"
 if (-not $UsePreparedDriverSubmission) {
@@ -798,6 +805,17 @@ $shimCmake = Convert-ToCMakePath $shimOutput
 $vhidCmake = Convert-ToCMakePath $vhidSigned
 $vmicCmake = Convert-ToCMakePath $vmicSigned
 $vddCmake = Convert-ToCMakePath $vddSigned
+# The hosted workflow restores this ignored, source-adjacent tree before the
+# disposable staging root is recreated. Point FetchContent at it explicitly.
+$dependencyCacheRoot = Join-Path $SourceRoot "cmake-build-windows\_deps"
+New-Item -ItemType Directory -Path $dependencyCacheRoot -Force | Out-Null
+$dependencyCacheCmake = Convert-ToCMakePath $dependencyCacheRoot
+$compilerLauncherCmake = if ($null -eq $sccacheExecutable) {
+    '-DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER='
+} else {
+    $sccacheCmake = Convert-ToCMakePath $sccacheExecutable
+    "-DCMAKE_C_COMPILER_LAUNCHER='$sccacheCmake' -DCMAKE_CXX_COMPILER_LAUNCHER='$sccacheCmake'"
+}
 [void](Invoke-MandatoryGate6Command `
     -RunId 'tool-msbuild-version' `
     -FilePath $msbuild `
@@ -843,6 +861,8 @@ export PATH='$shimMsys':'$msquicRuntimeMsys':'$dotnetMsys':'$nodeMsys':"`$PATH"
 '$uvMsys' sync --locked --no-python-downloads --no-install-project
 cmake -S . -B '$buildMsys' -G Ninja \
   -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_WERROR=ON -DCMAKE_BUILD_TYPE=Release \
+  -DFETCHCONTENT_BASE_DIR='$dependencyCacheCmake' \
+  $compilerLauncherCmake \
   -DPython3_ROOT_DIR='$pythonRootCmake' \
   -DPython3_EXECUTABLE='$pythonCmake' \
   -DDOTNET_EXECUTABLE='$dotnetCmake' \
@@ -951,6 +971,9 @@ if (-not $BuildOnly) {
         [ordered]@{ id = 'npm'; path = $npmExecutable },
         [ordered]@{ id = 'uv'; path = $uvExecutable }
     )
+    if ($null -ne $sccacheExecutable) {
+        $nativeTools += [ordered]@{ id = 'sccache'; path = $sccacheExecutable }
+    }
     $toolIdentities = @(
         foreach ($tool in $nativeTools) {
             $item = Get-Item -LiteralPath $tool.path
@@ -1049,8 +1072,20 @@ $requiredApplicationPaths = @(
     'msquic.dll',
     'lumen_msquic_shim.dll',
     'MsQuic-LICENSE.txt',
-    'tools/sunshinesvc.exe',
+    'tools/lumensvc.exe',
     'tools/lumen-vddctl.exe'
+)
+$requiredWebPaths = @(
+    'assets/web/apps.html',
+    'assets/web/clients.html',
+    'assets/web/config.html',
+    'assets/web/featured.html',
+    'assets/web/index.html',
+    'assets/web/logout.html',
+    'assets/web/password.html',
+    'assets/web/pin.html',
+    'assets/web/troubleshooting.html',
+    'assets/web/welcome.html'
 )
 $requiredMsiDriverPaths = @(
     'tools/lumen-vhidctl.exe',
@@ -1075,8 +1110,8 @@ $requiredShaderPaths = @(
     'assets/shaders/directx/include/convert_vdd_color_transform_base.hlsl'
 )
 foreach ($package in @(
-        @{ Name = 'MSI'; Root = $msiContentRoot; Paths = @($requiredApplicationPaths + $requiredMsiDriverPaths + $requiredShaderPaths) },
-        @{ Name = 'ZIP'; Root = $zipContentRoot; Paths = @($requiredApplicationPaths + $requiredShaderPaths) }
+        @{ Name = 'MSI'; Root = $msiContentRoot; Paths = @($requiredApplicationPaths + $requiredWebPaths + $requiredMsiDriverPaths + $requiredShaderPaths) },
+        @{ Name = 'ZIP'; Root = $zipContentRoot; Paths = @($requiredApplicationPaths + $requiredWebPaths + $requiredShaderPaths) }
     )) {
     foreach ($path in $package.Paths) {
         if (-not (Test-Path -LiteralPath (Join-Path $package.Root $path) -PathType Leaf)) {
