@@ -205,9 +205,11 @@ jobs:
             }
           }
 
-      - name: Test full-profile source provenance
+      - name: Test Windows full-profile contracts
         shell: pwsh
-        run: .\tests\packaging\test-full-profile-source-provenance.ps1
+        run: |
+          .\tests\packaging\test-full-profile-source-provenance.ps1
+          .\tests\packaging\test-windows-ci-build-only.ps1
 
       - name: Cache CMake dependency tree
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -924,6 +926,7 @@ jobs:
               -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
               -BuildVersion $env:LUMEN_BUILD_VERSION `
               -BuildOnly `
+              -SkipSourceArchive `
               -SignedDriverRoot $env:SIGNED_DRIVER_ROOT
           } else {
             & .\scripts\windows\build-full-profile.ps1 `
@@ -937,7 +940,8 @@ jobs:
               -WdkApiValidatorBinRoot $env:WDK_API_VALIDATOR_BIN_ROOT `
               -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
               -BuildVersion $env:LUMEN_BUILD_VERSION `
-              -BuildOnly
+              -BuildOnly `
+              -SkipSourceArchive
             & .\scripts\windows\sign-full-profile-local-test.ps1 `
               -StagingRoot $staging `
               -OutputRoot $env:SIGNED_DRIVER_ROOT
@@ -953,6 +957,7 @@ jobs:
               -WdkUniversalDdisRoot $env:WDK_UNIVERSAL_DDIS_ROOT `
               -BuildVersion $env:LUMEN_BUILD_VERSION `
               -BuildOnly `
+              -SkipSourceArchive `
               -UsePreparedDriverSubmission `
               -SignedDriverRoot $env:SIGNED_DRIVER_ROOT `
               -AllowTestSignedDrivers
