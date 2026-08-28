@@ -27,7 +27,7 @@
   #include <dxgi1_6.h>
   #include <SetupAPI.h>
   #include <Windows.h>
-  #include <Aclapi.h>
+  #include <sddl.h>
   #include <wrl/client.h>
 
   // local includes
@@ -52,61 +52,26 @@ namespace platf::virtual_display {
     /** Grant the UMDF Local Service host only the process rights required for ABI handle transfer. */
     bool grant_umdf_process_access(DWORD &native_status) noexcept {
       native_status = ERROR_SUCCESS;
-      PACL current_dacl = nullptr;
       PSECURITY_DESCRIPTOR descriptor = nullptr;
-      native_status = GetSecurityInfo(
-        GetCurrentProcess(),
-        SE_KERNEL_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        nullptr,
-        nullptr,
-        &current_dacl,
-        nullptr,
-        &descriptor
-      );
-      if (native_status != ERROR_SUCCESS || current_dacl == nullptr || descriptor == nullptr) {
-        if (descriptor != nullptr) {
-          LocalFree(descriptor);
-        }
-        return false;
-      }
-      std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> local_service_buffer {};
-      DWORD local_service_size = static_cast<DWORD>(local_service_buffer.size());
-      if (!CreateWellKnownSid(
-            WinLocalServiceSid,
-            nullptr,
-            local_service_buffer.data(),
-            &local_service_size
+      constexpr wchar_t transfer_sddl[] =
+        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x00101040;;;LS)";
+      if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            transfer_sddl,
+            SDDL_REVISION_1,
+            &descriptor,
+            nullptr
           )) {
         native_status = GetLastError();
-        LocalFree(descriptor);
         return false;
       }
-      EXPLICIT_ACCESSW access {};
-      access.grfAccessPermissions = PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
-      access.grfAccessMode = GRANT_ACCESS;
-      access.grfInheritance = NO_INHERITANCE;
-      access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-      access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-      access.Trustee.ptstrName = reinterpret_cast<LPWSTR>(local_service_buffer.data());
-      PACL updated_dacl = nullptr;
-      native_status = SetEntriesInAclW(1, &access, current_dacl, &updated_dacl);
-      if (native_status != ERROR_SUCCESS || updated_dacl == nullptr) {
-        LocalFree(descriptor);
-        return false;
-      }
-      native_status = SetSecurityInfo(
+      const auto applied = SetKernelObjectSecurity(
         GetCurrentProcess(),
-        SE_KERNEL_OBJECT,
         DACL_SECURITY_INFORMATION,
-        nullptr,
-        nullptr,
-        updated_dacl,
-        nullptr
+        descriptor
       );
-      LocalFree(updated_dacl);
+      native_status = applied ? ERROR_SUCCESS : GetLastError();
       LocalFree(descriptor);
-      return native_status == ERROR_SUCCESS;
+      return applied != FALSE;
     }
 
     /** @brief Pack a Windows LUID without changing its signed high-part bits. */
