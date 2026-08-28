@@ -200,9 +200,13 @@ namespace lumen::protocol_v3::runtime {
         if (!prepare_parent(path.parent_path())) {
           return false;
         }
+        const auto *sddl = private_sddl();
+        if (!sddl) {
+          return false;
+        }
         PSECURITY_DESCRIPTOR descriptor {};
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-              private_sddl,
+              sddl,
               SDDL_REVISION_1,
               &descriptor,
               nullptr
@@ -281,7 +285,8 @@ namespace lumen::protocol_v3::runtime {
         DWORD admin_size = static_cast<DWORD>(admin_buffer.size());
         if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, system_buffer.data(), &system_size) ||
             !CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, admin_buffer.data(), &admin_size) ||
-            !EqualSid(owner, system_buffer.data()) || dacl->AceCount != 2) {
+            (!EqualSid(owner, system_buffer.data()) && !EqualSid(owner, admin_buffer.data())) ||
+            dacl->AceCount != 2) {
           return false;
         }
         bool system_allowed {};
@@ -326,7 +331,24 @@ namespace lumen::protocol_v3::runtime {
       }
 
     private:
-      static constexpr wchar_t private_sddl[] = L"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+      static constexpr wchar_t system_private_sddl[] = L"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+      static constexpr wchar_t administrator_private_sddl[] = L"O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+
+      /**
+       * @brief Return the protected ACL policy for the active authorized principal.
+       *
+       * @return SDDL string, or nullptr when the principal is unsupported.
+       */
+      const wchar_t *private_sddl() const noexcept {
+        switch (principal()) {
+          case HostPrincipal::local_system:
+            return system_private_sddl;
+          case HostPrincipal::elevated_administrator:
+            return administrator_private_sddl;
+          default:
+            return nullptr;
+        }
+      }
 
       static std::array<std::uint8_t, 37> entropy() {
         std::array<std::uint8_t, 37> output {};
@@ -336,10 +358,14 @@ namespace lumen::protocol_v3::runtime {
         return output;
       }
 
-      static bool apply_private(const std::filesystem::path &path) {
+      bool apply_private(const std::filesystem::path &path) const {
+        const auto *sddl = private_sddl();
+        if (!sddl) {
+          return false;
+        }
         PSECURITY_DESCRIPTOR descriptor {};
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-              private_sddl,
+              sddl,
               SDDL_REVISION_1,
               &descriptor,
               nullptr
@@ -367,7 +393,7 @@ namespace lumen::protocol_v3::runtime {
                ) == ERROR_SUCCESS;
       }
 
-      static bool prepare_parent(const std::filesystem::path &parent) {
+      bool prepare_parent(const std::filesystem::path &parent) const {
         std::error_code error;
         std::filesystem::create_directories(parent, error);
         return !error && apply_private(parent);
@@ -691,7 +717,10 @@ namespace lumen::protocol_v3::runtime {
     bytes.assign(std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {});
     const auto read = input.good() || input.eof();
     input.close();
-    return read && !bytes.empty() && platform->write_private(path, bytes);
+    if (!read || bytes.empty()) {
+      return false;
+    }
+    return platform->verify_private(path) || platform->write_private(path, bytes);
   }
 
   bool verify_private_key_file(const std::filesystem::path &path) {

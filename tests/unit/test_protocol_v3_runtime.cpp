@@ -971,6 +971,42 @@ TEST(ProtocolV3Identity, UnsupportedPrincipalCreatesNoSecondIdentity) {
   EXPECT_TRUE(files->files.empty());
 }
 
+#ifdef _WIN32
+TEST(ProtocolV3Identity, NativePrivateKeySecuritySupportsAuthorizedWindowsPrincipal) {
+  const auto platform = runtime::make_native_host_identity_platform();
+  ASSERT_NE(platform, nullptr);
+  if (platform->principal() == runtime::HostPrincipal::unsupported) {
+    GTEST_SKIP() << "requires LocalSystem or an elevated administrator";
+  }
+
+  control::SecureRandom random;
+  std::array<std::uint8_t, 16> suffix {};
+  ASSERT_TRUE(random.fill(suffix));
+  const auto directory = std::filesystem::temp_directory_path() / ("lumen-private-key-" + hex(suffix));
+  const auto private_key = directory / "cakey.pem";
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  {
+    std::ofstream output {private_key, std::ios::binary};
+    output << "private-key-test";
+    ASSERT_TRUE(output.good());
+  }
+
+  EXPECT_TRUE(runtime::secure_private_key_file(private_key));
+  EXPECT_TRUE(runtime::verify_private_key_file(private_key));
+
+  std::error_code timestamp_error;
+  const auto preserved_timestamp = std::filesystem::last_write_time(private_key) - std::chrono::hours {1};
+  std::filesystem::last_write_time(private_key, preserved_timestamp, timestamp_error);
+  ASSERT_FALSE(timestamp_error);
+  const auto actual_preserved_timestamp = std::filesystem::last_write_time(private_key);
+  ASSERT_TRUE(runtime::secure_private_key_file(private_key));
+  EXPECT_EQ(std::filesystem::last_write_time(private_key), actual_preserved_timestamp);
+
+  std::error_code ignored;
+  std::filesystem::remove_all(directory, ignored);
+}
+#endif
+
 TEST(ProtocolV3Identity, InsecureExistingBlobIsRejectedWithoutAclWeakening) {
   auto files = std::make_shared<FakeIdentityFiles>();
   const auto paths = fake_identity_paths();
