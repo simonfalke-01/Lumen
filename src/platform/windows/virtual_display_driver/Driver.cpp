@@ -613,6 +613,11 @@ namespace {
         finish(mmcss);
         return;
       }
+      if (FAILED(dxgi_device->SetGPUThreadPriority(7))) {
+        disable_direct_frames(lumen::vdd::frame::submission_result_e::copy_failed);
+        finish(mmcss);
+        return;
+      }
       IDARG_IN_SWAPCHAINSETDEVICE set_device {};
       set_device.pDevice = dxgi_device.Get();
       if (FAILED(IddCxSwapChainSetDevice(swap_chain, &set_device))) {
