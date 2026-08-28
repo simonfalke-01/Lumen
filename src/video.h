@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <limits>
@@ -905,6 +906,35 @@ namespace video {
   inline std::chrono::nanoseconds capture_frame_interval(const config_t &config) {
     const AVRational fps = framerate_to_rational(config);
     return std::chrono::nanoseconds {(static_cast<int64_t>(fps.den) * 1'000'000'000LL) / fps.num};
+  }
+
+  /**
+   * @brief Bounded wait used to establish a new capture pacing group.
+   *
+   * A missed cadence must not fall back to the historical fixed 200 ms wait at
+   * high refresh rates. Static-content duplication runs independently, so the
+   * capture backend only needs one requested frame interval to resynchronize.
+   *
+   * @param numerator Requested frames-per-second numerator.
+   * @param denominator Requested frames-per-second denominator.
+   * @return Whole-millisecond wait clamped to 1..200 ms.
+   */
+  [[nodiscard]] inline std::chrono::milliseconds capture_resynchronization_timeout(
+    const std::uint64_t numerator,
+    const std::uint64_t denominator
+  ) noexcept {
+    if (numerator == 0 || denominator == 0 ||
+        denominator > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) / 1'000'000'000ULL) {
+      return std::chrono::milliseconds {200};
+    }
+    const auto interval = std::chrono::nanoseconds {
+      static_cast<std::int64_t>(denominator * 1'000'000'000ULL / numerator)
+    };
+    return std::clamp(
+      std::chrono::duration_cast<std::chrono::milliseconds>(interval),
+      std::chrono::milliseconds {1},
+      std::chrono::milliseconds {200}
+    );
   }
 
   /** @brief Capture-thread action after a backend requests display reinitialization. */

@@ -795,6 +795,11 @@ TEST_P(CaptureFrameIntervalTest, Run) {
   config.framerate = framerate;
   config.framerateX100 = framerateX100;
   ASSERT_EQ(expected, video::capture_frame_interval(config));
+  const auto fps = video::framerate_to_rational(config);
+  ASSERT_EQ(
+    std::chrono::duration_cast<std::chrono::milliseconds>(expected),
+    video::capture_resynchronization_timeout(fps.num, fps.den)
+  );
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -806,3 +811,10 @@ INSTANTIATE_TEST_SUITE_P(
     std::make_tuple(120, 11988, std::chrono::nanoseconds {8341666})  // 1e9 * 1001 / 120000
   )
 );
+
+TEST(CaptureResynchronizationTimeoutTest, InvalidAndLowRatesRemainSafelyBounded) {
+  EXPECT_EQ(video::capture_resynchronization_timeout(0, 1), 200ms);
+  EXPECT_EQ(video::capture_resynchronization_timeout(1, 0), 200ms);
+  EXPECT_EQ(video::capture_resynchronization_timeout(1, 1), 200ms);
+  EXPECT_EQ(video::capture_resynchronization_timeout(1'000'000, 1), 1ms);
+}

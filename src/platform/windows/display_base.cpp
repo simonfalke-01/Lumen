@@ -321,6 +321,10 @@ namespace platf::dxgi {
     };
 
     DXGI_RATIONAL client_frame_rate_adjusted = adjust_client_frame_rate();
+    const auto capture_resynchronization_timeout = video::capture_resynchronization_timeout(
+      client_frame_rate_adjusted.Numerator,
+      client_frame_rate_adjusted.Denominator
+    );
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
     uint32_t frame_pacing_group_frames = 0;
 
@@ -380,7 +384,15 @@ namespace platf::dxgi {
       // Start new frame pacing group if necessary, snapshot() is called with non-zero timeout
       if (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start)) {
         capture_boundary();
-        status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
+        // A missed pacing group must not turn into an unrelated 200 ms capture
+        // stall. Bound resynchronization to the requested frame interval; the
+        // encoder's duplicate-frame path remains responsible for static content.
+        status = snapshot(
+          pull_free_image_cb,
+          img_out,
+          capture_resynchronization_timeout,
+          *cursor
+        );
 
         if (status == capture_e::ok && img_out) {
           frame_pacing_group_start = img_out->frame_timestamp;
