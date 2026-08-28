@@ -25,6 +25,7 @@
   #endif
   #include <d3d11_4.h>
   #include <dxgi1_6.h>
+  #include <Aclapi.h>
   #include <SetupAPI.h>
   #include <Windows.h>
   #include <wrl/client.h>
@@ -47,6 +48,64 @@ using namespace std::literals;
 namespace platf::virtual_display {
   namespace {
     std::atomic_bool runtime_quarantined {false};  ///< Process-wide sticky direct-frame failure state.
+
+    /** Grant the UMDF Local Service host only the process rights required for ABI handle transfer. */
+    bool grant_umdf_process_access(DWORD &native_status) noexcept {
+      native_status = ERROR_SUCCESS;
+      PACL current_dacl = nullptr;
+      PSECURITY_DESCRIPTOR descriptor = nullptr;
+      native_status = GetSecurityInfo(
+        GetCurrentProcess(),
+        SE_KERNEL_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        &current_dacl,
+        nullptr,
+        &descriptor
+      );
+      if (native_status != ERROR_SUCCESS || current_dacl == nullptr || descriptor == nullptr) {
+        if (descriptor != nullptr) {
+          LocalFree(descriptor);
+        }
+        return false;
+      }
+      const auto free_descriptor = std::unique_ptr<void, decltype(&LocalFree)> {descriptor, LocalFree};
+      std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> local_service_buffer {};
+      DWORD local_service_size = static_cast<DWORD>(local_service_buffer.size());
+      if (!CreateWellKnownSid(
+            WinLocalServiceSid,
+            nullptr,
+            local_service_buffer.data(),
+            &local_service_size
+          )) {
+        native_status = GetLastError();
+        return false;
+      }
+      EXPLICIT_ACCESSW access {};
+      access.grfAccessPermissions = PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+      access.grfAccessMode = GRANT_ACCESS;
+      access.grfInheritance = NO_INHERITANCE;
+      access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+      access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+      access.Trustee.ptstrName = reinterpret_cast<LPWSTR>(local_service_buffer.data());
+      PACL updated_dacl = nullptr;
+      native_status = SetEntriesInAclW(1, &access, current_dacl, &updated_dacl);
+      if (native_status != ERROR_SUCCESS || updated_dacl == nullptr) {
+        return false;
+      }
+      const auto free_dacl = std::unique_ptr<void, decltype(&LocalFree)> {updated_dacl, LocalFree};
+      native_status = SetSecurityInfo(
+        GetCurrentProcess(),
+        SE_KERNEL_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        updated_dacl,
+        nullptr
+      );
+      return native_status == ERROR_SUCCESS;
+    }
 
     /** @brief Pack a Windows LUID without changing its signed high-part bits. */
     std::uint64_t packed_luid(const LUID &luid) noexcept {
@@ -512,6 +571,14 @@ namespace platf::virtual_display {
         return fail(
           direct_frame_init_stage_e::publisher_identity,
           frame_io_e::invalid_data,
+          direct_frame_native_domain_e::win32,
+          native_status
+        );
+      }
+      if (!grant_umdf_process_access(native_status)) {
+        return fail(
+          direct_frame_init_stage_e::publisher_process_open,
+          frame_io_e::transport_error,
           direct_frame_native_domain_e::win32,
           native_status
         );
