@@ -15,7 +15,9 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -51,6 +53,7 @@ namespace platf::dxgi {
 #endif
 
 namespace {
+  using namespace std::literals;
   using namespace platf::virtual_display;
   using vdd_mode_t = platf::virtual_display::mode_t;
 
@@ -903,6 +906,184 @@ TEST(VirtualDisplayDirectFrameValidation, RequiresExactUniqueTwoSlotResources) {
   resources.generation = 9;
   resources.fence_handles[1] = resources.texture_handles[0];
   EXPECT_FALSE(valid_frame_resources(resources, 9, mode_4k120));
+}
+
+TEST(VirtualDisplayDirectFrameInitializationDiagnostics, ExposesStableLabelsAndPodFacts) {
+  static_assert(std::is_trivial_v<direct_frame_init_diagnostic_t>);
+  static_assert(std::is_standard_layout_v<direct_frame_init_diagnostic_t>);
+
+  constexpr std::array stage_labels {
+    std::pair {direct_frame_init_stage_e::precondition, "precondition"sv},
+    std::pair {direct_frame_init_stage_e::device_interface_open, "device_interface_open"sv},
+    std::pair {direct_frame_init_stage_e::abi_query, "abi_query"sv},
+    std::pair {direct_frame_init_stage_e::abi_contract, "abi_contract"sv},
+    std::pair {direct_frame_init_stage_e::cancel_event_create, "cancel_event_create"sv},
+    std::pair {direct_frame_init_stage_e::frame_event_query, "frame_event_query"sv},
+    std::pair {direct_frame_init_stage_e::publisher_identity, "publisher_identity"sv},
+    std::pair {direct_frame_init_stage_e::publisher_process_open, "publisher_process_open"sv},
+    std::pair {direct_frame_init_stage_e::frame_event_duplicate, "frame_event_duplicate"sv},
+    std::pair {direct_frame_init_stage_e::frame_channel_query, "frame_channel_query"sv},
+    std::pair {direct_frame_init_stage_e::frame_channel_wait, "frame_channel_wait"sv},
+    std::pair {direct_frame_init_stage_e::frame_channel_contract, "frame_channel_contract"sv},
+    std::pair {direct_frame_init_stage_e::texture_handle_duplicate, "texture_handle_duplicate"sv},
+    std::pair {direct_frame_init_stage_e::fence_handle_duplicate, "fence_handle_duplicate"sv},
+    std::pair {direct_frame_init_stage_e::initial_color_metadata, "initial_color_metadata"sv},
+    std::pair {direct_frame_init_stage_e::resource_contract, "resource_contract"sv},
+    std::pair {direct_frame_init_stage_e::color_transform, "color_transform"sv},
+    std::pair {direct_frame_init_stage_e::handle_identity, "handle_identity"sv},
+    std::pair {direct_frame_init_stage_e::dxgi_factory, "dxgi_factory"sv},
+    std::pair {direct_frame_init_stage_e::adapter_enumeration, "adapter_enumeration"sv},
+    std::pair {direct_frame_init_stage_e::adapter_identity, "adapter_identity"sv},
+    std::pair {direct_frame_init_stage_e::d3d11_device, "d3d11_device"sv},
+    std::pair {direct_frame_init_stage_e::multithread_context, "multithread_context"sv},
+    std::pair {direct_frame_init_stage_e::texture_import, "texture_import"sv},
+    std::pair {direct_frame_init_stage_e::fence_import, "fence_import"sv},
+    std::pair {direct_frame_init_stage_e::texture_contract, "texture_contract"sv},
+    std::pair {direct_frame_init_stage_e::ready, "ready"sv},
+  };
+  for (const auto &[stage, label] : stage_labels) {
+    EXPECT_EQ(direct_frame_init_stage_label(stage), label);
+  }
+
+  EXPECT_EQ(direct_frame_native_domain_label(direct_frame_native_domain_e::none), "none");
+  EXPECT_EQ(direct_frame_native_domain_label(direct_frame_native_domain_e::win32), "win32");
+  EXPECT_EQ(direct_frame_native_domain_label(direct_frame_native_domain_e::wait), "wait");
+  EXPECT_EQ(direct_frame_native_domain_label(direct_frame_native_domain_e::hresult), "hresult");
+  EXPECT_EQ(direct_frame_native_domain_label(direct_frame_native_domain_e::logical), "logical");
+  EXPECT_EQ(direct_frame_init_result_label(frame_io_e::ok), "ok");
+  EXPECT_EQ(direct_frame_init_result_label(frame_io_e::empty), "empty");
+  EXPECT_EQ(direct_frame_init_result_label(frame_io_e::timeout), "timeout");
+  EXPECT_EQ(direct_frame_init_result_label(frame_io_e::stale_generation), "stale_generation");
+  EXPECT_EQ(direct_frame_init_result_label(frame_io_e::invalid_data), "invalid_data");
+  EXPECT_EQ(direct_frame_init_result_label(frame_io_e::unsupported), "unsupported");
+  EXPECT_EQ(direct_frame_init_result_label(frame_io_e::transport_error), "transport_error");
+  EXPECT_EQ(direct_frame_init_result_label(frame_io_e::stopped), "stopped");
+  EXPECT_EQ(direct_frame_handle_kind_label(direct_frame_handle_kind_e::none), "none");
+  EXPECT_EQ(direct_frame_handle_kind_label(direct_frame_handle_kind_e::availability_event), "availability_event");
+  EXPECT_EQ(direct_frame_handle_kind_label(direct_frame_handle_kind_e::texture), "texture");
+  EXPECT_EQ(direct_frame_handle_kind_label(direct_frame_handle_kind_e::fence), "fence");
+  EXPECT_EQ(direct_frame_state_query_label(direct_frame_state_query_e::not_attempted), "not_attempted");
+  EXPECT_EQ(direct_frame_state_query_label(direct_frame_state_query_e::succeeded), "succeeded");
+  EXPECT_EQ(direct_frame_state_query_label(direct_frame_state_query_e::transport_failure), "transport_failure");
+  EXPECT_EQ(direct_frame_state_query_label(direct_frame_state_query_e::invalid_snapshot), "invalid_snapshot");
+
+  direct_frame_init_diagnostic_t facts {};
+  facts.generation = 9;
+  facts.expected_adapter_luid = 0x100000002ULL;
+  facts.resource_adapter_luid = 0x700000008ULL;
+  facts.publisher_process_id = 42;
+  facts.publisher_process_creation_time = 1001;
+  facts.selection_preference_submitted = true;
+  record_direct_frame_initialization_result(
+    facts,
+    direct_frame_init_stage_e::frame_channel_wait,
+    frame_io_e::timeout,
+    direct_frame_native_domain_e::wait,
+    0x102U,
+    direct_frame_handle_kind_e::fence,
+    1
+  );
+  const auto copied = facts;
+  EXPECT_EQ(copied.stage, direct_frame_init_stage_e::frame_channel_wait);
+  EXPECT_EQ(copied.result, frame_io_e::timeout);
+  EXPECT_EQ(copied.domain, direct_frame_native_domain_e::wait);
+  EXPECT_EQ(copied.native_status, 0x102U);
+  EXPECT_EQ(copied.expected_adapter_luid, 0x100000002ULL);
+  EXPECT_EQ(copied.resource_adapter_luid, 0x700000008ULL);
+  EXPECT_EQ(copied.publisher_process_id, 42U);
+  EXPECT_EQ(copied.publisher_process_creation_time, 1001U);
+  EXPECT_TRUE(copied.selection_preference_submitted);
+  EXPECT_EQ(copied.handle_kind, direct_frame_handle_kind_e::fence);
+  EXPECT_EQ(copied.handle_slot, 1U);
+}
+
+TEST(VirtualDisplayDirectFrameInitializationDiagnostics, ReplacesSnapshotsWithoutChangingTerminalFacts) {
+  direct_frame_init_diagnostic_t diagnostic {};
+  diagnostic.generation = 9;
+  diagnostic.expected_adapter_luid = 0x100000002ULL;
+  diagnostic.resource_adapter_luid = 0x700000008ULL;
+  diagnostic.selection_preference_submitted = true;
+  record_direct_frame_initialization_result(
+    diagnostic,
+    direct_frame_init_stage_e::texture_import,
+    frame_io_e::unsupported,
+    direct_frame_native_domain_e::hresult,
+    0x887a0005U,
+    direct_frame_handle_kind_e::texture,
+    1
+  );
+  EXPECT_EQ(diagnostic.state_query, direct_frame_state_query_e::not_attempted);
+  EXPECT_FALSE(diagnostic.driver_state_available);
+
+  const direct_frame_driver_state_snapshot_t mismatched_adapters {
+    9,
+    10,
+    0x300000004ULL,
+    0x500000006ULL,
+    42,
+    1,
+    0,
+    0,
+  };
+  record_direct_frame_driver_state_query(
+    diagnostic,
+    frame_io_e::ok,
+    direct_frame_native_domain_e::none,
+    0,
+    mismatched_adapters
+  );
+  EXPECT_EQ(diagnostic.state_query, direct_frame_state_query_e::succeeded);
+  EXPECT_TRUE(diagnostic.driver_state_available);
+  EXPECT_EQ(diagnostic.driver_state.preferred_adapter_luid, 0x300000004ULL);
+  EXPECT_EQ(diagnostic.driver_state.assigned_adapter_luid, 0x500000006ULL);
+  EXPECT_EQ(diagnostic.resource_adapter_luid, 0x700000008ULL);
+  EXPECT_TRUE(diagnostic.selection_preference_submitted);
+  EXPECT_EQ(diagnostic.driver_state.preference_submitted, 0U);
+  EXPECT_EQ(diagnostic.stage, direct_frame_init_stage_e::texture_import);
+  EXPECT_EQ(diagnostic.result, frame_io_e::unsupported);
+  EXPECT_EQ(diagnostic.domain, direct_frame_native_domain_e::hresult);
+  EXPECT_EQ(diagnostic.native_status, 0x887a0005U);
+  EXPECT_EQ(diagnostic.handle_kind, direct_frame_handle_kind_e::texture);
+  EXPECT_EQ(diagnostic.handle_slot, 1U);
+
+  record_direct_frame_driver_state_query(
+    diagnostic,
+    frame_io_e::transport_error,
+    direct_frame_native_domain_e::win32,
+    31,
+    mismatched_adapters
+  );
+  EXPECT_EQ(diagnostic.state_query, direct_frame_state_query_e::transport_failure);
+  EXPECT_FALSE(diagnostic.driver_state_available);
+  EXPECT_EQ(diagnostic.driver_state.generation, 0U);
+  EXPECT_EQ(diagnostic.driver_state.preferred_adapter_luid, 0U);
+  EXPECT_EQ(diagnostic.driver_state.assigned_adapter_luid, 0U);
+  EXPECT_TRUE(diagnostic.selection_preference_submitted);
+  EXPECT_EQ(diagnostic.stage, direct_frame_init_stage_e::texture_import);
+  EXPECT_EQ(diagnostic.native_status, 0x887a0005U);
+}
+
+TEST(VirtualDisplayDirectFrameInitializationDiagnostics, RejectsStaleAndContradictorySnapshots) {
+  direct_frame_init_diagnostic_t diagnostic {};
+  diagnostic.generation = 9;
+  const auto record = [&](const direct_frame_driver_state_snapshot_t &snapshot) {
+    record_direct_frame_driver_state_query(
+      diagnostic,
+      frame_io_e::ok,
+      direct_frame_native_domain_e::none,
+      0,
+      snapshot
+    );
+    EXPECT_EQ(diagnostic.state_query, direct_frame_state_query_e::invalid_snapshot);
+    EXPECT_FALSE(diagnostic.driver_state_available);
+    EXPECT_EQ(diagnostic.driver_state.generation, 0U);
+  };
+
+  record({8, 9, 0x11, 0x11, 42, 1, 1, 0});
+  record({9, 8, 0x11, 0x11, 42, 1, 1, 0});
+  record({9, 9, 0, 0x11, 42, 1, 1, 0});
+  record({9, 9, 0x11, 0x11, 42, 2, 1, 0});
+  record({9, 9, 0x11, 0x11, 42, 1, 1, 1});
 }
 
 TEST(VirtualDisplayDirectFrameValidation, ValidatesInitializationTransportPublisherAndImportedTexture) {

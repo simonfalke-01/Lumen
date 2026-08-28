@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <variant>
 
 // local includes
@@ -194,6 +195,250 @@ namespace platf::virtual_display {
     transport_error,  ///< Device IO failed.
     stopped,  ///< Source was closed or quarantined.
   };
+
+  /** @brief Stable initialization stage for one VDD direct-frame diagnostic. */
+  enum class direct_frame_init_stage_e : std::uint8_t {
+    precondition,
+    device_interface_open,
+    abi_query,
+    abi_contract,
+    cancel_event_create,
+    frame_event_query,
+    publisher_identity,
+    publisher_process_open,
+    frame_event_duplicate,
+    frame_channel_query,
+    frame_channel_wait,
+    frame_channel_contract,
+    texture_handle_duplicate,
+    fence_handle_duplicate,
+    initial_color_metadata,
+    resource_contract,
+    color_transform,
+    handle_identity,
+    dxgi_factory,
+    adapter_enumeration,
+    adapter_identity,
+    d3d11_device,
+    multithread_context,
+    texture_import,
+    fence_import,
+    texture_contract,
+    ready,
+  };
+
+  /** @brief Native status namespace retained by one initialization diagnostic. */
+  enum class direct_frame_native_domain_e : std::uint8_t {
+    none,
+    win32,
+    wait,
+    hresult,
+    logical,
+  };
+
+  /** @brief Shared-handle kind involved in an initialization failure. */
+  enum class direct_frame_handle_kind_e : std::uint8_t {
+    none,
+    availability_event,
+    texture,
+    fence,
+  };
+
+  /** @brief Whether the best-effort QUERY_STATE diagnostic produced a usable snapshot. */
+  enum class direct_frame_state_query_e : std::uint8_t {
+    not_attempted,
+    succeeded,
+    transport_failure,
+    invalid_snapshot,
+  };
+
+  [[nodiscard]] constexpr std::string_view direct_frame_state_query_label(
+    const direct_frame_state_query_e query
+  ) noexcept {
+    switch (query) {
+      case direct_frame_state_query_e::not_attempted: return "not_attempted";
+      case direct_frame_state_query_e::succeeded: return "succeeded";
+      case direct_frame_state_query_e::transport_failure: return "transport_failure";
+      case direct_frame_state_query_e::invalid_snapshot: return "invalid_snapshot";
+    }
+    return "not_attempted";
+  }
+
+  inline constexpr std::uint32_t direct_frame_no_handle_slot {0xffffffffU};
+
+  /** @brief Raw QUERY_STATE facts retained only after structural validation succeeds. */
+  struct direct_frame_driver_state_snapshot_t {
+    std::uint64_t generation;  ///< Current driver generation.
+    std::uint64_t last_generation;  ///< Highest generation admitted by the driver.
+    std::uint64_t preferred_adapter_luid;  ///< Adapter requested before monitor arrival.
+    std::uint64_t assigned_adapter_luid;  ///< Adapter assigned by the active swap chain.
+    std::uint32_t owner_process_id;  ///< Process owning the active generation.
+    std::uint32_t monitor_started;  ///< Raw zero/one monitor-present value.
+    std::uint32_t preference_submitted;  ///< Raw zero/one IddCx preference-submission value.
+    std::uint32_t reserved;  ///< Must remain zero.
+  };
+
+  /** @brief Raw, trivially copyable facts for one direct-frame initialization attempt. */
+  struct direct_frame_init_diagnostic_t {
+    direct_frame_init_stage_e stage;  ///< Exact terminal initialization stage.
+    direct_frame_native_domain_e domain;  ///< Namespace for `native_status`.
+    frame_io_e result;  ///< Unchanged stable initialization result.
+    direct_frame_state_query_e state_query;  ///< Explicit QUERY_STATE attempt outcome.
+    direct_frame_native_domain_e state_query_domain;  ///< Namespace for the best-effort snapshot status.
+    frame_io_e state_query_result;  ///< Best-effort QUERY_STATE transport result.
+    direct_frame_handle_kind_e handle_kind;  ///< Handle kind involved in the terminal stage.
+    std::uint32_t native_status;  ///< Exact Win32, WAIT, HRESULT-bit, or logical status.
+    std::uint32_t state_query_native_status;  ///< Exact best-effort QUERY_STATE native status.
+    std::uint32_t adapter_enumeration_status;  ///< First non-NOT_FOUND EnumAdapters1 HRESULT bits.
+    std::uint32_t adapter_description_status;  ///< First failed GetDesc1 HRESULT bits.
+    std::uint32_t handle_slot;  ///< Exact slot, or `direct_frame_no_handle_slot`.
+    std::uint64_t generation;  ///< Host-selected generation.
+    std::uint32_t abi_version;  ///< Driver-reported ABI version.
+    std::uint32_t expected_abi_version;  ///< Host ABI version.
+    std::uint32_t capability_flags;  ///< Driver-reported capability bitmap.
+    std::uint32_t required_capabilities;  ///< Mode-specific host capability bitmap.
+    std::uint64_t expected_adapter_luid;  ///< Frozen encoder-probe adapter LUID.
+    std::uint64_t resource_adapter_luid;  ///< Frame-channel resource adapter LUID.
+    std::uint32_t publisher_process_id;  ///< Driver frame publisher process identifier.
+    std::uint64_t publisher_process_creation_time;  ///< PID-reuse-safe publisher creation time.
+    direct_frame_driver_state_snapshot_t driver_state;  ///< Valid snapshot, or zeroed absent facts.
+    bool driver_state_available;  ///< Whether `driver_state` is present and structurally valid.
+    bool selection_preference_submitted;  ///< Prepared-mode fact, never replaced by QUERY_STATE.
+  };
+
+  [[nodiscard]] constexpr std::string_view direct_frame_init_stage_label(
+    const direct_frame_init_stage_e stage
+  ) noexcept {
+    switch (stage) {
+      case direct_frame_init_stage_e::precondition: return "precondition";
+      case direct_frame_init_stage_e::device_interface_open: return "device_interface_open";
+      case direct_frame_init_stage_e::abi_query: return "abi_query";
+      case direct_frame_init_stage_e::abi_contract: return "abi_contract";
+      case direct_frame_init_stage_e::cancel_event_create: return "cancel_event_create";
+      case direct_frame_init_stage_e::frame_event_query: return "frame_event_query";
+      case direct_frame_init_stage_e::publisher_identity: return "publisher_identity";
+      case direct_frame_init_stage_e::publisher_process_open: return "publisher_process_open";
+      case direct_frame_init_stage_e::frame_event_duplicate: return "frame_event_duplicate";
+      case direct_frame_init_stage_e::frame_channel_query: return "frame_channel_query";
+      case direct_frame_init_stage_e::frame_channel_wait: return "frame_channel_wait";
+      case direct_frame_init_stage_e::frame_channel_contract: return "frame_channel_contract";
+      case direct_frame_init_stage_e::texture_handle_duplicate: return "texture_handle_duplicate";
+      case direct_frame_init_stage_e::fence_handle_duplicate: return "fence_handle_duplicate";
+      case direct_frame_init_stage_e::initial_color_metadata: return "initial_color_metadata";
+      case direct_frame_init_stage_e::resource_contract: return "resource_contract";
+      case direct_frame_init_stage_e::color_transform: return "color_transform";
+      case direct_frame_init_stage_e::handle_identity: return "handle_identity";
+      case direct_frame_init_stage_e::dxgi_factory: return "dxgi_factory";
+      case direct_frame_init_stage_e::adapter_enumeration: return "adapter_enumeration";
+      case direct_frame_init_stage_e::adapter_identity: return "adapter_identity";
+      case direct_frame_init_stage_e::d3d11_device: return "d3d11_device";
+      case direct_frame_init_stage_e::multithread_context: return "multithread_context";
+      case direct_frame_init_stage_e::texture_import: return "texture_import";
+      case direct_frame_init_stage_e::fence_import: return "fence_import";
+      case direct_frame_init_stage_e::texture_contract: return "texture_contract";
+      case direct_frame_init_stage_e::ready: return "ready";
+    }
+    return "precondition";
+  }
+
+  [[nodiscard]] constexpr std::string_view direct_frame_native_domain_label(
+    const direct_frame_native_domain_e domain
+  ) noexcept {
+    switch (domain) {
+      case direct_frame_native_domain_e::none: return "none";
+      case direct_frame_native_domain_e::win32: return "win32";
+      case direct_frame_native_domain_e::wait: return "wait";
+      case direct_frame_native_domain_e::hresult: return "hresult";
+      case direct_frame_native_domain_e::logical: return "logical";
+    }
+    return "none";
+  }
+
+  [[nodiscard]] constexpr std::string_view direct_frame_init_result_label(
+    const frame_io_e result
+  ) noexcept {
+    switch (result) {
+      case frame_io_e::ok: return "ok";
+      case frame_io_e::empty: return "empty";
+      case frame_io_e::timeout: return "timeout";
+      case frame_io_e::stale_generation: return "stale_generation";
+      case frame_io_e::invalid_data: return "invalid_data";
+      case frame_io_e::unsupported: return "unsupported";
+      case frame_io_e::transport_error: return "transport_error";
+      case frame_io_e::stopped: return "stopped";
+    }
+    return "transport_error";
+  }
+
+  [[nodiscard]] constexpr std::string_view direct_frame_handle_kind_label(
+    const direct_frame_handle_kind_e kind
+  ) noexcept {
+    switch (kind) {
+      case direct_frame_handle_kind_e::none: return "none";
+      case direct_frame_handle_kind_e::availability_event: return "availability_event";
+      case direct_frame_handle_kind_e::texture: return "texture";
+      case direct_frame_handle_kind_e::fence: return "fence";
+    }
+    return "none";
+  }
+
+  /** Return whether raw QUERY_STATE facts satisfy the driver-state structural contract. */
+  [[nodiscard]] constexpr bool valid_direct_frame_driver_state_snapshot(
+    const direct_frame_driver_state_snapshot_t &snapshot
+  ) noexcept {
+    return snapshot.monitor_started <= 1 && snapshot.preference_submitted <= 1 &&
+           snapshot.reserved == 0 && snapshot.last_generation >= snapshot.generation &&
+           ((snapshot.generation == 0 && snapshot.owner_process_id == 0 &&
+             snapshot.monitor_started == 0 && snapshot.preferred_adapter_luid == 0 &&
+             snapshot.assigned_adapter_luid == 0 && snapshot.preference_submitted == 0) ||
+            (snapshot.generation != 0 && snapshot.owner_process_id != 0 &&
+             snapshot.preferred_adapter_luid != 0));
+  }
+
+  /** Record one terminal initialization result without changing independent raw facts. */
+  constexpr void record_direct_frame_initialization_result(
+    direct_frame_init_diagnostic_t &diagnostic,
+    const direct_frame_init_stage_e stage,
+    const frame_io_e result,
+    const direct_frame_native_domain_e domain,
+    const std::uint32_t native_status,
+    const direct_frame_handle_kind_e handle_kind = direct_frame_handle_kind_e::none,
+    const std::uint32_t handle_slot = direct_frame_no_handle_slot
+  ) noexcept {
+    diagnostic.stage = stage;
+    diagnostic.result = result;
+    diagnostic.domain = domain;
+    diagnostic.native_status = native_status;
+    diagnostic.handle_kind = handle_kind;
+    diagnostic.handle_slot = handle_slot;
+  }
+
+  /** Replace the previous best-effort state snapshot without affecting initialization decisions. */
+  constexpr void record_direct_frame_driver_state_query(
+    direct_frame_init_diagnostic_t &diagnostic,
+    const frame_io_e result,
+    const direct_frame_native_domain_e domain,
+    const std::uint32_t native_status,
+    const direct_frame_driver_state_snapshot_t &snapshot = {}
+  ) noexcept {
+    diagnostic.driver_state = {};
+    diagnostic.driver_state_available = false;
+    diagnostic.state_query_result = result;
+    diagnostic.state_query_domain = domain;
+    diagnostic.state_query_native_status = native_status;
+    if (result != frame_io_e::ok) {
+      diagnostic.state_query = direct_frame_state_query_e::transport_failure;
+      return;
+    }
+    if (!valid_direct_frame_driver_state_snapshot(snapshot) ||
+        snapshot.generation != diagnostic.generation) {
+      diagnostic.state_query = direct_frame_state_query_e::invalid_snapshot;
+      return;
+    }
+    diagnostic.state_query = direct_frame_state_query_e::succeeded;
+    diagnostic.driver_state = snapshot;
+    diagnostic.driver_state_available = true;
+  }
 
   /** @brief Semantic platform error reported by the direct-frame device transport. */
   enum class frame_transport_error_e {

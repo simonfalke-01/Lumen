@@ -13,8 +13,9 @@
 #include <cstring>
   #include <limits>
   #include <mutex>
-  #include <optional>
-  #include <thread>
+#include <optional>
+#include <sstream>
+#include <thread>
   #include <utility>
   #include <vector>
 
@@ -29,7 +30,6 @@
   #include <wrl/client.h>
 
   // local includes
-  #include "display.h"
   #include "fused_d3d11_policy.h"
   #include "src/logging.h"
   #include "src/utility.h"
@@ -55,12 +55,18 @@ namespace platf::virtual_display {
     }
 
     /** @brief Pack a process creation FILETIME for PID-reuse-safe source validation. */
-    std::uint64_t packed_process_creation_time(HANDLE process) noexcept {
+    std::uint64_t packed_process_creation_time(HANDLE process, DWORD *native_status = nullptr) noexcept {
+      if (native_status != nullptr) {
+        *native_status = ERROR_SUCCESS;
+      }
       FILETIME creation {};
       FILETIME exit {};
       FILETIME kernel {};
       FILETIME user {};
       if (process == nullptr || !GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
+        if (native_status != nullptr) {
+          *native_status = process == nullptr ? ERROR_INVALID_HANDLE : GetLastError();
+        }
         return 0;
       }
       return static_cast<std::uint64_t>(creation.dwHighDateTime) << 32U | creation.dwLowDateTime;
@@ -212,7 +218,8 @@ namespace platf::virtual_display {
     }
 
     /** @brief Open exactly one secured Lumen VDD device interface. */
-    HANDLE open_device_interface() {
+    HANDLE open_device_interface(DWORD &native_status) {
+      native_status = ERROR_SUCCESS;
       HDEVINFO devices = SetupDiGetClassDevsW(
         &GUID_DEVINTERFACE_LUMEN_VIRTUAL_DISPLAY,
         nullptr,
@@ -220,6 +227,7 @@ namespace platf::virtual_display {
         DIGCF_DEVICEINTERFACE | DIGCF_PRESENT
       );
       if (devices == INVALID_HANDLE_VALUE) {
+        native_status = GetLastError();
         return INVALID_HANDLE_VALUE;
       }
       auto destroy_devices = util::fail_guard([&]() {
@@ -234,24 +242,27 @@ namespace platf::virtual_display {
             0,
             &interface_data
           )) {
+        native_status = GetLastError();
         return INVALID_HANDLE_VALUE;
       }
       SP_DEVICE_INTERFACE_DATA duplicate {sizeof(duplicate)};
-      if (SetupDiEnumDeviceInterfaces(
-            devices,
-            nullptr,
-            &GUID_DEVINTERFACE_LUMEN_VIRTUAL_DISPLAY,
-            1,
-            &duplicate
-          ) ||
-          GetLastError() != ERROR_NO_MORE_ITEMS) {
-        SetLastError(ERROR_DUP_NAME);
+      const auto duplicate_found = SetupDiEnumDeviceInterfaces(
+        devices,
+        nullptr,
+        &GUID_DEVINTERFACE_LUMEN_VIRTUAL_DISPLAY,
+        1,
+        &duplicate
+      );
+      const auto duplicate_status = duplicate_found ? ERROR_SUCCESS : GetLastError();
+      if (duplicate_found || duplicate_status != ERROR_NO_MORE_ITEMS) {
+        native_status = duplicate_found ? ERROR_DUP_NAME : duplicate_status;
         return INVALID_HANDLE_VALUE;
       }
 
       DWORD required = 0;
       SetupDiGetDeviceInterfaceDetailW(devices, &interface_data, nullptr, 0, &required, nullptr);
       if (required < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) {
+        native_status = GetLastError();
         return INVALID_HANDLE_VALUE;
       }
       std::vector<std::byte> storage(required);
@@ -265,9 +276,10 @@ namespace platf::virtual_display {
             nullptr,
             nullptr
           )) {
+        native_status = GetLastError();
         return INVALID_HANDLE_VALUE;
       }
-      return CreateFileW(
+      const auto handle = CreateFileW(
         detail->DevicePath,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -276,6 +288,45 @@ namespace platf::virtual_display {
         FILE_ATTRIBUTE_NORMAL,
         nullptr
       );
+      if (handle == INVALID_HANDLE_VALUE) {
+        native_status = GetLastError();
+      }
+      return handle;
+    }
+
+    /** @brief Render one complete stable direct-frame initialization diagnostic. */
+    std::string direct_frame_init_diagnostic_text(const direct_frame_init_diagnostic_t &diagnostic) {
+      std::ostringstream output;
+      output << "stage=" << direct_frame_init_stage_label(diagnostic.stage)
+             << ", domain=" << direct_frame_native_domain_label(diagnostic.domain)
+             << ", result=" << direct_frame_init_result_label(diagnostic.result)
+             << ", native_status=" << diagnostic.native_status
+             << ", generation=" << diagnostic.generation
+             << ", abi=" << diagnostic.abi_version
+             << ", expected_abi=" << diagnostic.expected_abi_version
+             << ", capabilities=" << diagnostic.capability_flags
+             << ", required_capabilities=" << diagnostic.required_capabilities
+             << ", expected_adapter_luid=" << diagnostic.expected_adapter_luid
+             << ", selection_preference_submitted=" << diagnostic.selection_preference_submitted
+             << ", resource_adapter_luid=" << diagnostic.resource_adapter_luid
+             << ", publisher_process_id=" << diagnostic.publisher_process_id
+             << ", publisher_process_creation_time=" << diagnostic.publisher_process_creation_time
+             << ", handle_kind=" << direct_frame_handle_kind_label(diagnostic.handle_kind)
+             << ", handle_slot=" << diagnostic.handle_slot
+             << ", adapter_enumeration_status=" << diagnostic.adapter_enumeration_status
+             << ", adapter_description_status=" << diagnostic.adapter_description_status
+             << ", state_query=" << direct_frame_state_query_label(diagnostic.state_query)
+             << ", state_query_domain=" << direct_frame_native_domain_label(diagnostic.state_query_domain)
+             << ", state_query_result=" << direct_frame_init_result_label(diagnostic.state_query_result)
+             << ", state_query_native_status=" << diagnostic.state_query_native_status
+             << ", driver_state_available=" << diagnostic.driver_state_available
+             << ", driver_generation=" << diagnostic.driver_state.generation
+             << ", driver_last_generation=" << diagnostic.driver_state.last_generation
+             << ", preferred_adapter_luid=" << diagnostic.driver_state.preferred_adapter_luid
+             << ", assigned_adapter_luid=" << diagnostic.driver_state.assigned_adapter_luid
+             << ", observed_preference_submitted=" << diagnostic.driver_state.preference_submitted
+             << ", monitor_started=" << diagnostic.driver_state.monitor_started;
+      return output.str();
     }
   }  // namespace
 
@@ -312,7 +363,8 @@ namespace platf::virtual_display {
   public:
     explicit impl_t(const stream_selection_t &selection):
         generation {selection.generation},
-        mode {selection.selected_mode} {
+        mode {selection.selected_mode},
+        selection_preference_submitted {selection.render_adapter_preference_submitted} {
       if (selection.render_adapter) {
         frozen_probe_identity = direct_frame_adapter_identity_t {
           selection.render_adapter->adapter_luid,
@@ -335,43 +387,124 @@ namespace platf::virtual_display {
       }
     }
 
-    frame_io_e initialize(const std::chrono::milliseconds timeout) {
+    frame_io_e initialize(
+      const std::chrono::milliseconds timeout,
+      direct_frame_init_diagnostic_t &diagnostic
+    ) {
+      diagnostic = {};
+      record_direct_frame_initialization_result(
+        diagnostic,
+        direct_frame_init_stage_e::precondition,
+        frame_io_e::unsupported,
+        direct_frame_native_domain_e::logical,
+        0
+      );
+      diagnostic.state_query = direct_frame_state_query_e::not_attempted;
+      diagnostic.state_query_result = frame_io_e::stopped;
+      diagnostic.handle_slot = direct_frame_no_handle_slot;
+      diagnostic.generation = generation;
+      diagnostic.expected_abi_version = LUMEN_VDD_ABI_VERSION;
+      diagnostic.expected_adapter_luid = frozen_probe_identity ? frozen_probe_identity->adapter_luid : 0;
+      diagnostic.selection_preference_submitted = selection_preference_submitted;
+      bool state_snapshot_permitted = false;
+      const auto fail = [&](const direct_frame_init_stage_e stage,
+                            const frame_io_e result,
+                            const direct_frame_native_domain_e domain,
+                            const std::uint32_t native_status = 0,
+                            const direct_frame_handle_kind_e handle_kind = direct_frame_handle_kind_e::none,
+                            const std::uint32_t handle_slot = direct_frame_no_handle_slot) {
+        record_direct_frame_initialization_result(
+          diagnostic,
+          stage,
+          result,
+          domain,
+          native_status,
+          handle_kind,
+          handle_slot
+        );
+        if (state_snapshot_permitted) {
+          snapshot_driver_state(diagnostic);
+        }
+        stop();
+        return result;
+      };
+
+      diagnostic.required_capabilities = LUMEN_VDD_CAP_DIRECT_FRAME_V1 |
+                                         LUMEN_VDD_CAP_FRAME_METADATA_V2 |
+                                         LUMEN_VDD_CAP_COLOR_TRANSFORM_V1 |
+                                         (mode.dynamic_range == dynamic_range_e::hdr10 ?
+                                            LUMEN_VDD_CAP_HDR10 |
+                                              LUMEN_VDD_CAP_10BIT |
+                                              LUMEN_VDD_CAP_DIRECT_FRAME_FP16 :
+                                            LUMEN_VDD_CAP_SDR8);
       const bool nvenc_active = ::video::active_encoder_is_nvenc();
       if (runtime_quarantined.load(std::memory_order_acquire) || !nvenc_active) {
-        return frame_io_e::unsupported;
+        return fail(
+          direct_frame_init_stage_e::precondition,
+          frame_io_e::unsupported,
+          direct_frame_native_domain_e::logical
+        );
       }
 
-      device_handle = open_device_interface();
+      DWORD native_status = ERROR_SUCCESS;
+      device_handle = open_device_interface(native_status);
       if (device_handle == INVALID_HANDLE_VALUE) {
-        return frame_error(GetLastError());
+        const auto result = frame_error(native_status);
+        return fail(
+          direct_frame_init_stage_e::device_interface_open,
+          result,
+          direct_frame_native_domain_e::win32,
+          native_status
+        );
       }
 
       LUMEN_VDD_QUERY_ABI_RESPONSE abi {};
-      const auto abi_status = ioctl(IOCTL_LUMEN_VDD_QUERY_ABI, nullptr, 0, &abi, sizeof(abi));
-      const std::uint32_t required_capabilities = LUMEN_VDD_CAP_DIRECT_FRAME_V1 |
-                                                  LUMEN_VDD_CAP_FRAME_METADATA_V2 |
-                                                  LUMEN_VDD_CAP_COLOR_TRANSFORM_V1 |
-                                                  (mode.dynamic_range == dynamic_range_e::hdr10 ?
-                                                     LUMEN_VDD_CAP_HDR10 |
-                                                       LUMEN_VDD_CAP_10BIT |
-                                                       LUMEN_VDD_CAP_DIRECT_FRAME_FP16 :
-                                                     LUMEN_VDD_CAP_SDR8);
+      const auto abi_status = ioctl(
+        IOCTL_LUMEN_VDD_QUERY_ABI,
+        nullptr,
+        0,
+        &abi,
+        sizeof(abi),
+        &native_status
+      );
+      diagnostic.abi_version = abi.abi_version;
+      diagnostic.capability_flags = abi.capability_flags;
+      if (abi_status != frame_io_e::ok) {
+        return fail(
+          direct_frame_init_stage_e::abi_query,
+          abi_status,
+          native_status == ERROR_SUCCESS ?
+            direct_frame_native_domain_e::logical :
+            direct_frame_native_domain_e::win32,
+          native_status
+        );
+      }
       const auto abi_contract = validate_frame_abi_contract(
         abi_status,
         abi.abi_version,
         LUMEN_VDD_ABI_VERSION,
         abi.capability_flags,
-        required_capabilities
+        diagnostic.required_capabilities
       );
       if (abi_contract != frame_io_e::ok) {
-        stop();
-        return abi_contract;
+        return fail(
+          direct_frame_init_stage_e::abi_contract,
+          abi_contract,
+          direct_frame_native_domain_e::logical
+        );
       }
+      state_snapshot_permitted = true;
+      snapshot_driver_state(diagnostic);
 
       cancel_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
       if (cancel_event == nullptr) {
-        stop();
-        return frame_io_e::transport_error;
+        native_status = GetLastError();
+        return fail(
+          direct_frame_init_stage_e::cancel_event_create,
+          frame_io_e::transport_error,
+          direct_frame_native_domain_e::win32,
+          native_status
+        );
       }
       const LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST event_request {
         generation,
@@ -384,7 +517,8 @@ namespace platf::virtual_display {
         &event_request,
         sizeof(event_request),
         &event_response,
-        sizeof(event_response)
+        sizeof(event_response),
+        &native_status
       );
       const frame_channel_source_identity_t event_source {
         event_response.generation,
@@ -393,16 +527,62 @@ namespace platf::virtual_display {
         event_response.source_process_creation_time,
         event_response.reserved,
       };
-      if (event_status != frame_io_e::ok ||
-          !valid_frame_channel_source_identity(event_source, generation) ||
-          event_response.event_handle == 0 ||
-          !bind_source_process(
+      diagnostic.publisher_process_id = event_source.process_id;
+      diagnostic.publisher_process_creation_time = event_source.process_creation_time;
+      if (event_status != frame_io_e::ok) {
+        return fail(
+          direct_frame_init_stage_e::frame_event_query,
+          event_status,
+          native_status == ERROR_SUCCESS ?
+            direct_frame_native_domain_e::logical :
+            direct_frame_native_domain_e::win32,
+          native_status
+        );
+      }
+      if (!valid_frame_channel_source_identity(event_source, generation)) {
+        return fail(
+          direct_frame_init_stage_e::publisher_identity,
+          frame_io_e::invalid_data,
+          direct_frame_native_domain_e::logical
+        );
+      }
+      if (event_response.event_handle == 0) {
+        return fail(
+          direct_frame_init_stage_e::frame_event_duplicate,
+          frame_io_e::invalid_data,
+          direct_frame_native_domain_e::logical,
+          0,
+          direct_frame_handle_kind_e::availability_event
+        );
+      }
+      direct_frame_native_domain_e publisher_domain = direct_frame_native_domain_e::logical;
+      if (!bind_source_process(
             event_response.source_process_id,
-            event_response.source_process_creation_time
-          ) ||
-          !duplicate_source_handle(event_response.event_handle, availability_event)) {
-        stop();
-        return event_status == frame_io_e::ok ? frame_io_e::invalid_data : event_status;
+            event_response.source_process_creation_time,
+            publisher_domain,
+            native_status
+          )) {
+        return fail(
+          direct_frame_init_stage_e::publisher_process_open,
+          frame_io_e::invalid_data,
+          publisher_domain,
+          native_status
+        );
+      }
+      direct_frame_native_domain_e duplicate_domain = direct_frame_native_domain_e::logical;
+      if (!duplicate_source_handle(
+            event_response.event_handle,
+            availability_event,
+            duplicate_domain,
+            native_status
+          )) {
+        return fail(
+          direct_frame_init_stage_e::frame_event_duplicate,
+          frame_io_e::invalid_data,
+          duplicate_domain,
+          native_status,
+          direct_frame_handle_kind_e::availability_event
+        );
       }
 
       const auto deadline = std::chrono::steady_clock::now() + std::max(timeout, 0ms);
@@ -418,17 +598,25 @@ namespace platf::virtual_display {
           &request,
           sizeof(request),
           &response,
-          sizeof(response)
+          sizeof(response),
+          &native_status
         );
         if (status == frame_io_e::ok) {
           break;
         }
         if (status != frame_io_e::empty) {
-          stop();
-          return status;
+          return fail(
+            direct_frame_init_stage_e::frame_channel_query,
+            status,
+            native_status == ERROR_SUCCESS ?
+              direct_frame_native_domain_e::logical :
+              direct_frame_native_domain_e::win32,
+            native_status
+          );
         }
-        const auto wait_status = wait_for_availability(deadline);
+        const auto wait_status = wait_for_availability(deadline, &diagnostic);
         if (wait_status != frame_io_e::ok) {
+          snapshot_driver_state(diagnostic);
           stop();
           return wait_status;
         }
@@ -447,12 +635,21 @@ namespace platf::virtual_display {
           (response.texture_format != LUMEN_VDD_FRAME_FORMAT_BGRA8 &&
            response.texture_format != LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT) ||
           response.color_transform_version == 0) {
-        stop();
-        return frame_io_e::invalid_data;
+        return fail(
+          direct_frame_init_stage_e::frame_channel_contract,
+          frame_io_e::invalid_data,
+          direct_frame_native_domain_e::logical
+        );
       }
-      if (!duplicate_response_handles(response)) {
-        stop();
-        return frame_io_e::transport_error;
+      if (!duplicate_response_handles(response, diagnostic)) {
+        return fail(
+          diagnostic.stage,
+          frame_io_e::transport_error,
+          diagnostic.domain,
+          diagnostic.native_status,
+          diagnostic.handle_kind,
+          diagnostic.handle_slot
+        );
       }
       const auto format = response.texture_format == LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT ?
                             frame_format_e::rgba16_float :
@@ -468,8 +665,11 @@ namespace platf::virtual_display {
       );
       if (!initial_color_metadata) {
         close_response_handles(response);
-        stop();
-        return frame_io_e::invalid_data;
+        return fail(
+          direct_frame_init_stage_e::initial_color_metadata,
+          frame_io_e::invalid_data,
+          direct_frame_native_domain_e::logical
+        );
       }
       resources = {
         response.generation,
@@ -490,15 +690,23 @@ namespace platf::virtual_display {
         response.color_transform_version,
         *initial_color_metadata,
       };
+      diagnostic.resource_adapter_luid = resources.adapter_luid;
       if (!valid_frame_resources(resources, generation, mode)) {
         close_response_handles(response);
-        stop();
-        return frame_io_e::invalid_data;
+        return fail(
+          direct_frame_init_stage_e::resource_contract,
+          frame_io_e::invalid_data,
+          direct_frame_native_domain_e::logical
+        );
       }
-      if (!resolve_color_transform(response.color_transform_version)) {
+      if (!resolve_color_transform(response.color_transform_version, &diagnostic)) {
         close_response_handles(response);
-        stop();
-        return frame_io_e::invalid_data;
+        return fail(
+          direct_frame_init_stage_e::color_transform,
+          frame_io_e::invalid_data,
+          diagnostic.domain,
+          diagnostic.native_status
+        );
       }
       const auto texture_identity = compare_direct_frame_handle_identity(
         resources.texture_handles[0],
@@ -512,8 +720,16 @@ namespace platf::virtual_display {
           fence_identity == direct_frame_handle_identity_e::alias) {
         runtime_quarantined.store(true, std::memory_order_release);
         close_response_handles(response);
-        stop();
-        return frame_io_e::invalid_data;
+        return fail(
+          direct_frame_init_stage_e::handle_identity,
+          frame_io_e::invalid_data,
+          direct_frame_native_domain_e::logical,
+          0,
+          texture_identity == direct_frame_handle_identity_e::alias ?
+            direct_frame_handle_kind_e::texture :
+            direct_frame_handle_kind_e::fence,
+          1
+        );
       }
       if (texture_identity == direct_frame_handle_identity_e::unavailable_or_error ||
           fence_identity == direct_frame_handle_identity_e::unavailable_or_error) {
@@ -523,23 +739,52 @@ namespace platf::virtual_display {
       }
 
       ComPtr<IDXGIFactory1> factory;
-      if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+      auto hresult = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+      if (FAILED(hresult)) {
         close_response_handles(response);
-        stop();
-        return frame_io_e::unsupported;
+        return fail(
+          direct_frame_init_stage_e::dxgi_factory,
+          frame_io_e::unsupported,
+          direct_frame_native_domain_e::hresult,
+          static_cast<std::uint32_t>(hresult)
+        );
       }
+      HRESULT adapter_description_failure = S_OK;
+      bool described_adapter = false;
       for (UINT index = 0;; ++index) {
         ComPtr<IDXGIAdapter1> candidate;
-        if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) {
+        hresult = factory->EnumAdapters1(index, &candidate);
+        if (hresult == DXGI_ERROR_NOT_FOUND) {
           break;
         }
+        if (FAILED(hresult)) {
+          diagnostic.adapter_enumeration_status = static_cast<std::uint32_t>(hresult);
+          close_response_handles(response);
+          return fail(
+            direct_frame_init_stage_e::adapter_enumeration,
+            frame_io_e::unsupported,
+            direct_frame_native_domain_e::hresult,
+            static_cast<std::uint32_t>(hresult)
+          );
+        }
         DXGI_ADAPTER_DESC1 description {};
-        if (SUCCEEDED(candidate->GetDesc1(&description)) &&
-            packed_luid(description.AdapterLuid) == resources.adapter_luid) {
+        const auto description_status = candidate->GetDesc1(&description);
+        if (FAILED(description_status)) {
+          if (SUCCEEDED(adapter_description_failure)) {
+            adapter_description_failure = description_status;
+            diagnostic.adapter_description_status = static_cast<std::uint32_t>(description_status);
+          }
+          continue;
+        }
+        described_adapter = true;
+        if (packed_luid(description.AdapterLuid) == resources.adapter_luid) {
           if (adapter) {
             close_response_handles(response);
-            stop();
-            return frame_io_e::invalid_data;
+            return fail(
+              direct_frame_init_stage_e::adapter_enumeration,
+              frame_io_e::invalid_data,
+              direct_frame_native_domain_e::logical
+            );
           }
           adapter = std::move(candidate);
         }
@@ -547,11 +792,39 @@ namespace platf::virtual_display {
 
       DXGI_ADAPTER_DESC1 description {};
       LARGE_INTEGER driver_version {};
-      if (!adapter || FAILED(adapter->GetDesc1(&description)) ||
-          FAILED(adapter->CheckInterfaceSupport(IID_IDXGIDevice, &driver_version))) {
+      if (!adapter) {
         close_response_handles(response);
-        stop();
-        return frame_io_e::unsupported;
+        return fail(
+          direct_frame_init_stage_e::adapter_enumeration,
+          frame_io_e::unsupported,
+          !described_adapter && FAILED(adapter_description_failure) ?
+            direct_frame_native_domain_e::hresult :
+            direct_frame_native_domain_e::logical,
+          !described_adapter && FAILED(adapter_description_failure) ?
+            static_cast<std::uint32_t>(adapter_description_failure) :
+            0
+        );
+      }
+      hresult = adapter->GetDesc1(&description);
+      if (FAILED(hresult)) {
+        diagnostic.adapter_description_status = static_cast<std::uint32_t>(hresult);
+        close_response_handles(response);
+        return fail(
+          direct_frame_init_stage_e::adapter_identity,
+          frame_io_e::unsupported,
+          direct_frame_native_domain_e::hresult,
+          static_cast<std::uint32_t>(hresult)
+        );
+      }
+      hresult = adapter->CheckInterfaceSupport(IID_IDXGIDevice, &driver_version);
+      if (FAILED(hresult)) {
+        close_response_handles(response);
+        return fail(
+          direct_frame_init_stage_e::adapter_identity,
+          frame_io_e::unsupported,
+          direct_frame_native_domain_e::hresult,
+          static_cast<std::uint32_t>(hresult)
+        );
       }
       const direct_frame_adapter_identity_t imported_identity {
         packed_luid(description.AdapterLuid),
@@ -564,35 +837,62 @@ namespace platf::virtual_display {
       if (resources.adapter_luid != imported_identity.adapter_luid ||
           !valid_direct_frame_adapter_binding(nvenc_active, imported_identity, frozen_probe_identity)) {
         close_response_handles(response);
-        stop();
-        return frame_io_e::unsupported;
+        return fail(
+          direct_frame_init_stage_e::adapter_identity,
+          frame_io_e::unsupported,
+          direct_frame_native_domain_e::logical
+        );
       }
 
       const D3D_FEATURE_LEVEL levels[] {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
       D3D_FEATURE_LEVEL selected {};
-      if (FAILED(D3D11CreateDevice(
-            adapter.Get(),
-            D3D_DRIVER_TYPE_UNKNOWN,
-            nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            levels,
-            ARRAYSIZE(levels),
-            D3D11_SDK_VERSION,
-            &device,
-            &selected,
-            &context
-          )) ||
-          FAILED(device.As(&device1)) || FAILED(device.As(&device5)) ||
-          FAILED(context.As(&context4))) {
+      hresult = D3D11CreateDevice(
+        adapter.Get(),
+        D3D_DRIVER_TYPE_UNKNOWN,
+        nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        levels,
+        ARRAYSIZE(levels),
+        D3D11_SDK_VERSION,
+        &device,
+        &selected,
+        &context
+      );
+      if (FAILED(hresult)) {
         close_response_handles(response);
-        stop();
-        return frame_io_e::unsupported;
+        return fail(
+          direct_frame_init_stage_e::d3d11_device,
+          frame_io_e::unsupported,
+          direct_frame_native_domain_e::hresult,
+          static_cast<std::uint32_t>(hresult)
+        );
+      }
+      hresult = device.As(&device1);
+      if (SUCCEEDED(hresult)) {
+        hresult = device.As(&device5);
+      }
+      if (SUCCEEDED(hresult)) {
+        hresult = context.As(&context4);
+      }
+      if (FAILED(hresult)) {
+        close_response_handles(response);
+        return fail(
+          direct_frame_init_stage_e::d3d11_device,
+          frame_io_e::unsupported,
+          direct_frame_native_domain_e::hresult,
+          static_cast<std::uint32_t>(hresult)
+        );
       }
       ComPtr<ID3D11Multithread> multithread;
-      if (FAILED(context.As(&multithread))) {
+      hresult = context.As(&multithread);
+      if (FAILED(hresult)) {
         close_response_handles(response);
-        stop();
-        return frame_io_e::unsupported;
+        return fail(
+          direct_frame_init_stage_e::multithread_context,
+          frame_io_e::unsupported,
+          direct_frame_native_domain_e::hresult,
+          static_cast<std::uint32_t>(hresult)
+        );
       }
       multithread->SetMultithreadProtected(TRUE);
 
@@ -600,17 +900,36 @@ namespace platf::virtual_display {
         close_response_handles(response);
       });
       for (std::size_t slot = 0; slot < direct_frame_slot_count; ++slot) {
-        if (FAILED(device1->OpenSharedResource1(
-              reinterpret_cast<HANDLE>(resources.texture_handles[slot]),
-              IID_PPV_ARGS(&textures[slot])
-            )) ||
-            FAILED(textures[slot].As(&keyed_mutexes[slot])) ||
-            FAILED(device5->OpenSharedFence(
-              reinterpret_cast<HANDLE>(resources.fence_handles[slot]),
-              IID_PPV_ARGS(&fences[slot])
-            ))) {
-          stop();
-          return frame_io_e::unsupported;
+        hresult = device1->OpenSharedResource1(
+          reinterpret_cast<HANDLE>(resources.texture_handles[slot]),
+          IID_PPV_ARGS(&textures[slot])
+        );
+        if (SUCCEEDED(hresult)) {
+          hresult = textures[slot].As(&keyed_mutexes[slot]);
+        }
+        if (FAILED(hresult)) {
+          return fail(
+            direct_frame_init_stage_e::texture_import,
+            frame_io_e::unsupported,
+            direct_frame_native_domain_e::hresult,
+            static_cast<std::uint32_t>(hresult),
+            direct_frame_handle_kind_e::texture,
+            static_cast<std::uint32_t>(slot)
+          );
+        }
+        hresult = device5->OpenSharedFence(
+          reinterpret_cast<HANDLE>(resources.fence_handles[slot]),
+          IID_PPV_ARGS(&fences[slot])
+        );
+        if (FAILED(hresult)) {
+          return fail(
+            direct_frame_init_stage_e::fence_import,
+            frame_io_e::unsupported,
+            direct_frame_native_domain_e::hresult,
+            static_cast<std::uint32_t>(hresult),
+            direct_frame_handle_kind_e::fence,
+            static_cast<std::uint32_t>(slot)
+          );
         }
         D3D11_TEXTURE2D_DESC texture_desc {};
         textures[slot]->GetDesc(&texture_desc);
@@ -634,11 +953,25 @@ namespace platf::virtual_display {
                                                DXGI_FORMAT_B8G8R8A8_UNORM;
         if (texture_desc.Format != expected_texture_format ||
             !valid_frame_texture_descriptor(descriptor, resources)) {
-          stop();
-          return frame_io_e::invalid_data;
+          return fail(
+            direct_frame_init_stage_e::texture_contract,
+            frame_io_e::invalid_data,
+            direct_frame_native_domain_e::logical,
+            0,
+            direct_frame_handle_kind_e::texture,
+            static_cast<std::uint32_t>(slot)
+          );
         }
       }
       healthy = true;
+      snapshot_driver_state(diagnostic);
+      record_direct_frame_initialization_result(
+        diagnostic,
+        direct_frame_init_stage_e::ready,
+        frame_io_e::ok,
+        direct_frame_native_domain_e::none,
+        0
+      );
       return frame_io_e::ok;
     }
 
@@ -786,40 +1119,83 @@ namespace platf::virtual_display {
       fail_locked(false);
     }
 
-    std::shared_ptr<const color_transform_t> resolve_color_transform(const std::uint64_t version) {
+    std::shared_ptr<const color_transform_t> resolve_color_transform(
+      const std::uint64_t version,
+      direct_frame_init_diagnostic_t *diagnostic = nullptr
+    ) {
       if (auto cached = color_transforms.find(generation, version)) {
         return cached;
       }
       try {
         const LUMEN_VDD_QUERY_COLOR_TRANSFORM_REQUEST request {generation, version};
         auto response = std::make_unique<LUMEN_VDD_QUERY_COLOR_TRANSFORM_RESPONSE>();
-        if (ioctl(
-              IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM,
-              &request,
-              sizeof(request),
-              response.get(),
-              sizeof(*response)
-            ) != frame_io_e::ok ||
-            response->generation != generation || response->transform_version != version) {
+        DWORD native_status = ERROR_SUCCESS;
+        const auto status = ioctl(
+          IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM,
+          &request,
+          sizeof(request),
+          response.get(),
+          sizeof(*response),
+          &native_status
+        );
+        if (status != frame_io_e::ok) {
+          if (diagnostic != nullptr) {
+            diagnostic->domain = native_status == ERROR_SUCCESS ?
+                                   direct_frame_native_domain_e::logical :
+                                   direct_frame_native_domain_e::win32;
+            diagnostic->native_status = native_status;
+          }
+          return {};
+        }
+        if (response->generation != generation || response->transform_version != version) {
+          if (diagnostic != nullptr) {
+            diagnostic->domain = direct_frame_native_domain_e::logical;
+            diagnostic->native_status = 0;
+          }
           return {};
         }
         auto parsed = color_transform(*response);
         if (!parsed || !color_transforms.commit(parsed)) {
+          if (diagnostic != nullptr) {
+            diagnostic->domain = direct_frame_native_domain_e::logical;
+            diagnostic->native_status = 0;
+          }
           return {};
         }
         return parsed;
       } catch (...) {
+        if (diagnostic != nullptr) {
+          diagnostic->domain = direct_frame_native_domain_e::logical;
+          diagnostic->native_status = 0;
+        }
         return {};
       }
     }
 
-    frame_io_e wait_for_availability(const std::chrono::steady_clock::time_point deadline) const noexcept {
+    frame_io_e wait_for_availability(
+      const std::chrono::steady_clock::time_point deadline,
+      direct_frame_init_diagnostic_t *diagnostic = nullptr
+    ) const noexcept {
+      const auto record = [&](const frame_io_e result,
+                              const direct_frame_native_domain_e domain,
+                              const std::uint32_t native_status) {
+        if (diagnostic != nullptr) {
+          record_direct_frame_initialization_result(
+            *diagnostic,
+            direct_frame_init_stage_e::frame_channel_wait,
+            result,
+            domain,
+            native_status
+          );
+        }
+        return result;
+      };
       if (availability_event == nullptr || cancel_event == nullptr) {
-        return frame_io_e::stopped;
+        return record(frame_io_e::stopped, direct_frame_native_domain_e::logical, 0);
       }
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline) {
-        return frame_io_e::timeout;
+        return record(frame_io_e::timeout, direct_frame_native_domain_e::wait, WAIT_TIMEOUT);
       }
       const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
       const auto timeout_ms = static_cast<DWORD>(std::clamp<std::int64_t>(
@@ -833,9 +1209,19 @@ namespace platf::virtual_display {
         return frame_io_e::ok;
       }
       if (result == WAIT_OBJECT_0 + 1) {
-        return frame_io_e::stopped;
+        return record(frame_io_e::stopped, direct_frame_native_domain_e::wait, result);
       }
-      return result == WAIT_TIMEOUT ? frame_io_e::timeout : frame_io_e::transport_error;
+      if (result == WAIT_TIMEOUT) {
+        return record(frame_io_e::timeout, direct_frame_native_domain_e::wait, result);
+      }
+      if (result == WAIT_FAILED) {
+        return record(
+          frame_io_e::transport_error,
+          direct_frame_native_domain_e::win32,
+          GetLastError()
+        );
+      }
+      return record(frame_io_e::transport_error, direct_frame_native_domain_e::wait, result);
     }
 
     frame_io_e ioctl(
@@ -843,9 +1229,16 @@ namespace platf::virtual_display {
       const void *input,
       const DWORD input_size,
       void *output,
-      const DWORD output_size
+      const DWORD output_size,
+      DWORD *native_status = nullptr
     ) const noexcept {
+      if (native_status != nullptr) {
+        *native_status = ERROR_SUCCESS;
+      }
       if (device_handle == INVALID_HANDLE_VALUE) {
+        if (native_status != nullptr) {
+          *native_status = ERROR_INVALID_HANDLE;
+        }
         return frame_io_e::stopped;
       }
       DWORD transferred = 0;
@@ -859,45 +1252,153 @@ namespace platf::virtual_display {
             &transferred,
             nullptr
           )) {
-        return frame_error(GetLastError());
+        const auto error = GetLastError();
+        if (native_status != nullptr) {
+          *native_status = error;
+        }
+        return frame_error(error);
       }
       return transferred == output_size ? frame_io_e::ok : frame_io_e::invalid_data;
     }
 
-    bool bind_source_process(const std::uint32_t process_id, const std::uint64_t creation_time) noexcept {
+    void snapshot_driver_state(direct_frame_init_diagnostic_t &diagnostic) const noexcept {
+      LUMEN_VDD_QUERY_STATE_RESPONSE response {};
+      DWORD native_status = ERROR_SUCCESS;
+      const auto status = ioctl(
+        IOCTL_LUMEN_VDD_QUERY_STATE,
+        nullptr,
+        0,
+        &response,
+        sizeof(response),
+        &native_status
+      );
+      const direct_frame_driver_state_snapshot_t snapshot {
+        response.generation,
+        response.last_generation,
+        response.preferred_render_adapter_luid,
+        response.assigned_render_adapter_luid,
+        response.owner_process_id,
+        response.monitor_started,
+        response.render_adapter_preference_submitted,
+        response.reserved,
+      };
+      record_direct_frame_driver_state_query(
+        diagnostic,
+        status,
+        status == frame_io_e::ok ?
+          direct_frame_native_domain_e::none :
+          (native_status == ERROR_SUCCESS ?
+             direct_frame_native_domain_e::logical :
+             direct_frame_native_domain_e::win32),
+        native_status,
+        snapshot
+      );
+    }
+
+    bool bind_source_process(
+      const std::uint32_t process_id,
+      const std::uint64_t creation_time,
+      direct_frame_native_domain_e &domain,
+      DWORD &native_status
+    ) noexcept {
+      domain = direct_frame_native_domain_e::logical;
+      native_status = ERROR_SUCCESS;
       if (source_process != nullptr) {
-        return process_id == source_process_id && creation_time == source_process_creation_time &&
-               WaitForSingleObject(source_process, 0) == WAIT_TIMEOUT;
-      }
-      HANDLE process = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
-      if (process == nullptr || WaitForSingleObject(process, 0) != WAIT_TIMEOUT ||
-          packed_process_creation_time(process) != creation_time) {
-        if (process != nullptr) {
-          CloseHandle(process);
+        if (process_id != source_process_id || creation_time != source_process_creation_time) {
+          return false;
+        }
+        const auto wait_status = WaitForSingleObject(source_process, 0);
+        if (wait_status == WAIT_TIMEOUT) {
+          return true;
+        }
+        if (wait_status == WAIT_FAILED) {
+          domain = direct_frame_native_domain_e::win32;
+          native_status = GetLastError();
+        } else {
+          domain = direct_frame_native_domain_e::wait;
+          native_status = wait_status;
         }
         return false;
       }
+      HANDLE process = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+      if (process == nullptr) {
+        domain = direct_frame_native_domain_e::win32;
+        native_status = GetLastError();
+        return false;
+      }
+      auto close_process = util::fail_guard([&]() {
+        CloseHandle(process);
+      });
+      const auto wait_status = WaitForSingleObject(process, 0);
+      if (wait_status != WAIT_TIMEOUT) {
+        if (wait_status == WAIT_FAILED) {
+          domain = direct_frame_native_domain_e::win32;
+          native_status = GetLastError();
+        } else {
+          domain = direct_frame_native_domain_e::wait;
+          native_status = wait_status;
+        }
+        return false;
+      }
+      const auto actual_creation_time = packed_process_creation_time(process, &native_status);
+      if (actual_creation_time == 0) {
+        domain = direct_frame_native_domain_e::win32;
+        return false;
+      }
+      if (actual_creation_time != creation_time) {
+        native_status = ERROR_SUCCESS;
+        return false;
+      }
+      close_process.disable();
       source_process = process;
       source_process_id = process_id;
       source_process_creation_time = creation_time;
       return true;
     }
 
-    bool duplicate_source_handle(const std::uint64_t raw_source, HANDLE &duplicate) const noexcept {
+    bool duplicate_source_handle(
+      const std::uint64_t raw_source,
+      HANDLE &duplicate,
+      direct_frame_native_domain_e &domain,
+      DWORD &native_status
+    ) const noexcept {
       duplicate = nullptr;
-      return source_process != nullptr && raw_source != 0 && WaitForSingleObject(source_process, 0) == WAIT_TIMEOUT &&
-             DuplicateHandle(
-               source_process,
-               reinterpret_cast<HANDLE>(raw_source),
-               GetCurrentProcess(),
-               &duplicate,
-               0,
-               FALSE,
-               DUPLICATE_SAME_ACCESS
-             );
+      domain = direct_frame_native_domain_e::logical;
+      native_status = ERROR_SUCCESS;
+      if (source_process == nullptr || raw_source == 0) {
+        return false;
+      }
+      const auto wait_status = WaitForSingleObject(source_process, 0);
+      if (wait_status != WAIT_TIMEOUT) {
+        if (wait_status == WAIT_FAILED) {
+          domain = direct_frame_native_domain_e::win32;
+          native_status = GetLastError();
+        } else {
+          domain = direct_frame_native_domain_e::wait;
+          native_status = wait_status;
+        }
+        return false;
+      }
+      if (!DuplicateHandle(
+            source_process,
+            reinterpret_cast<HANDLE>(raw_source),
+            GetCurrentProcess(),
+            &duplicate,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS
+          )) {
+        domain = direct_frame_native_domain_e::win32;
+        native_status = GetLastError();
+        return false;
+      }
+      return true;
     }
 
-    bool duplicate_response_handles(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response) const noexcept {
+    bool duplicate_response_handles(
+      LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response,
+      direct_frame_init_diagnostic_t &diagnostic
+    ) const noexcept {
       std::array<HANDLE, LUMEN_VDD_FRAME_SLOT_COUNT * 2> duplicates {};
       std::size_t count = 0;
       const auto close_partial = [&]() {
@@ -906,14 +1407,36 @@ namespace platf::virtual_display {
         }
       };
       for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
-        if (!duplicate_source_handle(response.texture_handles[slot], duplicates[count])) {
+        direct_frame_native_domain_e domain = direct_frame_native_domain_e::logical;
+        DWORD native_status = ERROR_SUCCESS;
+        if (!duplicate_source_handle(response.texture_handles[slot], duplicates[count], domain, native_status)) {
+          record_direct_frame_initialization_result(
+            diagnostic,
+            direct_frame_init_stage_e::texture_handle_duplicate,
+            frame_io_e::transport_error,
+            domain,
+            native_status,
+            direct_frame_handle_kind_e::texture,
+            static_cast<std::uint32_t>(slot)
+          );
           close_partial();
           return false;
         }
         ++count;
       }
       for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
-        if (!duplicate_source_handle(response.fence_handles[slot], duplicates[count])) {
+        direct_frame_native_domain_e domain = direct_frame_native_domain_e::logical;
+        DWORD native_status = ERROR_SUCCESS;
+        if (!duplicate_source_handle(response.fence_handles[slot], duplicates[count], domain, native_status)) {
+          record_direct_frame_initialization_result(
+            diagnostic,
+            direct_frame_init_stage_e::fence_handle_duplicate,
+            frame_io_e::transport_error,
+            domain,
+            native_status,
+            direct_frame_handle_kind_e::fence,
+            static_cast<std::uint32_t>(slot)
+          );
           close_partial();
           return false;
         }
@@ -968,6 +1491,7 @@ namespace platf::virtual_display {
     std::uint64_t generation {};  ///< Exact active driver generation.
     mode_t mode;  ///< Exact selected mode.
     std::optional<direct_frame_adapter_identity_t> frozen_probe_identity;  ///< Encoder identity frozen at selection.
+    bool selection_preference_submitted {};  ///< Prepared-mode adapter-preference fact.
     mutable std::mutex mutex;  ///< Serializes IOCTLs and slot ownership.
     HANDLE device_handle {INVALID_HANDLE_VALUE};  ///< Concrete secured VDD device interface.
     HANDLE source_process {};  ///< Validated live WUDFHost source for reverse handle duplication.
@@ -1076,7 +1600,10 @@ namespace platf::virtual_display {
     const std::chrono::milliseconds timeout
   ) {
     auto impl = std::make_unique<frame_source_t::impl_t>(selection);
-    if (impl->initialize(timeout) != frame_io_e::ok) {
+    direct_frame_init_diagnostic_t diagnostic;
+    if (impl->initialize(timeout, diagnostic) != frame_io_e::ok) {
+      BOOST_LOG(error) << "Lumen VDD direct-frame initialization failed: "sv
+                       << direct_frame_init_diagnostic_text(diagnostic);
       impl.reset();
       report_direct_frame_initialization_failure(selection.generation);
       return {};
@@ -1084,7 +1611,8 @@ namespace platf::virtual_display {
     auto source = std::shared_ptr<frame_source_t> {new frame_source_t(std::move(impl))};
     report_direct_frame_bound(selection.generation);
     BOOST_LOG(info) << "Lumen VDD direct-frame one-copy path enabled for generation "sv
-                    << selection.generation << "; two persistent shared texture/fence slots"sv;
+                    << selection.generation << "; two persistent shared texture/fence slots; "sv
+                    << direct_frame_init_diagnostic_text(diagnostic);
     return source;
   }
 
