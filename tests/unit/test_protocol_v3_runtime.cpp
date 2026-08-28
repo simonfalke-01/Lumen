@@ -463,17 +463,24 @@ namespace {
     std::expected<bool, std::uint8_t> start(const runtime::ApplicationLaunch &) override {
       ++start_calls;
       state_->record("application.start");
+      running_.store(true);
       return true;
     }
 
     bool stop(bool) noexcept override {
       ++stop_calls;
       state_->record("application.stop");
+      running_.store(false);
       return true;
     }
 
     bool running() noexcept override {
-      return false;
+      return running_.load();
+    }
+
+    /** @brief Simulate an external legacy lifecycle clearing the application process only. */
+    void simulate_external_stop() noexcept {
+      running_.store(false);
     }
 
     std::atomic_int start_calls {};
@@ -481,6 +488,7 @@ namespace {
 
   private:
     std::shared_ptr<LifetimeFailureState> state_;
+    std::atomic_bool running_ {};
   };
 
   class LifetimeTransport final: public runtime::QuicTransportSink {
@@ -1616,6 +1624,58 @@ TEST(ProtocolV3Runtime, StartAndStopOutcomesReplayAcrossAuthoritiesWithoutRepeat
   ASSERT_FALSE(expired.has_value());
   EXPECT_EQ(expired.error(), static_cast<std::uint8_t>(ProtocolStatus::expired));
   EXPECT_EQ(factory.create_calls, 1);
+}
+
+TEST(ProtocolV3Runtime, FreshStartReconcilesExternallyStoppedLaunchedOwnerAfterAuthorization) {
+  const auto state = std::make_shared<LifetimeFailureState>();
+  control::SecureRandom random;
+  LifetimeApplicationBridge applications {state};
+  LifetimeFailureFactory factory {state};
+  LifetimeTransport transport {state};
+  runtime::ProductionSessionBackend backend {random, applications, factory, transport};
+  const auto client = start_client(0x96);
+
+  const auto first = backend.start(
+    client,
+    sdr_h264_start_fields(1920, 1080),
+    96,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(backend.owned_session(client).has_value());
+  applications.simulate_external_stop();
+
+  auto unauthorized = client;
+  unauthorized.permissions = 0;
+  auto unauthorized_request = sdr_h264_start_fields(1920, 1080);
+  *mutable_map_field(unauthorized_request, 1) = control::cbor::Value::Bytes(16, 0x33);
+  const auto rejected = backend.start(
+    unauthorized,
+    unauthorized_request,
+    97,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_FALSE(rejected.has_value());
+  EXPECT_EQ(rejected.error(), static_cast<std::uint8_t>(ProtocolStatus::unauthorized));
+  EXPECT_TRUE(backend.owned_session(client).has_value());
+  EXPECT_EQ(state->resource_stops.load(), 0);
+
+  auto fresh_request = sdr_h264_start_fields(1920, 1080);
+  *mutable_map_field(fresh_request, 1) = control::cbor::Value::Bytes(16, 0x44);
+  const auto fresh = backend.start(
+    client,
+    fresh_request,
+    98,
+    quic::maximum_semantic_datagram_bytes
+  );
+  ASSERT_TRUE(fresh.has_value());
+  EXPECT_NE(fresh->session_id, first->session_id);
+  EXPECT_EQ(state->resource_stops.load(), 1);
+  EXPECT_EQ(state->resource_destructions.load(), 1);
+  EXPECT_EQ(applications.start_calls.load(), 2);
+  EXPECT_EQ(applications.stop_calls.load(), 1);
+  EXPECT_EQ(transport.revoke_calls.load(), 1);
+  EXPECT_TRUE(backend.owned_session(client).has_value());
 }
 
 TEST(ProtocolV3Runtime, OutcomeBudgetRefusalHappensBeforeStartSideEffects) {

@@ -1626,7 +1626,15 @@ namespace lumen::protocol_v3::runtime {
       return std::unexpected(static_cast<std::uint8_t>(Status::unauthorized));
     }
     if (!impl_->applications.running()) {
-      revoke_client(client.client_id);
+      const auto stale_launched_owner = [&]() {
+        std::scoped_lock lock {impl_->mutex};
+        return std::ranges::any_of(impl_->sessions, [&](const auto &entry) {
+          return entry.second.owner_client_id == client.client_id && entry.second.launched_application;
+        });
+      }();
+      if (stale_launched_owner) {
+        revoke_client(client.client_id);
+      }
     }
     std::scoped_lock lock {impl_->mutex};
     if (connection_id == 0 || maximum_datagram_bytes < quic_server::maximum_semantic_datagram_bytes) {
