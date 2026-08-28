@@ -27,7 +27,6 @@
   #include <dxgi1_6.h>
   #include <SetupAPI.h>
   #include <Windows.h>
-  #include <sddl.h>
   #include <wrl/client.h>
 
   // local includes
@@ -39,6 +38,7 @@
   #include "virtual_display_driver/LumenVirtualDisplayGuids.h"
   #include "virtual_display_driver/LumenDirectFrameSlotPolicy.h"
   #include "virtual_display_frame.h"
+  #include "virtual_display_process_access.h"
   #include "virtual_display_status.h"
 
 using Microsoft::WRL::ComPtr;
@@ -48,31 +48,6 @@ using namespace std::literals;
 namespace platf::virtual_display {
   namespace {
     std::atomic_bool runtime_quarantined {false};  ///< Process-wide sticky direct-frame failure state.
-
-    /** Grant the UMDF Local Service host only the process rights required for ABI handle transfer. */
-    bool grant_umdf_process_access(DWORD &native_status) noexcept {
-      native_status = ERROR_SUCCESS;
-      PSECURITY_DESCRIPTOR descriptor = nullptr;
-      constexpr wchar_t transfer_sddl[] =
-        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x00101040;;;LS)";
-      if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            transfer_sddl,
-            SDDL_REVISION_1,
-            &descriptor,
-            nullptr
-          )) {
-        native_status = GetLastError();
-        return false;
-      }
-      const auto applied = SetKernelObjectSecurity(
-        GetCurrentProcess(),
-        DACL_SECURITY_INFORMATION,
-        descriptor
-      );
-      native_status = applied ? ERROR_SUCCESS : GetLastError();
-      LocalFree(descriptor);
-      return applied != FALSE;
-    }
 
     /** @brief Pack a Windows LUID without changing its signed high-part bits. */
     std::uint64_t packed_luid(const LUID &luid) noexcept {
