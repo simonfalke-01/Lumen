@@ -197,7 +197,7 @@ namespace lumen::protocol_v3::runtime {
         const std::filesystem::path &path,
         const std::span<const std::uint8_t> bytes
       ) override {
-        if (!prepare_parent(path.parent_path())) {
+        if (!create_parent(path.parent_path())) {
           return false;
         }
         const auto *sddl = private_sddl();
@@ -232,7 +232,8 @@ namespace lumen::protocol_v3::runtime {
                         WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
                         written == bytes.size() && FlushFileBuffers(file);
         CloseHandle(file);
-        return ok && apply_private(path) && verify_private(path);
+        return ok && apply_private(path) && verify_private(path) &&
+               apply_private(path.parent_path()) && verify_private(path.parent_path());
       }
 
       bool read_private(
@@ -393,10 +394,16 @@ namespace lumen::protocol_v3::runtime {
                ) == ERROR_SUCCESS;
       }
 
-      bool prepare_parent(const std::filesystem::path &parent) const {
+      /**
+       * @brief Create the private file's parent before hardening the file and parent in that order.
+       *
+       * @param parent Parent directory path.
+       * @return true when the directory exists without filesystem errors.
+       */
+      static bool create_parent(const std::filesystem::path &parent) {
         std::error_code error;
         std::filesystem::create_directories(parent, error);
-        return !error && apply_private(parent);
+        return !error;
       }
     };
 #else
