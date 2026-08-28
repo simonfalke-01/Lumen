@@ -12,7 +12,7 @@ ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
 ClassVer=2.0
 Provider=%ProviderName%
 CatalogFile=LumenVirtualDisplay.cat
-DriverVer=08/24/2026,0.1.0.0
+DriverVer=08/28/2026,0.1.0.1
 
 [Manufacturer]
 %ProviderName%=Standard,NTamd64.10.0...18362
