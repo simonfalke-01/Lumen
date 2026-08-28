@@ -2367,6 +2367,7 @@ namespace rtsp_stream {
       boost::system::error_code read_error;
       boost::asio::read(client, response, read_error);
       if (read_error && read_error != boost::asio::error::eof &&
+          read_error != boost::asio::error::connection_aborted &&
           read_error != boost::asio::error::connection_reset) {
         throw boost::system::system_error {read_error};
       }
