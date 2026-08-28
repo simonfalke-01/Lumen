@@ -2671,15 +2671,14 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
-    const bool explicit_latency =
-      session->config.optimization_policy->mode == stream_policy::StreamOptimizationMode::latency &&
-      session->config.optimization_policy->client_negotiated_mode;
-    const auto egress_behavior = explicit_latency ?
-                                   video::egress_queue_t::behavior_e::latency :
-                                   video::egress_queue_t::behavior_e::fifo;
+    // Interactive video must never accumulate a quality-mode FIFO. At 120 Hz,
+    // the former 32-frame queue could be hundreds of milliseconds old before
+    // overflow recovery ran. Retain only the current frame and recover within
+    // one refresh when the network sender falls behind.
+    const auto egress_behavior = video::egress_queue_t::behavior_e::latency;
     const video::egress_queue_t::registration_policy_t egress_policy {
-      explicit_latency ? 1U : ref->video_egress.capacity_per_session(),
-      explicit_latency ? video::capture_frame_interval(session->config.monitor) : std::chrono::nanoseconds::zero(),
+      1U,
+      video::capture_frame_interval(session->config.monitor),
     };
     const auto registered = ref->video_egress.register_session(
       session,
@@ -2700,6 +2699,10 @@ namespace stream {
       BOOST_LOG(error) << "Could not register session with the video egress scheduler"sv;
       return;
     }
+    BOOST_LOG(info) << "Video egress session "sv << session->launch_session_id
+                    << " configured for newest-frame latency: capacity="sv << egress_policy.capacity
+                    << ", deadline_ms="sv
+                    << std::chrono::duration<double, std::milli> {egress_policy.max_queue_age}.count();
     auto unregister_egress = util::fail_guard([&]() {
       const auto telemetry = ref->video_egress.unregister_session(session);
       if (!telemetry) {
@@ -3523,16 +3526,14 @@ namespace stream {
             }) != lumen::protocol_v3::start_mode::AdmissionError::none) {
           throw std::runtime_error {"protocol-v3 canonical mode admission rejected resources"};
         }
-        const auto behavior = selection_.profile == lumen::protocol_v3::quic_server::Profile::latency ?
-                                video::egress_queue_t::behavior_e::latency :
-                                video::egress_queue_t::behavior_e::fifo;
+        const auto behavior = video::egress_queue_t::behavior_e::latency;
         const auto latency_deadline = std::chrono::nanoseconds {
           static_cast<std::int64_t>(selection_.refresh_denominator) * 1'000'000'000LL /
           selection_.refresh_numerator
         };
         const video::egress_queue_t::registration_policy_t egress_policy {
-          behavior == video::egress_queue_t::behavior_e::latency ? 1U : video_egress_.capacity_per_session(),
-          behavior == video::egress_queue_t::behavior_e::latency ? latency_deadline : std::chrono::nanoseconds::zero(),
+          1U,
+          latency_deadline,
         };
         if (!video_egress_.register_session(this, behavior, egress_policy, [this](const auto &) {
               mail_->event<bool>(mail::idr)->raise(true);

@@ -1622,10 +1622,13 @@ namespace lumen::protocol_v3::runtime {
     const std::uint64_t connection_id,
     const std::uint16_t maximum_datagram_bytes
   ) {
-    std::scoped_lock lock {impl_->mutex};
     if ((client.permissions & control::start_permission) == 0) {
       return std::unexpected(static_cast<std::uint8_t>(Status::unauthorized));
     }
+    if (!impl_->applications.running()) {
+      revoke_client(client.client_id);
+    }
+    std::scoped_lock lock {impl_->mutex};
     if (connection_id == 0 || maximum_datagram_bytes < quic_server::maximum_semantic_datagram_bytes) {
       return std::unexpected(static_cast<std::uint8_t>(Status::busy));
     }
