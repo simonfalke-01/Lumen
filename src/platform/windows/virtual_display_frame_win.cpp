@@ -70,7 +70,6 @@ namespace platf::virtual_display {
         }
         return false;
       }
-      const auto free_descriptor = std::unique_ptr<void, decltype(&LocalFree)> {descriptor, LocalFree};
       std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> local_service_buffer {};
       DWORD local_service_size = static_cast<DWORD>(local_service_buffer.size());
       if (!CreateWellKnownSid(
@@ -80,6 +79,7 @@ namespace platf::virtual_display {
             &local_service_size
           )) {
         native_status = GetLastError();
+        LocalFree(descriptor);
         return false;
       }
       EXPLICIT_ACCESSW access {};
@@ -92,9 +92,9 @@ namespace platf::virtual_display {
       PACL updated_dacl = nullptr;
       native_status = SetEntriesInAclW(1, &access, current_dacl, &updated_dacl);
       if (native_status != ERROR_SUCCESS || updated_dacl == nullptr) {
+        LocalFree(descriptor);
         return false;
       }
-      const auto free_dacl = std::unique_ptr<void, decltype(&LocalFree)> {updated_dacl, LocalFree};
       native_status = SetSecurityInfo(
         GetCurrentProcess(),
         SE_KERNEL_OBJECT,
@@ -104,6 +104,8 @@ namespace platf::virtual_display {
         updated_dacl,
         nullptr
       );
+      LocalFree(updated_dacl);
+      LocalFree(descriptor);
       return native_status == ERROR_SUCCESS;
     }
 
