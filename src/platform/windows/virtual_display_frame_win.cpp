@@ -25,9 +25,9 @@
   #endif
   #include <d3d11_4.h>
   #include <dxgi1_6.h>
-  #include <Aclapi.h>
   #include <SetupAPI.h>
   #include <Windows.h>
+  #include <Aclapi.h>
   #include <wrl/client.h>
 
   // local includes
