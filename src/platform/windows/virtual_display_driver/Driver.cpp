@@ -45,8 +45,6 @@
 
 using Microsoft::WRL::ComPtr;
 
-EVT_WDF_REQUEST_IMPERSONATE LumenVddOpenRequestorProcess;
-
 namespace {
   constexpr WCHAR endpoint_model[] = L"Lumen Virtual Display";
   constexpr WCHAR endpoint_manufacturer[] = L"Lumen";
@@ -54,13 +52,6 @@ namespace {
   std::uint64_t pack_luid(LUID luid) noexcept;
   LUID unpack_luid(std::uint64_t packed) noexcept;
   std::uint64_t packed_process_creation_time(HANDLE process) noexcept;
-
-  /** @brief Result storage populated only while WDF impersonates the requestor. */
-  struct requestor_process_open_context_t {
-    std::uint32_t process_id {};  ///< Authoritative WDF requestor process identifier.
-    HANDLE process {};  ///< Least-privilege requestor process handle, or null.
-    DWORD native_error {ERROR_SUCCESS};  ///< OpenProcess failure when no handle was returned.
-  };
 
   /** @brief Pinned authenticated process receiving ABI6 direct-frame handles. */
   struct requestor_process_t {
@@ -876,15 +867,13 @@ namespace {
   }
 
   /**
-   * @brief Open and pin the authenticated WDF requestor under SecurityImpersonation.
+   * @brief Open and pin the exact authenticated WDF requestor with least privilege.
    *
-   * @param request Active WDF request whose requestor is impersonated only for OpenProcess.
    * @param process_id Authoritative WDF requestor process identifier.
    * @param output Pinned process identity returned on success.
    * @return Success only for the exact live requestor process and nonzero creation time.
    */
   NTSTATUS open_authenticated_requestor_process(
-    WDFREQUEST request,
     const std::uint32_t process_id,
     requestor_process_t &output
   ) noexcept {
@@ -892,38 +881,33 @@ namespace {
     if (process_id == 0) {
       return STATUS_INVALID_PARAMETER;
     }
-    requestor_process_open_context_t context {process_id};
-    const auto impersonate_status = WdfRequestImpersonate(
-      request,
-      SecurityImpersonation,
-      LumenVddOpenRequestorProcess,
-      &context
+    HANDLE process = OpenProcess(
+      PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+      FALSE,
+      process_id
     );
-    if (!NT_SUCCESS(impersonate_status)) {
-      return impersonate_status;
-    }
-    if (context.process == nullptr) {
-      return requestor_process_status(context.native_error);
+    if (process == nullptr) {
+      return requestor_process_status(GetLastError());
     }
     const auto close_process = [&]() {
-      CloseHandle(context.process);
-      context.process = nullptr;
+      CloseHandle(process);
+      process = nullptr;
     };
-    if (GetProcessId(context.process) != process_id) {
+    if (GetProcessId(process) != process_id) {
       close_process();
       return STATUS_INVALID_PARAMETER;
     }
-    const auto wait_status = WaitForSingleObject(context.process, 0);
+    const auto wait_status = WaitForSingleObject(process, 0);
     if (wait_status != WAIT_TIMEOUT) {
       close_process();
       return wait_status == WAIT_FAILED ? requestor_process_status(GetLastError()) : STATUS_INVALID_PARAMETER;
     }
-    const auto creation_time = packed_process_creation_time(context.process);
+    const auto creation_time = packed_process_creation_time(process);
     if (creation_time == 0) {
       close_process();
       return requestor_process_status(GetLastError());
     }
-    output = {context.process, process_id, creation_time};
+    output = {process, process_id, creation_time};
     return STATUS_SUCCESS;
   }
 
@@ -1242,26 +1226,6 @@ namespace {
     return STATUS_SUCCESS;
   }
 }  // namespace
-
-/**
- * @brief Open the exact WDF requestor process while WDF holds SecurityImpersonation.
- *
- * @param request Active request supplying the impersonation token.
- * @param raw_context Requestor-process open result storage.
- */
-_Use_decl_annotations_ void LumenVddOpenRequestorProcess(WDFREQUEST request, PVOID raw_context) {
-  static_cast<void>(request);
-  auto *context = static_cast<requestor_process_open_context_t *>(raw_context);
-  if (context == nullptr) {
-    return;
-  }
-  context->process = OpenProcess(
-    PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-    FALSE,
-    context->process_id
-  );
-  context->native_error = context->process == nullptr ? GetLastError() : ERROR_SUCCESS;
-}
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD LumenVddDeviceAdd;
@@ -1809,7 +1773,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           break;
         }
         requestor_process_t requestor_process;
-        status = open_authenticated_requestor_process(request, requestor_pid, requestor_process);
+        status = open_authenticated_requestor_process(requestor_pid, requestor_process);
         if (!NT_SUCCESS(status)) {
           break;
         }
@@ -1981,7 +1945,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           break;
         }
         requestor_process_t requestor_process;
-        status = open_authenticated_requestor_process(request, requestor_pid, requestor_process);
+        status = open_authenticated_requestor_process(requestor_pid, requestor_process);
         if (!NT_SUCCESS(status)) {
           break;
         }

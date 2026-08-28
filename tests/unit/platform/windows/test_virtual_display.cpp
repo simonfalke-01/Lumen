@@ -773,13 +773,14 @@ TEST(VirtualDisplayDirectFrameTransfer, PublishesOnlyCompleteTransfersAndRollsBa
   EXPECT_TRUE(rolled_back.empty());
 }
 
-TEST(VirtualDisplayDirectFrameTransfer, ProductionUsesImpersonatedTransactionalAbi6Transfer) {
+TEST(VirtualDisplayDirectFrameTransfer, ProductionUsesAuthenticatedTransactionalAbi6Transfer) {
   const auto driver = read_source("src/platform/windows/virtual_display_driver/Driver.cpp");
   const auto host = read_source("src/platform/windows/virtual_display_frame_win.cpp");
   const auto inf = read_source("src/platform/windows/virtual_display_driver/LumenVirtualDisplay.inf");
 
-  EXPECT_NE(driver.find("WdfRequestImpersonate("), std::string::npos);
-  EXPECT_NE(driver.find("SecurityImpersonation"), std::string::npos);
+  EXPECT_EQ(driver.find("WdfRequestImpersonate("), std::string::npos);
+  EXPECT_NE(driver.find("WdfRequestGetRequestorProcessId("), std::string::npos);
+  EXPECT_NE(driver.find("valid_transfer_request_identity("), std::string::npos);
   EXPECT_NE(
     driver.find("PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE"),
     std::string::npos
