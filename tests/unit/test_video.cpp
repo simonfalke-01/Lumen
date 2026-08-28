@@ -818,3 +818,17 @@ TEST(CaptureResynchronizationTimeoutTest, InvalidAndLowRatesRemainSafelyBounded)
   EXPECT_EQ(video::capture_resynchronization_timeout(1, 1), 200ms);
   EXPECT_EQ(video::capture_resynchronization_timeout(1'000'000, 1), 1ms);
 }
+
+TEST(TargetEncodeDeadlineTest, WaitsUntilTargetAndAdvancesWithoutProcessingDrift) {
+  const auto epoch = std::chrono::steady_clock::time_point {};
+  EXPECT_EQ(video::target_encode_wait(epoch + 10ms, epoch + 3ms), 7ms);
+  EXPECT_EQ(video::target_encode_wait(epoch + 10ms, epoch + 11ms), 0ms);
+  EXPECT_EQ(
+    video::advance_target_encode_deadline(epoch + 10ms, 8ms, epoch + 15ms),
+    epoch + 18ms
+  );
+  EXPECT_EQ(
+    video::advance_target_encode_deadline(epoch + 10ms, 8ms, epoch + 35ms),
+    epoch + 42ms
+  );
+}

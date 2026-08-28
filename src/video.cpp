@@ -2715,6 +2715,9 @@ namespace video {
     double minimum_fps_target = (config::video.minimum_fps_target > 0.0) ? config::video.minimum_fps_target : (config.framerate / 2);
     std::chrono::duration<double, std::milli> max_frametime {1000.0 / minimum_fps_target};
     BOOST_LOG(info) << "Minimum FPS target set to ~"sv << minimum_fps_target << "fps ("sv << max_frametime.count() << "ms)"sv;
+    const bool target_rate_vdd = static_cast<bool>(config.virtual_display_frame_source);
+    const auto target_frame_interval = capture_frame_interval(config);
+    auto target_encode_deadline = std::chrono::steady_clock::now() + target_frame_interval;
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto idr_events = mail->event<bool>(mail::idr);
@@ -2754,7 +2757,10 @@ namespace video {
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
-        if (auto captured = images->pop(max_frametime)) {
+        const auto image_wait = target_rate_vdd ?
+                                  target_encode_wait(target_encode_deadline, std::chrono::steady_clock::now()) :
+                                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(max_frametime);
+        if (auto captured = images->pop(image_wait)) {
           frame_timestamp = captured->image->frame_timestamp;
           input_watermark = {
             captured->applied_input_state_sequence,
@@ -2786,6 +2792,14 @@ namespace video {
       if (encode(frame_nr++, *session, egress, channel_data, frame_timestamp, input_watermark)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
+      }
+
+      if (target_rate_vdd) {
+        target_encode_deadline = advance_target_encode_deadline(
+          target_encode_deadline,
+          target_frame_interval,
+          std::chrono::steady_clock::now()
+        );
       }
 
       session->request_normal_frame();

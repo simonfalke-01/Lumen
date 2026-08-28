@@ -937,6 +937,35 @@ namespace video {
     );
   }
 
+  /** @brief Remaining wait until an absolute target-rate encode deadline. */
+  [[nodiscard]] inline std::chrono::steady_clock::duration target_encode_wait(
+    const std::chrono::steady_clock::time_point deadline,
+    const std::chrono::steady_clock::time_point now
+  ) noexcept {
+    return deadline > now ? deadline - now : std::chrono::steady_clock::duration::zero();
+  }
+
+  /**
+   * @brief Advance an absolute encode deadline past completed work without drift.
+   * @param deadline Prior target deadline.
+   * @param interval Exact requested frame interval.
+   * @param now Time after the preceding encode completed.
+   * @return First target deadline strictly later than `now`.
+   */
+  [[nodiscard]] inline std::chrono::steady_clock::time_point advance_target_encode_deadline(
+    std::chrono::steady_clock::time_point deadline,
+    const std::chrono::steady_clock::duration interval,
+    const std::chrono::steady_clock::time_point now
+  ) noexcept {
+    if (interval <= std::chrono::steady_clock::duration::zero()) {
+      return now;
+    }
+    do {
+      deadline += interval;
+    } while (deadline <= now);
+    return deadline;
+  }
+
   /** @brief Capture-thread action after a backend requests display reinitialization. */
   enum class capture_reinitialization_e {
     retry,  ///< Recreate the capture display and continue the session.
