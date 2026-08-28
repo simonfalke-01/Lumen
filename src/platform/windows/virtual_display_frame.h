@@ -20,7 +20,7 @@
 
 namespace platf::virtual_display {
   inline constexpr std::size_t direct_frame_slot_count {2};  ///< Fixed persistent VDD slot count.
-  inline constexpr std::size_t color_transform_lut_entry_count {4096};  ///< Fixed ABI5 3x4 LUT size.
+  inline constexpr std::size_t color_transform_lut_entry_count {4096};  ///< Fixed VDD ABI 3x4 LUT size.
 
   /** @brief Pixel format exported by the VDD direct-frame channel. */
   enum class frame_format_e : std::uint32_t {
@@ -28,7 +28,7 @@ namespace platf::virtual_display {
     rgba16_float = 2,  ///< DXGI_FORMAT_R16G16B16A16_FLOAT.
   };
 
-  /** Return the exact byte pitch for one ABI5 direct-frame pixel. */
+  /** Return the exact byte pitch for one VDD direct-frame pixel. */
   [[nodiscard]] constexpr std::uint32_t frame_format_pixel_pitch(const frame_format_e format) noexcept {
     return format == frame_format_e::rgba16_float ? 8U : 4U;
   }
@@ -102,7 +102,7 @@ namespace platf::virtual_display {
     new_ = 3,
   };
 
-  /** @brief Exact resolved HDR10 static metadata carried by ABI5. */
+  /** @brief Exact resolved HDR10 static metadata carried by the VDD ABI. */
   struct frame_hdr10_metadata_t {
     std::array<std::uint16_t, 2> red_primary {};
     std::array<std::uint16_t, 2> green_primary {};
@@ -140,14 +140,14 @@ namespace platf::virtual_display {
     std::array<std::uint16_t, 256> blue {};
   };
 
-  /** @brief One exact ABI5 floating-point RGB lookup-table entry. */
+  /** @brief One exact VDD ABI floating-point RGB lookup-table entry. */
   struct color_transform_rgb_t {
     float red {};
     float green {};
     float blue {};
   };
 
-  /** @brief Exact normalized ABI5 3x4 matrix/scalar/4096-entry LUT payload. */
+  /** @brief Exact normalized VDD ABI 3x4 matrix/scalar/4096-entry LUT payload. */
   struct color_transform_3x4_t {
     bool matrix_enabled {};
     std::array<float, 12> color_matrix_3x4 {};
@@ -507,34 +507,40 @@ namespace platf::virtual_display {
              frame_io_e::unsupported;
   }
 
-  /** @brief Generation and publisher identity returned by one frame-channel operation. */
+  /** @brief Generation and requestor identity returned by one frame-channel operation. */
   struct frame_channel_source_identity_t {
     std::uint64_t generation {};  ///< Exact active VDD generation.
-    std::uint32_t process_id {};  ///< Live WUDFHost publisher process.
+    std::uint32_t process_id {};  ///< Authenticated process that received the transferred handles.
     std::uint32_t source_reserved {};  ///< Must be zero.
-    std::uint64_t process_creation_time {};  ///< PID-reuse-safe process creation time.
+    std::uint64_t process_creation_time {};  ///< Exact requestor creation FILETIME.
     std::uint64_t response_reserved {};  ///< Must be zero.
 
     bool operator==(const frame_channel_source_identity_t &) const = default;
   };
 
   /**
-   * @brief Validate a nonzero generation-scoped frame publisher identity.
+   * @brief Validate a generation-scoped handle recipient as the exact current host process.
    *
    * @param source Driver response identity.
    * @param expected_generation Active host generation.
-   * @return True only for the exact generation, live publisher fields, and zero reserved fields.
+   * @param expected_process_id Exact current host process identifier.
+   * @param expected_process_creation_time Exact current host process creation FILETIME.
+   * @return True only for the exact generation, host identity, and zero reserved fields.
    */
   [[nodiscard]] constexpr bool valid_frame_channel_source_identity(
     const frame_channel_source_identity_t &source,
-    const std::uint64_t expected_generation
+    const std::uint64_t expected_generation,
+    const std::uint32_t expected_process_id,
+    const std::uint64_t expected_process_creation_time
   ) noexcept {
     return expected_generation != 0 && source.generation == expected_generation &&
-           source.process_id != 0 && source.process_creation_time != 0 &&
+           expected_process_id != 0 && source.process_id == expected_process_id &&
+           expected_process_creation_time != 0 &&
+           source.process_creation_time == expected_process_creation_time &&
            source.source_reserved == 0 && source.response_reserved == 0;
   }
 
-  /** @brief Driver-owned persistent resources duplicated into the Lumen process. */
+  /** @brief Driver-owned persistent resources transferred into the Lumen process. */
   struct frame_resources_t {
     std::uint64_t generation {};  ///< Exact active VDD generation.
     std::uint64_t adapter_luid {};  ///< Packed render-adapter LUID.
@@ -597,7 +603,7 @@ namespace platf::virtual_display {
   /**
    * @brief Validate the imported VDD adapter against the active encoder probe.
    * @param nvenc_active Whether the committed active encoder backend is NVENC.
-   * @param imported Exact identity queried from the adapter named by the ABI5 response.
+   * @param imported Exact identity queried from the adapter named by the VDD response.
    * @param encoder_probe Exact adapter identity retained by the active encoder probe.
    * @return True only for one complete NVIDIA identity with exact LUID/PCI/driver agreement.
    */

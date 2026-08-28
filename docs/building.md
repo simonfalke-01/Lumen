@@ -282,15 +282,15 @@ msbuild src\platform\windows\virtual_display_driver\LumenVirtualDisplay.vcxproj 
 
 Portable tests cover mode arithmetic, ABI layouts, generation and lease
 lifecycle, rollback, stable-container selection, render-adapter binding,
-frame metadata, and immutable color-transform validation. ABI 5 exports two
+frame metadata, and immutable color-transform validation. ABI 6 exports two
 persistent shared texture/fence slots through a bounded event-driven channel:
 SDR uses BGRA8/sRGB and HDR uses FP16/scRGB. The driver performs one GPU
 `CopyResource` from each accepted IddCx surface into a safe slot; this is a
-one-copy path, not zero-copy. ABI 5 also carries validated per-frame white-level
+one-copy path, not zero-copy. ABI 6 also carries validated per-frame white-level
 and HDR10 metadata plus versioned default, RGB gamma-table, or 3x4-matrix/LUT
 color transforms to the host.
 
-HDR VDD capture requires the complete ABI 5 FP16 direct-frame path. Startup
+HDR VDD capture requires the complete ABI 6 FP16 direct-frame path. Startup
 fails closed when its IddCx 1.10, exact-mode, adapter, metadata, transform,
 shared-handle, fence, conversion, or NVENC gates do not pass; it never falls
 back to an untransformed DDA/WGC HDR capture. Legacy SDR may retain DDA/WGC

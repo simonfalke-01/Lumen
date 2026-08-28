@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 /** Fixed driver ABI version. */
-#define LUMEN_VDD_ABI_VERSION 5u
+#define LUMEN_VDD_ABI_VERSION 6u
 /** Minimum supported width shared with protocol-v3 START admission. */
 #define LUMEN_VDD_MIN_WIDTH LUMEN_START_MODE_MIN_WIDTH
 /** Maximum supported width shared with protocol-v3 START admission. */
@@ -241,19 +241,19 @@ extern "C" {
     uint32_t reserved;  ///< Must be zero.
   } LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST;
 
-  /** Two persistent driver-owned texture/fence pairs published for authorized reverse duplication. */
+  /** Two persistent driver-owned texture/fence pairs transferred into the authorized requestor. */
   typedef struct LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE {
     uint64_t generation;  ///< Exact active generation.
     uint64_t adapter_luid;  ///< Packed render-adapter LUID used by the IddCx swap chain.
-    uint32_t source_process_id;  ///< WUDFHost process that owns the raw unnamed handles.
+    uint32_t source_process_id;  ///< Authenticated requestor process receiving the transferred handles.
     uint32_t source_reserved;  ///< Must be zero.
-    uint64_t source_process_creation_time;  ///< Exact packed FILETIME preventing PID-reuse confusion.
+    uint64_t source_process_creation_time;  ///< Exact requestor FILETIME preventing PID-reuse confusion.
     uint32_t width;  ///< Exact texture width.
     uint32_t height;  ///< Exact texture height.
     uint32_t texture_format;  ///< LUMEN_VDD_FRAME_FORMAT_*.
     uint32_t slot_count;  ///< Must equal LUMEN_VDD_FRAME_SLOT_COUNT.
-    uint64_t texture_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Raw WUDFHost NT handles for shared textures.
-    uint64_t fence_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Raw WUDFHost NT handles for shared D3D11 fences.
+    uint64_t texture_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Non-inheritable texture handles valid in the requestor.
+    uint64_t fence_handles[LUMEN_VDD_FRAME_SLOT_COUNT];  ///< Non-inheritable fence handles valid in the requestor.
     uint64_t color_transform_version;  ///< Current immutable transform version, starting with DEFAULT version 1.
     uint32_t initial_surface_color_space;  ///< Initial LUMEN_VDD_COLOR_SPACE_* for encoder creation.
     uint32_t initial_sdr_white_level_nits;  ///< Initial committed IddCx SDR white level.
@@ -263,13 +263,13 @@ extern "C" {
     uint64_t reserved;  ///< Must be zero.
   } LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE;
 
-  /** Driver-published auto-reset event exposed for authorized reverse duplication. */
+  /** Driver-published auto-reset event transferred into the authorized requestor. */
   typedef struct LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE {
     uint64_t generation;  ///< Exact active generation.
-    uint32_t source_process_id;  ///< WUDFHost process that owns the raw unnamed event handle.
+    uint32_t source_process_id;  ///< Authenticated requestor process receiving the event handle.
     uint32_t source_reserved;  ///< Must be zero.
-    uint64_t source_process_creation_time;  ///< Exact packed FILETIME preventing PID-reuse confusion.
-    uint64_t event_handle;  ///< Raw WUDFHost handle duplicated by the authorized caller.
+    uint64_t source_process_creation_time;  ///< Exact requestor FILETIME preventing PID-reuse confusion.
+    uint64_t event_handle;  ///< Non-inheritable event handle already valid in the requestor.
     uint64_t reserved;  ///< Must be zero.
   } LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE;
 

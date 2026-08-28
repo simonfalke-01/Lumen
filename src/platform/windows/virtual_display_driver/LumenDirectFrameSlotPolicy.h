@@ -1,6 +1,6 @@
 /**
  * @file src/platform/windows/virtual_display_driver/LumenDirectFrameSlotPolicy.h
- * @brief Portable ownership transitions for one ABI v4 direct-frame slot.
+ * @brief Portable ownership and handle-transfer rules for direct frames.
  */
 #ifndef LUMEN_PLATFORM_WINDOWS_DIRECT_FRAME_SLOT_POLICY_H
 #define LUMEN_PLATFORM_WINDOWS_DIRECT_FRAME_SLOT_POLICY_H
@@ -10,6 +10,72 @@
 #include <optional>
 
 namespace lumen::vdd::frame {
+  /** @brief Authoritative identity facts for one direct-frame open request. */
+  struct transfer_request_identity_t {
+    std::uint64_t generation {};  ///< Requested active generation.
+    std::uint32_t owner_process_id {};  ///< Claimed requestor process identifier.
+    std::uint32_t reserved {};  ///< Must remain zero.
+  };
+
+  /**
+   * @brief Validate one direct-frame request against driver-derived ownership facts.
+   *
+   * @param request Untrusted buffered request fields.
+   * @param active_generation Exact generation currently owned by the service.
+   * @param requestor_process_id Real WDF requestor process identifier.
+   * @param prepared_owner_process_id Process that prepared the active generation.
+   * @return True only when every generation, process, and reserved field is exact.
+   */
+  [[nodiscard]] constexpr bool valid_transfer_request_identity(
+    const transfer_request_identity_t &request,
+    const std::uint64_t active_generation,
+    const std::uint32_t requestor_process_id,
+    const std::uint32_t prepared_owner_process_id
+  ) noexcept {
+    return active_generation != 0 && request.generation == active_generation &&
+           requestor_process_id != 0 && request.owner_process_id == requestor_process_id &&
+           requestor_process_id == prepared_owner_process_id && request.reserved == 0;
+  }
+
+  /**
+   * @brief Transfer every source handle transactionally into one target process.
+   *
+   * The caller-provided rollback operation must close a previously created target-process
+   * handle. The destination remains completely zeroed unless every duplication succeeds.
+   *
+   * @tparam SourceRange Fixed range of source-process handle values.
+   * @tparam DestinationRange Equally sized fixed range receiving target-process handle values.
+   * @tparam Duplicate Callable accepting a source value and target-value reference.
+   * @tparam Rollback Callable closing one already-created target-process handle value.
+   * @param source Exact source-process handles to transfer.
+   * @param destination Output target-process handles, published only on full success.
+   * @param duplicate Duplicate one handle into the target process.
+   * @param rollback Close one target-process handle after a later duplication failure.
+   * @return True only when every handle was duplicated and published.
+   */
+  template<typename SourceRange, typename DestinationRange, typename Duplicate, typename Rollback>
+  [[nodiscard]] bool transfer_handles_transactionally(
+    const SourceRange &source,
+    DestinationRange &destination,
+    Duplicate &&duplicate,
+    Rollback &&rollback
+  ) {
+    destination.fill(0);
+    DestinationRange staged {};
+    std::size_t completed = 0;
+    for (; completed < source.size(); ++completed) {
+      if (source[completed] == 0 || !duplicate(source[completed], staged[completed])) {
+        while (completed != 0) {
+          --completed;
+          rollback(staged[completed]);
+        }
+        return false;
+      }
+    }
+    destination = staged;
+    return true;
+  }
+
   /** Return whether the actual IddCx swap-chain adapter matches the frozen encoder preference. */
   [[nodiscard]] constexpr bool render_adapter_matches(
     const std::uint64_t preferred,

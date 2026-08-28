@@ -17,7 +17,7 @@ complete Windows profile requires that package and its lifecycle helper.
   swap-chain acquire/finish APIs.
 - Host-side `QueryDisplayConfig`, `SetDisplayConfig`, and Advanced Color APIs.
 
-ABI 5 advertises HDR only when every required IddCx 1.10 function, callback
+ABI 6 advertises HDR only when every required IddCx 1.10 function, callback
 field, structure, and `IDDCX_METADATA2` field is available at runtime. Missing
 HDR API support returns `STATUS_NOT_SUPPORTED`; it is never inferred from an OS
 version string.
@@ -29,7 +29,7 @@ rational refresh rates from 10 through 480 Hz, further bounded by pixel count,
 pixel rate, the active GPU, and the selected encoder. It publishes exactly one
 mode per generation. The host rejects silent driver or DisplayConfig changes.
 
-ABI 5 admits only these color-mode pairs:
+ABI 6 admits only these color-mode pairs:
 
 - SDR: 8-bit wire mode, BGRA8 direct-frame texture, sRGB surface color space.
 - HDR: 10-bit wire mode, FP16 direct-frame texture, linear scRGB surface color
@@ -40,7 +40,14 @@ and target-scoped Advanced Color state. The FP16/scRGB capture source remains
 linear; downstream stream negotiation preserves the selected PQ or HLG transfer
 instead of deriving it from static metadata.
 
-## ABI 5 direct frames
+## ABI 6 direct frames
+
+ABI 6 intentionally changes handle ownership without changing the packed
+request/response sizes or IOCTL numbers. ABI 5 responses contained raw
+WUDFHost-owned handles that the host reverse-duplicated; ABI 6 responses contain
+handles already transferred into the authenticated requestor. Both sides require
+an exact ABI version before either handle-open path, so mixed ABI 5/6 binaries
+fail closed instead of interpreting the other ownership model.
 
 The driver creates two persistent shared textures and one shared D3D11 fence
 per slot on the assigned IddCx render adapter. It performs at most one GPU
@@ -78,13 +85,18 @@ input; already-PQ surfaces are rejected rather than interpreted heuristically.
 - Standard users cannot open the secured device interface.
 - Mutating IOCTLs require exact packed sizes, write access, the real requestor
   PID, the owning WDF file, and a nonzero monotonic generation.
-- ABI 5 reports the retained generation floor and requested/assigned adapter
+- ABI 6 reports the retained generation floor and requested/assigned adapter
   LUIDs, preventing generation reuse after a service restart.
 - Same-request retries are idempotent. Another process, file, or generation is
   rejected.
-- WUDFHost event, texture, and fence handles carry the source PID and creation
-  time. The LocalSystem host pins that process before reverse-duplicating them,
-  preventing PID-reuse substitution.
+- The driver impersonates only the authenticated WDF requestor while opening
+  that exact process with duplicate, limited-query, and synchronize rights. It
+  pins and validates the live requestor, then transactionally duplicates the
+  event, texture, and fence handles into it as non-inheritable handles.
+- Responses carry the receiving requestor PID and creation time. Lumen accepts
+  them only when both match its own exact process identity and when the event
+  and channel identities agree. Partial transfers are remotely closed before
+  the consumer file is claimed.
 - Direct frames require exact agreement between the assigned adapter and the
   active NVIDIA encoder probe: LUID, PCI identity, revision, and UMD driver
   version.
@@ -95,7 +107,7 @@ input; already-PQ surfaces are rejected rather than interpreted heuristically.
 ## Fail-closed behavior and compatibility
 
 Umbra v3 treats the default `optional` runtime policy as required: unless VDD is
-explicitly disabled, startup requires the exact VDD mode and a healthy ABI 5
+explicitly disabled, startup requires the exact VDD mode and a healthy ABI 6
 direct-frame channel. Direct-frame or NVENC failure ends/reinitializes the v3
 session; it does not switch capture backends mid-session.
 
@@ -104,7 +116,7 @@ activation failure may return to the configured physical display only after a
 proven-safe rollback. If an SDR VDD is already active and its direct channel is
 unavailable or quarantined, Lumen may capture that VDD through DDA/WGC.
 
-An active HDR VDD always requires the ABI 5 FP16/metadata/transform path.
+An active HDR VDD always requires the ABI 6 FP16/metadata/transform path.
 Startup or runtime failure is terminal for that attempt; untransformed DDA/WGC
 HDR fallback is forbidden.
 

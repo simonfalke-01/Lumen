@@ -45,13 +45,29 @@
 
 using Microsoft::WRL::ComPtr;
 
+EVT_WDF_REQUEST_IMPERSONATE LumenVddOpenRequestorProcess;
+
 namespace {
   constexpr WCHAR endpoint_model[] = L"Lumen Virtual Display";
   constexpr WCHAR endpoint_manufacturer[] = L"Lumen";
   constexpr char connector_id[] = "LUM0001";
   std::uint64_t pack_luid(LUID luid) noexcept;
   LUID unpack_luid(std::uint64_t packed) noexcept;
-  std::uint64_t current_process_creation_time() noexcept;
+  std::uint64_t packed_process_creation_time(HANDLE process) noexcept;
+
+  /** @brief Result storage populated only while WDF impersonates the requestor. */
+  struct requestor_process_open_context_t {
+    std::uint32_t process_id {};  ///< Authoritative WDF requestor process identifier.
+    HANDLE process {};  ///< Least-privilege requestor process handle, or null.
+    DWORD native_error {ERROR_SUCCESS};  ///< OpenProcess failure when no handle was returned.
+  };
+
+  /** @brief Pinned authenticated process receiving ABI6 direct-frame handles. */
+  struct requestor_process_t {
+    HANDLE process {};  ///< PROCESS_DUP_HANDLE, query, and synchronize handle.
+    std::uint32_t process_id {};  ///< Exact WDF requestor process identifier.
+    std::uint64_t creation_time {};  ///< Exact packed process creation FILETIME.
+  };
 
   struct device_state_t;
 
@@ -256,22 +272,15 @@ namespace {
     swap_chain_processor_t(const swap_chain_processor_t &) = delete;
     swap_chain_processor_t &operator=(const swap_chain_processor_t &) = delete;
 
-    /** @brief Publish exact raw unnamed texture/fence handles for authorized reverse duplication. */
+    /** @brief Stage exact raw texture/fence handles for authenticated requestor transfer. */
     NTSTATUS open_frame_channel(LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response) noexcept {
       std::lock_guard lock(mutex_);
       if (!resources_ready_ || !direct_enabled_.load(std::memory_order_acquire)) {
         return direct_enabled_.load(std::memory_order_relaxed) ? STATUS_DEVICE_NOT_READY : STATUS_NOT_SUPPORTED;
       }
-      const auto source_creation_time = current_process_creation_time();
-      if (source_creation_time == 0) {
-        return STATUS_UNSUCCESSFUL;
-      }
-
       std::memset(&response, 0, sizeof(response));
       response.generation = generation_;
       response.adapter_luid = adapter_luid_;
-      response.source_process_id = GetCurrentProcessId();
-      response.source_process_creation_time = source_creation_time;
       response.width = mode_.width;
       response.height = mode_.height;
       response.texture_format = mode_.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 ?
@@ -789,6 +798,7 @@ namespace {
     NTSTATUS adapter_init_status {STATUS_DEVICE_NOT_READY};  ///< Latest immediate or asynchronous adapter status.
     IDDCX_MONITOR monitor {};  ///< Present monitor, or null.
     WDFFILEOBJECT owner_file {};  ///< Exclusive requestor file.
+    WDFFILEOBJECT frame_event_file {};  ///< File that completed the ABI6 event transfer.
     WDFFILEOBJECT frame_consumer_file {};  ///< Exact generation-scoped direct-frame consumer.
     HANDLE frame_ready_event {};  ///< Auto-reset availability event for the active generation.
     std::unique_ptr<swap_chain_processor_t> swap_chain;  ///< Active swap-chain consumer.
@@ -841,16 +851,136 @@ namespace {
     };
   }
 
-  /** @brief Return the exact WUDFHost creation FILETIME for PID-reuse-safe reverse duplication. */
-  std::uint64_t current_process_creation_time() noexcept {
+  /** @brief Return one process's exact creation FILETIME for PID-reuse-safe validation. */
+  std::uint64_t packed_process_creation_time(const HANDLE process) noexcept {
     FILETIME creation {};
     FILETIME exit {};
     FILETIME kernel {};
     FILETIME user {};
-    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+    if (process == nullptr || !GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
       return 0;
     }
     return static_cast<std::uint64_t>(creation.dwHighDateTime) << 32U | creation.dwLowDateTime;
+  }
+
+  /** @brief Map a requestor-process operation failure into a fail-closed NTSTATUS. */
+  NTSTATUS requestor_process_status(const DWORD native_error) noexcept {
+    switch (native_error) {
+      case ERROR_ACCESS_DENIED:
+        return STATUS_ACCESS_DENIED;
+      case ERROR_INVALID_PARAMETER:
+        return STATUS_INVALID_PARAMETER;
+      default:
+        return STATUS_UNSUCCESSFUL;
+    }
+  }
+
+  /**
+   * @brief Open and pin the authenticated WDF requestor under SecurityImpersonation.
+   *
+   * @param request Active WDF request whose requestor is impersonated only for OpenProcess.
+   * @param process_id Authoritative WDF requestor process identifier.
+   * @param output Pinned process identity returned on success.
+   * @return Success only for the exact live requestor process and nonzero creation time.
+   */
+  NTSTATUS open_authenticated_requestor_process(
+    WDFREQUEST request,
+    const std::uint32_t process_id,
+    requestor_process_t &output
+  ) noexcept {
+    output = {};
+    if (process_id == 0) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    requestor_process_open_context_t context {process_id};
+    const auto impersonate_status = WdfRequestImpersonate(
+      request,
+      SecurityImpersonation,
+      LumenVddOpenRequestorProcess,
+      &context
+    );
+    if (!NT_SUCCESS(impersonate_status)) {
+      return impersonate_status;
+    }
+    if (context.process == nullptr) {
+      return requestor_process_status(context.native_error);
+    }
+    const auto close_process = [&]() {
+      CloseHandle(context.process);
+      context.process = nullptr;
+    };
+    if (GetProcessId(context.process) != process_id) {
+      close_process();
+      return STATUS_INVALID_PARAMETER;
+    }
+    const auto wait_status = WaitForSingleObject(context.process, 0);
+    if (wait_status != WAIT_TIMEOUT) {
+      close_process();
+      return wait_status == WAIT_FAILED ? requestor_process_status(GetLastError()) : STATUS_INVALID_PARAMETER;
+    }
+    const auto creation_time = packed_process_creation_time(context.process);
+    if (creation_time == 0) {
+      close_process();
+      return requestor_process_status(GetLastError());
+    }
+    output = {context.process, process_id, creation_time};
+    return STATUS_SUCCESS;
+  }
+
+  /**
+   * @brief Duplicate a fixed set of WUDFHost handles into one authenticated requestor transactionally.
+   *
+   * @tparam Count Fixed number of handles transferred as one transaction.
+   * @param requestor Pinned requestor process receiving non-inheritable handles.
+   * @param source WUDFHost-owned source handles.
+   * @param transferred Requestor-valid handles, left zero on failure.
+   * @return Success only when every handle was transferred; partial transfers are remotely closed.
+   */
+  template<std::size_t Count>
+  NTSTATUS transfer_handles_to_requestor(
+    const requestor_process_t &requestor,
+    const std::array<std::uint64_t, Count> &source,
+    std::array<std::uint64_t, Count> &transferred
+  ) noexcept {
+    DWORD native_error = ERROR_SUCCESS;
+    bool rollback_failed = false;
+    const auto duplicate = [&](const std::uint64_t source_handle, std::uint64_t &target_handle) {
+      HANDLE duplicate_handle = nullptr;
+      if (!DuplicateHandle(
+            GetCurrentProcess(),
+            reinterpret_cast<HANDLE>(source_handle),
+            requestor.process,
+            &duplicate_handle,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS
+          )) {
+        native_error = GetLastError();
+        return false;
+      }
+      target_handle = reinterpret_cast<std::uint64_t>(duplicate_handle);
+      return true;
+    };
+    const auto rollback = [&](const std::uint64_t target_handle) {
+      HANDLE local_duplicate = nullptr;
+      if (!DuplicateHandle(
+            requestor.process,
+            reinterpret_cast<HANDLE>(target_handle),
+            GetCurrentProcess(),
+            &local_duplicate,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE
+          )) {
+        rollback_failed = true;
+        return;
+      }
+      CloseHandle(local_duplicate);
+    };
+    if (!lumen::vdd::frame::transfer_handles_transactionally(source, transferred, duplicate, rollback)) {
+      return rollback_failed ? STATUS_UNSUCCESSFUL : requestor_process_status(native_error);
+    }
+    return STATUS_SUCCESS;
   }
 
   /** @brief Fill exact signal metadata for a dynamic mode. */
@@ -998,6 +1128,7 @@ namespace {
     }
     state.monitor_started = false;
     state.owner_file = nullptr;
+    state.frame_event_file = nullptr;
     state.frame_consumer_file = nullptr;
     state.owner_process_id = 0;
     state.preferred_render_adapter_luid = 0;
@@ -1111,6 +1242,26 @@ namespace {
     return STATUS_SUCCESS;
   }
 }  // namespace
+
+/**
+ * @brief Open the exact WDF requestor process while WDF holds SecurityImpersonation.
+ *
+ * @param request Active request supplying the impersonation token.
+ * @param raw_context Requestor-process open result storage.
+ */
+_Use_decl_annotations_ void LumenVddOpenRequestorProcess(WDFREQUEST request, PVOID raw_context) {
+  static_cast<void>(request);
+  auto *context = static_cast<requestor_process_open_context_t *>(raw_context);
+  if (context == nullptr) {
+    return;
+  }
+  context->process = OpenProcess(
+    PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+    FALSE,
+    context->process_id
+  );
+  context->native_error = context->process == nullptr ? GetLastError() : ERROR_SUCCESS;
+}
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD LumenVddDeviceAdd;
@@ -1377,10 +1528,13 @@ _Use_decl_annotations_ void LumenVddFileCleanup(WDFFILEOBJECT file_object) {
   if (state->owner_file == file_object && state->generation != 0) {
     static_cast<void>(stop_locked(*state, lock, state->generation, file_object, false));
   } else if (state->frame_consumer_file == file_object) {
+    state->frame_event_file = nullptr;
     state->frame_consumer_file = nullptr;
     if (state->swap_chain != nullptr) {
       state->swap_chain->disable_direct_frames();
     }
+  } else if (state->frame_event_file == file_object) {
+    state->frame_event_file = nullptr;
   }
 }
 
@@ -1622,24 +1776,64 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         if (input == nullptr || output == nullptr) {
           break;
         }
-        if (input->reserved != 0 || input->generation != state->generation ||
-            input->owner_process_id != requestor_pid || requestor_pid != state->owner_process_id) {
+        *output = {};
+        const lumen::vdd::frame::transfer_request_identity_t request_identity {
+          input->generation,
+          input->owner_process_id,
+          input->reserved,
+        };
+        if (!lumen::vdd::frame::valid_transfer_request_identity(
+              request_identity,
+              state->generation,
+              requestor_pid,
+              state->owner_process_id
+            )) {
           status = STATUS_ACCESS_DENIED;
           break;
         }
-        if (state->frame_consumer_file != nullptr && state->frame_consumer_file != file) {
+        if (state->frame_event_file != file) {
+          status = STATUS_ACCESS_DENIED;
+          break;
+        }
+        if (state->frame_consumer_file != nullptr) {
           status = STATUS_DEVICE_BUSY;
           break;
         }
-        state->frame_consumer_file = file;
         if (state->swap_chain == nullptr) {
           status = STATUS_DEVICE_NOT_READY;
           break;
         }
-        status = state->swap_chain->open_frame_channel(*output);
-        if (NT_SUCCESS(status)) {
-          information = sizeof(*output);
+        LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE published {};
+        status = state->swap_chain->open_frame_channel(published);
+        if (!NT_SUCCESS(status)) {
+          break;
         }
+        requestor_process_t requestor_process;
+        status = open_authenticated_requestor_process(request, requestor_pid, requestor_process);
+        if (!NT_SUCCESS(status)) {
+          break;
+        }
+        const std::array<std::uint64_t, LUMEN_VDD_FRAME_SLOT_COUNT * 2> source_handles {
+          published.texture_handles[0],
+          published.texture_handles[1],
+          published.fence_handles[0],
+          published.fence_handles[1],
+        };
+        std::array<std::uint64_t, LUMEN_VDD_FRAME_SLOT_COUNT * 2> transferred_handles {};
+        status = transfer_handles_to_requestor(requestor_process, source_handles, transferred_handles);
+        CloseHandle(requestor_process.process);
+        if (!NT_SUCCESS(status)) {
+          break;
+        }
+        published.source_process_id = requestor_process.process_id;
+        published.source_process_creation_time = requestor_process.creation_time;
+        for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
+          published.texture_handles[slot] = transferred_handles[slot];
+          published.fence_handles[slot] = transferred_handles[LUMEN_VDD_FRAME_SLOT_COUNT + slot];
+        }
+        *output = published;
+        state->frame_consumer_file = file;
+        information = sizeof(*output);
         break;
       }
     case IOCTL_LUMEN_VDD_DEQUEUE_FRAME:
@@ -1762,30 +1956,54 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         if (input == nullptr || output == nullptr) {
           break;
         }
-        if (input->reserved != 0 || input->generation != state->generation ||
-            input->owner_process_id != requestor_pid || requestor_pid != state->owner_process_id ||
+        *output = {};
+        const lumen::vdd::frame::transfer_request_identity_t request_identity {
+          input->generation,
+          input->owner_process_id,
+          input->reserved,
+        };
+        if (!lumen::vdd::frame::valid_transfer_request_identity(
+              request_identity,
+              state->generation,
+              requestor_pid,
+              state->owner_process_id
+            ) ||
             state->frame_ready_event == nullptr) {
           status = STATUS_ACCESS_DENIED;
           break;
         }
-        if (state->frame_consumer_file != nullptr && state->frame_consumer_file != file) {
+        if (state->frame_event_file != nullptr) {
           status = STATUS_DEVICE_BUSY;
           break;
         }
-        state->frame_consumer_file = file;
-        const auto source_creation_time = current_process_creation_time();
-        if (source_creation_time == 0) {
-          status = STATUS_UNSUCCESSFUL;
+        if (state->frame_consumer_file != nullptr) {
+          status = STATUS_DEVICE_BUSY;
           break;
         }
-        *output = {
-          state->generation,
-          GetCurrentProcessId(),
-          0,
-          source_creation_time,
+        requestor_process_t requestor_process;
+        status = open_authenticated_requestor_process(request, requestor_pid, requestor_process);
+        if (!NT_SUCCESS(status)) {
+          break;
+        }
+        const std::array<std::uint64_t, 1> source_handles {
           reinterpret_cast<std::uint64_t>(state->frame_ready_event),
+        };
+        std::array<std::uint64_t, 1> transferred_handles {};
+        status = transfer_handles_to_requestor(requestor_process, source_handles, transferred_handles);
+        CloseHandle(requestor_process.process);
+        if (!NT_SUCCESS(status)) {
+          break;
+        }
+        const LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE published {
+          state->generation,
+          requestor_process.process_id,
+          0,
+          requestor_process.creation_time,
+          transferred_handles[0],
           0,
         };
+        *output = published;
+        state->frame_event_file = file;
         information = sizeof(*output);
         break;
       }

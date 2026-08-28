@@ -681,7 +681,7 @@ TEST(VirtualDisplayPolicy, OptionalLegacySessionAdmitsProvenHdr10TenBitVdd) {
 }
 
 TEST(VirtualDisplayProtocol, UsesBufferedAdminServiceAbiWithStableSizes) {
-  EXPECT_EQ(LUMEN_VDD_ABI_VERSION, 5U);
+  EXPECT_EQ(LUMEN_VDD_ABI_VERSION, 6U);
   EXPECT_EQ(sizeof(LUMEN_VDD_MODE), 20U);
   EXPECT_EQ(sizeof(LUMEN_VDD_QUERY_ABI_RESPONSE), 56U);
   EXPECT_EQ(sizeof(LUMEN_VDD_PREPARE_MODE_REQUEST), 44U);
@@ -706,6 +706,106 @@ TEST(VirtualDisplayProtocol, UsesBufferedAdminServiceAbiWithStableSizes) {
   EXPECT_NE(IOCTL_LUMEN_VDD_OPEN_FRAME_EVENT & (LUMEN_VDD_FILE_READ_DATA << 14U), 0U);
   EXPECT_NE(IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM & (LUMEN_VDD_FILE_READ_DATA << 14U), 0U);
   EXPECT_NE(IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM & (LUMEN_VDD_FILE_WRITE_DATA << 14U), 0U);
+}
+
+TEST(VirtualDisplayDirectFrameTransfer, RequiresExactGenerationAndAuthoritativeProcessIdentity) {
+  using lumen::vdd::frame::transfer_request_identity_t;
+  using lumen::vdd::frame::valid_transfer_request_identity;
+
+  transfer_request_identity_t request {9, 42, 0};
+  EXPECT_TRUE(valid_transfer_request_identity(request, 9, 42, 42));
+  EXPECT_FALSE(valid_transfer_request_identity(request, 8, 42, 42));
+  EXPECT_FALSE(valid_transfer_request_identity(request, 9, 43, 42));
+  EXPECT_FALSE(valid_transfer_request_identity(request, 9, 42, 43));
+  request.owner_process_id = 43;
+  EXPECT_FALSE(valid_transfer_request_identity(request, 9, 42, 42));
+  request.owner_process_id = 42;
+  request.reserved = 1;
+  EXPECT_FALSE(valid_transfer_request_identity(request, 9, 42, 42));
+}
+
+TEST(VirtualDisplayDirectFrameTransfer, PublishesOnlyCompleteTransfersAndRollsBackNthFailure) {
+  using lumen::vdd::frame::transfer_handles_transactionally;
+
+  const std::array<std::uint64_t, 4> source {10, 11, 12, 13};
+  std::array<std::uint64_t, 4> destination {99, 99, 99, 99};
+  std::vector<std::uint64_t> rolled_back;
+  std::size_t attempt = 0;
+  bool consumer_claimed = false;
+  const auto transferred = transfer_handles_transactionally(
+    source,
+    destination,
+    [&](const std::uint64_t input, std::uint64_t &output) {
+      if (attempt++ == 2) {
+        return false;
+      }
+      output = input + 100;
+      return true;
+    },
+    [&](const std::uint64_t handle) {
+      rolled_back.push_back(handle);
+    }
+  );
+  if (transferred) {
+    consumer_claimed = true;
+  }
+
+  EXPECT_FALSE(transferred);
+  EXPECT_FALSE(consumer_claimed);
+  EXPECT_EQ(destination, (std::array<std::uint64_t, 4> {}));
+  EXPECT_EQ(rolled_back, (std::vector<std::uint64_t> {111, 110}));
+
+  attempt = 0;
+  rolled_back.clear();
+  EXPECT_TRUE(transfer_handles_transactionally(
+    source,
+    destination,
+    [&](const std::uint64_t input, std::uint64_t &output) {
+      ++attempt;
+      output = input + 200;
+      return true;
+    },
+    [&](const std::uint64_t handle) {
+      rolled_back.push_back(handle);
+    }
+  ));
+  EXPECT_EQ(destination, (std::array<std::uint64_t, 4> {210, 211, 212, 213}));
+  EXPECT_TRUE(rolled_back.empty());
+}
+
+TEST(VirtualDisplayDirectFrameTransfer, ProductionUsesImpersonatedTransactionalAbi6Transfer) {
+  const auto driver = read_source("src/platform/windows/virtual_display_driver/Driver.cpp");
+  const auto host = read_source("src/platform/windows/virtual_display_frame_win.cpp");
+  const auto inf = read_source("src/platform/windows/virtual_display_driver/LumenVirtualDisplay.inf");
+
+  EXPECT_NE(driver.find("WdfRequestImpersonate("), std::string::npos);
+  EXPECT_NE(driver.find("SecurityImpersonation"), std::string::npos);
+  EXPECT_NE(
+    driver.find("PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE"),
+    std::string::npos
+  );
+  EXPECT_NE(driver.find("DUPLICATE_CLOSE_SOURCE"), std::string::npos);
+  EXPECT_NE(driver.find("state->frame_event_file != nullptr"), std::string::npos);
+  EXPECT_NE(driver.find("state->frame_consumer_file != nullptr"), std::string::npos);
+  EXPECT_NE(driver.find("state.frame_event_file = nullptr"), std::string::npos);
+  EXPECT_NE(driver.find("state.frame_consumer_file = nullptr"), std::string::npos);
+  const auto channel_case = driver.find("case IOCTL_LUMEN_VDD_OPEN_FRAME_CHANNEL:");
+  const auto dequeue_case = driver.find("case IOCTL_LUMEN_VDD_DEQUEUE_FRAME:", channel_case);
+  ASSERT_NE(channel_case, std::string::npos);
+  ASSERT_NE(dequeue_case, std::string::npos);
+  const auto channel = driver.substr(channel_case, dequeue_case - channel_case);
+  EXPECT_LT(channel.find("*output = {};"), channel.find("open_authenticated_requestor_process("));
+  EXPECT_LT(channel.find("transfer_handles_to_requestor("), channel.find("state->frame_consumer_file = file;"));
+
+  EXPECT_NE(host.find("SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION"), std::string::npos);
+  EXPECT_NE(host.find("channel_source != event_source"), std::string::npos);
+  EXPECT_NE(
+    host.find("availability_event = reinterpret_cast<HANDLE>(event_response.event_handle)"),
+    std::string::npos
+  );
+  EXPECT_EQ(host.find("OpenProcess("), std::string::npos);
+  EXPECT_EQ(host.find("DuplicateHandle("), std::string::npos);
+  EXPECT_NE(inf.find("UmdfImpersonationLevel=Impersonation"), std::string::npos);
 }
 
 TEST(VirtualDisplayHdrEdidPolicy, UsesStandardHdr10Bt2020CtaWithoutVendorPayload) {
@@ -1138,27 +1238,39 @@ TEST(VirtualDisplayDirectFrameValidation, ValidatesInitializationTransportPublis
     frame_io_e::unsupported
   );
   EXPECT_EQ(
+    validate_frame_abi_contract(
+      frame_io_e::ok,
+      5,
+      LUMEN_VDD_ABI_VERSION,
+      0b1111,
+      required_capabilities
+    ),
+    frame_io_e::unsupported
+  );
+  EXPECT_EQ(
     validate_frame_abi_contract(frame_io_e::ok, 5, 5, 0b0011, required_capabilities),
     frame_io_e::unsupported
   );
 
-  frame_channel_source_identity_t publisher {9, 42, 0, 1001, 0};
-  EXPECT_TRUE(valid_frame_channel_source_identity(publisher, 9));
-  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 0));
-  publisher.generation = 8;
-  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
-  publisher.generation = 9;
-  publisher.process_id = 0;
-  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
-  publisher.process_id = 42;
-  publisher.process_creation_time = 0;
-  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
-  publisher.process_creation_time = 1001;
-  publisher.source_reserved = 1;
-  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
-  publisher.source_reserved = 0;
-  publisher.response_reserved = 1;
-  EXPECT_FALSE(valid_frame_channel_source_identity(publisher, 9));
+  frame_channel_source_identity_t recipient {9, 42, 0, 1001, 0};
+  EXPECT_TRUE(valid_frame_channel_source_identity(recipient, 9, 42, 1001));
+  EXPECT_FALSE(valid_frame_channel_source_identity(recipient, 0, 42, 1001));
+  recipient.generation = 8;
+  EXPECT_FALSE(valid_frame_channel_source_identity(recipient, 9, 42, 1001));
+  recipient.generation = 9;
+  EXPECT_FALSE(valid_frame_channel_source_identity(recipient, 9, 43, 1001));
+  EXPECT_FALSE(valid_frame_channel_source_identity(recipient, 9, 42, 1002));
+  recipient.process_id = 0;
+  EXPECT_FALSE(valid_frame_channel_source_identity(recipient, 9, 42, 1001));
+  recipient.process_id = 42;
+  recipient.process_creation_time = 0;
+  EXPECT_FALSE(valid_frame_channel_source_identity(recipient, 9, 42, 1001));
+  recipient.process_creation_time = 1001;
+  recipient.source_reserved = 1;
+  EXPECT_FALSE(valid_frame_channel_source_identity(recipient, 9, 42, 1001));
+  recipient.source_reserved = 0;
+  recipient.response_reserved = 1;
+  EXPECT_FALSE(valid_frame_channel_source_identity(recipient, 9, 42, 1001));
 
   const frame_resources_t resources {
     9,

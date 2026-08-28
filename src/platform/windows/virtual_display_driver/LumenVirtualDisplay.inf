@@ -58,6 +58,7 @@ UmdfKernelModeClientPolicy=AllowKernelModeClients
 
 [LumenVdd_Service]
 UmdfLibraryVersion=2.25.0
+UmdfImpersonationLevel=Impersonation
 ServiceBinary=%13%\LumenVirtualDisplay.dll
 UmdfExtensions=IddCx0102
 

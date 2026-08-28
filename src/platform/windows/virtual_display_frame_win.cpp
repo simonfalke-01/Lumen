@@ -285,7 +285,7 @@ namespace platf::virtual_display {
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION,
         nullptr
       );
       if (handle == INVALID_HANDLE_VALUE) {
@@ -506,9 +506,19 @@ namespace platf::virtual_display {
           native_status
         );
       }
+      const auto host_process_id = GetCurrentProcessId();
+      const auto host_process_creation_time = packed_process_creation_time(GetCurrentProcess(), &native_status);
+      if (host_process_id == 0 || host_process_creation_time == 0) {
+        return fail(
+          direct_frame_init_stage_e::publisher_identity,
+          frame_io_e::invalid_data,
+          direct_frame_native_domain_e::win32,
+          native_status
+        );
+      }
       const LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST event_request {
         generation,
-        GetCurrentProcessId(),
+        host_process_id,
         0,
       };
       LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE event_response {};
@@ -539,7 +549,13 @@ namespace platf::virtual_display {
           native_status
         );
       }
-      if (!valid_frame_channel_source_identity(event_source, generation)) {
+      availability_event = reinterpret_cast<HANDLE>(event_response.event_handle);
+      if (!valid_frame_channel_source_identity(
+            event_source,
+            generation,
+            host_process_id,
+            host_process_creation_time
+          )) {
         return fail(
           direct_frame_init_stage_e::publisher_identity,
           frame_io_e::invalid_data,
@@ -555,42 +571,13 @@ namespace platf::virtual_display {
           direct_frame_handle_kind_e::availability_event
         );
       }
-      direct_frame_native_domain_e publisher_domain = direct_frame_native_domain_e::logical;
-      if (!bind_source_process(
-            event_response.source_process_id,
-            event_response.source_process_creation_time,
-            publisher_domain,
-            native_status
-          )) {
-        return fail(
-          direct_frame_init_stage_e::publisher_process_open,
-          frame_io_e::invalid_data,
-          publisher_domain,
-          native_status
-        );
-      }
-      direct_frame_native_domain_e duplicate_domain = direct_frame_native_domain_e::logical;
-      if (!duplicate_source_handle(
-            event_response.event_handle,
-            availability_event,
-            duplicate_domain,
-            native_status
-          )) {
-        return fail(
-          direct_frame_init_stage_e::frame_event_duplicate,
-          frame_io_e::invalid_data,
-          duplicate_domain,
-          native_status,
-          direct_frame_handle_kind_e::availability_event
-        );
-      }
 
       const auto deadline = std::chrono::steady_clock::now() + std::max(timeout, 0ms);
       LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE response {};
       while (true) {
         const LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST request {
           generation,
-          GetCurrentProcessId(),
+          host_process_id,
           0,
         };
         const auto status = ioctl(
@@ -629,26 +616,22 @@ namespace platf::virtual_display {
         response.source_process_creation_time,
         response.reserved,
       };
-      if (!valid_frame_channel_source_identity(channel_source, generation) ||
+      if (!valid_frame_channel_source_identity(
+            channel_source,
+            generation,
+            host_process_id,
+            host_process_creation_time
+          ) ||
           channel_source != event_source ||
           response.slot_count != LUMEN_VDD_FRAME_SLOT_COUNT ||
           (response.texture_format != LUMEN_VDD_FRAME_FORMAT_BGRA8 &&
            response.texture_format != LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT) ||
           response.color_transform_version == 0) {
+        close_response_handles(response);
         return fail(
           direct_frame_init_stage_e::frame_channel_contract,
           frame_io_e::invalid_data,
           direct_frame_native_domain_e::logical
-        );
-      }
-      if (!duplicate_response_handles(response, diagnostic)) {
-        return fail(
-          diagnostic.stage,
-          frame_io_e::transport_error,
-          diagnostic.domain,
-          diagnostic.native_status,
-          diagnostic.handle_kind,
-          diagnostic.handle_slot
         );
       }
       const auto format = response.texture_format == LUMEN_VDD_FRAME_FORMAT_RGBA16_FLOAT ?
@@ -1295,162 +1278,6 @@ namespace platf::virtual_display {
       );
     }
 
-    bool bind_source_process(
-      const std::uint32_t process_id,
-      const std::uint64_t creation_time,
-      direct_frame_native_domain_e &domain,
-      DWORD &native_status
-    ) noexcept {
-      domain = direct_frame_native_domain_e::logical;
-      native_status = ERROR_SUCCESS;
-      if (source_process != nullptr) {
-        if (process_id != source_process_id || creation_time != source_process_creation_time) {
-          return false;
-        }
-        const auto wait_status = WaitForSingleObject(source_process, 0);
-        if (wait_status == WAIT_TIMEOUT) {
-          return true;
-        }
-        if (wait_status == WAIT_FAILED) {
-          domain = direct_frame_native_domain_e::win32;
-          native_status = GetLastError();
-        } else {
-          domain = direct_frame_native_domain_e::wait;
-          native_status = wait_status;
-        }
-        return false;
-      }
-      HANDLE process = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
-      if (process == nullptr) {
-        domain = direct_frame_native_domain_e::win32;
-        native_status = GetLastError();
-        return false;
-      }
-      auto close_process = util::fail_guard([&]() {
-        CloseHandle(process);
-      });
-      const auto wait_status = WaitForSingleObject(process, 0);
-      if (wait_status != WAIT_TIMEOUT) {
-        if (wait_status == WAIT_FAILED) {
-          domain = direct_frame_native_domain_e::win32;
-          native_status = GetLastError();
-        } else {
-          domain = direct_frame_native_domain_e::wait;
-          native_status = wait_status;
-        }
-        return false;
-      }
-      const auto actual_creation_time = packed_process_creation_time(process, &native_status);
-      if (actual_creation_time == 0) {
-        domain = direct_frame_native_domain_e::win32;
-        return false;
-      }
-      if (actual_creation_time != creation_time) {
-        native_status = ERROR_SUCCESS;
-        return false;
-      }
-      close_process.disable();
-      source_process = process;
-      source_process_id = process_id;
-      source_process_creation_time = creation_time;
-      return true;
-    }
-
-    bool duplicate_source_handle(
-      const std::uint64_t raw_source,
-      HANDLE &duplicate,
-      direct_frame_native_domain_e &domain,
-      DWORD &native_status
-    ) const noexcept {
-      duplicate = nullptr;
-      domain = direct_frame_native_domain_e::logical;
-      native_status = ERROR_SUCCESS;
-      if (source_process == nullptr || raw_source == 0) {
-        return false;
-      }
-      const auto wait_status = WaitForSingleObject(source_process, 0);
-      if (wait_status != WAIT_TIMEOUT) {
-        if (wait_status == WAIT_FAILED) {
-          domain = direct_frame_native_domain_e::win32;
-          native_status = GetLastError();
-        } else {
-          domain = direct_frame_native_domain_e::wait;
-          native_status = wait_status;
-        }
-        return false;
-      }
-      if (!DuplicateHandle(
-            source_process,
-            reinterpret_cast<HANDLE>(raw_source),
-            GetCurrentProcess(),
-            &duplicate,
-            0,
-            FALSE,
-            DUPLICATE_SAME_ACCESS
-          )) {
-        domain = direct_frame_native_domain_e::win32;
-        native_status = GetLastError();
-        return false;
-      }
-      return true;
-    }
-
-    bool duplicate_response_handles(
-      LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response,
-      direct_frame_init_diagnostic_t &diagnostic
-    ) const noexcept {
-      std::array<HANDLE, LUMEN_VDD_FRAME_SLOT_COUNT * 2> duplicates {};
-      std::size_t count = 0;
-      const auto close_partial = [&]() {
-        for (std::size_t index = 0; index < count; ++index) {
-          CloseHandle(duplicates[index]);
-        }
-      };
-      for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
-        direct_frame_native_domain_e domain = direct_frame_native_domain_e::logical;
-        DWORD native_status = ERROR_SUCCESS;
-        if (!duplicate_source_handle(response.texture_handles[slot], duplicates[count], domain, native_status)) {
-          record_direct_frame_initialization_result(
-            diagnostic,
-            direct_frame_init_stage_e::texture_handle_duplicate,
-            frame_io_e::transport_error,
-            domain,
-            native_status,
-            direct_frame_handle_kind_e::texture,
-            static_cast<std::uint32_t>(slot)
-          );
-          close_partial();
-          return false;
-        }
-        ++count;
-      }
-      for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
-        direct_frame_native_domain_e domain = direct_frame_native_domain_e::logical;
-        DWORD native_status = ERROR_SUCCESS;
-        if (!duplicate_source_handle(response.fence_handles[slot], duplicates[count], domain, native_status)) {
-          record_direct_frame_initialization_result(
-            diagnostic,
-            direct_frame_init_stage_e::fence_handle_duplicate,
-            frame_io_e::transport_error,
-            domain,
-            native_status,
-            direct_frame_handle_kind_e::fence,
-            static_cast<std::uint32_t>(slot)
-          );
-          close_partial();
-          return false;
-        }
-        ++count;
-      }
-      for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
-        response.texture_handles[slot] = reinterpret_cast<std::uint64_t>(duplicates[slot]);
-        response.fence_handles[slot] = reinterpret_cast<std::uint64_t>(
-          duplicates[LUMEN_VDD_FRAME_SLOT_COUNT + slot]
-        );
-      }
-      return true;
-    }
-
     static void close_response_handles(const LUMEN_VDD_OPEN_FRAME_CHANNEL_RESPONSE &response) noexcept {
       for (std::size_t slot = 0; slot < LUMEN_VDD_FRAME_SLOT_COUNT; ++slot) {
         if (response.texture_handles[slot] != 0) {
@@ -1482,9 +1309,6 @@ namespace platf::virtual_display {
       if (device_handle != INVALID_HANDLE_VALUE) {
         CloseHandle(std::exchange(device_handle, INVALID_HANDLE_VALUE));
       }
-      if (source_process != nullptr) {
-        CloseHandle(std::exchange(source_process, nullptr));
-      }
       color_transforms.clear();
     }
 
@@ -1494,9 +1318,6 @@ namespace platf::virtual_display {
     bool selection_preference_submitted {};  ///< Prepared-mode adapter-preference fact.
     mutable std::mutex mutex;  ///< Serializes IOCTLs and slot ownership.
     HANDLE device_handle {INVALID_HANDLE_VALUE};  ///< Concrete secured VDD device interface.
-    HANDLE source_process {};  ///< Validated live WUDFHost source for reverse handle duplication.
-    std::uint32_t source_process_id {};  ///< Exact source PID retained with its process handle.
-    std::uint64_t source_process_creation_time {};  ///< Exact source creation FILETIME preventing PID reuse.
     HANDLE availability_event {};  ///< Driver-published resource/frame availability event.
     HANDLE cancel_event {};  ///< Host cancellation event for bounded waits.
     frame_resources_t resources;  ///< Validated imported resource metadata.

@@ -41,7 +41,7 @@ try {
         '{"abi":3,"header_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","project_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
     Write-TestFile `
         (Join-Path $source 'src/platform/windows/virtual_display_driver/LumenVirtualDisplayProtocol.h') `
-        '#define LUMEN_VDD_ABI_VERSION 5u'
+        '#define LUMEN_VDD_ABI_VERSION 6u'
     $shaderPaths = @(
         'convert_yuv420_packed_uv_type0_ps_vdd_color_transform.hlsl',
         'convert_yuv420_packed_uv_type0s_ps_vdd_color_transform.hlsl',
