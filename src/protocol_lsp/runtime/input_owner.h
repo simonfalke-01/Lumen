@@ -81,6 +81,24 @@ namespace lumen::lsp::runtime {
     bool configure(const InputSessionMapping &mapping) noexcept;
 
     /**
+     * @brief Preflight whether `configure()` has no remaining fallible prerequisite.
+     *
+     * @param mapping Candidate fresh authority mapping.
+     * @return True when the worker/platform owner is stable and the mapping is valid.
+     */
+    [[nodiscard]] bool ready_for_configuration(const InputSessionMapping &mapping) const noexcept;
+
+    /**
+     * @brief Commit a mapping previously accepted by `ready_for_configuration()`.
+     *
+     * This operation performs no allocation and has no failure return. The
+     * caller must serialize the preflight and commit with session authority.
+     *
+     * @param mapping Preflighted fresh mapping.
+     */
+    void commit_configuration(const InputSessionMapping &mapping) noexcept;
+
+    /**
      * @brief Validate SSRC/PT and enqueue one authenticated plaintext RTP packet.
      *
      * @param peer Exact receive five-tuple.

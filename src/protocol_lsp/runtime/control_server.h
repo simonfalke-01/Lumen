@@ -110,6 +110,22 @@ namespace lumen::lsp::runtime {
       std::uint32_t connection_generation,
       const StopRequestPayload &request
     ) noexcept = 0;
+
+    /**
+     * @brief Transfer an existing session to this fresh authenticated connection.
+     *
+     * @param peer Fresh DTLS association.
+     * @param client Authenticated original owner.
+     * @param connection_generation Fresh connection generation.
+     * @param request Exact ATTACH request.
+     * @return Rotated session authority or stable failure.
+     */
+    [[nodiscard]] virtual std::expected<AttachResponsePayload, ControlStatus> attach_input(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      std::uint32_t connection_generation,
+      const AttachRequestPayload &request
+    ) noexcept = 0;
   };
 
   /**
@@ -270,6 +286,7 @@ namespace lumen::lsp::runtime {
      * @param spki_sha256 Exact DTLS certificate SPKI pin.
      * @param trust_store Persistent LSP trust store.
      * @param applications Application snapshot provider.
+     * @param start_handler START, ATTACH, and STOP product authority owner.
      * @param crypto Randomness and Ed25519 provider.
      * @param transport Exact DTLS record sender.
      * @param maximum_connections Bound from one through 64.

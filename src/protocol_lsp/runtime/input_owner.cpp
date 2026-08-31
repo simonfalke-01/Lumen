@@ -93,6 +93,11 @@ namespace lumen::lsp::runtime {
       if (!ready_ || !mapping.valid()) {
         return false;
       }
+      commit_configuration(mapping);
+      return true;
+    }
+
+    void commit_configuration(const InputSessionMapping &mapping) noexcept {
       std::scoped_lock lock(mutex_);
       input::neutralize_lsp_platform_input(*platform_);
       head_ = 0;
@@ -111,7 +116,11 @@ namespace lumen::lsp::runtime {
       controller_latest_ = {};
       touches_ = {};
       next_controller_sequence_ = 1;
-      return true;
+    }
+
+    bool ready_for_configuration(const InputSessionMapping &mapping) const noexcept {
+      std::scoped_lock lock(mutex_);
+      return ready_ && mapping.valid();
     }
 
     bool receive(const PeerEndpoint &peer, const std::span<const std::uint8_t> packet) noexcept {
@@ -785,6 +794,16 @@ namespace lumen::lsp::runtime {
 
   bool InputOwner::configure(const InputSessionMapping &mapping) noexcept {
     return impl_ && impl_->configure(mapping);
+  }
+
+  bool InputOwner::ready_for_configuration(const InputSessionMapping &mapping) const noexcept {
+    return impl_ && impl_->ready_for_configuration(mapping);
+  }
+
+  void InputOwner::commit_configuration(const InputSessionMapping &mapping) noexcept {
+    if (impl_) {
+      impl_->commit_configuration(mapping);
+    }
   }
 
   bool InputOwner::receive(const PeerEndpoint &peer, const std::span<const std::uint8_t> packet) noexcept {

@@ -74,12 +74,49 @@ namespace lumen::lsp {
   AuthorityResult SessionAuthority::attach(
     const AuthenticatedClient &client,
     const Identifier128 &session_id,
-    const Secret256 &attach_token
+    const Secret256 &attach_token,
+    const std::optional<Secret256> replacement_attach_token
   ) noexcept {
-    if (state_ != SessionState::detached) {
+    const auto prepared = prepare_attach(client, session_id, attach_token, replacement_attach_token);
+    if (prepared != AuthorityResult::accepted) {
+      return prepared;
+    }
+    if (state_ == SessionState::streaming) {
+      input_baseline_complete_ = false;
+      if (!neutralize(NeutralizationReason::transport_loss)) {
+        state_ = SessionState::faulted;
+        return AuthorityResult::neutralization_failed;
+      }
+      state_ = SessionState::detached;
+    }
+    if (!input_neutralized_) {
+      state_ = SessionState::faulted;
+      return AuthorityResult::neutralization_failed;
+    }
+
+    generations_.connection = client.connection_generation;
+    ++generations_.input;
+    if (replacement_attach_token) {
+      attach_token_ = *replacement_attach_token;
+    }
+    effective_permissions_ = client.permissions;
+    revocation_generation_ = client.revocation_generation;
+    input_baseline_complete_ = false;
+    state_ = SessionState::streaming;
+    return AuthorityResult::accepted;
+  }
+
+  AuthorityResult SessionAuthority::prepare_attach(
+    const AuthenticatedClient &client,
+    const Identifier128 &session_id,
+    const Secret256 &attach_token,
+    const std::optional<Secret256> &replacement_attach_token
+  ) const noexcept {
+    if (state_ != SessionState::detached && state_ != SessionState::streaming) {
       return AuthorityResult::invalid_state;
     }
-    if (!client.valid() || is_zero(session_id) || is_zero(attach_token)) {
+    if (!client.valid() || is_zero(session_id) || is_zero(attach_token) ||
+        (replacement_attach_token && is_zero(*replacement_attach_token))) {
       return AuthorityResult::malformed;
     }
     if (!client.permissions.contains(Permission::start_attach)) {
@@ -98,20 +135,9 @@ namespace lumen::lsp {
         generations_.input == std::numeric_limits<std::uint32_t>::max()) {
       return AuthorityResult::generation_exhausted;
     }
-    if (client.connection_generation != generations_.connection + 1U) {
+    if (client.connection_generation <= generations_.connection) {
       return AuthorityResult::stale_generation;
     }
-    if (!input_neutralized_) {
-      state_ = SessionState::faulted;
-      return AuthorityResult::neutralization_failed;
-    }
-
-    generations_.connection = client.connection_generation;
-    ++generations_.input;
-    effective_permissions_ = client.permissions;
-    revocation_generation_ = client.revocation_generation;
-    input_baseline_complete_ = false;
-    state_ = SessionState::streaming;
     return AuthorityResult::accepted;
   }
 

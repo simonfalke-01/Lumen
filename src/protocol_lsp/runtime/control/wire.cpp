@@ -42,7 +42,7 @@ namespace lumen::lsp::runtime {
       value.max_byte_string_bytes = ed25519_signature_size;
       value.max_text_bytes = 512;
       value.max_array_elements = maximum_applications;
-      value.max_map_entries = 15;
+      value.max_map_entries = 16;
       value.max_container_depth = 3;
       return value;
     }
@@ -260,5 +260,38 @@ namespace lumen::lsp::runtime {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({{1, wire_version}, {2, static_cast<std::uint8_t>(status)}});
+  }
+
+  std::expected<AttachRequestPayload, ControlWireError> decode_attach(const std::span<const std::uint8_t> payload) {
+    const auto map = decode_map(payload, 4);
+    AttachRequestPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || !fixed_bytes((*map)[1].second, result.session_id) ||
+        !fixed_bytes((*map)[2].second, result.attach_token) || !fixed_bytes((*map)[3].second, result.intent_id) ||
+        is_zero(result.session_id) || is_zero(result.attach_token) || is_zero(result.intent_id)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_attach_response(const AttachResponsePayload &payload) {
+    if (payload.status != ControlStatus::success || is_zero(payload.session_id) || is_zero(payload.attach_token) ||
+        payload.connection_generation == 0 || payload.stream_generation == 0 || payload.input_generation == 0 ||
+        payload.input_ssrc == 0 || payload.acknowledgement_ssrc == 0 || payload.input_ssrc == payload.acknowledgement_ssrc ||
+        payload.input_payload_type < 96 || payload.input_payload_type > 127 || payload.pointer_rate < 125 ||
+        payload.pointer_rate > 16'000 || payload.controller_rate < 125 || payload.controller_rate > 2'000 ||
+        payload.sensor_rate < 125 || payload.sensor_rate > 4'000 || payload.reconciliation_rate < 50 ||
+        payload.reconciliation_rate > 1'000 || payload.reserved_input_wire_bits_per_second == 0 ||
+        payload.reserved_input_wire_bits_per_second > 32'000'000 || !payload.baseline_required) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version}, {2, static_cast<std::uint8_t>(payload.status)}, {3, bytes(payload.session_id)},
+      {4, bytes(payload.attach_token)}, {5, payload.connection_generation}, {6, payload.stream_generation},
+      {7, payload.input_generation}, {8, payload.input_ssrc}, {9, payload.acknowledgement_ssrc},
+      {10, payload.input_payload_type}, {11, payload.pointer_rate}, {12, payload.controller_rate},
+      {13, payload.sensor_rate}, {14, payload.reconciliation_rate}, {15, payload.reserved_input_wire_bits_per_second},
+      {16, cbor::Value {payload.baseline_required}},
+    });
   }
 }  // namespace lumen::lsp::runtime

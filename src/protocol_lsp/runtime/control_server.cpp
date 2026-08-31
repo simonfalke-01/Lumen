@@ -371,6 +371,8 @@ namespace lumen::lsp::runtime {
           return list_applications(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::start:
           return start_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::attach:
+          return attach_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::stop:
           return stop_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::client_hello:
@@ -379,6 +381,7 @@ namespace lumen::lsp::runtime {
         case ControlMessageType::auth_response:
         case ControlMessageType::applications:
         case ControlMessageType::start_response:
+        case ControlMessageType::attach_response:
         case ControlMessageType::stop_response:
           return send_error(connection, frame, parsed.header, response_type(message_type), ControlStatus::unsupported, now_microseconds);
       }
@@ -442,6 +445,8 @@ namespace lumen::lsp::runtime {
           return ControlMessageType::applications;
         case ControlMessageType::start:
           return ControlMessageType::start_response;
+        case ControlMessageType::attach:
+          return ControlMessageType::attach_response;
         case ControlMessageType::stop:
           return ControlMessageType::stop_response;
         case ControlMessageType::server_hello:
@@ -449,6 +454,7 @@ namespace lumen::lsp::runtime {
         case ControlMessageType::auth_response:
         case ControlMessageType::applications:
         case ControlMessageType::start_response:
+        case ControlMessageType::attach_response:
         case ControlMessageType::stop_response:
           return request;
       }
@@ -773,6 +779,35 @@ namespace lumen::lsp::runtime {
                            status != ControlStatus::success,
                            now_microseconds
                          );
+    }
+
+    bool attach_input(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (!connection.authenticated_client ||
+          !connection.authenticated_client->permissions.contains(Permission::start_attach) ||
+          !connection.authenticated_client->permissions.contains(Permission::input)) {
+        return send_error(connection, request, header, ControlMessageType::attach_response, ControlStatus::permission_denied, now_microseconds);
+      }
+      const auto decoded = decode_attach(payload);
+      if (!decoded) {
+        return send_error(connection, request, header, ControlMessageType::attach_response, ControlStatus::malformed, now_microseconds);
+      }
+      const auto attached = start_handler_.attach_input(
+        connection.peer,
+        *connection.authenticated_client,
+        connection.generation,
+        *decoded
+      );
+      if (!attached) {
+        return send_error(connection, request, header, ControlMessageType::attach_response, attached.error(), now_microseconds);
+      }
+      const auto response = encode_attach_response(*attached);
+      return response && send_response(connection, request, header, ControlMessageType::attach_response, *response, false, now_microseconds);
     }
 
     const HostIdentity &identity_;  ///< Stable LSP-only identity.

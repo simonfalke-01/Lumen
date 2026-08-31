@@ -68,6 +68,7 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t runtime_receive_batch = 64;
     constexpr std::uint32_t runtime_poll_milliseconds = 2;
     constexpr std::uint64_t invitation_lifetime_seconds = 10U * 60U;
+    constexpr std::uint64_t attach_grace_microseconds = 10U * 1'000'000U;
 
     std::string lowercase_hex(const std::span<const std::uint8_t> bytes) {
       constexpr std::string_view digits = "0123456789abcdef";
@@ -715,6 +716,15 @@ namespace lumen::lsp::runtime {
       }
       active_client_ = authority_client;
       active_process_generation_ = launched.process_generation;
+      active_rates_ = {
+        .pointer = request.pointer_rate,
+        .controller = request.controller_rate,
+        .sensor = request.sensor_rate,
+        .reconciliation = request.reconciliation_rate,
+        .budget = total_budget,
+      };
+      last_attach_intent_ = {};
+      detached_deadline_microseconds_ = 0;
       ssrc_registry_ = std::move(*registry);
       ++next_stream_generation_;
       return StartResponsePayload {
@@ -730,6 +740,123 @@ namespace lumen::lsp::runtime {
         .sensor_rate = request.sensor_rate,
         .reconciliation_rate = request.reconciliation_rate,
         .reserved_input_wire_bits_per_second = total_budget,
+        .baseline_required = true,
+      };
+    }
+
+    std::expected<AttachResponsePayload, ControlStatus> attach_input(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      const std::uint32_t connection_generation,
+      const AttachRequestPayload &request
+    ) noexcept override {
+      std::scoped_lock lock(session_mutex_);
+      if (request.intent_id == last_attach_intent_ || active_process_generation_ == 0 || proc::proc.running() <= 0) {
+        return std::unexpected(ControlStatus::stale_generation);
+      }
+      const auto previous_mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
+      if (previous_mapping && previous_mapping->peer != peer && pending_association_close_count_ == pending_association_closes_.size()) {
+        return std::unexpected(ControlStatus::busy);
+      }
+      Secret256 replacement_token {};
+      std::array<std::uint8_t, 8> ssrc_bytes {};
+      if (!crypto_->random(replacement_token) || !crypto_->random(ssrc_bytes)) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      auto input_ssrc = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.first<4>());
+      auto acknowledgement_ssrc = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<4, 4>());
+      if (input_ssrc == 0) {
+        input_ssrc = 1;
+      }
+      if (acknowledgement_ssrc == 0 || acknowledgement_ssrc == input_ssrc) {
+        acknowledgement_ssrc = input_ssrc == std::numeric_limits<std::uint32_t>::max() ? input_ssrc - 1U : input_ssrc + 1U;
+      }
+      const AuthenticatedClient authority_client {
+        .client_id = client.client_id,
+        .connection_generation = connection_generation,
+        .revocation_generation = client.revocation_generation,
+        .permissions = client.permissions,
+      };
+      const auto prepared = authority_.prepare_attach(
+        authority_client,
+        request.session_id,
+        request.attach_token,
+        replacement_token
+      );
+      if (prepared == AuthorityResult::permission_denied) {
+        return std::unexpected(ControlStatus::permission_denied);
+      }
+      if (prepared == AuthorityResult::token_mismatch) {
+        return std::unexpected(ControlStatus::authentication_failed);
+      }
+      if (prepared == AuthorityResult::not_owner || prepared == AuthorityResult::stale_generation ||
+          prepared == AuthorityResult::generation_exhausted) {
+        return std::unexpected(ControlStatus::stale_generation);
+      }
+      if (prepared != AuthorityResult::accepted) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      const auto prior_snapshot = authority_.snapshot();
+      if (prior_snapshot.generations.input == std::numeric_limits<std::uint32_t>::max()) {
+        return std::unexpected(ControlStatus::stale_generation);
+      }
+      const auto next_input_generation = prior_snapshot.generations.input + 1U;
+      constexpr std::uint8_t input_payload_type = 96;
+      const SsrcAssignment assignment {
+        .ssrc = input_ssrc,
+        .payload_type = input_payload_type,
+        .lane = MediaLane::input,
+        .direction = MediaDirection::client_to_host,
+        .format = PayloadFormat::lsp_input,
+        .clock_rate = 1'000'000,
+        .generation = next_input_generation,
+      };
+      auto registry = SsrcRegistry::create(std::span<const SsrcAssignment> {&assignment, 1});
+      const InputSessionMapping mapping {
+        .peer = peer,
+        .client_id = client.client_id,
+        .connection_generation = connection_generation,
+        .session_generation = prior_snapshot.generations.stream,
+        .input_generation = next_input_generation,
+        .input_ssrc = input_ssrc,
+        .acknowledgement_ssrc = acknowledgement_ssrc,
+        .input_payload_type = input_payload_type,
+      };
+      if (!registry || !input_owner_ || !input_owner_->ready_for_configuration(mapping)) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      const auto result = authority_.attach(
+        authority_client,
+        request.session_id,
+        request.attach_token,
+        replacement_token
+      );
+      if (result != AuthorityResult::accepted) {
+        return std::unexpected(result == AuthorityResult::neutralization_failed ? ControlStatus::internal_failure : ControlStatus::stale_generation);
+      }
+      input_owner_->commit_configuration(mapping);
+      const auto snapshot = authority_.snapshot();
+      active_client_ = authority_client;
+      ssrc_registry_ = std::move(*registry);
+      last_attach_intent_ = request.intent_id;
+      detached_deadline_microseconds_ = 0;
+      if (previous_mapping && previous_mapping->peer != peer) {
+        queue_association_close(std::move(previous_mapping->peer));
+      }
+      return AttachResponsePayload {
+        .session_id = snapshot.session_id,
+        .attach_token = replacement_token,
+        .connection_generation = snapshot.generations.connection,
+        .stream_generation = snapshot.generations.stream,
+        .input_generation = snapshot.generations.input,
+        .input_ssrc = input_ssrc,
+        .acknowledgement_ssrc = acknowledgement_ssrc,
+        .input_payload_type = input_payload_type,
+        .pointer_rate = active_rates_.pointer,
+        .controller_rate = active_rates_.controller,
+        .sensor_rate = active_rates_.sensor,
+        .reconciliation_rate = active_rates_.reconciliation,
+        .reserved_input_wire_bits_per_second = active_rates_.budget,
         .baseline_required = true,
       };
     }
@@ -761,6 +888,8 @@ namespace lumen::lsp::runtime {
       active_process_generation_ = 0;
       active_client_.reset();
       ssrc_registry_.reset();
+      detached_deadline_microseconds_ = 0;
+      last_attach_intent_ = {};
       return process_stopped ? ControlStatus::success : ControlStatus::internal_failure;
     }
 
@@ -810,6 +939,7 @@ namespace lumen::lsp::runtime {
           if (service_) {
             service_->receive(datagram.peer, datagram.payload);
           }
+          process_pending_association_closes();
           if (classify_packet(datagram.payload) == PacketClass::dtls) {
             refresh_dtls_timer(datagram.peer, datagram.received_at_microseconds);
           }
@@ -822,6 +952,7 @@ namespace lumen::lsp::runtime {
           control_->tick(now);
         }
         process_dtls_timers(now);
+        process_detached_grace(now);
       }
       active_ = false;
     }
@@ -864,6 +995,46 @@ namespace lumen::lsp::runtime {
         if (result == WolfsslDtlsOperationResult::accepted) {
           refresh_dtls_timer(peer, now_microseconds);
         }
+      }
+    }
+
+    void queue_association_close(PeerEndpoint peer) noexcept {
+      for (std::size_t index = 0; index < pending_association_close_count_; ++index) {
+        if (pending_association_closes_[index] == peer) {
+          return;
+        }
+      }
+      if (pending_association_close_count_ < pending_association_closes_.size()) {
+        pending_association_closes_[pending_association_close_count_++] = std::move(peer);
+      }
+    }
+
+    void process_pending_association_closes() noexcept {
+      std::scoped_lock lock(session_mutex_);
+      while (pending_association_close_count_ != 0) {
+        auto peer = std::move(pending_association_closes_[--pending_association_close_count_]);
+        pending_association_closes_[pending_association_close_count_] = {};
+        if (dtls_) {
+          (void)dtls_->close_association(peer);
+        }
+      }
+    }
+
+    void process_detached_grace(const std::uint64_t now_microseconds) noexcept {
+      std::scoped_lock lock(session_mutex_);
+      if (detached_deadline_microseconds_ == 0 || now_microseconds < detached_deadline_microseconds_) {
+        return;
+      }
+      detached_deadline_microseconds_ = 0;
+      if (authority_.snapshot().state == SessionState::detached) {
+        (void)authority_.stop_from_host(NeutralizationReason::transport_loss);
+        if (active_process_generation_ != 0) {
+          (void)proc::proc.terminate_lsp_generation(active_process_generation_);
+          active_process_generation_ = 0;
+        }
+        active_client_.reset();
+        ssrc_registry_.reset();
+        last_attach_intent_ = {};
       }
     }
 
@@ -923,6 +1094,7 @@ namespace lumen::lsp::runtime {
         const auto mapping = runtime.input_owner_->mapping();
         if (mapping && mapping->peer == peer) {
           (void)runtime.authority_.transport_lost(mapping->connection_generation);
+          runtime.detached_deadline_microseconds_ = monotonic_microseconds() + attach_grace_microseconds;
           runtime.ssrc_registry_.reset();
           runtime.active_client_.reset();
         }
@@ -1031,8 +1203,19 @@ namespace lumen::lsp::runtime {
     std::optional<SsrcRegistry> ssrc_registry_;  ///< Authenticated input SSRC mapping.
     std::uint32_t next_stream_generation_ {1};  ///< Next nonzero input-only session generation.
     std::uint64_t active_process_generation_ {};  ///< Generation-qualified LSP-owned application process.
+    struct ActiveRates {
+      std::uint32_t pointer {};  ///< Selected pointer reports/s.
+      std::uint32_t controller {};  ///< Selected controller reports/s.
+      std::uint32_t sensor {};  ///< Selected sensor reports/s.
+      std::uint32_t reconciliation {};  ///< Selected reconciliation reports/s.
+      std::uint64_t budget {};  ///< Reserved input wire bits/s.
+    } active_rates_;  ///< Retained input selection across ATTACH/rekey.
+    Identifier128 last_attach_intent_ {};  ///< Last consumed attach intent, preventing semantic replay.
+    std::uint64_t detached_deadline_microseconds_ {};  ///< Bounded process-hold deadline.
     mutable std::recursive_mutex session_mutex_;  ///< Synchronizes socket authority with the input apply worker.
     std::vector<DtlsTimer> dtls_timers_;  ///< Bounded association retransmission timers.
+    std::array<PeerEndpoint, 64> pending_association_closes_ {};  ///< Old associations retired after response submission.
+    std::size_t pending_association_close_count_ {};  ///< Live leading deferred-close entries.
     std::jthread worker_;  ///< Socket receive/control timer owner.
     std::optional<std::string> pairing_uri_;  ///< Current UI-bound invitation issuance copy.
     std::uint64_t pairing_expiration_utc_seconds_ {};  ///< Current invitation expiry.

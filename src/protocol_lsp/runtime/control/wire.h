@@ -30,6 +30,8 @@ namespace lumen::lsp::runtime {
     applications = 0x0101,  ///< Return the bounded application snapshot.
     start = 0x0200,  ///< Request the authenticated input-only session slice.
     start_response = 0x0201,  ///< Return exact input authority and SSRC/rate selection.
+    attach = 0x0202,  ///< Transfer an existing session to a fresh authenticated association.
+    attach_response = 0x0203,  ///< Return rotated authority, token, SSRCs, and baseline requirement.
     stop = 0x0204,  ///< Stop the authenticated client's own session.
     stop_response = 0x0205,  ///< Return the terminal owner-qualified stop outcome.
   };
@@ -143,6 +145,32 @@ namespace lumen::lsp::runtime {
     Identifier128 session_id {};  ///< Exact session identifier returned by START_RESPONSE.
   };
 
+  /** @brief Exact ATTACH four-key request map. */
+  struct AttachRequestPayload {
+    Identifier128 session_id {};  ///< Existing session identifier.
+    Secret256 attach_token {};  ///< Current single-use attach token.
+    Identifier128 intent_id {};  ///< Fresh nonzero idempotent attach intent identifier.
+  };
+
+  /** @brief Exact ATTACH_RESPONSE sixteen-key response map. */
+  struct AttachResponsePayload {
+    ControlStatus status {ControlStatus::success};  ///< Transfer outcome.
+    Identifier128 session_id {};  ///< Retained session identifier.
+    Secret256 attach_token {};  ///< Fresh replacement token; the presented token is retired.
+    std::uint32_t connection_generation {};  ///< New authoritative connection generation.
+    std::uint32_t stream_generation {};  ///< Retained stream-session generation.
+    std::uint32_t input_generation {};  ///< Advanced input authority generation.
+    std::uint32_t input_ssrc {};  ///< Fresh input SSRC for the new DTLS-SRTP keys.
+    std::uint32_t acknowledgement_ssrc {};  ///< Fresh host SRTCP sender SSRC.
+    std::uint8_t input_payload_type {};  ///< Fresh dynamic input payload type.
+    std::uint32_t pointer_rate {};  ///< Retained selected pointer rate.
+    std::uint32_t controller_rate {};  ///< Retained selected controller rate.
+    std::uint32_t sensor_rate {};  ///< Retained selected sensor rate.
+    std::uint32_t reconciliation_rate {};  ///< Retained selected reconciliation rate.
+    std::uint64_t reserved_input_wire_bits_per_second {};  ///< Retained reverse input budget.
+    bool baseline_required {true};  ///< Always true after authority transfer.
+  };
+
   /** @brief Decode exact CLIENT_HELLO deterministic CBOR. */
   [[nodiscard]] std::expected<ClientHelloPayload, ControlWireError> decode_client_hello(std::span<const std::uint8_t> payload);
 
@@ -181,4 +209,10 @@ namespace lumen::lsp::runtime {
 
   /** @brief Encode exact STOP_RESPONSE map `{1: version, 2: status}`. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_stop_response(ControlStatus status);
+
+  /** @brief Decode exact ATTACH deterministic CBOR. */
+  [[nodiscard]] std::expected<AttachRequestPayload, ControlWireError> decode_attach(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact ATTACH_RESPONSE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_attach_response(const AttachResponsePayload &payload);
 }  // namespace lumen::lsp::runtime

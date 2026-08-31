@@ -428,6 +428,51 @@ TEST(LspSessionAuthority, NeutralizesBeforeAttachAndRequiresFreshBaseline) {
   EXPECT_EQ(authority.authorize_input(owner.client_id, 11, 20, 61), lsp::AuthorityResult::baseline_required);
 }
 
+TEST(LspSessionAuthority, AttachPreflightIsReadOnlyAndSuccessfulRekeyRotatesToken) {
+  FakeNeutralizer neutralizer;
+  FakeTokenVerifier token_verifier;
+  lsp::SessionAuthority authority {neutralizer, &token_verifier};
+  auto owner = client();
+  const auto start = start_authority();
+  ASSERT_EQ(authority.start(owner, start), lsp::AuthorityResult::accepted);
+  ASSERT_EQ(authority.commit_input_baseline(owner, 20, 60), lsp::AuthorityResult::accepted);
+
+  auto fresh_owner = owner;
+  fresh_owner.connection_generation = 15;
+  const auto replacement = filled<32>(11);
+  EXPECT_EQ(
+    authority.prepare_attach(fresh_owner, start.session_id, filled<32>(10), replacement),
+    lsp::AuthorityResult::token_mismatch
+  );
+  EXPECT_EQ(neutralizer.calls, 0U);
+  EXPECT_EQ(authority.authorize_input(owner.client_id, 10, 20, 60), lsp::AuthorityResult::accepted);
+
+  EXPECT_EQ(
+    authority.prepare_attach(fresh_owner, start.session_id, start.attach_token, replacement),
+    lsp::AuthorityResult::accepted
+  );
+  EXPECT_EQ(neutralizer.calls, 0U);
+  EXPECT_EQ(authority.authorize_input(owner.client_id, 10, 20, 60), lsp::AuthorityResult::accepted);
+  ASSERT_EQ(
+    authority.attach(fresh_owner, start.session_id, start.attach_token, replacement),
+    lsp::AuthorityResult::accepted
+  );
+  EXPECT_EQ(neutralizer.calls, 1U);
+  EXPECT_EQ(authority.snapshot().generations.connection, 15U);
+  EXPECT_EQ(authority.snapshot().generations.input, 61U);
+
+  ASSERT_EQ(authority.transport_lost(15), lsp::AuthorityResult::accepted);
+  fresh_owner.connection_generation = 16;
+  EXPECT_EQ(
+    authority.prepare_attach(fresh_owner, start.session_id, start.attach_token),
+    lsp::AuthorityResult::token_mismatch
+  );
+  EXPECT_EQ(
+    authority.prepare_attach(fresh_owner, start.session_id, replacement),
+    lsp::AuthorityResult::accepted
+  );
+}
+
 TEST(LspSessionAuthority, RevocationNeutralizesBeforeInputRemainsDenied) {
   FakeNeutralizer neutralizer;
   FakeTokenVerifier token_verifier;

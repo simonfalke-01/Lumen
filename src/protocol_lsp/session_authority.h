@@ -190,20 +190,44 @@ namespace lumen::lsp {
     /**
      * @brief Transfer a held session to a fresh authenticated connection.
      *
-     * The supplied connection generation must be exactly the next value. Input
-     * generation advances internally, and input remains blocked until a new
-     * complete baseline is committed.
+     * The supplied connection generation must be strictly newer. This permits
+     * unrelated authenticated connections to consume host-wide generation
+     * values without weakening stale-association fencing. Input generation
+     * advances internally, and input remains blocked until a new complete
+     * baseline is committed. A valid ATTACH on a still-live association first
+     * neutralizes the old input authority for planned rekey.
      *
      * @param client Fresh authenticated connection for the same owner.
      * @param session_id Session identifier returned by START.
      * @param attach_token Secret returned by START.
+     * @param replacement_attach_token Optional fresh token that atomically retires the presented token on success.
      * @return Exact transition result.
      */
     AuthorityResult attach(
       const AuthenticatedClient &client,
       const Identifier128 &session_id,
-      const Secret256 &attach_token
+      const Secret256 &attach_token,
+      std::optional<Secret256> replacement_attach_token = std::nullopt
     ) noexcept;
+
+    /**
+     * @brief Validate ATTACH identity, token, permission, and generation without mutation.
+     *
+     * Product integration uses this preflight to prepare every fallible SSRC,
+     * queue, and mapping resource before committing authority/token rotation.
+     *
+     * @param client Fresh authenticated connection for the same owner.
+     * @param session_id Existing session identifier.
+     * @param attach_token Presented current token.
+     * @param replacement_attach_token Optional nonzero replacement token.
+     * @return Exact result that `attach()` will return absent an intervening mutation or neutralization failure.
+     */
+    [[nodiscard]] AuthorityResult prepare_attach(
+      const AuthenticatedClient &client,
+      const Identifier128 &session_id,
+      const Secret256 &attach_token,
+      const std::optional<Secret256> &replacement_attach_token = std::nullopt
+    ) const noexcept;
 
     /**
      * @brief Commit the complete multipart input baseline for an authority.
