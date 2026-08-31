@@ -30,6 +30,12 @@ implemented product boundaries do not claim a live cross-product stream or
 hardware qualification until the Windows host and macOS client run the exact
 negotiated slice together.
 
+The client allocates both bounded incomplete-frame byte regions, fragment
+tables, ordered slice views, and decoder-transfer frame pool at authenticated
+video configuration. Authenticated packet insertion, reorder, completion, and
+slot recycling then perform no heap allocation. The retained compatibility
+helper remains outside the live receiver path.
+
 The Lumen Streaming Protocol (LSP) is the native, single-port protocol between
 Lumen and its clients. It is optimized for competitive game streaming on a
 controlled wired network while retaining secure operation and congestion-safe
