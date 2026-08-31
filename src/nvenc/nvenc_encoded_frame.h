@@ -18,6 +18,7 @@ namespace nvenc {
     uint64_t frame_index = 0;  ///< Capture-frame index associated with the encoded data.
     bool idr = false;  ///< Whether the encoded frame is an IDR frame.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
+    std::uint64_t reference_invalidation_generation = 0;  ///< Exact accepted LSP invalidation request, or zero.
   };
 
 }  // namespace nvenc

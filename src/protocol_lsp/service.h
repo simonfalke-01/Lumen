@@ -66,6 +66,18 @@ namespace lumen::lsp {
   };
 
   /**
+   * @brief Decide whether a provider disposition requires exact-association teardown.
+   *
+   * @param result Authenticated service receive disposition.
+   * @return True only for a local provider-fatal result; ordinary provider drops stay silent.
+   */
+  [[nodiscard]] constexpr bool datagram_result_requires_association_close(
+    const DatagramResult result
+  ) noexcept {
+    return result == DatagramResult::provider_fatal;
+  }
+
+  /**
    * @brief Fail-closed host dispatcher for the single LSP UDP port.
    */
   class HostService {
@@ -117,7 +129,7 @@ namespace lumen::lsp {
      */
     DatagramResult receive(
       const PeerEndpoint &peer,
-      std::span<const std::uint8_t> datagram
+      std::span<std::uint8_t> datagram
     ) noexcept;
 
     /**

@@ -1037,8 +1037,6 @@ namespace NVENC_NAMESPACE {
       return true;
     }
 
-    encoder_state.rfi_needs_confirmation = true;
-
     if (last_frame < first_frame) {
       BOOST_LOG(error) << "NvEnc: invaid rfi request " << first_frame << "-" << last_frame << ", generating IDR";
       return false;
@@ -1046,8 +1044,6 @@ namespace NVENC_NAMESPACE {
 
     BOOST_LOG(debug) << "NvEnc: rfi request " << first_frame << "-" << last_frame << " expanding to last encoded frame " << encoder_state.last_encoded_frame_index;
     last_frame = encoder_state.last_encoded_frame_index;
-
-    encoder_state.last_rfi_range = {first_frame, last_frame};
 
     if (last_frame - first_frame + 1 >= encoder_params.ref_frames_in_dpb) {
       BOOST_LOG(debug) << "NvEnc: rfi request too large, generating IDR";
@@ -1061,6 +1057,8 @@ namespace NVENC_NAMESPACE {
       }
     }
 
+    encoder_state.last_rfi_range = {first_frame, last_frame};
+    encoder_state.rfi_needs_confirmation = true;
     return true;
   }
 

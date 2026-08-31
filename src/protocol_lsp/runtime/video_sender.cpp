@@ -12,13 +12,16 @@
 #include "../media/h264.h"
 #include "../media/hevc.h"
 #include "../transport/congestion.h"
+#include "../transport/repair.h"
 #include "../transport/rtcp.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <span>
@@ -32,7 +35,6 @@ namespace lumen::lsp::runtime {
   namespace {
     constexpr std::size_t maximum_nal_units_per_access_unit = 1'024;  ///< Fixed Annex-B view bound.
     constexpr std::size_t maximum_extension_block_bytes = 64;  ///< Largest first-slice RFC 8285 block.
-    constexpr std::size_t final_packet_slab_bytes = media::ipv4_udp_payload_ceiling;  ///< Largest protected UDP payload.
     constexpr std::size_t sender_srtp_tag_bytes = media::srtp_aead_tag_size;  ///< AEAD AES-128-GCM tag size.
     constexpr std::array<std::uint8_t, 4> lspp_name {'L', 'S', 'P', 'P'};  ///< Exact path-probe APP name.
     constexpr std::uint64_t minimum_probe_timer_microseconds = 15'000'000;  ///< LSP conservative PROBE_TIMER floor.
@@ -44,6 +46,20 @@ namespace lumen::lsp::runtime {
     constexpr std::uint64_t black_hole_confirmation_microseconds = 3'000'000;  ///< Sustained large-packet delivery-loss window.
     constexpr std::uint64_t black_hole_feedback_freshness_microseconds = 5'000'000;  ///< Recent small-path proof requirement.
     constexpr std::uint64_t black_hole_minimum_large_packets = 8;  ///< Minimum large sends before fallback.
+    constexpr std::size_t pending_datagram_slot_count = 128;  ///< Completion metadata bounded above path slots.
+    constexpr std::size_t pending_frame_slot_count = 32;  ///< Whole-frame completion states bounded above queued video.
+    constexpr std::uint8_t pending_datagram_index_bits = 7;  ///< Bits naming one of 128 datagram slots.
+    constexpr std::uint8_t pending_frame_index_bits = 5;  ///< Bits naming one of 32 frame slots.
+    constexpr std::uint64_t pending_datagram_index_mask = pending_datagram_slot_count - 1U;  ///< Datagram token slot bits.
+    constexpr std::uint64_t pending_frame_index_mask = pending_frame_slot_count - 1U;  ///< Frame ticket slot bits.
+    constexpr std::uint64_t pending_datagram_incarnation_mask =
+      (std::uint64_t {1} << (60U - pending_datagram_index_bits)) - 1U;  ///< Datagram token incarnation bits.
+    constexpr std::uint64_t pending_frame_incarnation_mask =
+      (std::uint64_t {1} << (64U - pending_frame_index_bits)) - 1U;  ///< Frame ticket incarnation bits.
+    constexpr std::uint8_t feedback_unreported = 0;  ///< Actually sent and not yet reported.
+    constexpr std::uint8_t feedback_lost = 1;  ///< Actually sent and reported lost.
+    constexpr std::uint8_t feedback_received = 2;  ///< Actually sent and reported received.
+    constexpr std::uint8_t feedback_local_unsent = 3;  ///< Protected sequence consumed without transmission.
 
     /** @brief Atomic sent-packet ledger slot indexed by the 16-bit RTP sequence number. */
     struct SentPacketRecord {
@@ -54,26 +70,37 @@ namespace lumen::lsp::runtime {
       std::atomic<std::uint16_t> udp_payload_bytes {};  ///< Exact protected UDP payload for PMTU evidence.
       std::atomic<std::uint16_t> confirmed_path_payload_bytes {};  ///< Frame-boundary limit active at send.
       std::atomic<std::uint32_t> path_generation {};  ///< Frame-boundary PMTU evidence generation.
-      std::atomic<std::uint8_t> feedback_state {};  ///< Zero unreported, one lost, two received.
+      std::atomic<std::uint8_t> feedback_state {};  ///< Sent delivery state or local-unsent tombstone.
       std::atomic<std::uint8_t> ecn_state {};  ///< First echoed ECN value, upgraded once to CE when duplicated.
     };
 
-    /** @brief Retained exact protected LSPP bytes and logical retry state. */
+    /** @brief Retained logical LSPP retry state; protected bytes live only in the aggregate path. */
     struct PathProbeTransmission {
       PathProbePayload probe {};  ///< Logical identifier and protected target size.
-      std::array<std::uint8_t, media::ipv4_udp_payload_ceiling> protected_packet {};  ///< Exact immutable local-send retry bytes.
-      std::size_t protected_bytes {};  ///< Populated exact candidate bytes.
       std::uint64_t began_microseconds {};  ///< Authenticated control-intent initiation time.
+      std::uint64_t last_attempt_microseconds {};  ///< Latest protected aggregate-path admission time.
       std::uint64_t last_transmission_microseconds {};  ///< Last accepted local submission time.
       std::uint8_t transmissions {};  ///< Fresh SRTCP-index transmissions accepted locally.
-      bool local_send_pending {};  ///< Exact protected packet awaits retry after local send failure.
-      bool protected_is_probe_timer_retry {};  ///< Retained protected bytes are a fresh PROBE_TIMER retry.
+      bool completion_pending {};  ///< Fresh protection is queued in the aggregate path.
     };
 
     /** @brief Retained middle-NTP sender-report timing used to validate RR RTT samples. */
     struct SenderReportTiming {
       std::atomic<std::uint32_t> lsr {};  ///< Middle 32 bits of the transmitted SR NTP timestamp.
       std::atomic<std::uint64_t> sent_microseconds {};  ///< Local monotonic SRTCP submission time.
+    };
+
+    /** @brief Stack guard that retires callback ownership as its final action. */
+    struct CallbackRetirement {
+      void *context {};  ///< Opaque callback owner.
+      void (*retire)(void *context) noexcept {};  ///< Required final-action hook.
+
+      /** @brief Invoke the final-action hook exactly once. */
+      ~CallbackRetirement() {
+        if (retire != nullptr) {
+          retire(context);
+        }
+      }
     };
 
     /** @brief One detected Annex-B prefix and its byte width. */
@@ -484,17 +511,20 @@ namespace lumen::lsp::runtime {
       const bool full_metadata,
       const std::uint64_t capture_ntp,
       const std::uint64_t frame_id,
+      const std::uint32_t recovery_epoch,
       const std::uint64_t input_state_sequence,
       const std::uint64_t input_edge_id,
       const std::uint32_t capture_to_submit_us,
       const std::uint32_t capture_to_complete_us
     ) noexcept {
       std::array<std::uint8_t, 8> capture_bytes {};
-      std::array<std::uint8_t, 8> frame_id_bytes {};
+      std::array<std::uint8_t, video_frame_identity_extension_size> frame_identity_bytes {};
       std::array<std::uint8_t, 16> watermark_bytes {};
       std::array<std::uint8_t, 8> timing_bytes {};
       wire::write_be<std::uint64_t>(capture_bytes, capture_ntp);
-      wire::write_be<std::uint64_t>(frame_id_bytes, frame_id);
+      if (!write_video_frame_identity_extension(frame_identity_bytes, frame_id, recovery_epoch)) {
+        return 0;
+      }
       wire::write_be<std::uint64_t>(std::span<std::uint8_t> {watermark_bytes}.first<8>(), input_state_sequence);
       wire::write_be<std::uint64_t>(std::span<std::uint8_t> {watermark_bytes}.subspan<8, 8>(), input_edge_id);
       wire::write_be<std::uint32_t>(std::span<std::uint8_t> {timing_bytes}.first<4>(), capture_to_submit_us);
@@ -510,12 +540,12 @@ namespace lumen::lsp::runtime {
       }
       if (full_metadata &&
           (!append_extension(output, offset, video_absolute_capture_time_extension_id, capture_bytes) ||
-           !append_extension(output, offset, video_frame_id_extension_id, frame_id_bytes) ||
+           !append_extension(output, offset, video_frame_id_extension_id, frame_identity_bytes) ||
            !append_extension(output, offset, video_input_watermark_extension_id, watermark_bytes) ||
            !append_extension(output, offset, video_encoder_timing_extension_id, timing_bytes))) {
         return 0;
       }
-      if (!full_metadata && !append_extension(output, offset, video_frame_id_extension_id, frame_id_bytes)) {
+      if (!full_metadata && !append_extension(output, offset, video_frame_id_extension_id, frame_identity_bytes)) {
         return 0;
       }
       while ((offset % 4U) != 0) {
@@ -535,6 +565,7 @@ namespace lumen::lsp::runtime {
       const bool independent,
       const std::uint64_t capture_ntp,
       const std::uint64_t frame_id,
+      const std::uint32_t recovery_epoch,
       const std::uint64_t input_state_sequence,
       const std::uint64_t input_edge_id,
       const std::uint32_t capture_to_submit_us,
@@ -545,11 +576,11 @@ namespace lumen::lsp::runtime {
       constexpr std::uint8_t independent_bit = 0x20U;
       const auto independent_mark = independent ? independent_bit : 0U;
       OwnedExtensionBlocks blocks;
-      blocks.first_and_final_size = write_extension_block(blocks.first_and_final, static_cast<std::uint8_t>(start | end | independent_mark), true, capture_ntp, frame_id, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
-      blocks.first_size = write_extension_block(blocks.first, static_cast<std::uint8_t>(start | independent_mark), true, capture_ntp, frame_id, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
-      blocks.second_and_final_size = write_extension_block(blocks.second_and_final, static_cast<std::uint8_t>(end | independent_mark), true, capture_ntp, frame_id, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
-      blocks.second_size = write_extension_block(blocks.second, independent_mark, true, capture_ntp, frame_id, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
-      blocks.final_size = write_extension_block(blocks.final, static_cast<std::uint8_t>(end | independent_mark), false, capture_ntp, frame_id, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
+      blocks.first_and_final_size = write_extension_block(blocks.first_and_final, static_cast<std::uint8_t>(start | end | independent_mark), true, capture_ntp, frame_id, recovery_epoch, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
+      blocks.first_size = write_extension_block(blocks.first, static_cast<std::uint8_t>(start | independent_mark), true, capture_ntp, frame_id, recovery_epoch, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
+      blocks.second_and_final_size = write_extension_block(blocks.second_and_final, static_cast<std::uint8_t>(end | independent_mark), true, capture_ntp, frame_id, recovery_epoch, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
+      blocks.second_size = write_extension_block(blocks.second, independent_mark, true, capture_ntp, frame_id, recovery_epoch, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
+      blocks.final_size = write_extension_block(blocks.final, static_cast<std::uint8_t>(end | independent_mark), false, capture_ntp, frame_id, recovery_epoch, input_state_sequence, input_edge_id, capture_to_submit_us, capture_to_complete_us);
       if (blocks.first_and_final_size == 0 || blocks.first_size == 0 || blocks.second_and_final_size == 0 ||
           blocks.second_size == 0 || blocks.final_size == 0) {
         return std::nullopt;
@@ -558,7 +589,7 @@ namespace lumen::lsp::runtime {
     }
 
     /** @brief Return monotonic microseconds for frame admission and pacing. */
-    [[nodiscard]] std::uint64_t monotonic_microseconds() noexcept {
+    [[nodiscard]] std::uint64_t video_monotonic_microseconds() noexcept {
       const auto count = std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now().time_since_epoch()
       )
@@ -572,7 +603,8 @@ namespace lumen::lsp::runtime {
       const std::uint64_t interval_microseconds
     ) noexcept {
       return now_microseconds > std::numeric_limits<std::uint64_t>::max() - interval_microseconds ?
-               std::numeric_limits<std::uint64_t>::max() : now_microseconds + interval_microseconds;
+               std::numeric_limits<std::uint64_t>::max() :
+               now_microseconds + interval_microseconds;
     }
 
     /** @brief Clamp the initial aggregate rate to selected video plus reserved overhead. */
@@ -584,6 +616,73 @@ namespace lumen::lsp::runtime {
       return std::min(config.aggregate_pacing_bits_per_second, media_rate);
     }
   }  // namespace
+
+  bool write_video_frame_identity_extension(
+    const std::span<std::uint8_t> destination,
+    const std::uint64_t frame_id,
+    const std::uint32_t recovery_epoch
+  ) noexcept {
+    if (destination.size() != video_frame_identity_extension_size || frame_id == 0 || recovery_epoch == 0) {
+      return false;
+    }
+    wire::write_be<std::uint64_t>(destination.first<8>(), frame_id);
+    wire::write_be<std::uint32_t>(destination.subspan<8, 4>(), recovery_epoch);
+    return true;
+  }
+
+  VideoRecoveryFeedbackAction apply_authenticated_lspv_recovery(
+    transport::recovery_controller &recovery,
+    bool &failure_latched,
+    const transport::lspv_status &status,
+    const std::uint64_t latest_sent_frame_id,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    if (transport::validate_lspv_status(status) != transport::lspv_status_error::none) {
+      return VideoRecoveryFeedbackAction::ignored;
+    }
+    auto snapshot = recovery.snapshot();
+    if (status.recovery_epoch != snapshot.epoch) {
+      return VideoRecoveryFeedbackAction::ignored;
+    }
+
+    const auto decoder_error = status.decoder_status == transport::lspv_decoder_status::recoverable_error ||
+                               status.decoder_status == transport::lspv_decoder_status::unrecoverable_error;
+    if (snapshot.phase == transport::recovery_phase::recovery_frame_outstanding &&
+        status.largest_decoded_frame_id >= snapshot.outstanding_recovery_frame_id &&
+        recovery.confirm_recovery_decoded_through(
+          status.recovery_epoch,
+          status.largest_decoded_frame_id
+        ) == transport::recovery_result::accepted) {
+      failure_latched = false;
+      snapshot = recovery.snapshot();
+    }
+
+    if (snapshot.phase == transport::recovery_phase::healthy && decoder_error) {
+      const auto damaged_frame_id = status.largest_complete_frame_id != 0 ?
+                                      status.largest_complete_frame_id :
+                                      latest_sent_frame_id;
+      if (recovery.report_unrecoverable_damage(
+            damaged_frame_id,
+            transport::recovery_cause::decoder_unrecoverable
+          ) == transport::recovery_result::accepted) {
+        failure_latched = false;
+        return VideoRecoveryFeedbackAction::request_independent_frame;
+      }
+      return VideoRecoveryFeedbackAction::ignored;
+    }
+
+    snapshot = recovery.snapshot();
+    if (decoder_error) {
+      failure_latched = true;
+    }
+    if (snapshot.phase == transport::recovery_phase::recovery_frame_outstanding &&
+        failure_latched && now_microseconds >= snapshot.recovery_deadline_microseconds &&
+        recovery.permit_retry(now_microseconds, true) == transport::recovery_result::accepted) {
+      failure_latched = false;
+      return VideoRecoveryFeedbackAction::request_independent_frame;
+    }
+    return VideoRecoveryFeedbackAction::accepted;
+  }
 
   std::optional<PathProbePayload> parse_path_probe_datagram(
     const std::span<const std::uint8_t> packet,
@@ -691,14 +790,18 @@ namespace lumen::lsp::runtime {
   bool HostVideoSenderConfig::valid() const noexcept {
     const auto codec_profile = (video.codec == VideoCodec::h264 && video.profile == VideoProfile::h264_high) ||
                                (video.codec == VideoCodec::hevc && video.profile == VideoProfile::hevc_main);
-    return peer.valid() && codec_profile && video.video_generation != 0 && video.primary_ssrc != 0 &&
+    return peer.valid() && forward_path && forward_path->ready() && forward_path->snapshot().started &&
+           !forward_path->snapshot().closed && forward_path_generation != 0 &&
+           forward_path->generation() == forward_path_generation && codec_profile &&
+           video.video_generation != 0 && video.primary_ssrc != 0 &&
            video.primary_payload_type >= 96 && video.primary_payload_type <= 127 && video.clock_rate == 90'000 &&
            video.width > 0 && video.height > 0 && video.refresh_numerator > 0 && video.refresh_denominator > 0 &&
            video.selected_bits_per_second > 0 && video.pixel_format == video_pixel_format_nv12 &&
            video.initial_udp_payload_size == media::initial_udp_payload_size && video.decoder_surfaces >= 2 &&
            video.decoder_surfaces <= 4 && video.render_mailbox == 1 &&
            video.delivery == video_delivery_complete_access_unit && !video.flexfec && !video.rtx &&
-           initial_timestamp != 0 && frame_id_origin != 0 && maximum_access_unit_bytes > 0 &&
+           initial_timestamp != 0 && frame_id_origin != 0 && initial_recovery_epoch != 0 &&
+           maximum_access_unit_bytes > 0 &&
            maximum_access_unit_bytes <= media::competition_frame_size_limit &&
            maximum_capture_to_present_microseconds > 0 &&
            video.maximum_frame_age_microseconds == maximum_capture_to_present_microseconds &&
@@ -715,14 +818,8 @@ namespace lumen::lsp::runtime {
     Impl(HostVideoSenderConfig config, LibsrtpServerProvider &srtp) noexcept:
         config_ {std::move(config)},
         srtp_ {srtp},
-        pacer_({
-          .pacing_bits_per_second = initial_pacing_rate(config_),
-          .input_reserve_bits_per_second = 0,
-          .path_datagram_bytes = static_cast<std::uint16_t>(config_.video.initial_udp_payload_size + ip_udp_overhead()),
-          .quantum_microseconds = 100,
-          .submission_horizon_microseconds = 200,
-          .max_datagrams_per_batch = 8,
-        }),
+        invalidation_request_events_ {config_.capture_mail ? config_.capture_mail->event<video::reference_invalidation_request_t>(mail::lsp_invalidate_ref_frames) : safe::mail_raw_t::event_t<video::reference_invalidation_request_t> {}},
+        invalidation_result_events_ {config_.capture_mail ? config_.capture_mail->event<video::reference_invalidation_result_t>(mail::invalidate_ref_frames_result) : safe::mail_raw_t::event_t<video::reference_invalidation_result_t> {}},
         congestion_({
           .profile = config_.network_profile == VideoNetworkProfile::competition ?
                        transport::controller_profile::competition_lan :
@@ -734,18 +831,21 @@ namespace lumen::lsp::runtime {
           ),
           .maximum_pacing_bits_per_second = config_.aggregate_pacing_bits_per_second,
           .competition_capacity_bits_per_second = config_.network_profile == VideoNetworkProfile::competition ?
-                                                    config_.aggregate_pacing_bits_per_second : 0,
+                                                    config_.aggregate_pacing_bits_per_second :
+                                                    0,
           .reserved_overhead_bits_per_second = config_.reserved_overhead_bits_per_second,
           .maximum_rtt_microseconds = 100'000,
           .queue_delay_budget_microseconds = config_.network_profile == VideoNetworkProfile::competition ? 2'000U : 10'000U,
         }),
         path_mtu_({
           .ip_version = config_.family == media::ip_family::ipv4 ?
-                          transport::path_ip_version::ipv4 : transport::path_ip_version::ipv6,
+                          transport::path_ip_version::ipv4 :
+                          transport::path_ip_version::ipv6,
           .sender_interface_limit = config_.path_payload_ceiling,
           .receiver_advertised_limit = config_.path_payload_ceiling,
           .operator_configured_limit = config_.path_payload_ceiling,
         }),
+        recovery_ {config_.initial_recovery_epoch},
         next_sequence_ {config_.initial_sequence},
         initial_timestamp_ {config_.initial_timestamp},
         next_frame_id_ {config_.frame_id_origin},
@@ -756,8 +856,15 @@ namespace lumen::lsp::runtime {
         current_pacing_bits_per_second_ {initial_pacing_rate(config_)},
         current_encoder_bits_per_second_ {config_.video.selected_bits_per_second},
         current_path_payload_ {config_.video.initial_udp_payload_size} {
-      if (!config_.valid() || pacer_.error() != pacer_error::none ||
-          congestion_.error() != transport::controller_error::none || !path_mtu_.valid()) {
+      for (std::size_t index = 0; index < free_pending_datagrams_.size(); ++index) {
+        free_pending_datagrams_[index] = static_cast<std::uint8_t>(free_pending_datagrams_.size() - 1U - index);
+      }
+      free_pending_datagram_count_ = free_pending_datagrams_.size();
+      for (std::size_t index = 0; index < free_pending_frames_.size(); ++index) {
+        free_pending_frames_[index] = static_cast<std::uint8_t>(free_pending_frames_.size() - 1U - index);
+      }
+      free_pending_frame_count_ = free_pending_frames_.size();
+      if (!config_.valid() || congestion_.error() != transport::controller_error::none || !path_mtu_.valid()) {
         return;
       }
       try {
@@ -794,10 +901,16 @@ namespace lumen::lsp::runtime {
         [this](const video::egress_queue_t::recovery_request_t &request) {
           pressure_events_.fetch_add(1, std::memory_order_relaxed);
           if (config_.reference_invalidation) {
-            config_.capture_mail->event<std::pair<std::int64_t, std::int64_t>>(mail::invalidate_ref_frames)->raise(std::make_pair(request.first_frame, request.last_frame));
+            if (!request_reference_invalidation(
+                  request.first_frame,
+                  request.last_frame,
+                  InvalidationFailurePolicy::fail_closed
+                )) {
+              fail_forward_path();
+            }
           } else {
-            failed_.store(true, std::memory_order_release);
-            config_.capture_mail->event<bool>(mail::shutdown)->raise(true);
+            (void) mark_reference_dependency_broken(request.last_frame);
+            fail_forward_path();
           }
         }
       );
@@ -806,7 +919,6 @@ namespace lumen::lsp::runtime {
         return false;
       }
       registered_ = true;
-      pacer_.reset(monotonic_microseconds());
       try {
         worker_ = std::jthread([this]() noexcept {
           run();
@@ -831,11 +943,74 @@ namespace lumen::lsp::runtime {
       decoder_credit_.store(std::min<std::uint8_t>(credit, 4), std::memory_order_release);
     }
 
+    /**
+     * @brief Apply authenticated decoder capacity and recovery evidence.
+     *
+     * @param status Generation-qualified client status.
+     * @param now_microseconds Current monotonic receive time.
+     * @return True when the status is structurally valid for this video generation.
+     */
+    bool receive_video_status(
+      const transport::lspv_status &status,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (transport::validate_lspv_status(status) != transport::lspv_status_error::none ||
+          status.video_generation != config_.video.video_generation) {
+        return false;
+      }
+      VideoRecoveryFeedbackAction action;
+      bool recovery_confirmed = false;
+      bool decoder_failure_newly_latched = false;
+      bool dependency_exhausted = false;
+      {
+        std::scoped_lock pending_lock(pending_mutex_);
+        std::scoped_lock dependency_lock(dependency_state_mutex_);
+        const auto before = recovery_.snapshot();
+        const auto failure_latched_before = recovery_failure_latched_;
+        action = apply_authenticated_lspv_recovery(
+          recovery_,
+          recovery_failure_latched_,
+          status,
+          latest_sent_frame_id_.load(std::memory_order_acquire),
+          now_microseconds
+        );
+        recovery_confirmed = before.phase == transport::recovery_phase::recovery_frame_outstanding &&
+                             recovery_.snapshot().phase == transport::recovery_phase::healthy;
+        decoder_failure_newly_latched = !failure_latched_before && recovery_failure_latched_;
+        if (action != VideoRecoveryFeedbackAction::ignored &&
+            (action == VideoRecoveryFeedbackAction::request_independent_frame || decoder_failure_newly_latched) &&
+            !mark_reference_dependency_broken_locked(std::nullopt)) {
+          dependency_exhausted = true;
+        }
+        const auto decoder_error = status.decoder_status == transport::lspv_decoder_status::recoverable_error ||
+                                   status.decoder_status == transport::lspv_decoder_status::unrecoverable_error;
+        if (action != VideoRecoveryFeedbackAction::ignored && !dependency_exhausted && !decoder_error &&
+            recovery_confirmed && !dependency_repair_pending_ && !invalidation_pending_locked()) {
+          reference_path_valid_.store(true, std::memory_order_release);
+        }
+      }
+      if (action == VideoRecoveryFeedbackAction::ignored) {
+        return false;
+      }
+      if (dependency_exhausted) {
+        fail_forward_path();
+        return false;
+      }
+      update_decoder_credit(static_cast<std::uint8_t>(
+        status.maximum_decode_submissions - status.decode_submissions_in_flight
+      ));
+      if (action == VideoRecoveryFeedbackAction::request_independent_frame) {
+        config_.capture_mail->event<bool>(mail::idr)->raise(true);
+      }
+      return true;
+    }
+
     [[nodiscard]] std::optional<PathProbePayload> begin_path_probe(
       const std::uint64_t probe_id,
       const std::uint64_t now_microseconds,
       const std::uint64_t probe_interval_microseconds
     ) noexcept {
+      std::scoped_lock lock(control_mutex_);
       if (probe_id == 0 || std::ranges::find(recent_probe_ids_, probe_id) != recent_probe_ids_.end()) {
         return std::nullopt;
       }
@@ -849,7 +1024,8 @@ namespace lumen::lsp::runtime {
       }
       const auto prior_path_mtu = path_mtu_;
       const auto media_probe_interval = smoothed_rtt_microseconds_ == 0 ?
-                                          probe_interval_microseconds : smoothed_rtt_microseconds_;
+                                          probe_interval_microseconds :
+                                          smoothed_rtt_microseconds_;
       const auto result = path_mtu_.start_probe(
         probe_id,
         now_microseconds,
@@ -873,13 +1049,15 @@ namespace lumen::lsp::runtime {
       const PathProbePayload &probe,
       const std::uint64_t now_microseconds
     ) noexcept {
-      if (path_probe_.probe != probe || path_probe_.local_send_pending) {
+      std::scoped_lock lock(control_mutex_);
+      if (path_probe_.probe != probe || path_probe_.completion_pending) {
         return false;
       }
       return protect_and_submit_path_probe(now_microseconds, path_probe_.transmissions != 0);
     }
 
     bool acknowledge_path_probe(const PathProbePayload &probe) noexcept {
+      std::scoped_lock lock(control_mutex_);
       if (last_acknowledged_probe_ == probe) {
         return true;
       }
@@ -895,6 +1073,7 @@ namespace lumen::lsp::runtime {
     }
 
     bool rollback_path_probe(const PathProbePayload &probe) noexcept {
+      std::scoped_lock lock(control_mutex_);
       if (path_probe_.probe != probe || !path_mtu_before_probe_) {
         return false;
       }
@@ -902,13 +1081,14 @@ namespace lumen::lsp::runtime {
       path_mtu_before_probe_.reset();
       path_probe_ = {};
       next_path_raise_microseconds_.store(
-        saturating_add_time(monotonic_microseconds(), path_raise_timer_microseconds),
+        saturating_add_time(video_monotonic_microseconds(), path_raise_timer_microseconds),
         std::memory_order_release
       );
       return true;
     }
 
     bool reject_path_probe(const PathProbePayload &probe) noexcept {
+      std::scoped_lock lock(control_mutex_);
       if (path_probe_.probe != probe || path_probe_.transmissions == 0 ||
           path_mtu_.probe_timed_out() != transport::path_mtu_result::accepted) {
         return false;
@@ -922,6 +1102,7 @@ namespace lumen::lsp::runtime {
       const std::uint64_t now_microseconds,
       const std::uint64_t probe_interval_microseconds
     ) noexcept {
+      std::scoped_lock lock(control_mutex_);
       evaluate_path_black_hole(now_microseconds);
       if (local_candidate_failed_.exchange(false, std::memory_order_acq_rel)) {
         if (path_probe_.probe.probe_id == 0 ||
@@ -954,50 +1135,20 @@ namespace lumen::lsp::runtime {
         path_mtu_before_probe_.reset();
         return true;
       }
-      if (path_probe_.local_send_pending) {
-        const auto send_result = srtp_.send_protected(
-          config_.peer,
-          std::span<const std::uint8_t> {path_probe_.protected_packet}.first(path_probe_.protected_bytes)
-        );
-        if (send_result == ProtectedSendResult::would_block) {
-          return true;
-        }
-        if (send_result == ProtectedSendResult::message_too_large) {
-          path_probe_.local_send_pending = false;
-          local_candidate_failed_.store(true, std::memory_order_release);
-          return true;
-        }
-        if (send_result == ProtectedSendResult::fatal) {
-          return false;
-        }
-        path_probe_.local_send_pending = false;
-        ++path_probe_.transmissions;
-        path_probe_.last_transmission_microseconds = now_microseconds;
-        path_probe_datagrams_.fetch_add(1, std::memory_order_relaxed);
-        if (path_probe_.protected_is_probe_timer_retry) {
-          path_probe_retries_.fetch_add(1, std::memory_order_relaxed);
-        }
-        path_probe_.protected_is_probe_timer_retry = false;
+      if (path_probe_.completion_pending) {
         return true;
       }
       const auto media_probe_interval = smoothed_rtt_microseconds_ == 0 ?
-                                          probe_interval_microseconds : smoothed_rtt_microseconds_;
+                                          probe_interval_microseconds :
+                                          smoothed_rtt_microseconds_;
       const auto timer = std::max(minimum_probe_timer_microseconds, media_probe_interval);
       if (path_probe_.last_transmission_microseconds == 0) {
-        if (now_microseconds < path_probe_.began_microseconds ||
-            now_microseconds - path_probe_.began_microseconds < timer * maximum_probe_attempts) {
+        if (path_probe_.last_attempt_microseconds == 0 ||
+            now_microseconds < path_probe_.last_attempt_microseconds ||
+            now_microseconds - path_probe_.last_attempt_microseconds < timer) {
           return true;
         }
-        if (path_mtu_.probe_timed_out() != transport::path_mtu_result::accepted) {
-          return false;
-        }
-        path_probe_ = {};
-        path_mtu_before_probe_.reset();
-        next_path_raise_microseconds_.store(
-          saturating_add_time(now_microseconds, path_raise_timer_microseconds),
-          std::memory_order_release
-        );
-        return true;
+        return protect_and_submit_path_probe(now_microseconds, false);
       }
       if (now_microseconds < path_probe_.last_transmission_microseconds ||
           now_microseconds - path_probe_.last_transmission_microseconds < timer) {
@@ -1019,6 +1170,7 @@ namespace lumen::lsp::runtime {
     }
 
     [[nodiscard]] std::optional<PathProbePayload> outstanding_path_probe() const noexcept {
+      std::scoped_lock lock(control_mutex_);
       return path_probe_.probe.probe_id == 0 ? std::nullopt : std::optional {path_probe_.probe};
     }
 
@@ -1029,7 +1181,7 @@ namespace lumen::lsp::runtime {
       requested_path_payload_.store(1'200, std::memory_order_release);
       black_hole_requested_.store(true, std::memory_order_release);
       next_path_raise_microseconds_.store(
-        saturating_add_time(monotonic_microseconds(), path_raise_timer_microseconds),
+        saturating_add_time(video_monotonic_microseconds(), path_raise_timer_microseconds),
         std::memory_order_release
       );
       return true;
@@ -1039,6 +1191,7 @@ namespace lumen::lsp::runtime {
       const std::span<const std::uint8_t> packet,
       const std::uint64_t now_microseconds
     ) noexcept {
+      std::scoped_lock lock(control_mutex_);
       const auto summary = transport::parse_rtcp_datagram(packet, transport::rtcp_datagram_form::compound);
       if (!summary || now_microseconds < last_compound_rtcp_microseconds_) {
         return false;
@@ -1091,7 +1244,8 @@ namespace lumen::lsp::runtime {
               rtt_variation_microseconds_ = sample / 2U;
             } else {
               const auto difference = smoothed_rtt_microseconds_ > sample ?
-                                        smoothed_rtt_microseconds_ - sample : sample - smoothed_rtt_microseconds_;
+                                        smoothed_rtt_microseconds_ - sample :
+                                        sample - smoothed_rtt_microseconds_;
               rtt_variation_microseconds_ =
                 (rtt_variation_microseconds_ * 3U + difference) / 4U;
               smoothed_rtt_microseconds_ =
@@ -1158,6 +1312,7 @@ namespace lumen::lsp::runtime {
       const std::span<const std::uint8_t> packet,
       const std::uint64_t now_microseconds
     ) noexcept {
+      std::scoped_lock lock(control_mutex_);
       const auto reject = [this]() noexcept {
         feedback_rejections_.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -1227,14 +1382,19 @@ namespace lumen::lsp::runtime {
           record.confirmed_path_payload_bytes.load(std::memory_order_relaxed);
         const auto record_path_generation = record.path_generation.load(std::memory_order_relaxed);
         const auto state = record.feedback_state.load(std::memory_order_relaxed);
+        const auto local_unsent = state == feedback_local_unsent;
         const auto serial_confirmed = record.send_serial.load(std::memory_order_acquire);
-        const auto invalid = serial == 0 || serial != serial_confirmed || bytes == 0 ||
-                             classify_path_packet_size(udp_payload_bytes, confirmed_path_payload_bytes) ==
-                               PathPacketSizeClass::invalid ||
-                             record_path_generation == 0 ||
+        const auto actual_send_invalid = !local_unsent &&
+                                         (bytes == 0 ||
+                                          classify_path_packet_size(udp_payload_bytes, confirmed_path_payload_bytes) ==
+                                            PathPacketSizeClass::invalid ||
+                                          record_path_generation == 0);
+        const auto tombstone_invalid = local_unsent && (received || bytes != 0);
+        const auto invalid = serial == 0 || serial != serial_confirmed || actual_send_invalid || tombstone_invalid ||
                              sent > now_microseconds ||
                              now_microseconds - sent > feedback_packet_freshness_microseconds ||
-                             (index != 0 && serial != first_serial + index) || (!received && state == 2U);
+                             (index != 0 && serial != first_serial + index) ||
+                             (!received && state == feedback_received);
         record.access.clear(std::memory_order_release);
         if (invalid) {
           return reject();
@@ -1246,7 +1406,7 @@ namespace lumen::lsp::runtime {
       }
       const auto highest_sent = last_send_serial_.load(std::memory_order_acquire);
       if (report_count != 0 && (last_serial > highest_sent ||
-          (highest_feedback_serial_ != 0 && last_serial + 16'384U < highest_feedback_serial_))) {
+                                (highest_feedback_serial_ != 0 && last_serial + 16'384U < highest_feedback_serial_))) {
         return reject();
       }
 
@@ -1270,6 +1430,15 @@ namespace lumen::lsp::runtime {
           record.access.clear(std::memory_order_release);
           return reject();
         }
+        auto state = record.feedback_state.load(std::memory_order_relaxed);
+        if (state == feedback_local_unsent) {
+          if (received || record.send_serial.load(std::memory_order_acquire) != expected_serial) {
+            record.access.clear(std::memory_order_release);
+            return reject();
+          }
+          record.access.clear(std::memory_order_release);
+          continue;
+        }
         const auto bytes = record.complete_ip_bytes.load(std::memory_order_relaxed);
         const auto udp_payload_bytes = record.udp_payload_bytes.load(std::memory_order_relaxed);
         const auto confirmed_path_payload_bytes =
@@ -1280,11 +1449,10 @@ namespace lumen::lsp::runtime {
           confirmed_path_payload_bytes
         );
         const auto current_path_evidence = record_path_generation == current_path_generation;
-        auto state = record.feedback_state.load(std::memory_order_relaxed);
         if (received) {
-          const auto newly_received = state != 2U;
-          if (state != 2U) {
-            record.feedback_state.store(2U, std::memory_order_relaxed);
+          const auto newly_received = state != feedback_received;
+          if (state != feedback_received) {
+            record.feedback_state.store(feedback_received, std::memory_order_relaxed);
             delivered_bytes += bytes;
             if (current_path_evidence && path_size_class == PathPacketSizeClass::confirmed_size &&
                 confirmed_path_payload_bytes > 1'200) {
@@ -1292,7 +1460,7 @@ namespace lumen::lsp::runtime {
             } else if (current_path_evidence && path_size_class == PathPacketSizeClass::smaller) {
               ++small_path_delivered;
             }
-            if (state == 0U) {
+            if (state == feedback_unreported) {
               subtract_in_flight(bytes);
             }
           }
@@ -1329,8 +1497,8 @@ namespace lumen::lsp::runtime {
             has_delay_sample_ = true;
           }
         } else {
-          if (state == 0U) {
-            record.feedback_state.store(1U, std::memory_order_relaxed);
+          if (state == feedback_unreported) {
+            record.feedback_state.store(feedback_lost, std::memory_order_relaxed);
             lost_bytes += bytes;
             if (current_path_evidence && path_size_class == PathPacketSizeClass::confirmed_size &&
                 confirmed_path_payload_bytes > 1'200) {
@@ -1359,6 +1527,7 @@ namespace lumen::lsp::runtime {
         large_path_lost,
         small_path_delivered
       );
+      update_measured_forward_overhead(now_microseconds);
       const auto has_new_evidence = delivered_bytes != 0 || lost_bytes != 0 || ecn_ce_bytes != 0;
       if (!has_new_evidence) {
         feedback_reports_.fetch_add(1, std::memory_order_relaxed);
@@ -1391,12 +1560,20 @@ namespace lumen::lsp::runtime {
         return;
       }
       egress_.stop();
+      pending_condition_.notify_all();
     }
 
     /** @brief Join sender and retire its egress registration. */
     void join() noexcept {
       if (worker_.joinable()) {
         worker_.join();
+      }
+      {
+        std::unique_lock lock(pending_mutex_);
+        pending_condition_.wait(lock, [this]() {
+          return free_pending_datagram_count_ == pending_datagrams_.size() &&
+                 free_pending_frame_count_ == pending_frames_.size() && active_completion_callbacks_ == 0;
+        });
       }
       if (registered_) {
         (void) egress_.unregister_session(this);
@@ -1429,15 +1606,605 @@ namespace lumen::lsp::runtime {
       };
     }
 
+    bool complete_forward_datagram(
+      const std::uint64_t token,
+      const HostForwardCompletion completion,
+      const std::uint64_t completed_at_microseconds,
+      const std::size_t protected_bytes,
+      const std::uint16_t charged_bytes
+    ) noexcept {
+      const auto pending = take_pending(token, true);
+      if (!pending) {
+        return false;
+      }
+      const CallbackRetirement callback_retirement {
+        .context = this,
+        .retire = [](void *context) noexcept {
+          static_cast<Impl *>(context)->retire_completion_callback();
+        },
+      };
+      if (pending->kind == PendingKind::rtp) {
+        if (completion == HostForwardCompletion::sent) {
+          record_sent_packet(
+            pending->sequence,
+            pending->packet_serial,
+            charged_bytes,
+            static_cast<std::uint16_t>(protected_bytes),
+            pending->confirmed_path_payload,
+            completed_at_microseconds
+          );
+          rtp_packet_count_.fetch_add(1, std::memory_order_relaxed);
+          rtp_octet_count_.fetch_add(pending->payload_octets, std::memory_order_relaxed);
+          submitted_packets_.fetch_add(1, std::memory_order_relaxed);
+          submitted_wire_bytes_.fetch_add(charged_bytes, std::memory_order_relaxed);
+          complete_pending_frame(pending->frame_ticket, true, completed_at_microseconds);
+          return true;
+        }
+        record_unsent_packet(*pending, completed_at_microseconds);
+        if (!mark_reference_dependency_broken(std::nullopt)) {
+          fail_forward_path();
+        }
+        complete_pending_frame(pending->frame_ticket, false, completed_at_microseconds);
+        pressure_events_.fetch_add(1, std::memory_order_relaxed);
+        if (completion == HostForwardCompletion::message_too_large) {
+          if (!confirm_path_black_hole()) {
+            fail_forward_path();
+          }
+        } else if (completion == HostForwardCompletion::fatal) {
+          fail_forward_path();
+        }
+        return true;
+      }
+
+      std::scoped_lock lock(control_mutex_);
+      if (pending->kind == PendingKind::sender_report) {
+        sender_report_pending_ = false;
+        if (completion == HostForwardCompletion::sent) {
+          auto &timing = sender_report_timings_[next_sender_report_timing_];
+          timing.lsr.store(0, std::memory_order_release);
+          timing.sent_microseconds.store(completed_at_microseconds, std::memory_order_relaxed);
+          timing.lsr.store(pending->lsr, std::memory_order_release);
+          next_sender_report_timing_ = (next_sender_report_timing_ + 1U) % sender_report_timings_.size();
+          last_sender_report_microseconds_ = completed_at_microseconds;
+        } else if (completion == HostForwardCompletion::fatal) {
+          fail_forward_path();
+        }
+        return true;
+      }
+
+      if (path_probe_.probe.probe_id == pending->probe_id) {
+        path_probe_.completion_pending = false;
+        if (completion == HostForwardCompletion::sent) {
+          ++path_probe_.transmissions;
+          path_probe_.last_transmission_microseconds = completed_at_microseconds;
+          path_probe_datagrams_.fetch_add(1, std::memory_order_relaxed);
+          if (pending->probe_timer_retry) {
+            path_probe_retries_.fetch_add(1, std::memory_order_relaxed);
+          }
+        } else if (completion == HostForwardCompletion::message_too_large) {
+          local_candidate_failed_.store(true, std::memory_order_release);
+        } else if (completion == HostForwardCompletion::fatal) {
+          fail_forward_path();
+        }
+      }
+      return true;
+    }
+
+    void set_forward_backpressure(const bool blocked) noexcept {
+      const auto prior = forward_backpressured_.exchange(blocked, std::memory_order_acq_rel);
+      if (blocked && !prior) {
+        pressure_events_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
     /** @brief Return constructor validation and slab-allocation status. */
     [[nodiscard]] bool ready() const noexcept {
       return ready_;
     }
 
   private:
+    enum class PendingKind : std::uint8_t {
+      rtp,
+      sender_report,
+      path_probe,
+    };
+
+    struct PendingDatagram {
+      std::uint64_t token {};  ///< Nonzero namespaced sender-local completion token.
+      std::uint64_t incarnation {};  ///< Slot incarnation encoded into `token`.
+      std::uint64_t frame_ticket {};  ///< Nonzero whole-frame completion owner for primary RTP.
+      std::uint64_t packet_serial {};  ///< Sequence incarnation assigned before successful protection.
+      std::uint64_t probe_id {};  ///< Logical LSPP identifier for probe completion.
+      std::uint32_t payload_octets {};  ///< Codec bytes credited only after final send.
+      std::uint32_t lsr {};  ///< Middle NTP bits retained for final-sent SR timing.
+      std::uint16_t sequence {};  ///< Primary RTP sequence for exact sent-ledger publication.
+      std::uint16_t confirmed_path_payload {};  ///< PMTU generation limit active at protection.
+      PendingKind kind {PendingKind::rtp};  ///< Producer type for terminal handling.
+      bool probe_timer_retry {};  ///< Whether this LSPP is a fresh PROBE_TIMER retry.
+    };
+
+    struct PendingFrame {
+      std::uint64_t ticket {};  ///< Nonzero frame completion incarnation.
+      std::uint64_t incarnation {};  ///< Slot incarnation encoded into `ticket`.
+      std::uint64_t frame_id {};  ///< Nonzero protocol frame identity used by recovery epochs.
+      std::uint64_t terminal_microseconds {};  ///< Latest packet terminal time for recovery deadlines.
+      std::size_t committed_packets {};  ///< Packets successfully admitted to the path.
+      std::size_t completed_packets {};  ///< Terminal callbacks already received.
+      std::int64_t frame_index {};  ///< Capture frame identity used for asynchronous recovery.
+      std::uint64_t reference_invalidation_generation {};  ///< Encoder invalidation generation carried by this frame.
+      std::uint64_t dependency_generation {};  ///< Local dependency-break generation captured at admission.
+      bool commit_complete {};  ///< Producer finished admitting this frame.
+      bool failed {};  ///< At least one packet did not reach the kernel.
+      bool reference_damaged {};  ///< Protected/committed media can make following dependencies undecodable.
+      bool independent {};  ///< IDR or post-invalidation frame may restore references.
+      bool idr {};  ///< Whether the encoder declared a codec-independent IDR.
+      bool recovery_reserved {};  ///< Frame exclusively owns the active recovery epoch before first commit.
+    };
+
+    /** @brief Action taken when one exact encoder invalidation request is rejected. */
+    enum class InvalidationFailurePolicy : std::uint8_t {
+      fail_closed,  ///< Queue/admission recovery cannot legitimately request an IDR.
+      independent_recovery,  ///< An active recovery epoch permits one independent-frame fallback.
+    };
+
+    /** @brief One generation/range-qualified invalidation awaiting an encoder terminal result. */
+    struct PendingInvalidation {
+      video::reference_invalidation_request_t request {};  ///< Exact request written to the capture mailbox.
+      std::uint64_t dependency_generation {};  ///< Logical dependency break satisfied by this request.
+      InvalidationFailurePolicy failure_policy {InvalidationFailurePolicy::fail_closed};  ///< Rejection action.
+      bool occupied {};  ///< Whether this fixed slot awaits a terminal result.
+    };
+
+    /** @brief Exact invalidation completion plus an atomically promoted queued request. */
+    struct InvalidationCompletion {
+      PendingInvalidation completed {};  ///< Matched request and its rejection policy.
+      std::optional<video::reference_invalidation_request_t> promoted {};  ///< Next sole published request.
+      bool promotion_failed {};  ///< Queued request could not receive a nonzero generation.
+    };
+
+    /** @brief Frame-boundary recovery epoch and independent-frame admission decision. */
+    struct RecoveryBoundary {
+      std::uint32_t epoch {};  ///< Nonzero recovery epoch encoded into every boundary extension.
+      bool blocked {};  ///< Whether this encoded frame must not reach the network.
+      bool request_independent_frame {};  ///< Whether an expired failed recovery needs a new encoder request.
+    };
+
+    /** @brief Result of reserving one independent frame for an active recovery epoch. */
+    enum class RecoveryReservation : std::uint8_t {
+      not_required,  ///< Healthy independent frame or dependent frame needs no recovery reservation.
+      reserved,  ///< This frame now exclusively owns the active recovery attempt.
+      rejected,  ///< Epoch changed or another independent recovery frame is outstanding.
+    };
+
+    /** @brief Dispatch one exact path completion directly to its producer in O(1). */
+    static void forward_completion_callback(
+      void *context,
+      const std::uint64_t token,
+      const HostForwardLane lane,
+      const HostForwardCompletion completion,
+      const std::uint64_t completed_at_microseconds,
+      const std::size_t protected_bytes,
+      const std::uint16_t charged_bytes
+    ) noexcept {
+      (void) lane;
+      auto *self = static_cast<Impl *>(context);
+      if (self != nullptr) {
+        (void) self->complete_forward_datagram(
+          token,
+          completion,
+          completed_at_microseconds,
+          protected_bytes,
+          charged_bytes
+        );
+      }
+    }
+
+    /** @brief Return the callback retained by every committed video-owned datagram. */
+    [[nodiscard]] HostForwardCompletionTarget completion_target() noexcept {
+      return {.context = this, .completed = forward_completion_callback};
+    }
+
+    /** @brief Reserve one indexed, incarnation-qualified asynchronous completion token. */
+    [[nodiscard]] std::uint64_t register_pending(PendingDatagram pending) noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      if (closed_.load(std::memory_order_acquire) || free_pending_datagram_count_ == 0) {
+        return 0;
+      }
+      const auto index = free_pending_datagrams_[--free_pending_datagram_count_];
+      auto &slot = pending_datagrams_[index];
+      auto incarnation = (slot.incarnation + 1U) & pending_datagram_incarnation_mask;
+      if (incarnation == 0) {
+        incarnation = 1;
+      }
+      pending.incarnation = incarnation;
+      if (pending.kind == PendingKind::rtp) {
+        pending.packet_serial = next_send_serial_.fetch_add(1, std::memory_order_relaxed);
+        if (pending.packet_serial == 0) {
+          pending.packet_serial = next_send_serial_.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      pending.token = (std::uint64_t {2} << 60U) |
+                      (incarnation << pending_datagram_index_bits) |
+                      index;
+      slot = pending;
+      return pending.token;
+    }
+
+    /** @brief Register exact RTP sent-ledger metadata before consuming an SRTP index. */
+    [[nodiscard]] std::uint64_t register_pending_rtp(
+      const std::uint16_t sequence,
+      const std::uint32_t payload_octets,
+      const std::uint16_t confirmed_path_payload,
+      const std::uint64_t frame_ticket
+    ) noexcept {
+      return register_pending({
+        .frame_ticket = frame_ticket,
+        .payload_octets = payload_octets,
+        .sequence = sequence,
+        .confirmed_path_payload = confirmed_path_payload,
+        .kind = PendingKind::rtp,
+      });
+    }
+
+    /** @brief Reserve whole-frame completion state before committing its first packet. */
+    [[nodiscard]] std::uint64_t begin_pending_frame(
+      const bool independent,
+      const bool idr,
+      const std::uint64_t frame_id,
+      const std::int64_t frame_index,
+      const std::uint64_t reference_invalidation_generation,
+      const std::uint64_t dependency_generation
+    ) noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      if (closed_.load(std::memory_order_acquire) || free_pending_frame_count_ == 0) {
+        return 0;
+      }
+      const auto index = free_pending_frames_[--free_pending_frame_count_];
+      auto &frame = pending_frames_[index];
+      auto incarnation = (frame.incarnation + 1U) & pending_frame_incarnation_mask;
+      if (incarnation == 0) {
+        incarnation = 1;
+      }
+      const auto ticket = (incarnation << pending_frame_index_bits) | index;
+      frame = {
+        .ticket = ticket,
+        .incarnation = incarnation,
+        .frame_id = frame_id,
+        .frame_index = frame_index,
+        .reference_invalidation_generation = reference_invalidation_generation,
+        .dependency_generation = dependency_generation,
+        .independent = independent,
+        .idr = idr,
+      };
+      last_reference_frame_ticket_ = ticket;
+      return ticket;
+    }
+
+    /**
+     * @brief Reserve the current dependency generation before first packet construction.
+     *
+     * @param independent Whether the frame bypasses dependent-reference validity.
+     * @return Reserved nonzero generation, or no value when dependent admission is already stale.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> reserve_dependency_generation(
+      const bool independent
+    ) noexcept {
+      std::scoped_lock lock(dependency_state_mutex_);
+      if (!video_dependency_reservation_valid(
+            independent,
+            dependency_break_generation_,
+            dependency_break_generation_,
+            reference_path_valid_.load(std::memory_order_acquire),
+            dependency_repair_pending_
+          )) {
+        return std::nullopt;
+      }
+      return dependency_break_generation_;
+    }
+
+    /**
+     * @brief Resolve retry timing and freeze the epoch used by one encoded frame.
+     *
+     * @param independent Whether the encoder declares this frame independent.
+     * @param now_microseconds Current monotonic frame-boundary time.
+     * @return Frozen epoch plus retry and admission decisions.
+     */
+    [[nodiscard]] RecoveryBoundary prepare_recovery_boundary(
+      const bool independent,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      auto snapshot = recovery_.snapshot();
+      bool request_independent_frame = false;
+      if (snapshot.phase == transport::recovery_phase::recovery_frame_outstanding &&
+          recovery_failure_latched_ && now_microseconds >= snapshot.recovery_deadline_microseconds &&
+          recovery_.permit_retry(now_microseconds, true) == transport::recovery_result::accepted) {
+        recovery_failure_latched_ = false;
+        request_independent_frame = true;
+        snapshot = recovery_.snapshot();
+      }
+      return {
+        .epoch = snapshot.epoch,
+        .blocked = independent && snapshot.phase == transport::recovery_phase::recovery_frame_outstanding,
+        .request_independent_frame = request_independent_frame,
+      };
+    }
+
+    /**
+     * @brief Reserve the sole recovery frame before its first RTP packet is committed.
+     *
+     * @param ticket Live pending-frame ticket.
+     * @param independent Whether the frame is independently decodable.
+     * @param recovery_epoch Epoch already encoded into the frame extensions.
+     * @param now_microseconds Current monotonic admission time.
+     * @param deadline_microseconds Strict recovery-frame deadline.
+     * @return Whether no reservation was needed, it succeeded, or the frame must be rejected.
+     */
+    [[nodiscard]] RecoveryReservation reserve_recovery_frame(
+      const std::uint64_t ticket,
+      const bool independent,
+      const std::uint32_t recovery_epoch,
+      const std::uint64_t now_microseconds,
+      const std::uint64_t deadline_microseconds
+    ) noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      auto *frame = pending_frame_for_ticket(ticket);
+      const auto snapshot = recovery_.snapshot();
+      if (frame == nullptr || snapshot.epoch != recovery_epoch) {
+        return RecoveryReservation::rejected;
+      }
+      if (!independent || snapshot.phase == transport::recovery_phase::healthy) {
+        return RecoveryReservation::not_required;
+      }
+      if (snapshot.phase == transport::recovery_phase::recovery_frame_outstanding ||
+          recovery_.mark_independent_frame_sent(
+            frame->frame_id,
+            now_microseconds,
+            deadline_microseconds
+          ) != transport::recovery_result::accepted) {
+        return RecoveryReservation::rejected;
+      }
+      frame->recovery_reserved = true;
+      recovery_failure_latched_ = false;
+      return RecoveryReservation::reserved;
+    }
+
+    /** @brief Fence one dependent admission on its predecessor's terminal disposition. */
+    [[nodiscard]] bool wait_for_reference_terminal(
+      const bool independent,
+      const std::uint64_t deadline_microseconds
+    ) noexcept {
+      if (independent) {
+        return true;
+      }
+      std::unique_lock lock(pending_mutex_);
+      while (last_reference_frame_ticket_ != 0 && !closed_.load(std::memory_order_acquire)) {
+        const auto now = video_monotonic_microseconds();
+        if (now >= deadline_microseconds) {
+          return false;
+        }
+        pending_condition_.wait_for(lock, std::chrono::microseconds {deadline_microseconds - now});
+      }
+      return last_reference_frame_ticket_ == 0 &&
+             reference_path_valid_.load(std::memory_order_acquire) &&
+             video_monotonic_microseconds() < deadline_microseconds;
+    }
+
+    /** @brief Resolve one exact live frame ticket through its encoded slot and incarnation. */
+    [[nodiscard]] PendingFrame *pending_frame_for_ticket(const std::uint64_t ticket) noexcept {
+      const auto index = static_cast<std::size_t>(ticket & pending_frame_index_mask);
+      const auto incarnation = ticket >> pending_frame_index_bits;
+      if (ticket == 0 || index >= pending_frames_.size()) {
+        return nullptr;
+      }
+      auto &frame = pending_frames_[index];
+      return frame.ticket == ticket && frame.incarnation == incarnation ? &frame : nullptr;
+    }
+
+    /** @brief Count one packet accepted by the aggregate path for a pending frame. */
+    void mark_frame_packet_committed(const std::uint64_t ticket) noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      if (auto *frame = pending_frame_for_ticket(ticket)) {
+        ++frame->committed_packets;
+      }
+    }
+
+    /** @brief Publish that the producer admitted all possible packets for one frame. */
+    void finish_pending_frame(
+      const std::uint64_t ticket,
+      const bool producer_succeeded
+    ) noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      if (auto *frame = pending_frame_for_ticket(ticket)) {
+        frame->commit_complete = true;
+        frame->failed = frame->failed || !producer_succeeded;
+        frame->reference_damaged = frame->reference_damaged ||
+                                   (!producer_succeeded &&
+                                    video_frame_is_partial_network_submission(frame->committed_packets));
+        finalize_pending_frame(*frame);
+      }
+    }
+
+    /** @brief Fold one packet terminal disposition into whole-frame completion state. */
+    void complete_pending_frame(
+      const std::uint64_t ticket,
+      const bool sent,
+      const std::uint64_t completed_at_microseconds
+    ) noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      if (auto *frame = pending_frame_for_ticket(ticket)) {
+        ++frame->completed_packets;
+        frame->failed = frame->failed || !sent;
+        frame->reference_damaged = frame->reference_damaged || !sent;
+        frame->terminal_microseconds = std::max(frame->terminal_microseconds, completed_at_microseconds);
+        finalize_pending_frame(*frame);
+      }
+    }
+
+    /** @brief Publish sent-frame counters or recovery after every terminal callback arrives. */
+    void finalize_pending_frame(PendingFrame &frame) noexcept {
+      if (!frame.commit_complete || frame.completed_packets != frame.committed_packets) {
+        return;
+      }
+      const auto index = static_cast<std::size_t>(frame.ticket & pending_frame_index_mask);
+      const auto incarnation = frame.incarnation;
+      if (!frame.failed) {
+        submitted_frames_.fetch_add(1, std::memory_order_relaxed);
+        latest_sent_frame_id_.store(frame.frame_id, std::memory_order_release);
+        if (frame.independent) {
+          std::scoped_lock dependency_lock(dependency_state_mutex_);
+          const auto satisfies_dependency = video_independent_satisfies_dependency_fence(
+            frame.idr,
+            frame.reference_invalidation_generation,
+            latest_published_invalidation_generation_,
+            latest_published_dependency_generation_,
+            frame.dependency_generation,
+            dependency_break_generation_,
+            frame.frame_index,
+            dependency_frame_fence_
+          );
+          if (satisfies_dependency && !invalidation_pending_locked()) {
+            dependency_repair_pending_ = false;
+            reference_path_valid_.store(true, std::memory_order_release);
+            pre_submit_invalidation_pending_ = false;
+            pre_submit_invalidation_frame_ = 0;
+          }
+        }
+      } else {
+        dropped_frames_.fetch_add(1, std::memory_order_relaxed);
+        std::optional<std::uint64_t> dependency_generation;
+        bool recovery_opened = false;
+        if (frame.recovery_reserved || frame.reference_damaged) {
+          std::scoped_lock dependency_lock(dependency_state_mutex_);
+          dependency_generation = mark_reference_dependency_broken_locked(frame.frame_index);
+          if (frame.recovery_reserved) {
+            recovery_failure_latched_ = true;
+          }
+          if (frame.reference_damaged) {
+            recovery_opened = recovery_.report_unrecoverable_damage(
+                                frame.frame_id,
+                                transport::recovery_cause::unexpected_partial_frame
+                              ) == transport::recovery_result::accepted;
+          }
+        }
+        if (!dependency_generation && (frame.recovery_reserved || frame.reference_damaged)) {
+          fail_forward_path();
+        } else if (recovery_opened) {
+          if (config_.reference_invalidation) {
+            if (!request_reference_invalidation(
+                  frame.frame_index,
+                  frame.frame_index,
+                  InvalidationFailurePolicy::independent_recovery,
+                  dependency_generation
+                )) {
+              config_.capture_mail->event<bool>(mail::idr)->raise(true);
+            }
+          } else {
+            config_.capture_mail->event<bool>(mail::idr)->raise(true);
+          }
+        }
+      }
+      if (last_reference_frame_ticket_ == frame.ticket) {
+        last_reference_frame_ticket_ = 0;
+      }
+      frame = {};
+      frame.incarnation = incarnation;
+      free_pending_frames_[free_pending_frame_count_++] = static_cast<std::uint8_t>(index);
+      pending_condition_.notify_all();
+    }
+
+    /**
+     * @brief Consume sender-local metadata for one exact completion token.
+     *
+     * @param token Incarnation-qualified sender token.
+     * @param claim_callback Whether a live aggregate callback now retains the sender.
+     * @return Removed metadata, or no value for an unknown/stale token.
+     */
+    [[nodiscard]] std::optional<PendingDatagram> take_pending(
+      const std::uint64_t token,
+      const bool claim_callback
+    ) noexcept {
+      if ((token >> 60U) != 2U) {
+        return std::nullopt;
+      }
+      std::scoped_lock lock(pending_mutex_);
+      const auto index = static_cast<std::size_t>(token & pending_datagram_index_mask);
+      const auto incarnation = (token >> pending_datagram_index_bits) & pending_datagram_incarnation_mask;
+      if (index >= pending_datagrams_.size()) {
+        return std::nullopt;
+      }
+      auto &pending = pending_datagrams_[index];
+      if (pending.token != token || pending.incarnation != incarnation) {
+        return std::nullopt;
+      }
+      const auto result = pending;
+      pending = {};
+      pending.incarnation = incarnation;
+      free_pending_datagrams_[free_pending_datagram_count_++] = static_cast<std::uint8_t>(index);
+      if (claim_callback) {
+        ++active_completion_callbacks_;
+      }
+      return result;
+    }
+
+    /** @brief End one claimed direct callback after its final sender access. */
+    void retire_completion_callback() noexcept {
+      {
+        std::scoped_lock lock(pending_mutex_);
+        if (active_completion_callbacks_ != 0) {
+          --active_completion_callbacks_;
+        }
+      }
+      pending_condition_.notify_all();
+    }
+
+    /** @brief Stop video after a fatal aggregate-path terminal disposition. */
+    void fail_forward_path() noexcept {
+      if (!failed_.exchange(true, std::memory_order_acq_rel)) {
+        closed_.store(true, std::memory_order_release);
+        egress_.stop();
+        pending_condition_.notify_all();
+        config_.capture_mail->event<bool>(mail::shutdown)->raise(true);
+      }
+    }
+
     /** @brief Return complete IP plus UDP header bytes for this path. */
     [[nodiscard]] std::size_t ip_udp_overhead() const noexcept {
       return config_.family == media::ip_family::ipv4 ? 28U : 48U;
+    }
+
+    /** @brief Feed measured non-video aggregate wire rate into encoder headroom. */
+    void update_measured_forward_overhead(const std::uint64_t now_microseconds) noexcept {
+      constexpr std::uint64_t sample_interval_microseconds = 100'000;
+      const auto path_bytes = config_.forward_path->snapshot().sent_charged_bytes;
+      const auto video_bytes = submitted_wire_bytes_.load(std::memory_order_relaxed);
+      if (last_overhead_sample_microseconds_ == 0 || now_microseconds < last_overhead_sample_microseconds_) {
+        last_overhead_sample_microseconds_ = now_microseconds;
+        last_path_charged_bytes_ = path_bytes;
+        last_video_charged_bytes_ = video_bytes;
+        return;
+      }
+      const auto elapsed = now_microseconds - last_overhead_sample_microseconds_;
+      if (elapsed < sample_interval_microseconds) {
+        return;
+      }
+      const auto path_delta = path_bytes >= last_path_charged_bytes_ ? path_bytes - last_path_charged_bytes_ : 0;
+      const auto video_delta = video_bytes >= last_video_charged_bytes_ ? video_bytes - last_video_charged_bytes_ : 0;
+      const auto overhead_bytes = path_delta > video_delta ? path_delta - video_delta : 0;
+      const auto measured = overhead_bytes > std::numeric_limits<std::uint64_t>::max() / 8'000'000U ?
+                              std::numeric_limits<std::uint64_t>::max() :
+                              overhead_bytes * 8'000'000U / elapsed;
+      const auto bounded_measured = std::min(
+        measured,
+        config_.aggregate_pacing_bits_per_second > 1U ? config_.aggregate_pacing_bits_per_second - 1U : 0U
+      );
+      smoothed_forward_overhead_bits_per_second_ = smoothed_forward_overhead_bits_per_second_ == 0 ? bounded_measured :
+                                                                                                     (smoothed_forward_overhead_bits_per_second_ * 3U + bounded_measured) / 4U;
+      const auto reserved = std::max(config_.reserved_overhead_bits_per_second, smoothed_forward_overhead_bits_per_second_);
+      (void) congestion_.update_reserved_overhead(reserved);
+      last_overhead_sample_microseconds_ = now_microseconds;
+      last_path_charged_bytes_ = path_bytes;
+      last_video_charged_bytes_ = video_bytes;
     }
 
     /** @brief Fold newly authenticated per-packet feedback into independent PMTU evidence. */
@@ -1520,37 +2287,72 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    /** @brief Publish one successful final socket submission into the bounded sequence ledger. */
-    void record_sent_packet(
+    /** @brief Publish the greatest protected RTP sequence incarnation without regressing on callback order. */
+    void publish_last_send_serial(const std::uint64_t serial) noexcept {
+      auto current = last_send_serial_.load(std::memory_order_relaxed);
+      while (current < serial && !last_send_serial_.compare_exchange_weak(
+                                   current,
+                                   serial,
+                                   std::memory_order_release,
+                                   std::memory_order_relaxed
+                                 )) {
+      }
+    }
+
+    /** @brief Replace one sequence slot while retiring any prior unreported actual send. */
+    void replace_packet_record(
       const std::uint16_t sequence,
+      const std::uint64_t serial,
       const std::uint32_t complete_ip_bytes,
       const std::uint16_t udp_payload_bytes,
       const std::uint16_t confirmed_path_payload_bytes,
-      const std::uint64_t sent_microseconds
+      const std::uint64_t completed_microseconds,
+      const std::uint8_t feedback_state
     ) noexcept {
       auto &record = sent_ledger_[sequence];
       while (record.access.test_and_set(std::memory_order_acquire)) {
       }
       if (record.send_serial.load(std::memory_order_acquire) != 0 &&
-          record.feedback_state.load(std::memory_order_relaxed) == 0U) {
+          record.feedback_state.load(std::memory_order_relaxed) == feedback_unreported) {
         subtract_in_flight(record.complete_ip_bytes.load(std::memory_order_relaxed));
       }
       record.send_serial.store(0, std::memory_order_release);
-      auto serial = next_send_serial_.fetch_add(1, std::memory_order_relaxed);
-      if (serial == 0) {
-        serial = next_send_serial_.fetch_add(1, std::memory_order_relaxed);
-      }
-      record.sent_microseconds.store(sent_microseconds, std::memory_order_relaxed);
+      record.sent_microseconds.store(completed_microseconds, std::memory_order_relaxed);
       record.complete_ip_bytes.store(complete_ip_bytes, std::memory_order_relaxed);
       record.udp_payload_bytes.store(udp_payload_bytes, std::memory_order_relaxed);
       record.confirmed_path_payload_bytes.store(confirmed_path_payload_bytes, std::memory_order_relaxed);
-      record.path_generation.store(path_generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-      record.feedback_state.store(0, std::memory_order_relaxed);
+      record.path_generation.store(
+        feedback_state == feedback_local_unsent ? 0U : path_generation_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed
+      );
+      record.feedback_state.store(feedback_state, std::memory_order_relaxed);
       record.ecn_state.store(0, std::memory_order_relaxed);
-      last_send_serial_.store(serial, std::memory_order_release);
-      bytes_in_flight_.fetch_add(complete_ip_bytes, std::memory_order_relaxed);
+      publish_last_send_serial(serial);
+      if (feedback_state == feedback_unreported) {
+        bytes_in_flight_.fetch_add(complete_ip_bytes, std::memory_order_relaxed);
+      }
       record.send_serial.store(serial, std::memory_order_release);
       record.access.clear(std::memory_order_release);
+    }
+
+    /** @brief Publish one successful final socket submission into the bounded sequence ledger. */
+    void record_sent_packet(
+      const std::uint16_t sequence,
+      const std::uint64_t serial,
+      const std::uint32_t complete_ip_bytes,
+      const std::uint16_t udp_payload_bytes,
+      const std::uint16_t confirmed_path_payload_bytes,
+      const std::uint64_t sent_microseconds
+    ) noexcept {
+      replace_packet_record(
+        sequence,
+        serial,
+        complete_ip_bytes,
+        udp_payload_bytes,
+        confirmed_path_payload_bytes,
+        sent_microseconds,
+        feedback_unreported
+      );
       if (confirmed_path_payload_bytes > 1'200 &&
           classify_path_packet_size(udp_payload_bytes, confirmed_path_payload_bytes) ==
             PathPacketSizeClass::confirmed_size) {
@@ -1558,7 +2360,23 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    /** @brief Reconfigure sender-thread pacing immediately and other targets only at a frame boundary. */
+    /** @brief Publish one protected but never transmitted RTP sequence for CCFB range continuity. */
+    void record_unsent_packet(
+      const PendingDatagram &pending,
+      const std::uint64_t completed_microseconds
+    ) noexcept {
+      replace_packet_record(
+        pending.sequence,
+        pending.packet_serial,
+        0,
+        0,
+        0,
+        completed_microseconds,
+        feedback_local_unsent
+      );
+    }
+
+    /** @brief Reconfigure the aggregate path and publish other targets at a frame boundary. */
     [[nodiscard]] bool apply_requested_targets(
       const std::uint64_t now_microseconds,
       const bool frame_boundary
@@ -1591,29 +2409,21 @@ namespace lumen::lsp::runtime {
         return false;
       }
       if (pacing != current_pacing_bits_per_second_.load(std::memory_order_relaxed) ||
-          path_payload != pacer_path_payload_) {
-        if (!pacer_.reconfigure({
-          .pacing_bits_per_second = pacing,
-          .input_reserve_bits_per_second = 0,
-          .path_datagram_bytes = static_cast<std::uint16_t>(path_payload + ip_udp_overhead()),
-          .quantum_microseconds = 100,
-          .submission_horizon_microseconds = 200,
-          .max_datagrams_per_batch = 8,
-        }, now_microseconds)) {
+          path_payload != config_.forward_path->snapshot().path_payload_bytes) {
+        if (!config_.forward_path->reconfigure(pacing, path_payload)) {
           return false;
         }
-        pacer_path_payload_ = path_payload;
         current_pacing_bits_per_second_.store(pacing, std::memory_order_release);
       }
       return true;
     }
 
-    /** @brief Freshly protect and submit one exact candidate, retaining bytes only for local retry. */
+    /** @brief Freshly protect and commit one exact candidate into the path-probe reserve. */
     [[nodiscard]] bool protect_and_submit_path_probe(
       const std::uint64_t now_microseconds,
       const bool probe_timer_retry
     ) noexcept {
-      if (path_probe_.probe.probe_id == 0 || path_probe_.probe.udp_payload_size > path_probe_.protected_packet.size()) {
+      if (path_probe_.probe.probe_id == 0 || path_probe_.completion_pending) {
         return false;
       }
       const auto trailer = srtp_.protect_trailer_length(config_.peer, SecurePacketClass::rtcp);
@@ -1624,8 +2434,12 @@ namespace lumen::lsp::runtime {
       if (plaintext_bytes < 24U || (plaintext_bytes & 3U) != 0U) {
         return false;
       }
-      std::ranges::fill(path_probe_.protected_packet, 0);
-      auto packet = std::span<std::uint8_t> {path_probe_.protected_packet}.first(path_probe_.probe.udp_payload_size);
+      auto lease = config_.forward_path->acquire(HostForwardLane::path_probe);
+      if (!lease || path_probe_.probe.udp_payload_size > lease->storage.size()) {
+        return false;
+      }
+      auto packet = lease->storage.first(path_probe_.probe.udp_payload_size);
+      std::ranges::fill(packet, 0);
       packet[0] = 0x80U;
       packet[1] = transport::rtcp_app_type;
       wire::write_be<std::uint16_t>(packet.subspan<2, 2>(), static_cast<std::uint16_t>(plaintext_bytes / 4U - 1U));
@@ -1636,6 +2450,14 @@ namespace lumen::lsp::runtime {
       wire::write_be<std::uint16_t>(packet.subspan<14, 2>(), path_probe_.probe.udp_payload_size);
       wire::write_be<std::uint64_t>(packet.subspan<16, 8>(), path_probe_.probe.probe_id);
 
+      const auto token = register_pending({
+        .probe_id = path_probe_.probe.probe_id,
+        .kind = PendingKind::path_probe,
+        .probe_timer_retry = probe_timer_retry,
+      });
+      if (token == 0) {
+        return false;
+      }
       std::size_t protected_bytes = 0;
       if (!srtp_.protect_in_place(
             config_.peer,
@@ -1643,32 +2465,20 @@ namespace lumen::lsp::runtime {
             packet,
             plaintext_bytes,
             protected_bytes
-          ) || protected_bytes != path_probe_.probe.udp_payload_size) {
+          ) ||
+          protected_bytes != path_probe_.probe.udp_payload_size) {
+        (void) take_pending(token, false);
         return false;
       }
-      path_probe_.protected_bytes = protected_bytes;
-      path_probe_.protected_is_probe_timer_retry = probe_timer_retry;
-      const auto send_result = srtp_.send_protected(config_.peer, packet.first(protected_bytes));
-      if (send_result == ProtectedSendResult::would_block) {
-        path_probe_.local_send_pending = true;
-        return true;
-      }
-      if (send_result == ProtectedSendResult::message_too_large) {
-        path_probe_.local_send_pending = false;
-        local_candidate_failed_.store(true, std::memory_order_release);
-        return true;
-      }
-      if (send_result == ProtectedSendResult::fatal) {
+      const auto deadline = saturating_add_time(now_microseconds, minimum_probe_timer_microseconds);
+      path_probe_.completion_pending = true;
+      if (config_.forward_path->commit(*lease, protected_bytes, deadline, token, completion_target()) !=
+          HostForwardSubmitResult::accepted) {
+        path_probe_.completion_pending = false;
+        (void) take_pending(token, false);
         return false;
       }
-      path_probe_.local_send_pending = false;
-      ++path_probe_.transmissions;
-      path_probe_.last_transmission_microseconds = now_microseconds;
-      path_probe_datagrams_.fetch_add(1, std::memory_order_relaxed);
-      if (probe_timer_retry) {
-        path_probe_retries_.fetch_add(1, std::memory_order_relaxed);
-      }
-      path_probe_.protected_is_probe_timer_retry = false;
+      path_probe_.last_attempt_microseconds = now_microseconds;
       return true;
     }
 
@@ -1677,9 +2487,13 @@ namespace lumen::lsp::runtime {
       const std::uint32_t rtp_timestamp,
       const std::uint64_t now_microseconds
     ) noexcept {
+      std::scoped_lock lock(control_mutex_);
       if (last_sender_report_microseconds_ != 0 &&
           (now_microseconds < last_sender_report_microseconds_ ||
            now_microseconds - last_sender_report_microseconds_ < video_sender_report_interval_microseconds)) {
+        return;
+      }
+      if (sender_report_pending_) {
         return;
       }
       const auto now = std::chrono::steady_clock::now();
@@ -1692,46 +2506,312 @@ namespace lumen::lsp::runtime {
         .ntp_seconds = static_cast<std::uint32_t>(ntp >> 32U),
         .ntp_fraction = static_cast<std::uint32_t>(ntp),
         .rtp_timestamp = rtp_timestamp,
-        .packet_count = rtp_packet_count_,
-        .octet_count = rtp_octet_count_,
+        .packet_count = rtp_packet_count_.load(std::memory_order_relaxed),
+        .octet_count = rtp_octet_count_.load(std::memory_order_relaxed),
       };
-      const auto written = transport::write_sender_report(report, rtcp_slab_);
-      if (!written || !srtp_.protect_and_send(
-                        config_.peer,
-                        SecurePacketClass::rtcp,
-                        std::span<const std::uint8_t> {rtcp_slab_}.first(written.bytes_written)
-                      )) {
+      auto lease = config_.forward_path->acquire(HostForwardLane::periodic);
+      if (!lease) {
         return;
       }
-      auto &timing = sender_report_timings_[next_sender_report_timing_];
-      timing.lsr.store(0, std::memory_order_release);
-      timing.sent_microseconds.store(now_microseconds, std::memory_order_relaxed);
-      timing.lsr.store(static_cast<std::uint32_t>(ntp >> 16U), std::memory_order_release);
-      next_sender_report_timing_ = (next_sender_report_timing_ + 1U) % sender_report_timings_.size();
-      last_sender_report_microseconds_ = now_microseconds;
+      const auto written = transport::write_sender_report(report, lease->storage);
+      if (!written) {
+        return;
+      }
+      const auto token = register_pending({
+        .lsr = static_cast<std::uint32_t>(ntp >> 16U),
+        .kind = PendingKind::sender_report,
+      });
+      if (token == 0) {
+        return;
+      }
+      std::size_t protected_bytes = 0;
+      if (!srtp_.protect_in_place(
+            config_.peer,
+            SecurePacketClass::rtcp,
+            lease->storage,
+            written.bytes_written,
+            protected_bytes
+          )) {
+        (void) take_pending(token, false);
+        return;
+      }
+      const auto deadline = saturating_add_time(now_microseconds, 20'000U);
+      sender_report_pending_ = true;
+      if (config_.forward_path->commit(*lease, protected_bytes, deadline, token, completion_target()) !=
+          HostForwardSubmitResult::accepted) {
+        sender_report_pending_ = false;
+        (void) take_pending(token, false);
+        return;
+      }
     }
 
-    /** @brief Retire a protected partial frame without reusing any consumed RTP sequence. */
-    [[nodiscard]] bool abandon_partially_submitted_frame(
-      video::packet_raw_t &packet,
-      const std::size_t consumed_packets,
-      const bool independent_recovery_permitted
-    ) noexcept {
+    /** @brief Retire consumed RTP sequence values without changing reference state a second time. */
+    [[nodiscard]] bool retire_consumed_sequences(const std::size_t consumed_packets) noexcept {
       next_sequence_ = static_cast<std::uint16_t>(next_sequence_ + consumed_packets);
-      reference_path_valid_ = false;
+      pressure_events_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+
+    /**
+     * @brief Publish a monotonic local dependency break before any recovery side effect.
+     *
+     * @param frame_fence Damaged/dropped encoder frame index, or no value for remote decoder evidence.
+     * @return New nonzero dependency generation, or no value on exhaustion.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> mark_reference_dependency_broken_locked(
+      const std::optional<std::int64_t> frame_fence
+    ) noexcept {
+      if (dependency_break_generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        return std::nullopt;
+      }
+      ++dependency_break_generation_;
+      if (frame_fence) {
+        dependency_frame_fence_ = std::max(dependency_frame_fence_, *frame_fence);
+      }
+      dependency_repair_pending_ = true;
+      reference_path_valid_.store(false, std::memory_order_release);
+      return dependency_break_generation_;
+    }
+
+    /** @brief Publish a dependency break under the common dependency-state lock. */
+    [[nodiscard]] std::optional<std::uint64_t> mark_reference_dependency_broken(
+      const std::optional<std::int64_t> frame_fence
+    ) noexcept {
+      std::scoped_lock lock(dependency_state_mutex_);
+      return mark_reference_dependency_broken_locked(frame_fence);
+    }
+
+    /** @brief Return whether an exact or coalesced invalidation awaits completion; lock required. */
+    [[nodiscard]] bool invalidation_pending_locked() const noexcept {
+      return active_invalidation_.occupied || queued_invalidation_.occupied;
+    }
+
+    /**
+     * @brief Publish one bounded generation/range-qualified encoder invalidation request.
+     *
+     * @param first_frame First inclusive encoder frame index.
+     * @param last_frame Last inclusive encoder frame index.
+     * @param failure_policy Permitted action if the encoder rejects this exact request.
+     * @param existing_dependency_generation Already-published atomic recovery break, if any.
+     * @param pre_submit Whether this request fences a locally dropped pre-submit frame.
+     * @return True after the sole active request was raised or the next range was safely coalesced.
+     */
+    [[nodiscard]] bool request_reference_invalidation(
+      const std::int64_t first_frame,
+      const std::int64_t last_frame,
+      const InvalidationFailurePolicy failure_policy,
+      const std::optional<std::uint64_t> existing_dependency_generation = std::nullopt,
+      const bool pre_submit = false
+    ) noexcept {
+      if (!invalidation_request_events_ || first_frame > last_frame) {
+        return false;
+      }
+      video::reference_invalidation_request_t request;
+      {
+        std::scoped_lock lock(dependency_state_mutex_);
+        if (existing_dependency_generation &&
+            (*existing_dependency_generation == 0 || *existing_dependency_generation > dependency_break_generation_)) {
+          return false;
+        }
+        const auto dependency_generation = existing_dependency_generation ?
+                                             existing_dependency_generation :
+                                             mark_reference_dependency_broken_locked(last_frame);
+        if (!dependency_generation) {
+          return false;
+        }
+        const auto bound_dependency_generation = bind_video_invalidation_dependency_generation(
+          *dependency_generation,
+          dependency_break_generation_,
+          latest_published_dependency_generation_
+        );
+        if (pre_submit) {
+          pre_submit_invalidation_pending_ = true;
+          pre_submit_invalidation_frame_ = last_frame;
+        }
+        if (active_invalidation_.occupied) {
+          if (!queued_invalidation_.occupied) {
+            queued_invalidation_ = {
+              .request = {
+                .first_frame = first_frame,
+                .last_frame = last_frame,
+              },
+              .dependency_generation = bound_dependency_generation,
+              .failure_policy = failure_policy,
+              .occupied = true,
+            };
+          } else {
+            if (!video::coalesce_reference_invalidation_range(
+                  queued_invalidation_.request,
+                  first_frame,
+                  last_frame
+                )) {
+              return false;
+            }
+            if (failure_policy == InvalidationFailurePolicy::fail_closed) {
+              queued_invalidation_.failure_policy = InvalidationFailurePolicy::fail_closed;
+            }
+            queued_invalidation_.dependency_generation = std::max(
+              queued_invalidation_.dependency_generation,
+              bound_dependency_generation
+            );
+          }
+          return true;
+        }
+        if (next_invalidation_generation_ == 0) {
+          return false;
+        }
+        request = {
+          .generation = next_invalidation_generation_++,
+          .first_frame = first_frame,
+          .last_frame = last_frame,
+        };
+        active_invalidation_ = {
+          .request = request,
+          .dependency_generation = bound_dependency_generation,
+          .failure_policy = failure_policy,
+          .occupied = true,
+        };
+        latest_published_invalidation_generation_ = request.generation;
+        latest_published_dependency_generation_ = std::max(
+          latest_published_dependency_generation_,
+          bound_dependency_generation
+        );
+      }
+      invalidation_request_events_->raise(request);
+      return true;
+    }
+
+    /**
+     * @brief Consume the exact pending invalidation named by one encoder terminal result.
+     *
+     * @param result Generation and inclusive range echoed by the encoder.
+     * @return Matched policy and any atomically promoted next request, or no value when stale.
+     */
+    [[nodiscard]] std::optional<InvalidationCompletion> take_invalidation_result(
+      const video::reference_invalidation_result_t &result
+    ) noexcept {
+      std::scoped_lock lock(dependency_state_mutex_);
+      if (!active_invalidation_.occupied ||
+          !video::reference_invalidation_result_matches(active_invalidation_.request, result)) {
+        return std::nullopt;
+      }
+      InvalidationCompletion completion {
+        .completed = active_invalidation_,
+      };
+      active_invalidation_ = {};
+      if (!result.succeeded) {
+        queued_invalidation_ = {};
+        return completion;
+      }
+      if (queued_invalidation_.occupied) {
+        if (next_invalidation_generation_ == 0) {
+          queued_invalidation_ = {};
+          completion.promotion_failed = true;
+          return completion;
+        }
+        queued_invalidation_.request.generation = next_invalidation_generation_++;
+        queued_invalidation_.dependency_generation = bind_video_invalidation_dependency_generation(
+          queued_invalidation_.dependency_generation,
+          dependency_break_generation_,
+          latest_published_dependency_generation_
+        );
+        active_invalidation_ = queued_invalidation_;
+        completion.promoted = active_invalidation_.request;
+        latest_published_invalidation_generation_ = active_invalidation_.request.generation;
+        latest_published_dependency_generation_ = std::max(
+          latest_published_dependency_generation_,
+          active_invalidation_.dependency_generation
+        );
+        queued_invalidation_ = {};
+      }
+      return completion;
+    }
+
+    /**
+     * @brief Invalidate one encoded frame that reached no aggregate-path commit.
+     *
+     * @param packet Unsent encoded frame whose future reference use is forbidden.
+     * @return True after exact invalidation was queued; false after fail-closed teardown.
+     */
+    [[nodiscard]] bool invalidate_uncommitted_frame_dependency(video::packet_raw_t &packet) noexcept {
+      const auto frame_index = packet.frame_index();
+      if (!config_.reference_invalidation) {
+        {
+          std::scoped_lock lock(dependency_state_mutex_);
+          pre_submit_invalidation_pending_ = true;
+          pre_submit_invalidation_frame_ = frame_index;
+          (void) mark_reference_dependency_broken_locked(frame_index);
+        }
+        fail_forward_path();
+        return false;
+      }
+      if (!request_reference_invalidation(
+            frame_index,
+            frame_index,
+            InvalidationFailurePolicy::fail_closed,
+            std::nullopt,
+            true
+          )) {
+        fail_forward_path();
+        return false;
+      }
+      return true;
+    }
+
+    /** @brief Drop an encoded frame before submission and invalidate its future reference use. */
+    [[nodiscard]] bool drop_pre_submit_frame(video::packet_raw_t &packet) noexcept {
       dropped_frames_.fetch_add(1, std::memory_order_relaxed);
       pressure_events_.fetch_add(1, std::memory_order_relaxed);
-      if (config_.reference_invalidation) {
-        const auto frame_index = packet.frame_index();
-        config_.capture_mail->event<std::pair<std::int64_t, std::int64_t>>(mail::invalidate_ref_frames)
-          ->raise(std::make_pair(frame_index, frame_index));
-        return true;
+      return invalidate_uncommitted_frame_dependency(packet);
+    }
+
+    /** @brief Apply exact encoder invalidation results and the request's bounded rejection policy. */
+    [[nodiscard]] bool consume_invalidation_results() noexcept {
+      if (!invalidation_result_events_) {
+        return false;
       }
-      if (independent_recovery_permitted) {
-        config_.capture_mail->event<bool>(mail::idr)->raise(true);
-        return true;
+      while (invalidation_result_events_->peek()) {
+        const auto result = invalidation_result_events_->pop(std::chrono::milliseconds {0});
+        if (!result) {
+          continue;
+        }
+        const auto completion = take_invalidation_result(*result);
+        if (!completion) {
+          continue;
+        }
+        if (completion->promotion_failed) {
+          fail_forward_path();
+          return false;
+        }
+        if (completion->promoted) {
+          invalidation_request_events_->raise(*completion->promoted);
+        }
+        if (result->succeeded) {
+          continue;
+        }
+        if (completion->completed.failure_policy == InvalidationFailurePolicy::independent_recovery) {
+          bool request_independent_frame = false;
+          bool recovery_already_outstanding = false;
+          {
+            std::scoped_lock lock(pending_mutex_);
+            const auto recovery = recovery_.snapshot();
+            request_independent_frame = recovery.phase == transport::recovery_phase::repairing_references ||
+                                        recovery.phase == transport::recovery_phase::retry_permitted;
+            recovery_already_outstanding =
+              recovery.phase == transport::recovery_phase::recovery_frame_outstanding;
+          }
+          if (request_independent_frame) {
+            config_.capture_mail->event<bool>(mail::idr)->raise(true);
+            continue;
+          }
+          if (recovery_already_outstanding) {
+            continue;
+          }
+        }
+        fail_forward_path();
+        return false;
       }
-      return false;
+      return !failed_.load(std::memory_order_acquire);
     }
 
     /** @brief Drain encoded access units until close or fatal packet submission failure. */
@@ -1750,7 +2830,10 @@ namespace lumen::lsp::runtime {
 
     /** @brief Materialize, admit, packetize, pace, protect, and submit one complete access unit. */
     [[nodiscard]] bool process_frame(video::packet_raw_t &packet) noexcept {
-      const auto boundary_now = monotonic_microseconds();
+      if (!consume_invalidation_results()) {
+        return false;
+      }
+      const auto boundary_now = video_monotonic_microseconds();
       if (!apply_requested_targets(boundary_now, true)) {
         return false;
       }
@@ -1794,10 +2877,23 @@ namespace lumen::lsp::runtime {
       if (next_frame_id_ == 0) {
         failed_.store(true, std::memory_order_release);
       }
+      const auto independent = packet.is_idr() || packet.after_ref_frame_invalidation;
+      const auto recovery_boundary = prepare_recovery_boundary(independent, video_monotonic_microseconds());
+      if (recovery_boundary.epoch == 0) {
+        return false;
+      }
+      if (video_recovery_drop_requires_dependency_invalidation(
+            recovery_boundary.blocked,
+            recovery_boundary.request_independent_frame,
+            independent
+          )) {
+        return drop_pre_submit_frame(packet);
+      }
       const auto extension_storage = make_extensions(
-        packet.is_idr(),
+        independent,
         absolute_capture_ntp(capture_time, complete_time),
         frame_id,
+        recovery_boundary.epoch,
         packet.applied_input_state_sequence,
         packet.applied_input_edge_id,
         saturated_microseconds(submit_time - capture_time),
@@ -1831,11 +2927,14 @@ namespace lumen::lsp::runtime {
         return false;
       }
 
-      const auto now_us = monotonic_microseconds();
       const auto deadline = media::compute_network_deadline({
         .capture_time_us = capture_us,
         .maximum_capture_to_client_us = config_.maximum_capture_to_present_microseconds,
       });
+      if (!wait_for_reference_terminal(independent, deadline)) {
+        return drop_pre_submit_frame(packet);
+      }
+      const auto now_us = video_monotonic_microseconds();
       const auto credit = decoder_credit_.load(std::memory_order_acquire);
       const auto admission = media::admit_frame({
         .size_mode = media::frame_size_mode::complete_access_unit,
@@ -1845,12 +2944,14 @@ namespace lumen::lsp::runtime {
         .now_us = now_us,
         .network_deadline_us = deadline,
         .decoder_credits = credit,
-        .reference_path_valid = packet.is_idr() || packet.after_ref_frame_invalidation || reference_path_valid_,
+        .reference_path_valid = independent || reference_path_valid_.load(std::memory_order_acquire),
       });
       if (!admission) {
-        dropped_frames_.fetch_add(1, std::memory_order_relaxed);
-        pressure_events_.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        return drop_pre_submit_frame(packet);
+      }
+      if (forward_backpressured_.load(std::memory_order_acquire) ||
+          !config_.forward_path->video_admission_open()) {
+        return drop_pre_submit_frame(packet);
       }
 
       std::uint64_t complete_wire_bytes = 0;
@@ -1869,138 +2970,219 @@ namespace lumen::lsp::runtime {
                                       std::numeric_limits<std::uint64_t>::max() :
                                       (wire_bits * 1'000'000U + pacing_rate - 1U) / pacing_rate;
       if (now_us >= deadline || serialization_us > deadline - now_us) {
-        dropped_frames_.fetch_add(1, std::memory_order_relaxed);
-        pressure_events_.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        return drop_pre_submit_frame(packet);
       }
 
+      const auto dependency_generation = reserve_dependency_generation(independent);
+      if (!dependency_generation) {
+        return drop_pre_submit_frame(packet);
+      }
       admitted_frames_.fetch_add(1, std::memory_order_relaxed);
-      std::size_t packet_index = 0;
-      while (packet_index < plan_count) {
-        std::array<std::uint16_t, 8> charges {};
-        const auto remaining = std::min<std::size_t>(charges.size(), plan_count - packet_index);
-        for (std::size_t index = 0; index < remaining; ++index) {
-          const auto absolute_index = packet_index + index;
-          const auto extension = extension_views.for_role(media::packet_role(absolute_index, plan_count));
-          charges[index] = static_cast<std::uint16_t>(rtp_fixed_header_size + extension.size() + plans[absolute_index].payload_bytes + sender_srtp_tag_bytes + ip_udp_overhead());
-        }
-        const auto now = monotonic_microseconds();
+      const auto frame_ticket = begin_pending_frame(
+        independent,
+        packet.is_idr(),
+        frame_id,
+        packet.frame_index(),
+        packet.reference_invalidation_generation,
+        *dependency_generation
+      );
+      if (frame_ticket == 0) {
+        return drop_pre_submit_frame(packet);
+      }
+      const auto reservation = reserve_recovery_frame(
+        frame_ticket,
+        independent,
+        recovery_boundary.epoch,
+        now_us,
+        deadline
+      );
+      if (reservation == RecoveryReservation::rejected) {
+        pressure_events_.fetch_add(1, std::memory_order_relaxed);
+        finish_pending_frame(frame_ticket, false);
+        return true;
+      }
+      for (std::size_t packet_index = 0; packet_index < plan_count; ++packet_index) {
+        const auto now = video_monotonic_microseconds();
         if (!apply_requested_targets(now, false)) {
+          finish_pending_frame(frame_ticket, false);
           return false;
         }
         if (now >= deadline) {
-          reference_path_valid_ = false;
-          pressure_events_.fetch_add(1, std::memory_order_relaxed);
+          finish_pending_frame(frame_ticket, false);
+          return retire_consumed_sequences(packet_index);
+        }
+        bool dependency_valid = false;
+        {
+          std::scoped_lock dependency_lock(dependency_state_mutex_);
+          dependency_valid = video_dependency_reservation_valid(
+            independent,
+            *dependency_generation,
+            dependency_break_generation_,
+            reference_path_valid_.load(std::memory_order_acquire),
+            dependency_repair_pending_
+          );
+        }
+        if (!dependency_valid) {
+          finish_pending_frame(frame_ticket, false);
+          if (packet_index == 0) {
+            if (!config_.reference_invalidation ||
+                !request_reference_invalidation(
+                  packet.frame_index(),
+                  packet.frame_index(),
+                  InvalidationFailurePolicy::fail_closed,
+                  std::nullopt,
+                  true
+                )) {
+              fail_forward_path();
+              return false;
+            }
+          }
+          return retire_consumed_sequences(packet_index);
+        }
+        auto lease = config_.forward_path->acquire_until(HostForwardLane::video, deadline);
+        if (!lease) {
+          finish_pending_frame(frame_ticket, false);
+          return retire_consumed_sequences(packet_index);
+        }
+        const auto role = media::packet_role(packet_index, plan_count);
+        const auto extension = extension_views.for_role(role);
+        const auto &plan = plans[packet_index];
+        const auto plaintext_bytes = rtp_fixed_header_size + extension.size() + plan.payload_bytes;
+        if (plaintext_bytes + sender_srtp_tag_bytes > path_payload) {
+          finish_pending_frame(frame_ticket, false);
           return false;
         }
-        const auto grant = pacer_.grant(std::span<const std::uint16_t> {charges}.first(remaining), false, now);
-        if (grant.datagrams == 0) {
-          const auto wait = pacer_.wait_microseconds(charges[0], false, now);
-          if (wait == std::numeric_limits<std::uint64_t>::max() || wait >= deadline - now) {
-            reference_path_valid_ = false;
-            pressure_events_.fetch_add(1, std::memory_order_relaxed);
-            return false;
-          }
-          std::this_thread::sleep_for(std::chrono::microseconds {wait});
-          continue;
+        const rtp_fixed_header rtp {
+          .padding = false,
+          .extension = !extension.empty(),
+          .marker = packet_index + 1U == plan_count,
+          .payload_type = config_.video.primary_payload_type,
+          .csrc_count = 0,
+          .sequence_number = static_cast<std::uint16_t>(next_sequence_ + packet_index),
+          .timestamp = rtp_timestamp,
+          .ssrc = config_.video.primary_ssrc,
+        };
+        const auto header = write_rtp_fixed_header(rtp, {}, lease->storage);
+        if (!header || header.bytes_written != rtp_fixed_header_size) {
+          finish_pending_frame(frame_ticket, false);
+          return false;
         }
-        for (std::size_t index = 0; index < grant.datagrams; ++index) {
-          const auto absolute_index = packet_index + index;
-          const auto role = media::packet_role(absolute_index, plan_count);
-          const auto extension = extension_views.for_role(role);
-          const auto &plan = plans[absolute_index];
-          const auto plaintext_bytes = rtp_fixed_header_size + extension.size() + plan.payload_bytes;
-          if (plaintext_bytes + sender_srtp_tag_bytes > path_payload) {
-            return false;
-          }
-          const rtp_fixed_header rtp {
-            .padding = false,
-            .extension = !extension.empty(),
-            .marker = absolute_index + 1U == plan_count,
-            .payload_type = config_.video.primary_payload_type,
-            .csrc_count = 0,
-            .sequence_number = static_cast<std::uint16_t>(next_sequence_ + absolute_index),
-            .timestamp = rtp_timestamp,
-            .ssrc = config_.video.primary_ssrc,
-          };
-          const auto header = write_rtp_fixed_header(rtp, {}, packet_slab_);
-          if (!header || header.bytes_written != rtp_fixed_header_size) {
-            return false;
-          }
-          std::copy(extension.begin(), extension.end(), packet_slab_.begin() + static_cast<std::ptrdiff_t>(rtp_fixed_header_size));
-          const auto payload = std::span<std::uint8_t> {packet_slab_}.subspan(
-            rtp_fixed_header_size + extension.size(),
-            plan.payload_bytes
-          );
-          const auto payload_written = config_.video.codec == VideoCodec::h264 ?
-                                         write_h264_payload(plan, units, payload) :
-                                         write_hevc_payload(plan, units, payload);
-          if (!payload_written) {
-            return false;
-          }
-          std::size_t protected_bytes = 0;
-          auto send_result = srtp_.protect_and_send_in_place_result(
-            config_.peer,
-            SecurePacketClass::rtp,
-            std::span<std::uint8_t> {packet_slab_}.first(path_payload),
-            plaintext_bytes,
-            protected_bytes
-          );
-          while (send_result == ProtectedSendResult::would_block) {
-            const auto retry_time = monotonic_microseconds();
-            if (retry_time >= deadline) {
-              return abandon_partially_submitted_frame(packet, absolute_index + 1U, false);
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds {50});
-            send_result = srtp_.send_protected(
+        std::copy(extension.begin(), extension.end(), lease->storage.begin() + static_cast<std::ptrdiff_t>(rtp_fixed_header_size));
+        const auto payload = lease->storage.subspan(
+          rtp_fixed_header_size + extension.size(),
+          plan.payload_bytes
+        );
+        const auto payload_written = config_.video.codec == VideoCodec::h264 ?
+                                       write_h264_payload(plan, units, payload) :
+                                       write_hevc_payload(plan, units, payload);
+        if (!payload_written) {
+          finish_pending_frame(frame_ticket, false);
+          return false;
+        }
+        const auto token = register_pending_rtp(
+          rtp.sequence_number,
+          static_cast<std::uint32_t>(plan.payload_bytes),
+          path_payload,
+          frame_ticket
+        );
+        if (token == 0) {
+          finish_pending_frame(frame_ticket, false);
+          return retire_consumed_sequences(packet_index);
+        }
+        std::size_t protected_bytes = 0;
+        if (!srtp_.protect_in_place(
               config_.peer,
-              std::span<const std::uint8_t> {packet_slab_}.first(protected_bytes)
+              SecurePacketClass::rtp,
+              lease->storage,
+              plaintext_bytes,
+              protected_bytes
+            ) ||
+            protected_bytes == 0) {
+          (void) take_pending(token, false);
+          finish_pending_frame(frame_ticket, false);
+          return false;
+        }
+        auto submit_result = HostForwardSubmitResult::invalid;
+        {
+          std::scoped_lock dependency_lock(dependency_state_mutex_);
+          dependency_valid = video_dependency_reservation_valid(
+            independent,
+            *dependency_generation,
+            dependency_break_generation_,
+            reference_path_valid_.load(std::memory_order_acquire),
+            dependency_repair_pending_
+          );
+          if (dependency_valid) {
+            submit_result = config_.forward_path->commit(
+              *lease,
+              protected_bytes,
+              deadline,
+              token,
+              completion_target()
             );
           }
-          if (send_result == ProtectedSendResult::message_too_large && confirm_path_black_hole()) {
-            return abandon_partially_submitted_frame(packet, absolute_index + 1U, true);
+        }
+        if (!dependency_valid) {
+          if (const auto pending = take_pending(token, false)) {
+            record_unsent_packet(*pending, video_monotonic_microseconds());
           }
-          if (send_result != ProtectedSendResult::sent || protected_bytes == 0) {
-            reference_path_valid_ = false;
-            pressure_events_.fetch_add(1, std::memory_order_relaxed);
+          finish_pending_frame(frame_ticket, false);
+          const auto retired = retire_consumed_sequences(packet_index + 1U);
+          if (packet_index == 0 && !invalidate_uncommitted_frame_dependency(packet)) {
             return false;
           }
-          record_sent_packet(
-            rtp.sequence_number,
-            charges[index],
-            static_cast<std::uint16_t>(protected_bytes),
-            path_payload,
-            monotonic_microseconds()
-          );
-          ++rtp_packet_count_;
-          rtp_octet_count_ += static_cast<std::uint32_t>(plan.payload_bytes);
-          submitted_packets_.fetch_add(1, std::memory_order_relaxed);
-          submitted_wire_bytes_.fetch_add(charges[index], std::memory_order_relaxed);
+          return retired;
         }
-        packet_index += grant.datagrams;
+        if (submit_result != HostForwardSubmitResult::accepted) {
+          if (const auto pending = take_pending(token, false)) {
+            record_unsent_packet(*pending, video_monotonic_microseconds());
+          }
+          finish_pending_frame(frame_ticket, false);
+          const auto retired = retire_consumed_sequences(packet_index + 1U);
+          if (packet_index == 0 && !invalidate_uncommitted_frame_dependency(packet)) {
+            return false;
+          }
+          return retired;
+        }
+        mark_frame_packet_committed(frame_ticket);
       }
       next_sequence_ = static_cast<std::uint16_t>(next_sequence_ + plan_count);
-      reference_path_valid_ = true;
+      finish_pending_frame(frame_ticket, true);
       if (credit != 0) {
         auto expected_credit = credit;
         (void) decoder_credit_.compare_exchange_strong(expected_credit, static_cast<std::uint8_t>(credit - 1U));
       }
-      submitted_frames_.fetch_add(1, std::memory_order_relaxed);
-      maybe_send_sender_report(rtp_timestamp, monotonic_microseconds());
+      maybe_send_sender_report(rtp_timestamp, video_monotonic_microseconds());
       return true;
     }
 
     HostVideoSenderConfig config_;  ///< Immutable negotiated sender configuration.
     LibsrtpServerProvider &srtp_;  ///< Installed association provider.
+    safe::mail_raw_t::event_t<video::reference_invalidation_request_t> invalidation_request_events_;  ///< Generation-qualified encoder invalidation requests.
+    safe::mail_raw_t::event_t<video::reference_invalidation_result_t> invalidation_result_events_;  ///< Encoder invalidation terminal results.
     video::egress_queue_t egress_ {1};  ///< One-unsent-frame encoded egress owner.
-    aggregate_pacer pacer_;  ///< Complete IP-layer rate-derived microbatch pacer.
     transport::congestion_controller congestion_;  ///< Independent forward-path RFC 8888 controller.
     transport::path_mtu_discovery path_mtu_;  ///< Authenticated host-to-client DPLPMTUD search state.
+    transport::recovery_controller recovery_;  ///< Coalesces reference damage into one recovery epoch/request.
     std::optional<transport::path_mtu_discovery> path_mtu_before_probe_ {};  ///< Rollback state until control intent starts.
     std::array<std::vector<std::uint8_t>, 2> frame_slabs_ {};  ///< Two preallocated complete-AU scratch slabs.
     std::vector<PacketPlan> packet_plans_ {};  ///< Preallocated fixed-capacity packet descriptor storage.
-    std::array<std::uint8_t, final_packet_slab_bytes> packet_slab_ {};  ///< Final in-place RTP/SRTP packet slab.
-    std::array<std::uint8_t, 64> rtcp_slab_ {};  ///< Periodic report-block-free video SR storage.
+    std::array<PendingDatagram, pending_datagram_slot_count> pending_datagrams_ {};  ///< Indexed final-send metadata.
+    std::array<PendingFrame, pending_frame_slot_count> pending_frames_ {};  ///< Indexed whole-frame completion state.
+    PendingInvalidation active_invalidation_ {};  ///< Sole request published through the replaceable mailbox event.
+    PendingInvalidation queued_invalidation_ {};  ///< Coalesced next range retained until active completion.
+    std::array<std::uint8_t, pending_datagram_slot_count> free_pending_datagrams_ {};  ///< O(1) datagram free list.
+    std::array<std::uint8_t, pending_frame_slot_count> free_pending_frames_ {};  ///< O(1) frame free list.
+    std::mutex pending_mutex_;  ///< Serializes path completions with producer token registration.
+    std::condition_variable pending_condition_;  ///< Wakes dependency and lifetime drain waiters.
+    mutable std::recursive_mutex control_mutex_;  ///< Serializes path-probe, report, and feedback state with completions.
+    mutable std::mutex dependency_state_mutex_;  ///< Serializes dependency breaks, invalidation correlation, and restoration.
+    std::size_t free_pending_datagram_count_ {};  ///< Available leading datagram free-list entries.
+    std::size_t free_pending_frame_count_ {};  ///< Available leading frame free-list entries.
+    std::size_t active_completion_callbacks_ {};  ///< Claimed callbacks that still access this sender.
+    std::uint64_t last_reference_frame_ticket_ {};  ///< Terminal fence for the next dependent admission.
+    std::uint64_t next_invalidation_generation_ {1};  ///< Next nonzero encoder request generation.
+    bool recovery_failure_latched_ {};  ///< Authenticated or local failure retained until retry deadline.
     std::array<SentPacketRecord, 65'536> sent_ledger_ {};  ///< Current incarnation for every RTP sequence value.
     std::array<SenderReportTiming, 8> sender_report_timings_ {};  ///< Recent authenticated RR timing matches.
     PathProbeTransmission path_probe_ {};  ///< One protected logical DPLPMTUD transmission.
@@ -2009,7 +3191,6 @@ namespace lumen::lsp::runtime {
     std::jthread worker_;  ///< Dedicated packetization, pacing, and send worker.
     std::optional<std::chrono::steady_clock::time_point> capture_origin_ {};  ///< First capture sampling origin.
     std::uint16_t next_sequence_ {};  ///< Next primary RTP sequence number.
-    std::uint16_t pacer_path_payload_ {1'200};  ///< UDP payload reflected by the active sender-thread pacer.
     std::uint32_t initial_timestamp_ {};  ///< Random initial 90 kHz timestamp.
     std::uint64_t next_frame_id_ {};  ///< Next nonzero frame identifier.
     std::uint64_t last_compound_rtcp_microseconds_ {};  ///< Latest valid regular compound report time.
@@ -2017,25 +3198,38 @@ namespace lumen::lsp::runtime {
     std::uint64_t highest_feedback_serial_ {};  ///< Greatest sent incarnation covered by valid CCFB.
     std::uint64_t last_delay_send_microseconds_ {};  ///< Prior sender time for delay-trend differencing.
     std::uint64_t last_sender_report_microseconds_ {};  ///< Last accepted video SRTCP SR submission.
+    std::uint64_t last_overhead_sample_microseconds_ {};  ///< Latest non-video aggregate-rate sample time.
+    std::uint64_t last_path_charged_bytes_ {};  ///< Aggregate path bytes at the prior overhead sample.
+    std::uint64_t last_video_charged_bytes_ {};  ///< Primary video bytes at the prior overhead sample.
+    std::uint64_t smoothed_forward_overhead_bits_per_second_ {};  ///< Smoothed measured non-video wire rate.
     std::uint32_t last_delay_arrival_timestamp_ {};  ///< Prior receiver middle-NTP arrival timestamp.
     std::uint32_t last_feedback_timestamp_ {};  ///< Latest accepted RFC 8888 report timestamp.
     std::uint32_t smoothed_rtt_microseconds_ {};  ///< Latest regular-RTCP RTT estimate when available.
     std::uint32_t rtt_variation_microseconds_ {};  ///< Latest regular-RTCP RTT variation when available.
-    std::uint32_t rtp_packet_count_ {};  ///< Video RTP packet count modulo 2^32 for SR.
-    std::uint32_t rtp_octet_count_ {};  ///< Video codec-payload octets modulo 2^32 for SR.
+    std::atomic<std::uint32_t> rtp_packet_count_ {};  ///< Final-sent video RTP packet count modulo 2^32 for SR.
+    std::atomic<std::uint32_t> rtp_octet_count_ {};  ///< Final-sent video codec-payload octets modulo 2^32 for SR.
+    std::atomic<std::uint64_t> latest_sent_frame_id_ {};  ///< Greatest fully submitted frame for decoder damage attribution.
+    std::uint64_t dependency_break_generation_ {1};  ///< Latest local encoder/decoder dependency break under state lock.
+    std::int64_t dependency_frame_fence_ {std::numeric_limits<std::int64_t>::min()};  ///< Greatest frame invalidated by a local break.
+    std::uint64_t latest_published_invalidation_generation_ {};  ///< Sole active encoder request generation.
+    std::uint64_t latest_published_dependency_generation_ {};  ///< Dependency break owned by the active request.
     std::size_t next_frame_slab_ {};  ///< Alternating complete-AU scratch slot.
     std::size_t next_recent_probe_id_ {};  ///< Next session replay-cache replacement slot.
     std::size_t next_sender_report_timing_ {};  ///< Next recent-SR timing replacement slot.
-    bool reference_path_valid_ {true};  ///< Whether known encoder dependencies remain decodable.
+    std::atomic<bool> reference_path_valid_ {true};  ///< Whether known encoder dependencies remain decodable.
+    bool pre_submit_invalidation_pending_ {};  ///< Whether exact local-drop invalidation awaits an independent frame.
+    bool dependency_repair_pending_ {};  ///< Whether only a latest-generation independent may restore validity.
+    std::int64_t pre_submit_invalidation_frame_ {};  ///< Exact frame index awaiting encoder invalidation.
     bool has_compound_rtcp_ {};  ///< Whether reduced-size CCFB has a fresh regular-report prerequisite.
     bool has_feedback_timestamp_ {};  ///< Whether report timestamp monotonicity has an origin.
     bool has_feedback_receive_time_ {};  ///< Whether local CCFB cadence has an origin.
     bool has_delay_sample_ {};  ///< Whether delay-trend differencing has an origin.
+    bool sender_report_pending_ {};  ///< Whether one protected periodic SR awaits terminal completion.
     bool ready_ {};  ///< Constructor validation and fixed-slab allocation status.
     bool registered_ {};  ///< Whether egress retains this session key.
     std::atomic<std::uint8_t> decoder_credit_ {};  ///< Latest freshness-bounded available decoder surfaces.
-    std::atomic<std::uint64_t> next_send_serial_ {1};  ///< Next nonzero RTP incarnation serial.
-    std::atomic<std::uint64_t> last_send_serial_ {};  ///< Greatest release-published RTP incarnation serial.
+    std::atomic<std::uint64_t> next_send_serial_ {1};  ///< Next protected RTP sequence incarnation serial.
+    std::atomic<std::uint64_t> last_send_serial_ {};  ///< Greatest sent-or-tombstoned RTP incarnation serial.
     std::atomic<std::uint64_t> bytes_in_flight_ {};  ///< Unreported complete IP-layer bytes.
     std::atomic<std::uint64_t> next_path_raise_microseconds_ {};  ///< Earliest upward search after a failed candidate/black hole.
     std::atomic<std::uint64_t> path_confirmation_started_microseconds_ {};  ///< Current >1,200-byte monitoring origin.
@@ -2047,6 +3241,7 @@ namespace lumen::lsp::runtime {
     std::atomic<std::uint32_t> path_generation_ {1};  ///< Current frame-boundary PMTU evidence generation.
     std::atomic<bool> black_hole_requested_ {};  ///< Sender-thread EMSGSIZE evidence awaiting path-state ownership.
     std::atomic<bool> local_candidate_failed_ {};  ///< LSPP EMSGSIZE awaiting candidate-only failure transition.
+    std::atomic<bool> forward_backpressured_ {};  ///< Aggregate path blocks new whole-frame admission.
     std::atomic<std::uint64_t> requested_pacing_bits_per_second_ {};  ///< Socket-thread controller target.
     std::atomic<std::uint64_t> requested_encoder_bits_per_second_ {};  ///< Next-frame encoder target.
     std::atomic<std::uint16_t> requested_path_payload_ {};  ///< Next-frame confirmed UDP payload.
@@ -2071,7 +3266,7 @@ namespace lumen::lsp::runtime {
   };
 
   HostVideoSender::HostVideoSender(HostVideoSenderConfig config, LibsrtpServerProvider &srtp) noexcept:
-      impl_ {new (std::nothrow) Impl {std::move(config), srtp}} {
+      impl_ {new(std::nothrow) Impl {std::move(config), srtp}} {
   }
 
   HostVideoSender::~HostVideoSender() = default;
@@ -2150,6 +3345,13 @@ namespace lumen::lsp::runtime {
     return impl_ && impl_->receive_congestion_feedback(packet, now_microseconds);
   }
 
+  bool HostVideoSender::receive_video_status(
+    const transport::lspv_status &status,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->receive_video_status(status, now_microseconds);
+  }
+
   void HostVideoSender::close() noexcept {
     if (impl_) {
       impl_->close();
@@ -2168,5 +3370,27 @@ namespace lumen::lsp::runtime {
 
   HostVideoSenderSnapshot HostVideoSender::snapshot() const noexcept {
     return impl_ ? impl_->snapshot() : HostVideoSenderSnapshot {};
+  }
+
+  bool HostVideoSender::complete_forward_datagram(
+    const std::uint64_t token,
+    const HostForwardCompletion completion,
+    const std::uint64_t completed_at_microseconds,
+    const std::size_t protected_bytes,
+    const std::uint16_t charged_bytes
+  ) noexcept {
+    return impl_ && impl_->complete_forward_datagram(
+                      token,
+                      completion,
+                      completed_at_microseconds,
+                      protected_bytes,
+                      charged_bytes
+                    );
+  }
+
+  void HostVideoSender::set_forward_backpressure(const bool blocked) noexcept {
+    if (impl_) {
+      impl_->set_forward_backpressure(blocked);
+    }
   }
 }  // namespace lumen::lsp::runtime

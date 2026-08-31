@@ -6,6 +6,8 @@
 #pragma once
 
 #include "../types.h"
+#include "host_forward_path.h"
+#include "libsrtp_provider.h"
 
 #include <cstdint>
 #include <memory>
@@ -17,6 +19,7 @@ namespace lumen::lsp::runtime {
   /** @brief Authenticated input-only session mapping installed by START_RESPONSE. */
   struct InputSessionMapping {
     PeerEndpoint peer;  ///< Exact authoritative DTLS/SRTP five-tuple.
+    std::shared_ptr<HostForwardPath> forward_path;  ///< Exact aggregate host-to-client path generation.
     Identifier128 client_id {};  ///< Authenticated client identity.
     std::uint32_t connection_generation {};  ///< Connection authority generation.
     std::uint32_t session_generation {};  ///< Stream-session generation.
@@ -31,20 +34,13 @@ namespace lumen::lsp::runtime {
     bool operator==(const InputSessionMapping &) const = default;
   };
 
-  /** @brief Non-owning crypto and protected-ACK callbacks used by the input owner. */
+  /** @brief Non-owning crypto and authority callbacks used by the input owner. */
   struct InputOwnerCallbacks {
     /** @brief Verify SHA-256 for one completed multipart baseline. */
     using VerifyDigest = bool (*)(
       void *context,
       std::span<const std::uint8_t> bytes,
       const Digest256 &expected
-    ) noexcept;
-
-    /** @brief Protect and send one complete plaintext RTCP APP packet. */
-    using SendAcknowledgement = bool (*)(
-      void *context,
-      const PeerEndpoint &peer,
-      std::span<const std::uint8_t> rtcp_packet
     ) noexcept;
 
     /** @brief Commit baseline authority before any normal input is applied. */
@@ -57,7 +53,6 @@ namespace lumen::lsp::runtime {
 
     void *context {};  ///< Opaque callback context.
     VerifyDigest verify_digest {};  ///< Required baseline verifier.
-    SendAcknowledgement send_acknowledgement {};  ///< Required SRTCP sender.
     BaselineCommitted baseline_committed {};  ///< Required SessionAuthority commit callback.
   };
 
@@ -66,8 +61,13 @@ namespace lumen::lsp::runtime {
    */
   class InputOwner {
   public:
-    /** @brief Start the dedicated platform-apply worker. */
-    explicit InputOwner(InputOwnerCallbacks callbacks) noexcept;
+    /**
+     * @brief Start the dedicated platform-apply worker.
+     *
+     * @param callbacks Baseline crypto and authority callbacks.
+     * @param srtp Association provider that outlives this owner.
+     */
+    InputOwner(InputOwnerCallbacks callbacks, LibsrtpServerProvider &srtp) noexcept;
     InputOwner(const InputOwner &) = delete;
     InputOwner &operator=(const InputOwner &) = delete;
     /** @brief Neutralize held input, stop, and join the worker. */
@@ -123,6 +123,13 @@ namespace lumen::lsp::runtime {
      * @return Applied state sequence and edge identifier; both zero before baseline authority.
      */
     [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> applied_watermark() const noexcept;
+
+    /**
+     * @brief Return measured final-sent complete IP/UDP bytes for host input feedback.
+     *
+     * @return Combined LSPI and LSPG charged bytes for the active owner lifetime.
+     */
+    [[nodiscard]] std::uint64_t sent_feedback_wire_bytes() const noexcept;
 
   private:
     class Impl;

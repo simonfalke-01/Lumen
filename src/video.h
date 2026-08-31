@@ -578,11 +578,67 @@ namespace video {
     std::vector<replace_t> *replacements = nullptr;  ///< Optional encoded-byte substitutions applied before packetization.
     void *channel_data = nullptr;  ///< Platform or protocol state carried with this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
+    std::uint64_t reference_invalidation_generation = 0;  ///< Exact accepted LSP invalidation generation, or zero.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
     std::optional<std::chrono::steady_clock::time_point> encoder_submit_timestamp;  ///< Actual encoder submission time.
     std::uint64_t applied_input_state_sequence {};  ///< Input state watermark sampled at capture submission.
     std::uint64_t applied_input_edge_id {};  ///< Input edge watermark sampled at capture submission.
   };
+
+  /** @brief Generation-qualified local encoder reference-invalidation request. */
+  struct reference_invalidation_request_t {
+    std::uint64_t generation {};  ///< Nonzero sender-local request generation.
+    std::int64_t first_frame {};  ///< First encoder frame index to invalidate.
+    std::int64_t last_frame {};  ///< Last encoder frame index to invalidate.
+  };
+
+  /** @brief Terminal result for one local encoder reference-invalidation request. */
+  struct reference_invalidation_result_t {
+    std::uint64_t generation {};  ///< Exact request generation being completed.
+    std::int64_t first_frame {};  ///< First requested encoder frame index.
+    std::int64_t last_frame {};  ///< Last requested encoder frame index.
+    bool succeeded {};  ///< Whether the encoder accepted the complete invalidation range.
+  };
+
+  /**
+   * @brief Match one terminal invalidation result to its exact generation and frame range.
+   *
+   * @param request Outstanding sender request.
+   * @param result Encoder terminal result.
+   * @return True only for the exact nonzero generation and unchanged inclusive range.
+   */
+  [[nodiscard]] constexpr bool reference_invalidation_result_matches(
+    const reference_invalidation_request_t &request,
+    const reference_invalidation_result_t &result
+  ) noexcept {
+    return request.generation != 0 && request.generation == result.generation &&
+           request.first_frame == result.first_frame && request.last_frame == result.last_frame;
+  }
+
+  /**
+   * @brief Merge a concurrently requested inclusive range into one not-yet-published request.
+   *
+   * The existing request generation is retained. Callers use this only for the single queued
+   * request behind an already published generation, so replaceable mailbox delivery cannot lose
+   * either range.
+   *
+   * @param pending Initialized queued request to extend.
+   * @param first_frame Additional first inclusive frame index.
+   * @param last_frame Additional last inclusive frame index.
+   * @return True when the additional range was valid and merged.
+   */
+  [[nodiscard]] constexpr bool coalesce_reference_invalidation_range(
+    reference_invalidation_request_t &pending,
+    const std::int64_t first_frame,
+    const std::int64_t last_frame
+  ) noexcept {
+    if (pending.first_frame > pending.last_frame || first_frame > last_frame) {
+      return false;
+    }
+    pending.first_frame = std::min(pending.first_frame, first_frame);
+    pending.last_frame = std::max(pending.last_frame, last_frame);
+    return true;
+  }
 
   /**
    * @brief AVCodec packet wrapper with codec-specific metadata.

@@ -15,16 +15,8 @@
 #include <span>
 
 namespace lumen::lsp::runtime {
-  /** @brief Exact disposition of one already-protected nonblocking datagram submission. */
-  enum class ProtectedSendResult : std::uint8_t {
-    sent,  ///< Kernel accepted the complete protected datagram.
-    would_block,  ///< Exact protected bytes may be retried without consuming another index.
-    message_too_large,  ///< Kernel path state rejected this protected UDP payload size.
-    fatal,  ///< Association or socket state forbids retry.
-  };
-
   /**
-   * @brief Non-owning authenticated SRTP/SRTCP delivery callbacks.
+   * @brief Non-owning authenticated SRTP/SRTCP delivery callbacks invoked without the provider mutex.
    */
   struct LibsrtpCallbacks {
     /**
@@ -45,23 +37,8 @@ namespace lumen::lsp::runtime {
       std::size_t protected_bytes
     ) noexcept;
 
-    /**
-     * @brief Submit one complete protected RTP or RTCP datagram.
-     *
-     * @param context Opaque callback context.
-     * @param peer Exact destination association.
-     * @param protected_packet Complete protected packet.
-     * @return True only when the socket accepted the complete datagram.
-     */
-    using SendDatagram = ProtectedSendResult (*)(
-      void *context,
-      const PeerEndpoint &peer,
-      std::span<const std::uint8_t> protected_packet
-    ) noexcept;
-
     void *context {};  ///< Opaque callback value.
     PlaintextPacket plaintext_packet {};  ///< Required authenticated receive callback.
-    SendDatagram send_datagram {};  ///< Required exact protected send callback.
   };
 
   /**
@@ -93,7 +70,7 @@ namespace lumen::lsp::runtime {
     ProviderDatagramResult receive_secure_packet(
       const PeerEndpoint &peer,
       SecurePacketClass packet_class,
-      std::span<const std::uint8_t> datagram
+      std::span<std::uint8_t> datagram
     ) noexcept override;
 
     /**
@@ -115,54 +92,6 @@ namespace lumen::lsp::runtime {
      * @return True when an association was removed.
      */
     bool remove_association(const PeerEndpoint &peer) noexcept;
-
-    /**
-     * @brief Protect and atomically submit one RTP or RTCP packet.
-     *
-     * @param peer Exact established association.
-     * @param packet_class RTP or RTCP classification.
-     * @param plaintext Complete unprotected packet.
-     * @return True only when protection and exact datagram submission succeed.
-     */
-    bool protect_and_send(
-      const PeerEndpoint &peer,
-      SecurePacketClass packet_class,
-      std::span<const std::uint8_t> plaintext
-    ) noexcept;
-
-    /**
-     * @brief Protect a final caller-owned RTP slab in place and atomically submit it.
-     *
-     * @param peer Exact established association.
-     * @param packet_class RTP or RTCP classification.
-     * @param packet_storage Writable final slab including SRTP trailer capacity.
-     * @param plaintext_bytes Populated leading plaintext bytes.
-     * @return True only when in-place protection and exact datagram submission succeed.
-     */
-    bool protect_and_send_in_place(
-      const PeerEndpoint &peer,
-      SecurePacketClass packet_class,
-      std::span<std::uint8_t> packet_storage,
-      std::size_t plaintext_bytes
-    ) noexcept;
-
-    /**
-     * @brief Protect and submit one caller-owned packet with typed socket disposition.
-     *
-     * @param peer Exact established association.
-     * @param packet_class RTP or RTCP classification.
-     * @param packet_storage Writable final slab including trailer capacity.
-     * @param plaintext_bytes Populated leading plaintext bytes.
-     * @param protected_bytes Receives protected leading bytes whenever protection succeeds.
-     * @return Exact protected-send disposition.
-     */
-    ProtectedSendResult protect_and_send_in_place_result(
-      const PeerEndpoint &peer,
-      SecurePacketClass packet_class,
-      std::span<std::uint8_t> packet_storage,
-      std::size_t plaintext_bytes,
-      std::size_t &protected_bytes
-    ) noexcept;
 
     /** @brief Query exact libSRTP trailer bytes for the installed association/profile. */
     [[nodiscard]] std::optional<std::size_t> protect_trailer_length(
@@ -186,12 +115,6 @@ namespace lumen::lsp::runtime {
       std::span<std::uint8_t> packet_storage,
       std::size_t plaintext_bytes,
       std::size_t &protected_bytes
-    ) noexcept;
-
-    /** @brief Submit already-protected immutable bytes without consuming another SRTP index. */
-    ProtectedSendResult send_protected(
-      const PeerEndpoint &peer,
-      std::span<const std::uint8_t> protected_packet
     ) noexcept;
 
     /**

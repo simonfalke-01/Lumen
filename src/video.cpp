@@ -8,8 +8,8 @@
 #include <atomic>
 #include <bitset>
 #include <cstring>
-#include <list>
 #include <limits>
+#include <list>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -797,7 +797,9 @@ namespace video {
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
     egress_queue_t *egress;  ///< Per-session scheduler receiving encoded video packets for the stream sender.
     safe::mail_raw_t::event_t<bool> idr_events;  ///< Event raised when an IDR frame is requested.
-    safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Reference ranges requiring encoder recovery.
+    safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Legacy reference ranges requiring encoder recovery.
+    safe::mail_raw_t::event_t<reference_invalidation_request_t> lsp_invalidate_ref_frames_events;  ///< Generation-qualified LSP reference recovery.
+    safe::mail_raw_t::event_t<reference_invalidation_result_t> invalidate_ref_frames_result_events;  ///< Terminal reference-invalidation results.
     safe::mail_raw_t::event_t<std::uint32_t> bitrate_events;  ///< LSP frame-boundary bitrate targets.
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;  ///< Event carrying updated HDR metadata.
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;  ///< Event carrying updated touch viewport metadata.
@@ -805,6 +807,7 @@ namespace video {
     config_t config;  ///< Stream or encoder configuration captured for the worker.
     int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
     void *channel_data;  ///< Platform-specific channel data forwarded to packet senders.
+    std::uint64_t reference_invalidation_generation {};  ///< Accepted LSP invalidation tagging the next output.
   };
 
   /**
@@ -2181,6 +2184,7 @@ namespace video {
    * @param egress Per-session scheduler that receives the encoded packet.
    * @param channel_data Platform or protocol state attached to the packet.
    * @param frame_timestamp Capture timestamp associated with the encoded frame.
+   * @param reference_invalidation_generation Accepted invalidation generation tagging this output.
    * @return 0 when packets are queued; nonzero when NVENC encoding fails.
    */
   int encode_nvenc(
@@ -2189,7 +2193,8 @@ namespace video {
     egress_queue_t &egress,
     void *channel_data,
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
-    const std::pair<std::uint64_t, std::uint64_t> input_watermark
+    const std::pair<std::uint64_t, std::uint64_t> input_watermark,
+    const std::uint64_t reference_invalidation_generation
   ) {
     const auto encoder_submit_timestamp = std::chrono::steady_clock::now();
     auto encoded_frame = session.encode_frame(frame_nr);
@@ -2202,9 +2207,15 @@ namespace video {
       BOOST_LOG(error) << "NvENC frame index mismatch " << frame_nr << " " << encoded_frame.frame_index;
     }
 
+    if (reference_invalidation_generation != 0) {
+      encoded_frame.after_ref_frame_invalidation = true;
+      encoded_frame.reference_invalidation_generation = reference_invalidation_generation;
+    }
+
     auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
     packet->channel_data = channel_data;
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
+    packet->reference_invalidation_generation = encoded_frame.reference_invalidation_generation;
     packet->frame_timestamp = frame_timestamp;
     packet->encoder_submit_timestamp = encoder_submit_timestamp;
     packet->applied_input_state_sequence = input_watermark.first;
@@ -2224,6 +2235,7 @@ namespace video {
    * @param egress Per-session scheduler that receives encoded packets.
    * @param channel_data Channel data.
    * @param frame_timestamp Frame timestamp.
+   * @param reference_invalidation_generation Accepted invalidation generation tagging this output.
    * @return 0 when the frame is encoded and queued; nonzero on encoder failure.
    */
   int encode(
@@ -2232,12 +2244,21 @@ namespace video {
     egress_queue_t &egress,
     void *channel_data,
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
-    const std::pair<std::uint64_t, std::uint64_t> input_watermark
+    const std::pair<std::uint64_t, std::uint64_t> input_watermark,
+    const std::uint64_t reference_invalidation_generation
   ) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
       return encode_avcodec(frame_nr, *avcodec_session, egress, channel_data, frame_timestamp, input_watermark);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
-      return encode_nvenc(frame_nr, *nvenc_session, egress, channel_data, frame_timestamp, input_watermark);
+      return encode_nvenc(
+        frame_nr,
+        *nvenc_session,
+        egress,
+        channel_data,
+        frame_timestamp,
+        input_watermark,
+        reference_invalidation_generation
+      );
     }
 
     return -1;
@@ -2798,6 +2819,8 @@ namespace video {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto lsp_invalidate_ref_frames_events = mail->event<reference_invalidation_request_t>(mail::lsp_invalidate_ref_frames);
+    auto invalidate_ref_frames_result_events = mail->event<reference_invalidation_result_t>(mail::invalidate_ref_frames_result);
     auto bitrate_events = mail->event<std::uint32_t>(mail::lsp_bitrate);
 
     {
@@ -2812,16 +2835,41 @@ namespace video {
     }
 
     std::pair<std::uint64_t, std::uint64_t> input_watermark;
+    std::uint64_t reference_invalidation_generation = 0;
     while (true) {
       bool requested_idr_frame = false;
 
       while (invalidate_ref_frames_events->peek()) {
         if (auto frames = invalidate_ref_frames_events->pop(0ms)) {
+          bool succeeded = true;
           if (config.client_protocol == stream_policy::ClientProtocol::lumen_streaming_protocol) {
-            (void) session->try_invalidate_ref_frames_without_idr(frames->first, frames->second);
+            succeeded = session->try_invalidate_ref_frames_without_idr(frames->first, frames->second);
           } else {
             session->invalidate_ref_frames(frames->first, frames->second);
           }
+          invalidate_ref_frames_result_events->raise(reference_invalidation_result_t {
+            .generation = 0,
+            .first_frame = frames->first,
+            .last_frame = frames->second,
+            .succeeded = succeeded,
+          });
+        }
+      }
+      while (lsp_invalidate_ref_frames_events->peek()) {
+        if (auto request = lsp_invalidate_ref_frames_events->pop(0ms)) {
+          const auto succeeded = session->try_invalidate_ref_frames_without_idr(
+            request->first_frame,
+            request->last_frame
+          );
+          if (succeeded) {
+            reference_invalidation_generation = request->generation;
+          }
+          invalidate_ref_frames_result_events->raise(reference_invalidation_result_t {
+            .generation = request->generation,
+            .first_frame = request->first_frame,
+            .last_frame = request->last_frame,
+            .succeeded = succeeded,
+          });
         }
       }
 
@@ -2878,10 +2926,19 @@ namespace video {
         break;
       }
 
-      if (encode(frame_nr++, *session, egress, channel_data, frame_timestamp, input_watermark)) {
+      if (encode(
+            frame_nr++,
+            *session,
+            egress,
+            channel_data,
+            frame_timestamp,
+            input_watermark,
+            reference_invalidation_generation
+          )) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
+      reference_invalidation_generation = 0;
 
       if (target_rate_vdd) {
         target_encode_deadline = advance_target_encode_deadline(
@@ -3179,11 +3236,35 @@ namespace video {
 
           while (ctx->invalidate_ref_frames_events->peek()) {
             if (auto frames = ctx->invalidate_ref_frames_events->pop(0ms)) {
+              bool succeeded = true;
               if (ctx->config.client_protocol == stream_policy::ClientProtocol::lumen_streaming_protocol) {
-                (void) pos->session->try_invalidate_ref_frames_without_idr(frames->first, frames->second);
+                succeeded = pos->session->try_invalidate_ref_frames_without_idr(frames->first, frames->second);
               } else {
                 pos->session->invalidate_ref_frames(frames->first, frames->second);
               }
+              ctx->invalidate_ref_frames_result_events->raise(reference_invalidation_result_t {
+                .generation = 0,
+                .first_frame = frames->first,
+                .last_frame = frames->second,
+                .succeeded = succeeded,
+              });
+            }
+          }
+          while (ctx->lsp_invalidate_ref_frames_events->peek()) {
+            if (auto request = ctx->lsp_invalidate_ref_frames_events->pop(0ms)) {
+              const auto succeeded = pos->session->try_invalidate_ref_frames_without_idr(
+                request->first_frame,
+                request->last_frame
+              );
+              if (succeeded) {
+                ctx->reference_invalidation_generation = request->generation;
+              }
+              ctx->invalidate_ref_frames_result_events->raise(reference_invalidation_result_t {
+                .generation = request->generation,
+                .first_frame = request->first_frame,
+                .last_frame = request->last_frame,
+                .succeeded = succeeded,
+              });
             }
           }
           while (ctx->bitrate_events->peek()) {
@@ -3219,13 +3300,16 @@ namespace video {
                 *ctx->egress,
                 ctx->channel_data,
                 frame_timestamp,
-                pos->input_watermark
+                pos->input_watermark,
+                ctx->reference_invalidation_generation
               )) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
 
             continue;
           }
+
+          ctx->reference_invalidation_generation = 0;
 
           pos->session->request_normal_frame();
 
@@ -3439,12 +3523,15 @@ namespace video {
         &egress,
         std::move(idr_events),
         mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames),
+        mail->event<reference_invalidation_request_t>(mail::lsp_invalidate_ref_frames),
+        mail->event<reference_invalidation_result_t>(mail::invalidate_ref_frames_result),
         mail->event<std::uint32_t>(mail::lsp_bitrate),
         mail->event<hdr_info_t>(mail::hdr),
         mail->event<input::touch_port_t>(mail::touch_port),
         config,
         1,
         channel_data,
+        0,
       });
 
       // Wait for join signal
@@ -3497,7 +3584,7 @@ namespace video {
         )) {
       return -1;
     }
-    if (encode(1, *session, egress, nullptr, {}, {})) {
+    if (encode(1, *session, egress, nullptr, {}, {}, 0)) {
       return -1;
     }
 
@@ -3581,8 +3668,7 @@ namespace video {
           if (byte_count == 0 || byte_count > maximum_initialization_bytes) {
             return {};
           }
-          return {access_unit.begin() + static_cast<std::ptrdiff_t>(obu_start),
-                  access_unit.begin() + static_cast<std::ptrdiff_t>(obu_end)};
+          return {access_unit.begin() + static_cast<std::ptrdiff_t>(obu_start), access_unit.begin() + static_cast<std::ptrdiff_t>(obu_end)};
         }
         offset = obu_end;
       }
@@ -3620,9 +3706,12 @@ namespace video {
         const auto nal_type = video_format == 0 ? header & 0x1fU : (header >> 1U) & 0x3fU;
         std::uint8_t bit = 0;
         if (video_format == 0) {
-          bit = nal_type == 7 ? 0x01U : nal_type == 8 ? 0x02U : 0;
+          bit = nal_type == 7 ? 0x01U : nal_type == 8 ? 0x02U :
+                                                        0;
         } else {
-          bit = nal_type == 32 ? 0x01U : nal_type == 33 ? 0x02U : nal_type == 34 ? 0x04U : 0;
+          bit = nal_type == 32 ? 0x01U : nal_type == 33 ? 0x02U :
+                                       nal_type == 34   ? 0x04U :
+                                                          0;
         }
         if (bit != 0 && (found_mask & bit) == 0) {
           const auto byte_count = unit_end - current.first;
@@ -3707,7 +3796,7 @@ namespace video {
           {1, std::chrono::nanoseconds::zero()},
           {}
         ) ||
-        encode(1, *session, egress, nullptr, {}, {})) {
+        encode(1, *session, egress, nullptr, {}, {}, 0)) {
       return std::nullopt;
     }
     auto dequeued = egress.pop_for(2s);

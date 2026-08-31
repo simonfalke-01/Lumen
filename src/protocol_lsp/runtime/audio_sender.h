@@ -7,6 +7,7 @@
 
 #include "../../audio.h"
 #include "../media/audio.h"
+#include "host_forward_path.h"
 #include "libsrtp_provider.h"
 
 #include <cstddef>
@@ -17,6 +18,8 @@ namespace lumen::lsp::runtime {
   /** @brief Immutable negotiated configuration for one LSP host-audio source. */
   struct HostAudioSenderConfig {
     PeerEndpoint peer {};  ///< Exact authenticated DTLS/SRTP association five-tuple.
+    std::shared_ptr<HostForwardPath> forward_path;  ///< Generation-owned aggregate final-send path.
+    std::uint32_t forward_path_generation {};  ///< Exact connection/path authority generation.
     std::uint32_t ssrc {};  ///< Random nonzero host audio SSRC.
     std::uint8_t payload_type {};  ///< Negotiated dynamic Opus RTP payload type.
     std::uint16_t initial_sequence {};  ///< Random nonzero initial RTP sequence number.
@@ -38,13 +41,13 @@ namespace lumen::lsp::runtime {
   /** @brief Snapshot of host-audio sender admission, expiry, media, and RTCP counters. */
   struct HostAudioSenderSnapshot {
     std::uint64_t enqueued_packets {};  ///< Packets accepted by the bounded queue.
-    std::uint64_t sent_packets {};  ///< RTP packets successfully protected and submitted.
-    std::uint64_t sent_payload_octets {};  ///< Opus payload bytes successfully submitted.
-    std::uint64_t expired_packets {};  ///< Stale queued packets discarded at their age bound.
-    std::uint64_t backpressure_events {};  ///< Nonblocking enqueue attempts rejected by contention or capacity.
+    std::uint64_t sent_packets {};  ///< RTP packets accepted by the final kernel send.
+    std::uint64_t sent_payload_octets {};  ///< Opus payload bytes accepted by the final kernel send.
+    std::uint64_t expired_packets {};  ///< Queued or committed RTP packets discarded at their original age bound.
+    std::uint64_t backpressure_events {};  ///< Enqueue or aggregate-path capacity pressure observations.
     std::uint64_t malformed_packets {};  ///< Empty, oversized, or invalid-timeline packets rejected by the sender.
-    std::uint64_t send_failures {};  ///< RTP or SRTCP protection/submission failures.
-    std::uint64_t sender_reports {};  ///< SRTCP sender reports successfully submitted.
+    std::uint64_t send_failures {};  ///< Fatal RTP/SRTCP protection or aggregate-path failures.
+    std::uint64_t sender_reports {};  ///< SRTCP sender reports accepted by the final kernel send.
     bool started {};  ///< Whether the sender worker was started.
     bool closed {};  ///< Whether packet admission has closed.
     bool failed {};  ///< Whether a protection or submission failure terminated the worker.
@@ -54,9 +57,9 @@ namespace lumen::lsp::runtime {
    * @brief Nonblocking encoded-audio destination with a dedicated RTP/SRTP sender worker.
    *
    * The producer transfers already encoded Opus packets through `enqueue()`. The dedicated worker
-   * owns RTP sequence/timestamp state, caller-owned RTP/RTCP buffers, SRTP calls, sender counters,
-   * and periodic sender reports. No FEC, RTX, fragmentation, or socket operation executes on the
-   * capture or Opus encoder thread.
+   * owns RTP sequence/timestamp state, direct-write aggregate-path leases, SRTP calls, sender
+   * counters, and periodic sender reports. No FEC, RTX, fragmentation, or socket operation executes
+   * on the capture or Opus encoder thread.
    */
   class HostAudioSender final: public audio::AudioPacketDestination {
   public:
@@ -71,7 +74,7 @@ namespace lumen::lsp::runtime {
     HostAudioSender(const HostAudioSender &) = delete;
     HostAudioSender &operator=(const HostAudioSender &) = delete;
 
-    /** @brief Close admission, stop the worker, and join it before releasing state. */
+    /** @brief Close admission, stop the worker, and drain path completions before releasing state. */
     ~HostAudioSender() override;
 
     /**
@@ -87,7 +90,7 @@ namespace lumen::lsp::runtime {
     /** @copydoc audio::AudioPacketDestination::close */
     void close() noexcept override;
 
-    /** @brief Join the closed sender worker; safe to call repeatedly. */
+    /** @brief Join the closed sender worker and wait for every committed datagram completion. */
     void join() noexcept;
 
     /**
@@ -103,6 +106,27 @@ namespace lumen::lsp::runtime {
      * @return Current sender observations.
      */
     [[nodiscard]] HostAudioSenderSnapshot snapshot() const noexcept;
+
+    /**
+     * @brief Apply one asynchronous aggregate-path terminal disposition from a fallback dispatcher.
+     *
+     * Normal commits install a direct producer target. This entry point remains
+     * available to generation-level fatal dispatch and compatibility callers.
+     *
+     * @param token Sender-local committed datagram token.
+     * @param completion Final path disposition.
+     * @param completed_at_microseconds Monotonic kernel completion time.
+     * @param protected_bytes Exact protected UDP payload bytes.
+     * @param charged_bytes Complete IP/UDP bytes charged once.
+     * @return `true` only when this sender owned the token.
+     */
+    bool complete_forward_datagram(
+      std::uint64_t token,
+      HostForwardCompletion completion,
+      std::uint64_t completed_at_microseconds,
+      std::size_t protected_bytes,
+      std::uint16_t charged_bytes
+    ) noexcept;
 
   private:
     class Impl;

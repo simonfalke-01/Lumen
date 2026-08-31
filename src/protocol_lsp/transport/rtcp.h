@@ -1,5 +1,5 @@
 /**
- * @file src/protocol_lsp/transport/rtcp.h
+ * @file src/lsp/transport/rtcp.h
  * @brief Bounded RTCP parsing and LSP transport-feedback state.
  */
 
@@ -362,12 +362,258 @@ namespace lumen::lsp::transport {
     std::size_t entry_count = 0;  ///< Number of populated FIR entries.
   };
 
+  /** @brief Typed RFC 4585/5104 feedback parse failure. */
+  enum class rtcp_feedback_parse_error : std::uint8_t {
+    none,  ///< Feedback packet parsed completely.
+    invalid_packet,  ///< Input RTCP view is invalid.
+    wrong_packet_type,  ///< RTCP packet type does not match the requested feedback model.
+    wrong_format,  ///< Five-bit RTCP feedback format does not match the requested model.
+    invalid_length,  ///< Feedback Control Information has an invalid or empty length.
+    invalid_ssrc,  ///< A required sender, media, or FIR target SSRC is zero or forbidden.
+    duplicate_entry,  ///< FIR repeats a media-sender target in one feedback packet.
+    capacity_exceeded,  ///< Caller model cannot retain every feedback record.
+  };
+
+  /**
+   * @brief Parse one RFC 4585 Generic NACK from an authenticated RTCP packet view.
+   *
+   * @tparam MaximumPairs Fixed PID/BLP pair capacity.
+   * @param packet Parsed complete RTCP packet view.
+   * @param nack Receives the model only after complete validation.
+   * @return Typed parse status.
+   */
+  template<std::size_t MaximumPairs>
+  [[nodiscard]] constexpr rtcp_feedback_parse_error parse_generic_nack(
+    const rtcp_packet_view &packet,
+    generic_nack<MaximumPairs> &nack
+  ) noexcept {
+    if (!packet) {
+      return rtcp_feedback_parse_error::invalid_packet;
+    }
+    if (packet.packet_type != rtcp_transport_feedback_type) {
+      return rtcp_feedback_parse_error::wrong_packet_type;
+    }
+    if (packet.count != rtcp_generic_nack_format) {
+      return rtcp_feedback_parse_error::wrong_format;
+    }
+    if (packet.payload.size() < 12U || (packet.payload.size() - 8U) % 4U != 0) {
+      return rtcp_feedback_parse_error::invalid_length;
+    }
+    const auto pair_count = (packet.payload.size() - 8U) / 4U;
+    if (pair_count > MaximumPairs) {
+      return rtcp_feedback_parse_error::capacity_exceeded;
+    }
+    generic_nack<MaximumPairs> parsed;
+    parsed.sender_ssrc = detail::read_u32(packet.payload.first(4));
+    parsed.media_ssrc = detail::read_u32(packet.payload.subspan(4, 4));
+    if (parsed.sender_ssrc == 0 || parsed.media_ssrc == 0) {
+      return rtcp_feedback_parse_error::invalid_ssrc;
+    }
+    parsed.pair_count = pair_count;
+    for (std::size_t index = 0; index < pair_count; ++index) {
+      parsed.pairs[index] = {
+        .packet_id = detail::read_u16(packet.payload.subspan(8U + index * 4U, 2)),
+        .lost_packet_bitmask = detail::read_u16(packet.payload.subspan(10U + index * 4U, 2)),
+      };
+    }
+    nack = parsed;
+    return rtcp_feedback_parse_error::none;
+  }
+
+  /**
+   * @brief Parse one RFC 4585 Picture Loss Indication from authenticated RTCP.
+   *
+   * @param packet Parsed complete RTCP packet view.
+   * @param pli Receives the model only after complete validation.
+   * @return Typed parse status.
+   */
+  [[nodiscard]] constexpr rtcp_feedback_parse_error parse_picture_loss_indication(
+    const rtcp_packet_view &packet,
+    picture_loss_indication &pli
+  ) noexcept {
+    if (!packet) {
+      return rtcp_feedback_parse_error::invalid_packet;
+    }
+    if (packet.packet_type != rtcp_payload_feedback_type) {
+      return rtcp_feedback_parse_error::wrong_packet_type;
+    }
+    if (packet.count != rtcp_picture_loss_indication_format) {
+      return rtcp_feedback_parse_error::wrong_format;
+    }
+    if (packet.payload.size() != 8U) {
+      return rtcp_feedback_parse_error::invalid_length;
+    }
+    picture_loss_indication parsed {
+      .sender_ssrc = detail::read_u32(packet.payload.first(4)),
+      .media_ssrc = detail::read_u32(packet.payload.subspan(4, 4)),
+    };
+    if (parsed.sender_ssrc == 0 || parsed.media_ssrc == 0) {
+      return rtcp_feedback_parse_error::invalid_ssrc;
+    }
+    pli = parsed;
+    return rtcp_feedback_parse_error::none;
+  }
+
+  /**
+   * @brief Parse one RFC 5104 Full Intra Request from authenticated RTCP.
+   *
+   * The common media-source SSRC must be zero. Reserved FIR entry bits are ignored as required by
+   * RFC 5104, while every target media-sender SSRC must be nonzero.
+   *
+   * @tparam MaximumEntries Fixed FIR entry capacity.
+   * @param packet Parsed complete RTCP packet view.
+   * @param fir Receives the model only after complete validation.
+   * @return Typed parse status.
+   */
+  template<std::size_t MaximumEntries>
+  [[nodiscard]] constexpr rtcp_feedback_parse_error parse_full_intra_request(
+    const rtcp_packet_view &packet,
+    full_intra_request<MaximumEntries> &fir
+  ) noexcept {
+    if (!packet) {
+      return rtcp_feedback_parse_error::invalid_packet;
+    }
+    if (packet.packet_type != rtcp_payload_feedback_type) {
+      return rtcp_feedback_parse_error::wrong_packet_type;
+    }
+    if (packet.count != rtcp_full_intra_request_format) {
+      return rtcp_feedback_parse_error::wrong_format;
+    }
+    if (packet.payload.size() < 16U || (packet.payload.size() - 8U) % 8U != 0) {
+      return rtcp_feedback_parse_error::invalid_length;
+    }
+    const auto entry_count = (packet.payload.size() - 8U) / 8U;
+    if (entry_count > MaximumEntries) {
+      return rtcp_feedback_parse_error::capacity_exceeded;
+    }
+    full_intra_request<MaximumEntries> parsed;
+    parsed.sender_ssrc = detail::read_u32(packet.payload.first(4));
+    if (parsed.sender_ssrc == 0 || detail::read_u32(packet.payload.subspan(4, 4)) != 0) {
+      return rtcp_feedback_parse_error::invalid_ssrc;
+    }
+    parsed.entry_count = entry_count;
+    for (std::size_t index = 0; index < entry_count; ++index) {
+      const auto offset = 8U + index * 8U;
+      parsed.entries[index] = {
+        .media_sender_ssrc = detail::read_u32(packet.payload.subspan(offset, 4)),
+        .sequence_number = packet.payload[offset + 4U],
+      };
+      if (parsed.entries[index].media_sender_ssrc == 0) {
+        return rtcp_feedback_parse_error::invalid_ssrc;
+      }
+      for (std::size_t prior = 0; prior < index; ++prior) {
+        if (parsed.entries[prior].media_sender_ssrc == parsed.entries[index].media_sender_ssrc) {
+          return rtcp_feedback_parse_error::duplicate_entry;
+        }
+      }
+    }
+    fir = parsed;
+    return rtcp_feedback_parse_error::none;
+  }
+
+  /** @brief Typed bounded Generic NACK sequence expansion failure. */
+  enum class generic_nack_expansion_error : std::uint8_t {
+    none,  ///< Every unique missing sequence was written.
+    invalid_count,  ///< Pair count is zero or exceeds model capacity.
+    destination_too_small,  ///< Caller storage cannot contain every unique missing sequence.
+  };
+
+  /** @brief Result of expanding PID/BLP pairs into unique missing source sequences. */
+  struct generic_nack_expansion_result {
+    std::size_t sequence_count = 0;  ///< Unique missing sequences written on success.
+    std::size_t required = 0;  ///< Unique sequences required even when storage is too small.
+    generic_nack_expansion_error error = generic_nack_expansion_error::none;  ///< Typed status.
+
+    /**
+     * @brief Return whether expansion succeeded.
+     *
+     * @return `true` only when every unique sequence was written.
+     */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return error == generic_nack_expansion_error::none;
+    }
+  };
+
+  /**
+   * @brief Expand RFC 4585 PID/BLP pairs into a bounded unique sequence list.
+   *
+   * Pair order and ascending BLP bit order are preserved. Overlapping pairs are deduplicated. The
+   * function performs a validation/count pass before writing, so insufficient storage never leaves
+   * a partial list that could be mistaken for complete feedback.
+   *
+   * @tparam MaximumPairs Fixed PID/BLP pair capacity.
+   * @param nack Parsed Generic NACK model.
+   * @param destination Caller-owned sequence storage.
+   * @return Written/required counts and typed status.
+   */
+  template<std::size_t MaximumPairs>
+  [[nodiscard]] constexpr generic_nack_expansion_result expand_generic_nack(
+    const generic_nack<MaximumPairs> &nack,
+    const std::span<std::uint16_t> destination
+  ) noexcept {
+    if (nack.pair_count == 0 || nack.pair_count > MaximumPairs) {
+      return {.error = generic_nack_expansion_error::invalid_count};
+    }
+    const auto selected = [&nack](const std::size_t pair_index, const std::size_t position) constexpr noexcept {
+      return position == 0 ||
+             (nack.pairs[pair_index].lost_packet_bitmask & (std::uint16_t {1} << (position - 1U))) != 0;
+    };
+    const auto sequence = [&nack](const std::size_t pair_index, const std::size_t position) constexpr noexcept {
+      return static_cast<std::uint16_t>(nack.pairs[pair_index].packet_id + position);
+    };
+    const auto appeared_before = [&selected, &sequence](
+                                   const std::size_t pair_index,
+                                   const std::size_t position,
+                                   const std::uint16_t candidate
+                                 ) constexpr noexcept {
+      for (std::size_t prior_pair = 0; prior_pair <= pair_index; ++prior_pair) {
+        const auto positions = prior_pair == pair_index ? position : 17U;
+        for (std::size_t prior_position = 0; prior_position < positions; ++prior_position) {
+          if (selected(prior_pair, prior_position) && sequence(prior_pair, prior_position) == candidate) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    std::size_t required = 0;
+    for (std::size_t pair_index = 0; pair_index < nack.pair_count; ++pair_index) {
+      for (std::size_t position = 0; position < 17U; ++position) {
+        if (!selected(pair_index, position)) {
+          continue;
+        }
+        const auto candidate = sequence(pair_index, position);
+        if (!appeared_before(pair_index, position, candidate)) {
+          ++required;
+        }
+      }
+    }
+    if (destination.size() < required) {
+      return {.required = required, .error = generic_nack_expansion_error::destination_too_small};
+    }
+    std::size_t written = 0;
+    for (std::size_t pair_index = 0; pair_index < nack.pair_count; ++pair_index) {
+      for (std::size_t position = 0; position < 17U; ++position) {
+        if (!selected(pair_index, position)) {
+          continue;
+        }
+        const auto candidate = sequence(pair_index, position);
+        if (!appeared_before(pair_index, position, candidate)) {
+          destination[written++] = candidate;
+        }
+      }
+    }
+    return {.sequence_count = written, .required = required};
+  }
+
   /** @brief Typed feedback model serialization failure. */
   enum class rtcp_feedback_error : std::uint8_t {
     none,  ///< Serialization completed successfully.
     invalid_ssrc,  ///< A required SSRC is zero.
     empty_feedback,  ///< A NACK or FIR contains no feedback records.
     invalid_count,  ///< Populated record count exceeds fixed storage or RTCP length bounds.
+    duplicate_entry,  ///< FIR repeats a media-sender target in one packet.
     destination_too_small,  ///< Destination cannot contain the complete RTCP packet.
   };
 
@@ -473,6 +719,11 @@ namespace lumen::lsp::transport {
     for (std::size_t index = 0; index < fir.entry_count; ++index) {
       if (fir.entries[index].media_sender_ssrc == 0) {
         return {.error = rtcp_feedback_error::invalid_ssrc};
+      }
+      for (std::size_t prior = 0; prior < index; ++prior) {
+        if (fir.entries[prior].media_sender_ssrc == fir.entries[index].media_sender_ssrc) {
+          return {.error = rtcp_feedback_error::duplicate_entry};
+        }
       }
     }
     const auto required = 12U + fir.entry_count * 8U;
@@ -728,10 +979,16 @@ namespace lumen::lsp::transport {
   enum class lspv_update_result : std::uint8_t {
     accepted,  ///< Latest status replaced the pending snapshot.
     invalid_status,  ///< Status failed semantic validation.
-    stale_generation,  ///< Status is older than the pending or last emitted generation.
+    stale_generation,  ///< Status is older than the pending generation or recovery epoch.
   };
 
-  /** @brief Allocation-free 500-microsecond `LSPV` status coalescer. */
+  /**
+   * @brief Allocation-free 500-microsecond `LSPV` status coalescer.
+   *
+   * Recoverable and unrecoverable decoder evidence survives coalesced capacity updates in the
+   * same recovery scope. A later ready decode clears it only after the decoded-frame watermark
+   * advances, while a newer session, video generation, or recovery epoch starts a clean scope.
+   */
   class lspv_coalescer {
   public:
     /**
@@ -745,15 +1002,52 @@ namespace lumen::lsp::transport {
       if (validate_lspv_status(status) != lspv_status_error::none) {
         return lspv_update_result::invalid_status;
       }
-      if (has_generation_ &&
-          (status.session_generation < session_generation_ ||
-           (status.session_generation == session_generation_ && status.video_generation < video_generation_))) {
-        return lspv_update_result::stale_generation;
+      bool newer_scope = !has_generation_;
+      if (has_generation_) {
+        if (status.session_generation < session_generation_ ||
+            (status.session_generation == session_generation_ && status.video_generation < video_generation_) ||
+            (status.session_generation == session_generation_ && status.video_generation == video_generation_ &&
+             status.recovery_epoch < recovery_epoch_)) {
+          return lspv_update_result::stale_generation;
+        }
+        newer_scope = status.session_generation > session_generation_ ||
+                      status.video_generation > video_generation_ || status.recovery_epoch > recovery_epoch_;
+      }
+      if (newer_scope) {
+        evidence_ = {};
+        evidence_valid_ = false;
       }
       pending_ = status;
+      if (evidence_valid_ && event == lspv_event::decode_completion &&
+          status.decoder_status == lspv_decoder_status::ready &&
+          status.largest_decoded_frame_id > evidence_.decoded_frame_watermark) {
+        evidence_ = {};
+        evidence_valid_ = false;
+      }
+      const auto decoder_error = status.decoder_status == lspv_decoder_status::recoverable_error ||
+                                 status.decoder_status == lspv_decoder_status::unrecoverable_error;
+      if (decoder_error || status.deadline_miss) {
+        evidence_.decoded_frame_watermark = evidence_valid_ ?
+                                              std::max(evidence_.decoded_frame_watermark, status.largest_decoded_frame_id) :
+                                              status.largest_decoded_frame_id;
+        evidence_.deadline_miss = evidence_.deadline_miss || status.deadline_miss;
+        if (decoder_error &&
+            (!evidence_.has_decoder_error || status.decoder_status == lspv_decoder_status::unrecoverable_error)) {
+          evidence_.decoder_status = status.decoder_status;
+          evidence_.has_decoder_error = true;
+        }
+        evidence_valid_ = true;
+      }
+      if (evidence_valid_) {
+        pending_.deadline_miss = pending_.deadline_miss || evidence_.deadline_miss;
+        if (evidence_.has_decoder_error) {
+          pending_.decoder_status = evidence_.decoder_status;
+        }
+      }
       pending_event_ = event;
       session_generation_ = status.session_generation;
       video_generation_ = status.video_generation;
+      recovery_epoch_ = status.recovery_epoch;
       has_generation_ = true;
       pending_valid_ = true;
       return lspv_update_result::accepted;
@@ -799,13 +1093,24 @@ namespace lumen::lsp::transport {
     }
 
   private:
+    /** @brief Decoder evidence retained until a later successful decode proves recovery. */
+    struct latched_evidence {
+      std::uint64_t decoded_frame_watermark = 0;  ///< Greatest decoded watermark carrying evidence.
+      bool deadline_miss = false;  ///< Whether any retained update observed a deadline miss.
+      lspv_decoder_status decoder_status = lspv_decoder_status::ready;  ///< Greatest retained decoder-error severity.
+      bool has_decoder_error = false;  ///< Whether `decoder_status` carries an error.
+    };
+
     lspv_status pending_ {};  ///< Latest coalesced semantic status.
+    latched_evidence evidence_ {};  ///< Monotonic decoder evidence for the active recovery scope.
     lspv_event pending_event_ = lspv_event::decode_completion;  ///< Latest transition type.
     std::uint64_t last_emit_microseconds_ = 0;  ///< Latest committed SRTCP submission time.
     std::uint32_t session_generation_ = 0;  ///< Latest accepted session generation.
     std::uint32_t video_generation_ = 0;  ///< Latest accepted video generation.
+    std::uint32_t recovery_epoch_ = 0;  ///< Latest accepted recovery epoch within the generation.
     bool pending_valid_ = false;  ///< Whether a status awaits transmission.
     bool has_emitted_ = false;  ///< Whether the coalescing floor has an origin.
     bool has_generation_ = false;  ///< Whether stale-generation checks have an origin.
+    bool evidence_valid_ = false;  ///< Whether retained evidence must survive non-recovering updates.
   };
 }  // namespace lumen::lsp::transport

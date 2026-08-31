@@ -75,7 +75,7 @@ namespace lumen::lsp {
 
   DatagramResult HostService::receive(
     const PeerEndpoint &peer,
-    const std::span<const std::uint8_t> datagram
+    const std::span<std::uint8_t> datagram
   ) noexcept {
     if (!active_) {
       return DatagramResult::inactive;

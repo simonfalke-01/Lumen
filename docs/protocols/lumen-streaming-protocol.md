@@ -16,12 +16,14 @@ paired permission, and a successful Windows virtual-microphone probe; SRTP
 admission begins only after the matching generation-qualified
 `MICROPHONE_CONFIG_ACK`.
 Lumen now also freezes the sixteen-key `START`, 31/32-key START/ATTACH
-responses, 28-key SDR video selection, and `VIDEO_CONFIG/ACK` schemas for the
+responses, 28-key SDR video selection, and schema-version-two
+`VIDEO_CONFIG/ACK` maps for the
 first H.264 High or HEVC Main slice. The host prepares and owns the exact
 Windows virtual display when enabled, proves the named hardware encoder tuple,
 and starts its bounded complete-access-unit RTP/SRTP sender only after the
 matching authenticated video acknowledgement. Fixed extension IDs 1 through 5
-carry visible frame marking and capture time plus RFC 6904-encrypted frame ID,
+carry visible frame marking and capture time plus RFC 6904-encrypted frame
+ID/recovery epoch,
 input watermark, and encoder timing. FlexFEC and RTX remain negotiated false in
 this first product slice.
 Umbra now has the matching native receive/depacketization/reassembly,
@@ -123,13 +125,16 @@ LSP uses out-of-band deterministic CBOR negotiation and does not use SDP.
 
 - Protocol name: `Lumen Streaming Protocol`.
 - Abbreviation: `LSP` within Lumen and Umbra documentation.
-- Wire version: unsigned integer `1`.
+- Wire version: unsigned integer `1`; `VIDEO_CONFIG/ACK` payloads use dedicated
+  schema revision `2` at map key one.
 - DTLS ALPN: exact ASCII `lumen-stream/1`.
 - Default UDP port: `48030`.
 - mDNS service type: `_lumen-stream._udp`.
 - Invitation URI: `umbra://pair/lsp1#<base64url>`.
 
-Every control message contains the wire version. RTP and RTCP formats are
+Every control message contains its assigned version discriminator. LSP/1 maps
+use wire version one except that `VIDEO_CONFIG` and `VIDEO_CONFIG_ACK` use
+their dedicated schema revision two at key one. RTP and RTCP formats are
 selected only by an authenticated version-1 control negotiation. Unknown
 versions, message types, payload types, SSRCs, header-extension IDs, or control
 fields are rejected unless explicitly declared extensible.
@@ -541,12 +546,13 @@ positive maximum frame-age budget no greater than START key 16. Extension IDs
 1 and 2 are visible frame marking and absolute capture time. IDs 3, 4, and 5
 are RFC 6904-encrypted frame ID, input watermark, and encoder timing.
 
-`VIDEO_CONFIG` is an exact eight-key host request containing version, session
-ID, stream generation, the selected 28-key video map, prefix-free codec
+`VIDEO_CONFIG` is an exact eight-key host request containing dedicated schema
+version `2`, session ID, stream generation, the selected 28-key video map, prefix-free codec
 parameter sets, nonzero frame-ID origin, nonzero recovery epoch, and maximum
 complete access-unit bytes. H.264 carries exactly SPS/PPS; HEVC carries exactly
-VPS/SPS/PPS. `VIDEO_CONFIG_ACK` is an exact five-key response containing
-version, status, session ID, video generation, and decoder credit `2...4`.
+VPS/SPS/PPS. `VIDEO_CONFIG_ACK` is an exact five-key response containing the
+same dedicated schema version `2`, status, session ID, video generation, and
+decoder credit `2...4`.
 The LSPC error-response flag and non-success status must agree. No primary
 video SRTP packet is legal before a successful matching acknowledgement.
 
@@ -606,11 +612,14 @@ encryption work on every packet.
 | --- | ---: | --- |
 | RFC 9626 frame marking | short form | first two and final video packets |
 | RFC 8872 absolute capture time | 8 bytes | first two packets of a video frame |
-| `urn:lumen:rtp-hdrext:frame-id` | 8 bytes | first two and final video packets |
+| `urn:lumen:rtp-hdrext:frame-id` | 12 bytes | first two and final video packets |
 | `urn:lumen:rtp-hdrext:input-watermark` | 16 bytes | first two packets of a video frame |
 | `urn:lumen:rtp-hdrext:encoder-timing` | 8 bytes | first two packets of a video frame |
 
-Frame ID is a nonzero 64-bit encoder access-unit counter. The input watermark
+The encrypted frame-identity value is the nonzero 64-bit encoder access-unit
+counter followed by the nonzero 32-bit recovery epoch, both in network byte
+order. It is repeated unchanged on the first two and final packets of the
+frame. The input watermark
 contains the last completely applied input state sequence and edge ID, each as
 64-bit network-order values. Encoder timing contains capture-to-submit and
 capture-to-complete microseconds as two saturated 32-bit values.
@@ -874,6 +883,38 @@ Only one independent recovery frame may be outstanding. Repeated feedback for
 the same epoch does not create more keyframes. A new IDR retry requires expiry
 of the prior recovery deadline and evidence that it did not decode.
 
+The sender initializes its recovery controller from the nonzero epoch in
+`VIDEO_CONFIG`. It writes the controller's current epoch beside every repeated
+frame ID. When recovery requires an independent frame, that frame reserves the
+sole outstanding slot before its first RTP packet is committed. A second
+independent frame is not admitted while the slot remains outstanding; its
+unsent encoder dependency is invalidated before later dependent frames may be
+admitted.
+
+Each host encoder reference-invalidation request carries a nonzero local
+generation and an exact inclusive frame range, both echoed by its terminal
+result. The replaceable capture mailbox has exactly one published invalidation
+generation. Requests arriving concurrently are retained as one coalesced next
+range and published only after the active generation completes. A stale
+generation or changed range cannot complete another request. Rejection during
+an active recovery epoch falls back to its permitted independent frame;
+rejection of pressure-only invalidation fails closed rather than creating an
+IDR loop. The accepted generation is carried with the encoder's first repaired
+output into the host packet owner. Only an IDR or repaired output matching the
+latest dependency generation and frame-index fence may restore reference
+validity; older frame completion or `LSPV` confirmation cannot erase a newer
+local break. Recovery-phase transitions and dependency break/restore state are
+committed under one sender-owned critical section, so no dependent admission
+can observe a new recovery epoch with the prior reference validity. A dependent
+frame reserves that dependency generation before submission and revalidates it
+at every packet commit boundary. A newer break cancels an uncommitted frame or
+stops a partially committed frame at the next boundary and enters the existing
+partial-frame recovery path. Protecting a packet consumes its SRTP sequence and
+creates a local feedback tombstone, but does not make the frame partially
+network-visible. If the first protected packet cannot commit, the sender uses
+exact pre-submit dependency invalidation rather than opening unexpected-partial
+recovery or requesting an IDR for local queue pressure.
+
 The sender recovery state is exactly `healthy`, `repairing-references`,
 `recovery-frame-outstanding`, or `retry-permitted`. An epoch opens only for an
 unrecoverable reference loss, an explicit unrecoverable decoder report, or an
@@ -901,6 +942,16 @@ decode submissions, and current render-mailbox occupancy. The client sends it
 on each decode completion or capacity transition, subject to one coalesced
 packet per 500 microseconds. It is observation, decoder credit, and recovery
 input, never an unauthenticated encoder command.
+
+After SRTCP authentication and session/video generation validation, a status
+whose epoch equals the sender's current outstanding epoch confirms recovery
+when its decoded watermark reaches or passes the reserved recovery frame. A
+same-epoch decoder error is retained as failure evidence, but another recovery
+attempt is permitted only after the reserved frame deadline. A decoder error
+while recovery is healthy opens the next epoch and requests one independent
+frame. Surface exhaustion and deadline-miss observation without decoder error
+update capacity and telemetry only; neither opens a recovery epoch nor ends
+the session.
 
 The frozen plaintext `LSPV` packet is a 56-byte SRTCP APP packet: version two,
 subtype zero, PT 204, RTCP length 13, sender SSRC equal to the negotiated client
@@ -1795,6 +1846,11 @@ Malformed unauthenticated datagrams are silently dropped. Authenticated media
 parse failures are dropped and counted. An isolated media failure does not
 close control authority. Security, generation, repeated-abuse, or resource
 integrity failure closes the relevant association.
+
+A security provider's ordinary drop disposition remains silent. Its fatal
+disposition is acted on only after any synchronous DTLS output scope ends: the
+socket owner defers closure and input neutralization of that exact association
+without affecting another peer.
 
 ## 23. Compatibility boundary
 

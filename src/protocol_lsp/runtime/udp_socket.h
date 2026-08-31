@@ -21,7 +21,7 @@ namespace lumen::lsp::runtime {
    */
   struct ReceivedDatagram {
     PeerEndpoint peer;  ///< Exact source and bound local endpoint.
-    std::span<const std::uint8_t> payload;  ///< Complete payload valid only for the callback.
+    std::span<std::uint8_t> payload;  ///< Mutable socket-owned payload valid only for the callback.
     std::uint64_t received_at_microseconds {};  ///< Local monotonic receive timestamp.
   };
 

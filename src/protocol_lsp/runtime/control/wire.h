@@ -209,6 +209,9 @@ namespace lumen::lsp::runtime {
   /** @brief Fixed encrypted LSP frame-ID extension identifier. */
   inline constexpr std::uint8_t video_frame_id_extension_id = 3;
 
+  /** @brief Dedicated schema version for `VIDEO_CONFIG` and `VIDEO_CONFIG_ACK`. */
+  inline constexpr std::uint8_t video_configuration_schema_version = 2;
+
   /** @brief Fixed encrypted LSP input-watermark extension identifier. */
   inline constexpr std::uint8_t video_input_watermark_extension_id = 4;
 

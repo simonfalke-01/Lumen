@@ -5,11 +5,11 @@
 
 #include "src/protocol_lsp/invitation.h"
 #include "src/protocol_lsp/packet_classifier.h"
+#include "src/protocol_lsp/runtime/udp_socket.h"
 #include "src/protocol_lsp/service.h"
 #include "src/protocol_lsp/session_authority.h"
 #include "src/protocol_lsp/ssrc_registry.h"
 #include "src/protocol_lsp/types.h"
-#include "src/protocol_lsp/runtime/udp_socket.h"
 
 #include <algorithm>
 #include <array>
@@ -125,7 +125,7 @@ namespace {
     lsp::ProviderDatagramResult receive_secure_packet(
       const lsp::PeerEndpoint &,
       const lsp::SecurePacketClass packet_class,
-      const std::span<const std::uint8_t>
+      const std::span<std::uint8_t>
     ) noexcept override {
       ++receive_calls;
       last_class = packet_class;
@@ -268,36 +268,38 @@ TEST(LspHostService, BindsOnePortAndDispatchesOnlyDefinedPacketClasses) {
     .remote_address = "192.0.2.10",
     .remote_port = 50'000,
   };
-  EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 1> {22}), lsp::DatagramResult::accepted);
+  std::array<std::uint8_t, 1> dtls_datagram {22};
+  std::array<std::uint8_t, 2> rtp_datagram {0x80, 96};
+  std::array<std::uint8_t, 2> rtcp_datagram {0x80, 200};
+  std::array<std::uint8_t, 1> reserved_datagram {0};
+  std::array<std::uint8_t, 1> invalid_datagram {80};
+  std::array<std::uint8_t, 1> short_rtp_datagram {0x80};
+  EXPECT_EQ(service.receive(peer, dtls_datagram), lsp::DatagramResult::accepted);
   EXPECT_EQ(dtls.receive_calls, 1U);
-  EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 2> {0x80, 96}), lsp::DatagramResult::accepted);
+  EXPECT_EQ(service.receive(peer, rtp_datagram), lsp::DatagramResult::accepted);
   EXPECT_EQ(srtp.last_class, lsp::SecurePacketClass::rtp);
-  EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 2> {0x80, 200}), lsp::DatagramResult::accepted);
+  EXPECT_EQ(service.receive(peer, rtcp_datagram), lsp::DatagramResult::accepted);
   EXPECT_EQ(srtp.last_class, lsp::SecurePacketClass::rtcp);
-  EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 1> {0}), lsp::DatagramResult::reserved_drop);
-  EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 1> {80}), lsp::DatagramResult::invalid_drop);
+  EXPECT_EQ(service.receive(peer, reserved_datagram), lsp::DatagramResult::reserved_drop);
+  EXPECT_EQ(service.receive(peer, invalid_datagram), lsp::DatagramResult::invalid_drop);
   auto wrong_local_port = peer;
   wrong_local_port.local_port = 1;
-  EXPECT_EQ(
-    service.receive(wrong_local_port, std::array<std::uint8_t, 1> {22}),
-    lsp::DatagramResult::malformed_peer
-  );
-  EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 1> {0x80}), lsp::DatagramResult::invalid_drop);
+  EXPECT_EQ(service.receive(wrong_local_port, dtls_datagram), lsp::DatagramResult::malformed_peer);
+  EXPECT_EQ(service.receive(peer, short_rtp_datagram), lsp::DatagramResult::invalid_drop);
 
   dtls.receive_result = lsp::ProviderDatagramResult::dropped;
-  EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 1> {22}), lsp::DatagramResult::provider_drop);
+  EXPECT_EQ(service.receive(peer, dtls_datagram), lsp::DatagramResult::provider_drop);
+  EXPECT_FALSE(lsp::datagram_result_requires_association_close(lsp::DatagramResult::provider_drop));
   srtp.receive_result = lsp::ProviderDatagramResult::fatal;
-  EXPECT_EQ(
-    service.receive(peer, std::array<std::uint8_t, 2> {0x80, 96}),
-    lsp::DatagramResult::provider_fatal
-  );
+  EXPECT_EQ(service.receive(peer, rtp_datagram), lsp::DatagramResult::provider_fatal);
+  EXPECT_TRUE(lsp::datagram_result_requires_association_close(lsp::DatagramResult::provider_fatal));
   EXPECT_EQ(dtls.receive_calls, 2U);
   EXPECT_EQ(srtp.receive_calls, 3U);
 
   service.stop();
   EXPECT_FALSE(service.active());
   EXPECT_EQ(socket.close_calls, 1U);
-  EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 1> {22}), lsp::DatagramResult::inactive);
+  EXPECT_EQ(service.receive(peer, dtls_datagram), lsp::DatagramResult::inactive);
 }
 
 TEST(LspNativeUdpSocket, BindsNoFragmentDualStackAndPreservesMappedIpv4Peers) {

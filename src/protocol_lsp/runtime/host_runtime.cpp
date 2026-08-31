@@ -6,6 +6,7 @@
 #include "host_runtime.h"
 
 #include "../core/rtp.h"
+#include "../input_plane/feedback.h"
 #include "../input_plane/rate.h"
 #include "../media/frame_pipeline.h"
 #include "../packet_classifier.h"
@@ -16,6 +17,7 @@
 #include "../transport/rtcp.h"
 #include "audio_sender.h"
 #include "control_server.h"
+#include "host_forward_path.h"
 #include "identity.h"
 #include "input_owner.h"
 #include "libsrtp_provider.h"
@@ -517,17 +519,16 @@ namespace lumen::lsp::runtime {
       srtp_ = std::make_unique<LibsrtpServerProvider>(LibsrtpCallbacks {
         .context = this,
         .plaintext_packet = secure_packet_callback,
-        .send_datagram = secure_send_callback,
       });
       if (!srtp_ || !srtp_->ready(SrtpRequirements {})) {
         return RuntimeCreateStatus::srtp_failed;
       }
       input_owner_ = std::make_unique<InputOwner>(InputOwnerCallbacks {
-        .context = this,
-        .verify_digest = input_digest_callback,
-        .send_acknowledgement = input_ack_callback,
-        .baseline_committed = input_baseline_callback,
-      });
+                                                    .context = this,
+                                                    .verify_digest = input_digest_callback,
+                                                    .baseline_committed = input_baseline_callback,
+                                                  },
+                                                  *srtp_);
       if (!input_owner_) {
         return RuntimeCreateStatus::allocation_failed;
       }
@@ -613,6 +614,7 @@ namespace lumen::lsp::runtime {
       process_pending_audio_retirements();
       process_pending_video_retirements();
       process_pending_microphone_retirements();
+      retire_all_forward_paths();
       socket_.close();
       if (worker_.joinable()) {
         worker_.join();
@@ -762,6 +764,190 @@ namespace lumen::lsp::runtime {
       bool remove_srtp_on_retirement {};  ///< Whether association loss deferred SRTP removal until join.
     };
 
+    /** @brief Shared callback-safe owner of one connection-generation aggregate path. */
+    struct ForwardPathGeneration {
+      ProductHostRuntime *runtime {};  ///< Product socket owner, valid until every path joins.
+      PeerEndpoint peer {};  ///< Exact authenticated association five-tuple.
+      std::uint32_t generation {};  ///< Exact control connection generation.
+      std::shared_ptr<HostForwardPath> path;  ///< Aggregate scheduler and final socket owner.
+      std::uint8_t slot {};  ///< Stable bit index used for callback-to-socket-loop teardown handoff.
+      std::atomic<std::uint32_t> fatal_generation {};  ///< Exact generation atomically marked after fatal path completion.
+
+      /** @brief Close and join the callback source before generation storage is destroyed. */
+      ~ForwardPathGeneration() {
+        if (path) {
+          path->close();
+          path->join();
+        }
+      }
+    };
+
+    /**
+     * @brief Retain one callback-safe path generation without taking session authority.
+     *
+     * @param peer Exact association five-tuple.
+     * @return Shared generation owner, or null when absent.
+     */
+    [[nodiscard]] std::shared_ptr<ForwardPathGeneration> find_forward_path(
+      const PeerEndpoint &peer
+    ) const noexcept {
+      std::scoped_lock lock(forward_path_mutex_);
+      for (const auto &generation : forward_paths_) {
+        if (generation && generation->peer == peer) {
+          return generation;
+        }
+      }
+      return {};
+    }
+
+    /** @brief Enter one synchronous DTLS provider call that may emit pre-authentication output. */
+    void begin_dtls_provider_output(const PeerEndpoint &peer) noexcept {
+      std::scoped_lock lock(forward_path_mutex_);
+      direct_dtls_output_peer_ = peer;
+    }
+
+    /** @brief Leave the matching synchronous DTLS provider output scope. */
+    void end_dtls_provider_output(const PeerEndpoint &peer) noexcept {
+      std::scoped_lock lock(forward_path_mutex_);
+      if (direct_dtls_output_peer_ && *direct_dtls_output_peer_ == peer) {
+        direct_dtls_output_peer_.reset();
+      }
+    }
+
+    /** @brief Publish one provider-authenticated peer independently from forward-path lifetime. */
+    [[nodiscard]] bool remember_authenticated_peer(const PeerEndpoint &peer) noexcept {
+      std::scoped_lock lock(forward_path_mutex_);
+      if (std::ranges::find(authenticated_peers_, peer) != authenticated_peers_.end()) {
+        return true;
+      }
+      const auto empty = std::ranges::find_if(authenticated_peers_, [](const PeerEndpoint &candidate) {
+        return !candidate.valid();
+      });
+      if (empty == authenticated_peers_.end()) {
+        return false;
+      }
+      *empty = peer;
+      return true;
+    }
+
+    /** @brief Forget one closed authenticated peer. */
+    void forget_authenticated_peer(const PeerEndpoint &peer) noexcept {
+      std::scoped_lock lock(forward_path_mutex_);
+      const auto entry = std::ranges::find(authenticated_peers_, peer);
+      if (entry != authenticated_peers_.end()) {
+        *entry = {};
+      }
+    }
+
+    /** @brief Permit direct output only inside a provider call for a peer not yet authenticated. */
+    [[nodiscard]] bool direct_dtls_output_allowed(const PeerEndpoint &peer) const noexcept {
+      std::scoped_lock lock(forward_path_mutex_);
+      return direct_dtls_output_peer_ && *direct_dtls_output_peer_ == peer &&
+             std::ranges::find(authenticated_peers_, peer) == authenticated_peers_.end();
+    }
+
+    /**
+     * @brief Allocate, start, and publish one connection-generation path.
+     *
+     * @param peer Exact authenticated association.
+     * @param generation Nonzero control connection generation.
+     * @return True only after the path worker is discoverable.
+     */
+    [[nodiscard]] bool create_forward_path(
+      const PeerEndpoint &peer,
+      const std::uint32_t generation
+    ) noexcept {
+      auto owner = std::shared_ptr<ForwardPathGeneration> {new (std::nothrow) ForwardPathGeneration};
+      if (!owner) {
+        return false;
+      }
+      owner->runtime = this;
+      owner->peer = peer;
+      owner->generation = generation;
+      {
+        std::scoped_lock lock(forward_path_mutex_);
+        const auto free = std::ranges::find(forward_paths_, nullptr);
+        if (free == forward_paths_.end()) {
+          return false;
+        }
+        owner->slot = static_cast<std::uint8_t>(std::distance(forward_paths_.begin(), free));
+      }
+      owner->path = std::shared_ptr<HostForwardPath> {new (std::nothrow) HostForwardPath({
+        .peer = peer,
+        .generation = generation,
+        .pacing_bits_per_second = 20'000'000,
+        .path_payload_bytes = 1'200,
+        .probe_payload_ceiling = 0,
+        .callbacks = {
+          .context = owner.get(),
+          .send_datagram = forward_send_callback,
+          .completed = forward_completed_callback,
+        },
+      })};
+      if (!owner->path || !owner->path->ready() || !owner->path->start()) {
+        return false;
+      }
+      std::scoped_lock lock(forward_path_mutex_);
+      auto &slot = forward_paths_[owner->slot];
+      if (!slot) {
+        slot = std::move(owner);
+        return true;
+      }
+      owner->path->close();
+      owner->path->join();
+      return false;
+    }
+
+    /**
+     * @brief Close and join one path while keeping it discoverable to DTLS callbacks.
+     *
+     * @param peer Exact retiring association.
+     */
+    void retire_forward_path(const PeerEndpoint &peer) noexcept {
+      std::shared_ptr<ForwardPathGeneration> owner;
+      {
+        std::scoped_lock lock(forward_path_mutex_);
+        for (const auto &slot : forward_paths_) {
+          if (slot && slot->peer == peer) {
+            owner = slot;
+            break;
+          }
+        }
+      }
+      if (owner && owner->path) {
+        owner->path->close();
+        owner->path->join();
+      }
+      {
+        std::scoped_lock lock(forward_path_mutex_);
+        for (auto &slot : forward_paths_) {
+          if (slot == owner) {
+            slot.reset();
+            break;
+          }
+        }
+      }
+    }
+
+    /** @brief Close, join, and forget every remaining connection-generation path. */
+    void retire_all_forward_paths() noexcept {
+      std::array<std::shared_ptr<ForwardPathGeneration>, 64> owners;
+      {
+        std::scoped_lock lock(forward_path_mutex_);
+        owners = forward_paths_;
+      }
+      for (auto &owner : owners) {
+        if (owner && owner->path) {
+          owner->path->close();
+          owner->path->join();
+        }
+      }
+      {
+        std::scoped_lock lock(forward_path_mutex_);
+        forward_paths_ = {};
+      }
+    }
+
     struct DtlsTimer {
       PeerEndpoint peer;  ///< Association being timed.
       std::uint64_t due_microseconds {};  ///< Monotonic due time.
@@ -774,6 +960,35 @@ namespace lumen::lsp::runtime {
       std::uint64_t deadline_microseconds {};  ///< Control-owned bounded receive deadline.
       bool active {};  ///< Whether an authenticated data probe remains expected.
     };
+
+    /**
+     * @brief Calculate exact worst-case LSPI wire reservation for the installed association.
+     *
+     * @param peer Authenticated association used to query the negotiated SRTCP trailer.
+     * @return Complete IP/UDP bits per second at the 125-microsecond hard ACK floor.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> maximum_feedback_bits_per_second(
+      const PeerEndpoint &peer
+    ) const noexcept {
+      if (!srtp_) {
+        return std::nullopt;
+      }
+      const auto trailer = srtp_->protect_trailer_length(peer, SecurePacketClass::rtcp);
+      if (!trailer) {
+        return std::nullopt;
+      }
+      constexpr std::uint64_t maximum_lspi_plaintext_bytes =
+        12U + input_plane::lspi_fixed_size +
+        input_plane::maximum_acknowledged_pointers * input_plane::lspi_pointer_record_size;
+      const auto ip_udp_bytes = peer.family == IpAddressFamily::ipv6 ? 48U : 28U;
+      const auto charged_bytes = maximum_lspi_plaintext_bytes + *trailer + ip_udp_bytes;
+      constexpr std::uint64_t maximum_acknowledgements_per_second = 1'000'000U / 125U;
+      if (charged_bytes > std::numeric_limits<std::uint64_t>::max() / 8U /
+                            maximum_acknowledgements_per_second) {
+        return std::nullopt;
+      }
+      return charged_bytes * 8U * maximum_acknowledgements_per_second;
+    }
 
     /**
      * @brief Select the first exact supported audio offer in client order.
@@ -1193,6 +1408,7 @@ namespace lumen::lsp::runtime {
         const auto peer = runtime->peer;
         stop_audio_runtime(std::move(runtime));
         if (remove_srtp && srtp_) {
+          retire_forward_path(peer);
           srtp_->remove_association(peer);
         }
       }
@@ -1278,6 +1494,7 @@ namespace lumen::lsp::runtime {
         const auto peer = runtime->peer;
         stop_video_runtime(std::move(runtime));
         if (remove_srtp && srtp_) {
+          retire_forward_path(peer);
           srtp_->remove_association(peer);
         }
       }
@@ -1290,6 +1507,20 @@ namespace lumen::lsp::runtime {
         std::scoped_lock lock(session_mutex_);
         if (video_runtime_ && video_runtime_->sender && video_runtime_->sender->snapshot().failed) {
           failed_peer = video_runtime_->peer;
+        }
+      }
+      if (failed_peer) {
+        fail_required_video_session(*failed_peer);
+      }
+    }
+
+    /** @brief Terminate the required media session after fatal audio protection or path failure. */
+    void process_audio_failure() noexcept {
+      std::optional<PeerEndpoint> failed_peer;
+      {
+        std::scoped_lock lock(session_mutex_);
+        if (audio_runtime_ && audio_runtime_->sender && audio_runtime_->sender->snapshot().failed) {
+          failed_peer = audio_runtime_->peer;
         }
       }
       if (failed_peer) {
@@ -1377,7 +1608,8 @@ namespace lumen::lsp::runtime {
       const AudioSelectionPayload &selection
     ) noexcept {
       std::array<std::uint8_t, 6> random_timeline {};
-      if (!srtp_ || !crypto_ || !crypto_->random(random_timeline)) {
+      const auto forward = find_forward_path(peer);
+      if (!srtp_ || !crypto_ || !forward || !forward->path || !crypto_->random(random_timeline)) {
         return nullptr;
       }
       auto sequence = wire::read_be<std::uint16_t>(std::span<const std::uint8_t> {random_timeline}.first<2>());
@@ -1399,6 +1631,8 @@ namespace lumen::lsp::runtime {
       runtime->sender = std::shared_ptr<HostAudioSender> {new (std::nothrow) HostAudioSender(
         HostAudioSenderConfig {
           .peer = peer,
+          .forward_path = forward->path,
+          .forward_path_generation = forward->generation,
           .ssrc = selection.audio_ssrc,
           .payload_type = selection.audio_payload_type,
           .initial_sequence = sequence,
@@ -1449,7 +1683,8 @@ namespace lumen::lsp::runtime {
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease
     ) noexcept {
       std::array<std::uint8_t, 6> random_timeline {};
-      if (!srtp_ || !crypto_ || !crypto_->random(random_timeline)) {
+      const auto forward = find_forward_path(peer);
+      if (!srtp_ || !crypto_ || !forward || !forward->path || !crypto_->random(random_timeline)) {
         return nullptr;
       }
       auto sequence = wire::read_be<std::uint16_t>(std::span<const std::uint8_t> {random_timeline}.first<2>());
@@ -1472,10 +1707,13 @@ namespace lumen::lsp::runtime {
       runtime->sender = std::shared_ptr<HostVideoSender> {new (std::nothrow) HostVideoSender(
         HostVideoSenderConfig {
           .peer = peer,
+          .forward_path = forward->path,
+          .forward_path_generation = forward->generation,
           .video = selection.wire.video,
           .initial_sequence = sequence,
           .initial_timestamp = timestamp,
           .frame_id_origin = selection.wire.frame_id_origin,
+          .initial_recovery_epoch = selection.wire.recovery_epoch,
           .maximum_access_unit_bytes = selection.wire.maximum_complete_access_unit_bytes,
           .maximum_capture_to_present_microseconds = selection.wire.video.maximum_frame_age_microseconds,
           .aggregate_pacing_bits_per_second = selection.aggregate_pacing_bits_per_second,
@@ -1579,6 +1817,10 @@ namespace lumen::lsp::runtime {
       const StartRequestPayload &request
     ) noexcept override {
       std::scoped_lock lock(session_mutex_);
+      const auto forward = find_forward_path(peer);
+      if (!forward || !forward->path || forward->generation != connection_generation) {
+        return std::unexpected(ControlStatus::stale_generation);
+      }
       const auto applications = applications_->snapshot();
       if (!applications || std::ranges::none_of(*applications, [&](const ControlApplication &application) {
             return application.id == request.application_id;
@@ -1675,12 +1917,31 @@ namespace lumen::lsp::runtime {
       if (!video_selection) {
         return std::unexpected(video_selection.error());
       }
+      const auto feedback_bits_per_second = maximum_feedback_bits_per_second(peer);
+      if (!feedback_bits_per_second ||
+          *feedback_bits_per_second > std::numeric_limits<std::uint64_t>::max() - audio_selection->bitrate) {
+        (void) proc::proc.terminate_lsp_generation(video_selection->process_generation);
+        return std::unexpected(ControlStatus::internal_failure);
+      }
       video_selection->reserved_overhead_bits_per_second =
-        static_cast<std::uint64_t>(audio_selection->bitrate) + 256'000U;
+        static_cast<std::uint64_t>(audio_selection->bitrate) + *feedback_bits_per_second;
+      if (video_selection->reserved_overhead_bits_per_second >=
+          video_selection->aggregate_pacing_bits_per_second) {
+        (void) proc::proc.terminate_lsp_generation(video_selection->process_generation);
+        return std::unexpected(ControlStatus::path_capacity_insufficient);
+      }
       video_selection->feedback_sender_ssrc = input_ssrc;
       video_selection->audio_feedback_ssrc = audio_ssrc;
       video_selection->path_payload_ceiling = request.offered_maximum_udp_payload;
       video_selection->network_profile = request.network_profile;
+      const auto initial_forward_rate = std::min(
+        video_selection->aggregate_pacing_bits_per_second,
+        video_selection->wire.video.selected_bits_per_second + video_selection->reserved_overhead_bits_per_second
+      );
+      if (!forward->path->reconfigure(initial_forward_rate, video_selection->wire.video.initial_udp_payload_size)) {
+        (void) proc::proc.terminate_lsp_generation(video_selection->process_generation);
+        return std::unexpected(ControlStatus::path_capacity_insufficient);
+      }
       constexpr std::uint8_t input_payload_type = 96;
       std::array<SsrcAssignment, 4> assignments {
         SsrcAssignment {
@@ -1741,6 +2002,7 @@ namespace lumen::lsp::runtime {
       }
       const InputSessionMapping mapping {
         .peer = peer,
+        .forward_path = forward->path,
         .client_id = client.client_id,
         .connection_generation = connection_generation,
         .session_generation = start.generations.stream,
@@ -1808,6 +2070,10 @@ namespace lumen::lsp::runtime {
       const AttachRequestPayload &request
     ) noexcept override {
       std::scoped_lock lock(session_mutex_);
+      const auto forward = find_forward_path(peer);
+      if (!forward || !forward->path || forward->generation != connection_generation) {
+        return std::unexpected(ControlStatus::stale_generation);
+      }
       if (request.intent_id == last_attach_intent_ || active_process_generation_ == 0 || proc::proc.running() <= 0 ||
           !active_audio_configuration_ || !active_video_configuration_) {
         return std::unexpected(ControlStatus::stale_generation);
@@ -1909,6 +2175,13 @@ namespace lumen::lsp::runtime {
       if (video_selection.wire.frame_id_origin == 0) {
         video_selection.wire.frame_id_origin = 1;
       }
+      const auto initial_forward_rate = std::min(
+        video_selection.aggregate_pacing_bits_per_second,
+        video_selection.wire.video.selected_bits_per_second + video_selection.reserved_overhead_bits_per_second
+      );
+      if (!forward->path->reconfigure(initial_forward_rate, video_selection.wire.video.initial_udp_payload_size)) {
+        return std::unexpected(ControlStatus::path_capacity_insufficient);
+      }
       constexpr std::uint8_t input_payload_type = 96;
       std::array<SsrcAssignment, 4> assignments {
         SsrcAssignment {
@@ -1955,6 +2228,7 @@ namespace lumen::lsp::runtime {
       auto registry = SsrcRegistry::create(std::span<const SsrcAssignment> {assignments}.first(assignment_count));
       const InputSessionMapping mapping {
         .peer = peer,
+        .forward_path = forward->path,
         .client_id = client.client_id,
         .connection_generation = connection_generation,
         .session_generation = prior_snapshot.generations.stream,
@@ -2335,18 +2609,29 @@ namespace lumen::lsp::runtime {
       while (!stop_token.stop_requested() && active_) {
         (void) socket_.wait_readable(runtime_poll_milliseconds);
         const auto result = socket_.receive_batch(runtime_receive_batch, [this](const ReceivedDatagram &datagram) {
-          if (classify_packet(datagram.payload) == PacketClass::dtls) {
+          const auto packet_class = classify_packet(datagram.payload);
+          if (packet_class == PacketClass::dtls) {
             refresh_dtls_timer(datagram.peer, datagram.received_at_microseconds);
+            begin_dtls_provider_output(datagram.peer);
           }
+          auto disposition = DatagramResult::inactive;
           if (service_) {
-            service_->receive(datagram.peer, datagram.payload);
+            disposition = service_->receive(datagram.peer, datagram.payload);
           }
-          process_pending_video_retirements();
+          if (packet_class == PacketClass::dtls) {
+            end_dtls_provider_output(datagram.peer);
+          }
+          if (datagram_result_requires_association_close(disposition)) {
+            queue_association_close(datagram.peer);
+          }
           process_pending_audio_retirements();
+          process_pending_video_retirements();
           process_pending_microphone_retirements();
+          process_failed_forward_paths();
           process_pending_association_closes();
+          process_audio_failure();
           process_video_failure();
-          if (classify_packet(datagram.payload) == PacketClass::dtls) {
+          if (packet_class == PacketClass::dtls && !datagram_result_requires_association_close(disposition)) {
             refresh_dtls_timer(datagram.peer, datagram.received_at_microseconds);
           }
         });
@@ -2359,9 +2644,12 @@ namespace lumen::lsp::runtime {
         }
         process_path_probes(now);
         process_dtls_timers(now);
-        process_pending_video_retirements();
         process_pending_audio_retirements();
+        process_pending_video_retirements();
         process_pending_microphone_retirements();
+        process_failed_forward_paths();
+        process_pending_association_closes();
+        process_audio_failure();
         process_video_failure();
         process_detached_grace(now);
         process_application_exit();
@@ -2403,7 +2691,9 @@ namespace lumen::lsp::runtime {
           continue;
         }
         const auto peer = dtls_timers_[index].peer;
+        begin_dtls_provider_output(peer);
         const auto result = dtls_->handle_timeout(peer);
+        end_dtls_provider_output(peer);
         dtls_timers_.erase(dtls_timers_.begin() + static_cast<std::ptrdiff_t>(index));
         if (result == WolfsslDtlsOperationResult::accepted) {
           refresh_dtls_timer(peer, now_microseconds);
@@ -2480,6 +2770,30 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /** @brief Close every atomically reported fatal path association on the socket owner. */
+    void process_failed_forward_paths() noexcept {
+      auto pending = pending_forward_failures_.exchange(0, std::memory_order_acq_rel);
+      for (std::size_t index = 0; pending != 0 && index < forward_paths_.size(); ++index) {
+        const auto bit = std::uint64_t {1} << index;
+        if ((pending & bit) == 0) {
+          continue;
+        }
+        pending &= ~bit;
+        PeerEndpoint peer;
+        {
+          std::scoped_lock lock(forward_path_mutex_);
+          const auto &owner = forward_paths_[index];
+          if (!owner || owner->fatal_generation.load(std::memory_order_acquire) != owner->generation) {
+            continue;
+          }
+          peer = owner->peer;
+        }
+        if (dtls_) {
+          (void) dtls_->close_association(peer);
+        }
+      }
+    }
+
     void process_detached_grace(const std::uint64_t now_microseconds) noexcept {
       std::unique_ptr<ActiveAudioRuntime> audio;
       std::unique_ptr<ActiveVideoRuntime> video;
@@ -2550,12 +2864,70 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /** @brief Submit one immutable aggregate-path datagram through the native socket. */
+    static UdpSendResult forward_send_callback(
+      void *context,
+      const PeerEndpoint &peer,
+      const std::span<const std::uint8_t> datagram
+    ) noexcept {
+      const auto *owner = static_cast<ForwardPathGeneration *>(context);
+      return owner && owner->runtime ?
+               owner->runtime->socket_.send_datagram_result(peer, datagram) :
+               UdpSendResult::fatal;
+    }
+
+    /** @brief Hand a fatal path generation to the socket loop without taking session authority. */
+    static void forward_completed_callback(
+      void *context,
+      const std::uint64_t token,
+      const HostForwardLane lane,
+      const HostForwardCompletion completion,
+      const std::uint64_t completed_at_microseconds,
+      const std::size_t protected_bytes,
+      const std::uint16_t charged_bytes
+    ) noexcept {
+      auto *owner = static_cast<ForwardPathGeneration *>(context);
+      (void) token;
+      (void) lane;
+      (void) completed_at_microseconds;
+      (void) protected_bytes;
+      (void) charged_bytes;
+      if (owner == nullptr || owner->runtime == nullptr || completion != HostForwardCompletion::fatal) {
+        return;
+      }
+      std::uint32_t expected = 0;
+      if (owner->fatal_generation.compare_exchange_strong(
+            expected,
+            owner->generation,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire
+          )) {
+        owner->runtime->pending_forward_failures_.fetch_or(
+          std::uint64_t {1} << owner->slot,
+          std::memory_order_release
+        );
+      }
+    }
+
     static bool dtls_send_callback(
       void *context,
       const PeerEndpoint &peer,
       const std::span<const std::uint8_t> datagram
     ) noexcept {
-      return static_cast<ProductHostRuntime *>(context)->socket_.send_datagram(peer, datagram);
+      auto &runtime = *static_cast<ProductHostRuntime *>(context);
+      const auto forward = runtime.find_forward_path(peer);
+      if (forward && forward->path) {
+        const auto now = monotonic_microseconds();
+        const auto deadline = now > std::numeric_limits<std::uint64_t>::max() - 100'000U ?
+                                std::numeric_limits<std::uint64_t>::max() :
+                                now + 100'000U;
+        return forward->path->submit_copy(
+                 HostForwardLane::urgent_control,
+                 datagram,
+                 deadline
+               ) == HostForwardSubmitResult::accepted;
+      }
+      return runtime.direct_dtls_output_allowed(peer) && runtime.socket_.send_datagram(peer, datagram);
     }
 
     static bool application_data_callback(
@@ -2582,7 +2954,19 @@ namespace lumen::lsp::runtime {
           !runtime.srtp_->install_association(peer, security.srtp)) {
         return false;
       }
-      if (runtime.control_->association_ready(peer) == 0) {
+      const auto generation = runtime.control_->association_ready(peer);
+      if (generation == 0) {
+        runtime.srtp_->remove_association(peer);
+        return false;
+      }
+      if (!runtime.create_forward_path(peer, generation)) {
+        runtime.control_->association_closed(peer);
+        runtime.srtp_->remove_association(peer);
+        return false;
+      }
+      if (!runtime.remember_authenticated_peer(peer)) {
+        runtime.retire_forward_path(peer);
+        runtime.control_->association_closed(peer);
         runtime.srtp_->remove_association(peer);
         return false;
       }
@@ -2601,6 +2985,7 @@ namespace lumen::lsp::runtime {
 
     static void association_closed_callback(void *context, const PeerEndpoint &peer) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
+      runtime.forget_authenticated_peer(peer);
       std::unique_ptr<ActiveAudioRuntime> audio;
       std::unique_ptr<ActiveVideoRuntime> video;
       std::unique_ptr<LspMicrophoneReceiver> microphone;
@@ -2628,21 +3013,30 @@ namespace lumen::lsp::runtime {
         }
         if (runtime.audio_runtime_ && runtime.audio_runtime_->peer == peer) {
           audio = std::move(runtime.audio_runtime_);
-          audio->remove_srtp_on_retirement = true;
         }
         if (runtime.video_runtime_ && runtime.video_runtime_->peer == peer) {
           video = std::move(runtime.video_runtime_);
-          video->remove_srtp_on_retirement = !audio;
         }
         if (runtime.microphone_runtime_ && runtime.microphone_runtime_->peer() == peer) {
           microphone = std::move(runtime.microphone_runtime_);
         }
       }
-      const auto deferred_srtp_removal = static_cast<bool>(audio) || static_cast<bool>(video);
+      const auto audio_uses_closed_peer = audio && audio->peer == peer;
+      const auto video_uses_closed_peer = video && video->peer == peer;
+      if (video_uses_closed_peer) {
+        video->remove_srtp_on_retirement = true;
+        if (audio_uses_closed_peer) {
+          audio->remove_srtp_on_retirement = false;
+        }
+      } else if (audio_uses_closed_peer) {
+        audio->remove_srtp_on_retirement = true;
+      }
+      const auto deferred_srtp_removal = audio_uses_closed_peer || video_uses_closed_peer;
       runtime.queue_audio_retirement(std::move(audio));
       runtime.queue_video_retirement(std::move(video));
       runtime.queue_microphone_retirement(std::move(microphone));
       if (!deferred_srtp_removal && runtime.srtp_) {
+        runtime.retire_forward_path(peer);
         runtime.srtp_->remove_association(peer);
       }
       if (runtime.control_) {
@@ -2665,6 +3059,35 @@ namespace lumen::lsp::runtime {
       const std::size_t protected_bytes
     ) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
+      if (packet_class == SecurePacketClass::rtcp && plaintext.size() >= 12U &&
+          std::ranges::equal(transport::lspv_app_name, plaintext.subspan<8, 4>())) {
+        std::shared_ptr<HostVideoSender> sender;
+        std::optional<InputSessionMapping> mapping;
+        std::uint32_t stream_generation = 0;
+        std::uint32_t video_generation = 0;
+        {
+          std::scoped_lock session_lock(runtime.session_mutex_);
+          if (!runtime.input_owner_ || !runtime.active_video_configuration_ ||
+              !runtime.video_runtime_ || runtime.video_runtime_->peer != peer ||
+              !runtime.video_runtime_->sender) {
+            return true;
+          }
+          mapping = runtime.input_owner_->mapping();
+          if (!mapping || mapping->peer != peer) {
+            return true;
+          }
+          stream_generation = runtime.active_video_configuration_->wire.stream_generation;
+          video_generation = runtime.active_video_configuration_->wire.video.video_generation;
+          sender = runtime.video_runtime_->sender;
+        }
+        const auto status = parse_lspv_status(plaintext, mapping->input_ssrc);
+        if (!status || status->session_generation != stream_generation ||
+            status->video_generation != video_generation) {
+          return true;
+        }
+        (void) sender->receive_video_status(*status, monotonic_microseconds());
+        return true;
+      }
       std::scoped_lock session_lock(runtime.session_mutex_);
       if (!runtime.input_owner_) {
         return true;
@@ -2685,28 +3108,6 @@ namespace lumen::lsp::runtime {
           runtime.next_recent_inbound_path_probe_id_ =
             (runtime.next_recent_inbound_path_probe_id_ + 1U) % runtime.recent_inbound_path_probe_ids_.size();
           runtime.pending_inbound_path_probe_ = {};
-          return true;
-        }
-        if (plaintext.size() >= 12U && std::ranges::equal(transport::lspv_app_name, plaintext.subspan<8, 4>())) {
-          if (!mapping || mapping->peer != peer || !runtime.active_video_configuration_ ||
-              !runtime.video_runtime_ || runtime.video_runtime_->peer != peer) {
-            return true;
-          }
-          const auto status = parse_lspv_status(plaintext, mapping->input_ssrc);
-          if (!status || status->session_generation != runtime.active_video_configuration_->wire.stream_generation ||
-              status->video_generation != runtime.active_video_configuration_->wire.video.video_generation ||
-              status->recovery_epoch != runtime.active_video_configuration_->wire.recovery_epoch) {
-            return true;
-          }
-          const auto available = static_cast<std::uint8_t>(
-            status->maximum_decode_submissions - status->decode_submissions_in_flight
-          );
-          runtime.video_runtime_->sender->update_decoder_credit(available);
-          if (status->deadline_miss ||
-              status->decoder_status == transport::lspv_decoder_status::recoverable_error ||
-              status->decoder_status == transport::lspv_decoder_status::unrecoverable_error) {
-            runtime.fail_required_video_session(peer);
-          }
           return true;
         }
         if (runtime.video_runtime_ && runtime.video_runtime_->peer == peer && runtime.video_runtime_->sender &&
@@ -2763,42 +3164,14 @@ namespace lumen::lsp::runtime {
       return true;
     }
 
-    static ProtectedSendResult secure_send_callback(
-      void *context,
-      const PeerEndpoint &peer,
-      const std::span<const std::uint8_t> datagram
-    ) noexcept {
-      switch (static_cast<ProductHostRuntime *>(context)->socket_.send_datagram_result(peer, datagram)) {
-        case UdpSendResult::sent:
-          return ProtectedSendResult::sent;
-        case UdpSendResult::would_block:
-          return ProtectedSendResult::would_block;
-        case UdpSendResult::message_too_large:
-          return ProtectedSendResult::message_too_large;
-        case UdpSendResult::fatal:
-          return ProtectedSendResult::fatal;
-      }
-      return ProtectedSendResult::fatal;
-    }
-
     static bool input_digest_callback(
       void *context,
       const std::span<const std::uint8_t> bytes,
       const Digest256 &expected
     ) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
-      std::scoped_lock session_lock(runtime.session_mutex_);
       Digest256 actual {};
       return runtime.crypto_ && runtime.crypto_->sha256(bytes, actual) && runtime.crypto_->equal_secret(actual, expected);
-    }
-
-    static bool input_ack_callback(
-      void *context,
-      const PeerEndpoint &peer,
-      const std::span<const std::uint8_t> rtcp_packet
-    ) noexcept {
-      auto &runtime = *static_cast<ProductHostRuntime *>(context);
-      return runtime.srtp_ && runtime.srtp_->protect_and_send(peer, SecurePacketClass::rtcp, rtcp_packet);
     }
 
     static bool input_baseline_callback(
@@ -2809,11 +3182,19 @@ namespace lumen::lsp::runtime {
     ) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
       std::scoped_lock session_lock(runtime.session_mutex_);
-      if (!runtime.active_client_ || !runtime.input_owner_) {
+      if (!runtime.active_client_) {
         return false;
       }
-      const auto mapping = runtime.input_owner_->mapping();
-      return mapping && mapping->peer == peer && runtime.authority_.commit_input_baseline(*runtime.active_client_, session_generation, input_generation) == AuthorityResult::accepted;
+      const auto snapshot = runtime.authority_.snapshot();
+      const auto forward = runtime.find_forward_path(peer);
+      return snapshot.generations.connection == runtime.active_client_->connection_generation &&
+             snapshot.generations.stream == session_generation && snapshot.generations.input == input_generation &&
+             forward && forward->generation == snapshot.generations.connection &&
+             runtime.authority_.commit_input_baseline(
+               *runtime.active_client_,
+               session_generation,
+               input_generation
+             ) == AuthorityResult::accepted;
     }
 
     HostRuntimeConfig config_;  ///< Immutable runtime configuration.
@@ -2854,6 +3235,11 @@ namespace lumen::lsp::runtime {
     std::optional<PeerEndpoint> pending_old_peer_after_attach_;  ///< Old association retained until fresh video configuration succeeds.
     bool video_start_pending_ {};  ///< Fresh capture waits for prior VDD/frame-source ownership to join.
     std::uint64_t detached_deadline_microseconds_ {};  ///< Bounded process-hold deadline.
+    mutable std::mutex forward_path_mutex_;  ///< Dedicated path lookup/lifetime lock, never used for session authority.
+    std::array<std::shared_ptr<ForwardPathGeneration>, 64> forward_paths_ {};  ///< Active connection-generation path owners.
+    std::array<PeerEndpoint, 64> authenticated_peers_ {};  ///< Provider-authenticated peers that must never regain direct socket output.
+    std::optional<PeerEndpoint> direct_dtls_output_peer_;  ///< Current synchronous provider receive/timer output scope.
+    std::atomic<std::uint64_t> pending_forward_failures_ {};  ///< Fatal path slots awaiting socket-loop association teardown.
     mutable std::recursive_mutex session_mutex_;  ///< Synchronizes socket authority with the input apply worker.
     std::vector<DtlsTimer> dtls_timers_;  ///< Bounded association retransmission timers.
     std::array<PeerEndpoint, 64> pending_association_closes_ {};  ///< Old associations retired after response submission.

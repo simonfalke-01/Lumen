@@ -7,11 +7,15 @@
 
 #include "../../video_egress_queue.h"
 #include "../media/common.h"
+#include "../transport/repair.h"
+#include "../transport/rtcp.h"
 #include "control/wire.h"
+#include "host_forward_path.h"
 #include "libsrtp_provider.h"
 
-#include <atomic>
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -19,6 +23,152 @@
 #include <span>
 
 namespace lumen::lsp::runtime {
+  /** @brief Exact encrypted extension-ID-3 value size in LSP video schema version two. */
+  inline constexpr std::size_t video_frame_identity_extension_size = 12;
+
+  /**
+   * @brief Serialize the encrypted frame identity and recovery epoch extension value.
+   *
+   * @param destination Exact 12-byte extension-value storage.
+   * @param frame_id Nonzero encoder access-unit identifier.
+   * @param recovery_epoch Nonzero active recovery epoch.
+   * @return True only when the exact network-order value was written.
+   */
+  [[nodiscard]] bool write_video_frame_identity_extension(
+    std::span<std::uint8_t> destination,
+    std::uint64_t frame_id,
+    std::uint32_t recovery_epoch
+  ) noexcept;
+
+  /**
+   * @brief Decide whether recovery admission dropped a frame whose encoder dependency must be invalidated.
+   *
+   * @param recovery_blocked Whether another independent recovery frame is already outstanding.
+   * @param retry_requested Whether a failed recovery became retry-permitted at this boundary.
+   * @param independent Whether the current encoded frame is independent.
+   * @return True when the unsent frame may otherwise become a reference for later encoded frames.
+   */
+  [[nodiscard]] constexpr bool video_recovery_drop_requires_dependency_invalidation(
+    const bool recovery_blocked,
+    const bool retry_requested,
+    const bool independent
+  ) noexcept {
+    return recovery_blocked || (retry_requested && !independent);
+  }
+
+  /**
+   * @brief Test whether an independent frame satisfies the latest local dependency break.
+   *
+   * @param idr Whether the frame is a codec-independent IDR.
+   * @param frame_invalidation_generation Encoder invalidation generation carried by the frame.
+   * @param latest_invalidation_generation Latest published invalidation generation.
+   * @param invalidation_dependency_generation Dependency break owned by that published invalidation.
+   * @param frame_dependency_generation Dependency-break generation captured before admission.
+   * @param latest_dependency_generation Current dependency-break generation.
+   * @param frame_index Encoder frame index of the completed independent frame.
+   * @param dependency_frame_fence Greatest locally dropped/damaged encoder frame index.
+   * @return True only when this frame was produced after and for the latest dependency break.
+   */
+  [[nodiscard]] constexpr bool video_independent_satisfies_dependency_fence(
+    const bool idr,
+    const std::uint64_t frame_invalidation_generation,
+    const std::uint64_t latest_invalidation_generation,
+    const std::uint64_t invalidation_dependency_generation,
+    const std::uint64_t frame_dependency_generation,
+    const std::uint64_t latest_dependency_generation,
+    const std::int64_t frame_index,
+    const std::int64_t dependency_frame_fence
+  ) noexcept {
+    if (frame_dependency_generation == 0 ||
+        frame_dependency_generation != latest_dependency_generation ||
+        frame_index <= dependency_frame_fence) {
+      return false;
+    }
+    return idr ||
+           (frame_invalidation_generation != 0 &&
+            frame_invalidation_generation == latest_invalidation_generation &&
+            frame_dependency_generation == invalidation_dependency_generation);
+  }
+
+  /**
+   * @brief Bind a queued invalidation to a dependency generation without regression.
+   *
+   * @param requested_generation Dependency generation supplied by the request owner.
+   * @param current_generation Latest serialized dependency break.
+   * @param published_generation Dependency generation of the currently published request.
+   * @return Greatest generation so queued promotion cannot restore an older dependency state.
+   */
+  [[nodiscard]] constexpr std::uint64_t bind_video_invalidation_dependency_generation(
+    const std::uint64_t requested_generation,
+    const std::uint64_t current_generation,
+    const std::uint64_t published_generation
+  ) noexcept {
+    return std::max({requested_generation, current_generation, published_generation});
+  }
+
+  /**
+   * @brief Validate one frame's dependency reservation at a packet commit boundary.
+   *
+   * @param independent Whether the frame is independently decodable.
+   * @param reserved_generation Dependency generation reserved before frame submission.
+   * @param current_generation Latest serialized dependency break.
+   * @param reference_valid Whether the current dependent reference path is valid.
+   * @param repair_pending Whether a newer independent repair is still required.
+   * @return True when this packet may commit without crossing a newer dependency break.
+   */
+  [[nodiscard]] constexpr bool video_dependency_reservation_valid(
+    const bool independent,
+    const std::uint64_t reserved_generation,
+    const std::uint64_t current_generation,
+    const bool reference_valid,
+    const bool repair_pending
+  ) noexcept {
+    return independent ||
+           (reserved_generation != 0 && reserved_generation == current_generation &&
+            reference_valid && !repair_pending);
+  }
+
+  /**
+   * @brief Decide whether a failed frame was partially exposed to the network.
+   *
+   * @param committed_packets Packets accepted by the aggregate path before failure.
+   * @return True only when at least one packet, rather than merely an SRTP index, was committed.
+   */
+  [[nodiscard]] constexpr bool video_frame_is_partial_network_submission(
+    const std::size_t committed_packets
+  ) noexcept {
+    return committed_packets != 0;
+  }
+
+  /** @brief Product action resulting from authenticated `LSPV` recovery evidence. */
+  enum class VideoRecoveryFeedbackAction : std::uint8_t {
+    ignored,  ///< Status is invalid, stale, or outside the current recovery epoch.
+    accepted,  ///< Status was current but requires no new independent frame.
+    request_independent_frame,  ///< A new or retry-permitted recovery frame must be produced.
+  };
+
+  /**
+   * @brief Apply authenticated decoder evidence to one sender recovery controller.
+   *
+   * The caller serializes access to `recovery` and `failure_latched`. Capacity exhaustion and a
+   * deadline observation without decoder error never open an epoch. A same-epoch decoder error is
+   * retained until the outstanding deadline permits one retry.
+   *
+   * @param recovery Generation-scoped recovery controller seeded from `VIDEO_CONFIG`.
+   * @param failure_latched Retained same-epoch decode-failure evidence.
+   * @param status Authenticated and structurally validated `LSPV` status.
+   * @param latest_sent_frame_id Greatest completely submitted local frame, or zero before media.
+   * @param now_microseconds Current monotonic time.
+   * @return Whether the status was ignored, accepted, or requires one independent frame.
+   */
+  [[nodiscard]] VideoRecoveryFeedbackAction apply_authenticated_lspv_recovery(
+    transport::recovery_controller &recovery,
+    bool &failure_latched,
+    const transport::lspv_status &status,
+    std::uint64_t latest_sent_frame_id,
+    std::uint64_t now_microseconds
+  ) noexcept;
+
   /** @brief Maximum active forward-media SSRC blocks admitted in one RFC 8888 packet. */
   inline constexpr std::size_t maximum_congestion_feedback_blocks = 8;
 
@@ -113,7 +263,8 @@ namespace lumen::lsp::runtime {
       return PathPacketSizeClass::invalid;
     }
     return udp_payload_bytes == confirmed_payload_bytes ?
-             PathPacketSizeClass::confirmed_size : PathPacketSizeClass::smaller;
+             PathPacketSizeClass::confirmed_size :
+             PathPacketSizeClass::smaller;
   }
 
   /**
@@ -133,10 +284,13 @@ namespace lumen::lsp::runtime {
   /** @brief Immutable negotiated configuration for one first-slice LSP video source. */
   struct HostVideoSenderConfig {
     PeerEndpoint peer {};  ///< Exact authenticated DTLS/SRTP destination.
+    std::shared_ptr<HostForwardPath> forward_path;  ///< Generation-owned aggregate final-send path.
+    std::uint32_t forward_path_generation {};  ///< Exact connection/path authority generation.
     VideoSelectionPayload video {};  ///< Frozen primary SSRC/PT/codec/extension selection.
     std::uint16_t initial_sequence {};  ///< Random initial RTP sequence number.
     std::uint32_t initial_timestamp {};  ///< Random nonzero initial 90 kHz timestamp.
     std::uint64_t frame_id_origin {};  ///< Random nonzero first frame ID.
+    std::uint32_t initial_recovery_epoch {};  ///< Nonzero recovery epoch carried by `VIDEO_CONFIG`.
     std::uint32_t maximum_access_unit_bytes {};  ///< Complete-AU bound, at most 16 MiB.
     std::uint32_t maximum_capture_to_present_microseconds {};  ///< Positive frame admission budget.
     std::uint64_t aggregate_pacing_bits_per_second {};  ///< Complete IP-layer pacing ceiling.
@@ -266,6 +420,18 @@ namespace lumen::lsp::runtime {
     /** @brief Parse authenticated RFC 8888 CCFB and update independent forward congestion state. */
     bool receive_congestion_feedback(std::span<const std::uint8_t> packet, std::uint64_t now_microseconds) noexcept;
 
+    /**
+     * @brief Apply one authenticated, generation-qualified `LSPV` status outside session locks.
+     *
+     * @param status Structurally valid client video status for this sender generation.
+     * @param now_microseconds Current monotonic receive time.
+     * @return True when the current sender accepted the status.
+     */
+    bool receive_video_status(
+      const transport::lspv_status &status,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
     /** @brief Stop packet admission and wake the sender after capture has quiesced. */
     void close() noexcept;
 
@@ -285,6 +451,27 @@ namespace lumen::lsp::runtime {
      * @return Current sender observations.
      */
     [[nodiscard]] HostVideoSenderSnapshot snapshot() const noexcept;
+
+    /**
+     * @brief Apply one asynchronous aggregate-path terminal disposition.
+     *
+     * @param token Sender-local committed datagram token.
+     * @param completion Final path disposition.
+     * @param completed_at_microseconds Monotonic kernel completion time.
+     * @param protected_bytes Exact protected UDP payload bytes.
+     * @param charged_bytes Complete IP/UDP bytes charged once.
+     * @return True only when this sender owned the token.
+     */
+    bool complete_forward_datagram(
+      std::uint64_t token,
+      HostForwardCompletion completion,
+      std::uint64_t completed_at_microseconds,
+      std::size_t protected_bytes,
+      std::uint16_t charged_bytes
+    ) noexcept;
+
+    /** @brief Observe aggregate-path kernel pressure for frame admission. */
+    void set_forward_backpressure(bool blocked) noexcept;
 
   private:
     class Impl;

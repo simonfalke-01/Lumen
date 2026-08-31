@@ -324,7 +324,7 @@ namespace lumen::lsp::runtime {
             .remote_address = remote_address,
             .remote_port = remote_port,
           },
-          .payload = std::span<const std::uint8_t> {storage.data(), static_cast<std::size_t>(size)},
+          .payload = std::span<std::uint8_t> {storage.data(), static_cast<std::size_t>(size)},
           .received_at_microseconds = monotonic_microseconds(),
         });
       }

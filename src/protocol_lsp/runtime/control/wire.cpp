@@ -737,7 +737,7 @@ namespace lumen::lsp::runtime {
       parameter_sets.emplace_back(cbor::Value::Bytes {set.begin(), set.end()});
     }
     return encode({
-      {1, wire_version},
+      {1, video_configuration_schema_version},
       {2, bytes(payload.session_id)},
       {3, payload.stream_generation},
       {4, video_selection(payload.video)},
@@ -757,7 +757,7 @@ namespace lumen::lsp::runtime {
     const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
     const auto *video_generation = map ? unsigned_value((*map)[3].second) : nullptr;
     const auto *decoder_credit = map ? unsigned_value((*map)[4].second) : nullptr;
-    if (!map || version == nullptr || *version != wire_version || status == nullptr ||
+    if (!map || version == nullptr || *version != video_configuration_schema_version || status == nullptr ||
         *status > static_cast<std::uint8_t>(ControlStatus::internal_failure) ||
         !fixed_bytes((*map)[2].second, result.session_id) || is_zero(result.session_id) ||
         video_generation == nullptr || *video_generation == 0 ||

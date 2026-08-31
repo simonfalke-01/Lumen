@@ -5,15 +5,16 @@
 
 #include "input_owner.h"
 
+#include "../../input.h"
 #include "../core/packet.h"
 #include "../core/rtp.h"
 #include "../input_plane/feedback.h"
 #include "../input_plane/state.h"
-#include "../../input.h"
 #include "udp_socket.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <condition_variable>
 #include <limits>
@@ -40,7 +41,9 @@ namespace lumen::lsp::runtime {
   }  // namespace
 
   bool InputSessionMapping::valid() const noexcept {
-    return peer.valid() && !is_zero(client_id) && connection_generation != 0 && session_generation != 0 &&
+    return peer.valid() && forward_path && forward_path->ready() &&
+           forward_path->generation() == connection_generation && !is_zero(client_id) &&
+           connection_generation != 0 && session_generation != 0 &&
            input_generation != 0 && input_ssrc != 0 && acknowledgement_ssrc != 0 && input_ssrc != acknowledgement_ssrc &&
            input_payload_type >= 96 && input_payload_type <= 127;
   }
@@ -61,11 +64,12 @@ namespace lumen::lsp::runtime {
       Impl &owner_;  ///< Callback owner.
     };
 
-    explicit Impl(const InputOwnerCallbacks callbacks) noexcept:
+    Impl(const InputOwnerCallbacks callbacks, LibsrtpServerProvider &srtp) noexcept:
         callbacks_ {callbacks},
+        srtp_ {srtp},
         verifier_ {*this},
         platform_ {input::alloc_lsp_platform_input(platform_feedback_callback, this)} {
-      if (!callbacks_.verify_digest || !callbacks_.send_acknowledgement || !callbacks_.baseline_committed || !platform_) {
+      if (!callbacks_.verify_digest || !callbacks_.baseline_committed || !platform_) {
         return;
       }
       try {
@@ -116,6 +120,14 @@ namespace lumen::lsp::runtime {
       controller_latest_ = {};
       touches_ = {};
       next_controller_sequence_ = 1;
+      ack_scheduler_ = {};
+      ack_pending_ = false;
+      ack_mapping_ = {};
+      ack_receive_time_ = 0;
+      ack_apply_time_ = 0;
+      ack_pending_since_ = 0;
+      ack_pending_records_ = 0;
+      ack_urgent_ = false;
     }
 
     bool ready_for_configuration(const InputSessionMapping &mapping) const noexcept {
@@ -153,6 +165,12 @@ namespace lumen::lsp::runtime {
       baseline_.reset();
       pointer_ = {};
       pending_pointer_.reset();
+      ack_scheduler_ = {};
+      ack_pending_ = false;
+      ack_mapping_ = {};
+      ack_pending_since_ = 0;
+      ack_pending_records_ = 0;
+      ack_urgent_ = false;
       input::neutralize_lsp_platform_input(*platform_);
     }
 
@@ -165,6 +183,11 @@ namespace lumen::lsp::runtime {
     std::pair<std::uint64_t, std::uint64_t> applied_watermark() const noexcept {
       std::scoped_lock lock(mutex_);
       return {highest_applied_state_, edges_.applied_through()};
+    }
+
+    /** @brief Read exact final-sent complete IP/UDP bytes for LSPI and LSPG. */
+    [[nodiscard]] std::uint64_t sent_feedback_wire_bytes() const noexcept {
+      return sent_feedback_wire_bytes_.load(std::memory_order_relaxed);
     }
 
     bool receive_rtcp(const PeerEndpoint &peer, const std::span<const std::uint8_t> packet) noexcept {
@@ -224,13 +247,15 @@ namespace lumen::lsp::runtime {
         InputSessionMapping mapping;
         {
           std::unique_lock lock(mutex_);
-          condition_.wait_for(lock, std::chrono::milliseconds {1}, [&]() {
+          const auto wait = ack_pending_ ? std::chrono::microseconds {125} : std::chrono::microseconds {1'000};
+          condition_.wait_for(lock, wait, [&]() {
             return stop_token.stop_requested() || size_ != 0;
           });
           if (stop_token.stop_requested()) {
             return;
           }
           if (size_ == 0) {
+            flush_pending_ack(monotonic_microseconds());
             lock.unlock();
             retry_controller_commands();
             continue;
@@ -245,14 +270,12 @@ namespace lumen::lsp::runtime {
           mapping = *mapping_;
         }
         process(mapping, packet.bytes());
+        std::scoped_lock lock(mutex_);
+        flush_pending_ack(monotonic_microseconds());
       }
     }
 
     void process(const InputSessionMapping &mapping, const std::span<const std::uint8_t> rtp_packet) noexcept {
-      std::scoped_lock lock(mutex_);
-      if (!mapping_ || *mapping_ != mapping) {
-        return;
-      }
       const auto rtp = parse_rtp_fixed_header(rtp_packet);
       if (!rtp || rtp.bytes_consumed >= rtp_packet.size()) {
         return;
@@ -262,9 +285,16 @@ namespace lumen::lsp::runtime {
       if (!packet) {
         return;
       }
+      if (packet.header.kind == input_plane::packet_kind::baseline_part) {
+        process_baseline(mapping, packet, received_at);
+        return;
+      }
+      std::scoped_lock lock(mutex_);
+      if (!mapping_ || *mapping_ != mapping) {
+        return;
+      }
       switch (packet.header.kind) {
         case input_plane::packet_kind::baseline_part:
-          process_baseline(mapping, packet, received_at);
           break;
         case input_plane::packet_kind::edge_batch:
           process_edges(mapping, packet, received_at);
@@ -293,14 +323,29 @@ namespace lumen::lsp::runtime {
       if (!part) {
         return;
       }
-      const auto added = baseline_.add(packet.header, part.value);
-      if (added != input_plane::baseline_result::accepted && added != input_plane::baseline_result::duplicate) {
+      input_plane::baseline_receiver candidate;
+      {
+        std::scoped_lock lock(mutex_);
+        if (!mapping_ || *mapping_ != mapping) {
+          return;
+        }
+        const auto added = baseline_.add(packet.header, part.value);
+        if (added != input_plane::baseline_result::accepted && added != input_plane::baseline_result::duplicate) {
+          return;
+        }
+        if (added == input_plane::baseline_result::duplicate && baseline_.committed()) {
+          schedule_ack(mapping, received_at, monotonic_microseconds(), true);
+          return;
+        }
+        if (!baseline_.complete() || baseline_.committed()) {
+          return;
+        }
+        candidate = baseline_;
+      }
+      if (candidate.commit(verifier_) != input_plane::baseline_result::committed) {
         return;
       }
-      if (!baseline_.complete() || baseline_.commit(verifier_) != input_plane::baseline_result::committed) {
-        return;
-      }
-      const auto bytes = baseline_.committed_bytes();
+      const auto bytes = candidate.committed_bytes();
       if (bytes.size() != neutral_baseline_size || !std::equal(neutral_baseline_magic.begin(), neutral_baseline_magic.end(), bytes.begin()) ||
           bytes[4] != wire_version || bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 0) {
         neutralize();
@@ -320,13 +365,18 @@ namespace lumen::lsp::runtime {
         neutralize();
         return;
       }
+      std::scoped_lock lock(mutex_);
+      if (!mapping_ || *mapping_ != mapping || baseline_.baseline_id() != candidate.baseline_id() || baseline_.committed()) {
+        return;
+      }
+      baseline_ = candidate;
       input::neutralize_lsp_platform_input(*platform_);
       edges_.reset(mapping.input_generation, watermark);
       edges_.activate_baseline();
       pointer_ = {};
       highest_accepted_state_ = 1;
       highest_applied_state_ = 1;
-      send_ack(mapping, received_at, monotonic_microseconds());
+      schedule_ack(mapping, received_at, monotonic_microseconds(), true);
     }
 
     void process_edges(
@@ -349,7 +399,7 @@ namespace lumen::lsp::runtime {
       if (result != input_plane::edge_receive_result::accepted && result != input_plane::edge_receive_result::duplicate) {
         return;
       }
-      edges_.drain([this](const input_plane::edge_record &edge) noexcept {
+      const auto applied = edges_.drain([this](const input_plane::edge_record &edge) noexcept {
         switch (edge.kind) {
           case input_plane::edge_kind::key_down:
           case input_plane::edge_kind::key_up:
@@ -414,10 +464,16 @@ namespace lumen::lsp::runtime {
                 return false;
               }
               if (touch.submitted && !input::apply_lsp_controller_touch(
-                    *platform_, mapping_->input_generation, touch.controller_id, touch.instance_generation,
-                    edge.kind == input_plane::edge_kind::touch_end ? 2 : 4,
-                    edge.device_id, touch.x, touch.y, touch.pressure
-                  )) {
+                                       *platform_,
+                                       mapping_->input_generation,
+                                       touch.controller_id,
+                                       touch.instance_generation,
+                                       edge.kind == input_plane::edge_kind::touch_end ? 2 : 4,
+                                       edge.device_id,
+                                       touch.x,
+                                       touch.y,
+                                       touch.pressure
+                                     )) {
                 return false;
               }
               touch = {};
@@ -428,7 +484,7 @@ namespace lumen::lsp::runtime {
         }
       });
       apply_pending_pointer();
-      send_ack(mapping, received_at, monotonic_microseconds());
+      schedule_ack(mapping, received_at, monotonic_microseconds(), true, std::max<std::size_t>(applied, 1));
     }
 
     void process_pointer(
@@ -444,7 +500,7 @@ namespace lumen::lsp::runtime {
       highest_accepted_state_ = packet.header.state_sequence;
       pending_pointer_ = PendingPointer {.header = packet.header, .value = parsed.value};
       apply_pending_pointer();
-      send_ack(mapping, received_at, monotonic_microseconds());
+      schedule_ack(mapping, received_at, monotonic_microseconds(), false);
     }
 
     void process_device_state(
@@ -468,14 +524,21 @@ namespace lumen::lsp::runtime {
           return std::bit_cast<std::int16_t>(wire::read_be<std::uint16_t>(packet.payload.subspan(offset, 2)));
         };
         const auto applied = input::apply_lsp_controller_state(
-          *platform_, prefix.value.device_id, prefix.value.instance_generation, packet.payload[24], packet.payload[25],
-          signed_axis(28), signed_axis(30), signed_axis(32), signed_axis(34)
+          *platform_,
+          prefix.value.device_id,
+          prefix.value.instance_generation,
+          packet.payload[24],
+          packet.payload[25],
+          signed_axis(28),
+          signed_axis(30),
+          signed_axis(32),
+          signed_axis(34)
         );
         if (applied) {
           controller_ordinals_[prefix.value.device_id - 1] = prefix.value.physical_ordinal;
           highest_accepted_state_ = std::max(highest_accepted_state_, packet.header.state_sequence);
           highest_applied_state_ = std::max(highest_applied_state_, packet.header.state_sequence);
-          send_ack(mapping, received_at, monotonic_microseconds());
+          schedule_ack(mapping, received_at, monotonic_microseconds(), false);
         }
       } else if (prefix.value.device == input_plane::device_type::touch && packet.payload.size() == 40 &&
                  prefix.value.device_id <= touches_.size()) {
@@ -490,8 +553,15 @@ namespace lumen::lsp::runtime {
         const auto y = static_cast<float>(wire::read_be<std::uint32_t>(packet.payload.subspan(32, 4))) * scale;
         const auto pressure = static_cast<float>(wire::read_be<std::uint32_t>(packet.payload.subspan(36, 4))) * scale;
         if (input::apply_lsp_controller_touch(
-              *platform_, mapping.input_generation, controller_id, touch.instance_generation,
-              touch.submitted ? 3 : 1, prefix.value.device_id, x, y, pressure
+              *platform_,
+              mapping.input_generation,
+              controller_id,
+              touch.instance_generation,
+              touch.submitted ? 3 : 1,
+              prefix.value.device_id,
+              x,
+              y,
+              pressure
             )) {
           touch.physical_ordinal = prefix.value.physical_ordinal;
           touch.x = x;
@@ -500,7 +570,7 @@ namespace lumen::lsp::runtime {
           touch.submitted = true;
           highest_accepted_state_ = std::max(highest_accepted_state_, packet.header.state_sequence);
           highest_applied_state_ = std::max(highest_applied_state_, packet.header.state_sequence);
-          send_ack(mapping, received_at, monotonic_microseconds());
+          schedule_ack(mapping, received_at, monotonic_microseconds(), false);
         }
       }
     }
@@ -522,12 +592,18 @@ namespace lumen::lsp::runtime {
         return std::bit_cast<float>(wire::read_be<std::uint32_t>(packet.payload.subspan(offset, 4)));
       };
       if (input::apply_lsp_controller_sensor(
-            *platform_, mapping.input_generation, prefix.value.device_id, prefix.value.instance_generation,
-            packet.payload[1], decode_float(24), decode_float(28), decode_float(32)
+            *platform_,
+            mapping.input_generation,
+            prefix.value.device_id,
+            prefix.value.instance_generation,
+            packet.payload[1],
+            decode_float(24),
+            decode_float(28),
+            decode_float(32)
           )) {
         highest_accepted_state_ = std::max(highest_accepted_state_, packet.header.state_sequence);
         highest_applied_state_ = std::max(highest_applied_state_, packet.header.state_sequence);
-        send_ack(mapping, received_at, monotonic_microseconds());
+        schedule_ack(mapping, received_at, monotonic_microseconds(), false);
       }
     }
 
@@ -548,11 +624,11 @@ namespace lumen::lsp::runtime {
       }
       for (std::uint16_t button = 1; button <= 5; ++button) {
         const auto held = (packet.payload[2] & (1U << (button - 1U))) != 0;
-        (void)input::apply_lsp_pointer_button(*platform_, button, !held);
+        (void) input::apply_lsp_pointer_button(*platform_, button, !held);
       }
       highest_accepted_state_ = std::max(highest_accepted_state_, packet.header.state_sequence);
       highest_applied_state_ = std::max(highest_applied_state_, packet.header.state_sequence);
-      send_ack(mapping, received_at, monotonic_microseconds());
+      schedule_ack(mapping, received_at, monotonic_microseconds(), false);
     }
 
     void apply_pending_pointer() noexcept {
@@ -592,7 +668,64 @@ namespace lumen::lsp::runtime {
       pending_pointer_.reset();
     }
 
-    void send_ack(
+    /** @brief Record one applied input update and emit it at the exact LSPI cadence when due. */
+    void schedule_ack(
+      const InputSessionMapping &mapping,
+      const std::uint64_t receive_time,
+      const std::uint64_t apply_time,
+      const bool urgent,
+      const std::size_t records = 1
+    ) noexcept {
+      if (!mapping_ || *mapping_ != mapping || records == 0) {
+        return;
+      }
+      if (urgent) {
+        if (baseline_.committed()) {
+          ack_scheduler_.baseline_committed();
+        } else {
+          ack_scheduler_.edge_applied();
+        }
+      }
+      const auto ordinary_records = urgent ? records - 1U : records;
+      for (std::size_t index = 0; index < ordinary_records; ++index) {
+        ack_scheduler_.state_applied();
+      }
+      if (!ack_pending_) {
+        ack_pending_since_ = apply_time;
+      }
+      ack_pending_records_ = static_cast<std::uint8_t>(
+        std::min<std::size_t>(
+          std::numeric_limits<std::uint8_t>::max(),
+          std::size_t {ack_pending_records_} + records
+        )
+      );
+      ack_urgent_ = ack_urgent_ || urgent;
+      ack_pending_ = true;
+      ack_mapping_ = mapping;
+      ack_receive_time_ = receive_time;
+      ack_apply_time_ = apply_time;
+      flush_pending_ack(apply_time);
+    }
+
+    /** @brief Send the newest coalesced LSPI state once its floor/window threshold is due. */
+    void flush_pending_ack(const std::uint64_t now) noexcept {
+      const auto ordinary_due = ack_pending_records_ >= 8U ||
+                                (now >= ack_pending_since_ && now - ack_pending_since_ >= 1'000U);
+      if (!ack_pending_ || !mapping_ || *mapping_ != ack_mapping_ || (!ack_urgent_ && !ordinary_due) ||
+          !ack_scheduler_.due(now)) {
+        return;
+      }
+      if (send_ack(ack_mapping_, ack_receive_time_, ack_apply_time_)) {
+        ack_scheduler_.mark_sent(now);
+        ack_pending_ = false;
+        ack_pending_since_ = 0;
+        ack_pending_records_ = 0;
+        ack_urgent_ = false;
+      }
+    }
+
+    /** @brief Serialize, protect once, and commit one current LSPI acknowledgement. */
+    [[nodiscard]] bool send_ack(
       const InputSessionMapping &mapping,
       const std::uint64_t receive_time,
       const std::uint64_t apply_time
@@ -615,20 +748,69 @@ namespace lumen::lsp::runtime {
         };
         ack.pointer_count = 1;
       }
-      std::array<std::uint8_t, 12 + input_plane::lspi_fixed_size + input_plane::lspi_pointer_record_size> rtcp {};
+      auto lease = mapping.forward_path->acquire(HostForwardLane::input_feedback);
+      if (!lease) {
+        return false;
+      }
       const auto payload_size = input_plane::lspi_fixed_size + std::size_t {ack.pointer_count} * input_plane::lspi_pointer_record_size;
+      const auto total = 12U + payload_size;
+      if (total > lease->storage.size()) {
+        return false;
+      }
+      auto rtcp = lease->storage.first(total);
+      std::ranges::fill(rtcp, 0);
       rtcp[0] = 0x80;
       rtcp[1] = 204;
-      wire::write_be<std::uint16_t>(std::span<std::uint8_t> {rtcp}.subspan(2, 2), static_cast<std::uint16_t>((12 + payload_size) / 4 - 1));
-      wire::write_be<std::uint32_t>(std::span<std::uint8_t> {rtcp}.subspan(4, 4), mapping.acknowledgement_ssrc);
+      wire::write_be<std::uint16_t>(rtcp.subspan(2, 2), static_cast<std::uint16_t>(total / 4 - 1));
+      wire::write_be<std::uint32_t>(rtcp.subspan(4, 4), mapping.acknowledgement_ssrc);
       std::copy(input_plane::lspi_name.begin(), input_plane::lspi_name.end(), rtcp.begin() + 8);
-      if (input_plane::serialize_lspi_ack(ack, std::span<std::uint8_t> {rtcp}.subspan(12, payload_size)) == input_plane::lspi_error::none) {
-        callbacks_.send_acknowledgement(callbacks_.context, mapping.peer, std::span<const std::uint8_t> {rtcp}.first(12 + payload_size));
+      if (input_plane::serialize_lspi_ack(ack, rtcp.subspan(12, payload_size)) != input_plane::lspi_error::none) {
+        return false;
       }
+      std::size_t protected_bytes = 0;
+      if (!srtp_.protect_in_place(mapping.peer, SecurePacketClass::rtcp, lease->storage, total, protected_bytes)) {
+        return false;
+      }
+      const auto now = monotonic_microseconds();
+      const auto deadline = now > std::numeric_limits<std::uint64_t>::max() - 20'000U ?
+                              std::numeric_limits<std::uint64_t>::max() :
+                              now + 20'000U;
+      return mapping.forward_path->commit(
+               *lease,
+               protected_bytes,
+               deadline,
+               0,
+               completion_target()
+             ) == HostForwardSubmitResult::accepted;
     }
 
     static void platform_feedback_callback(void *context, const input::lsp_controller_feedback_t &feedback) noexcept {
       static_cast<Impl *>(context)->handle_feedback(feedback.message);
+    }
+
+    /** @brief Count final-sent host input-feedback wire bytes without entering owner synchronization. */
+    static void forward_completion_callback(
+      void *context,
+      const std::uint64_t token,
+      const HostForwardLane lane,
+      const HostForwardCompletion completion,
+      const std::uint64_t completed_at_microseconds,
+      const std::size_t protected_bytes,
+      const std::uint16_t charged_bytes
+    ) noexcept {
+      (void) token;
+      (void) lane;
+      (void) completed_at_microseconds;
+      (void) protected_bytes;
+      auto *self = static_cast<Impl *>(context);
+      if (self != nullptr && completion == HostForwardCompletion::sent) {
+        self->sent_feedback_wire_bytes_.fetch_add(charged_bytes, std::memory_order_relaxed);
+      }
+    }
+
+    /** @brief Return the exact per-slot completion target for LSPI and LSPG datagrams. */
+    [[nodiscard]] HostForwardCompletionTarget completion_target() noexcept {
+      return {.context = this, .completed = forward_completion_callback};
     }
 
     void handle_feedback(const platf::gamepad_feedback_msg_t &message) noexcept {
@@ -696,9 +878,13 @@ namespace lumen::lsp::runtime {
         return;
       }
       latest.sequence = next_controller_sequence_++;
-      std::array<std::uint8_t, input_plane::maximum_lspg_packet_size> lspg {};
-      if (input_plane::serialize_controller_latest(latest, lspg) == input_plane::lspg_error::none) {
-        send_lspg(std::span<const std::uint8_t> {lspg}.first(input_plane::lspg_header_size + 8));
+      constexpr auto lspg_size = input_plane::lspg_header_size + 8U;
+      auto lease = begin_lspg(lspg_size);
+      if (lease && input_plane::serialize_controller_latest(
+                     latest,
+                     lease->storage.subspan(8, lspg_size)
+                   ) == input_plane::lspg_error::none) {
+        (void) finish_lspg(*lease, lspg_size, 0);
       }
     }
 
@@ -728,12 +914,10 @@ namespace lumen::lsp::runtime {
     }
 
     void send_controller_command(const input_plane::controller_command &command, const std::uint64_t now) noexcept {
-      std::array<std::uint8_t, input_plane::maximum_lspg_packet_size> lspg {};
-      if (input_plane::serialize_controller_command(command, lspg) != input_plane::lspg_error::none) {
-        return;
-      }
       const auto size = input_plane::lspg_header_size + 4U + command.parameter_length;
-      if (send_lspg(std::span<const std::uint8_t> {lspg}.first(size))) {
+      auto lease = begin_lspg(size);
+      if (lease && input_plane::serialize_controller_command(command, lease->storage.subspan(8, size)) == input_plane::lspg_error::none &&
+          finish_lspg(*lease, size, command.deadline_us)) {
         controller_output_.mark_command_sent(command.sequence, now);
       }
     }
@@ -751,22 +935,56 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    bool send_lspg(const std::span<const std::uint8_t> lspg) noexcept {
-      if (!mapping_) {
-        return false;
+    /** @brief Reserve and initialize one direct-write SRTCP APP envelope for LSPG. */
+    [[nodiscard]] std::optional<HostForwardLease> begin_lspg(const std::size_t lspg_size) noexcept {
+      if (!mapping_ || !mapping_->forward_path) {
+        return std::nullopt;
       }
-      std::array<std::uint8_t, 8 + input_plane::maximum_lspg_packet_size> rtcp {};
-      const auto unpadded = 8U + lspg.size();
+      const auto unpadded = 8U + lspg_size;
       const auto total = (unpadded + 3U) & ~std::size_t {3U};
+      auto lease = mapping_->forward_path->acquire(HostForwardLane::input_feedback);
+      if (!lease || total > lease->storage.size()) {
+        return std::nullopt;
+      }
+      auto rtcp = lease->storage.first(total);
+      std::ranges::fill(rtcp, 0);
       rtcp[0] = 0x80;
       rtcp[1] = 204;
-      wire::write_be<std::uint16_t>(std::span<std::uint8_t> {rtcp}.subspan(2, 2), static_cast<std::uint16_t>(total / 4U - 1U));
-      wire::write_be<std::uint32_t>(std::span<std::uint8_t> {rtcp}.subspan(4, 4), mapping_->acknowledgement_ssrc);
-      std::copy(lspg.begin(), lspg.end(), rtcp.begin() + 8);
-      return callbacks_.send_acknowledgement(callbacks_.context, mapping_->peer, std::span<const std::uint8_t> {rtcp}.first(total));
+      wire::write_be<std::uint16_t>(rtcp.subspan(2, 2), static_cast<std::uint16_t>(total / 4U - 1U));
+      wire::write_be<std::uint32_t>(rtcp.subspan(4, 4), mapping_->acknowledgement_ssrc);
+      return lease;
+    }
+
+    /** @brief Protect and commit one populated direct-write LSPG envelope. */
+    bool finish_lspg(
+      HostForwardLease &lease,
+      const std::size_t lspg_size,
+      const std::uint64_t command_deadline_microseconds
+    ) noexcept {
+      if (!mapping_ || !mapping_->forward_path) {
+        return false;
+      }
+      const auto total = (8U + lspg_size + 3U) & ~std::size_t {3U};
+      std::size_t protected_bytes = 0;
+      if (!srtp_.protect_in_place(mapping_->peer, SecurePacketClass::rtcp, lease.storage, total, protected_bytes)) {
+        return false;
+      }
+      const auto now = monotonic_microseconds();
+      const auto default_deadline = now > std::numeric_limits<std::uint64_t>::max() - 20'000U ?
+                                      std::numeric_limits<std::uint64_t>::max() :
+                                      now + 20'000U;
+      const auto deadline = command_deadline_microseconds == 0 ? default_deadline : command_deadline_microseconds;
+      return mapping_->forward_path->commit(
+               lease,
+               protected_bytes,
+               deadline,
+               0,
+               completion_target()
+             ) == HostForwardSubmitResult::accepted;
     }
 
     InputOwnerCallbacks callbacks_;  ///< Crypto and SRTCP callbacks.
+    LibsrtpServerProvider &srtp_;  ///< Association provider used only for direct in-place protection.
     DigestVerifier verifier_;  ///< Baseline SHA adapter.
     input::lsp_platform_input_ptr platform_;  ///< Existing platform-input boundary.
     mutable std::recursive_mutex mutex_;  ///< Queue, generation, and ordered state synchronization.
@@ -788,12 +1006,24 @@ namespace lumen::lsp::runtime {
     std::array<TouchState, 16> touches_ {};  ///< Active generation-fenced controller touch contacts.
     std::array<input_plane::controller_latest_state, 16> controller_latest_ {};  ///< Latest rumble/LED state per controller.
     std::uint64_t next_controller_sequence_ {1};  ///< Host-to-client controller output sequence.
+    input_plane::lspi_ack_scheduler ack_scheduler_;  ///< Exact 125-us/eight-record/1-ms LSPI cadence.
+    InputSessionMapping ack_mapping_;  ///< Mapping owning the newest coalesced acknowledgement.
+    std::uint64_t ack_receive_time_ {};  ///< Receive timestamp carried by the newest coalesced acknowledgement.
+    std::uint64_t ack_apply_time_ {};  ///< Apply timestamp carried by the newest coalesced acknowledgement.
+    std::uint64_t ack_pending_since_ {};  ///< First unsent ordinary record time for the one-millisecond limit.
+    std::uint8_t ack_pending_records_ {};  ///< Saturating new-record count for the eight-record threshold.
+    bool ack_pending_ {};  ///< Whether current acknowledgement state awaits its legal send instant.
+    bool ack_urgent_ {};  ///< Whether baseline or edge state requests the earliest legal send.
     std::jthread worker_;  ///< Dedicated ordered platform apply owner.
+    std::atomic<std::uint64_t> sent_feedback_wire_bytes_ {};  ///< Complete final-sent IP/UDP bytes for LSPI and LSPG.
     bool ready_ {};  ///< Callback/platform/worker readiness.
   };
 
-  InputOwner::InputOwner(const InputOwnerCallbacks callbacks) noexcept:
-      impl_ {new (std::nothrow) Impl {callbacks}} {
+  InputOwner::InputOwner(
+    const InputOwnerCallbacks callbacks,
+    LibsrtpServerProvider &srtp
+  ) noexcept:
+      impl_ {new (std::nothrow) Impl {callbacks, srtp}} {
   }
 
   InputOwner::~InputOwner() = default;
@@ -833,5 +1063,10 @@ namespace lumen::lsp::runtime {
   /** @copydoc InputOwner::applied_watermark */
   std::pair<std::uint64_t, std::uint64_t> InputOwner::applied_watermark() const noexcept {
     return impl_ ? impl_->applied_watermark() : std::pair<std::uint64_t, std::uint64_t> {};
+  }
+
+  /** @copydoc InputOwner::sent_feedback_wire_bytes */
+  std::uint64_t InputOwner::sent_feedback_wire_bytes() const noexcept {
+    return impl_ ? impl_->sent_feedback_wire_bytes() : 0;
   }
 }  // namespace lumen::lsp::runtime

@@ -252,6 +252,13 @@ Codec configuration is acknowledged over reliable control before dependent
 media is accepted. Required parameter sets are also repeated in-band at the
 codec-defined recovery boundary.
 
+The video configuration maps use a dedicated schema revision two without
+renaming LSP/1 or changing the surrounding control protocol. Revision two
+binds each repeated encrypted frame identity to its recovery epoch as one
+12-byte network-order value. This lets authenticated decoded-frame feedback
+confirm the exact outstanding recovery attempt and prevents an old epoch from
+clearing or retrying a newer one.
+
 ## 12. Throughput model
 
 LSP is designed for at least 100,000 aggregate authenticated RTP packets per
@@ -535,6 +542,24 @@ stream. Remaining control CBOR, device-specific state bodies, production
 SRTCP APP serialization not covered by those codecs, and cross-process product
 wiring still require their scheduled interoperability freeze. No current
 performance or latency target is presented as already achieved.
+
+The host product integration additionally seeds the shared recovery controller
+from `VIDEO_CONFIG`, reserves one independent recovery frame before its first
+RTP commit, carries the epoch with repeated frame identity, and consumes
+authenticated `LSPV` decode evidence without holding session authority locks.
+It does not treat decoder-surface pressure or a deadline observation alone as
+an encoder-recovery command. Encoder reference invalidation is terminally
+tracked by exact generation and range; one published request plus one
+coalesced queued range matches the replaceable mailbox semantics and prevents
+concurrent requests or stale results from silently stranding recovery. The
+accepted generation follows the first repaired encoder output, so neither an
+older independent-frame completion nor an older `LSPV` confirmation can
+override a newer dependency break. One serialized dependency-state boundary
+makes the recovery transition and reference-validity change visible together.
+Dependent frames additionally reserve and revalidate that version at every
+packet commit, preventing admission-time validity from becoming a stale send
+authorization. A protected-but-uncommitted first packet remains a pre-submit
+drop for dependency recovery even though its SRTP sequence is tombstoned.
 
 ## 19. Design-stage completion
 

@@ -52,7 +52,7 @@ set(LUMEN_PHOTON_LOCK "${LUMEN_PHOTON_DIRECTORY}/photon.lock")
 set(LUMEN_PHOTON_MANIFEST "${LUMEN_PHOTON_DIRECTORY}/photon-source-manifest.txt")
 set(LUMEN_PHOTON_DIGEST "${LUMEN_PHOTON_DIRECTORY}/photon-source-digest.sha256")
 set(LUMEN_PHOTON_EXPECTED_LOCK
-        "repository=git@github.com:simonfalke-01/Photon.git\ncommit=d353901bb52ff22e2ad88833bdc8ae2bcc8f5423\ndigest=fc49b5a1e44fd01379283f865ef6e59fd4c605c58f04ef25b25f41eb625771e4\n")
+        "repository=git@github.com:simonfalke-01/Photon.git\ncommit=66f5d0ab422c328ad248859dd2669ad922b6810c\ndigest=dae452bffdcb05a60a9632f4020d23c1e5258972dce71b475e2b82f14915e1b0\n")
 file(READ "${LUMEN_PHOTON_LOCK}" LUMEN_PHOTON_ACTUAL_LOCK)
 if(NOT LUMEN_PHOTON_ACTUAL_LOCK STREQUAL LUMEN_PHOTON_EXPECTED_LOCK)
     message(FATAL_ERROR "Lumen's Photon lock does not match the reviewed repository, commit, and digest")
@@ -92,7 +92,7 @@ string(SHA256 LUMEN_PHOTON_ACTUAL_DIGEST "${LUMEN_PHOTON_DIGEST_INPUT}")
 file(READ "${LUMEN_PHOTON_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
 string(STRIP "${LUMEN_PHOTON_EXPECTED_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
 string(TOLOWER "${LUMEN_PHOTON_EXPECTED_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
-if(NOT LUMEN_PHOTON_EXPECTED_DIGEST STREQUAL "fc49b5a1e44fd01379283f865ef6e59fd4c605c58f04ef25b25f41eb625771e4")
+if(NOT LUMEN_PHOTON_EXPECTED_DIGEST STREQUAL "dae452bffdcb05a60a9632f4020d23c1e5258972dce71b475e2b82f14915e1b0")
     message(FATAL_ERROR "Lumen's Photon digest file differs from photon.lock")
 endif()
 if(NOT LUMEN_PHOTON_ACTUAL_DIGEST STREQUAL LUMEN_PHOTON_EXPECTED_DIGEST)
@@ -236,6 +236,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/control/wire.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/audio_sender.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/audio_sender.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/host_forward_path.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/host_forward_path.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/host_runtime.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/host_runtime.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/identity.cpp"

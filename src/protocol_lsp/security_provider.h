@@ -101,13 +101,13 @@ namespace lumen::lsp {
      *
      * @param peer Source endpoint bound to the authenticated association.
      * @param packet_class RFC 5761 packet class.
-     * @param datagram Complete SRTP or SRTCP packet.
+     * @param datagram Mutable socket-owned SRTP or SRTCP packet unprotected in place.
      * @return Provider disposition.
      */
     virtual ProviderDatagramResult receive_secure_packet(
       const PeerEndpoint &peer,
       SecurePacketClass packet_class,
-      std::span<const std::uint8_t> datagram
+      std::span<std::uint8_t> datagram
     ) noexcept = 0;
   };
 }  // namespace lumen::lsp

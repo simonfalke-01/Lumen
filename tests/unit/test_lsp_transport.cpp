@@ -183,11 +183,45 @@ TEST(LspTransportFeedback, CoalescesValidatedLspvCapacityAndDecodeStatus) {
 }
 
 TEST(LspTransportRepair, AccumulatesFrameLocalPlaintextParityBeforeRepairSrtp) {
-  std::array<std::uint8_t, 8> parity_storage {};
+  std::array<std::uint8_t, 32> parity_storage {};
   lsp_transport::flexfec_group group(parity_storage);
   ASSERT_EQ(group.begin(10, 100, 200), lsp_transport::flexfec_result::accepted);
-  constexpr std::array<std::uint8_t, 4> first {1, 2, 3, 4};
-  constexpr std::array<std::uint8_t, 6> second {7, 6, 5, 4, 3, 2};
+  constexpr std::array<std::uint8_t, 15> first {
+    0x80,
+    0xe0,
+    0xff,
+    0xff,
+    0,
+    0,
+    0,
+    100,
+    0,
+    0,
+    0,
+    100,
+    1,
+    2,
+    3,
+  };
+  constexpr std::array<std::uint8_t, 17> second {
+    0x80,
+    0x60,
+    0,
+    0,
+    0,
+    0,
+    0,
+    101,
+    0,
+    0,
+    0,
+    100,
+    4,
+    5,
+    6,
+    7,
+    8,
+  };
   EXPECT_EQ(group.add_plaintext_source(10, 100, 65'535, first), lsp_transport::flexfec_result::accepted);
   EXPECT_EQ(group.add_plaintext_source(10, 100, 0, second), lsp_transport::flexfec_result::accepted);
   EXPECT_EQ(group.add_plaintext_source(11, 100, 1, first), lsp_transport::flexfec_result::wrong_frame);
@@ -196,11 +230,11 @@ TEST(LspTransportRepair, AccumulatesFrameLocalPlaintextParityBeforeRepairSrtp) {
   ASSERT_EQ(group.seal_plaintext_repair(parity), lsp_transport::flexfec_result::accepted);
   EXPECT_EQ(parity.base_sequence_number, 65'535);
   EXPECT_EQ(parity.source_mask, 0b11ULL);
-  EXPECT_EQ(parity.length_recovery, std::uint16_t {2});
-  ASSERT_EQ(parity.parity.size(), std::size_t {6});
-  EXPECT_EQ(parity.parity[0], static_cast<std::uint8_t>(1 ^ 7));
-  EXPECT_EQ(parity.parity[4], 3);
-  EXPECT_EQ(parity.parity[5], 2);
+  EXPECT_EQ(parity.length_recovery, std::uint16_t {3 ^ 5});
+  ASSERT_EQ(parity.parity.size(), std::size_t {5});
+  EXPECT_EQ(parity.parity[0], static_cast<std::uint8_t>(1 ^ 4));
+  EXPECT_EQ(parity.parity[3], 7);
+  EXPECT_EQ(parity.parity[4], 8);
   EXPECT_EQ(group.add_plaintext_source(10, 100, 1, first), lsp_transport::flexfec_result::wrong_phase);
   EXPECT_EQ(group.mark_repair_plaintext_constructed(), lsp_transport::flexfec_result::accepted);
   EXPECT_EQ(group.phase(), lsp_transport::flexfec_phase::repair_ready_for_srtp);
@@ -257,7 +291,7 @@ TEST(LspTransportRtx, RetainsTwoFrameGenerationsAndRequiresStrictDeadlineEligibi
   };
   ASSERT_EQ(
     retention.retain(
-      {.token = 1, .frame_id = 10, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 100, .protected_packet_bytes = 1'200},
+      {.reconstruction_token = 1, .frame_id = 10, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 100, .source_packet_bytes = 1'200},
       1'000,
       500,
       release
@@ -266,7 +300,7 @@ TEST(LspTransportRtx, RetainsTwoFrameGenerationsAndRequiresStrictDeadlineEligibi
   );
   ASSERT_EQ(
     retention.retain(
-      {.token = 2, .frame_id = 11, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 101, .protected_packet_bytes = 1'200},
+      {.reconstruction_token = 2, .frame_id = 11, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 101, .source_packet_bytes = 1'200},
       1'000,
       500,
       release
@@ -275,7 +309,7 @@ TEST(LspTransportRtx, RetainsTwoFrameGenerationsAndRequiresStrictDeadlineEligibi
   );
   ASSERT_EQ(
     retention.retain(
-      {.token = 3, .frame_id = 12, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 102, .protected_packet_bytes = 1'200},
+      {.reconstruction_token = 3, .frame_id = 12, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 102, .source_packet_bytes = 1'200},
       1'000,
       500,
       release
@@ -294,7 +328,7 @@ TEST(LspTransportRtx, RetainsTwoFrameGenerationsAndRequiresStrictDeadlineEligibi
     {.reverse_feedback_microseconds = 20, .retransmission_serialization_microseconds = 20, .forward_delivery_microseconds = 20, .decode_safety_reserve_microseconds = 20}
   );
   ASSERT_TRUE(eligible.has_value());
-  EXPECT_EQ(eligible->token, 3ULL);
+  EXPECT_EQ(eligible->reconstruction_token, 3ULL);
   EXPECT_EQ(retention.prune(1'500, release), std::size_t {2});
   EXPECT_EQ(retention.retained_bytes(), std::size_t {0});
 }
@@ -305,7 +339,7 @@ TEST(LspTransportRtx, EnforcesTheSixteenMibibyteConnectionBoundWithoutPacketCopi
   lsp_transport::rtx_retention retention(slots);
   ASSERT_EQ(
     retention.retain(
-      {.token = 1, .frame_id = 10, .frame_deadline_microseconds = 10'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 1, .protected_packet_bytes = half_capacity},
+      {.reconstruction_token = 1, .frame_id = 10, .frame_deadline_microseconds = 10'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 1, .source_packet_bytes = half_capacity},
       1'000,
       5'000,
       [](const std::uint64_t) {
@@ -315,7 +349,7 @@ TEST(LspTransportRtx, EnforcesTheSixteenMibibyteConnectionBoundWithoutPacketCopi
   );
   ASSERT_EQ(
     retention.retain(
-      {.token = 2, .frame_id = 10, .frame_deadline_microseconds = 10'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 2, .protected_packet_bytes = half_capacity},
+      {.reconstruction_token = 2, .frame_id = 10, .frame_deadline_microseconds = 10'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 2, .source_packet_bytes = half_capacity},
       1'000,
       5'000,
       [](const std::uint64_t) {
@@ -327,13 +361,13 @@ TEST(LspTransportRtx, EnforcesTheSixteenMibibyteConnectionBoundWithoutPacketCopi
   EXPECT_EQ(
     retention.retain(
       {
-        .token = 3,
+        .reconstruction_token = 3,
         .frame_id = 10,
         .frame_deadline_microseconds = 10'000,
         .source_ssrc = 5,
         .video_generation = 7,
         .source_sequence_number = 3,
-        .protected_packet_bytes = 1,
+        .source_packet_bytes = 1,
       },
       1'000,
       5'000,

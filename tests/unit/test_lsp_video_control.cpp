@@ -220,21 +220,256 @@ TEST(LspVideoControlWire, FreezesVideoConfigParameterSetsAndFiveKeyAcknowledgeme
   ASSERT_TRUE(decoded);
   const auto &map = std::get<cbor::Value::Map>(decoded.value->storage);
   ASSERT_EQ(map.size(), std::size_t {8});
+  EXPECT_EQ(std::get<std::uint64_t>(map[0].second.storage), 2U);
   EXPECT_EQ(std::get<cbor::Value::Map>(map[3].second.storage).size(), std::size_t {28});
   EXPECT_EQ(std::get<cbor::Value::Array>(map[4].second.storage).size(), std::size_t {2});
 
-  const auto ack_bytes = cbor::encode(cbor::Value {cbor::Value::Map {
-                                        {1, 1U},
-                                        {2, 0U},
-                                        {3, cbor::Value::Bytes(configuration.session_id.begin(), configuration.session_id.end())},
-                                        {4, configuration.video.video_generation},
-                                        {5, 3U},
-                                      }})
-                           .bytes;
+  const auto encode_ack = [&](const std::uint8_t schema_version) {
+    return cbor::encode(cbor::Value {cbor::Value::Map {
+                          {1, schema_version},
+                          {2, 0U},
+                          {3, cbor::Value::Bytes(configuration.session_id.begin(), configuration.session_id.end())},
+                          {4, configuration.video.video_generation},
+                          {5, 3U},
+                        }})
+      .bytes;
+  };
+  const auto ack_bytes = encode_ack(2);
   const auto ack = lsp::decode_video_config_ack(ack_bytes);
   ASSERT_TRUE(ack);
   EXPECT_EQ(ack->decoder_credit, 3U);
   EXPECT_EQ(ack->video_generation, configuration.video.video_generation);
+
+  EXPECT_FALSE(lsp::decode_video_config_ack(encode_ack(1)));
+}
+
+TEST(LspVideoRecoveryWire, SerializesFrameIdentityAndRecoveryEpochAsTwelveNetworkOrderBytes) {
+  std::array<std::uint8_t, lsp::video_frame_identity_extension_size> extension {};
+  ASSERT_TRUE(lsp::write_video_frame_identity_extension(
+    extension,
+    0x0102030405060708ULL,
+    0x11121314U
+  ));
+  EXPECT_EQ(
+    extension,
+    (std::array<std::uint8_t, 12> {
+      0x01,
+      0x02,
+      0x03,
+      0x04,
+      0x05,
+      0x06,
+      0x07,
+      0x08,
+      0x11,
+      0x12,
+      0x13,
+      0x14,
+    })
+  );
+  EXPECT_FALSE(lsp::write_video_frame_identity_extension(extension, 0, 1));
+  EXPECT_FALSE(lsp::write_video_frame_identity_extension(extension, 1, 0));
+  std::array<std::uint8_t, 11> short_extension {};
+  EXPECT_FALSE(lsp::write_video_frame_identity_extension(short_extension, 1, 1));
+}
+
+TEST(LspVideoRecoveryWire, UsesAuthenticatedDecoderErrorsForOneDeadlineGatedRecoveryAttempt) {
+  lumen::lsp::transport::recovery_controller recovery {7};
+  bool failure_latched = false;
+  lumen::lsp::transport::lspv_status status {
+    .session_generation = 1,
+    .video_generation = 2,
+    .recovery_epoch = 7,
+    .largest_complete_frame_id = 50,
+    .largest_decoded_frame_id = 49,
+    .largest_metal_committed_frame_id = 49,
+    .deadline_miss = true,
+    .decoder_status = lumen::lsp::transport::lspv_decoder_status::ready,
+    .maximum_decode_submissions = 3,
+  };
+
+  EXPECT_EQ(
+    lsp::apply_authenticated_lspv_recovery(recovery, failure_latched, status, 50, 90),
+    lsp::VideoRecoveryFeedbackAction::accepted
+  );
+  EXPECT_EQ(recovery.snapshot().phase, lumen::lsp::transport::recovery_phase::healthy);
+
+  status.recovery_epoch = 6;
+  EXPECT_EQ(
+    lsp::apply_authenticated_lspv_recovery(recovery, failure_latched, status, 50, 92),
+    lsp::VideoRecoveryFeedbackAction::ignored
+  );
+  status.recovery_epoch = 7;
+  status.deadline_miss = false;
+  status.decoder_status = lumen::lsp::transport::lspv_decoder_status::surface_exhausted;
+  EXPECT_EQ(
+    lsp::apply_authenticated_lspv_recovery(recovery, failure_latched, status, 50, 95),
+    lsp::VideoRecoveryFeedbackAction::accepted
+  );
+  EXPECT_EQ(recovery.snapshot().epoch, 7U);
+
+  status.decoder_status = lumen::lsp::transport::lspv_decoder_status::unrecoverable_error;
+  EXPECT_EQ(
+    lsp::apply_authenticated_lspv_recovery(recovery, failure_latched, status, 50, 100),
+    lsp::VideoRecoveryFeedbackAction::request_independent_frame
+  );
+  ASSERT_EQ(recovery.snapshot().epoch, 8U);
+  ASSERT_EQ(
+    recovery.mark_independent_frame_sent(60, 100, 200),
+    lumen::lsp::transport::recovery_result::accepted
+  );
+
+  status.recovery_epoch = 8;
+  status.largest_complete_frame_id = 60;
+  status.largest_decoded_frame_id = 59;
+  status.largest_metal_committed_frame_id = 59;
+  EXPECT_EQ(
+    lsp::apply_authenticated_lspv_recovery(recovery, failure_latched, status, 60, 150),
+    lsp::VideoRecoveryFeedbackAction::accepted
+  );
+  EXPECT_TRUE(failure_latched);
+  EXPECT_EQ(recovery.snapshot().phase, lumen::lsp::transport::recovery_phase::recovery_frame_outstanding);
+  EXPECT_EQ(
+    lsp::apply_authenticated_lspv_recovery(recovery, failure_latched, status, 60, 200),
+    lsp::VideoRecoveryFeedbackAction::request_independent_frame
+  );
+  EXPECT_FALSE(failure_latched);
+  ASSERT_EQ(recovery.snapshot().phase, lumen::lsp::transport::recovery_phase::retry_permitted);
+  ASSERT_EQ(
+    recovery.mark_independent_frame_sent(61, 201, 300),
+    lumen::lsp::transport::recovery_result::accepted
+  );
+
+  status.decoder_status = lumen::lsp::transport::lspv_decoder_status::ready;
+  status.largest_complete_frame_id = 62;
+  status.largest_decoded_frame_id = 62;
+  status.largest_metal_committed_frame_id = 61;
+  EXPECT_EQ(
+    lsp::apply_authenticated_lspv_recovery(recovery, failure_latched, status, 62, 250),
+    lsp::VideoRecoveryFeedbackAction::accepted
+  );
+  EXPECT_EQ(recovery.snapshot().phase, lumen::lsp::transport::recovery_phase::healthy);
+}
+
+TEST(LspVideoRecoveryWire, InvalidatesBlockedDependenciesAndRejectsStaleIndependentCompletion) {
+  EXPECT_TRUE(lsp::video_recovery_drop_requires_dependency_invalidation(true, false, true));
+  EXPECT_TRUE(lsp::video_recovery_drop_requires_dependency_invalidation(false, true, false));
+  EXPECT_FALSE(lsp::video_recovery_drop_requires_dependency_invalidation(false, true, true));
+  EXPECT_TRUE(lsp::video_independent_satisfies_dependency_fence(
+    true,
+    0,
+    12,
+    20,
+    20,
+    20,
+    101,
+    100
+  ));
+  EXPECT_TRUE(lsp::video_independent_satisfies_dependency_fence(
+    false,
+    12,
+    12,
+    20,
+    20,
+    20,
+    101,
+    100
+  ));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
+    false,
+    11,
+    12,
+    19,
+    20,
+    20,
+    101,
+    100
+  ));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
+    true,
+    0,
+    12,
+    20,
+    19,
+    20,
+    101,
+    100
+  ));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
+    true,
+    0,
+    12,
+    20,
+    20,
+    20,
+    100,
+    100
+  ));
+}
+
+TEST(LspVideoRecoveryWire, QualifiesTerminalInvalidationAndCoalescesConcurrentQueuedRanges) {
+  video::reference_invalidation_request_t active {
+    .generation = 9,
+    .first_frame = 100,
+    .last_frame = 104,
+  };
+  const video::reference_invalidation_result_t exact {
+    .generation = 9,
+    .first_frame = 100,
+    .last_frame = 104,
+    .succeeded = true,
+  };
+  EXPECT_TRUE(video::reference_invalidation_result_matches(active, exact));
+  auto stale_generation = exact;
+  stale_generation.generation = 8;
+  EXPECT_FALSE(video::reference_invalidation_result_matches(active, stale_generation));
+  auto stale_range = exact;
+  stale_range.last_frame = 105;
+  EXPECT_FALSE(video::reference_invalidation_result_matches(active, stale_range));
+
+  video::reference_invalidation_request_t queued {
+    .first_frame = 110,
+    .last_frame = 112,
+  };
+  ASSERT_TRUE(video::coalesce_reference_invalidation_range(queued, 106, 115));
+  EXPECT_EQ(queued.generation, 0U);
+  EXPECT_EQ(queued.first_frame, 106);
+  EXPECT_EQ(queued.last_frame, 115);
+}
+
+TEST(LspVideoRecoveryWire, NewerConcurrentDependencyBreakWinsOverOlderIndependentRestore) {
+  EXPECT_EQ(lsp::bind_video_invalidation_dependency_generation(40, 42, 41), 42U);
+  EXPECT_EQ(lsp::bind_video_invalidation_dependency_generation(43, 42, 44), 44U);
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
+    true,
+    0,
+    15,
+    15,
+    40,
+    41,
+    501,
+    500
+  ));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
+    false,
+    15,
+    15,
+    40,
+    40,
+    41,
+    501,
+    500
+  ));
+}
+
+TEST(LspVideoRecoveryWire, GenerationQualifiedReservationStopsDependentAtNextPacketBoundary) {
+  EXPECT_FALSE(lsp::video_frame_is_partial_network_submission(0));
+  EXPECT_TRUE(lsp::video_frame_is_partial_network_submission(1));
+  EXPECT_TRUE(lsp::video_dependency_reservation_valid(false, 7, 7, true, false));
+  EXPECT_FALSE(lsp::video_dependency_reservation_valid(false, 7, 8, true, false));
+  EXPECT_FALSE(lsp::video_dependency_reservation_valid(false, 7, 7, false, false));
+  EXPECT_FALSE(lsp::video_dependency_reservation_valid(false, 7, 7, true, true));
+  EXPECT_TRUE(lsp::video_dependency_reservation_valid(true, 7, 8, false, true));
 }
 
 TEST(LspPathProbeWire, FreezesExactControlMapAndValidatesEveryLsppByte) {
