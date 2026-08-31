@@ -33,7 +33,6 @@
 #include "crypto.h"
 #include "file_handler.h"
 #include "httpcommon.h"
-#include "protocol_v3/host_identity_store.h"
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
@@ -126,6 +125,23 @@ namespace http {
       fs::rename(temporary_path, destination_path, error);
       return !error;
 #endif
+    }
+
+    /**
+     * @brief Restrict a private key to the owning account.
+     *
+     * @param path Private key path to secure.
+     * @return True when the platform accepted the owner-only permission update.
+     */
+    bool secure_private_key_file(const fs::path &path) {
+      std::error_code error;
+      fs::permissions(
+        path,
+        fs::perms::owner_read | fs::perms::owner_write,
+        fs::perm_options::replace,
+        error
+      );
+      return !error;
     }
   }  // namespace
 
@@ -233,6 +249,49 @@ namespace http {
     return true;
   }
 
+  bool migrate_removed_transport_state(const std::string &file) {
+    constexpr auto removed_subtree = "protocol_" "v3";
+    constexpr std::array removed_credentials {
+      "protocol_" "v3_identity.bin",
+      "protocol_" "v3_identity.bin.pending",
+      "protocol_" "v3_identity.journal",
+      "protocol_" "v3_cng_keys.journal",
+    };
+
+    bool migrated = true;
+    std::error_code error;
+    const fs::path state_file {file};
+    const auto state_exists = fs::exists(state_file, error);
+    if (error) {
+      BOOST_LOG(warning) << "Unable to inspect retired transport state in ["sv << file << "]: "sv << error.message();
+      migrated = false;
+    } else if (state_exists) {
+      state_file_tree_t tree;
+      if (!read_state_file(file, tree)) {
+        BOOST_LOG(warning) << "Unable to read shared state while removing retired transport data from ["sv << file << ']';
+        migrated = false;
+      } else if (tree.get_child_optional(removed_subtree) &&
+                 !update_state_file(file, [&](state_file_tree_t &root) {
+                   root.erase(removed_subtree);
+                 })) {
+        BOOST_LOG(warning) << "Unable to remove retired transport state from ["sv << file << ']';
+        migrated = false;
+      }
+    }
+
+    const auto credentials_directory = state_file.parent_path() / "credentials";
+    for (const auto *name : removed_credentials) {
+      error.clear();
+      fs::remove(credentials_directory / name, error);
+      if (error) {
+        BOOST_LOG(warning) << "Unable to remove retired transport credential ["sv
+                           << (credentials_directory / name).string() << "]: "sv << error.message();
+        migrated = false;
+      }
+    }
+    return migrated;
+  }
+
   /**
    * @brief Load persisted HTTP credentials and initialize shared request state.
    */
@@ -250,7 +309,7 @@ namespace http {
     if ((!fs::exists(config::nvhttp.pkey) || !fs::exists(config::nvhttp.cert)) && create_creds(config::nvhttp.pkey, config::nvhttp.cert)) {
       return -1;
     }
-    if (!lumen::protocol_v3::runtime::secure_private_key_file(config::nvhttp.pkey)) {
+    if (!secure_private_key_file(config::nvhttp.pkey)) {
       BOOST_LOG(error) << "Couldn't apply and verify private-key security for ["sv << config::nvhttp.pkey << ']';
       return -1;
     }
@@ -378,7 +437,7 @@ namespace http {
       return -1;
     }
 
-    if (!lumen::protocol_v3::runtime::secure_private_key_file(pkey_path)) {
+    if (!secure_private_key_file(pkey_path)) {
       BOOST_LOG(error) << "Couldn't apply and verify private-key security for ["sv << config::nvhttp.pkey << ']';
       return -1;
     }

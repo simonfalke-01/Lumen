@@ -26,24 +26,14 @@ namespace client_microphone {
   constexpr std::size_t MAX_OPUS_PAYLOAD_SIZE = 1275;  ///< Maximum accepted Opus packet size in bytes.
   static_assert(JITTER_WINDOW == FRAME_DURATION * JITTER_TARGET_FRAMES);
 
-  /** @brief Protocol family competing for the single host microphone writer. */
-  enum class writer_protocol_e : std::uint8_t {
-    legacy,
-    protocol_v3,
-  };
-
-  /** @brief Collision-free writer identity shared by legacy and protocol v3. */
+  /** @brief Stable identity for the single host microphone writer. */
   struct writer_owner_t {
-    writer_protocol_e protocol;  ///< Protocol family that acquired the writer.
-    std::uint64_t id;  ///< Nonzero family-local owner identifier.
+    std::uint64_t id;  ///< Nonzero launch-session identifier.
 
     friend bool operator==(const writer_owner_t &, const writer_owner_t &) = default;
 
-    /** @return Owner identity for a legacy RTSP launch session. */
+    /** @return Owner identity for an RTSP launch session. */
     static writer_owner_t legacy(std::uint32_t launch_session_id);
-
-    /** @return Owner identity for a protocol-v3 authenticated connection. */
-    static writer_owner_t protocol_v3(std::uint64_t connection_id);
   };
 
   /** @brief Claim the process-wide writer for an exact tagged owner. */

@@ -57,22 +57,6 @@ namespace {
   }
 }  // namespace
 
-TEST(VideoColorspaceTest, MapsProtocolV3H273TransfersExactly) {
-  video::config_t config {};
-  config.protocolV3Colorimetry = true;
-  config.dynamicRange = 1;
-  config.colorMatrix = 9;
-
-  config.colorTransfer = 16;
-  EXPECT_EQ(video::colorspace_from_client_config(config, true).colorspace, video::colorspace_e::bt2020);
-
-  config.colorTransfer = 18;
-  EXPECT_EQ(video::colorspace_from_client_config(config, true).colorspace, video::colorspace_e::bt2020hlg);
-
-  config.colorTransfer = 1;
-  EXPECT_EQ(video::colorspace_from_client_config(config, false).colorspace, video::colorspace_e::bt2020sdr);
-}
-
 TEST(VideoCaptureRecoveryTest, RequiredDirectSourceLossTerminatesInsteadOfReinitializing) {
   video::config_t ordinary {};
   EXPECT_EQ(
@@ -533,26 +517,6 @@ INSTANTIATE_TEST_SUITE_P(
     return std::string(info.param->name);
   }
 );
-
-TEST(VideoExactRefresh, ProtocolV3RationalOverridesRoundedFpsForPacingAndVbv) {
-  video::config_t config {};
-  config.framerate = 60;
-  config.refreshNumerator = 60000;
-  config.refreshDenominator = 1001;
-  config.bitrate = 80000;
-  EXPECT_EQ(video::framerate_to_rational(config).num, 60000);
-  EXPECT_EQ(video::framerate_to_rational(config).den, 1001);
-  EXPECT_EQ(video::vbv_frame_size_bits(config), 1'334'666U);
-
-  config.refreshNumerator = 120;
-  config.refreshDenominator = 1;
-  EXPECT_EQ(video::vbv_frame_size_bits(config), 666'666U);
-
-  config.bitrate = std::numeric_limits<int>::max();
-  config.refreshNumerator = 2'000'000'000;
-  config.refreshDenominator = 200'000'000;
-  EXPECT_EQ(video::vbv_frame_size_bits(config), std::numeric_limits<std::uint32_t>::max());
-}
 
 TEST_P(EncoderTest, ValidateEncoder) {
   // todo:: test something besides fixture setup

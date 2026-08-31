@@ -335,6 +335,34 @@ namespace proc {
     return 0;
   }
 
+  proc_t::lsp_launch_result_t proc_t::execute_lsp_if_idle(const int app_id) {
+    auto lifecycle = _lifecycle->lock();
+    if (running() > 0) {
+      return {.status = 409};
+    }
+    auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+    launch->appid = app_id;
+    launch->unique_id = "lsp";
+    launch->refresh_denominator = 1;
+    launch->surround_info = 2;
+    const auto status = execute(app_id, launch);
+    return {
+      .status = status,
+      .process_generation = status == 0 ? launch->process_generation : 0,
+    };
+  }
+
+  bool proc_t::terminate_lsp_generation(const std::uint64_t process_generation) {
+    auto lifecycle = _lifecycle->lock();
+    if (process_generation == 0 || process_generation != (*_lifecycle)->generation || (*_lifecycle)->legacy_attachable) {
+      return false;
+    }
+    if (running() > 0) {
+      terminate();
+    }
+    return true;
+  }
+
   int proc_t::running() {
     auto lifecycle = _lifecycle->lock();
 #ifndef _WIN32

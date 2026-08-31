@@ -373,8 +373,8 @@ namespace platf::virtual_display {
     required  ///< Reject startup unless the exact VDD mode becomes active.
   };
 
-  /** Umbra v3 requires the optimized VDD path unless the operator explicitly disables it. */
-  [[nodiscard]] constexpr activation_policy_e modern_activation_policy(
+  /** LSP requires the optimized VDD path unless the operator explicitly disables it. */
+  [[nodiscard]] constexpr activation_policy_e lsp_activation_policy(
     const activation_policy_e configured
   ) noexcept {
     return configured == activation_policy_e::optional ? activation_policy_e::required : configured;

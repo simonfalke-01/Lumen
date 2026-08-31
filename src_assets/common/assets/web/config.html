@@ -272,6 +272,11 @@
             id: "network",
             name: "Network",
             options: {
+              "lsp_enabled": "enabled",
+              "lsp_port": 48030,
+              "lsp_profile": "adaptive-low-latency",
+              "lsp_competition_capacity_mbps": 0,
+              "lsp_pairing_permissions": 87,
               "upnp": "disabled",
               "address_family": "ipv4",
               "bind_address": "",
@@ -283,11 +288,6 @@
               "wan_encryption_mode": 2,
               "ping_timeout": 10000,
               "packetsize": 0,
-              "protocol_v3_enabled": "enabled",
-              "legacy_compatibility": "enabled",
-              "protocol_v3_port": 48030,
-              "protocol_v3_profile": "quality",
-              "protocol_v3_pairing_permissions": 23,
             },
           },
           {

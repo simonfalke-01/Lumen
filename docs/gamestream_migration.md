@@ -34,8 +34,7 @@ own UPnP or manual forwarding. Running two hosts or two port-mapping tools can
 produce conflicts. Prefer a trusted VPN or authenticated tunnel when practical.
 
 Do not expose Lumen's Web UI or management API directly to the public Internet.
-Legacy Moonlight streaming requires multiple ports. The repository's one-port
-QUIC protocol is experimental, Umbra-specific, and not a shipped replacement.
+Legacy Moonlight streaming requires multiple ports.
 
 ## Known migration differences
 

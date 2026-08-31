@@ -269,18 +269,17 @@ TEST(VirtualDisplayValidation, AcceptsExactPracticalEvenRationalMode) {
 }
 
 TEST(VirtualDisplayValidation, SharesCanonicalStartBoundsWithDriverAdmission) {
-  namespace start_mode = lumen::protocol_v3::start_mode;
   const mode_limits_t limits;
-  EXPECT_EQ(limits.minimum_width, start_mode::minimum_width);
-  EXPECT_EQ(limits.maximum_width, start_mode::maximum_width);
-  EXPECT_EQ(limits.minimum_height, start_mode::minimum_height);
-  EXPECT_EQ(limits.maximum_height, start_mode::maximum_height);
-  EXPECT_EQ(limits.minimum_refresh, (rational_t {start_mode::minimum_refresh_hz, 1}));
-  EXPECT_EQ(limits.maximum_refresh, (rational_t {start_mode::maximum_refresh_hz, 1}));
+  EXPECT_EQ(limits.minimum_width, LUMEN_START_MODE_MIN_WIDTH);
+  EXPECT_EQ(limits.maximum_width, LUMEN_START_MODE_MAX_WIDTH);
+  EXPECT_EQ(limits.minimum_height, LUMEN_START_MODE_MIN_HEIGHT);
+  EXPECT_EQ(limits.maximum_height, LUMEN_START_MODE_MAX_HEIGHT);
+  EXPECT_EQ(limits.minimum_refresh, (rational_t {LUMEN_START_MODE_MIN_REFRESH_HZ, 1}));
+  EXPECT_EQ(limits.maximum_refresh, (rational_t {LUMEN_START_MODE_MAX_REFRESH_HZ, 1}));
 
   LUMEN_VDD_MODE mode {
-    start_mode::minimum_width,
-    start_mode::minimum_height,
+    LUMEN_START_MODE_MIN_WIDTH,
+    LUMEN_START_MODE_MIN_HEIGHT,
     60000,
     1001,
     LUMEN_VDD_DYNAMIC_RANGE_SDR,
@@ -289,14 +288,14 @@ TEST(VirtualDisplayValidation, SharesCanonicalStartBoundsWithDriverAdmission) {
     LUMEN_VDD_FIDELITY_LOSSLESS,
   };
   EXPECT_TRUE(lumen::vdd::mode::valid(mode));
-  mode.width = start_mode::minimum_width - 2;
+  mode.width = LUMEN_START_MODE_MIN_WIDTH - 2;
   EXPECT_FALSE(lumen::vdd::mode::valid(mode));
-  mode.width = start_mode::maximum_width + 2;
+  mode.width = LUMEN_START_MODE_MAX_WIDTH + 2;
   EXPECT_FALSE(lumen::vdd::mode::valid(mode));
-  mode.width = start_mode::maximum_width;
-  mode.height = start_mode::maximum_height + 2;
+  mode.width = LUMEN_START_MODE_MAX_WIDTH;
+  mode.height = LUMEN_START_MODE_MAX_HEIGHT + 2;
   EXPECT_FALSE(lumen::vdd::mode::valid(mode));
-  mode.height = start_mode::maximum_height;
+  mode.height = LUMEN_START_MODE_MAX_HEIGHT;
   mode.refresh_numerator = 9999;
   mode.refresh_denominator = 1000;
   EXPECT_FALSE(lumen::vdd::mode::valid(mode));
@@ -628,17 +627,17 @@ TEST(VirtualDisplayPolicy, OptionalFallbackRejectsUncertainRollback) {
   EXPECT_EQ(rejected.diagnostic, start_error_e::rollback_failed);
 }
 
-TEST(VirtualDisplayPolicy, ModernSessionsRequireVddUnlessExplicitlyDisabled) {
+TEST(VirtualDisplayPolicy, LSPSessionsRequireVddUnlessExplicitlyDisabled) {
   EXPECT_EQ(
-    modern_activation_policy(activation_policy_e::optional),
+    lsp_activation_policy(activation_policy_e::optional),
     activation_policy_e::required
   );
   EXPECT_EQ(
-    modern_activation_policy(activation_policy_e::required),
+    lsp_activation_policy(activation_policy_e::required),
     activation_policy_e::required
   );
   EXPECT_EQ(
-    modern_activation_policy(activation_policy_e::disabled),
+    lsp_activation_policy(activation_policy_e::disabled),
     activation_policy_e::disabled
   );
   EXPECT_EQ(direct_surface_fidelity(), fidelity_e::lossless);

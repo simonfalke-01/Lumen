@@ -106,7 +106,7 @@ input; already-PQ surfaces are rejected rather than interpreted heuristically.
 
 ## Fail-closed behavior and compatibility
 
-Umbra v3 treats the default `optional` runtime policy as required: unless VDD is
+LSP treats the default `optional` runtime policy as required: unless VDD is
 explicitly disabled, startup requires the exact VDD mode and a healthy ABI 6
 direct-frame channel. Direct-frame or NVENC failure ends/reinitializes the v3
 session; it does not switch capture backends mid-session.

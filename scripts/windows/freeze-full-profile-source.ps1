@@ -151,8 +151,6 @@ if (-not $SkipArchive) {
     }
 }
 
-$msquicManifestPath = Join-Path $SourceRoot "src/platform/windows/msquic_shim/manifest.json"
-$msquicManifest = Get-Content $msquicManifestPath -Raw | ConvertFrom-Json
 $vddProtocolPath = Join-Path $SourceRoot "src/platform/windows/virtual_display_driver/LumenVirtualDisplayProtocol.h"
 $vddProtocol = Get-Content $vddProtocolPath -Raw
 $vddMatch = [regex]::Match($vddProtocol, '#define\s+LUMEN_VDD_ABI_VERSION\s+(\d+)u')
@@ -213,18 +211,12 @@ $freeze = [ordered]@{
         }
     }
     identities = [ordered]@{
-        msquicShimAbi = [int]$msquicManifest.abi
-        msquicHeaderSha256 = [string]$msquicManifest.header_sha256
-        msquicSourceSha256 = [string]$msquicManifest.source_sha256
-        msquicProjectSha256 = [string]$msquicManifest.project_sha256
         virtualDisplayAbi = [int]$vddMatch.Groups[1].Value
         virtualDisplayProtocolSha256 = (Get-FileHash $vddProtocolPath -Algorithm SHA256).Hash.ToLowerInvariant()
         vddShaderCount = $vddShaderRows.Count
         vddShaderInventorySha256 = $vddShaderInventorySha256
     }
     pendingRuntimePins = @(
-        "LUMEN_MSQUIC_SHIM_DLL_SHA256",
-        "LUMEN_MSQUIC_SHIM_LIB_SHA256",
         "Microsoft-signed virtual-hid package",
         "Microsoft-signed virtual-microphone package",
         "Microsoft-signed virtual-display package"

@@ -29,18 +29,6 @@ namespace rtsp_stream {
   struct launch_session_t;
 }
 
-#if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
-  namespace lumen::protocol_v3::media {
-    enum class PublishResult;
-    struct NegotiatedMediaConfig;
-    class TransportSink;
-  }
-
-  namespace lumen::protocol_v3::runtime {
-    class QuicTransportSink;
-    class SessionResourceFactory;
-  }
-#endif
 
 namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;  ///< GameStream base-port offset used for the video UDP stream.
@@ -361,27 +349,6 @@ namespace stream {
     void release_client_microphone(std::uint32_t launch_session_id);
   }  // namespace session
 
-#if defined(LUMEN_EXPERIMENTAL_MSQUIC) || defined(SUNSHINE_TESTS)
-  /**
-   * @brief Apply the exact negotiated v3 video tuple to the capture/encoder configuration.
-   * @param output Video configuration updated in place.
-   * @param selection Immutable v3 media selection.
-   */
-  void configure_protocol_v3_video(
-    video::config_t &output,
-    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection
-  );
-
-  /**
-   * @brief Apply the exact negotiated v3 Opus tuple and host-playback policy.
-   * @param output Audio capture configuration updated in place.
-   * @param selection Immutable v3 media selection.
-   */
-  void configure_protocol_v3_audio(
-    audio::config_t &output,
-    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection
-  );
-
 #ifdef SUNSHINE_TESTS
   /** @brief Raw observations from the exact production audio packet queue. */
   struct audio_packet_queue_probe_t {
@@ -397,7 +364,7 @@ namespace stream {
     bool waiter_pop_present {};  ///< Whether the close-woken consumer received a packet.
   };
 
-  /** @brief Raw observations from the exact legacy and protocol-v3 audio destinations. */
+  /** @brief Raw observations from exact legacy audio destinations. */
   struct audio_destination_isolation_probe_t {
     audio::AudioPacketDestination::enqueue_result_e legacy_first_enqueue;  ///< First legacy owner admission.
     audio::AudioPacketDestination::enqueue_result_e legacy_second_while_full;  ///< Second owner admission while the shared queue is full.
@@ -411,21 +378,12 @@ namespace stream {
     std::uint8_t legacy_second_pop_tag {};  ///< Payload tag returned for the second legacy packet.
     std::uint8_t legacy_second_after_close_owner {};  ///< Session identity returned after the first destination closes.
     std::uint8_t legacy_second_after_close_tag {};  ///< Payload tag returned after the first destination closes.
-    std::uint32_t v3_first_enqueued_count {};  ///< Packets accepted by the first v3 destination before saturation.
-    audio::AudioPacketDestination::enqueue_result_e v3_first_over_capacity;  ///< Admission beyond the first v3 queue capacity.
-    audio::AudioPacketDestination::enqueue_result_e v3_second_enqueue;  ///< Independent second v3 destination admission.
-    audio::AudioPacketDestination::enqueue_result_e v3_first_after_repeated_close;  ///< First v3 admission after two close calls.
-    audio::AudioPacketDestination::enqueue_result_e v3_second_after_first_close;  ///< Second v3 admission after first closes.
-    std::uint8_t v3_first_pop_tag {};  ///< First payload tag returned by the first v3 queue.
-    std::uint8_t v3_second_pop_tag {};  ///< First payload tag returned by the second v3 queue.
-    bool v3_first_pop_after_close_present {};  ///< Whether repeated close retained first-v3 packets.
-    std::uint8_t v3_second_after_close_tag {};  ///< Second-v3 payload returned after the first closes.
   };
 
   /** @brief Exercise exact capacity, pop, and close semantics of audio_packet_queue_t. */
   [[nodiscard]] audio_packet_queue_probe_t audio_packet_queue_probe_for_test();
 
-  /** @brief Exercise exact legacy and protocol-v3 production destination isolation. */
+  /** @brief Exercise exact legacy production destination isolation. */
   [[nodiscard]] audio_destination_isolation_probe_t audio_destination_isolation_probe_for_test();
 
   /**
@@ -451,51 +409,6 @@ namespace stream {
    */
   [[nodiscard]] legacy_udp_peer_isolation_probe_t legacy_udp_peer_isolation_probe_for_test();
 
-  /** @brief Raw observations from capture through the exact production v3 audio drain. */
-  struct protocol_v3_audio_fixture_probe_t {
-    lumen::protocol_v3::media::PublishResult publish_result;  ///< SessionPipeline admission of the captured Opus packet.
-    std::uint64_t first_sample_position {};  ///< Captured packet's exact 48 kHz sample position.
-    std::size_t opus_bytes {};  ///< Encoded Opus payload size delivered by capture.
-    bool discontinuity {};  ///< Captured decoder reset/flush marker.
-    bool capture_completed {};  ///< Whether capture produced and drained one packet before the watchdog.
-  };
-
-  /**
-   * @brief Run platform capture through the exact private v3 destination and SessionPipeline drain.
-   *
-   * @param selection Negotiated v3 media configuration used by capture and packetization.
-   * @param transport Exact production transport sink attached to the test QuicServer.
-   * @param connection_id Authenticated QuicServer connection identity.
-   * @param capture_time_microseconds Deterministic raw-event timestamp for the fixture.
-   * @return Raw capture, destination, and pipeline observations.
-   */
-  [[nodiscard]] protocol_v3_audio_fixture_probe_t protocol_v3_audio_fixture_probe_for_test(
-    const lumen::protocol_v3::media::NegotiatedMediaConfig &selection,
-    lumen::protocol_v3::runtime::QuicTransportSink &transport,
-    std::uint64_t connection_id,
-    std::uint64_t capture_time_microseconds
-  );
-
-  /** @brief Exercise the production immutable controller-feedback generation fence. */
-  bool protocol_v3_feedback_is_current_for_test(
-    const platf::gamepad_feedback_msg_t &message,
-    std::uint32_t input_generation,
-    std::uint32_t controller_generation
-  ) noexcept;
 #endif
 
-  /**
-   * @brief Create the native START-owned protocol-v3 capture/input/media factory.
-   *
-   * The factory uses the existing capture, encoder, audio, input, and virtual
-   * microphone primitives without entering RTSP or legacy UDP transport.
-   *
-   * @param transport Authenticated QUIC media sink retained by the runtime.
-   * @return Owned factory used by the production v3 SessionBackend.
-   */
-  std::unique_ptr<lumen::protocol_v3::runtime::SessionResourceFactory>
-    make_protocol_v3_session_resource_factory(
-      lumen::protocol_v3::media::TransportSink &transport
-    );
-#endif
 }  // namespace stream

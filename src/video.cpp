@@ -199,24 +199,6 @@ namespace video {
       append(config.dynamicRange);
       append(config.chromaSamplingType);
       append(config.enableIntraRefresh);
-      append(config.protocolV3Colorimetry);
-      append(config.colorPrimaries);
-      append(config.colorTransfer);
-      append(config.colorMatrix);
-      append(config.colorRange);
-      append(config.hasStaticHDRMetadata);
-      for (const auto coordinate : config.staticHDRDisplayPrimaries) {
-        append(coordinate);
-      }
-      for (const auto coordinate : config.staticHDRWhitePoint) {
-        append(coordinate);
-      }
-      append(config.staticHDRMaximumMasteringLuminance);
-      append(config.staticHDRMinimumMasteringLuminance);
-      append(config.staticHDRMaximumContentLightLevel);
-      append(config.staticHDRMaximumFrameAverageLightLevel);
-      append(config.refreshNumerator);
-      append(config.refreshDenominator);
       append_codec_cache_string(fingerprint, config.output_name);
       append(config.client_protocol);
       append(config.virtual_display_active);
@@ -2544,20 +2526,7 @@ namespace video {
     // Attach HDR metadata to the AVFrame
     if (colorspace_is_hdr(colorspace)) {
       SS_HDR_METADATA hdr_metadata;
-      if (config.protocolV3Colorimetry && config.hasStaticHDRMetadata) {
-        for (std::size_t index = 0; index < 3; ++index) {
-          hdr_metadata.displayPrimaries[index].x = config.staticHDRDisplayPrimaries[index * 2];
-          hdr_metadata.displayPrimaries[index].y = config.staticHDRDisplayPrimaries[index * 2 + 1];
-        }
-        hdr_metadata.whitePoint.x = config.staticHDRWhitePoint[0];
-        hdr_metadata.whitePoint.y = config.staticHDRWhitePoint[1];
-        hdr_metadata.maxDisplayLuminance = config.staticHDRMaximumMasteringLuminance / 10'000U;
-        hdr_metadata.minDisplayLuminance = config.staticHDRMinimumMasteringLuminance;
-        hdr_metadata.maxContentLightLevel = config.staticHDRMaximumContentLightLevel;
-        hdr_metadata.maxFrameAverageLightLevel = config.staticHDRMaximumFrameAverageLightLevel;
-      }
-      if ((config.protocolV3Colorimetry && config.hasStaticHDRMetadata) ||
-          (!config.protocolV3Colorimetry && disp->get_hdr_metadata(hdr_metadata))) {
+      if (disp->get_hdr_metadata(hdr_metadata)) {
         auto mdm = av_mastering_display_metadata_create_side_data(frame.get());
 
         mdm->display_primaries[0][0] = av_make_q(hdr_metadata.displayPrimaries[0].x, 50000);
@@ -2582,7 +2551,7 @@ namespace video {
           clm->MaxCLL = hdr_metadata.maxContentLightLevel;
           clm->MaxFALL = hdr_metadata.maxFrameAverageLightLevel;
         }
-      } else if (!config.protocolV3Colorimetry) {
+      } else {
         BOOST_LOG(error) << "Couldn't get display hdr metadata when colorspace selection indicates it should have one";
       }
     }
@@ -3562,7 +3531,7 @@ namespace video {
       const auto cache_key = make_cache_key(current_encoder_probe_identity());
       if (auto cached = chosen_codec_initialization_cache.lookup(cache_key)) {
         BOOST_LOG(info)
-          << "Protocol-v3 codec initialization cache hit; throwaway encoder skipped in "sv
+          << "LSP codec initialization cache hit; throwaway encoder skipped in "sv
           << std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - initialization_start
              )
@@ -3660,10 +3629,10 @@ namespace video {
           initialization
         )) {
       chosen_codec_initialization_cache.clear();
-      BOOST_LOG(debug) << "Protocol-v3 codec initialization was not cached because its device identity changed or was incomplete"sv;
+      BOOST_LOG(debug) << "LSP codec initialization was not cached because its device identity changed or was incomplete"sv;
     }
     BOOST_LOG(info)
-      << "Protocol-v3 codec initialization prewarm completed in "sv
+      << "LSP codec initialization prewarm completed in "sv
       << std::chrono::duration_cast<std::chrono::milliseconds>(
            std::chrono::steady_clock::now() - initialization_start
          )

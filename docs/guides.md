@@ -19,16 +19,14 @@
 
 ## Protocol references
 
-- [Lumen Streaming Protocol](protocols/lumen-streaming-protocol.md): clean-room
-  pre-implementation specification for the native single-port protocol.
+- [Lumen Streaming Protocol](protocols/lumen-streaming-protocol.md): normative
+  specification for the native single-port protocol under implementation.
 - [LSP architecture rationale](protocols/lumen-streaming-protocol-rationale.md):
   standards research, transport decision, and rejected alternatives.
 - [LSP ground-up rewrite plan](lumen-streaming-protocol-rewrite-plan.md):
   functional implementation stages, cutover, and old-protocol deletion plan.
 - [Client microphone v1](protocols/umbra-microphone-v1.md): production
   authenticated client-to-host microphone extension.
-- [Umbra/Lumen QUIC v3](protocols/umbra-lumen-quic-v3.md): abandoned
-  experimental implementation retained only until LSP cutover.
 - [Windows VDD source status](../src/platform/windows/virtual_display_driver/README.md)
   - source and validation bundle, not a packaged driver.
 

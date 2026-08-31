@@ -180,7 +180,7 @@ TEST(InputCausalWatermark, RejectsRegressionFutureApplicationAndStaleFrame) {
   EXPECT_EQ(watermark.captured_frame({1, 1}), 0U);
 }
 
-TEST(InputProtocolV3ControllerInjection, RejectsEveryAdvancedPacketWhenControllerInputIsDisabled) {
+TEST(InputControllerInjection, RejectsEveryAdvancedPacketWhenControllerInputIsDisabled) {
   const auto prior = config::input.controller;
   config::input.controller = false;
 

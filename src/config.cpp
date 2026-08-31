@@ -27,7 +27,6 @@
 #include "logging.h"
 #include "nvhttp.h"
 #include "platform/common.h"
-#include "protocol_v3/control_session.h"
 #include "rtsp.h"
 #include "utility.h"
 
@@ -837,26 +836,19 @@ namespace config {
   };
 
   /**
-   * @brief Default direct protocol-v3 listener configuration.
+   * @brief Default Lumen Streaming Protocol host configuration.
    */
-  protocol_v3_t protocol_v3 {
-#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
-    true,  // enabled in full Windows feature builds
+  lsp_t lsp {
+#if LUMEN_LSP_DEFAULT_ENABLED
+    true,  // enabled in full Windows builds
 #else
-    false,  // unavailable in legacy and non-MsQuic builds
+    false,  // disabled in legacy and unsupported host builds
 #endif
-    true,  // retain legacy Moonlight listeners by default
-    48030,  // single QUIC UDP port
-    "quality",  // stable bounded-fidelity policy
-    0x17,  // browse, start, input, and stop; mic/quit require explicit configuration
+    48'030,  // single LSP UDP application port
+    "adaptive-low-latency",  // congestion-safe default profile
+    0,  // competition is unavailable until a capacity ceiling is configured
+    0x57U,  // browse, start/attach, input, stop-own-stream, and controller output
   };
-
-  listener_startup_policy_t listener_startup_policy(const protocol_v3_t &settings) noexcept {
-    return {
-      .start_legacy = settings.legacy_compatibility,
-      .v3_failure_is_fatal = !settings.legacy_compatibility,
-    };
-  }
 
   /**
    * @brief Default NVHTTP server configuration values used before file and CLI overrides.
@@ -1801,32 +1793,37 @@ namespace config {
     }
     int_between_f(vars, "packetsize", stream.packetsize, {0, PACKETSIZE_MAX});
 
-    bool_f(vars, "protocol_v3_enabled", protocol_v3.enabled);
-    bool_f(vars, "legacy_compatibility", protocol_v3.legacy_compatibility);
+    bool_f(vars, "lsp_enabled", lsp.enabled);
     {
-      int protocol_v3_port = protocol_v3.port;
-      int_between_f(vars, "protocol_v3_port", protocol_v3_port, {1024, 65535});
-      protocol_v3.port = static_cast<std::uint16_t>(protocol_v3_port);
+      int lsp_port = lsp.port;
+      int_between_f(vars, "lsp_port", lsp_port, {1, std::numeric_limits<std::uint16_t>::max()});
+      lsp.port = static_cast<std::uint16_t>(lsp_port);
     }
-    string_restricted_f(vars, "protocol_v3_profile", protocol_v3.profile, {"latency"sv, "quality"sv});
+    string_restricted_f(
+      vars,
+      "lsp_profile",
+      lsp.profile,
+      {"adaptive-low-latency"sv, "competition"sv}
+    );
     {
-      int pairing_permissions = static_cast<int>(protocol_v3.pairing_permissions);
-      int_between_f(vars, "protocol_v3_pairing_permissions", pairing_permissions, {1, 255});
-      const auto requested_permissions = static_cast<std::uint64_t>(pairing_permissions);
-      if ((requested_permissions & ~lumen::protocol_v3::control_session::defined_permission_mask) != 0) {
-        BOOST_LOG(warning) << "Ignoring undefined protocol-v3 pairing permission bits 6/7"sv;
-      }
-      protocol_v3.pairing_permissions =
-        (requested_permissions & lumen::protocol_v3::control_session::defined_permission_mask) | 0x17U;
+      int competition_capacity_mbps = static_cast<int>(lsp.competition_capacity_mbps);
+      int_between_f(
+        vars,
+        "lsp_competition_capacity_mbps",
+        competition_capacity_mbps,
+        {0, std::numeric_limits<int>::max()}
+      );
+      lsp.competition_capacity_mbps = static_cast<std::uint32_t>(competition_capacity_mbps);
     }
-#if !LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
-    if (protocol_v3.enabled) {
-      BOOST_LOG(warning) << "Protocol v3 was requested but is unavailable in this build profile"sv;
-      protocol_v3.enabled = false;
+    {
+      int pairing_permissions = static_cast<int>(lsp.pairing_permissions);
+      int_between_f(vars, "lsp_pairing_permissions", pairing_permissions, {0, 0x7f});
+      lsp.pairing_permissions = static_cast<std::uint32_t>(pairing_permissions);
     }
-    if (!protocol_v3.legacy_compatibility) {
-      BOOST_LOG(warning) << "Legacy compatibility cannot be disabled when protocol v3 is unavailable"sv;
-      protocol_v3.legacy_compatibility = true;
+#if !LUMEN_LSP_RUNTIME_AVAILABLE
+    if (lsp.enabled) {
+      BOOST_LOG(warning) << "LSP was requested but is unavailable in this build profile"sv;
+      lsp.enabled = false;
     }
 #endif
 
@@ -1974,6 +1971,16 @@ namespace config {
       apply_flags(it->second.c_str());
 
       vars.erase(it);
+    }
+
+    for (auto setting = vars.begin(); setting != vars.end();) {
+      if (setting->first == "legacy_" "compatibility" || setting->first.starts_with("protocol_" "v3_")) {
+        std::cout << "Warning: Ignored retired streaming-protocol option ["sv << setting->first << ']' << std::endl;
+        modified_config_settings.erase(setting->first);
+        setting = vars.erase(setting);
+      } else {
+        ++setting;
+      }
     }
 
     if (sunshine.min_log_level <= 3) {

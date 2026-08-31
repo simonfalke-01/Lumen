@@ -2,7 +2,7 @@
 install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
 
 option(LUMEN_WINDOWS_FULL_PROFILE
-        "Require the complete MsQuic and Lumen driver package set"
+        "Require the complete Lumen driver package set"
         OFF)
 set(LUMEN_WINDOWS_LOCAL_TEST_SIGNING_MARKER "" CACHE FILEPATH
         "Optional local-test-only driver signing marker JSON")
@@ -285,15 +285,10 @@ install(TARGETS lumen-vddctl
         COMPONENT application)
 
 if(LUMEN_WINDOWS_FULL_PROFILE)
-    if(NOT LUMEN_EXPERIMENTAL_MSQUIC)
-        message(FATAL_ERROR "LUMEN_WINDOWS_FULL_PROFILE requires LUMEN_EXPERIMENTAL_MSQUIC=ON")
-    endif()
     foreach(REQUIRED_FULL_PROFILE_DIRECTORY IN ITEMS
             SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR
             SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR
-            SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR
-            LUMEN_MSQUIC_ROOT
-            LUMEN_MSQUIC_SHIM_ROOT)
+            SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
         if(NOT IS_DIRECTORY "${${REQUIRED_FULL_PROFILE_DIRECTORY}}")
             message(FATAL_ERROR
                     "LUMEN_WINDOWS_FULL_PROFILE requires ${REQUIRED_FULL_PROFILE_DIRECTORY}")

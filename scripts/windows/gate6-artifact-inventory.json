@@ -45,14 +45,8 @@
         { "path": "source-freeze/full-profile-files.json", "kind": "source-files-manifest" },
         { "path": "source-freeze/lumen-full-profile-source.tar.gz", "kind": "source-archive" },
         { "path": "full-profile-driver-manifest.json", "kind": "driver-manifest" },
-        { "path": "shim/lumen_msquic_shim.dll", "kind": "shim" },
-        { "path": "shim/lumen_msquic_shim.lib", "kind": "shim" },
-        { "path": "shim/manifest.json", "kind": "shim-manifest" },
         { "path": "app/Lumen.exe", "kind": "application" },
         { "path": "app/zlib1.dll", "kind": "runtime" },
-        { "path": "app/msquic.dll", "kind": "runtime" },
-        { "path": "app/lumen_msquic_shim.dll", "kind": "shim" },
-        { "path": "app/MsQuic-LICENSE.txt", "kind": "license" },
         { "path": "app/tools/lumensvc.exe", "kind": "application" },
         { "path": "app/tools/lumen-vddctl.exe", "kind": "application" },
         { "path": "drivers/virtual-hid/LumenVirtualHid.inf", "kind": "driver" },
@@ -64,8 +58,6 @@
         { "path": "drivers/virtual-display/LumenVirtualDisplay.inf", "kind": "driver" },
         { "path": "drivers/virtual-display/LumenVirtualDisplay.cat", "kind": "driver" },
         { "path": "drivers/virtual-display/LumenVirtualDisplay.dll", "kind": "driver" },
-        { "path": "vectors/quic_v3_vectors.json", "kind": "vector" },
-        { "path": "vectors/start_mode_vectors.json", "kind": "vector" },
         { "path": "vectors/vdd_gate5_contract.json", "kind": "vector" }
       ],
       "requiredPatterns": [
@@ -90,9 +82,6 @@
       "exactFiles": [
         { "path": "Lumen.exe", "kind": "application" },
         { "path": "zlib1.dll", "kind": "runtime" },
-        { "path": "msquic.dll", "kind": "runtime" },
-        { "path": "lumen_msquic_shim.dll", "kind": "shim" },
-        { "path": "MsQuic-LICENSE.txt", "kind": "license" },
         { "path": "tools/lumensvc.exe", "kind": "application" },
         { "path": "tools/lumen-vddctl.exe", "kind": "application" },
         { "path": "tools/lumen-vhidctl.exe", "kind": "application" },
@@ -182,9 +171,6 @@
       "exactFiles": [
         { "path": "Lumen.exe", "kind": "application" },
         { "path": "zlib1.dll", "kind": "runtime" },
-        { "path": "msquic.dll", "kind": "runtime" },
-        { "path": "lumen_msquic_shim.dll", "kind": "shim" },
-        { "path": "MsQuic-LICENSE.txt", "kind": "license" },
         { "path": "tools/lumensvc.exe", "kind": "application" },
         { "path": "tools/lumen-vddctl.exe", "kind": "application" },
         { "path": "tools/dxgi-info.exe", "kind": "application" },

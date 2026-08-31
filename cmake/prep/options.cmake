@@ -19,7 +19,7 @@ option(SUNSHINE_CONFIGURE_ONLY "Configure special files only, then exit." OFF)
 option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
 
 set(LUMEN_BUILD_PROFILE "full" CACHE STRING
-        "Lumen feature profile: full enables protocol v3; legacy keeps only Moonlight compatibility listeners.")
+        "Lumen feature profile: full includes bundled platform integrations; legacy keeps only Moonlight compatibility components.")
 set_property(CACHE LUMEN_BUILD_PROFILE PROPERTY STRINGS full legacy)
 if(NOT LUMEN_BUILD_PROFILE STREQUAL "full" AND
    NOT LUMEN_BUILD_PROFILE STREQUAL "legacy")
@@ -29,20 +29,17 @@ endif()
 if(WIN32)
     option(SUNSHINE_USE_STATIC_QT
             "Require static Qt libraries and their static third-party dependencies." ON)
-    if(LUMEN_BUILD_PROFILE STREQUAL "full")
-        set(_lumen_protocol_v3_default ON)
-    else()
-        set(_lumen_protocol_v3_default OFF)
-    endif()
-    option(LUMEN_EXPERIMENTAL_MSQUIC
-            "Build the production one-port Lumen protocol-v3 MsQuic runtime."
-            ${_lumen_protocol_v3_default})
-    unset(_lumen_protocol_v3_default)
-    if(LUMEN_BUILD_PROFILE STREQUAL "legacy" AND LUMEN_EXPERIMENTAL_MSQUIC)
-        message(FATAL_ERROR
-                "The legacy build profile cannot enable the protocol-v3 MsQuic runtime.")
-    endif()
 endif()
+
+if(WIN32 AND LUMEN_BUILD_PROFILE STREQUAL "full")
+    set(_lumen_lsp_runtime_default ON)
+else()
+    set(_lumen_lsp_runtime_default OFF)
+endif()
+option(LUMEN_ENABLE_LSP_RUNTIME
+        "Build the production LSP wolfSSL/libSRTP runtime."
+        ${_lumen_lsp_runtime_default})
+unset(_lumen_lsp_runtime_default)
 
 option(SUNSHINE_SYSTEM_VULKAN_HEADERS "Use system installation of vulkan-headers rather than the submodule." OFF)
 option(SUNSHINE_SYSTEM_WAYLAND_PROTOCOLS "Use system installation of wayland-protocols rather than the submodule." OFF)

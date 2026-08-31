@@ -31,7 +31,6 @@ namespace stream_policy {
     third_party_extension,
     umbra_legacy,
     umbra_v2,
-    umbra_v3,
   };
 
   /**

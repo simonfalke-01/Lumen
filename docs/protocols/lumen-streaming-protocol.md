@@ -1,6 +1,16 @@
 # Lumen Streaming Protocol
 
-Status: clean-room pre-implementation specification. Wire version: `1`.
+Status: normative specification with verified portable primitives and product
+integration in progress. Wire version: `1`.
+
+The portable C++23 core currently implements and tests the frozen input
+wire/state primitives in section 15, the media packetization and bounded
+frame-pipeline primitives in sections 12 through 14, and the RTCP, repair,
+congestion, DPLPMTUD, and generation-fence state described in sections 7, 13,
+17, and 19.
+Those results do not claim a live LSP stream: production UDP ownership,
+wolfSSL/libSRTP protection, capture, platform input, decoder, renderer, and
+application lifecycle wiring remain in progress.
 
 The Lumen Streaming Protocol (LSP) is the native, single-port protocol between
 Lumen and its clients. It is optimized for competitive game streaming on a
@@ -407,8 +417,8 @@ Large-object transfer:
 
 ## 9. Control message registry
 
-Exact CBOR schemas are frozen with golden vectors before implementation. The
-top-level message types are reserved now:
+Exact CBOR schemas MUST be frozen with golden vectors before the corresponding
+product control operation is enabled. The top-level message types are reserved:
 
 | Type | Name | Direction |
 | ---: | --- | --- |
@@ -596,6 +606,22 @@ them.
 - Frame-marking start/end/independent/discardable bits must agree with the
   codec payload and encoder dependency state.
 
+The portable packetizers further freeze these LSP/1 policies:
+
+- H.264 accepts Annex-B-prefix-free source NAL types `1...23`, emits single
+  NAL packets, STAP-A type `24`, or FU-A type `28`, and never emits STAP-B,
+  MTAP, FU-B, interleaved mode, or cross-frame aggregation.
+- HEVC accepts complete Annex-B-prefix-free source NAL types `0...47`, emits
+  single NAL packets, aggregation packets of type `48`, or fragmentation units
+  of type `49`, and never emits PACI, DONL, or cross-frame aggregation.
+- AV1 accepts normalized OBU types `1`, `3...7`, and `15` with the OBU
+  size-field and reserved bits clear. It omits temporal delimiters, uses the
+  AOM `Z`, `Y`, `W`, and `N` aggregation-header semantics, and sets `N` only
+  on the first packet of an explicitly identified coded-video-sequence start.
+- Every packetizer accepts only dynamic payload types `96...127` and a nonzero
+  negotiated SSRC. It sets the RTP marker only on the last packet of the access
+  unit or temporal unit.
+
 Within one already available encoded frame or incremental encoder chunk, the
 packetizer aggregates small NAL units or OBUs when the codec payload format
 permits and the result fits the current path maximum. It never aggregates
@@ -714,6 +740,22 @@ parser and generation checks, and entered into the source sequence/replay
 state so that a later original copy is discarded. FEC state never bypasses
 SSRC, payload-type, size, generation, or frame-deadline validation.
 
+The portable FlexFEC group state enforces this exact transition order:
+
+```text
+idle
+  -> accumulating plaintext source RTP
+  -> sealed plaintext repair parity
+  -> constructed plaintext repair RTP
+  -> repair ready for SRTP
+  -> complete
+```
+
+A group is frame-local, protects one primary SSRC with one distinct repair
+SSRC, and represents at most 64 source sequence numbers in one 64-bit mask.
+The accumulator stores only the zero-padded plaintext XOR, the XOR of source
+packet lengths, and group metadata. It does not retain source-packet pointers.
+
 ### 13.6 RTX
 
 RTX follows RFC 4588 and is negotiated with a separate SSRC and payload type.
@@ -751,6 +793,13 @@ frame generations and 16 MiB per connection. Retention creates no second copy
 in steady state. An actual RTX packet is constructed once in a new final slab
 only after an eligible NACK.
 
+The portable retention state stores an opaque nonzero slab token and bounded
+metadata. Lookup requires the active video generation, primary SSRC, original
+sequence number, unexpired retention, and the same strict reverse-feedback,
+serialization, forward-delivery, and decode-reserve deadline test used by the
+receiver. Whole older frames are evicted when the two-frame or 16 MiB bound
+would otherwise be exceeded.
+
 ### 13.7 Recovery state machine
 
 Recovery is scoped to a monotonically increasing recovery epoch:
@@ -767,6 +816,13 @@ Recovery is scoped to a monotonically increasing recovery epoch:
 Only one independent recovery frame may be outstanding. Repeated feedback for
 the same epoch does not create more keyframes. A new IDR retry requires expiry
 of the prior recovery deadline and evidence that it did not decode.
+
+The sender recovery state is exactly `healthy`, `repairing-references`,
+`recovery-frame-outstanding`, or `retry-permitted`. An epoch opens only for an
+unrecoverable reference loss, an explicit unrecoverable decoder report, or an
+unexpected partial frame after network admission. It advances monotonically
+without wrapping to zero and returns to `healthy` only when protected feedback
+confirms that the one outstanding independent recovery frame decoded.
 
 Sender queue pressure, an expired non-reference frame, and a presentation drop
 do not by themselves trigger PLI/FIR.
@@ -793,6 +849,15 @@ The host's complete-frame admission includes the client's most recent decoder
 credit and measured decode-completion rate. Credit is a freshness-bounded hint,
 not a reliable token: the receiver remains authoritative and drops before
 decoder submission when no hardware surface is available.
+
+The portable RTCP layer currently verifies compound and RFC 5506 reduced-size
+datagrams and serializes bounded RFC 4585 Generic NACK and PLI plus RFC 5104
+FIR packets. Its RFC 8888 state retains disjoint authenticated packet reports
+and makes feedback due at the earlier of 2 ms or 128 packets, subject to the
+500-microsecond hard floor. Its `LSPV` state validates generation, frame-order,
+decoder-credit, and mailbox invariants and coalesces decode/capacity updates at
+the same 500-microsecond minimum. Protection and live SRTCP submission remain
+product-integration work.
 
 ## 14. Audio and microphone
 
@@ -981,6 +1046,35 @@ length. A controller record carries the newest sticks, analog triggers,
 battery, and non-edge state. A packet otherwise carries one pen or a bounded
 group of touch coordinates that fits one path-sized packet.
 
+Device classes are frozen as keyboard `1`, pointer `2`, controller `3`, touch
+`4`, and pen `5`. Controller sensor classes are gyroscope `1` and
+accelerometer `2`.
+
+For a normal device-state object ID, bits `63...56` carry the device class,
+bits `55...32` are zero, and bits `31...0` carry a nonzero device ID. For a
+controller-sensor object ID, bits `63...56` carry controller class `3`, bits
+`55...48` carry the sensor class, bits `47...32` are zero, and bits `31...0`
+carry the nonzero controller ID. Pointer-motion object IDs are the pointer ID
+`1...4`; core-state object ID is zero; edge-batch object ID is its newest edge
+ID; and baseline-part object ID is the nonzero random baseline ID.
+
+Every device-state and sensor-state kind payload begins with this exact 24-byte
+prefix:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 | device class |
+| 1 | 1 | zero for device state; sensor class for sensor state |
+| 2 | 2 | physical reports represented, nonzero |
+| 4 | 4 | nonzero device ID |
+| 8 | 4 | nonzero instance generation |
+| 12 | 2 | exact complete kind-payload length |
+| 14 | 2 | zero |
+| 16 | 8 | nonzero newest physical-sample ordinal |
+
+Kind-specific state bytes follow this prefix. The common object ID and prefix
+MUST identify the same device and, for sensor state, the same sensor.
+
 Controller sensor state independently carries timestamped gyro or
 accelerometer vectors. Sticks, analog triggers, sensors, and touch coordinates
 may be coalesced only under their exact controller/device supersession key.
@@ -992,6 +1086,38 @@ An edge batch carries `1...16` exact 32-byte records with contiguous IDs. The
 same edge may appear in multiple packets until acknowledged. Repetition does
 not create a new edge or state sequence.
 
+Each edge record has this exact layout:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | nonzero edge ID |
+| 8 | 8 | nonzero client monotonic physical time, microseconds |
+| 16 | 1 | edge kind |
+| 17 | 1 | device class |
+| 18 | 2 | HID usage, button, contact, pen control, or lifecycle control ID |
+| 20 | 4 | nonzero device ID |
+| 24 | 4 | nonzero instance generation |
+| 28 | 4 | signed kind-specific scalar, slot, or lifecycle value |
+
+The edge-kind registry is:
+
+| Value | Kind | Required device class |
+| ---: | --- | --- |
+| 1 | key down | keyboard |
+| 2 | key up | keyboard |
+| 3 | pointer button down | pointer |
+| 4 | pointer button up | pointer |
+| 5 | controller arrival | controller |
+| 6 | controller removal | controller |
+| 7 | controller button down | controller |
+| 8 | controller button up | controller |
+| 9 | touch begin | touch |
+| 10 | touch end | touch |
+| 11 | touch cancel | touch |
+| 12 | pen begin | pen |
+| 13 | pen end | pen |
+| 14 | pen cancel | pen |
+
 A complete baseline is a deterministic byte string containing core state plus
 every active device and contact. It is split into at most 32 path-sized baseline
 parts. Each part carries part index, part count, total length, and a SHA-256
@@ -1000,9 +1126,25 @@ atomically installs it only after every authenticated part and the digest are
 valid. Normal state and edges are not applied until baseline ACK. Missing parts
 are retransmitted without changing the baseline ID or state sequence.
 
-Flags and the exact core/device/baseline bytes plus edge-kind registry are
-frozen by the LSP wire-vector task before implementation. They are designed
-afresh and are not copied from the old protocol.
+The exact 48-byte baseline metadata preceding each part range is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 | zero-based part index |
+| 1 | 1 | part count, `1...32` |
+| 2 | 2 | zero |
+| 4 | 4 | complete baseline length, `1...32768` |
+| 8 | 4 | exact part byte offset |
+| 12 | 4 | exact nonzero part byte length |
+| 16 | 32 | SHA-256 of the complete deterministic baseline |
+| 48 | variable | exact part bytes |
+
+The common input-header flags are zero in LSP/1. The pointer, device prefix,
+edge, and baseline-part layouts above are frozen and implemented. The portable
+codec does not yet define the device-specific state bodies following the
+24-byte prefix or the deterministic complete-baseline body. Those body schemas
+and their product integration remain in progress and are not counted as a
+completed wire primitive.
 
 ### 15.4 Input acknowledgements
 
@@ -1017,6 +1159,30 @@ Protected SRTCP APP name `LSPI` acknowledges:
 - 64-bit edge reception bitmap;
 - host monotonic receive and apply times; and
 - first captured video frame ID carrying the applied watermark.
+
+The bytes following the SRTCP APP name have an exact fixed 72-byte prefix and
+zero through four 16-byte pointer records:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | nonzero input generation |
+| 4 | 1 | pointer record count, `0...4` |
+| 5 | 1 | flags; bit 0 requests a baseline, all other bits zero |
+| 6 | 2 | zero |
+| 8 | 8 | accepted baseline ID, or zero |
+| 16 | 8 | highest accepted replaceable-state sequence |
+| 24 | 8 | highest platform-applied replaceable-state sequence |
+| 32 | 8 | greatest contiguously applied edge ID |
+| 40 | 8 | forward edge-reception bitmap; bit 0 names the next edge ID |
+| 48 | 8 | host monotonic receive time, microseconds |
+| 56 | 8 | host monotonic apply-completion time, microseconds |
+| 64 | 8 | first captured video frame ID carrying the watermark |
+| 72 | `16*n` | active-pointer records |
+
+Each pointer record contains a pointer ID `1...4`, its nonzero instance
+generation, and its nonzero greatest applied physical ordinal as `4`, `4`, and
+`8` bytes respectively. Pointer IDs in one ACK are unique, applied state never
+exceeds accepted state, and the payload length is exactly `72 + 16*n` bytes.
 
 The host sends an ACK immediately after baseline commit or an edge is applied.
 While high-rate input is active it also sends at the earlier of 1 ms or eight
@@ -1075,6 +1241,29 @@ controller-instance generations. Rumble amplitudes and LED color are
 replaceable latest state. Adaptive-trigger programs, haptic waveform changes,
 motion-sensor enable/disable, and player-slot changes are acknowledged edges.
 Feedback for a removed or rebound controller generation is ignored.
+
+The LSPG application data begins with this exact 28-byte envelope:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII `LSPG` |
+| 4 | 1 | wire version `1` |
+| 5 | 1 | subtype: latest state `1`, command `2`, or acknowledgement `3` |
+| 6 | 2 | exact subtype-payload length |
+| 8 | 4 | nonzero input generation |
+| 12 | 4 | nonzero controller ID |
+| 16 | 4 | nonzero controller instance generation |
+| 20 | 8 | nonzero direction-wide output sequence |
+| 28 | variable | subtype payload |
+
+Latest state has an exact eight-byte payload: low-frequency rumble `uint16`,
+high-frequency rumble `uint16`, red, green, and blue LED bytes, then one zero
+byte. A command payload contains command kind, one zero byte, a two-byte
+parameter length, and `0...224` parameter bytes. Command kinds are adaptive
+trigger `1`, haptic waveform `2`, motion sensor `3`, and player slot `4`. An
+acknowledgement payload is four bytes: status followed by three zero bytes.
+Statuses are success `0`, unsupported `1`, stale generation `2`, failed `3`,
+and expired `4`. Complete LSPG application data is at most 256 bytes.
 
 Each controller-output direction has a nonzero 64-bit command sequence.
 Replaceable rumble/LED state may skip obsolete sequences. An acknowledged
@@ -1485,10 +1674,9 @@ integrity failure closes the relevant association.
 LSP and legacy GameStream are separate protocols. A host may offer both, but a
 client connection selects one explicitly.
 
-The old experimental QUIC protocol is not a compatibility target. During
-development it may exist on a separate development port or behind a mutually
-exclusive runtime switch. The final LSP cutover removes its listener and
-client path rather than multiplexing QUIC and LSP indefinitely.
+The retired native transport is not a compatibility target and has been
+removed from the current product baselines. LSP does not multiplex it, reuse
+its trust or identity state, or expose a compatibility switch.
 
 ## 24. Competition acceptance targets
 
@@ -1542,9 +1730,10 @@ With controlled loss and reordering:
 Physical input-to-photon qualification uses a high-speed camera or photodiode,
 not software timestamps alone.
 
-## 25. Conformance artifacts required before implementation freeze
+## 25. Conformance artifacts required before interoperability freeze
 
-The implementation stage must first freeze:
+The implemented portable primitives require independent vectors before the
+interoperability freeze. Product integration must additionally freeze:
 
 - deterministic CBOR schemas for every control type;
 - complete LSPC positive and hostile vectors;

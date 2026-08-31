@@ -335,30 +335,6 @@ assert_file_contains_literal(
     "src_assets/windows/misc/sunshine-setup.ps1"
     [=[Invoke-AllPersistedRollbacks]=]
     "Setup failures must roll back every selected device driver")
-foreach(identity_disposition_contract IN ITEMS
-        [=[protocol_v3_identity.bin]=]
-        [=[protocol_v3_identity.journal]=]
-        [=[Start-ProtectedIdentityUninstallTransaction]=]
-        [=[Invoke-ProtectedIdentityRemoval]=]
-        [=[Invoke-ProtectedIdentityRollback]=]
-        [=[Restored exact protected identity bytes and ACL metadata during rollback.]=])
-    assert_file_contains_literal(
-        "src_assets/windows/misc/sunshine-setup.ps1"
-        "${identity_disposition_contract}"
-        "Installer identity disposition must retain ${identity_disposition_contract}")
-endforeach()
-assert_file_contains_literal(
-    "cmake/packaging/wix_resources/sunshine-installer.wxs"
-    [=[-IdentityDisposition preserve]=]
-    "Repair, feature changes, and related upgrades must preserve protected identity")
-assert_file_contains_literal(
-    "cmake/packaging/wix_resources/sunshine-installer.wxs"
-    [=[-IdentityDisposition remove]=]
-    "Full uninstall must explicitly remove protected identity")
-assert_file_contains_literal(
-    ".github/scripts/test-windows-msi.ps1"
-    [=['identity-reinstall']=]
-    "Windows MSI validation must scaffold exact identity preservation across reinstall")
 assert_file_contains_literal(
     ".github/scripts/validate-windows-msi.ps1"
     [=[`StartName` FROM `ServiceInstall`]=]
@@ -598,10 +574,6 @@ assert_file_excludes(
     "MSI live validation must prove Virtual Display installation without a property override")
 assert_file_contains_literal(
     "scripts/windows/build-full-profile.ps1"
-    [=[LUMEN_MSQUIC_SHIM_DLL_SHA256]=]
-    "The full-profile builder must pass the built MsQuic DLL pin")
-assert_file_contains_literal(
-    "scripts/windows/build-full-profile.ps1"
     [=[SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR]=]
     "The full-profile builder must pass the signed Virtual Display package root")
 assert_file_contains_literal(
@@ -634,7 +606,6 @@ endforeach()
 foreach(full_profile_clean_boundary IN ITEMS
         [=[Remove-Item -LiteralPath $freezeDirectory]=]
         [=[Remove-Item -LiteralPath $PackageDirectory]=]
-        [=[Remove-Item -LiteralPath $shimOutput]=]
         [=[Remove-Item -LiteralPath $buildRoot]=]
         [=[Remove-Item -LiteralPath $artifacts]=])
     assert_file_contains_literal(
@@ -708,15 +679,12 @@ foreach(full_profile_build_only_contract IN ITEMS
         [=[-SkipSourceArchive is permitted only with -BuildOnly.]=]
         [=[Get-FullProfileDirectSourceProvenance]=]
         [=['-SkipArchive']=]
-        [=[/p:IntDir=$shimIntermediateOutput\]=]
-        [=[MsQuic shim output validation]=]
         [=[-DPython3_ROOT_DIR=]=]
         [=[-DPython3_EXECUTABLE=]=]
         [=[[string]$WdkApiValidatorBinRoot]=]
         [=[[string]$WdkUniversalDdisRoot]=]
         [=[full-profile inventory is missing]=]
         [=[UsePreparedDriverSubmission]=]
-        [=[FULL_PROFILE_MSQUIC_SHIM_LIB_SHA256]=]
         [=[vdd-shader-inventory.json]=]
         [=[local-test-only-non-production]=])
     assert_file_contains_literal(

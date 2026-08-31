@@ -32,7 +32,6 @@ extern "C" {
 #include "src/network.h"
 #include "src/nvhttp.h"
 #include "src/process.h"
-#include "src/protocol_v3/control_session.h"
 #include "src/rtsp.h"
 #include "src/stream_policy.h"
 #include "src/utility.h"
@@ -817,7 +816,7 @@ TEST(VanillaMoonlightCompatibility, ReservationRollbackRetainsSlotThroughProcess
   EXPECT_TRUE(rtsp_stream::launch_session_rollback(replacement));
 }
 
-TEST(VanillaMoonlightCompatibility, StaleLegacyTimeoutCannotTearDownReplacementProtocolV3ProcessOrDisplay) {
+TEST(VanillaMoonlightCompatibility, StaleLegacyTimeoutCannotTearDownReplacementProcessOrDisplay) {
   constexpr auto owner_certificate = "certificate-a"sv;
   rtsp_stream::terminate_sessions();
   proc::proc.terminate();
@@ -847,9 +846,9 @@ TEST(VanillaMoonlightCompatibility, StaleLegacyTimeoutCannotTearDownReplacementP
   stale_pending->process_generation = legacy->process_generation;
   rtsp_stream::launch_session_raise(stale_pending);
 
-  auto protocol_v3 = std::make_shared<rtsp_stream::launch_session_t>();
-  ASSERT_EQ(proc::proc.execute(881, protocol_v3), 0);
-  ASSERT_GT(protocol_v3->process_generation, legacy->process_generation);
+  auto replacement = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(proc::proc.execute(881, replacement), 0);
+  ASSERT_GT(replacement->process_generation, legacy->process_generation);
   rtsp_stream::reset_idle_display_revert_count_for_tests();
 
   EXPECT_TRUE(rtsp_stream::expire_pending_launch_for_tests());
@@ -1583,47 +1582,4 @@ TEST(VanillaMoonlightCompatibility, UnknownSdpAttributeDoesNotBreakVanillaAnnoun
   ConnectedSockets sockets;
   rtsp_stream::cmd_announce(nullptr, sockets.server(), session, std::move(request));
   EXPECT_NE(sockets.read_response().find("RTSP/1.0 403 Forbidden\r\n"), std::string::npos);
-}
-
-TEST(VanillaMoonlightCompatibility, V3StartupFailurePreservesConfiguredLegacyListeners) {
-  auto settings = config::protocol_v3;
-  settings.legacy_compatibility = true;
-  auto policy = config::listener_startup_policy(settings);
-  EXPECT_TRUE(policy.start_legacy);
-  EXPECT_FALSE(policy.v3_failure_is_fatal);
-
-  settings.legacy_compatibility = false;
-  policy = config::listener_startup_policy(settings);
-  EXPECT_FALSE(policy.start_legacy);
-  EXPECT_TRUE(policy.v3_failure_is_fatal);
-}
-
-TEST(VanillaMoonlightCompatibility, UndefinedV3PairingPermissionBitsAreMigratedOutOfConfig) {
-  const auto saved = config::protocol_v3;
-  auto restore = util::fail_guard([&]() {
-    config::protocol_v3 = saved;
-  });
-
-  config::apply_config_for_test("protocol_v3_pairing_permissions = 255\n");
-  EXPECT_EQ(lumen::protocol_v3::control_session::defined_permission_mask, 0x3fU);
-  EXPECT_EQ(
-    config::protocol_v3.pairing_permissions,
-    lumen::protocol_v3::control_session::defined_permission_mask
-  );
-}
-
-TEST(VanillaMoonlightCompatibility, BuildsWithoutV3NormalizeMigratedV3OnlyConfiguration) {
-  const auto saved = config::protocol_v3;
-  auto restore = util::fail_guard([&]() {
-    config::protocol_v3 = saved;
-  });
-
-  config::apply_config_for_test("protocol_v3_enabled = true\nlegacy_compatibility = false\n");
-#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
-  EXPECT_TRUE(config::protocol_v3.enabled);
-  EXPECT_FALSE(config::protocol_v3.legacy_compatibility);
-#else
-  EXPECT_FALSE(config::protocol_v3.enabled);
-  EXPECT_TRUE(config::protocol_v3.legacy_compatibility);
-#endif
 }

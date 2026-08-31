@@ -57,20 +57,6 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
-    bool protocolV3Colorimetry {};  ///< Use exact protocol-v3 colorimetry instead of legacy inference.
-    std::uint8_t colorPrimaries {};  ///< Exact H.273 primaries code for protocol v3.
-    std::uint8_t colorTransfer {};  ///< Exact H.273 transfer code: SDR, PQ (16), or HLG (18).
-    std::uint8_t colorMatrix {};  ///< Exact H.273 matrix code.
-    std::uint8_t colorRange {};  ///< Zero limited or one full range.
-    bool hasStaticHDRMetadata {};  ///< Whether exact selected static HDR metadata applies.
-    std::array<std::uint16_t, 6> staticHDRDisplayPrimaries {};  ///< R/G/B x/y code values.
-    std::array<std::uint16_t, 2> staticHDRWhitePoint {};  ///< White-point x/y code values.
-    std::uint32_t staticHDRMaximumMasteringLuminance {};  ///< 0.0001-nit units.
-    std::uint32_t staticHDRMinimumMasteringLuminance {};  ///< 0.0001-nit units.
-    std::uint16_t staticHDRMaximumContentLightLevel {};  ///< MaxCLL in nits.
-    std::uint16_t staticHDRMaximumFrameAverageLightLevel {};  ///< MaxFALL in nits.
-    int refreshNumerator {};  ///< Optional exact protocol-v3 refresh numerator.
-    int refreshDenominator {};  ///< Optional exact protocol-v3 refresh denominator.
     std::string output_name;  ///< Per-session capture output, or empty for the configured default.
     std::shared_ptr<const stream_policy::EffectiveStreamPolicy> optimization_policy;  ///< Immutable resolved session policy.
     stream_policy::ClientProtocol client_protocol {stream_policy::ClientProtocol::vanilla};  ///< Exact negotiated client family.
@@ -779,7 +765,7 @@ namespace video {
    * @brief Produce exact decoder initialization for the active encoder tuple.
    *
    * The first exact adapter/driver/output/configuration tuple performs one bounded
-   * dummy-frame key-frame encode before protocol-v3 VIDEO_CONFIG is sent. Repeated
+   * dummy-frame key-frame encode before decoder initialization is published. Repeated
    * sessions reuse only an identity-bound initialization entry and otherwise fail
    * closed, so a cache hit never creates a throwaway encoder.
    *
@@ -861,9 +847,6 @@ namespace video {
    * @return Requested frame rate as a rational.
    */
   inline AVRational framerate_to_rational(const config_t &config) {
-    if (config.refreshNumerator > 0 && config.refreshDenominator > 0) {
-      return AVRational {config.refreshNumerator, config.refreshDenominator};
-    }
     if (config.framerateX100 > 0) {
       return framerateX100_to_rational(config.framerateX100);
     }

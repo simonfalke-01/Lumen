@@ -23,17 +23,17 @@ extern "C" {
 
 /** Fixed driver ABI version. */
 #define LUMEN_VDD_ABI_VERSION 6u
-/** Minimum supported width shared with protocol-v3 START admission. */
+/** Minimum supported width shared with host mode admission. */
 #define LUMEN_VDD_MIN_WIDTH LUMEN_START_MODE_MIN_WIDTH
-/** Maximum supported width shared with protocol-v3 START admission. */
+/** Maximum supported width shared with host mode admission. */
 #define LUMEN_VDD_MAX_WIDTH LUMEN_START_MODE_MAX_WIDTH
-/** Minimum supported height shared with protocol-v3 START admission. */
+/** Minimum supported height shared with host mode admission. */
 #define LUMEN_VDD_MIN_HEIGHT LUMEN_START_MODE_MIN_HEIGHT
-/** Maximum supported height shared with protocol-v3 START admission. */
+/** Maximum supported height shared with host mode admission. */
 #define LUMEN_VDD_MAX_HEIGHT LUMEN_START_MODE_MAX_HEIGHT
-/** Minimum supported refresh rate shared with protocol-v3 START admission. */
+/** Minimum supported refresh rate shared with host mode admission. */
 #define LUMEN_VDD_MIN_REFRESH_HZ LUMEN_START_MODE_MIN_REFRESH_HZ
-/** Maximum supported refresh rate shared with protocol-v3 START admission. */
+/** Maximum supported refresh rate shared with host mode admission. */
 #define LUMEN_VDD_MAX_REFRESH_HZ LUMEN_START_MODE_MAX_REFRESH_HZ
 /** Maximum rational component accepted at the trust boundary. */
 #define LUMEN_VDD_MAX_RATIONAL_COMPONENT LUMEN_START_MODE_MAX_RATIONAL_COMPONENT

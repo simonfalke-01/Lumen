@@ -11,11 +11,13 @@ extern "C" {
 // standard includes
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -223,6 +225,415 @@ namespace input {
   using gamepad_slot_allocator_t = detail::synchronized_slot_allocator_t<platf::MAX_GAMEPADS>;  ///< Global gamepad slot allocator type.
   static gamepad_slot_allocator_t gamepad_slots;  ///< Generation-qualified slots shared by session consumers.
   static detail::input_session_reset_gate_t input_session_gate;  ///< Shared transport reset serialization gate.
+
+  void update_platform_keyboard_locked(std::uint16_t key_code, bool release, std::uint8_t flags);
+
+  /** @brief Held keyboard and pointer-button contributions owned by one LSP authority. */
+  struct lsp_platform_input_t {
+    struct controller_t {
+      gamepad_slot_allocator_t::reservation_t reservation;  ///< Global platform slot ownership.
+      std::uint32_t controller_id {};  ///< LSP controller ID.
+      std::uint32_t instance_generation {};  ///< Exact live generation.
+      platf::gamepad_state_t state {};  ///< Latest analog and edge-owned button state.
+      bool active {};  ///< Whether this slot is live.
+    };
+
+    std::bitset<256> keyboard_usages;  ///< Pressed USB keyboard-page usages.
+    std::bitset<6> pointer_buttons;  ///< Pressed pointer buttons one through five.
+    std::array<controller_t, 16> controllers;  ///< LSP controller slots.
+    safe::mail_t feedback_mail;  ///< Private controller-feedback mailbox.
+    platf::feedback_queue_t feedback_queue;  ///< Platform callback queue.
+    lsp_controller_feedback_callback_t feedback_callback {};  ///< Runtime LSPG callback.
+    void *feedback_context {};  ///< Runtime callback context.
+    std::jthread feedback_worker;  ///< Feedback queue drain owner.
+  };
+
+  /**
+   * @brief Map a USB keyboard-page usage to the existing platform virtual-key boundary.
+   *
+   * @param usage USB HID usage.
+   * @return Virtual-key code, or zero when this first input slice does not support the usage.
+   */
+  std::uint16_t virtual_key_from_hid_usage(const std::uint16_t usage) noexcept {
+    if (usage >= 4 && usage <= 29) {
+      return static_cast<std::uint16_t>('A' + usage - 4);
+    }
+    if (usage >= 30 && usage <= 38) {
+      return static_cast<std::uint16_t>('1' + usage - 30);
+    }
+    if (usage == 39) {
+      return '0';
+    }
+    if (usage >= 58 && usage <= 69) {
+      return static_cast<std::uint16_t>(0x70 + usage - 58);
+    }
+    switch (usage) {
+      case 40:
+        return 0x0d;
+      case 41:
+        return 0x1b;
+      case 42:
+        return 0x08;
+      case 43:
+        return 0x09;
+      case 44:
+        return 0x20;
+      case 57:
+        return 0x14;
+      case 70:
+        return 0x2c;
+      case 71:
+        return 0x91;
+      case 72:
+        return 0x13;
+      case 73:
+        return 0x2d;
+      case 74:
+        return 0x24;
+      case 75:
+        return 0x21;
+      case 76:
+        return 0x2e;
+      case 77:
+        return 0x23;
+      case 78:
+        return 0x22;
+      case 79:
+        return 0x27;
+      case 80:
+        return 0x25;
+      case 81:
+        return 0x28;
+      case 82:
+        return 0x26;
+      case 83:
+        return 0x90;
+      case 224:
+        return VKEY_LCONTROL;
+      case 225:
+        return VKEY_LSHIFT;
+      case 226:
+        return VKEY_LMENU;
+      case 227:
+        return 0x5b;
+      case 228:
+        return VKEY_RCONTROL;
+      case 229:
+        return VKEY_RSHIFT;
+      case 230:
+        return VKEY_RMENU;
+      case 231:
+        return 0x5c;
+      default:
+        return 0;
+    }
+  }
+
+  void lsp_platform_input_deleter_t::operator()(lsp_platform_input_t *input) const noexcept {
+    if (input != nullptr) {
+      neutralize_lsp_platform_input(*input);
+      if (input->feedback_queue) {
+        input->feedback_queue->stop();
+      }
+      input->feedback_worker.request_stop();
+      if (input->feedback_worker.joinable()) {
+        input->feedback_worker.join();
+      }
+    }
+    delete input;
+  }
+
+  lsp_platform_input_ptr alloc_lsp_platform_input(
+    const lsp_controller_feedback_callback_t feedback_callback,
+    void *const feedback_context
+  ) {
+    lsp_platform_input_ptr input {new (std::nothrow) lsp_platform_input_t};
+    if (!input) {
+      return {};
+    }
+    input->feedback_callback = feedback_callback;
+    input->feedback_context = feedback_context;
+    input->feedback_mail = std::make_shared<safe::mail_raw_t>();
+    input->feedback_queue = input->feedback_mail->queue<platf::gamepad_feedback_msg_t>("lsp-controller-feedback");
+    if (feedback_callback != nullptr) {
+      auto *const raw = input.get();
+      try {
+        input->feedback_worker = std::jthread {[raw](const std::stop_token stop_token) {
+          while (!stop_token.stop_requested()) {
+            const auto message = raw->feedback_queue->pop(10ms);
+            if (message && raw->feedback_callback != nullptr) {
+              raw->feedback_callback(raw->feedback_context, {*message});
+            }
+          }
+        }};
+      } catch (...) {
+        return {};
+      }
+    }
+    return input;
+  }
+
+  bool apply_lsp_pointer(
+    lsp_platform_input_t &input,
+    std::int64_t delta_x,
+    std::int64_t delta_y,
+    std::int64_t vertical_scroll,
+    std::int64_t horizontal_scroll
+  ) noexcept {
+    (void)input;
+    std::lock_guard lock(platform_input_mutex);
+    constexpr auto minimum = static_cast<std::int64_t>(std::numeric_limits<int>::min());
+    constexpr auto maximum = static_cast<std::int64_t>(std::numeric_limits<int>::max());
+    while (delta_x != 0 || delta_y != 0) {
+      const auto x = static_cast<int>(std::clamp(delta_x, minimum, maximum));
+      const auto y = static_cast<int>(std::clamp(delta_y, minimum, maximum));
+      platf::move_mouse(platf_input, x, y);
+      delta_x -= x;
+      delta_y -= y;
+    }
+    while (vertical_scroll != 0) {
+      const auto distance = static_cast<int>(std::clamp(vertical_scroll, minimum, maximum));
+      platf::scroll(platf_input, distance);
+      vertical_scroll -= distance;
+    }
+    while (horizontal_scroll != 0) {
+      const auto distance = static_cast<int>(std::clamp(horizontal_scroll, minimum, maximum));
+      platf::hscroll(platf_input, distance);
+      horizontal_scroll -= distance;
+    }
+    return true;
+  }
+
+  bool apply_lsp_key(lsp_platform_input_t &input, const std::uint16_t hid_usage, const bool release) noexcept {
+    if (hid_usage >= input.keyboard_usages.size()) {
+      return false;
+    }
+    const auto key = virtual_key_from_hid_usage(hid_usage);
+    if (key == 0) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    if (input.keyboard_usages[hid_usage] == !release) {
+      return true;
+    }
+    input.keyboard_usages[hid_usage] = !release;
+    update_platform_keyboard_locked(key, release, 0);
+    return true;
+  }
+
+  bool apply_lsp_pointer_button(lsp_platform_input_t &input, const std::uint16_t button, const bool release) noexcept {
+    if (button == 0 || button >= input.pointer_buttons.size()) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    if (input.pointer_buttons[button] == !release) {
+      return true;
+    }
+    input.pointer_buttons[button] = !release;
+    if (!release) {
+      if (global_mouse_holds.acquire(button)) {
+        platf::button_mouse(platf_input, button, false);
+      }
+    } else if (global_mouse_holds.release(button)) {
+      platf::button_mouse(platf_input, button, true);
+    }
+    return true;
+  }
+
+  void neutralize_lsp_platform_input(lsp_platform_input_t &input) noexcept {
+    std::lock_guard lock(platform_input_mutex);
+    for (std::size_t usage = 0; usage < input.keyboard_usages.size(); ++usage) {
+      if (!input.keyboard_usages[usage]) {
+        continue;
+      }
+      const auto key = virtual_key_from_hid_usage(static_cast<std::uint16_t>(usage));
+      if (key != 0) {
+        update_platform_keyboard_locked(key, true, 0);
+      }
+      input.keyboard_usages[usage] = false;
+    }
+    for (std::size_t button = 1; button < input.pointer_buttons.size(); ++button) {
+      if (input.pointer_buttons[button] && global_mouse_holds.release(static_cast<int>(button))) {
+        platf::button_mouse(platf_input, static_cast<int>(button), true);
+      }
+      input.pointer_buttons[button] = false;
+    }
+    for (auto &controller : input.controllers) {
+      if (!controller.active) {
+        continue;
+      }
+      platf::gamepad_update(platf_input, controller.reservation.id, {});
+      platf::free_gamepad(platf_input, controller.reservation.id);
+      gamepad_slots.release(controller.reservation);
+      controller = {};
+    }
+  }
+
+  bool arrive_lsp_controller(
+    lsp_platform_input_t &input,
+    const std::uint32_t input_generation,
+    const std::uint32_t controller_id,
+    const std::uint32_t instance_generation,
+    const std::uint8_t type
+  ) noexcept {
+    if (input_generation == 0 || controller_id == 0 || controller_id > input.controllers.size() || instance_generation == 0) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    auto &controller = input.controllers[controller_id - 1];
+    if (controller.active) {
+      return controller.controller_id == controller_id && controller.instance_generation == instance_generation;
+    }
+    const auto reservation = gamepad_slots.allocate();
+    if (!reservation) {
+      return false;
+    }
+    const platf::gamepad_arrival_t arrival {.type = type};
+    if (platf::alloc_gamepad(
+          platf_input,
+          {reservation.id, static_cast<std::uint8_t>(controller_id - 1), input_generation, instance_generation},
+          arrival,
+          input.feedback_queue
+        ) != 0) {
+      gamepad_slots.release(reservation);
+      return false;
+    }
+    controller = {
+      .reservation = reservation,
+      .controller_id = controller_id,
+      .instance_generation = instance_generation,
+      .active = true,
+    };
+    return true;
+  }
+
+  bool remove_lsp_controller(
+    lsp_platform_input_t &input,
+    const std::uint32_t controller_id,
+    const std::uint32_t instance_generation
+  ) noexcept {
+    if (controller_id == 0 || controller_id > input.controllers.size()) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    auto &controller = input.controllers[controller_id - 1];
+    if (!controller.active || controller.instance_generation != instance_generation) {
+      return false;
+    }
+    platf::gamepad_update(platf_input, controller.reservation.id, {});
+    platf::free_gamepad(platf_input, controller.reservation.id);
+    gamepad_slots.release(controller.reservation);
+    controller = {};
+    return true;
+  }
+
+  bool apply_lsp_controller_state(
+    lsp_platform_input_t &input,
+    const std::uint32_t controller_id,
+    const std::uint32_t instance_generation,
+    const std::uint8_t left_trigger,
+    const std::uint8_t right_trigger,
+    const std::int16_t left_x,
+    const std::int16_t left_y,
+    const std::int16_t right_x,
+    const std::int16_t right_y
+  ) noexcept {
+    if (controller_id == 0 || controller_id > input.controllers.size()) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    auto &controller = input.controllers[controller_id - 1];
+    if (!controller.active || controller.instance_generation != instance_generation) {
+      return false;
+    }
+    controller.state.lt = left_trigger;
+    controller.state.rt = right_trigger;
+    controller.state.lsX = left_x;
+    controller.state.lsY = left_y;
+    controller.state.rsX = right_x;
+    controller.state.rsY = right_y;
+    platf::gamepad_update(platf_input, controller.reservation.id, controller.state);
+    return true;
+  }
+
+  bool apply_lsp_controller_button(
+    lsp_platform_input_t &input,
+    const std::uint32_t controller_id,
+    const std::uint32_t instance_generation,
+    const std::uint16_t button_bit,
+    const bool release
+  ) noexcept {
+    if (controller_id == 0 || controller_id > input.controllers.size() || button_bit >= 32) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    auto &controller = input.controllers[controller_id - 1];
+    if (!controller.active || controller.instance_generation != instance_generation) {
+      return false;
+    }
+    const auto mask = std::uint32_t {1} << button_bit;
+    controller.state.buttonFlags = release ? controller.state.buttonFlags & ~mask : controller.state.buttonFlags | mask;
+    platf::gamepad_update(platf_input, controller.reservation.id, controller.state);
+    return true;
+  }
+
+  bool apply_lsp_controller_sensor(
+    lsp_platform_input_t &input,
+    const std::uint32_t input_generation,
+    const std::uint32_t controller_id,
+    const std::uint32_t instance_generation,
+    const std::uint8_t sensor_type,
+    const float x,
+    const float y,
+    const float z
+  ) noexcept {
+    if (input_generation == 0 || controller_id == 0 || controller_id > input.controllers.size()) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    const auto &controller = input.controllers[controller_id - 1];
+    if (!controller.active || controller.instance_generation != instance_generation) {
+      return false;
+    }
+    platf::gamepad_motion(platf_input, {
+      .id = {controller.reservation.id, static_cast<std::uint8_t>(controller_id - 1), input_generation, instance_generation},
+      .motionType = sensor_type,
+      .x = x,
+      .y = y,
+      .z = z,
+    });
+    return true;
+  }
+
+  bool apply_lsp_controller_touch(
+    lsp_platform_input_t &input,
+    const std::uint32_t input_generation,
+    const std::uint32_t controller_id,
+    const std::uint32_t instance_generation,
+    const std::uint8_t event_type,
+    const std::uint32_t contact_id,
+    const float x,
+    const float y,
+    const float pressure
+  ) noexcept {
+    if (input_generation == 0 || controller_id == 0 || controller_id > input.controllers.size() || contact_id == 0) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    const auto &controller = input.controllers[controller_id - 1];
+    if (!controller.active || controller.instance_generation != instance_generation) {
+      return false;
+    }
+    platf::gamepad_touch(platf_input, {
+      .id = {controller.reservation.id, static_cast<std::uint8_t>(controller_id - 1), input_generation, instance_generation},
+      .eventType = event_type,
+      .pointerId = contact_id,
+      .x = x,
+      .y = y,
+      .pressure = pressure,
+    });
+    return true;
+  }
 
   /**
    * @brief Release all platform resources associated with a virtual gamepad.
@@ -2234,65 +2645,6 @@ namespace input {
            result == input_t::dispatcher_t::enqueue_result_e::coalesced;
   }
 
-  bool passthrough_state(
-    std::shared_ptr<input_t> &input,
-    ordered_state_operation_t operation,
-    bool supersedable,
-    std::function<void(bool)> completion
-  ) {
-    if (!input || !input->dispatcher || !operation) {
-      return false;
-    }
-    auto *const raw_input = input.get();
-    const auto result = input->dispatcher->enqueue_operation(
-      [raw_input, operation = std::move(operation), completion = std::move(completion)]() mutable {
-        const ordered_injector_t injector {[raw_input](std::vector<std::uint8_t> &&packet) {
-          return passthrough_next_message(raw_input, std::move(packet));
-        }};
-        if (!operation(injector)) {
-          if (completion) {
-            completion(false);
-          }
-          throw std::runtime_error {"protocol-v3 ordered input operation failed"};
-        }
-        if (completion) {
-          completion(true);
-        }
-      },
-      supersedable
-    );
-    if (result == input_t::dispatcher_t::enqueue_result_e::closed) {
-      BOOST_LOG(debug) << "Ignoring protocol-v3 input state after ordered dispatcher shutdown"sv;
-      return false;
-    }
-    return true;
-  }
-
-  bool set_gamepad_feedback_identity(
-    input_t *input,
-    const std::uint8_t controller,
-    const std::uint32_t input_generation,
-    const std::uint32_t controller_generation
-  ) noexcept {
-    if (!input || controller >= input->gamepads.size() || input_generation == 0 ||
-        controller_generation == 0) {
-      return false;
-    }
-    auto &gamepad = input->gamepads[controller];
-    if (gamepad.id >= 0) {
-      return gamepad.feedback_identity.id == controller &&
-             gamepad.feedback_identity.input_generation == input_generation &&
-             gamepad.feedback_identity.controller_generation == controller_generation;
-    }
-    gamepad.feedback_identity = {controller, input_generation, controller_generation};
-    return true;
-  }
-
-  /**
-   * @brief Seal a session dispatcher early so blocked control-stream producers wake for shutdown.
-   *
-   * @param input Shared stream input state to seal.
-   */
   void begin_close(std::shared_ptr<input_t> &input) {
     if (input && input->dispatcher) {
       input->dispatcher->begin_close();

@@ -204,25 +204,6 @@ endif ()
 set(SUNSHINE_SOURCES
         ${SUNSHINE_TARGET_FILES})
 
-# The portable facade implementation is always available to the test aggregate;
-# the real MsQuic dependency and native adapter remain Windows-only and opt-in.
-if(NOT (WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC))
-    list(APPEND SUNSHINE_SOURCES
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.cpp
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.h
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.cpp
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.h
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/operation_outcomes.cpp
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/operation_outcomes.h
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.cpp
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.h
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/resource_budget.cpp
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/resource_budget.h
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.cpp
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h
-            ${CMAKE_SOURCE_DIR}/src/protocol_v3/start_mode_contract.h)
-endif()
-
 # The Windows gamepad router, dynamic-session state machine, and report adapter
 # are intentionally portable so their fake-channel tests run on every host.
 # Windows builds already receive these sources through PLATFORM_TARGET_FILES.

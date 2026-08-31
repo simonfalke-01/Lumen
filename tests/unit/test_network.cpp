@@ -28,40 +28,39 @@ INSTANTIATE_TEST_SUITE_P(
   )
 );
 
-TEST(MdnsServiceDescriptorTest, AcceptsOnlyExactLegacyOrProtocolV3Records) {
-  EXPECT_TRUE(platf::publish::valid_service({
+TEST(MdnsServiceDescriptorTest, AcceptsLegacyAndExactLspRecords) {
+  const platf::publish::service_t legacy {
     .type = platf::SERVICE_TYPE,
     .port = 47989,
-  }));
-  const platf::publish::service_t modern {
-    .type = "_lumen-v3._udp",
+  };
+  const platf::publish::service_t lsp {
+    .type = platf::LSP_SERVICE_TYPE,
     .port = 48030,
     .txt = {
-      {"v", "3"},
-      {"id", "000102030405060708090a0b0c0d0e0f"},
-      {"port", "48030"},
-      {"caps", "000000000000037f"},
+      {"v", "1"},
+      {"id", "00112233445566778899aabbccddeeff"},
+      {"caps", "0000000000000057"},
     },
   };
-  EXPECT_TRUE(platf::publish::valid_service(modern));
-  EXPECT_TRUE(platf::publish::valid_services({
-    {.type = platf::SERVICE_TYPE, .port = 47989},
-    modern,
-  }));
-  EXPECT_FALSE(platf::publish::valid_services({modern, modern}));
-
-  auto invalid = modern;
-  invalid.txt[1].second[0] = 'A';
-  EXPECT_FALSE(platf::publish::valid_service(invalid));
-  invalid = modern;
-  invalid.txt[2].second = "48031";
-  EXPECT_FALSE(platf::publish::valid_service(invalid));
-  invalid = modern;
-  invalid.txt[3].second.pop_back();
-  EXPECT_FALSE(platf::publish::valid_service(invalid));
-  invalid = modern;
-  invalid.type = "_nvstream._udp";
-  EXPECT_FALSE(platf::publish::valid_service(invalid));
+  EXPECT_TRUE(platf::publish::valid_service(legacy));
+  EXPECT_TRUE(platf::publish::valid_service(lsp));
+  EXPECT_TRUE(platf::publish::valid_services({legacy}));
+  EXPECT_TRUE(platf::publish::valid_services({legacy, lsp}));
+  EXPECT_TRUE(platf::publish::valid_services({lsp, legacy}));
+  EXPECT_FALSE(platf::publish::valid_services({}));
+  EXPECT_FALSE(platf::publish::valid_services({legacy, legacy}));
+  EXPECT_FALSE(platf::publish::valid_services({lsp}));
+  EXPECT_FALSE(platf::publish::valid_services({lsp, lsp}));
+  EXPECT_FALSE(platf::publish::valid_service({.type = "_other._tcp", .port = 47989}));
+  auto invalid_version = lsp;
+  invalid_version.txt[0].second = "2";
+  EXPECT_FALSE(platf::publish::valid_service(invalid_version));
+  auto invalid_host_id = lsp;
+  invalid_host_id.txt[1].second = "00112233445566778899AABBCCDDEEFF";
+  EXPECT_FALSE(platf::publish::valid_service(invalid_host_id));
+  auto invalid_capabilities = lsp;
+  invalid_capabilities.txt[2].second = "57";
+  EXPECT_FALSE(platf::publish::valid_service(invalid_capabilities));
 }
 
 /**

@@ -37,8 +37,6 @@ $expanded = Join-Path $root 'expanded'
 $runs = Join-Path $root 'runs'
 try {
     New-Item -ItemType Directory -Path $source -Force | Out-Null
-    Write-TestFile (Join-Path $source 'src/platform/windows/msquic_shim/manifest.json') `
-        '{"abi":3,"header_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","project_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
     Write-TestFile `
         (Join-Path $source 'src/platform/windows/virtual_display_driver/LumenVirtualDisplayProtocol.h') `
         '#define LUMEN_VDD_ABI_VERSION 6u'

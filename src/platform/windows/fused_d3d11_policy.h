@@ -33,7 +33,6 @@ namespace platf::dxgi::fused_d3d11 {
     third_party_extension = 1,  ///< Non-Umbra client using an independently negotiated extension.
     umbra_legacy = 2,  ///< Umbra using the legacy GameStream transport.
     umbra_v2 = 3,  ///< Umbra using protocol v2.
-    umbra_v3 = 4,  ///< Umbra using protocol v3 over QUIC.
   };
 
   [[nodiscard]] constexpr telemetry_profile_e telemetry_profile_for(
@@ -62,8 +61,6 @@ namespace platf::dxgi::fused_d3d11 {
         return telemetry_client_e::umbra_legacy;
       case stream_policy::ClientProtocol::umbra_v2:
         return telemetry_client_e::umbra_v2;
-      case stream_policy::ClientProtocol::umbra_v3:
-        return telemetry_client_e::umbra_v3;
     }
     return telemetry_client_e::vanilla_legacy;
   }

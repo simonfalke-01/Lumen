@@ -111,6 +111,17 @@ namespace http {
   [[nodiscard]] bool update_state_file(const std::string &file, const state_file_mutator_t &mutator);
 
   /**
+   * @brief Remove persisted state and credentials owned by the retired native transport.
+   *
+   * All GameStream pairing, application, certificate, and Web UI state remains
+   * untouched. Missing retired files are treated as an already-complete migration.
+   *
+   * @param file Shared Lumen state file path.
+   * @return True when every requested removal completed or was already absent.
+   */
+  [[nodiscard]] bool migrate_removed_transport_state(const std::string &file);
+
+  /**
    * @brief Reload Web UI user credentials from disk.
    *
    * @param file Destination path for the downloaded content.

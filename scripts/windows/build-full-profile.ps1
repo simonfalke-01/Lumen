@@ -10,9 +10,6 @@ param(
     [string]$Msys2Root,
 
     [Parameter(Mandatory = $true)]
-    [string]$MsQuicPackageRoot,
-
-    [Parameter(Mandatory = $true)]
     [string]$BuildVersion,
 
     [string]$SharedSourceFreezeManifestPath,
@@ -67,7 +64,6 @@ function Resolve-Tool {
 
 $SourceRoot = Resolve-ExistingDirectory $SourceRoot "Source"
 $Msys2Root = Resolve-ExistingDirectory $Msys2Root "MSYS2"
-$MsQuicPackageRoot = Resolve-ExistingDirectory $MsQuicPackageRoot "MsQuic package"
 $StagingRoot = [IO.Path]::GetFullPath($StagingRoot)
 if ($UsePreparedDriverSubmission -and
     (-not $BuildOnly -or [string]::IsNullOrWhiteSpace($SignedDriverRoot))) {
@@ -377,20 +373,6 @@ $sourceProvenance = if ($SkipSourceArchive) {
 $SourceRoot = $sourceProvenance.SourceRoot
 $sourceFilesManifestSha256 = $sourceProvenance.FilesManifestSha256
 
-$requiredMsQuicHashes = @{
-    "build\native\include\msquic.h" = "EBD3499686C2B3008ED0EE5B06DAE1A62A50192816ABFE9A67BBBBA97CABB861"
-    "build\native\lib\x64\msquic.lib" = "AA08808C1CA29166EA476A66410B73C7D0D85A34459EA59A30DE63CCA7AD7327"
-    "build\native\bin\x64\msquic.dll" = "C981E61CD207F42D46B54EF7DBF1049F1F836424C3BA981F4469AC2B2BEA9610"
-    "LICENSE" = "903DF5512F7D02609FED0C780A9B704F5A3EEB6E4D84EBE42A29845C81899A3C"
-}
-foreach ($entry in $requiredMsQuicHashes.GetEnumerator()) {
-    $path = Join-Path $MsQuicPackageRoot $entry.Key
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
-        (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $entry.Value) {
-        throw "MsQuic 2.6.0 package identity mismatch: $($entry.Key)"
-    }
-}
-
 function Invoke-DriverBuild {
     param(
         [string]$Name,
@@ -495,60 +477,6 @@ if (-not $UsePreparedDriverSubmission) {
         -PackageDirectory $vddRaw
 }
 
-$shimProject = Join-Path $SourceRoot "src\platform\windows\msquic_shim\LumenMsQuicShim.vcxproj"
-[void](Assert-FullProfileSourceSnapshot `
-    -SourceRoot $SourceRoot `
-    -FilesManifestPath $sourceProvenance.FilesManifestPath `
-    -Boundary $(if ($UsePreparedDriverSubmission) { 'prepared driver reuse' } else { 'MsQuic shim build' }))
-$shimOutput = Join-Path $StagingRoot "msquic-shim"
-$shimIntermediateOutput = Join-Path $shimOutput "obj"
-if (-not $UsePreparedDriverSubmission) {
-    if (Test-Path -LiteralPath $shimOutput) {
-        Remove-Item -LiteralPath $shimOutput -Recurse -Force
-    }
-    New-Item -ItemType Directory -Path $shimOutput, $shimIntermediateOutput -Force | Out-Null
-    [void](Invoke-MandatoryGate6Command `
-        -RunId 'msquic-shim-msbuild' `
-        -FilePath $msbuild `
-        -Arguments @(
-            $shimProject,
-            '/m',
-            '/t:Rebuild',
-            '/warnaserror',
-            '/p:Configuration=Release',
-            '/p:Platform=x64',
-            "/p:MsQuicRoot=$MsQuicPackageRoot",
-            "/p:OutDir=$shimOutput\",
-            "/p:IntDir=$shimIntermediateOutput\"
-        ) `
-        -WorkingDirectory $SourceRoot `
-        -ToolchainIds @('windows-msbuild-wdk'))
-} elseif (-not (Test-Path -LiteralPath $shimOutput -PathType Container)) {
-    throw "Prepared MsQuic shim directory is missing: $shimOutput"
-}
-[void](Assert-FullProfileSourceSnapshot `
-    -SourceRoot $SourceRoot `
-    -FilesManifestPath $sourceProvenance.FilesManifestPath `
-    -Boundary 'MsQuic shim output validation')
-$shimDll = Join-Path $shimOutput "lumen_msquic_shim.dll"
-$shimLib = Join-Path $shimOutput "lumen_msquic_shim.lib"
-$shimManifest = Join-Path $shimOutput "manifest.json"
-foreach ($path in @($shimDll, $shimLib, $shimManifest)) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "MsQuic ABI3 shim output is incomplete: $path"
-    }
-}
-$manifest = Get-Content -LiteralPath $shimManifest -Raw | ConvertFrom-Json
-$shimDllHash = (Get-FileHash $shimDll -Algorithm SHA256).Hash.ToLowerInvariant()
-$shimLibHash = (Get-FileHash $shimLib -Algorithm SHA256).Hash.ToLowerInvariant()
-if ([int]$manifest.abi -ne 3 -or
-    [string]$manifest.architecture -cne "x64" -or
-    [string]$manifest.toolset -cne "v143" -or
-    [string]$manifest.shim_dll_sha256 -cne $shimDllHash -or
-    [string]$manifest.shim_import_library_sha256 -cne $shimLibHash) {
-    throw "MsQuic ABI3 shim manifest does not match the built artifacts."
-}
-
 $sourceFreezeManifest = Get-Content $sourceProvenance.FreezeManifestPath -Raw | ConvertFrom-Json
 $currentDriverSubmissions = [ordered]@{}
 foreach ($directory in @($vhidRaw, $vmicRaw, $vddRaw)) {
@@ -575,11 +503,8 @@ if ($UsePreparedDriverSubmission) {
         [string]$pendingManifest.sharedSourceFreezeManifestSha256 -cne $sharedSourceFreezeManifestSha256 -or
         [int]$pendingManifest.vddShaderCount -ne 7 -or
         [string]$pendingManifest.vddShaderInventorySha256 -cne
-            [string]$sourceFreezeManifest.identities.vddShaderInventorySha256 -or
-        [int]$pendingManifest.msquicShim.abi -ne 3 -or
-        [string]$pendingManifest.msquicShim.dllSha256 -cne $shimDllHash -or
-        [string]$pendingManifest.msquicShim.libSha256 -cne $shimLibHash) {
-        throw 'Prepared driver manifest is not bound to the current source freeze and MsQuic shim.'
+            [string]$sourceFreezeManifest.identities.vddShaderInventorySha256) {
+        throw 'Prepared driver manifest is not bound to the current source freeze.'
     }
     foreach ($name in @('virtual-hid', 'virtual-microphone', 'virtual-display')) {
         $expectedRows = @($pendingManifest.unsignedDriverSubmissions.$name | Sort-Object name)
@@ -605,11 +530,6 @@ if ($UsePreparedDriverSubmission) {
         sharedSourceFreezeManifestSha256 = $sharedSourceFreezeManifestSha256
         vddShaderCount = 7
         vddShaderInventorySha256 = [string]$sourceFreezeManifest.identities.vddShaderInventorySha256
-        msquicShim = @{
-            abi = 3
-            dllSha256 = $shimDllHash
-            libSha256 = $shimLibHash
-        }
         unsignedDriverSubmissions = $currentDriverSubmissions
     }
     $pendingManifest | ConvertTo-Json -Depth 8 | Set-Content $pendingManifestPath -Encoding UTF8
@@ -798,10 +718,6 @@ $npmMsys = Convert-ToMsysPath $npmExecutable
 $uvMsys = Convert-ToMsysPath $uvExecutable
 $pythonEnvironment = Join-Path $StagingRoot 'python-environment'
 $pythonEnvironmentMsys = Convert-ToMsysPath $pythonEnvironment
-$shimMsys = Convert-ToMsysPath $shimOutput
-$msquicRuntimeMsys = Convert-ToMsysPath (Join-Path $MsQuicPackageRoot "build\native\bin\x64")
-$msquicCmake = Convert-ToCMakePath $MsQuicPackageRoot
-$shimCmake = Convert-ToCMakePath $shimOutput
 $vhidCmake = Convert-ToCMakePath $vhidSigned
 $vmicCmake = Convert-ToCMakePath $vmicSigned
 $vddCmake = Convert-ToCMakePath $vddSigned
@@ -857,7 +773,7 @@ cd '$sourceMsys'
 export UV_PYTHON='$pythonCmake'
 export UV_PROJECT_ENVIRONMENT='$pythonEnvironmentMsys'
 export DOTNET_ROOT='$dotnetRootCmake'
-export PATH='$shimMsys':'$msquicRuntimeMsys':'$dotnetMsys':'$nodeMsys':"`$PATH"
+export PATH='$dotnetMsys':'$nodeMsys':"`$PATH"
 '$uvMsys' sync --locked --no-python-downloads --no-install-project
 cmake -S . -B '$buildMsys' -G Ninja \
   -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_WERROR=ON -DCMAKE_BUILD_TYPE=Release \
@@ -867,11 +783,7 @@ cmake -S . -B '$buildMsys' -G Ninja \
   -DPython3_EXECUTABLE='$pythonCmake' \
   -DDOTNET_EXECUTABLE='$dotnetCmake' \
   -DNPM='$npmCmake' \
-  -DLUMEN_WINDOWS_FULL_PROFILE=ON -DLUMEN_EXPERIMENTAL_MSQUIC=ON \
-  -DLUMEN_MSQUIC_VERSION=2.6.0 -DLUMEN_MSQUIC_ROOT='$msquicCmake' \
-  -DLUMEN_MSQUIC_SHIM_ROOT='$shimCmake' \
-  -DLUMEN_MSQUIC_SHIM_DLL_SHA256='$shimDllHash' \
-  -DLUMEN_MSQUIC_SHIM_LIB_SHA256='$shimLibHash' \
+  -DLUMEN_WINDOWS_FULL_PROFILE=ON \
   $localTestMarkerCmake \
   -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR='$vhidCmake' \
   -DSUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=OFF \
@@ -935,7 +847,6 @@ Copy-Item $zip[0].FullName $versionedZip -Force
 $env:EXPECT_VHID_FEATURE = "true"
 $env:EXPECT_VMIC_FEATURE = "true"
 $env:EXPECT_VDD_FEATURE = "true"
-$env:EXPECT_MSQUIC = "true"
 $env:EXPECT_LOCAL_TEST_SIGNED = if ($AllowTestSignedDrivers) { "true" } else { "false" }
 $env:GITHUB_ENV = Join-Path $StagingRoot "full-profile-validator.env"
 $env:LUMEN_MSI_PATH = $versionedMsi
@@ -1069,15 +980,11 @@ $zipContentRoot = Get-Gate6PackageContentRoot $zipExtractionRoot 'ZIP'
 $requiredApplicationPaths = @(
     'Lumen.exe',
     'zlib1.dll',
-    'msquic.dll',
-    'lumen_msquic_shim.dll',
-    'MsQuic-LICENSE.txt',
     'tools/lumensvc.exe',
     'tools/lumen-vddctl.exe'
 )
 $requiredWebPaths = @(
     'assets/web/apps.html',
-    'assets/web/clients.html',
     'assets/web/config.html',
     'assets/web/featured.html',
     'assets/web/index.html',
@@ -1126,10 +1033,6 @@ foreach ($package in @(
 
 $standaloneExe = Join-Path $artifacts "Lumen-$BuildVersion-Windows-AMD64.exe"
 Copy-Item (Join-Path $msiContentRoot 'Lumen.exe') $standaloneExe -Force
-
-$shimArtifactRoot = Join-Path $artifacts 'msquic-shim'
-New-Item -ItemType Directory -Path $shimArtifactRoot -Force | Out-Null
-Copy-Item -LiteralPath $shimDll, $shimLib, $shimManifest -Destination $shimArtifactRoot -Force
 
 $driverArtifactRoot = Join-Path $artifacts 'drivers'
 New-Item -ItemType Directory -Path $driverArtifactRoot -Force | Out-Null
@@ -1186,9 +1089,6 @@ Assert-Gate6MandatoryRunsPassed @($gate6Runs)
 if (-not $BuildOnly) {
     Copy-Gate6EvidenceTree $freezeDirectory 'source-freeze'
     Copy-Gate6EvidenceFile $signedSubmissionManifestPath 'full-profile-driver-manifest.json'
-    Copy-Gate6EvidenceFile $shimDll 'shim/lumen_msquic_shim.dll'
-    Copy-Gate6EvidenceFile $shimLib 'shim/lumen_msquic_shim.lib'
-    Copy-Gate6EvidenceFile $shimManifest 'shim/manifest.json'
     foreach ($path in $requiredApplicationPaths) {
         Copy-Gate6EvidenceFile (Join-Path $msiContentRoot $path) "app/$($path -replace '\\', '/')"
     }
@@ -1199,7 +1099,7 @@ if (-not $BuildOnly) {
         )) {
         Copy-Gate6EvidenceTree $driver.Root "drivers/$($driver.Name)"
     }
-    foreach ($vector in @('quic_v3_vectors.json', 'start_mode_vectors.json', 'vdd_gate5_contract.json')) {
+    foreach ($vector in @('vdd_gate5_contract.json')) {
         Copy-Gate6EvidenceFile `
             (Join-Path $SourceRoot "docs\protocols\vectors\$vector") `
             "vectors/$vector"
@@ -1231,8 +1131,6 @@ Write-Output "FULL_PROFILE_ZIP=$versionedZip"
 Write-Output "FULL_PROFILE_ZIP_SHA256=$((Get-FileHash $versionedZip -Algorithm SHA256).Hash)"
 Write-Output "FULL_PROFILE_EXE=$standaloneExe"
 Write-Output "FULL_PROFILE_EXE_SHA256=$((Get-FileHash $standaloneExe -Algorithm SHA256).Hash)"
-Write-Output "FULL_PROFILE_MSQUIC_SHIM_DLL_SHA256=$((Get-FileHash $shimDll -Algorithm SHA256).Hash)"
-Write-Output "FULL_PROFILE_MSQUIC_SHIM_LIB_SHA256=$((Get-FileHash $shimLib -Algorithm SHA256).Hash)"
 Write-Output "FULL_PROFILE_VDD_SHADER_INVENTORY=$vddShaderInventoryPath"
 Write-Output "FULL_PROFILE_VDD_SHADER_INVENTORY_SHA256=$((Get-FileHash $vddShaderInventoryPath -Algorithm SHA256).Hash)"
 Write-Output "FULL_PROFILE_SIGNING=$(if ($AllowTestSignedDrivers) { 'local-test-only-non-production' } else { 'production-driver-signing' })"

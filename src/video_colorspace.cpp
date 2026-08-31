@@ -31,19 +31,7 @@ namespace video {
 
     /* See video::config_t declaration for details */
 
-    if (config.protocolV3Colorimetry) {
-      if (config.colorTransfer == 16) {
-        colorspace.colorspace = colorspace_e::bt2020;
-      } else if (config.colorTransfer == 18) {
-        colorspace.colorspace = colorspace_e::bt2020hlg;
-      } else if (config.colorMatrix == 9) {
-        colorspace.colorspace = colorspace_e::bt2020sdr;
-      } else if (config.colorMatrix == 1) {
-        colorspace.colorspace = colorspace_e::rec709;
-      } else {
-        colorspace.colorspace = colorspace_e::rec601;
-      }
-    } else if (config.dynamicRange > 0 && hdr_display) {
+    if (config.dynamicRange > 0 && hdr_display) {
       // Rec. 2020 with ST 2084 perceptual quantizer
       colorspace.colorspace = colorspace_e::bt2020;
     } else {
@@ -70,9 +58,7 @@ namespace video {
       }
     }
 
-    colorspace.full_range = config.protocolV3Colorimetry ?
-                              config.colorRange != 0 :
-                              (config.encoderCscMode & 0x1);
+    colorspace.full_range = config.encoderCscMode & 0x1;
 
     switch (config.dynamicRange) {
       case 0:

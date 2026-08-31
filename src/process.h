@@ -139,6 +139,28 @@ namespace proc {
      */
     int execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session);
 
+    /** @brief Result of an input-only LSP application launch. */
+    struct lsp_launch_result_t {
+      int status {};  ///< Zero on success, 409 while another process is active, or launch error.
+      std::uint64_t process_generation {};  ///< Generation owned by the accepted LSP session.
+    };
+
+    /**
+     * @brief Launch one configured application only while the process slot is idle.
+     *
+     * @param app_id Configured numeric application ID.
+     * @return Launch status and generation-qualified ownership token.
+     */
+    [[nodiscard]] lsp_launch_result_t execute_lsp_if_idle(int app_id);
+
+    /**
+     * @brief Terminate an LSP-owned application only when its generation is current.
+     *
+     * @param process_generation Generation returned by `execute_lsp_if_idle`.
+     * @return True when ownership matched and the process was stopped or already exited.
+     */
+    bool terminate_lsp_generation(std::uint64_t process_generation);
+
     /**
      * @return `_app_id` if a process is running, otherwise returns `0`
      */
@@ -167,7 +189,7 @@ namespace proc {
      * @brief Publish one legacy session only when its process generation is current.
      *
      * The callback runs while the process lifecycle boundary is held, preventing
-     * a replacement or protocol-v3 launch from interleaving between generation
+     * a replacement process launch from interleaving between generation
      * validation, active-session publication, and certificate authorization.
      *
      * @param process_generation Generation captured by the pending legacy launch.

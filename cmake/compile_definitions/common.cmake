@@ -41,6 +41,60 @@ if(BUILD_WERROR)
     list(APPEND SUNSHINE_COMPILE_OPTIONS -Werror)
 endif()
 
+if(WIN32 AND LUMEN_BUILD_PROFILE STREQUAL "full")
+    list(APPEND SUNSHINE_DEFINITIONS LUMEN_LSP_DEFAULT_ENABLED=1)
+else()
+    list(APPEND SUNSHINE_DEFINITIONS LUMEN_LSP_DEFAULT_ENABLED=0)
+endif()
+
+set(LUMEN_LSP_CORE_DIRECTORY "${CMAKE_SOURCE_DIR}/src/protocol_lsp")
+set(LUMEN_LSP_CORE_FILES
+        core/control.h
+        core/core.h
+        core/input.h
+        core/packet.h
+        core/rtp.h
+        core/telemetry.h
+        core/transport.h
+        core/wire.h
+        input_plane/feedback.h
+        input_plane/input_plane.h
+        input_plane/rate.h
+        input_plane/state.h
+        input_plane/wire.h
+        media/audio.h
+        media/av1.h
+        media/common.h
+        media/frame_pipeline.h
+        media/h264.h
+        media/hevc.h
+        media/media.h
+        transport/congestion.h
+        transport/generation_fence.h
+        transport/repair.h
+        transport/rtcp.h
+        transport/transport.h)
+set(LUMEN_LSP_CORE_DIGEST_INPUT "")
+foreach(LUMEN_LSP_CORE_FILE IN LISTS LUMEN_LSP_CORE_FILES)
+    file(SHA256
+            "${LUMEN_LSP_CORE_DIRECTORY}/${LUMEN_LSP_CORE_FILE}"
+            LUMEN_LSP_CORE_FILE_DIGEST)
+    string(TOLOWER "${LUMEN_LSP_CORE_FILE_DIGEST}" LUMEN_LSP_CORE_FILE_DIGEST)
+    string(APPEND LUMEN_LSP_CORE_DIGEST_INPUT
+            "${LUMEN_LSP_CORE_FILE}\n${LUMEN_LSP_CORE_FILE_DIGEST}\n")
+endforeach()
+string(SHA256 LUMEN_LSP_CORE_ACTUAL_DIGEST "${LUMEN_LSP_CORE_DIGEST_INPUT}")
+file(READ
+        "${LUMEN_LSP_CORE_DIRECTORY}/core/source-digest.sha256"
+        LUMEN_LSP_CORE_EXPECTED_DIGEST)
+string(STRIP "${LUMEN_LSP_CORE_EXPECTED_DIGEST}" LUMEN_LSP_CORE_EXPECTED_DIGEST)
+string(TOLOWER "${LUMEN_LSP_CORE_EXPECTED_DIGEST}" LUMEN_LSP_CORE_EXPECTED_DIGEST)
+if(NOT LUMEN_LSP_CORE_ACTUAL_DIGEST STREQUAL LUMEN_LSP_CORE_EXPECTED_DIGEST)
+    message(FATAL_ERROR
+            "Canonical LSP core digest mismatch: expected "
+            "${LUMEN_LSP_CORE_EXPECTED_DIGEST}, computed ${LUMEN_LSP_CORE_ACTUAL_DIGEST}")
+endif()
+
 # setup assets directory
 if(NOT SUNSHINE_ASSETS_DIR)
     set(SUNSHINE_ASSETS_DIR "assets")
@@ -143,10 +197,61 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/protocol_common/cbor.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_common/crypto.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_common/crypto.h"
-        "${CMAKE_SOURCE_DIR}/src/protocol_common/input_state.cpp"
-        "${CMAKE_SOURCE_DIR}/src/protocol_common/input_state.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_common/secure_buffer.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_common/status.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/core/control.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/core/core.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/core/input.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/core/packet.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/core/rtp.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/core/telemetry.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/core/transport.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/core/wire.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/input_plane/feedback.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/input_plane/input_plane.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/input_plane/rate.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/input_plane/state.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/input_plane/wire.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/invitation.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/invitation.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/audio.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/av1.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/common.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/frame_pipeline.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/h264.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/hevc.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/media.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/packet_classifier.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/packet_classifier.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/control_server.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/control_server.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/control/wire.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/control/wire.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/host_runtime.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/host_runtime.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/identity.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/identity.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/input_owner.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/input_owner.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/libsrtp_provider.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/libsrtp_provider.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/udp_socket.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/udp_socket.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/wolfssl_dtls_server.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security_provider.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/service.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/service.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/session_authority.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/session_authority.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/ssrc_registry.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/ssrc_registry.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/transport/congestion.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/transport/generation_fence.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/transport/repair.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/transport/rtcp.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/transport/transport.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/types.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/types.h"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.cpp"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.h"
         "${CMAKE_SOURCE_DIR}/src/httpcommon.cpp"
@@ -192,31 +297,21 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
         ${PLATFORM_TARGET_FILES})
 
-list(APPEND SUNSHINE_TARGET_FILES
-        "${CMAKE_SOURCE_DIR}/src/protocol_v3/host_identity_store.cpp"
-        "${CMAKE_SOURCE_DIR}/src/protocol_v3/host_identity_store.h")
-
-if(WIN32 AND LUMEN_EXPERIMENTAL_MSQUIC)
+if(LUMEN_ENABLE_LSP_RUNTIME)
     list(APPEND SUNSHINE_TARGET_FILES
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.cpp"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/control_session.h"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.cpp"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/media_pipeline.h"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/operation_outcomes.cpp"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/operation_outcomes.h"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.cpp"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/quic_server.h"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/resource_budget.cpp"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/resource_budget.h"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.cpp"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/runtime.h"
-            "${CMAKE_SOURCE_DIR}/src/protocol_v3/start_mode_contract.h")
-    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES Lumen::MsQuicShim)
+            "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/wolfssl_dtls_server.cpp")
     list(APPEND SUNSHINE_DEFINITIONS
-            LUMEN_EXPERIMENTAL_MSQUIC=1
-            LUMEN_PROTOCOL_V3_DEFAULT_ENABLED=1)
+            LUMEN_LSP_WOLFSSL_AVAILABLE=1
+            LUMEN_LSP_LIBSRTP_AVAILABLE=1
+            LUMEN_LSP_RUNTIME_AVAILABLE=1)
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
+            Lumen::wolfssl
+            Lumen::srtp2)
 else()
-    list(APPEND SUNSHINE_DEFINITIONS LUMEN_PROTOCOL_V3_DEFAULT_ENABLED=0)
+    list(APPEND SUNSHINE_DEFINITIONS
+            LUMEN_LSP_WOLFSSL_AVAILABLE=0
+            LUMEN_LSP_LIBSRTP_AVAILABLE=0
+            LUMEN_LSP_RUNTIME_AVAILABLE=0)
 endif()
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)

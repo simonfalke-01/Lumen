@@ -4,7 +4,7 @@
  */
 #include "virtual_display.h"
 
-#include "../../protocol_v3/start_mode_contract.h"
+#include "virtual_display_driver/LumenModeValidationPolicy.h"
 
 #ifndef _WIN32
   #include "virtual_display_driver/LumenVirtualDisplayProtocol.h"
@@ -825,16 +825,16 @@ namespace platf::virtual_display {
         mode.dynamic_range == LUMEN_VDD_DYNAMIC_RANGE_HDR10 ? dynamic_range_e::hdr10 : dynamic_range_e::sdr,
         mode.bits_per_channel,
       };
-      const auto shape = lumen::protocol_v3::start_mode::admit_shape({
-        converted.width,
-        converted.height,
-        converted.refresh.numerator,
-        converted.refresh.denominator,
-      });
       const auto exact_color_mode =
         (converted.dynamic_range == dynamic_range_e::sdr && converted.bits_per_channel == 8) ||
         (converted.dynamic_range == dynamic_range_e::hdr10 && converted.bits_per_channel == 10);
-      if (shape != lumen::protocol_v3::start_mode::AdmissionError::none || !exact_color_mode ||
+      if (!mode::valid_shape(
+            converted.width,
+            converted.height,
+            converted.refresh.numerator,
+            converted.refresh.denominator
+          ) ||
+          !exact_color_mode ||
           converted.refresh.normalized() != converted.refresh) {
         return std::nullopt;
       }

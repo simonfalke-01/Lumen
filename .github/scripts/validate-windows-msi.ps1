@@ -144,11 +144,6 @@ foreach ($setterName in $setterNames) {
     } else {
         ' -UpgradeOwnedVirtualDisplay 0 -UpgradeVddOwnerProduct ""$'
     }
-    $expectedIdentityDisposition = if ($setterName -like 'SetLumenInstall*') {
-        ' -IdentityDisposition preserve '
-    } else {
-        ' -IdentityDisposition remove '
-    }
     if ($command -notmatch '^"\[System64Folder\]WindowsPowerShell\\v1\.0\\powershell\.exe" ' -or
         $command -notmatch $expectedScript -or
         $command -notmatch ' -Msi ' -or
@@ -158,7 +153,6 @@ foreach ($setterName in $setterNames) {
         $command -notmatch ' -InstallVirtualMicrophone \[LUMEN_INSTALL_VMIC\] ' -or
         $command -notmatch ' -InstallVirtualDisplay \[LUMEN_INSTALL_VDD\] ' -or
         $command -notmatch ' -RemoveVirtualDisplay \[LUMEN_REMOVE_VDD\] ' -or
-        $command -notmatch $expectedIdentityDisposition -or
         $command -notmatch $expectedUpgradeOwnership) {
         throw "Generated MSI has an invalid deferred command: $setterName"
     }
@@ -331,23 +325,6 @@ if ($expectVddFeature) {
     }
 }
 
-$msquicFiles = @($files | Where-Object {
-    $_[1] -match '(?i)(^|\|)(msquic|lumen_msquic_shim)\.dll$|MsQuic-LICENSE\.txt'
-})
-$expectMsQuic = $env:EXPECT_MSQUIC -eq 'true'
-if ($expectMsQuic) {
-    foreach ($requiredMsQuicFile in @(
-        'msquic.dll',
-        'lumen_msquic_shim.dll',
-        'MsQuic-LICENSE.txt'
-    )) {
-        if (-not ($msquicFiles | Where-Object { $_[1] -match "(?i)$([regex]::Escape($requiredMsQuicFile))" })) {
-            throw "Generated MSI is missing $requiredMsQuicFile."
-        }
-    }
-} elseif ($msquicFiles.Count -ne 0) {
-    throw 'Generated MSI unexpectedly contains MsQuic runtime files.'
-}
 $localTestMarkers = @($files | Where-Object {
     $_[1] -match '(?i)LOCAL-TEST-SIGNED\.json'
 })

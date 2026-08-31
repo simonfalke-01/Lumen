@@ -7,6 +7,7 @@
 // standard includes
 #include <bitset>
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -259,31 +260,15 @@ namespace config {
   };
 
   /**
-   * @brief Direct Umbra/Lumen protocol-v3 listener settings.
+   * @brief Lumen Streaming Protocol host settings.
    */
-  struct protocol_v3_t {
-    bool enabled;  ///< Start the authenticated QUIC listener when compiled into this build.
-    bool legacy_compatibility;  ///< Keep the Moonlight HTTP/RTSP listeners alongside protocol v3.
-    std::uint16_t port;  ///< UDP port used by the single protocol-v3 QUIC listener.
-    std::string profile;  ///< Default transport policy: `latency` or `quality`.
-    std::uint64_t pairing_permissions;  ///< Maximum permissions granted by new QR invitations.
+  struct lsp_t {
+    bool enabled;  ///< Start the native LSP listener when the build provides its security boundary.
+    std::uint16_t port;  ///< Single UDP application port used by every LSP flow.
+    std::string profile;  ///< Initial congestion profile: `adaptive-low-latency` or `competition`.
+    std::uint32_t competition_capacity_mbps;  ///< Explicit competition-mode capacity ceiling; zero disables that profile.
+    std::uint32_t pairing_permissions;  ///< Maximum LSP/1 permission mask offered to newly paired clients.
   };
-
-  /**
-   * @brief Decide which streaming listeners must remain available at startup.
-   */
-  struct listener_startup_policy_t {
-    bool start_legacy;  ///< Start the Moonlight HTTP and RTSP listeners.
-    bool v3_failure_is_fatal;  ///< Abort only when no legacy listener is allowed to recover service.
-  };
-
-  /**
-   * @brief Resolve listener availability from the current protocol settings.
-   *
-   * @param settings Parsed protocol-v3 settings.
-   * @return Startup policy shared by production startup and focused tests.
-   */
-  [[nodiscard]] listener_startup_policy_t listener_startup_policy(const protocol_v3_t &settings) noexcept;
 
   /**
    * @brief HTTP and HTTPS settings used by the GameStream pairing server.
@@ -420,7 +405,7 @@ namespace config {
   extern video_t video;
   extern audio_t audio;
   extern stream_t stream;
-  extern protocol_v3_t protocol_v3;
+  extern lsp_t lsp;
   extern nvhttp_t nvhttp;
   extern input_t input;
   extern sunshine_t sunshine;

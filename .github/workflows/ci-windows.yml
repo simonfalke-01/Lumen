@@ -227,12 +227,6 @@ jobs:
             windows-nuget-wix-v1-${{
             hashFiles('cmake/packaging/windows_wix.cmake') }}
 
-      - name: Cache MsQuic package
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: ${{ runner.temp }}/lumen-full-profile/downloads/Microsoft.Native.Quic.MsQuic.Schannel.2.6.0.nupkg
-          key: windows-msquic-schannel-2.6.0-37636DBC4FBB527F7A2F4505893BB2619862AA5879CC65499A048401C44EB590
-
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba  # v0.0.11
 
@@ -904,30 +898,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $sccache = (Get-Command sccache -ErrorAction Stop).Source
           $staging = Join-Path $env:RUNNER_TEMP 'lumen-full-profile'
-          $downloads = Join-Path $staging 'downloads'
-          $msquic = Join-Path $staging 'msquic-2.6.0'
-          New-Item -ItemType Directory -Path $downloads, $msquic -Force | Out-Null
-          $nupkg = Join-Path $downloads 'Microsoft.Native.Quic.MsQuic.Schannel.2.6.0.nupkg'
-          if (-not (Test-Path -LiteralPath $nupkg -PathType Leaf)) {
-            Invoke-WebRequest `
-              -UseBasicParsing `
-              -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.native.quic.msquic.schannel/2.6.0/microsoft.native.quic.msquic.schannel.2.6.0.nupkg' `
-              -OutFile $nupkg
-          }
-          $expected = '37636DBC4FBB527F7A2F4505893BB2619862AA5879CC65499A048401C44EB590'
-          if ((Get-FileHash $nupkg -Algorithm SHA256).Hash -ne $expected) {
-            throw 'MsQuic 2.6.0 NuGet package hash mismatch.'
-          }
-          $zip = Join-Path $downloads 'msquic-2.6.0.zip'
-          Copy-Item $nupkg $zip -Force
-          Expand-Archive -LiteralPath $zip -DestinationPath $msquic -Force
-
           if ($env:IS_RELEASE -eq 'true') {
             & .\scripts\windows\build-full-profile.ps1 `
               -SourceRoot $env:GITHUB_WORKSPACE `
               -StagingRoot $staging `
               -Msys2Root 'C:\msys64' `
-              -MsQuicPackageRoot $msquic `
               -PythonPath $env:PYTHON_PATH `
               -DotNetRoot $env:DOTNET_ROOT `
               -NodeRoot $env:NODEJS_PATH `
@@ -943,7 +918,6 @@ jobs:
               -SourceRoot $env:GITHUB_WORKSPACE `
               -StagingRoot $staging `
               -Msys2Root 'C:\msys64' `
-              -MsQuicPackageRoot $msquic `
               -PythonPath $env:PYTHON_PATH `
               -DotNetRoot $env:DOTNET_ROOT `
               -NodeRoot $env:NODEJS_PATH `
@@ -960,7 +934,6 @@ jobs:
               -SourceRoot $env:GITHUB_WORKSPACE `
               -StagingRoot $staging `
               -Msys2Root 'C:\msys64' `
-              -MsQuicPackageRoot $msquic `
               -PythonPath $env:PYTHON_PATH `
               -DotNetRoot $env:DOTNET_ROOT `
               -NodeRoot $env:NODEJS_PATH `
@@ -1198,7 +1171,6 @@ jobs:
           EXPECT_VHID_FEATURE: 'true'
           EXPECT_VMIC_FEATURE: 'true'
           EXPECT_VDD_FEATURE: 'true'
-          EXPECT_MSQUIC: 'true'
         run: ./.github/scripts/validate-windows-msi.ps1
 
       - name: Run ${{ matrix.scenario }} MSI scenario

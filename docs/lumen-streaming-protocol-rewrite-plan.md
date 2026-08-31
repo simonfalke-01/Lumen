@@ -1,10 +1,13 @@
 # Lumen Streaming Protocol ground-up rewrite plan
 
-Status: planning complete, implementation paused.
+Status: implementation active on branch `feature/lsp-rewrite`.
 
-This plan replaces the experimental protocol-v3 QUIC implementation with the
+This plan replaces the retired experimental QUIC implementation with the
 clean-room [Lumen Streaming Protocol](protocols/lumen-streaming-protocol.md).
-It authorizes no runtime changes by itself.
+The user has authorized implementation. Execution began by deleting the retired
+native protocol from Lumen and Umbra and restoring a clean legacy-only baseline;
+that completed cutover step supersedes the original deferred ordering in stage
+13 without changing any LSP wire requirement.
 
 ## 1. Outcome
 
@@ -19,12 +22,47 @@ The completed rewrite will provide:
 - aggregate frame-aware pacing and congestion control;
 - bounded recovery without keyframe storms;
 - one application port for all LSP traffic; and
-- deletion of the old v3 server, client, wire format, tests, and documentation
-  after cutover.
+- continued absence of the retired native server, client, wire format, tests,
+  documentation, and transport dependencies after cutover.
 
 The rewrite does not patch, wrap, translate, tunnel, or progressively evolve
 the old QUIC protocol. Work begins in new modules with new names and new
 contracts.
+
+## 0. Implementation status
+
+Last updated: 2026-08-31. This table is the durable progress ledger for the
+rewrite. A row moves to **Done** only after the named implementation and its
+smallest decisive verification both pass. Source-only scaffolding remains
+**In progress** until the real product boundary works.
+
+| Milestone | Status | Verified evidence | Remaining boundary |
+| --- | --- | --- | --- |
+| Working branches and pre-rewrite checkpoint | **Done** | Both repositories use `feature/lsp-rewrite`; Lumen checkpoint `2397c28c` | None |
+| Remove retired Lumen native transport | **Done** | Lumen application link, five focused legacy/migration tests, packaging check, and diff audit pass | None; the integrated deletion is included in the current Lumen checkpoint |
+| Remove retired Umbra native transport | **Done** | Umbra commit `0362c2e`; full Swift tests, warnings-as-errors build, and packaging tests pass | Physical Moonlight smoke test remains part of final hardware validation |
+| Select DTLS 1.3 provider | **Done** | Commercial wolfSSL 5.9.2 selected; tag `v5.9.2-stable` pinned | Keep license material external to the repository |
+| macOS DTLS-SRTP provider proof | **Done** | Live DTLS 1.3 exchange proved `TLS_AES_128_GCM_SHA256`, X25519, HRR cookie, ALPN `lumen-stream/1`, `SRTP_AEAD_AES_128_GCM`, and identical 56-byte exporter output | Repeat the exact proof on Windows/UCRT64 |
+| libSRTP wolfCrypt backend | **In progress** | The reviewed libSRTP 2.8.0 patch and CMake target are integrated; AES-128-GCM SRTP/SRTCP protection, encrypted extensions, authentication, and replay rejection pass on macOS | Repeat the provider-enabled product build and 16-byte-tag RTP/SRTCP proof on Windows/UCRT64 |
+| Shared portable C++23 core | **Done** | LSPC, ACK/RTO/cache, RTP, input, media, repair, pacing, congestion, DPLPMTUD, and telemetry tests pass; aggregate digest `587cdc…c0e5` | Extend the canonical digest whenever shared core files intentionally change |
+| Umbra `CLSPCore` C ABI and mirror | **Done** | Umbra commits `7bcbaaf` and `2779806`; ABI v1, digest gate, real UDP/kqueue wolfSSL/libSRTP runtime, persistent LSP identity/trust/host stores, and dependency-enabled warnings-as-errors product build pass | Extend the ABI only at coarse input, completed-media, lifecycle, and telemetry boundaries |
+| Lumen configuration, build, UI, and discovery foundation | **Done** | LSP config/UI, real runtime factory, active-only `_lumen-stream._udp`, digest gate, application/test builds, web build, and focused config/mDNS/LSP checks pass | Repeat the provider-enabled full product link on Windows/UCRT64 |
+| LSP host security/session foundation | **In progress** | Real nonblocking UDP ownership, wolfSSL DTLS 1.3, libSRTP contexts, fresh LSP identity persistence, invitations, pairing/authentication, LSP-only trust, LSPC reliability, browsing, and trusted-client administration are wired | Run the first real Lumen↔Umbra authenticated pairing/browse session and repeat on Windows/UCRT64 |
+| Frozen input wire/state primitives | **Done** | Ten focused tests pass across pointer/edge wire, device/sensor keys, baseline atomicity, loss/reorder, LSPI, LSPG, rates, and text barriers | Extend only when another input wire or safety invariant is implemented |
+| Remaining input schemas and product integration | **In progress** | Lumen applies baseline, cumulative pointer/scroll, exactly-once key/button edges, controllers, sensors, touch, and reconciliation; Umbra has native IOHID/GameController capture, AppKit fallback, retained edges, SRTP pacing, and LSPI ACK handling | Finish authenticated controller output/touch lifecycle, then prove a real 1/8 kHz Lumen↔Umbra input session |
+| Audio/video media primitives | **Done** | Fifteen focused tests verify H.264, HEVC, AV1, Opus, path limits, complete-frame admission, two-frame reassembly, decoder credits, and mailbox depth one | Extend only when another negotiated codec or frame-pipeline invariant is implemented |
+| Audio/video product integration | **Pending** | Packetizers and bounded frame-pipeline state are available, but no LSP media packet currently moves through the product backends | Connect Lumen Opus audio first, then capture/encoder video and Umbra audio/VideoToolbox/Metal delivery |
+| Bounded transport state primitives | **Done** | Thirteen focused tests verify RTCP/AVPF, RFC 8888 cadence, LSPV coalescing, FEC-before-SRTP state, recovered-packet admission, RTX bounds, recovery epochs, congestion, PMTU, and generation fencing | Extend only when another transport wire or safety invariant is implemented |
+| Protected transport wire and product integration | **In progress** | Live input SRTP/SRTCP and retained LSPG/LSPI handling are wired; dependency-independent feedback, repair, pacing, congestion, and PMTU state is available | Wire RFC 8888/LSPV/FlexFEC/RTX and DPLPMTUD into live media traffic after the first audio/video slice |
+| Reconnect, rekey, lifecycle, telemetry product surfaces | **Pending** | Authority-transfer primitives exist | Requires the live authenticated socket/control/media path |
+| Final conformance, packaging, performance, and hardware qualification | **Pending** | None claimed | Run only after the complete live feature works |
+
+Current functional stop point: both products contain real LSP UDP, wolfSSL,
+libSRTP, control, trust, START/STOP, and input paths. Those paths have compiled
+independently, but the first live Lumen↔Umbra authenticated session has not yet
+been run. LSP media streaming is not available until real Opus and encoded
+video packets move through the existing product audio, encoder, decoder, and
+renderer backends.
 
 ## 2. Non-negotiable boundaries
 
@@ -32,18 +70,18 @@ contracts.
 
 The following old-protocol components are excluded from reuse:
 
-- `ULI3`, `ULC3`, `ULM3`, and `ULB3` formats;
+- retired custom record formats;
 - QUIC listener and Network.framework QUIC adapters;
 - QUIC DATAGRAM media framing;
-- protocol-v3 control request and state machines;
-- v3 lane schedulers and queue limits;
-- v3 sequence/replay namespaces;
-- v3 media reassembly and feedback records;
-- v3 input state and edge records;
-- v3 pairing transcripts;
-- v3 start/attach/stop schemas;
-- v3 congestion sampling and recovery behavior; and
-- v3 golden vectors and tests as LSP acceptance criteria.
+- retired control request and state machines;
+- retired lane schedulers and queue limits;
+- retired sequence/replay namespaces;
+- retired media reassembly and feedback records;
+- retired input state and edge records;
+- retired pairing transcripts;
+- retired start/attach/stop schemas;
+- retired congestion sampling and recovery behavior; and
+- retired golden vectors and tests as LSP acceptance criteria.
 
 Old tests remain only until their code is removed. No LSP implementation is
 required to pass or emulate them.
@@ -61,7 +99,7 @@ These transport-independent capabilities may remain:
 - Umbra Metal and audio renderers;
 - host/client identity persistence; and
 - generic cryptographic, deterministic-CBOR, and bounded-buffer utilities that
-  contain no v3 wire assumptions.
+  contain no retired native wire assumptions.
 
 Each retained capability is called through an LSP-owned typed boundary. No
 adapter may manufacture an old-protocol packet internally.
@@ -99,7 +137,7 @@ src/protocol_lsp/
 ```
 
 Protocol-independent helpers belong under `src/protocol_common/` only after
-their APIs and tests prove they have no LSP or v3 wire semantics.
+their APIs and tests prove they have no LSP or retired native wire semantics.
 
 ### 3.2 Planned Umbra modules
 
@@ -170,21 +208,22 @@ input callback on the main actor. If later measurement identifies
 VideoToolbox/Metal bridging as a bottleneck, only that measured boundary moves
 to Objective-C++; the rewrite does not move UI code into C++ preemptively.
 
-### 3.4 Planned dependency changes
+### 3.4 Dependency changes
 
-No dependency change occurs in the documentation stage. Implementation will
-require reviewed decisions for:
+Active implementation uses these reviewed dependency decisions:
 
-- a DTLS 1.3 provider usable from MinGW/MSVC Lumen and macOS Umbra;
-- Cisco libSRTP built with its OpenSSL crypto backend;
+- wolfSSL 5.9.2 with the project's commercial license, built for DTLS 1.3 on
+  MinGW/MSVC Lumen and macOS Umbra;
+- Cisco libSRTP 2.8.0 using a reviewed wolfCrypt AES-GCM backend so LSP DTLS
+  and SRTP use the same cryptographic provider;
 - H.264/HEVC RTP packetization code, implemented locally from the RFCs or
   adopted from a compatible audited source;
 - the AOM AV1 RTP payload format; and
 - FlexFEC implementation ownership.
 
-Umbra's release target currently links `libcrypto.a` but not `libssl.a`; the LSP
-security target will need an explicit, isolated SSL linkage surface. Lumen's
-existing OpenSSL linkage does not prove DTLS 1.3 availability.
+Umbra and Lumen link wolfSSL only through an explicit LSP security target.
+Existing OpenSSL linkage remains available to legacy product code but is not
+part of the LSP handshake or SRTP protection boundary.
 
 No SCTP, WebRTC, QUIC, or browser stack is added.
 
@@ -711,7 +750,11 @@ Required scenarios are:
 Physical input-to-photon testing uses an optical rig after software-stage
 qualification.
 
-## 18. Stage 13: cutover and v3 deletion
+## 18. Stage 13: final cutover audit
+
+The retired native protocol was deleted before LSP product integration. This
+final stage therefore verifies the deletion and completes the product cutover
+rather than postponing removal until after LSP qualification.
 
 ### Entry criteria
 
@@ -721,7 +764,7 @@ qualification.
 - packaging includes the reviewed dependencies; and
 - legacy Moonlight behavior remains independently functional.
 
-### Cutover
+### Final cutover
 
 - make LSP the only native Lumen/Umbra protocol;
 - keep legacy GameStream only for explicit Moonlight compatibility;
@@ -730,39 +773,27 @@ qualification.
 - remove old configuration toggles and packaging dependencies; and
 - update user documentation to describe LSP as implemented.
 
-### Lumen deletion set
+### Completed Lumen deletion set
 
 At minimum, remove:
 
-```text
-src/protocol_v3/
-src/platform/windows/msquic_shim/
-docs/protocols/umbra-lumen-quic-v3.md
-docs/protocols/vectors/quic_v3_*
-the protocol-v3 runtime wiring in src/main.cpp and src/stream.cpp
-MsQuic CMake discovery, packaging, manifests, and options
-protocol-v3 tests and fixtures
-```
+The completed removal covered the retired protocol source tree, Windows
+transport shim, protocol document and vectors, runtime wiring, dependency
+discovery and packaging, and all dedicated tests and fixtures.
 
 Exact deletion is confirmed with repository search at cutover. No compatibility
 shim remains under a renamed file.
 
-### Umbra deletion set
+### Completed Umbra deletion set
 
 At minimum, remove:
 
-```text
-Sources/UmbraQUICTransport/
-Sources/UmbraProtocolV3/
-the old ProtocolV3 integration and manager implementations
-UmbraQUICTransportTests
-UmbraProtocolV3Tests
-old protocol-v3 fixtures and preference state
-Network.framework QUIC imports and package targets
-```
+The completed removal covered Umbra's retired transport and protocol targets,
+integration managers, dedicated tests and fixtures, preference state,
+Network.framework transport imports, and package products.
 
 Transport-independent media components remain only after their imports and
-types no longer reference v3.
+types no longer reference the retired protocol.
 
 ## 19. Build and verification commands
 
@@ -787,17 +818,19 @@ the required Doxygen documentation and conform to `.clang-format`.
 
 ## 20. Documentation lifecycle
 
-Before implementation starts:
+During implementation:
 
 - the architecture rationale remains the decision record;
-- the LSP specification remains pre-implementation;
-- this plan remains the execution source of truth; and
-- the old v3 document remains marked abandoned and is retained only because
-  its code still exists.
+- the LSP specification is normative and records frozen portable wire/state
+  primitives without presenting them as live product behavior;
+- this plan and its status table remain the execution source of truth; and
+- retired transport documentation remains deleted.
 
-During implementation, completed wire contracts move from planned to
-implemented only after cross-process evidence. At final cutover, the old v3
-document and references are deleted.
+A primitive milestone moves to **Done** after its exact implementation and
+focused verification pass. Product integration remains **In progress** until
+real authenticated cross-process traffic proves the corresponding boundary.
+Only after the complete feature works may the user documentation describe LSP
+streaming as available.
 
 ## 21. Risks and mitigations
 
@@ -824,19 +857,20 @@ document and references are deleted.
 | Old protocol contaminates design | New modules, no compatibility adapters, explicit final deletion set |
 | Tests replace real verification | Functional vertical slice required before later validation gates |
 
-## 22. First implementation task when resumed
+## 22. Current implementation boundary
 
-The first authorized implementation task is **Stage 0 only**:
+The retired protocol deletion and dependency-independent portable foundations
+are complete. Security integration remains gated by Stage 0:
 
-1. select the DTLS 1.3 provider;
+1. prove the pinned wolfSSL 5.9.2 DTLS 1.3 provider on both platforms;
 2. prove DTLS-SRTP exporter interoperability on Windows and macOS;
 3. prove AES-GCM SRTP/SRTCP through libSRTP; and
 4. record throughput and packaging evidence.
 
-No capture, media, input, UI, or old-protocol deletion begins in that task.
+No product path may claim authenticated LSP operation until that proof passes.
 
-## 23. Current pause point
+## 23. Implementation start
 
-Planning ends here. No protocol rewrite, dependency change, build-system
-change, source edit, configuration migration, or deletion is authorized until
-the user explicitly resumes implementation.
+The user resumed implementation. The rewrite proceeds through the functional
+stages above, with the DTLS/SRTP security boundary remaining fail-closed until
+the complete Stage 0 proof passes on both production platforms.

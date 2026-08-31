@@ -281,7 +281,7 @@ namespace platf::publish {
     PDNS_SERVICE_INSTANCE existing_instance;
   };
 
-  /** @brief Joint lifetime for the configured legacy and protocol-v3 registrations. */
+  /** @brief Joint lifetime for the configured DNS-SD registrations. */
   class mdns_registrations_t: public ::platf::deinit_t {
   public:
     explicit mdns_registrations_t(std::vector<service_t> services) {

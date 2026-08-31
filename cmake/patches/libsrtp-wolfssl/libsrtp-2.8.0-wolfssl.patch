@@ -1,0 +1,254 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 01f007f..a4cbd7e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -84,16 +84,17 @@ set(ERR_REPORTING_FILE "" CACHE FILEPATH "Use file for logging")
+ set(ENABLE_OPENSSL OFF CACHE BOOL "Enable OpenSSL crypto engine")
+ set(ENABLE_MBEDTLS OFF CACHE BOOL "Enable MbedTLS crypto engine")
+ set(ENABLE_NSS OFF CACHE BOOL "Enable NSS crypto engine")
++set(ENABLE_WOLFSSL OFF CACHE BOOL "Enable wolfCrypt AES-GCM crypto engine")
+ 
+-if(ENABLE_OPENSSL OR ENABLE_MBEDTLS OR ENABLE_NSS)
++if(ENABLE_OPENSSL OR ENABLE_MBEDTLS OR ENABLE_NSS OR ENABLE_WOLFSSL)
+   set(USE_EXTERNAL_CRYPTO TRUE)
+ else()
+   set(USE_EXTERNAL_CRYPTO FALSE)
+ endif()
+ 
+ if(ENABLE_OPENSSL)
+-  if(ENABLE_NSS OR ENABLE_MBEDTLS)
+-    message(FATAL_ERROR "ssl conflict. can not enable openssl and mbedtls or nss simultaneously.")
++  if(ENABLE_NSS OR ENABLE_MBEDTLS OR ENABLE_WOLFSSL)
++    message(FATAL_ERROR "crypto conflict: select exactly one external crypto engine.")
+   endif()
+   find_package(OpenSSL 1.1.0 REQUIRED)
+   set(OPENSSL ${ENABLE_OPENSSL} CACHE BOOL INTERNAL)
+@@ -101,8 +102,8 @@ if(ENABLE_OPENSSL)
+ endif()
+ 
+ if(ENABLE_MBEDTLS)
+-  if(ENABLE_OPENSSL OR ENABLE_NSS)
+-    message(FATAL_ERROR "ssl conflict. can not enable mbedtls and openssl or nss simultaneously.")
++  if(ENABLE_OPENSSL OR ENABLE_NSS OR ENABLE_WOLFSSL)
++    message(FATAL_ERROR "crypto conflict: select exactly one external crypto engine.")
+   endif()
+   find_package(MbedTLS REQUIRED)
+   set(MBEDTLS ${ENABLE_MBEDTLS} CACHE BOOL INTERNAL)
+@@ -110,14 +111,25 @@ if(ENABLE_MBEDTLS)
+ endif()
+ 
+ if(ENABLE_NSS)
+-  if(ENABLE_OPENSSL OR ENABLE_MBEDTLS)
+-    message(FATAL_ERROR "ssl conflict. can not enable nss and openssl or mbedtls simultaneously.")
++  if(ENABLE_OPENSSL OR ENABLE_MBEDTLS OR ENABLE_WOLFSSL)
++    message(FATAL_ERROR "crypto conflict: select exactly one external crypto engine.")
+   endif()
+   find_package(NSS REQUIRED)
+   set(NSS ${ENABLE_NSS} CACHE BOOL INTERNAL)
+   set(GCM ${ENABLE_NSS} CACHE BOOL INTERNAL)
+ endif()
+ 
++if(ENABLE_WOLFSSL)
++  if(ENABLE_OPENSSL OR ENABLE_MBEDTLS OR ENABLE_NSS)
++    message(FATAL_ERROR "crypto conflict: select exactly one external crypto engine.")
++  endif()
++  if(NOT TARGET wolfssl::wolfssl)
++    find_package(wolfssl 5.9.2 CONFIG REQUIRED)
++  endif()
++  set(WOLFSSL ${ENABLE_WOLFSSL} CACHE BOOL INTERNAL)
++  set(GCM ${ENABLE_WOLFSSL} CACHE BOOL INTERNAL)
++endif()
++
+ set(CONFIG_FILE_DIR ${CMAKE_CURRENT_BINARY_DIR})
+ include_directories(${CONFIG_FILE_DIR})
+ 
+@@ -159,6 +169,11 @@ elseif(ENABLE_NSS)
+     crypto/cipher/aes_icm_nss.c
+     crypto/cipher/aes_gcm_nss.c
+   )
++elseif(ENABLE_WOLFSSL)
++  list(APPEND CIPHERS_SOURCES_C
++    crypto/cipher/aes_icm_wolfssl.c
++    crypto/cipher/aes_gcm_wolfssl.c
++  )
+ else()
+   list(APPEND CIPHERS_SOURCES_C
+     crypto/cipher/aes.c
+@@ -185,6 +200,11 @@ elseif(ENABLE_NSS)
+   list(APPEND HASHES_SOURCES_C
+     crypto/hash/hmac_nss.c
+   )
++elseif(ENABLE_WOLFSSL)
++  list(APPEND HASHES_SOURCES_C
++    crypto/hash/hmac.c
++    crypto/hash/sha1.c
++  )
+ else()
+   list(APPEND HASHES_SOURCES_C
+     crypto/hash/hmac.c
+@@ -292,6 +312,11 @@ elseif(ENABLE_MBEDTLS)
+ elseif(ENABLE_NSS)
+   target_include_directories(srtp2 PRIVATE ${NSS_INCLUDE_DIRS})
+   target_link_libraries(srtp2 ${NSS_LIBRARIES})
++elseif(ENABLE_WOLFSSL)
++  target_link_libraries(srtp2 $<BUILD_INTERFACE:wolfssl::wolfssl>)
++  if(APPLE)
++    target_link_libraries(srtp2 "-framework Security" "-framework CoreFoundation")
++  endif()
+ endif()
+ if(WIN32)
+   target_link_libraries(srtp2 ws2_32)
+diff --git a/config_in_cmake.h b/config_in_cmake.h
+index 4a198dc..5de282c 100644
+--- a/config_in_cmake.h
++++ b/config_in_cmake.h
+@@ -24,6 +24,9 @@
+ /* Define this to use NSS crypto. */
+ #cmakedefine NSS 1
+ 
++/* Define this to use wolfCrypt AES-GCM. */
++#cmakedefine WOLFSSL 1
++
+ /* Define this to use AES-GCM. */
+ #cmakedefine GCM 1
+ 
+diff --git a/crypto/cipher/cipher_test_cases.c b/crypto/cipher/cipher_test_cases.c
+index e4b8f0f..ebb5451 100644
+--- a/crypto/cipher/cipher_test_cases.c
++++ b/crypto/cipher/cipher_test_cases.c
+@@ -37,6 +37,11 @@
+ #include "cipher_test_cases.h"
+ #include <stddef.h>
+ 
++#ifdef WOLFSSL
++#include <wolfssl/options.h>
++#include <wolfssl/wolfcrypt/settings.h>
++#endif
++
+ /*
+  * KAT values for AES self-test.  These
+  * values came from the legacy libsrtp code.
+@@ -253,6 +258,7 @@ static const uint8_t srtp_aes_gcm_128_test_case_0_ciphertext[76] = {
+ };
+ /* clang-format on */
+ 
++#if !defined(WOLFSSL) || WOLFSSL_MIN_AUTH_TAG_SZ <= 8
+ static const srtp_cipher_test_case_t srtp_aes_gcm_128_test_case_0a = {
+     SRTP_AES_GCM_128_KEY_LEN_WSALT,          /* octets in key            */
+     srtp_aes_gcm_128_test_case_0_key,        /* key                      */
+@@ -266,6 +272,10 @@ static const srtp_cipher_test_case_t srtp_aes_gcm_128_test_case_0a = {
+     8,                                       /* */
+     NULL                                     /* pointer to next testcase */
+ };
++#define SRTP_AES_GCM_128_NEXT_TEST &srtp_aes_gcm_128_test_case_0a
++#else
++#define SRTP_AES_GCM_128_NEXT_TEST NULL
++#endif
+ 
+ const srtp_cipher_test_case_t srtp_aes_gcm_128_test_case_0 = {
+     SRTP_AES_GCM_128_KEY_LEN_WSALT,          /* octets in key            */
+@@ -278,8 +288,9 @@ const srtp_cipher_test_case_t srtp_aes_gcm_128_test_case_0 = {
+     20,                                      /* octets in AAD            */
+     srtp_aes_gcm_128_test_case_0_aad,        /* AAD                      */
+     16,                                      /* */
+-    &srtp_aes_gcm_128_test_case_0a           /* pointer to next testcase */
++    SRTP_AES_GCM_128_NEXT_TEST                /* pointer to next testcase */
+ };
++#undef SRTP_AES_GCM_128_NEXT_TEST
+ 
+ /* clang-format off */
+ static const uint8_t srtp_aes_gcm_256_test_case_0_key[SRTP_AES_GCM_256_KEY_LEN_WSALT] = {
+@@ -336,6 +347,7 @@ static const uint8_t srtp_aes_gcm_256_test_case_0_ciphertext[76] = {
+ };
+ /* clang-format on */
+ 
++#if !defined(WOLFSSL) || WOLFSSL_MIN_AUTH_TAG_SZ <= 8
+ static const srtp_cipher_test_case_t srtp_aes_gcm_256_test_case_0a = {
+     SRTP_AES_GCM_256_KEY_LEN_WSALT,          /* octets in key            */
+     srtp_aes_gcm_256_test_case_0_key,        /* key                      */
+@@ -349,6 +361,10 @@ static const srtp_cipher_test_case_t srtp_aes_gcm_256_test_case_0a = {
+     8,                                       /* */
+     NULL                                     /* pointer to next testcase */
+ };
++#define SRTP_AES_GCM_256_NEXT_TEST &srtp_aes_gcm_256_test_case_0a
++#else
++#define SRTP_AES_GCM_256_NEXT_TEST NULL
++#endif
+ 
+ const srtp_cipher_test_case_t srtp_aes_gcm_256_test_case_0 = {
+     SRTP_AES_GCM_256_KEY_LEN_WSALT,          /* octets in key            */
+@@ -361,5 +377,6 @@ const srtp_cipher_test_case_t srtp_aes_gcm_256_test_case_0 = {
+     20,                                      /* octets in AAD            */
+     srtp_aes_gcm_256_test_case_0_aad,        /* AAD                      */
+     16,                                      /* */
+-    &srtp_aes_gcm_256_test_case_0a           /* pointer to next testcase */
++    SRTP_AES_GCM_256_NEXT_TEST                /* pointer to next testcase */
+ };
++#undef SRTP_AES_GCM_256_NEXT_TEST
+diff --git a/crypto/include/aes_gcm.h b/crypto/include/aes_gcm.h
+index cd0dcee..ef3b0ab 100644
+--- a/crypto/include/aes_gcm.h
++++ b/crypto/include/aes_gcm.h
+@@ -107,4 +107,24 @@ typedef struct {
+ 
+ #endif /* NSS */
+ 
++#ifdef WOLFSSL
++
++#include <wolfssl/options.h>
++#include <wolfssl/wolfcrypt/aes.h>
++
++#define SRTP_WOLFSSL_GCM_MAX_AAD_SIZE 2048
++
++typedef struct {
++    int key_size;
++    int tag_len;
++    int aad_size;
++    uint8_t iv[12];
++    uint8_t tag[16];
++    uint8_t aad[SRTP_WOLFSSL_GCM_MAX_AAD_SIZE];
++    Aes aes;
++    srtp_cipher_direction_t dir;
++} srtp_aes_gcm_ctx_t;
++
++#endif /* WOLFSSL */
++
+ #endif /* AES_GCM_H */
+diff --git a/crypto/include/aes_icm_ext.h b/crypto/include/aes_icm_ext.h
+index 5b21c95..6877649 100644
+--- a/crypto/include/aes_icm_ext.h
++++ b/crypto/include/aes_icm_ext.h
+@@ -96,4 +96,20 @@ typedef struct {
+ 
+ #endif /* NSS */
+ 
++#ifdef WOLFSSL
++
++#include <wolfssl/options.h>
++#include <wolfssl/wolfcrypt/aes.h>
++
++typedef struct {
++    v128_t counter;
++    v128_t offset;
++    v128_t keystream_buffer;
++    int bytes_in_buffer;
++    int key_size;
++    Aes aes;
++} srtp_aes_icm_ctx_t;
++
++#endif /* WOLFSSL */
++
+ #endif /* AES_ICM_H */
+diff --git a/crypto/include/cipher_types.h b/crypto/include/cipher_types.h
+index 28250d1..b414a08 100644
+--- a/crypto/include/cipher_types.h
++++ b/crypto/include/cipher_types.h
+@@ -71,7 +71,7 @@ extern srtp_debug_module_t srtp_mod_alloc;
+ /* debug modules for cipher types */
+ extern srtp_debug_module_t srtp_mod_aes_icm;
+ 
+-#if defined(OPENSSL) || defined(MBEDTLS) || defined(NSS)
++#if defined(OPENSSL) || defined(MBEDTLS) || defined(NSS) || defined(WOLFSSL)
+ extern srtp_debug_module_t srtp_mod_aes_gcm;
+ #endif
+ 

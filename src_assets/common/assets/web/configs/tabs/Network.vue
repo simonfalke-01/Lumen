@@ -5,38 +5,41 @@ import {
   TriangleAlert,
 } from '@lucide/vue'
 import Checkbox from "../../Checkbox.vue";
-import {
-  hasProtocolV3Permission,
-  normalizeConfiguredInvitationPermissionMask,
-  PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
-  setProtocolV3Permission,
-} from '../../protocol_v3_permissions'
-
 const props = defineProps([
   'platform',
   'config'
 ])
 
 const defaultMoonlightPort = 47989
+const lspKnownPermissionMask = 0x7f
+const lspDefaultPermissionMask = 0x57
 
 const config = ref(props.config)
 const effectivePort = computed(() => +config.value?.port ?? defaultMoonlightPort)
-const protocolV3Permissions = computed(() =>
-  normalizeConfiguredInvitationPermissionMask(config.value?.protocol_v3_pairing_permissions)
-)
-const protocolV3PermissionModel = bit => computed({
-  get: () => hasProtocolV3Permission(protocolV3Permissions.value, bit),
+const lspPairingPermissions = computed(() => {
+  const parsed = Number(config.value?.lsp_pairing_permissions)
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= lspKnownPermissionMask
+    ? parsed
+    : lspDefaultPermissionMask
+})
+const lspPermissionModel = bit => computed({
+  get: () => (lspPairingPermissions.value & bit) !== 0,
   set: enabled => {
-    config.value.protocol_v3_pairing_permissions = setProtocolV3Permission(
-      protocolV3Permissions.value,
-      bit,
-      enabled,
-      PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
-    )
+    config.value.lsp_pairing_permissions = enabled
+      ? lspPairingPermissions.value | bit
+      : lspPairingPermissions.value & ~bit
   },
 })
-const protocolV3MicrophonePermission = protocolV3PermissionModel(3)
-const protocolV3QuitPermission = protocolV3PermissionModel(5)
+const lspPermissionBrowse = lspPermissionModel(1 << 0)
+const lspPermissionStartAttach = lspPermissionModel(1 << 1)
+const lspPermissionInput = lspPermissionModel(1 << 2)
+const lspPermissionMicrophone = lspPermissionModel(1 << 3)
+const lspPermissionStopOwnStream = lspPermissionModel(1 << 4)
+const lspPermissionQuitApplication = lspPermissionModel(1 << 5)
+const lspPermissionControllerOutput = lspPermissionModel(1 << 6)
+const lspCompetitionNeedsCapacity = computed(() =>
+  config.value?.lsp_profile === 'competition' && Number(config.value?.lsp_competition_capacity_mbps) <= 0
+)
 </script>
 
 <template>
@@ -202,59 +205,89 @@ const protocolV3QuitPermission = protocolV3PermissionModel(5)
       <div class="form-text">{{ $t('config.packetsize_desc') }}</div>
     </div>
 
-    <hr class="my-4" />
-    <h3 class="h5">{{ $t('config.protocol_v3') }}</h3>
-    <p class="text-body-secondary">{{ $t('config.protocol_v3_desc') }}</p>
+    <template v-if="platform === 'windows'">
+      <hr class="my-4" />
+      <h3 class="h5">{{ $t('config.lsp') }}</h3>
+      <p class="text-body-secondary">{{ $t('config.lsp_desc') }}</p>
 
-    <Checkbox class="mb-3"
-              id="protocol_v3_enabled"
-              locale-prefix="config"
-              v-model="config.protocol_v3_enabled"
-              default="true"
-    ></Checkbox>
+      <Checkbox class="mb-3"
+                id="lsp_enabled"
+                locale-prefix="config"
+                v-model="config.lsp_enabled"
+                default="true"
+      ></Checkbox>
 
-    <Checkbox class="mb-3"
-              id="legacy_compatibility"
-              locale-prefix="config"
-              v-model="config.legacy_compatibility"
-              default="true"
-    ></Checkbox>
-
-    <div class="row g-3 mb-3">
-      <div class="col-12 col-md-6">
-        <label for="protocol_v3_port" class="form-label">{{ $t('config.protocol_v3_port') }}</label>
-        <input id="protocol_v3_port" v-model="config.protocol_v3_port" class="form-control"
-               type="number" min="1024" max="65535" placeholder="48030" />
-        <div class="form-text">{{ $t('config.protocol_v3_port_desc') }}</div>
+      <div class="row g-3 mb-3">
+        <div class="col-12 col-md-6">
+          <label for="lsp_port" class="form-label">{{ $t('config.lsp_port') }}</label>
+          <input id="lsp_port" v-model="config.lsp_port" class="form-control"
+                 type="number" min="1" max="65535" placeholder="48030" />
+          <div class="form-text">{{ $t('config.lsp_port_desc') }}</div>
+        </div>
+        <div class="col-12 col-md-6">
+          <label for="lsp_profile" class="form-label">{{ $t('config.lsp_profile') }}</label>
+          <select id="lsp_profile" v-model="config.lsp_profile" class="form-select">
+            <option value="adaptive-low-latency">{{ $t('config.lsp_profile_adaptive_low_latency') }}</option>
+            <option value="competition">{{ $t('config.lsp_profile_competition') }}</option>
+          </select>
+          <div class="form-text">{{ $t('config.lsp_profile_desc') }}</div>
+        </div>
       </div>
-      <div class="col-12 col-md-6">
-        <label for="protocol_v3_profile" class="form-label">{{ $t('config.protocol_v3_profile') }}</label>
-        <select id="protocol_v3_profile" v-model="config.protocol_v3_profile" class="form-select">
-          <option value="latency">{{ $t('config.protocol_v3_profile_latency') }}</option>
-          <option value="quality">{{ $t('config.protocol_v3_profile_quality') }}</option>
-        </select>
-        <div class="form-text">{{ $t('config.protocol_v3_profile_desc') }}</div>
-      </div>
-    </div>
 
-    <fieldset class="mb-3">
-      <legend class="h6">{{ $t('config.protocol_v3_optional_permissions') }}</legend>
-      <div class="form-check">
-        <input id="protocol_v3_permission_microphone" class="form-check-input" type="checkbox"
-               v-model="protocolV3MicrophonePermission" aria-describedby="protocol-v3-permission-help" />
-        <label for="protocol_v3_permission_microphone" class="form-check-label">
-          {{ $t('config.protocol_v3_permission_microphone') }}
+      <div class="mb-3">
+        <label for="lsp_competition_capacity_mbps" class="form-label">
+          {{ $t('config.lsp_competition_capacity_mbps') }}
         </label>
+        <input id="lsp_competition_capacity_mbps"
+               v-model="config.lsp_competition_capacity_mbps"
+               class="form-control"
+               type="number"
+               min="0"
+               max="2147483647"
+               placeholder="0" />
+        <div class="form-text">{{ $t('config.lsp_competition_capacity_mbps_desc') }}</div>
+        <div v-if="lspCompetitionNeedsCapacity" class="alert alert-warning mt-2 mb-0" role="alert">
+          <TriangleAlert :size="20" /> {{ $t('config.lsp_competition_capacity_required') }}
+        </div>
       </div>
-      <div class="form-check mt-2">
-        <input id="protocol_v3_permission_quit" class="form-check-input" type="checkbox"
-               v-model="protocolV3QuitPermission" aria-describedby="protocol-v3-permission-help" />
-        <label for="protocol_v3_permission_quit" class="form-check-label">
-          {{ $t('config.protocol_v3_permission_quit') }}
-        </label>
-      </div>
-      <div id="protocol-v3-permission-help" class="form-text">{{ $t('config.protocol_v3_optional_permissions_desc') }}</div>
-    </fieldset>
+
+      <fieldset class="mb-3" aria-describedby="lsp-pairing-permissions-help">
+        <legend class="h6">{{ $t('config.lsp_pairing_permissions') }}</legend>
+        <div class="row g-2">
+          <div class="col-12 col-md-6 form-check">
+            <input id="lsp_permission_browse" v-model="lspPermissionBrowse" class="form-check-input" type="checkbox" />
+            <label for="lsp_permission_browse" class="form-check-label">{{ $t('config.lsp_permission_browse') }}</label>
+          </div>
+          <div class="col-12 col-md-6 form-check">
+            <input id="lsp_permission_start_attach" v-model="lspPermissionStartAttach" class="form-check-input" type="checkbox" />
+            <label for="lsp_permission_start_attach" class="form-check-label">{{ $t('config.lsp_permission_start_attach') }}</label>
+          </div>
+          <div class="col-12 col-md-6 form-check">
+            <input id="lsp_permission_input" v-model="lspPermissionInput" class="form-check-input" type="checkbox" />
+            <label for="lsp_permission_input" class="form-check-label">{{ $t('config.lsp_permission_input') }}</label>
+          </div>
+          <div class="col-12 col-md-6 form-check">
+            <input id="lsp_permission_microphone" v-model="lspPermissionMicrophone" class="form-check-input" type="checkbox" />
+            <label for="lsp_permission_microphone" class="form-check-label">{{ $t('config.lsp_permission_microphone') }}</label>
+          </div>
+          <div class="col-12 col-md-6 form-check">
+            <input id="lsp_permission_stop_own_stream" v-model="lspPermissionStopOwnStream" class="form-check-input" type="checkbox" />
+            <label for="lsp_permission_stop_own_stream" class="form-check-label">{{ $t('config.lsp_permission_stop_own_stream') }}</label>
+          </div>
+          <div class="col-12 col-md-6 form-check">
+            <input id="lsp_permission_quit_application" v-model="lspPermissionQuitApplication" class="form-check-input" type="checkbox" />
+            <label for="lsp_permission_quit_application" class="form-check-label">{{ $t('config.lsp_permission_quit_application') }}</label>
+          </div>
+          <div class="col-12 col-md-6 form-check">
+            <input id="lsp_permission_controller_output" v-model="lspPermissionControllerOutput" class="form-check-input" type="checkbox" />
+            <label for="lsp_permission_controller_output" class="form-check-label">{{ $t('config.lsp_permission_controller_output') }}</label>
+          </div>
+        </div>
+        <div id="lsp-pairing-permissions-help" class="form-text mt-2">
+          {{ $t('config.lsp_pairing_permissions_desc') }}
+        </div>
+      </fieldset>
+    </template>
 
   </div>
 </template>

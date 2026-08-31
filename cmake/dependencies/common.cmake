@@ -5,6 +5,10 @@
 # This ensures a user-provided OPENSSL_ROOT_DIR is honored consistently.
 find_package(OpenSSL REQUIRED)
 
+if(LUMEN_ENABLE_LSP_RUNTIME)
+    include("${CMAKE_MODULE_PATH}/dependencies/lsp_security.cmake")
+endif()
+
 # boost, this should be before Simple-Web-Server as it also depends on boost
 include(dependencies/Boost_Sunshine)
 

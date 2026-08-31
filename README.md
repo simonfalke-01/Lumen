@@ -30,12 +30,8 @@ not mean an end-to-end lossless, HDR-perfect, or HDMI-equivalent stream.
 Vanilla Moonlight compatibility remains a release requirement. Existing
 clients continue to use GameStream's HTTP(S), RTSP, and UDP listeners.
 
-The repository also contains experimental Umbra/Lumen control, pairing, and
-single-port QUIC implementations. They are not shipped as the production path.
-The QUIC design uses one UDP port only for a future Umbra-specific protocol;
-vanilla Moonlight still requires the legacy ports. See:
+Performance tuning and measurement boundaries are documented separately:
 
-- [Experimental single-port QUIC v3 specification](docs/protocols/umbra-lumen-quic-v3.md)
 - [Performance tuning and measurement boundaries](docs/performance_tuning.md)
 
 ## Virtual display status

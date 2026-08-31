@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -128,8 +129,8 @@ namespace platf {
   /** @brief Immutable client-visible identity captured when one virtual controller is allocated. */
   struct gamepad_feedback_id_t {
     std::uint16_t id {};  ///< Client-relative controller identifier.
-    std::uint32_t input_generation {};  ///< Owning protocol-v3 input generation, or zero for legacy.
-    std::uint32_t controller_generation {};  ///< Owning controller instance generation, or zero for legacy.
+    std::uint32_t input_generation {};  ///< Owning input generation, or zero when no generation fence applies.
+    std::uint32_t controller_generation {};  ///< Owning controller generation, or zero when no generation fence applies.
 
     /** @brief Compare the complete immutable feedback identity. */
     bool operator==(const gamepad_feedback_id_t &) const = default;
@@ -426,8 +427,8 @@ namespace platf {
     // client. It must be used when communicating back to the client via
     // the input feedback queue.
     std::uint8_t clientRelativeIndex;  ///< Client relative index.
-    std::uint32_t inputGeneration {};  ///< Protocol-v3 input generation, or zero for legacy clients.
-    std::uint32_t controllerGeneration {};  ///< Protocol-v3 controller instance generation, or zero for legacy.
+    std::uint32_t inputGeneration {};  ///< LSP input generation, or zero for legacy clients.
+    std::uint32_t controllerGeneration {};  ///< LSP controller instance generation, or zero for legacy clients.
 
     /** @brief Return the immutable feedback identity for callbacks owned by this allocation. */
     gamepad_feedback_id_t feedback_identity() const noexcept {
@@ -1296,16 +1297,22 @@ namespace platf {
 
   constexpr auto SERVICE_NAME = "Lumen";  ///< mDNS service instance name advertised for GameStream discovery.
   constexpr auto SERVICE_TYPE = "_nvstream._tcp";  ///< mDNS service type advertised for GameStream discovery.
+  constexpr auto LSP_SERVICE_TYPE = "_lumen-stream._udp";  ///< mDNS service type advertised only for an active LSP listener.
 
   namespace publish {
     /** @brief Exact DNS-SD service record owned for one registration lifetime. */
     struct service_t {
-      std::string type;  ///< DNS-SD service type, for example `_lumen-v3._udp`.
+      std::string type;  ///< DNS-SD service type.
       std::uint16_t port {};  ///< Host-order service port advertised in SRV.
       std::vector<std::pair<std::string, std::string>> txt;  ///< Ordered TXT key/value pairs.
     };
 
-    /** @brief Validate the only two DNS-SD records Lumen is allowed to publish. */
+    /**
+     * @brief Validate an exact GameStream or LSP DNS-SD record.
+     *
+     * @param service Candidate service descriptor.
+     * @return True for the legacy record or an LSP/1 record with canonical TXT values.
+     */
     [[nodiscard]] inline bool valid_service(const service_t &service) {
       if (service.port == 0) {
         return false;
@@ -1319,22 +1326,38 @@ namespace platf {
                         (character >= 'a' && character <= 'f');
                });
       };
-      return service.type == "_lumen-v3._udp" && service.txt.size() == 4 &&
-             service.txt[0] == std::pair {std::string {"v"}, std::string {"3"}} &&
+      return service.type == LSP_SERVICE_TYPE && service.txt.size() == 3 &&
+             service.txt[0] == std::pair {std::string {"v"}, std::string {"1"}} &&
              service.txt[1].first == "id" && lowercase_hex(service.txt[1].second, 32) &&
-             service.txt[2] == std::pair {std::string {"port"}, std::to_string(service.port)} &&
-             service.txt[3].first == "caps" && lowercase_hex(service.txt[3].second, 16);
+             service.txt[2].first == "caps" && lowercase_hex(service.txt[2].second, 16);
     }
 
-    /** @brief Validate one nonempty, duplicate-free legacy/modern publication set. */
+    /**
+     * @brief Validate a publication set containing legacy GameStream and optional live LSP discovery.
+     *
+     * @param services Candidate service descriptors.
+     * @return True when exactly one legacy record and at most one exact LSP record are present.
+     */
     [[nodiscard]] inline bool valid_services(const std::vector<service_t> &services) {
-      return !services.empty() && services.size() <= 2 &&
-             std::ranges::all_of(services, valid_service) &&
-             (services.size() != 2 || services[0].type != services[1].type);
+      if (services.empty() || services.size() > 2 || !std::ranges::all_of(services, valid_service)) {
+        return false;
+      }
+      const auto legacy_count = std::ranges::count_if(services, [](const service_t &service) {
+        return service.type == SERVICE_TYPE;
+      });
+      const auto lsp_count = std::ranges::count_if(services, [](const service_t &service) {
+        return service.type == LSP_SERVICE_TYPE;
+      });
+      return legacy_count == 1 && lsp_count == static_cast<std::ptrdiff_t>(services.size() - 1);
     }
 
     [[nodiscard]] std::unique_ptr<deinit_t> start();
-    /** @brief Publish the exact configured legacy/modern DNS-SD record set. */
+    /**
+     * @brief Publish the exact configured GameStream and optional active-LSP DNS-SD record set.
+     *
+     * @param services Validated service descriptors owned for the returned lifetime.
+     * @return Registration lifetime, or null when validation or publication fails.
+     */
     [[nodiscard]] std::unique_ptr<deinit_t> start(std::vector<service_t> services);
   }
 

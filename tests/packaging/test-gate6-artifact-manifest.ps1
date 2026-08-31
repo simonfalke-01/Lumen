@@ -385,10 +385,9 @@ try {
     } 'case-colliding path'
 
     foreach ($swap in @(
-            @('swapped-shim', 'shim/lumen_msquic_shim.dll'),
             @('swapped-shader', 'inventories/msi/assets/shaders/directx/convert_yuv420_planar_y_ps.hlsl'),
             @('swapped-driver', 'drivers/virtual-display/LumenVirtualDisplay.dll'),
-            @('stale-vector', 'vectors/quic_v3_vectors.json')
+            @('stale-vector', 'vectors/vdd_gate5_contract.json')
         )) {
         Invoke-HostileFixture $swap[0] {
             param($fixture)

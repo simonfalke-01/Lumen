@@ -135,7 +135,7 @@ TEST(ProcessLifecycleTest, CancellationRequiresAnAuthorizedLegacyCertificate) {
   EXPECT_FALSE(process.terminate_if_owned_by_certificate("certificate-a"));
 }
 
-TEST(ProcessLifecycleTest, GenerationFencesLateLegacyOwnersFromReplacementAndProtocolV3Processes) {
+TEST(ProcessLifecycleTest, GenerationFencesLateLegacyOwnersFromReplacementProcesses) {
   boost::process::v1::environment env {boost::this_process::environment()};
   proc::ctx_t desktop {};
   desktop.name = "Desktop";
@@ -150,10 +150,10 @@ TEST(ProcessLifecycleTest, GenerationFencesLateLegacyOwnersFromReplacementAndPro
   ASSERT_EQ(process.execute(881, legacy), 0);
   const auto legacy_generation = legacy->process_generation;
 
-  auto protocol_v3 = std::make_shared<rtsp_stream::launch_session_t>();
-  ASSERT_EQ(process.execute(881, protocol_v3), 0);
-  const auto protocol_v3_generation = protocol_v3->process_generation;
-  ASSERT_GT(protocol_v3_generation, legacy_generation);
+  auto replacement = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(process.execute(881, replacement), 0);
+  const auto replacement_generation = replacement->process_generation;
+  ASSERT_GT(replacement_generation, legacy_generation);
 
   bool stale_publish_called {};
   EXPECT_FALSE(process.publish_legacy_session(
@@ -168,16 +168,16 @@ TEST(ProcessLifecycleTest, GenerationFencesLateLegacyOwnersFromReplacementAndPro
   EXPECT_FALSE(process.authorize_cancel_by_certificate("certificate-a", legacy_generation));
   EXPECT_FALSE(process.terminate_if_owned_by_certificate("certificate-a"));
 
-  bool cross_protocol_publish_called {};
+  bool replacement_publish_called {};
   EXPECT_FALSE(process.publish_legacy_session(
-    protocol_v3_generation,
+    replacement_generation,
     "certificate-a",
     [&]() {
-      cross_protocol_publish_called = true;
+      replacement_publish_called = true;
       return true;
     }
   ));
-  EXPECT_FALSE(cross_protocol_publish_called);
+  EXPECT_FALSE(replacement_publish_called);
   EXPECT_EQ(process.running(), 881);
 }
 
@@ -212,12 +212,12 @@ TEST(ProcessLifecycleTest, ActivePublicationSerializesAgainstConcurrentProcessRe
   });
   ASSERT_EQ(publish_started.wait_for(std::chrono::seconds {1}), std::future_status::ready);
 
-  auto protocol_v3 = std::make_shared<rtsp_stream::launch_session_t>();
+  auto replacement_session = std::make_shared<rtsp_stream::launch_session_t>();
   std::promise<void> replacement_entered;
   auto replacement_started = replacement_entered.get_future();
   auto replacement = std::async(std::launch::async, [&]() {
     replacement_entered.set_value();
-    return process.execute(881, protocol_v3);
+    return process.execute(881, replacement_session);
   });
   ASSERT_EQ(replacement_started.wait_for(std::chrono::seconds {1}), std::future_status::ready);
   EXPECT_EQ(replacement.wait_for(std::chrono::milliseconds {20}), std::future_status::timeout);
@@ -225,7 +225,7 @@ TEST(ProcessLifecycleTest, ActivePublicationSerializesAgainstConcurrentProcessRe
   release_publish.set_value();
   EXPECT_TRUE(publication.get());
   EXPECT_EQ(replacement.get(), 0);
-  EXPECT_GT(protocol_v3->process_generation, legacy->process_generation);
+  EXPECT_GT(replacement_session->process_generation, legacy->process_generation);
   EXPECT_FALSE(process.terminate_if_owned_by_certificate(legacy->client_cert));
 }
 

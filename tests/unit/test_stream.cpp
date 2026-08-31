@@ -7,7 +7,6 @@
 #include <functional>
 #include <future>
 #include <src/input.h>
-#include <src/protocol_v3/media_pipeline.h>
 #include <src/stream.h>
 #include <stdexcept>
 #include <string>
@@ -121,79 +120,10 @@ TEST(StreamSessionLifecycleTest, CommitFailureRejectsControlClaimAndRemovesEvery
   EXPECT_TRUE(probe.lookup_after_owner_release_rejected);
 }
 
-TEST(ProtocolV3AudioConfigurationTest, AppliesExplicitHostPlaybackPolicyAndExactTuple) {
-  lumen::protocol_v3::media::NegotiatedMediaConfig selection;
-  selection.audio = {
-    .sample_rate = 48'000,
-    .frame_samples = 240,
-    .channels = 6,
-    .layout = 2,
-    .streams = 4,
-    .coupled_streams = 2,
-    .mapping = {0, 1, 2, 3, 4, 5, 0xff, 0xff},
-    .bitrate_bps = 256'000,
-  };
-
-  for (const bool host_audio : {false, true}) {
-    selection.host_audio = host_audio;
-    audio::config_t configured {};
-    stream::configure_protocol_v3_audio(configured, selection);
-
-    EXPECT_EQ(configured.packetDuration, 5);
-    EXPECT_EQ(configured.channels, 6);
-    EXPECT_EQ(configured.mask, 0x3f);
-    EXPECT_EQ(configured.bitrate, 256'000);
-    EXPECT_EQ(configured.flags[audio::config_t::HOST_AUDIO], host_audio);
-    EXPECT_TRUE(configured.flags[audio::config_t::CONTINUOUS_AUDIO]);
-    EXPECT_TRUE(configured.flags[audio::config_t::CUSTOM_SURROUND_PARAMS]);
-    EXPECT_EQ(configured.customStreamParams.channelCount, 6);
-    EXPECT_EQ(configured.customStreamParams.streams, 4);
-    EXPECT_EQ(configured.customStreamParams.coupledStreams, 2);
-    EXPECT_TRUE(std::ranges::equal(
-      configured.customStreamParams.mapping,
-      selection.audio.mapping
-    ));
-  }
-}
-
-TEST(ProtocolV3VideoConfigurationTest, PreservesExactRefreshAcrossCaptureEncoderAndVbv) {
-  lumen::protocol_v3::media::NegotiatedMediaConfig selection;
-  selection.width = 3456;
-  selection.height = 2160;
-  selection.refresh_numerator = 60000;
-  selection.refresh_denominator = 1001;
-  selection.video_bitrate_kbps = 80000;
-  selection.codec_id = 2;
-  selection.bit_depth = 10;
-  selection.chroma_layout = 1;
-  selection.primaries = 9;
-  selection.transfer = 2;
-  selection.matrix_code = 9;
-  selection.range = 0;
-
-  video::config_t configured {};
-  stream::configure_protocol_v3_video(configured, selection);
-  EXPECT_EQ(configured.width, 3456);
-  EXPECT_EQ(configured.height, 2160);
-  EXPECT_EQ(configured.framerate, 60);
-  EXPECT_EQ(configured.refreshNumerator, 60000);
-  EXPECT_EQ(configured.refreshDenominator, 1001);
-  EXPECT_EQ(video::framerate_to_rational(configured).num, 60000);
-  EXPECT_EQ(video::framerate_to_rational(configured).den, 1001);
-  EXPECT_EQ(video::capture_frame_interval(configured), std::chrono::nanoseconds {(1001LL * 1'000'000'000LL) / 60000LL});
-  EXPECT_EQ(video::vbv_frame_size_bits(configured), 1'334'666U);
-  EXPECT_TRUE(configured.protocolV3Colorimetry);
-  EXPECT_EQ(configured.colorTransfer, 16U);
-
-  selection.refresh_numerator = 3'000'000'001U;
-  selection.refresh_denominator = 50'000'000U;
-  EXPECT_THROW(stream::configure_protocol_v3_video(configured, selection), std::overflow_error);
-}
-
-TEST(VirtualDisplayDirectLossContract, V3TerminatesWhileLegacyFallbackRequiresSafeRollback) {
-  video::config_t v3 {};
-  v3.virtual_display_direct_required = true;
-  EXPECT_EQ(video::capture_reinitialization_action(v3), video::capture_reinitialization_e::terminate);
+TEST(VirtualDisplayDirectLossContract, RequiredDirectSourceTerminatesWhileLegacyFallbackRequiresSafeRollback) {
+  video::config_t direct_required {};
+  direct_required.virtual_display_direct_required = true;
+  EXPECT_EQ(video::capture_reinitialization_action(direct_required), video::capture_reinitialization_e::terminate);
   EXPECT_FALSE(stream::allow_legacy_physical_hdr_fallback(false, true, true));
   EXPECT_FALSE(stream::allow_legacy_physical_hdr_fallback(true, false, true));
   EXPECT_TRUE(stream::allow_legacy_physical_hdr_fallback(true, true, true));
@@ -233,21 +163,6 @@ TEST(StreamAudioDestinationProductionTest, LegacySharedQueuePreservesOwnersAndIn
   EXPECT_EQ(probe.legacy_second_after_owner_expiry, result_e::closed);
 }
 
-TEST(StreamAudioDestinationProductionTest, ProtocolV3OwnsPrivateQueuesAndIndependentClose) {
-  using result_e = audio::AudioPacketDestination::enqueue_result_e;
-  const auto probe = stream::audio_destination_isolation_probe_for_test();
-
-  EXPECT_EQ(probe.v3_first_enqueued_count, 32U);
-  EXPECT_EQ(probe.v3_first_over_capacity, result_e::backpressure);
-  EXPECT_EQ(probe.v3_second_enqueue, result_e::enqueued);
-  EXPECT_EQ(probe.v3_first_pop_tag, 0x40);
-  EXPECT_EQ(probe.v3_second_pop_tag, 0xb1);
-  EXPECT_FALSE(probe.v3_first_pop_after_close_present);
-  EXPECT_EQ(probe.v3_first_after_repeated_close, result_e::closed);
-  EXPECT_EQ(probe.v3_second_after_first_close, result_e::enqueued);
-  EXPECT_EQ(probe.v3_second_after_close_tag, 0xb2);
-}
-
 TEST(StreamLegacyUdpPeerRoutingTest, ConcurrentVideoAndAudioPingsPreserveSocketSpecificPeers) {
   const auto probe = stream::legacy_udp_peer_isolation_probe_for_test();
 
@@ -262,47 +177,4 @@ TEST(StreamLegacyUdpPeerRoutingTest, ConcurrentVideoAndAudioPingsPreserveSocketS
   EXPECT_EQ(probe.routed_audio_port, probe.audio_source_port);
   EXPECT_TRUE(probe.audio_datagram_reached_audio_socket);
   EXPECT_FALSE(probe.audio_datagram_reached_video_socket);
-}
-
-TEST(ProtocolV3ControllerFeedbackTest, DelayedGenerationCannotRetargetAReusedControllerSlot) {
-  const auto delayed = platf::gamepad_feedback_msg_t::make_rumble(
-    {2, 7, 1},
-    0x1111,
-    0x2222
-  );
-  const auto current = platf::gamepad_feedback_msg_t::make_rumble(
-    {2, 7, 2},
-    0x3333,
-    0x4444
-  );
-
-  EXPECT_FALSE(stream::protocol_v3_feedback_is_current_for_test(delayed, 7, 2));
-  EXPECT_FALSE(stream::protocol_v3_feedback_is_current_for_test(current, 8, 2));
-  EXPECT_TRUE(stream::protocol_v3_feedback_is_current_for_test(current, 7, 2));
-  EXPECT_EQ(delayed.identity.controller_generation, 1U);
-}
-
-TEST(ProtocolV3InputResetTest, RealOrderedInjectorFailureReportsRejectedCompletion) {
-  auto platform_input = input::init();
-  auto mail = std::make_shared<safe::mail_raw_t>();
-  auto session_input = input::alloc(mail);
-  ASSERT_TRUE(session_input);
-
-  std::promise<bool> completion;
-  auto result = completion.get_future();
-  ASSERT_TRUE(input::passthrough_state(
-    session_input,
-    [](const input::ordered_injector_t &injector) {
-      return injector(std::vector<std::uint8_t>(sizeof(std::uint64_t), 0));
-    },
-    false,
-    [&completion](const bool applied) {
-      completion.set_value(applied);
-    }
-  ));
-  ASSERT_EQ(result.wait_for(std::chrono::seconds {1}), std::future_status::ready);
-  EXPECT_FALSE(result.get());
-
-  input::reset(session_input);
-  platform_input.reset();
 }

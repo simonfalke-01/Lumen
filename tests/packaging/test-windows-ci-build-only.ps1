@@ -108,7 +108,6 @@ foreach ($path in @(
         "src/platform/windows/virtual_microphone_driver/LumenVirtualMicrophone.inf",
         "src/platform/windows/virtual_display_driver/LumenVirtualDisplay.vcxproj",
         "src/platform/windows/virtual_display_driver/LumenVirtualDisplay.inf",
-        "src/platform/windows/msquic_shim/LumenMsQuicShim.vcxproj",
         ".github/scripts/validate-windows-msi.ps1"
     )) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $path) -PathType Leaf)) {
@@ -152,16 +151,10 @@ Assert-ContainsLiteral `
     "-DCMAKE_CXX_COMPILER_LAUNCHER='`$sccacheCmake'" `
     "The full-profile C++ compiler must use the hosted sccache executable."
 
-$msquicCachePath = '${{ runner.temp }}/lumen-full-profile/downloads/Microsoft.Native.Quic.MsQuic.Schannel.2.6.0.nupkg'
-Assert-ContainsLiteral $workflow "path: $msquicCachePath" "Windows CI must cache the pinned MsQuic package."
-Assert-ContainsLiteral `
-    $workflow `
-    'if (-not (Test-Path -LiteralPath $nupkg -PathType Leaf)) {' `
-    "Windows CI must reuse the cached MsQuic package before downloading it."
 Assert-ContainsLiteral `
     $workflow `
     "Copy-Item (Join-Path `$staging 'artifacts\*') artifacts -Recurse -Force" `
-    "Windows artifact staging must recursively preserve nested drivers, shim, and identity manifests."
+    "Windows artifact staging must recursively preserve nested driver and identity manifests."
 $uploadBlock = [regex]::Match(
     $workflow,
     '(?s)- name: Upload Windows artifacts(?<body>.*?)\n\s{2}publish_reused_windows_artifacts:'

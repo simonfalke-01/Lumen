@@ -7,9 +7,11 @@
 
 // standard imports
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <future>
 #include <stdexcept>
 #include <thread>
@@ -67,6 +69,49 @@ TEST(HttpCommonStateFileTest, TransactionsSerializeAndFailedMutationDoesNotCommi
   EXPECT_EQ(after_failure.get<std::string>("username"), "admin");
 
   std::filesystem::remove(state_file, ignored);
+}
+
+TEST(HttpCommonStateFileTest, RemovedTransportMigrationPreservesLegacyStateAndCredentials) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    std::format("lumen-retired-transport-{}", std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto state_file = root / "sunshine_state.json";
+  const auto credentials = root / "credentials";
+  std::error_code ignored;
+  std::filesystem::create_directories(credentials);
+  auto cleanup = util::fail_guard([&]() {
+    std::filesystem::remove_all(root, ignored);
+  });
+
+  ASSERT_TRUE(http::update_state_file(state_file.string(), [](http::state_file_tree_t &tree) {
+    tree.put("root.uniqueid", "legacy-host");
+    tree.put("devices.device.cert", "legacy-client");
+    tree.put("protocol_" "v3.client", "retired-client");
+  }));
+
+  constexpr std::array removed_credentials {
+    "protocol_" "v3_identity.bin",
+    "protocol_" "v3_identity.bin.pending",
+    "protocol_" "v3_identity.journal",
+    "protocol_" "v3_cng_keys.journal",
+  };
+  for (const auto *name : removed_credentials) {
+    std::ofstream {credentials / name} << "retired";
+  }
+  const auto legacy_certificate = credentials / "cacert.pem";
+  std::ofstream {legacy_certificate} << "legacy";
+
+  ASSERT_TRUE(http::migrate_removed_transport_state(state_file.string()));
+  http::state_file_tree_t migrated;
+  ASSERT_TRUE(http::read_state_file(state_file.string(), migrated));
+  EXPECT_EQ(migrated.get<std::string>("root.uniqueid"), "legacy-host");
+  EXPECT_EQ(migrated.get<std::string>("devices.device.cert"), "legacy-client");
+  EXPECT_FALSE(migrated.get_child_optional("protocol_" "v3"));
+  for (const auto *name : removed_credentials) {
+    EXPECT_FALSE(std::filesystem::exists(credentials / name));
+  }
+  EXPECT_TRUE(std::filesystem::exists(legacy_certificate));
+
+  EXPECT_TRUE(http::migrate_removed_transport_state(state_file.string()));
 }
 
 struct UrlEscapeTest: BaseTest, testing::WithParamInterface<std::tuple<std::string, std::string>> {};

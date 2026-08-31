@@ -6,7 +6,7 @@
 
 // standard includes
 #include <cstdint>
-#include <functional>
+#include <memory>
 #include <vector>
 
 // local includes
@@ -15,10 +15,144 @@
 
 namespace input {
   struct input_t;
-  using ordered_injector_t =
-    std::function<bool(std::vector<std::uint8_t> &&)>;  ///< Checked direct consumer-thread packet injector.
-  using ordered_state_operation_t =
-    std::function<bool(const ordered_injector_t &)>;  ///< One complete v3 state operation.
+
+  /** @brief Opaque held-state owner for one authenticated LSP input authority. */
+  struct lsp_platform_input_t;
+
+  /** @brief Controller output forwarded from the existing platform backend into LSPG. */
+  struct lsp_controller_feedback_t {
+    platf::gamepad_feedback_msg_t message;  ///< Generation-qualified platform feedback value.
+  };
+
+  /** @brief Non-reentrant controller feedback callback. */
+  using lsp_controller_feedback_callback_t = void (*)(void *, const lsp_controller_feedback_t &) noexcept;
+
+  /** @brief Deleter for the opaque LSP platform-input owner. */
+  struct lsp_platform_input_deleter_t {
+    /**
+     * @brief Destroy one LSP platform-input owner after neutralization.
+     *
+     * @param input Owner to destroy, or null.
+     */
+    void operator()(lsp_platform_input_t *input) const noexcept;
+  };
+
+  using lsp_platform_input_ptr = std::unique_ptr<lsp_platform_input_t, lsp_platform_input_deleter_t>;  ///< Owning opaque LSP input handle.
+
+  /** @brief Create a fresh neutral LSP platform-input contribution. */
+  [[nodiscard]] lsp_platform_input_ptr alloc_lsp_platform_input(
+    lsp_controller_feedback_callback_t feedback_callback = nullptr,
+    void *feedback_context = nullptr
+  );
+
+  /**
+   * @brief Apply cumulative-pointer differences through the existing platform backend.
+   *
+   * @param input LSP held-state owner.
+   * @param delta_x Relative horizontal difference.
+   * @param delta_y Relative vertical difference.
+   * @param vertical_scroll Cumulative vertical-scroll difference.
+   * @param horizontal_scroll Cumulative horizontal-scroll difference.
+   * @return True after every bounded platform update was submitted.
+   */
+  bool apply_lsp_pointer(
+    lsp_platform_input_t &input,
+    std::int64_t delta_x,
+    std::int64_t delta_y,
+    std::int64_t vertical_scroll,
+    std::int64_t horizontal_scroll
+  ) noexcept;
+
+  /**
+   * @brief Apply one exactly-once keyboard HID-usage transition.
+   *
+   * @param input LSP held-state owner.
+   * @param hid_usage Keyboard-page HID usage.
+   * @param release Whether to release the usage.
+   * @return True when the usage is supported and applied.
+   */
+  bool apply_lsp_key(lsp_platform_input_t &input, std::uint16_t hid_usage, bool release) noexcept;
+
+  /**
+   * @brief Apply one exactly-once pointer-button transition.
+   *
+   * @param input LSP held-state owner.
+   * @param button LSP pointer button in the range one through five.
+   * @param release Whether to release the button.
+   * @return True when the button is supported and applied.
+   */
+  bool apply_lsp_pointer_button(lsp_platform_input_t &input, std::uint16_t button, bool release) noexcept;
+
+  /**
+   * @brief Atomically release all keyboard and pointer state owned by LSP.
+   *
+   * @param input LSP held-state owner.
+   */
+  void neutralize_lsp_platform_input(lsp_platform_input_t &input) noexcept;
+
+  /** @brief Allocate one generation-qualified LSP controller. */
+  bool arrive_lsp_controller(
+    lsp_platform_input_t &input,
+    std::uint32_t input_generation,
+    std::uint32_t controller_id,
+    std::uint32_t instance_generation,
+    std::uint8_t type
+  ) noexcept;
+
+  /** @brief Remove one exact LSP controller generation. */
+  bool remove_lsp_controller(
+    lsp_platform_input_t &input,
+    std::uint32_t controller_id,
+    std::uint32_t instance_generation
+  ) noexcept;
+
+  /** @brief Apply the latest analog controller state while retaining edge-owned buttons. */
+  bool apply_lsp_controller_state(
+    lsp_platform_input_t &input,
+    std::uint32_t controller_id,
+    std::uint32_t instance_generation,
+    std::uint8_t left_trigger,
+    std::uint8_t right_trigger,
+    std::int16_t left_x,
+    std::int16_t left_y,
+    std::int16_t right_x,
+    std::int16_t right_y
+  ) noexcept;
+
+  /** @brief Apply one exactly-once controller button-bit transition. */
+  bool apply_lsp_controller_button(
+    lsp_platform_input_t &input,
+    std::uint32_t controller_id,
+    std::uint32_t instance_generation,
+    std::uint16_t button_bit,
+    bool release
+  ) noexcept;
+
+  /** @brief Apply one controller gyroscope or accelerometer sample. */
+  bool apply_lsp_controller_sensor(
+    lsp_platform_input_t &input,
+    std::uint32_t input_generation,
+    std::uint32_t controller_id,
+    std::uint32_t instance_generation,
+    std::uint8_t sensor_type,
+    float x,
+    float y,
+    float z
+  ) noexcept;
+
+  /** @brief Apply one controller touchpad contact event. */
+  bool apply_lsp_controller_touch(
+    lsp_platform_input_t &input,
+    std::uint32_t input_generation,
+    std::uint32_t controller_id,
+    std::uint32_t instance_generation,
+    std::uint8_t event_type,
+    std::uint32_t contact_id,
+    float x,
+    float y,
+    float pressure
+  ) noexcept;
+
 
   /**
    * @brief Internal input helpers exposed for focused unit testing.
@@ -155,46 +289,6 @@ namespace input {
    * @return True when the ordered consumer accepted or coalesced the packet.
    */
   bool passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data);
-
-  /**
-   * @brief Queue one protocol-v3 state operation on the ordered input consumer.
-   *
-   * Edge-free operations may supersede a consecutive stale state and expire
-   * under the normal motion-age bound. Operations containing a new edge are
-   * non-droppable and preserve strict FIFO ordering. Completion runs only after
-   * every packet emitted by the operation has returned from platform injection.
-   *
-   * @param input Shared stream input state.
-   * @param operation Consumer-thread operation using the direct ordered injector.
-   * @param supersedable Whether a newer consecutive state may replace this work.
-   * @param completion Callback reporting actual platform-injection success or failure.
-   * @return True when accepted, coalesced, or safely pressure-dropped; false when closed.
-   */
-  bool passthrough_state(
-    std::shared_ptr<input_t> &input,
-    ordered_state_operation_t operation,
-    bool supersedable,
-    std::function<void(bool)> completion = {}
-  );
-
-  /**
-   * @brief Bind immutable v3 authority identity to the next controller allocation.
-   *
-   * Must run inside that input session's ordered state operation immediately
-   * before its controller-arrival packet is injected.
-   *
-   * @param input Session input state.
-   * @param controller Client-relative controller slot.
-   * @param input_generation Nonzero input authority generation.
-   * @param controller_generation Nonzero controller instance generation.
-   * @return True when the unallocated slot accepted the identity.
-   */
-  bool set_gamepad_feedback_identity(
-    input_t *input,
-    std::uint8_t controller,
-    std::uint32_t input_generation,
-    std::uint32_t controller_generation
-  ) noexcept;
 
   /**
    * @brief Seal input producers before waiting for the control stream to terminate.

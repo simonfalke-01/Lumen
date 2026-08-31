@@ -4,16 +4,35 @@
 <head>
   <%- header %>
   <style>
-    .v3-pairing-layout { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2rem; align-items: start; }
-    .v3-qr-frame { padding: 1rem; background: var(--bs-white); border-radius: var(--bs-border-radius); }
-    .v3-qr-frame canvas { display: block; width: min(17.25rem, 68vw); height: auto; }
-    .v3-uri { min-height: 5.5rem; overflow-wrap: anywhere; resize: vertical; }
-    .v3-client-id { max-width: 16rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .v3-permissions { display: grid; grid-template-columns: repeat(3, minmax(7.5rem, 1fr)); gap: .5rem 1rem; }
-    @media (max-width: 767.98px) {
-      .v3-pairing-layout { grid-template-columns: 1fr; }
-      .v3-qr-frame { justify-self: center; }
-      .v3-permissions { grid-template-columns: repeat(2, minmax(7.5rem, 1fr)); }
+    .lsp-status-strip {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) repeat(2, minmax(8rem, auto)) auto;
+      gap: 1rem;
+      align-items: center;
+      padding: 1rem 1.5rem;
+      background: var(--bs-tertiary-bg);
+      border-inline-start: .25rem solid var(--bs-secondary-color);
+      border-radius: var(--bs-border-radius);
+    }
+    .lsp-status-strip.is-active { border-inline-start-color: var(--bs-success); }
+    .lsp-status-value { font-variant-numeric: tabular-nums; }
+    .lsp-invitation-uri { min-height: 7rem; overflow-wrap: anywhere; resize: vertical; }
+    .lsp-permissions { display: grid; grid-template-columns: repeat(3, minmax(8.5rem, 1fr)); gap: .5rem 1rem; }
+    .lsp-client-id { max-width: 22rem; overflow-wrap: anywhere; }
+    .lsp-client-row[aria-busy="true"] { opacity: .72; }
+    .lsp-section-heading { max-width: 44rem; }
+    @media (max-width: 991.98px) {
+      .lsp-status-strip { grid-template-columns: minmax(0, 1fr) minmax(8rem, auto) auto; }
+      .lsp-status-profile { grid-column: 1 / -1; grid-row: 2; }
+      .lsp-permissions { grid-template-columns: repeat(2, minmax(8.5rem, 1fr)); }
+    }
+    @media (max-width: 575.98px) {
+      .lsp-status-strip { grid-template-columns: 1fr auto; padding: 1rem; }
+      .lsp-status-port, .lsp-status-profile { grid-column: 1 / -1; }
+      .lsp-status-port { grid-row: 2; }
+      .lsp-status-profile { grid-row: 3; }
+      .lsp-permissions { grid-template-columns: 1fr; }
+      .lsp-client-id { max-width: 14rem; }
     }
   </style>
 </head>
@@ -22,397 +41,404 @@
   <Navbar></Navbar>
   <main id="content" class="container py-4">
     <header class="mb-4">
-      <h1>{{ $t('clients.title') }}</h1>
-      <p class="text-body-secondary mb-0">{{ $t('clients.description') }}</p>
+      <h1>{{ $t('lsp_clients.title') }}</h1>
+      <p class="text-body-secondary mb-0 lsp-section-heading">{{ $t('lsp_clients.description') }}</p>
     </header>
 
-    <section class="card mb-4" aria-labelledby="v3-pairing-title">
-      <div class="card-body p-4">
-        <div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
-          <div>
-            <h2 id="v3-pairing-title" class="h4 mb-1">{{ $t('clients.direct_pairing') }}</h2>
-            <p class="text-body-secondary mb-0">{{ $t('clients.direct_pairing_desc') }}</p>
-          </div>
-          <button v-if="invitation" class="btn btn-outline-danger" type="button"
-                  :disabled="invitationBusy" @click="revokeInvitation">
-            <trash-2 :size="17" class="icon"></trash-2>
-            {{ $t('clients.revoke_invitation') }}
-          </button>
-        </div>
+    <div v-if="initialLoading" class="py-5 text-center text-body-secondary" role="status">
+      {{ $t('_common.loading') }}
+    </div>
 
-        <div v-if="invitation" class="v3-pairing-layout">
-          <div>
-            <label for="v3InvitationUri" class="form-label">{{ $t('clients.invitation_uri') }}</label>
-            <textarea id="v3InvitationUri" class="form-control font-monospace v3-uri" readonly
-                      :value="invitation"></textarea>
-            <div class="d-flex flex-wrap gap-2 mt-3">
-              <button class="btn btn-primary" type="button" @click="copyInvitation">
-                <copy :size="17" class="icon"></copy>
-                {{ copied ? $t('clients.copied') : $t('clients.copy_invitation') }}
-              </button>
-              <span class="align-self-center text-body-secondary small">{{ $t('clients.expires_five_minutes') }}</span>
-            </div>
-          </div>
-          <div class="v3-qr-frame" role="img" :aria-label="$t('clients.qr_label')">
-            <canvas ref="qrCanvas"></canvas>
-          </div>
-        </div>
-
-        <form v-else @submit.prevent="issueInvitation">
-          <div class="row g-3">
-            <div class="col-12 col-lg-7">
-              <label for="v3Hostname" class="form-label">{{ $t('clients.hostname') }}</label>
-              <input id="v3Hostname" v-model.trim="hostname" class="form-control" maxlength="39" required
-                     autocomplete="off" :placeholder="$t('clients.hostname_placeholder')" />
-              <div class="form-text">{{ $t('clients.hostname_help') }}</div>
-            </div>
-            <div class="col-12 col-lg-5 d-flex align-items-end">
-              <div class="form-check mb-2">
-                <input id="v3HostnameIp" v-model="hostnameIsIP" class="form-check-input" type="checkbox" />
-                <label for="v3HostnameIp" class="form-check-label">{{ $t('clients.hostname_is_ip') }}</label>
-              </div>
-            </div>
-          </div>
-          <fieldset class="mt-4" :aria-busy="permissionPolicyLoading.toString()">
-            <legend class="h6">{{ $t('clients.permissions') }}</legend>
-            <div class="v3-permissions">
-              <div v-for="permission in permissionOptions" :key="permission.bit" class="form-check">
-                <input :id="'invitePermission' + permission.bit" class="form-check-input" type="checkbox"
-                       :checked="hasPermission(invitationPermissions, permission.bit)"
-                       :disabled="invitationPermissionDisabled(permission)"
-                       aria-describedby="v3PermissionPolicyStatus"
-                       @change="setInvitationPermission(permission.bit, $event.target.checked)" />
-                <label class="form-check-label" :for="'invitePermission' + permission.bit">
-                  {{ $t(permission.label) }}
-                </label>
-              </div>
-            </div>
-          </fieldset>
-          <div class="mt-4 d-flex align-items-center gap-3">
-            <button class="btn btn-primary" type="submit"
-                    :disabled="invitationBusy || permissionPolicyLoading || !!permissionPolicyError || !hostname">
-              <qr-code :size="18" class="icon"></qr-code>
-              {{ invitationBusy ? $t('_common.loading') : $t('clients.issue_invitation') }}
-            </button>
-            <span v-if="invitationError" class="text-danger" role="alert">{{ invitationError }}</span>
-          </div>
-        </form>
-        <div id="v3PermissionPolicyStatus" class="form-text mt-3" aria-live="polite">
-          <span v-if="permissionPolicyLoading">{{ $t('clients.permission_policy_loading') }}</span>
-          <span v-else-if="permissionPolicyError" class="text-danger">
-            {{ permissionPolicyError }}
-          </span>
-          <span v-else-if="invitation && invitationError" class="text-danger" role="alert">
-            {{ invitationError }}
-          </span>
-          <span v-else-if="permissionPolicyRestricted">
-            {{ $t('clients.permission_policy_restricted') }}
-            <a href="./config.html">{{ $t('clients.permission_policy_configure') }}</a>
-          </span>
-        </div>
-      </div>
-    </section>
-
-    <section aria-labelledby="v3-clients-title">
-      <div class="d-flex justify-content-between align-items-end gap-3 mb-3">
-        <div>
-          <h2 id="v3-clients-title" class="h4 mb-1">{{ $t('clients.paired_clients') }}</h2>
-          <p class="text-body-secondary mb-0">{{ $t('clients.paired_clients_desc') }}</p>
-        </div>
-        <button class="btn btn-outline-secondary" type="button"
-                :disabled="clientsLoading || clientMutationPending" @click="loadClients">
-          <refresh-cw :size="17" class="icon"></refresh-cw>
-          {{ $t('clients.refresh') }}
+    <template v-else>
+      <div v-if="initialError" class="alert alert-danger" role="alert">
+        <strong>{{ $t('lsp_clients.load_failed') }}</strong>
+        {{ initialError }}
+        <button class="btn btn-sm btn-outline-danger ms-2" type="button" @click="initialize">
+          {{ $t('lsp_clients.retry') }}
         </button>
       </div>
 
-      <div v-if="clientActionError" class="alert alert-danger" role="alert">{{ clientActionError }}</div>
-      <div v-if="clientsLoading" class="card"><div class="card-body py-5 text-center text-body-secondary">{{ $t('_common.loading') }}</div></div>
-      <div v-else-if="clientsError" class="alert alert-danger" role="alert">{{ clientsError }}</div>
-      <div v-else-if="clients.length === 0" class="card"><div class="card-body py-5 text-center text-body-secondary">{{ $t('clients.empty') }}</div></div>
-      <div v-else class="table-responsive card">
-        <table class="table align-middle mb-0">
-          <thead>
-            <tr>
-              <th scope="col">{{ $t('clients.client') }}</th>
-              <th scope="col">{{ $t('clients.permissions') }}</th>
-              <th scope="col">{{ $t('clients.access') }}</th>
-              <th scope="col" class="text-end">{{ $t('clients.actions') }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="client in clients" :key="client.clientId" :aria-busy="client.pending.toString()">
-              <td>
-                <div class="fw-semibold">
-                  {{ client.name }}
-                  <span v-if="client.pending" class="badge text-bg-secondary ms-2" role="status">
-                    {{ $t('clients.updating') }}
-                  </span>
-                </div>
-                <div class="small text-body-secondary font-monospace v3-client-id" :title="client.clientId">{{ client.clientId }}</div>
-              </td>
-              <td>
-                <div class="v3-permissions">
-                  <div v-for="permission in permissionOptions" :key="permission.bit" class="form-check">
-                    <input :id="client.clientId + permission.bit" class="form-check-input" type="checkbox"
-                           :checked="hasPermission(client.permissions, permission.bit)"
-                           :disabled="client.pending || clientPermissionDisabled(client, permission)"
-                           aria-describedby="v3PermissionPolicyStatus"
-                           @change="setClientPermission(client, permission.bit, $event.target.checked)" />
-                    <label class="form-check-label small" :for="client.clientId + permission.bit">
-                      {{ $t(permission.label) }}
-                    </label>
-                  </div>
-                </div>
-              </td>
-              <td>
-                <div class="form-check form-switch">
-                  <input :id="client.clientId + 'enabled'" class="form-check-input" type="checkbox"
-                         :checked="client.enabled" :disabled="client.pending"
-                         @change="setClientEnabled(client, !client.enabled)" />
-                  <label class="form-check-label" :for="client.clientId + 'enabled'">
-                    {{ client.enabled ? $t('_common.enabled') : $t('_common.disabled') }}
-                  </label>
-                </div>
-              </td>
-              <td class="text-end">
-                <template v-if="pendingRevokeId === client.clientId">
-                  <button class="btn btn-sm btn-outline-secondary me-2" type="button" @click="pendingRevokeId = null">{{ $t('_common.cancel') }}</button>
-                  <button class="btn btn-sm btn-danger" type="button" :disabled="client.pending" @click="revokeClient(client)">{{ $t('clients.confirm_revoke') }}</button>
-                </template>
-                <button v-else class="btn btn-sm btn-outline-danger" type="button" @click="pendingRevokeId = client.clientId">
-                  <trash-2 :size="16" class="icon"></trash-2>
-                  {{ $t('clients.revoke_client') }}
+      <template v-else>
+        <section class="mb-5" aria-labelledby="lsp-status-title">
+          <div class="lsp-status-strip" :class="{ 'is-active': runtime.active }">
+            <div>
+              <h2 id="lsp-status-title" class="h5 mb-1">{{ $t('lsp_clients.service_status') }}</h2>
+              <span :class="runtime.active ? 'text-success' : 'text-danger'">
+                {{ runtime.active ? $t('lsp_clients.active') : $t('lsp_clients.inactive') }}
+              </span>
+            </div>
+            <div class="lsp-status-port">
+              <div class="small text-body-secondary">{{ $t('lsp_clients.port') }}</div>
+              <div class="fw-semibold lsp-status-value">{{ runtime.port }}</div>
+            </div>
+            <div class="lsp-status-profile">
+              <div class="small text-body-secondary">{{ $t('lsp_clients.profile') }}</div>
+              <div class="fw-semibold">{{ profileLabel }}</div>
+            </div>
+            <button class="btn btn-sm btn-outline-secondary" type="button"
+                    :disabled="refreshing || clientMutationPending" @click="refreshAll">
+              <refresh-cw :size="17" class="icon"></refresh-cw>
+              {{ $t('lsp_clients.refresh') }}
+            </button>
+          </div>
+        </section>
+
+        <section class="mb-5" aria-labelledby="lsp-pairing-title">
+          <div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-3">
+            <div class="lsp-section-heading">
+              <h2 id="lsp-pairing-title" class="h4 mb-1">{{ $t('lsp_clients.pairing') }}</h2>
+              <p class="text-body-secondary mb-0">{{ $t('lsp_clients.pairing_desc') }}</p>
+            </div>
+            <button v-if="invitation" class="btn btn-outline-danger" type="button"
+                    :disabled="invitationBusy" @click="revokeInvitation">
+              <trash-2 :size="17" class="icon"></trash-2>
+              {{ $t('lsp_clients.revoke_invitation') }}
+            </button>
+          </div>
+
+          <div v-if="invitationError" class="alert alert-danger" role="alert">{{ invitationError }}</div>
+          <div v-if="invitation" class="card">
+            <div class="card-body p-4">
+              <label for="lspInvitationUri" class="form-label">{{ $t('lsp_clients.invitation_uri') }}</label>
+              <textarea id="lspInvitationUri" class="form-control font-monospace lsp-invitation-uri"
+                        readonly spellcheck="false" :value="invitation"></textarea>
+              <div class="d-flex flex-wrap align-items-center gap-3 mt-3">
+                <button class="btn btn-primary" type="button" :disabled="copying" @click="copyInvitation">
+                  <copy :size="17" class="icon"></copy>
+                  {{ copied ? $t('lsp_clients.copied') : $t('lsp_clients.copy_invitation') }}
                 </button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+                <span class="small text-body-secondary">{{ $t('lsp_clients.invitation_expiry') }}</span>
+              </div>
+            </div>
+          </div>
+          <div v-else class="py-4 border-top border-bottom">
+            <p class="mb-3 text-body-secondary">{{ $t('lsp_clients.no_invitation') }}</p>
+            <button class="btn btn-primary" type="button" :disabled="invitationBusy" @click="issueInvitation">
+              <link-2 :size="18" class="icon"></link-2>
+              {{ invitationBusy ? $t('_common.loading') : $t('lsp_clients.issue_invitation') }}
+            </button>
+          </div>
+        </section>
+
+        <section aria-labelledby="lsp-trusted-clients-title">
+          <div class="d-flex flex-wrap justify-content-between align-items-end gap-3 mb-3">
+            <div class="lsp-section-heading">
+              <h2 id="lsp-trusted-clients-title" class="h4 mb-1">{{ $t('lsp_clients.trusted_clients') }}</h2>
+              <p class="text-body-secondary mb-0">{{ $t('lsp_clients.trusted_clients_desc') }}</p>
+            </div>
+          </div>
+
+          <div v-if="clientActionError" class="alert alert-danger" role="alert">{{ clientActionError }}</div>
+          <div v-if="clientsLoading" class="py-5 text-center text-body-secondary" role="status">
+            {{ $t('_common.loading') }}
+          </div>
+          <div v-else-if="clientsError" class="alert alert-danger" role="alert">{{ clientsError }}</div>
+          <div v-else-if="clients.length === 0" class="py-5 text-center border-top border-bottom text-body-secondary">
+            {{ $t('lsp_clients.empty') }}
+          </div>
+          <div v-else class="table-responsive">
+            <table class="table align-middle">
+              <thead>
+                <tr>
+                  <th scope="col">{{ $t('lsp_clients.client') }}</th>
+                  <th scope="col">{{ $t('lsp_clients.permissions') }}</th>
+                  <th scope="col">{{ $t('lsp_clients.access') }}</th>
+                  <th scope="col" class="text-end">{{ $t('lsp_clients.actions') }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="client in clients" :key="client.clientId" class="lsp-client-row"
+                    :aria-busy="client.pending.toString()">
+                  <td>
+                    <div class="fw-semibold">{{ $t('lsp_clients.umbra_client') }}</div>
+                    <div class="small text-body-secondary font-monospace lsp-client-id">{{ client.clientId }}</div>
+                    <div class="small text-body-secondary lsp-status-value">
+                      {{ $t('lsp_clients.trust_generation', { generation: client.revocationGeneration }) }}
+                    </div>
+                  </td>
+                  <td>
+                    <div class="lsp-permissions">
+                      <div v-for="permission in permissionOptions" :key="permission.bit" class="form-check">
+                        <input :id="client.clientId + '-permission-' + permission.bit" class="form-check-input"
+                               type="checkbox" :checked="hasPermission(client.permissions, permission.bit)"
+                               :disabled="client.pending"
+                               @change="setClientPermission(client, permission.bit, $event.target.checked)" />
+                        <label class="form-check-label small" :for="client.clientId + '-permission-' + permission.bit">
+                          {{ $t(permission.label) }}
+                        </label>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <div class="form-check form-switch">
+                      <input :id="client.clientId + '-enabled'" class="form-check-input" type="checkbox"
+                             role="switch" :checked="client.enabled" :disabled="client.pending"
+                             :aria-checked="client.enabled.toString()"
+                             @change="setClientEnabled(client, $event.target.checked)" />
+                      <label class="form-check-label" :for="client.clientId + '-enabled'">
+                        {{ client.enabled ? $t('_common.enabled') : $t('_common.disabled') }}
+                      </label>
+                    </div>
+                    <span v-if="client.pending" class="small text-body-secondary" role="status">
+                      {{ $t('lsp_clients.updating') }}
+                    </span>
+                  </td>
+                  <td class="text-end text-nowrap">
+                    <template v-if="pendingRevokeId === client.clientId">
+                      <button class="btn btn-sm btn-outline-secondary me-2" type="button"
+                              :disabled="client.pending" @click="pendingRevokeId = null">
+                        {{ $t('_common.cancel') }}
+                      </button>
+                      <button class="btn btn-sm btn-danger" type="button"
+                              :disabled="client.pending" @click="revokeClient(client)">
+                        {{ $t('lsp_clients.confirm_revoke') }}
+                      </button>
+                    </template>
+                    <button v-else class="btn btn-sm btn-outline-danger" type="button"
+                            :disabled="client.pending" @click="pendingRevokeId = client.clientId">
+                      <trash-2 :size="16" class="icon"></trash-2>
+                      {{ $t('lsp_clients.revoke_client') }}
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </template>
+    </template>
   </main>
-</body>
 
-<script type="module">
-  import { createApp, nextTick } from 'vue'
-  import { initApp } from './init'
-  import Navbar from './Navbar.vue'
-  import { apiFetch } from './fetch_utils'
-  import {
-    buildClientPermissionUpdate,
-    isCurrentClientRefresh,
-    normalizeProtocolV3Client,
-    persistOptimisticClientPatch,
-    protocolV3AdminErrorKey,
-    revokeProtocolV3Invitation,
-  } from './protocol_v3_client_state'
-  import {
-    hasProtocolV3Permission,
-    normalizeInvitationPermissionMask,
-    normalizeProtocolV3PermissionMask,
-    PROTOCOL_V3_DEFINED_PERMISSION_MASK,
-    PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
-    setProtocolV3Permission,
-  } from './protocol_v3_permissions'
-  import { drawInvitationQr } from './qr_v3'
-  import { Copy, QrCode, RefreshCw, Trash2 } from '@lucide/vue'
+  <script type="module">
+    import { createApp } from 'vue'
+    import { initApp } from './init'
+    import Navbar from './Navbar.vue'
+    import { apiFetch } from './fetch_utils'
+    import {
+      isCurrentLspClientRefresh,
+      lspAdminErrorKey,
+      normalizeLspClient,
+      persistLspClientPatch,
+    } from './lsp_client_state'
+    import { buildLspPermissionUpdate, hasLspPermission } from './lsp_permissions'
+    import { Copy, Link2, RefreshCw, Trash2 } from '@lucide/vue'
 
-  const permissionOptions = [
-    { bit: 0, label: 'clients.permission_browse', required: true },
-    { bit: 1, label: 'clients.permission_start', required: true },
-    { bit: 2, label: 'clients.permission_input', required: true },
-    { bit: 4, label: 'clients.permission_stop', required: true },
-    { bit: 3, label: 'clients.permission_microphone', required: false },
-    { bit: 5, label: 'clients.permission_quit', required: false },
-  ]
+    const permissionOptions = [
+      { bit: 0, label: 'lsp_clients.permission_browse' },
+      { bit: 1, label: 'lsp_clients.permission_start_attach' },
+      { bit: 2, label: 'lsp_clients.permission_input' },
+      { bit: 3, label: 'lsp_clients.permission_microphone' },
+      { bit: 4, label: 'lsp_clients.permission_stop' },
+      { bit: 5, label: 'lsp_clients.permission_quit' },
+      { bit: 6, label: 'lsp_clients.permission_controller_output' },
+    ]
 
-  const app = createApp({
-    components: { Navbar, Copy, QrCode, RefreshCw, Trash2 },
-    data() {
-      return {
-        permissionOptions,
-        hostname: window.location.hostname || '',
-        hostnameIsIP: /^[\d.:]+$/.test(window.location.hostname),
-        invitationPermissions: PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
-        allowedPermissions: null,
-        invitation: null,
-        invitationBusy: false,
-        invitationError: '',
-        permissionPolicyLoading: true,
-        permissionPolicyError: '',
-        copied: false,
-        clients: [],
-        clientsLoading: true,
-        clientsError: '',
-        clientActionError: '',
-        clientMutationRevision: 0,
-        pendingRevokeId: null,
-      }
-    },
-    mounted() {
-      this.loadInvitation()
-      this.loadClients()
-    },
-    computed: {
-      permissionPolicyRestricted() {
-        return this.allowedPermissions !== null &&
-          this.allowedPermissions !== PROTOCOL_V3_DEFINED_PERMISSION_MASK
-      },
-      clientMutationPending() {
-        return this.clients.some(client => client.pending)
-      },
-    },
-    methods: {
-      hasPermission: hasProtocolV3Permission,
-      invitationPermissionDisabled(permission) {
-        return permission.required || this.permissionPolicyLoading || !!this.permissionPolicyError ||
-          !hasProtocolV3Permission(this.allowedPermissions, permission.bit)
-      },
-      clientPermissionDisabled(client, permission) {
-        if (!client.permissionsValid || this.permissionPolicyLoading || this.permissionPolicyError) return true
-        return !hasProtocolV3Permission(client.permissions, permission.bit) &&
-          !hasProtocolV3Permission(this.allowedPermissions, permission.bit)
-      },
-      setInvitationPermission(bit, enabled) {
-        const updated = setProtocolV3Permission(
-          this.invitationPermissions,
-          bit,
-          enabled,
-          PROTOCOL_V3_REQUIRED_PERMISSION_MASK,
-        )
-        this.invitationPermissions = updated & (this.allowedPermissions ?? 0)
-      },
-      async json(url, options) {
-        const response = await apiFetch(url, options)
-        if (!response.ok) {
-          throw new Error(this.$t(protocolV3AdminErrorKey(response.status)))
+    const app = createApp({
+      components: { Navbar, Copy, Link2, RefreshCw, Trash2 },
+      data() {
+        return {
+          permissionOptions,
+          csrfToken: '',
+          initialLoading: true,
+          initialError: '',
+          refreshing: false,
+          runtime: null,
+          invitation: null,
+          invitationBusy: false,
+          invitationError: '',
+          copying: false,
+          copied: false,
+          clients: [],
+          clientsLoading: false,
+          clientsError: '',
+          clientActionError: '',
+          clientMutationRevision: 0,
+          pendingRevokeId: null,
         }
-        return response.json()
       },
-      async loadInvitation() {
-        this.permissionPolicyLoading = true
-        this.permissionPolicyError = ''
-        this.invitationError = ''
-        try {
-          const result = await this.json('./api/protocol-v3/invitation')
-          const allowedPermissions = normalizeProtocolV3PermissionMask(result.approvedPermissions)
-          if (allowedPermissions === null ||
-              (allowedPermissions & PROTOCOL_V3_REQUIRED_PERMISSION_MASK) !== PROTOCOL_V3_REQUIRED_PERMISSION_MASK) {
-            throw new Error(this.$t('clients.permission_policy_unavailable'))
+      computed: {
+        clientMutationPending() {
+          return this.clients.some(client => client.pending)
+        },
+        profileLabel() {
+          return this.runtime?.profile === 'competition'
+            ? this.$t('lsp_clients.profile_competition')
+            : this.$t('lsp_clients.profile_adaptive')
+        },
+      },
+      mounted() {
+        this.initialize()
+      },
+      methods: {
+        hasPermission: hasLspPermission,
+        async initialize() {
+          this.initialLoading = true
+          this.initialError = ''
+          try {
+            const response = await apiFetch('./api/csrf-token')
+            if (!response.ok) throw new Error(this.$t(lspAdminErrorKey(response.status)))
+            const result = await response.json()
+            if (typeof result.csrf_token !== 'string' || result.csrf_token.length === 0) {
+              throw new Error(this.$t('lsp_clients.request_failed'))
+            }
+            this.csrfToken = result.csrf_token
+            await this.refreshAll()
+          } catch (error) {
+            this.initialError = error.message
+          } finally {
+            this.initialLoading = false
           }
-          this.allowedPermissions = allowedPermissions
-          this.invitationPermissions = normalizeInvitationPermissionMask(this.invitationPermissions)
-          this.invitationPermissions &= this.allowedPermissions
-          this.invitation = result.status ? result.invitation : null
-          if (this.invitation) await nextTick(() => drawInvitationQr(this.$refs.qrCanvas, this.invitation))
-        } catch (error) {
-          this.allowedPermissions = null
-          this.permissionPolicyError = error.message
-        } finally {
-          this.permissionPolicyLoading = false
-        }
+        },
+        async requestJson(url, options = {}) {
+          const headers = new Headers(options.headers || {})
+          headers.set('X-CSRF-Token', this.csrfToken)
+          const response = await apiFetch(url, { ...options, headers })
+          if (!response.ok) throw new Error(this.$t(lspAdminErrorKey(response.status)))
+          const result = await response.json()
+          if (!result?.status) throw new Error(this.$t('lsp_clients.request_failed'))
+          return result
+        },
+        async refreshAll() {
+          this.refreshing = true
+          this.initialError = ''
+          try {
+            const result = await this.requestJson('./api/lsp/status')
+            this.runtime = {
+              active: result.active === true,
+              port: Number(result.port),
+              profile: result.profile,
+            }
+            await Promise.all([this.loadInvitation(), this.loadClients()])
+          } catch (error) {
+            this.initialError = error.message
+          } finally {
+            this.refreshing = false
+          }
+        },
+        async loadInvitation() {
+          this.invitationError = ''
+          try {
+            const result = await this.requestJson('./api/lsp/invitation')
+            this.invitation = typeof result.invitation === 'string' ? result.invitation : null
+          } catch (error) {
+            this.invitationError = error.message
+          }
+        },
+        async issueInvitation() {
+          this.invitationBusy = true
+          this.invitationError = ''
+          try {
+            const result = await this.requestJson('./api/lsp/invitation', { method: 'POST' })
+            if (typeof result.invitation !== 'string' || !result.invitation.startsWith('umbra://pair/lsp1#')) {
+              throw new Error(this.$t('lsp_clients.request_failed'))
+            }
+            this.invitation = result.invitation
+          } catch (error) {
+            this.invitationError = error.message
+          } finally {
+            this.invitationBusy = false
+          }
+        },
+        async revokeInvitation() {
+          this.invitationBusy = true
+          this.invitationError = ''
+          try {
+            await this.requestJson('./api/lsp/invitation', { method: 'DELETE' })
+            this.invitation = null
+            this.copied = false
+          } catch (error) {
+            this.invitationError = error.message
+          } finally {
+            this.invitationBusy = false
+          }
+        },
+        async copyInvitation() {
+          this.copying = true
+          this.invitationError = ''
+          try {
+            await navigator.clipboard.writeText(this.invitation)
+            this.copied = true
+            window.setTimeout(() => { this.copied = false }, 1800)
+          } catch (error) {
+            this.invitationError = this.$t('lsp_clients.copy_failed')
+          } finally {
+            this.copying = false
+          }
+        },
+        async loadClients() {
+          const refreshRevision = this.clientMutationRevision
+          this.clientsLoading = true
+          this.clientsError = ''
+          try {
+            const result = await this.requestJson('./api/lsp/clients')
+            if (!isCurrentLspClientRefresh(refreshRevision, this.clientMutationRevision)) return
+            const clients = Array.isArray(result.clients) ? result.clients.map(normalizeLspClient) : null
+            if (!clients || clients.some(client => client === null)) {
+              throw new Error(this.$t('lsp_clients.invalid_response'))
+            }
+            this.clients = clients
+          } catch (error) {
+            this.clientsError = error.message
+          } finally {
+            this.clientsLoading = false
+          }
+        },
+        async updateClient(client, patch) {
+          this.clientMutationRevision += 1
+          this.clientActionError = ''
+          try {
+            await persistLspClientPatch(
+              client,
+              patch,
+              effectivePatch => this.requestJson('./api/lsp/clients', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  clientId: client.clientId,
+                  permissions: effectivePatch.permissions ?? client.permissions,
+                  enabled: effectivePatch.enabled ?? client.enabled,
+                }),
+              }),
+              new Error(this.$t('lsp_clients.request_failed')),
+            )
+            client.revocationGeneration += 1
+          } catch (error) {
+            this.clientActionError = error.message
+          }
+        },
+        setClientEnabled(client, enabled) {
+          return this.updateClient(client, { enabled })
+        },
+        setClientPermission(client, bit, enabled) {
+          const update = buildLspPermissionUpdate(client.permissions, bit, enabled)
+          if (update.error) {
+            this.clientActionError = this.$t(
+              update.error === 'empty' ? 'lsp_clients.permission_mask_required' : 'lsp_clients.invalid_response',
+            )
+            return
+          }
+          return this.updateClient(client, { permissions: update.permissions })
+        },
+        async revokeClient(client) {
+          this.clientMutationRevision += 1
+          client.pending = true
+          this.clientActionError = ''
+          try {
+            await this.requestJson('./api/lsp/clients', {
+              method: 'DELETE',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ clientId: client.clientId }),
+            })
+            this.clients = this.clients.filter(candidate => candidate.clientId !== client.clientId)
+            this.pendingRevokeId = null
+          } catch (error) {
+            client.pending = false
+            this.clientActionError = error.message
+          }
+        },
       },
-      async issueInvitation() {
-        if (this.permissionPolicyLoading || this.permissionPolicyError || this.allowedPermissions === null) return
-        this.invitationBusy = true
-        this.invitationError = ''
-        try {
-          const result = await this.json('./api/protocol-v3/invitation', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ hostname: this.hostname, hostnameIsIP: this.hostnameIsIP, permissions: this.invitationPermissions }),
-          })
-          this.invitation = result.invitation
-          await nextTick(() => drawInvitationQr(this.$refs.qrCanvas, this.invitation))
-        } catch (error) {
-          this.invitationError = error.message
-        } finally {
-          this.invitationBusy = false
-        }
-      },
-      async revokeInvitation() {
-        this.invitationBusy = true
-        this.invitationError = ''
-        try {
-          await revokeProtocolV3Invitation(
-            () => this.json('./api/protocol-v3/invitation', { method: 'DELETE' }),
-            new Error(this.$t('clients.invitation_revoke_failed')),
-          )
-          this.invitation = null
-          this.copied = false
-        } catch (error) {
-          this.invitationError = error.message
-        } finally {
-          this.invitationBusy = false
-        }
-      },
-      async copyInvitation() {
-        await navigator.clipboard.writeText(this.invitation)
-        this.copied = true
-        window.setTimeout(() => { this.copied = false }, 1800)
-      },
-      async loadClients() {
-        if (this.clientMutationPending) return
-        const refreshRevision = this.clientMutationRevision
-        this.clientsLoading = true
-        this.clientsError = ''
-        try {
-          const result = await this.json('./api/protocol-v3/clients')
-          if (!isCurrentClientRefresh(refreshRevision, this.clientMutationRevision)) return
-          this.clients = (result.clients || []).map(normalizeProtocolV3Client)
-        } catch (error) {
-          this.clientsError = error.message
-        } finally {
-          this.clientsLoading = false
-        }
-      },
-      async updateClient(client, patch) {
-        this.clientMutationRevision += 1
-        this.clientActionError = ''
-        try {
-          await persistOptimisticClientPatch(
-            client,
-            patch,
-            effectivePatch => this.json('./api/protocol-v3/clients', {
-              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ clientId: client.clientId, ...effectivePatch }),
-            }),
-            new Error(this.$t('clients.request_failed')),
-          )
-        } catch (error) {
-          this.clientActionError = error.message
-        }
-      },
-      setClientEnabled(client, enabled) { return this.updateClient(client, { enabled }) },
-      setClientPermission(client, bit, enabled) {
-        if (this.clientPermissionDisabled(client, { bit })) return
-        const update = buildClientPermissionUpdate(client.permissions, this.allowedPermissions, bit, enabled)
-        if (update.error) {
-          this.clientActionError = this.$t(
-            update.error === 'empty' ? 'clients.permission_mask_required' : 'clients.permission_policy_unavailable'
-          )
-          return
-        }
-        return this.updateClient(client, { permissions: update.permissions })
-      },
-      async revokeClient(client) {
-        this.clientMutationRevision += 1
-        client.pending = true
-        this.clientActionError = ''
-        try {
-          const result = await this.json('./api/protocol-v3/clients', {
-            method: 'DELETE', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ clientId: client.clientId }),
-          })
-          if (!result.status) throw new Error(this.$t('clients.request_failed'))
-          this.clients = this.clients.filter(item => item.clientId !== client.clientId)
-          this.pendingRevokeId = null
-        } catch (error) {
-          this.clientActionError = error.message
-          client.pending = false
-        }
-      },
-    },
-  })
-  initApp(app)
-</script>
+    })
+    initApp(app)
+  </script>
+</body>
 </html>

@@ -24,15 +24,15 @@
               </a>
             </li>
             <li class="nav-item">
-              <a class="nav-link" href="./apps">
-                <Layers :size="18" class="icon"></Layers>
-                {{ $t('navbar.applications') }}
+              <a class="nav-link" href="./clients">
+                <RadioTower :size="18" class="icon"></RadioTower>
+                {{ $t('navbar.lsp_clients') }}
               </a>
             </li>
             <li class="nav-item">
-              <a class="nav-link" href="./clients">
-                <Users :size="18" class="icon"></Users>
-                {{ $t('navbar.clients') }}
+              <a class="nav-link" href="./apps">
+                <Layers :size="18" class="icon"></Layers>
+                {{ $t('navbar.applications') }}
               </a>
             </li>
             <li class="nav-item">
@@ -88,7 +88,7 @@
 </template>
 
 <script>
-import { CircleUserRound, Home, Info, Layers, Lock, LogOut, Settings, Shield, Star, Users } from '@lucide/vue'
+import { CircleUserRound, Home, Info, Layers, Lock, LogOut, RadioTower, Settings, Shield, Star } from '@lucide/vue'
 import ThemeToggle from './ThemeToggle.vue'
 import Notification from './Notification.vue'
 
@@ -98,8 +98,8 @@ export default {
     Notification,
     Home,
     Lock,
+    RadioTower,
     Layers,
-    Users,
     Star,
     Settings,
     Shield,

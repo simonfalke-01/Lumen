@@ -28,11 +28,6 @@ HDR, and YUV 4:4:4 remain separate explicit preferences.
 Quality mode remains rate-controlled unless Umbra explicitly requests the
 separate fail-closed codec-lossless option.
 
-The repository contains an experimental single-port QUIC protocol for future
-Umbra/Lumen sessions. It is not the current production transport and must not be
-used as a deployment or firewall assumption. See the
-[experimental QUIC v3 specification](protocols/umbra-lumen-quic-v3.md).
-
 ## Network exposure
 
 The production Moonlight protocol uses multiple listeners. With the default
@@ -53,8 +48,7 @@ rules or current runtime configuration rather than assuming defaults.
 Keep TCP 47990 private. Do not forward the Web UI or management API directly to
 the public Internet. Remote streaming should use a trusted VPN/tunnel or tightly
 scoped streaming-port rules; management access is a separate security boundary.
-The future QUIC design can carry Umbra-specific streaming on one UDP port, but
-it cannot collapse unmodified Moonlight clients onto that port.
+
 
 ## Binaries
 

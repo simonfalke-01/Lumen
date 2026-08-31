@@ -14,14 +14,8 @@ $directManifestRoot = Join-Path $testRoot "direct-source-manifest"
 $tamperRoot = Join-Path $testRoot "tamper-output"
 
 try {
-    $shimRoot = Join-Path $sourceRoot "src/platform/windows/msquic_shim"
     $vddRoot = Join-Path $sourceRoot "src/platform/windows/virtual_display_driver"
-    New-Item -ItemType Directory -Path $shimRoot, $vddRoot -Force | Out-Null
-    [IO.File]::WriteAllText(
-        (Join-Path $shimRoot "manifest.json"),
-        '{"abi":3,"header_sha256":"header","source_sha256":"source","project_sha256":"project"}',
-        [Text.UTF8Encoding]::new($false)
-    )
+    New-Item -ItemType Directory -Path $vddRoot -Force | Out-Null
     [IO.File]::WriteAllText(
         (Join-Path $vddRoot "LumenVirtualDisplayProtocol.h"),
         "#define LUMEN_VDD_ABI_VERSION 3u`n",

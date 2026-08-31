@@ -1195,13 +1195,13 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Select whether Lumen's owned virtual display is used for Umbra v3 or legacy Moonlight sessions.
+            Select whether Lumen's owned virtual display is used for LSP or legacy Moonlight sessions.
             Lumen only activates a mode when the requested width, height, and reduced refresh rational are applied exactly.
             ABI 6 admits only exact SDR/8-bit or HDR/10-bit modes after intersecting the driver, OS, GPU, and encoder limits.
             Its two-slot direct-frame path exports BGRA8/sRGB for SDR and FP16/scRGB for HDR, together with validated frame metadata and versioned color transforms.
             HDR on a selected VDD requires that direct path and fails closed if any capability, adapter, handle, fence, metadata, transform, conversion, or NVENC gate fails; Lumen never substitutes untransformed DDA/WGC HDR capture.
             Legacy SDR can use DDA/WGC on the active VDD output when the direct path is unavailable or safely quarantined.
-            @note{For Umbra v3, <code>optional</code> is treated as <code>required</code>; use <code>disabled</code> to opt out of VDD. Legacy Moonlight keeps the compatibility fallback described below.}
+            @note{For LSP, <code>optional</code> is treated as <code>required</code>; use <code>disabled</code> to opt out of VDD. Legacy Moonlight keeps the compatibility fallback described below.}
             @note{Applies to Windows only.}
         </td>
     </tr>
@@ -1224,7 +1224,7 @@ The key retains its upstream name for compatibility with existing configuration 
     </tr>
     <tr>
         <td>optional</td>
-        <td>For legacy Moonlight, prefer an exact VDD mode and use the configured physical capture path only after a safe pre-activation rollback. For Umbra v3, require the exact VDD mode and ABI 6 direct-frame channel.</td>
+        <td>For legacy Moonlight, prefer an exact VDD mode and use the configured physical capture path only after a safe pre-activation rollback. For LSP, require the exact VDD mode and ABI 6 direct-frame channel.</td>
     </tr>
     <tr>
         <td>required</td>
@@ -1638,6 +1638,128 @@ The key retains its upstream name for compatibility with existing configuration 
 
 ## Network
 
+### lsp_enabled
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Enables the native Lumen Streaming Protocol listener. LSP uses one authenticated UDP port and remains
+            independent from the legacy GameStream listeners. It is enabled by default only for full Windows builds
+            that contain the required wolfSSL and libSRTP providers; other host platforms default to disabled.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lsp_enabled = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### lsp_port
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sets the single UDP application port used by LSP control, media, input, microphone, feedback, and repair.
+            It does not offset or disable any legacy GameStream port.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            48030
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lsp_port = 48030
+            @endcode</td>
+    </tr>
+</table>
+
+### lsp_profile
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Selects the initial LSP congestion profile. `adaptive-low-latency` is the safe default.
+            `competition` is accepted only when `lsp_competition_capacity_mbps` provides an explicit nonzero ceiling.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            adaptive-low-latency
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lsp_profile = adaptive-low-latency
+            @endcode</td>
+    </tr>
+</table>
+
+### lsp_competition_capacity_mbps
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sets the maximum aggregate capacity for the explicitly provisioned LSP competition profile, in megabits
+            per second. Zero keeps competition mode unavailable.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lsp_competition_capacity_mbps = 1000
+            @endcode</td>
+    </tr>
+</table>
+
+### lsp_pairing_permissions
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sets the maximum LSP permission mask offered to newly paired clients. The default value `87` enables
+            application browsing, start/attach, input, stop-own-stream, and controller output. Microphone and
+            application quit remain opt-in permissions.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            87
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lsp_pairing_permissions = 87
+            @endcode</td>
+    </tr>
+</table>
+
 ### upnp
 
 <table>
@@ -2001,121 +2123,6 @@ The key retains its upstream name for compatibility with existing configuration 
         <td>Example</td>
         <td colspan="2">@code{}
             packetsize = 1346
-            @endcode</td>
-    </tr>
-</table>
-
-### protocol_v3_enabled
-
-<table>
-    <tr>
-        <td>Description</td>
-        <td colspan="2">Start the authenticated single-port QUIC listener for Umbra clients.</td>
-    </tr>
-    <tr>
-        <td>Default</td>
-        <td colspan="2">Enabled in full Windows builds; disabled in builds without the protocol-v3 runtime.</td>
-    </tr>
-    <tr>
-        <td>Example</td>
-        <td colspan="2">@code{}
-            protocol_v3_enabled = enabled
-            @endcode</td>
-    </tr>
-</table>
-
-### legacy_compatibility
-
-<table>
-    <tr>
-        <td>Description</td>
-        <td colspan="2">Keep the Moonlight HTTP, RTSP, and GameStream listeners active beside protocol v3.</td>
-    </tr>
-    <tr>
-        <td>Default</td>
-        <td colspan="2">@code{}
-            enabled
-            @endcode</td>
-    </tr>
-    <tr>
-        <td>Example</td>
-        <td colspan="2">@code{}
-            legacy_compatibility = enabled
-            @endcode</td>
-    </tr>
-</table>
-
-### protocol_v3_port
-
-<table>
-    <tr>
-        <td>Description</td>
-        <td colspan="2">UDP port for the direct Umbra protocol-v3 listener.</td>
-    </tr>
-    <tr>
-        <td>Default</td>
-        <td colspan="2">@code{}
-            48030
-            @endcode</td>
-    </tr>
-    <tr>
-        <td>Range</td>
-        <td colspan="2">1024-65535</td>
-    </tr>
-    <tr>
-        <td>Example</td>
-        <td colspan="2">@code{}
-            protocol_v3_port = 48030
-            @endcode</td>
-    </tr>
-</table>
-
-### protocol_v3_profile
-
-<table>
-    <tr>
-        <td>Description</td>
-        <td colspan="2">Initial protocol-v3 scheduling profile. Each START request still negotiates its exact profile.</td>
-    </tr>
-    <tr>
-        <td>Default</td>
-        <td colspan="2">@code{}
-            quality
-            @endcode</td>
-    </tr>
-    <tr>
-        <td>Choices</td>
-        <td>latency</td>
-        <td>Prioritize bounded low-latency delivery.</td>
-    </tr>
-    <tr>
-        <td></td>
-        <td>quality</td>
-        <td>Prioritize stable fidelity while keeping queues bounded.</td>
-    </tr>
-</table>
-
-### protocol_v3_pairing_permissions
-
-<table>
-    <tr>
-        <td>Description</td>
-        <td colspan="2">Permission bit mask allowed in new protocol-v3 invitations. Browse, start, input, and stop are always included.</td>
-    </tr>
-    <tr>
-        <td>Default</td>
-        <td colspan="2">@code{}
-            23
-            @endcode</td>
-    </tr>
-    <tr>
-        <td>Range</td>
-        <td colspan="2">1-255</td>
-    </tr>
-    <tr>
-        <td>Example</td>
-        <td colspan="2">@code{}
-            protocol_v3_pairing_permissions = 23
             @endcode</td>
     </tr>
 </table>

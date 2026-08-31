@@ -306,8 +306,8 @@ the exact validation boundary.
 
 ##### Complete Windows profile
 
-The complete MSI includes the MsQuic ABI 3 runtime and the Virtual HID,
-Virtual Microphone, and Virtual Display packages. Build it with the strict
+The complete MSI includes the Virtual HID, Virtual Microphone, and Virtual
+Display packages. Build it with the strict
 PowerShell entry point:
 
 ```powershell
@@ -315,7 +315,6 @@ PowerShell entry point:
   -SourceRoot $PWD `
   -StagingRoot C:\LumenBuild\full `
   -Msys2Root C:\msys64 `
-  -MsQuicPackageRoot C:\LumenBuild\msquic-2.6.0 `
   -PythonPath C:\Python314\python.exe `
   -DotNetRoot 'C:\Program Files\dotnet' `
   -NodeRoot 'C:\Program Files\nodejs' `
@@ -327,15 +326,13 @@ The signed-driver root must contain `virtual-hid`, `virtual-microphone`, and
 `virtual-display` subdirectories plus the unchanged
 `full-profile-driver-manifest.json` produced with the raw submission. Each
 driver directory contains exactly its INF, Microsoft-signed catalog, and driver
-binary. The script builds all three raw driver submissions and the MsQuic shim
-first. If signed packages are absent it writes
+binary. The script builds all three raw driver submissions first. If signed packages are absent it writes
 `full-profile-driver-manifest.json` and stops before configuring the
 application. The script extracts the frozen archive into a disjoint staging
 tree, verifies every extracted path, byte count, and SHA-256 value against
-`full-profile-files.json`, and builds every driver, shim, test, and package only
+`full-profile-files.json`, and builds every driver, test, and package only
 from that immutable snapshot. After signed packages are supplied, it verifies
-the source-freeze identity, kernel signing, and catalog coverage; derives the ABI 3
-DLL/import-library hashes from the actual MSVC outputs; builds with
+the source-freeze identity, kernel signing, and catalog coverage; builds with
 `LUMEN_WINDOWS_FULL_PROFILE=ON`; synchronizes the locked Python environment
 without downloading another interpreter; builds with warnings as errors; runs
 the full test executable; creates MSI and lite ZIP packages; and validates the
@@ -343,9 +340,9 @@ MSI tables. `PythonPath`, `DotNetRoot`, and `NodeRoot` may be omitted when the
 tools are on `PATH`, but automation should pass their exact locations.
 
 Release CI requires `full_profile_driver_run_id`; a tag cannot silently omit a
-driver or fall back to the legacy transport. Source bundles can be created with
+driver. Source bundles can be created with
 `scripts/windows/freeze-full-profile-source.ps1`. The freeze records every
-file hash, archive hash, MsQuic source identity, VDD ABI, and runtime pins still
+file hash, archive hash, VDD ABI, and runtime pins still
 waiting for Windows artifacts.
 
 For an isolated local full-system test, run

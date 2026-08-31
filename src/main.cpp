@@ -9,7 +9,11 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <optional>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #ifdef __APPLE__
   #include <mach-o/dyld.h>
@@ -29,13 +33,99 @@
 #include "network.h"
 #include "nvhttp.h"
 #include "process.h"
-#include "protocol_v3/runtime.h"
+#include "protocol_lsp/runtime/host_runtime.h"
+#include "protocol_lsp/types.h"
 #include "stream.h"
 #include "system_tray.h"
 #include "upnp.h"
 #include "video.h"
 
 using namespace std::literals;
+
+namespace {
+  /**
+   * @brief Convert product configuration into the validated LSP service model.
+   *
+   * @return Host configuration passed to the fail-closed service.
+   */
+  [[nodiscard]] lumen::lsp::HostConfig lsp_host_config() noexcept {
+    const auto pairing_permissions = lumen::lsp::PermissionSet::from_mask(config::lsp.pairing_permissions)
+                                         .value_or(lumen::lsp::PermissionSet::default_pairing());
+    return {
+      .enabled = config::lsp.enabled,
+      .port = config::lsp.port,
+      .profile = config::lsp.profile == "competition"sv ?
+                   lumen::lsp::NetworkProfile::competition :
+                   lumen::lsp::NetworkProfile::adaptive_low_latency,
+      .competition_capacity_mbps = config::lsp.competition_capacity_mbps,
+      .pairing_permissions = pairing_permissions,
+    };
+  }
+
+  /**
+   * @brief Return a stable diagnostic name for one LSP activation result.
+   *
+   * @param result Activation result returned by HostService.
+   * @return Static result name suitable for logs.
+   */
+  [[nodiscard]] std::string_view lsp_start_result_name(const lumen::lsp::ServiceStartResult result) noexcept {
+    using enum lumen::lsp::ServiceStartResult;
+    switch (result) {
+      case started:
+        return "started"sv;
+      case disabled:
+        return "disabled"sv;
+      case invalid_configuration:
+        return "invalid configuration"sv;
+      case missing_dtls_provider:
+        return "missing DTLS provider"sv;
+      case missing_srtp_provider:
+        return "missing SRTP provider"sv;
+      case dtls_provider_not_ready:
+        return "DTLS provider not ready"sv;
+      case srtp_provider_not_ready:
+        return "SRTP provider not ready"sv;
+      case socket_bind_failed:
+        return "UDP bind failed"sv;
+      case already_started:
+        return "already started"sv;
+    }
+    return "unknown activation result"sv;
+  }
+
+  /**
+   * @brief Return a stable diagnostic name for one production-runtime factory result.
+   *
+   * @param status Factory status.
+   * @return Static result name suitable for logs.
+   */
+  [[nodiscard]] std::string_view lsp_runtime_status_name(
+    const lumen::lsp::runtime::RuntimeCreateStatus status
+  ) noexcept {
+    using enum lumen::lsp::runtime::RuntimeCreateStatus;
+    switch (status) {
+      case ready:
+        return "ready"sv;
+      case provider_unavailable:
+        return "wolfSSL/libSRTP providers unavailable"sv;
+      case invalid_configuration:
+        return "invalid runtime configuration"sv;
+      case identity_failed:
+        return "LSP identity initialization failed"sv;
+      case crypto_failed:
+        return "wolfCrypt application identity failed"sv;
+      case srtp_failed:
+        return "libSRTP provider initialization failed"sv;
+      case dtls_failed:
+        return "wolfSSL DTLS provider initialization failed"sv;
+      case control_failed:
+        return "LSP control initialization failed"sv;
+      case allocation_failed:
+        return "runtime allocation failed"sv;
+    }
+    return "unknown runtime factory result"sv;
+  }
+}  // namespace
 
 std::map<int, std::function<void()>> signal_handlers;  ///< Signal handlers.
 
@@ -228,6 +318,10 @@ int main(int argc, char *argv[]) {
   // Log modified_config_settings
   config::log_config_settings(config::modified_config_settings, false);
   config::modified_config_settings.clear();
+
+  if (!http::migrate_removed_transport_state(config::nvhttp.file_state)) {
+    BOOST_LOG(warning) << "Some retired native-protocol state could not be removed"sv;
+  }
 
   if (!config::sunshine.cmd.name.empty()) {
     auto fn = cmd_to_func.find(config::sunshine.cmd.name);
@@ -437,83 +531,52 @@ int main(int argc, char *argv[]) {
     return lifetime::desired_exit_code;
   }
 
-  const auto listener_policy = config::listener_startup_policy(config::protocol_v3);
-  std::vector<platf::publish::service_t> mdns_services;
-  if (listener_policy.start_legacy) {
-    mdns_services.push_back({
-      .type = platf::SERVICE_TYPE,
-      .port = net::map_port(nvhttp::PORT_HTTP),
-    });
-  }
+  std::unique_ptr<lumen::lsp::runtime::HostRuntime> lsp_runtime;
 
-#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
-  std::unique_ptr<lumen::protocol_v3::runtime::ProtocolV3Service> protocol_v3_service;
-  if (config::protocol_v3.enabled) {
-    protocol_v3_service = std::make_unique<lumen::protocol_v3::runtime::ProtocolV3Service>(
-      stream::make_protocol_v3_session_resource_factory
-    );
-    const auto profile = config::protocol_v3.profile == "latency" ?
-                           lumen::protocol_v3::quic_server::Profile::latency :
-                           lumen::protocol_v3::quic_server::Profile::quality;
-    const auto status = protocol_v3_service->start({
+  std::vector<platf::publish::service_t> mdns_services {{
+    .type = platf::SERVICE_TYPE,
+    .port = net::map_port(nvhttp::PORT_HTTP),
+  }};
+  if (config::lsp.enabled) {
+    auto created = lumen::lsp::runtime::create_host_runtime({
+      .host = lsp_host_config(),
+      .identity_file = platf::appdata() / "credentials" / "lsp_identity_v1.bin",
       .state_file = config::nvhttp.file_state,
-      .certificate_file = config::nvhttp.cert,
-      .private_key_file = config::nvhttp.pkey,
-      .udp_port = config::protocol_v3.port,
-      .profile = profile,
-      .persistent_authorization = !config::sunshine.flags[config::flag::FRESH_STATE],
-      .pairing_permissions = config::protocol_v3.pairing_permissions,
+      .host_name = config::nvhttp.sunshine_name,
     });
-    const auto startup_stage = protocol_v3_service->startup_stage();
-    if (!lumen::protocol_v3::quic_server::accepted(status)) {
-      protocol_v3_service.reset();
-      if (listener_policy.v3_failure_is_fatal) {
-        BOOST_LOG(fatal) << "Protocol v3 failed to start on UDP port "sv << config::protocol_v3.port
-                         << " at stage "sv << lumen::protocol_v3::quic_server::startup_stage_name(startup_stage)
-                         << " with transport status "sv << static_cast<int>(status);
-        return -1;
-      }
-      BOOST_LOG(error) << "Protocol v3 failed to start on UDP port "sv << config::protocol_v3.port
-                       << " at stage "sv << lumen::protocol_v3::quic_server::startup_stage_name(startup_stage)
-                       << " with transport status "sv << static_cast<int>(status)
-                       << "; continuing with Moonlight compatibility listeners"sv;
+    if (created.status != lumen::lsp::runtime::RuntimeCreateStatus::ready || !created.runtime) {
+      BOOST_LOG(warning) << "LSP is unavailable on UDP port "sv << config::lsp.port << ": "sv
+                         << lsp_runtime_status_name(created.status)
+                         << "; legacy GameStream listeners remain available"sv;
     } else {
-      BOOST_LOG(info) << "Protocol v3 listening on UDP port "sv << config::protocol_v3.port;
-      if (const auto advertisement = protocol_v3_service->discovery_advertisement()) {
-        mdns_services.push_back({
-          .type = advertisement->service_type,
-          .port = config::protocol_v3.port,
-          .txt = {
-            {"v", advertisement->version},
-            {"id", advertisement->host_id},
-            {"port", advertisement->port},
-            {"caps", advertisement->capabilities},
-          },
-        });
+      lsp_runtime = std::move(created.runtime);
+      const auto start_result = lsp_runtime->start();
+      if (start_result == lumen::lsp::ServiceStartResult::started) {
+        BOOST_LOG(info) << "LSP listening on UDP port "sv << config::lsp.port;
+        if (const auto discovery = lsp_runtime->discovery()) {
+          mdns_services.push_back({
+            .type = discovery->type,
+            .port = discovery->port,
+            .txt = discovery->txt,
+          });
+        }
       } else {
-        BOOST_LOG(error) << "Protocol v3 is live but its strict discovery descriptor is unavailable"sv;
+        BOOST_LOG(warning) << "LSP is unavailable on UDP port "sv << config::lsp.port << ": "sv
+                           << lsp_start_result_name(start_result)
+                           << "; legacy GameStream listeners remain available"sv;
+        lsp_runtime.reset();
       }
     }
   }
-#endif
 
   std::unique_ptr<platf::deinit_t> mdns;
-  std::optional<std::future<void>> sync_mdns;
-  if (!mdns_services.empty()) {
-    sync_mdns.emplace(std::async(std::launch::async, [&mdns, services = std::move(mdns_services)]() mutable {
-      mdns = platf::publish::start(std::move(services));
-    }));
-  }
+  auto sync_mdns = std::async(std::launch::async, [&mdns, services = std::move(mdns_services)]() mutable {
+    mdns = platf::publish::start(std::move(services));
+  });
 
-  std::optional<std::jthread> httpThread;
-  std::optional<std::jthread> rtspThread;
-  if (listener_policy.start_legacy) {
-    httpThread.emplace(nvhttp::start);
-    rtspThread.emplace(rtsp_stream::start);
-  } else {
-    BOOST_LOG(info) << "Legacy Moonlight HTTP/RTSP compatibility listeners are disabled"sv;
-  }
+  std::jthread httpThread {nvhttp::start};
   std::jthread configThread {confighttp::start};
+  std::jthread rtspThread {rtsp_stream::start};
 
 #ifdef _WIN32
   // If we're using the default port and GameStream is enabled, warn the user
@@ -539,22 +602,14 @@ int main(int argc, char *argv[]) {
 
   mainThreadLoop(shutdown_event);
 
-  if (sync_mdns) {
-    sync_mdns->wait();
-  }
+  sync_mdns.wait();
   mdns.reset();
-#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
-  if (protocol_v3_service) {
-    protocol_v3_service->stop();
+  if (lsp_runtime) {
+    lsp_runtime->stop();
   }
-#endif
-  if (httpThread) {
-    httpThread->join();
-  }
+  httpThread.join();
   configThread.join();
-  if (rtspThread) {
-    rtspThread->join();
-  }
+  rtspThread.join();
 
   task_pool.stop();
   task_pool.join();

@@ -410,16 +410,10 @@ function Expand-VerifiedFullProfileSource {
         -FilesManifestPath $filesManifestPath `
         -Boundary 'verified-source extraction')
 
-    $msquicManifestPath = Join-Path $DestinationDirectory "src/platform/windows/msquic_shim/manifest.json"
     $vddProtocolPath = Join-Path $DestinationDirectory "src/platform/windows/virtual_display_driver/LumenVirtualDisplayProtocol.h"
-    $msquicManifest = Get-Content -LiteralPath $msquicManifestPath -Raw | ConvertFrom-Json
     $vddProtocol = Get-Content -LiteralPath $vddProtocolPath -Raw
     $vddMatch = [regex]::Match($vddProtocol, '#define\s+LUMEN_VDD_ABI_VERSION\s+(\d+)u')
     if (-not $vddMatch.Success -or
-        [int]$freezeManifest.identities.msquicShimAbi -ne [int]$msquicManifest.abi -or
-        [string]$freezeManifest.identities.msquicHeaderSha256 -cne [string]$msquicManifest.header_sha256 -or
-        [string]$freezeManifest.identities.msquicSourceSha256 -cne [string]$msquicManifest.source_sha256 -or
-        [string]$freezeManifest.identities.msquicProjectSha256 -cne [string]$msquicManifest.project_sha256 -or
         [int]$freezeManifest.identities.virtualDisplayAbi -ne [int]$vddMatch.Groups[1].Value -or
         [string]$freezeManifest.identities.virtualDisplayProtocolSha256 -cne
             (Get-FileHash -LiteralPath $vddProtocolPath -Algorithm SHA256).Hash.ToLowerInvariant()) {

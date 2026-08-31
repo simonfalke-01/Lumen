@@ -360,38 +360,22 @@ TEST(ClientMicrophoneClockedReceiver, StopIsReusableAndShutdownJoinsWithinBound)
   EXPECT_EQ(sink.end_call_count(), 2U);
 }
 
-TEST(ClientMicrophoneWriter, ArbitratesLegacyAndV3WithTaggedStableOwnership) {
-  const auto legacy = client_microphone::writer_owner_t::legacy(0x2001);
-  const auto same_numeric_v3 = client_microphone::writer_owner_t::protocol_v3(0x2001);
-  const auto second_v3 = client_microphone::writer_owner_t::protocol_v3(0x2002);
+TEST(ClientMicrophoneWriter, ArbitratesStableLegacyOwners) {
+  const auto first = client_microphone::writer_owner_t::legacy(0x2001);
+  const auto second = client_microphone::writer_owner_t::legacy(0x2002);
 
-  client_microphone::release_writer(legacy);
-  client_microphone::release_writer(same_numeric_v3);
-  client_microphone::release_writer(second_v3);
-
-  ASSERT_TRUE(client_microphone::claim_writer(legacy));
-  EXPECT_TRUE(client_microphone::claim_writer(legacy));
-  EXPECT_FALSE(client_microphone::claim_writer(same_numeric_v3));
-  EXPECT_FALSE(client_microphone::claim_writer(second_v3));
-
-  client_microphone::release_writer(same_numeric_v3);
-  EXPECT_FALSE(client_microphone::claim_writer(second_v3));
-  client_microphone::release_writer(legacy);
-
-  ASSERT_TRUE(client_microphone::claim_writer(same_numeric_v3));
-  EXPECT_TRUE(client_microphone::claim_writer(same_numeric_v3));
-  EXPECT_FALSE(client_microphone::claim_writer(legacy));
-  EXPECT_FALSE(client_microphone::claim_writer(second_v3));
-
-  client_microphone::release_writer(legacy);
-  EXPECT_FALSE(client_microphone::claim_writer(second_v3));
-  client_microphone::release_writer(same_numeric_v3);
-  ASSERT_TRUE(client_microphone::claim_writer(second_v3));
-  client_microphone::release_writer(second_v3);
-
-  EXPECT_FALSE(client_microphone::claim_writer(client_microphone::writer_owner_t::protocol_v3(0)));
+  client_microphone::release_writer(first);
+  client_microphone::release_writer(second);
+  ASSERT_TRUE(client_microphone::claim_writer(first));
+  EXPECT_TRUE(client_microphone::claim_writer(first));
+  EXPECT_FALSE(client_microphone::claim_writer(second));
+  client_microphone::release_writer(second);
+  EXPECT_FALSE(client_microphone::claim_writer(second));
+  client_microphone::release_writer(first);
+  ASSERT_TRUE(client_microphone::claim_writer(second));
+  client_microphone::release_writer(second);
+  EXPECT_FALSE(client_microphone::claim_writer(client_microphone::writer_owner_t::legacy(0)));
 }
-
 TEST(ClientMicrophoneReceiver, RejectsNullDecoder) {
   fake_sink_t sink;
   EXPECT_THROW(client_microphone::receiver_t(nullptr, sink), std::invalid_argument);

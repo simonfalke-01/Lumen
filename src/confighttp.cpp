@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <string_view>
 
 // lib includes
@@ -43,7 +44,7 @@
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
-#include "protocol_v3/runtime.h"
+#include "protocol_lsp/runtime/host_runtime.h"
 #include "rtsp.h"
 #include "utility.h"
 #include "uuid.h"
@@ -1120,6 +1121,388 @@ namespace confighttp {
   }
 
   /**
+   * @brief Convert one LSP fixed-width identifier to lowercase hexadecimal.
+   *
+   * @param identifier Identifier bytes to encode.
+   * @return Stable 32-character lowercase client identifier.
+   */
+  std::string encode_lsp_client_id(const lumen::lsp::Identifier128 &identifier) {
+    constexpr std::string_view digits = "0123456789abcdef";
+    std::string encoded(identifier.size() * 2, '0');
+    for (std::size_t index = 0; index < identifier.size(); ++index) {
+      encoded[index * 2] = digits[identifier[index] >> 4U];
+      encoded[index * 2 + 1] = digits[identifier[index] & 0x0fU];
+    }
+    return encoded;
+  }
+
+  /**
+   * @brief Decode one canonical LSP client identifier.
+   *
+   * @param encoded Exact 32-character lowercase hexadecimal identifier.
+   * @return Decoded identifier, or no value for malformed input.
+   */
+  std::optional<lumen::lsp::Identifier128> decode_lsp_client_id(const std::string_view encoded) noexcept {
+    constexpr std::size_t encoded_client_id_size = 32;
+    if (encoded.size() != encoded_client_id_size) {
+      return std::nullopt;
+    }
+
+    const auto hex_value = [](const char value) -> std::optional<std::uint8_t> {
+      if (value >= '0' && value <= '9') {
+        return static_cast<std::uint8_t>(value - '0');
+      }
+      if (value >= 'a' && value <= 'f') {
+        return static_cast<std::uint8_t>(value - 'a' + 10);
+      }
+      return std::nullopt;
+    };
+
+    lumen::lsp::Identifier128 identifier {};
+    for (std::size_t index = 0; index < identifier.size(); ++index) {
+      const auto high = hex_value(encoded[index * 2]);
+      const auto low = hex_value(encoded[index * 2 + 1]);
+      if (!high || !low) {
+        return std::nullopt;
+      }
+      identifier[index] = static_cast<std::uint8_t>((*high << 4U) | *low);
+    }
+    return lumen::lsp::is_zero(identifier) ? std::nullopt : std::optional {identifier};
+  }
+
+  /**
+   * @brief Return the stable Web API name for one LSP network profile.
+   *
+   * @param profile Configured LSP profile.
+   * @return Public profile name.
+   */
+  std::string_view lsp_profile_name(const lumen::lsp::NetworkProfile profile) noexcept {
+    switch (profile) {
+      case lumen::lsp::NetworkProfile::adaptive_low_latency:
+        return "adaptive-low-latency"sv;
+      case lumen::lsp::NetworkProfile::competition:
+        return "competition"sv;
+    }
+    return "unknown"sv;
+  }
+
+  /**
+   * @brief Send a non-cacheable LSP administration JSON response.
+   *
+   * @param response Shared HTTPS response object.
+   * @param status HTTP response status.
+   * @param output_tree Public administration response body.
+   */
+  void send_lsp_admin_response(
+    const resp_https_t &response,
+    const SimpleWeb::StatusCode status,
+    const nlohmann::json &output_tree
+  ) {
+    const SimpleWeb::CaseInsensitiveMultimap headers {
+      {"Content-Type", "application/json"},
+      {"Cache-Control", "no-store"},
+      {"Pragma", "no-cache"},
+      {"Referrer-Policy", "no-referrer"},
+      {"X-Frame-Options", "DENY"},
+      {"Content-Security-Policy", "frame-ancestors 'none';"},
+    };
+    response->write(status, output_tree.dump(), headers);
+  }
+
+  /**
+   * @brief Reject an LSP administration request with a stable JSON error.
+   *
+   * @param response Shared HTTPS response object.
+   * @param status HTTP failure status.
+   * @param error Public error string without secret material.
+   */
+  void send_lsp_admin_error(
+    const resp_https_t &response,
+    const SimpleWeb::StatusCode status,
+    const std::string_view error
+  ) {
+    send_lsp_admin_response(response, status, {
+      {"status", false},
+      {"error", error},
+    });
+  }
+
+  /**
+   * @brief Enforce authenticated trusted-LAN access and an explicit CSRF token.
+   *
+   * General Web UI routes retain their existing origin-aware CSRF behavior.
+   * LSP invitation and trust administration always requires the token header,
+   * including same-origin GET requests, because responses may contain a live
+   * bearer invitation.
+   *
+   * @param response Shared HTTPS response object.
+   * @param request Shared HTTPS request object.
+   * @return True only for an authenticated PC/LAN source with a valid token.
+   */
+  bool authorize_lsp_administration(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return false;
+    }
+
+    const auto remote_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    if (net::from_address(remote_address) > net::LAN) {
+      send_lsp_admin_error(
+        response,
+        SimpleWeb::StatusCode::client_error_forbidden,
+        "LSP administration is restricted to the trusted local network"
+      );
+      return false;
+    }
+
+    const auto token = request->header.find("X-CSRF-Token");
+    if (token == request->header.end()) {
+      bad_request(response, request, "Missing CSRF token");
+      return false;
+    }
+    return validate_stored_csrf_token(response, request, get_client_id(request), token->second);
+  }
+
+  /**
+   * @brief Send the current LSP listener administration status.
+   *
+   * @api_examples{/api/lsp/status| GET| null}
+   */
+  void getLspStatus(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+
+    const auto snapshot = lumen::lsp::runtime::administration_snapshot();
+    if (!snapshot) {
+      send_lsp_admin_error(
+        response,
+        SimpleWeb::StatusCode::server_error_service_unavailable,
+        "LSP runtime is unavailable"
+      );
+      return;
+    }
+
+    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
+      {"status", true},
+      {"active", snapshot->active},
+      {"port", snapshot->port},
+      {"profile", lsp_profile_name(snapshot->profile)},
+      {"hasInvitation", snapshot->invitation_uri.has_value()},
+    });
+  }
+
+  /**
+   * @brief Return the current unconsumed LSP pairing invitation.
+   *
+   * The invitation is returned only to the authenticated response and is never
+   * passed to request logging.
+   *
+   * @api_examples{/api/lsp/invitation| GET| null}
+   */
+  void getLspInvitation(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+
+    const auto snapshot = lumen::lsp::runtime::administration_snapshot();
+    if (!snapshot) {
+      send_lsp_admin_error(
+        response,
+        SimpleWeb::StatusCode::server_error_service_unavailable,
+        "LSP runtime is unavailable"
+      );
+      return;
+    }
+
+    nlohmann::json output_tree {
+      {"status", true},
+      {"invitation", nullptr},
+    };
+    if (snapshot->invitation_uri) {
+      output_tree["invitation"] = *snapshot->invitation_uri;
+    }
+    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, output_tree);
+  }
+
+  /**
+   * @brief Rotate and return the current LSP pairing invitation.
+   *
+   * @api_examples{/api/lsp/invitation| POST| null}
+   */
+  void issueLspInvitation(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+
+    const auto invitation = lumen::lsp::runtime::administration_issue_pairing_invitation();
+    if (!invitation) {
+      send_lsp_admin_error(
+        response,
+        SimpleWeb::StatusCode::server_error_service_unavailable,
+        "LSP could not issue an invitation"
+      );
+      return;
+    }
+    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
+      {"status", true},
+      {"invitation", *invitation},
+    });
+  }
+
+  /**
+   * @brief Revoke the current unconsumed LSP pairing invitation.
+   *
+   * @api_examples{/api/lsp/invitation| DELETE| null}
+   */
+  void revokeLspInvitation(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+    if (!lumen::lsp::runtime::administration_snapshot()) {
+      send_lsp_admin_error(
+        response,
+        SimpleWeb::StatusCode::server_error_service_unavailable,
+        "LSP runtime is unavailable"
+      );
+      return;
+    }
+
+    lumen::lsp::runtime::administration_revoke_pairing_invitation();
+    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
+  }
+
+  /**
+   * @brief Return persisted LSP trusted clients without identity key material.
+   *
+   * @api_examples{/api/lsp/clients| GET| null}
+   */
+  void getLspClients(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+    if (!lumen::lsp::runtime::administration_snapshot()) {
+      send_lsp_admin_error(
+        response,
+        SimpleWeb::StatusCode::server_error_service_unavailable,
+        "LSP runtime is unavailable"
+      );
+      return;
+    }
+
+    nlohmann::json clients = nlohmann::json::array();
+    for (const auto &client : lumen::lsp::runtime::administration_trusted_clients()) {
+      clients.push_back({
+        {"clientId", encode_lsp_client_id(client.client_id)},
+        {"permissions", client.permissions.mask()},
+        {"revocationGeneration", client.revocation_generation},
+        {"enabled", client.enabled},
+      });
+    }
+    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
+      {"status", true},
+      {"clients", std::move(clients)},
+    });
+  }
+
+  /**
+   * @brief Atomically update one LSP trusted client's permissions and enable state.
+   *
+   * @api_examples{/api/lsp/clients| PATCH| {"clientId":"00112233445566778899aabbccddeeff","permissions":87,"enabled":true}}
+   */
+  void updateLspClient(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+
+    try {
+      std::stringstream content;
+      content << request->content.rdbuf();
+      nlohmann::json input_tree = nlohmann::json::parse(content);
+      if (!input_tree.is_object() || input_tree.size() != 3 ||
+          !input_tree.contains("clientId") || !input_tree["clientId"].is_string() ||
+          !input_tree.contains("permissions") || !input_tree["permissions"].is_number_unsigned() ||
+          !input_tree.contains("enabled") || !input_tree["enabled"].is_boolean()) {
+        bad_request(response, request, "Invalid LSP client update");
+        return;
+      }
+
+      const auto client_id = decode_lsp_client_id(input_tree["clientId"].get<std::string>());
+      const auto raw_permissions = input_tree["permissions"].get<std::uint64_t>();
+      if (!client_id || raw_permissions == 0 || raw_permissions > std::numeric_limits<std::uint32_t>::max()) {
+        bad_request(response, request, "Invalid LSP client update");
+        return;
+      }
+      const auto permissions = lumen::lsp::PermissionSet::from_mask(static_cast<std::uint32_t>(raw_permissions));
+      if (!permissions) {
+        bad_request(response, request, "Invalid LSP permission mask");
+        return;
+      }
+
+      const bool updated = lumen::lsp::runtime::administration_update_trusted_client(
+        *client_id,
+        *permissions,
+        input_tree["enabled"].get<bool>()
+      );
+      if (!updated) {
+        send_lsp_admin_error(
+          response,
+          SimpleWeb::StatusCode::client_error_not_found,
+          "LSP trusted client was not found or could not be saved"
+        );
+        return;
+      }
+      send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
+    } catch (const nlohmann::json::exception &) {
+      bad_request(response, request, "Invalid LSP client update");
+    }
+  }
+
+  /**
+   * @brief Revoke one persisted LSP trusted client.
+   *
+   * @api_examples{/api/lsp/clients| DELETE| {"clientId":"00112233445566778899aabbccddeeff"}}
+   */
+  void revokeLspClient(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+
+    try {
+      std::stringstream content;
+      content << request->content.rdbuf();
+      nlohmann::json input_tree = nlohmann::json::parse(content);
+      if (!input_tree.is_object() || input_tree.size() != 1 ||
+          !input_tree.contains("clientId") || !input_tree["clientId"].is_string()) {
+        bad_request(response, request, "Invalid LSP client revocation");
+        return;
+      }
+      const auto client_id = decode_lsp_client_id(input_tree["clientId"].get<std::string>());
+      if (!client_id) {
+        bad_request(response, request, "Invalid LSP client revocation");
+        return;
+      }
+
+      if (!lumen::lsp::runtime::administration_revoke_trusted_client(*client_id)) {
+        send_lsp_admin_error(
+          response,
+          SimpleWeb::StatusCode::client_error_not_found,
+          "LSP trusted client was not found or could not be revoked"
+        );
+        return;
+      }
+      send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
+    } catch (const nlohmann::json::exception &) {
+      bad_request(response, request, "Invalid LSP client revocation");
+    }
+  }
+
+  /**
    * @brief Get the configuration settings.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -1569,226 +1952,6 @@ namespace confighttp {
       bad_request(response, request, error.what());
     }
   }
-
-#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
-  /** @brief Restrict invitation and direct-client administration to trusted LAN scopes. */
-  bool requireLocalProtocolV3Admin(const resp_https_t &response, const req_https_t &request) {
-    if (!nvhttp::is_trusted_pairing_source(request->remote_endpoint().address())) {
-      bad_request(response, request, "Protocol-v3 pairing administration is restricted to the local network");
-      return false;
-    }
-    return true;
-  }
-
-  /** @brief Encode a public protocol-v3 client identifier for WebUI JSON. */
-  std::string protocolV3IdentifierText(const lumen::protocol_v3::control_session::Identifier &identifier) {
-    static constexpr char alphabet[] = "0123456789abcdef";
-    std::string output(identifier.size() * 2, '0');
-    for (std::size_t index = 0; index < identifier.size(); ++index) {
-      output[index * 2] = alphabet[identifier[index] >> 4U];
-      output[index * 2 + 1] = alphabet[identifier[index] & 0x0fU];
-    }
-    return output;
-  }
-
-  /** @brief Decode one exact public protocol-v3 client identifier. */
-  std::optional<lumen::protocol_v3::control_session::Identifier> protocolV3Identifier(
-    const std::string_view encoded
-  ) {
-    if (encoded.size() != 32) {
-      return std::nullopt;
-    }
-    const auto nibble = [](const char value) -> std::optional<std::uint8_t> {
-      if (value >= '0' && value <= '9') return static_cast<std::uint8_t>(value - '0');
-      if (value >= 'a' && value <= 'f') return static_cast<std::uint8_t>(value - 'a' + 10);
-      if (value >= 'A' && value <= 'F') return static_cast<std::uint8_t>(value - 'A' + 10);
-      return std::nullopt;
-    };
-    lumen::protocol_v3::control_session::Identifier output {};
-    for (std::size_t index = 0; index < output.size(); ++index) {
-      const auto high = nibble(encoded[index * 2]);
-      const auto low = nibble(encoded[index * 2 + 1]);
-      if (!high || !low) {
-        return std::nullopt;
-      }
-      output[index] = static_cast<std::uint8_t>((*high << 4U) | *low);
-    }
-    return output;
-  }
-
-  /**
-   * @brief Issue a five-minute QR invitation for direct protocol-v3 pairing.
-   */
-  void issueProtocolV3Invitation(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json") || !authenticate(response, request) ||
-        !requireLocalProtocolV3Admin(response, request)) {
-      return;
-    }
-    const auto client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-    if (request->content.size() > 1024) {
-      bad_request(response, request, "Protocol-v3 invitation body is too large");
-      return;
-    }
-    std::stringstream body;
-    body << request->content.rdbuf();
-    try {
-      const auto input = nlohmann::json::parse(body);
-      const auto hostname = input.value("hostname", config::nvhttp.sunshine_name);
-      const auto hostname_is_ip = input.value("hostnameIsIP", false);
-      const auto permissions = input.value<std::uint64_t>(
-        "permissions",
-        config::protocol_v3.pairing_permissions
-      );
-      auto invitation = lumen::protocol_v3::runtime::issue_active_invitation(
-        hostname,
-        hostname_is_ip,
-        permissions
-      );
-      if (!invitation) {
-        bad_request(response, request, "Unable to issue a protocol-v3 invitation");
-        return;
-      }
-      nlohmann::json output {
-        {"status", true},
-        {"invitation", *invitation},
-        {"expiresInSeconds", 300},
-        {"approvedPermissions", permissions},
-      };
-      SimpleWeb::CaseInsensitiveMultimap headers;
-      headers.emplace("Content-Type", "application/json");
-      headers.emplace("Cache-Control", "no-store");
-      headers.emplace("X-Frame-Options", "DENY");
-      response->write(output.dump(), headers);
-    } catch (const std::exception &error) {
-      bad_request(response, request, error.what());
-    }
-  }
-
-  /** @brief Return the current unexpired protocol-v3 QR invitation. */
-  void getProtocolV3Invitation(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request) || !requireLocalProtocolV3Admin(response, request)) {
-      return;
-    }
-    nlohmann::json output;
-    if (const auto invitation = lumen::protocol_v3::runtime::current_active_invitation()) {
-      output = {
-        {"status", true}, {"invitation", *invitation},
-        {"approvedPermissions", lumen::protocol_v3::runtime::active_pairing_permissions()},
-      };
-    } else {
-      output = {
-        {"status", false}, {"invitation", nullptr},
-        {"approvedPermissions", lumen::protocol_v3::runtime::active_pairing_permissions()},
-      };
-    }
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "application/json");
-    headers.emplace("Cache-Control", "no-store");
-    headers.emplace("X-Frame-Options", "DENY");
-    response->write(output.dump(), headers);
-  }
-
-  /** @brief Revoke the current unconsumed protocol-v3 invitation. */
-  void revokeProtocolV3Invitation(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request) || !requireLocalProtocolV3Admin(response, request)) {
-      return;
-    }
-    const auto client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-    nlohmann::json output {{"status", lumen::protocol_v3::runtime::revoke_current_active_invitation()}};
-    send_response(response, output);
-  }
-
-  /** @brief List paired direct protocol-v3 clients. */
-  void getProtocolV3Clients(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request) || !requireLocalProtocolV3Admin(response, request)) {
-      return;
-    }
-    nlohmann::json clients = nlohmann::json::array();
-    for (const auto &client : lumen::protocol_v3::runtime::active_clients()) {
-      clients.push_back({
-        {"clientId", protocolV3IdentifierText(client.client_id)},
-        {"name", client.display_name},
-        {"permissions", client.permissions},
-        {"generation", client.generation},
-        {"enabled", client.enabled},
-      });
-    }
-    nlohmann::json output {{"clients", std::move(clients)}};
-    send_response(response, output);
-  }
-
-  /** @brief Update enabled state and/or permissions for one paired v3 client. */
-  void updateProtocolV3Client(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json") || !authenticate(response, request) ||
-        !requireLocalProtocolV3Admin(response, request)) {
-      return;
-    }
-    const auto web_client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, web_client_id) || request->content.size() > 1024) {
-      return;
-    }
-    std::stringstream body;
-    body << request->content.rdbuf();
-    try {
-      const auto input = nlohmann::json::parse(body);
-      const auto client_id = protocolV3Identifier(input.value("clientId", ""));
-      if (!client_id || (!input.contains("enabled") && !input.contains("permissions"))) {
-        bad_request(response, request, "Invalid protocol-v3 client update");
-        return;
-      }
-      bool status = true;
-      if (input.contains("permissions")) {
-        status = lumen::protocol_v3::runtime::set_active_client_permissions(
-          *client_id,
-          input.at("permissions").get<std::uint64_t>()
-        );
-      }
-      if (status && input.contains("enabled")) {
-        status = lumen::protocol_v3::runtime::set_active_client_enabled(
-          *client_id,
-          input.at("enabled").get<bool>()
-        );
-      }
-      send_response(response, nlohmann::json {{"status", status}});
-    } catch (const std::exception &error) {
-      bad_request(response, request, error.what());
-    }
-  }
-
-  /** @brief Revoke one paired direct protocol-v3 client. */
-  void revokeProtocolV3Client(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json") || !authenticate(response, request) ||
-        !requireLocalProtocolV3Admin(response, request)) {
-      return;
-    }
-    const auto web_client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, web_client_id) || request->content.size() > 256) {
-      return;
-    }
-    std::stringstream body;
-    body << request->content.rdbuf();
-    try {
-      const auto input = nlohmann::json::parse(body);
-      const auto client_id = protocolV3Identifier(input.value("clientId", ""));
-      if (!client_id) {
-        bad_request(response, request, "Invalid protocol-v3 client ID");
-        return;
-      }
-      send_response(response, nlohmann::json {{
-        "status",
-        lumen::protocol_v3::runtime::revoke_active_client(*client_id),
-      }});
-    } catch (const std::exception &error) {
-      bad_request(response, request, error.what());
-    }
-  }
-#endif
 
   /**
    * @brief Reset the display device persistence.
@@ -2279,18 +2442,17 @@ namespace confighttp {
     server.resource["^/api/covers/([0-9]+)$"]["GET"] = getCover;
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
     server.resource["^/api/csrf-token$"]["GET"] = getCSRFToken;
+    server.resource["^/api/lsp/status$"]["GET"] = getLspStatus;
+    server.resource["^/api/lsp/invitation$"]["GET"] = getLspInvitation;
+    server.resource["^/api/lsp/invitation$"]["POST"] = issueLspInvitation;
+    server.resource["^/api/lsp/invitation$"]["DELETE"] = revokeLspInvitation;
+    server.resource["^/api/lsp/clients$"]["GET"] = getLspClients;
+    server.resource["^/api/lsp/clients$"]["PATCH"] = updateLspClient;
+    server.resource["^/api/lsp/clients$"]["DELETE"] = revokeLspClient;
     server.resource["^/api/password$"]["POST"] = savePassword;
     server.resource["^/api/pin$"]["GET"] = getPendingPairingRequests;
     server.resource["^/api/pin$"]["POST"] = savePin;
     server.resource["^/api/pin/cancel$"]["POST"] = cancelPendingPairingRequest;
-#if LUMEN_PROTOCOL_V3_DEFAULT_ENABLED
-    server.resource["^/api/protocol-v3/invitation$"]["GET"] = getProtocolV3Invitation;
-    server.resource["^/api/protocol-v3/invitation$"]["POST"] = issueProtocolV3Invitation;
-    server.resource["^/api/protocol-v3/invitation$"]["DELETE"] = revokeProtocolV3Invitation;
-    server.resource["^/api/protocol-v3/clients$"]["GET"] = getProtocolV3Clients;
-    server.resource["^/api/protocol-v3/clients$"]["PATCH"] = updateProtocolV3Client;
-    server.resource["^/api/protocol-v3/clients$"]["DELETE"] = revokeProtocolV3Client;
-#endif
     server.resource["^/api/logs$"]["GET"] = getLogs;
     server.resource["^/api/reset-display-device-persistence$"]["POST"] = resetDisplayDevicePersistence;
     server.resource["^/api/restart$"]["POST"] = restart;

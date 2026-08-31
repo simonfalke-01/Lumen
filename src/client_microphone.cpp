@@ -21,16 +21,12 @@
 
 namespace client_microphone {
   namespace {
-    std::mutex writer_mutex;  ///< Serializes cross-protocol writer arbitration.
-    std::optional<writer_owner_t> writer_owner;  ///< Exact tagged owner of the single writer.
+    std::mutex writer_mutex;  ///< Serializes writer arbitration.
+    std::optional<writer_owner_t> writer_owner;  ///< Exact owner of the single writer.
   }  // namespace
 
   writer_owner_t writer_owner_t::legacy(const std::uint32_t launch_session_id) {
-    return {writer_protocol_e::legacy, launch_session_id};
-  }
-
-  writer_owner_t writer_owner_t::protocol_v3(const std::uint64_t connection_id) {
-    return {writer_protocol_e::protocol_v3, connection_id};
+    return {launch_session_id};
   }
 
   bool claim_writer(const writer_owner_t owner) {

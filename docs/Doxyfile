@@ -50,7 +50,6 @@ INPUT = ../README.md \
         protocols/umbra-microphone-v1.md \
         protocols/lumen-streaming-protocol.md \
         protocols/lumen-streaming-protocol-rationale.md \
-        protocols/umbra-lumen-quic-v3.md \
         ../src/platform/windows/virtual_display_driver/README.md \
         performance_tuning.md \
         api.md \

@@ -1,6 +1,6 @@
 # Lumen Streaming Protocol architecture rationale
 
-Status: proposed design direction, pre-implementation. This document records
+Status: selected design direction, implementation active. This document records
 the clean-room transport decision for the protocol that will replace the
 experimental QUIC protocol. It is not a compatibility or migration profile for
 that protocol.
@@ -23,10 +23,10 @@ The new **Lumen Streaming Protocol** (LSP) will use:
   when a packet can still arrive before its deadline; and
 - a bounded reliable control protocol carried in DTLS application records.
 
-LSP is a ground-up replacement. It does not retain the old protocol's QUIC
-connection, ULC3/ULM3/ULB3 records, fixed 1,152-byte envelope, control state
-machine, scheduler, media fragment format, replay namespace, input format,
-feedback messages, recovery cadence, or queue policy.
+LSP is a ground-up replacement. It does not retain the retired transport
+connection, custom records, fixed 1,152-byte envelope, control state machine,
+scheduler, media fragment format, replay namespace, input format, feedback
+messages, recovery cadence, or queue policy.
 
 Only transport-independent product components may remain: capture, color
 conversion, encoders, audio capture, platform input injection, decoders,
@@ -114,8 +114,9 @@ They are not the best control boundary for this project:
 - QUIC DATAGRAM frames use the connection's congestion controller. The
   application can assign deadlines and priorities only through the API surface
   exposed by the implementation.
-- Apple Network.framework and MsQuic expose different scheduling and callback
-  models. The protocol cannot require identical frame-aware behavior from both.
+- The prior platform transport libraries expose different scheduling and
+  callback models. The protocol cannot require identical frame-aware behavior
+  from both.
 - QUIC datagrams are connection-scoped rather than stream-scoped. Adding QUIC
   streams does not isolate live video datagrams.
 - Multiple QUIC connections would create multiple congestion controllers over
@@ -178,13 +179,13 @@ DTLS is used only for handshake and relatively low-rate control. SRTP protects
 the high-rate media and input path. The security design therefore does not put
 every media packet through a DTLS record API.
 
-The implementation plan contains a dependency gate because released OpenSSL
-3.6 supports DTLS through version 1.2, while DTLS 1.3 support has landed on the
-upstream development branch for a later release. LSP implementation must not
-silently downgrade the final protocol to DTLS 1.2. Before production work
-crosses the security boundary, both Windows and macOS must prove one reviewed
-DTLS 1.3 provider, DTLS-SRTP key export, stateless cookie validation, and the
-selected SRTP profile.
+The selected provider is commercially licensed wolfSSL 5.9.2. Its stable
+release supports DTLS 1.3, stateless HelloRetryRequest cookies, ALPN,
+`use_srtp`, and the RFC 5764 exporter. A macOS Stage 0 exchange has proved the
+exact `TLS_AES_128_GCM_SHA256` cipher suite, X25519, ALPN
+`lumen-stream/1`, `SRTP_AEAD_AES_128_GCM`, and matching 56-byte exporter
+output. Windows packaging and the libSRTP wolfCrypt AES-GCM backend remain
+mandatory Stage 0 gates. LSP must not silently downgrade to DTLS 1.2.
 
 This gate affects session startup, not the selected media data plane. It is
 better to resolve it before building incompatible temporary security framing.
@@ -399,7 +400,7 @@ or experimental behavior including exception propagation, move operations, and
 virtual member functions.
 
 Pure Swift can be fast, but it provides no advantage for the packet and raw-HID
-loops that must share OpenSSL, libSRTP, codec C APIs, and Lumen's C++ protocol
+loops that must share wolfSSL, libSRTP, codec C APIs, and Lumen's C++ protocol
 logic. ARC, `Data`, actor, and dispatch use are acceptable at per-frame or
 control frequency, not as mandatory work at 100,000 packets/s or 8,000 pointer
 reports/s.
@@ -462,7 +463,7 @@ remain strict.
 - [RFC 9626: video frame marking](https://www.rfc-editor.org/rfc/rfc9626.html)
 - [AOM RTP Payload Format For AV1 v1.0.0](https://aomediacodec.github.io/av1-rtp-spec/)
 - [Cisco libSRTP](https://github.com/cisco/libsrtp)
-- [OpenSSL supported protocol versions](https://github.com/openssl/openssl/blob/openssl-3.6.0/README.md)
+- [wolfSSL 5.9.2](https://github.com/wolfSSL/wolfssl/releases/tag/v5.9.2-stable)
 - [Microsoft UDP socket options](https://learn.microsoft.com/windows/win32/winsock/ipproto-udp-socket-options)
 - [Apple `NSEvent` documentation](https://developer.apple.com/documentation/appkit/nsevent)
 - [Apple IOKit documentation](https://developer.apple.com/documentation/iokit)
@@ -511,8 +512,8 @@ The audit corrected these concrete defects:
 
 The remaining implementation unknowns are explicit gates, not assumptions:
 
-1. a production DTLS 1.3 provider with DTLS-SRTP exporter support on both
-   Windows and macOS;
+1. wolfSSL 5.9.2 DTLS 1.3 packaging and DTLS-SRTP exporter proof on Windows,
+   plus the libSRTP wolfCrypt AES-GCM backend proof on both platforms;
 2. real IOHID permissions and sustained callback distributions for named 1/8
    kHz devices, plus honest AppKit fallback behavior;
 3. measured Windows virtual-HID keyboard/mouse/controller apply capacity;
@@ -523,13 +524,21 @@ The remaining implementation unknowns are explicit gates, not assumptions:
 6. FlexFEC CPU/latency cost at the selected packet rate; and
 7. physical input-to-photon results on the named competition rig.
 
-Exact CBOR, controller/device-state, edge, RTCP APP, and ABI structures still
-require the scheduled golden-vector freeze before implementation. No current
+The portable core now freezes and tests the 40-byte input header, device and
+sensor object IDs, 24-byte device prefix, 32-byte edge records, 48-byte
+baseline metadata, LSPI input acknowledgements, the 28-byte versioned LSPG
+envelope, H.264/HEVC/AV1/Opus packetization policy, bounded frame admission and
+reassembly, RTCP parsing and AVPF serializers, FlexFEC ordering, RTX retention,
+recovery epochs, congestion state, DPLPMTUD, and reconnect generation fencing.
+These are dependency-independent primitives, not evidence of a live product
+stream. Remaining control CBOR, device-specific state bodies, production
+SRTCP APP serialization not covered by those codecs, and cross-process product
+wiring still require their scheduled interoperability freeze. No current
 performance or latency target is presented as already achieved.
 
-## 19. Stop condition for this design stage
+## 19. Design-stage completion
 
-This rationale and the companion protocol and rewrite-plan documents are the
-only authorized changes in this stage. No LSP runtime, dependency, build,
-configuration, or migration code is to be written until the user explicitly
-starts the rewrite.
+The design stage is complete and the user has started the rewrite. Normative
+wire requirements remain governed by the companion protocol specification;
+implementation evidence updates this rationale without weakening those
+requirements.

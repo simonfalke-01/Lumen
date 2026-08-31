@@ -382,10 +382,6 @@ namespace {
       telemetry_client_for(stream_policy::ClientProtocol::umbra_v2),
       telemetry_client_e::umbra_v2
     );
-    EXPECT_EQ(
-      telemetry_client_for(stream_policy::ClientProtocol::umbra_v3),
-      telemetry_client_e::umbra_v3
-    );
   }
 
   TEST(FusedD3D11Telemetry, DisabledFrameTelemetryDoesNoCorrelatedWork) {
