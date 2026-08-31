@@ -1172,29 +1172,12 @@ namespace platf::virtual_display {
         }
         std::vector<DISPLAYCONFIG_PATH_INFO> configured_paths;
         std::vector<DISPLAYCONFIG_MODE_INFO> configured_modes;
-        if (!query(QDC_ONLY_ACTIVE_PATHS, configured_paths, configured_modes)) {
-          return false;
-        }
         auto path = paths[*connector_index];
         path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
         path.targetInfo.refreshRate = {mode.refresh.numerator, mode.refresh.denominator};
         path.targetInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
         path.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
         path.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-
-        LONG right_edge = 0;
-        for (const auto &active_path : configured_paths) {
-          if (active_path.sourceInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID &&
-              active_path.sourceInfo.modeInfoIdx < configured_modes.size()) {
-            const auto &active_mode = configured_modes[active_path.sourceInfo.modeInfoIdx];
-            if (active_mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
-              right_edge = std::max(
-                right_edge,
-                active_mode.sourceMode.position.x + static_cast<LONG>(active_mode.sourceMode.width)
-              );
-            }
-          }
-        }
 
         DISPLAYCONFIG_MODE_INFO source_mode {};
         source_mode.infoType = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
@@ -1203,7 +1186,7 @@ namespace platf::virtual_display {
         source_mode.sourceMode.width = mode.width;
         source_mode.sourceMode.height = mode.height;
         source_mode.sourceMode.pixelFormat = DISPLAYCONFIG_PIXELFORMAT_32BPP;
-        source_mode.sourceMode.position = {right_edge, 0};
+        source_mode.sourceMode.position = {0, 0};
         path.sourceInfo.modeInfoIdx = static_cast<UINT32>(configured_modes.size());
         configured_modes.push_back(source_mode);
 

@@ -2090,6 +2090,9 @@ namespace rtsp_stream {
         config.monitor.width = static_cast<int>(prepared.selection->selected_mode.width);
         config.monitor.height = static_cast<int>(prepared.selection->selected_mode.height);
         config.monitor.virtual_display_active = true;
+        if (config.monitor.dynamicRange == 0) {
+          config.monitor.encoderCscMode = 3;
+        }
         config.monitor.virtual_display_direct_required =
           activation_policy == platf::virtual_display::activation_policy_e::required ||
           config.monitor.dynamicRange != 0;

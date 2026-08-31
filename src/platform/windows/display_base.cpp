@@ -321,7 +321,7 @@ namespace platf::dxgi {
     };
 
     DXGI_RATIONAL client_frame_rate_adjusted = adjust_client_frame_rate();
-    const auto capture_resynchronization_timeout = video::capture_resynchronization_timeout(
+    const auto capture_resynchronization_timeout = ::video::capture_resynchronization_timeout(
       client_frame_rate_adjusted.Numerator,
       client_frame_rate_adjusted.Denominator
     );

@@ -3104,7 +3104,21 @@ namespace platf::dxgi {
     if (!source_ || !source_->healthy()) {
       return capture_e::reinit;
     }
-    auto acquired = source_->acquire(timeout);
+    const auto ownership_state = encode_resource_ownership->state();
+    if (ownership_state == fused_d3d11::resource_state_e::unset ||
+        ownership_state == fused_d3d11::resource_state_e::transitioning_fused) {
+      return capture_e::timeout;
+    }
+    auto acquire_timeout = timeout;
+    if (acquire_timeout <= 0ms && client_frame_rate_strict.Numerator != 0) {
+      acquire_timeout = std::chrono::milliseconds {
+        static_cast<std::int64_t>(
+          (1000ULL * client_frame_rate_strict.Denominator + client_frame_rate_strict.Numerator - 1ULL) /
+          client_frame_rate_strict.Numerator
+        )
+      };
+    }
+    auto acquired = source_->acquire(acquire_timeout);
     if (acquired.status == virtual_display::frame_io_e::timeout) {
       return capture_e::timeout;
     }

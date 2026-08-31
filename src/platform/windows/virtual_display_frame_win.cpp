@@ -517,7 +517,9 @@ namespace platf::virtual_display {
           native_status
         );
       }
-      if (!grant_umdf_process_access(native_status)) {
+      std::uint32_t process_access_status = ERROR_SUCCESS;
+      if (!grant_umdf_process_access(process_access_status)) {
+        native_status = static_cast<DWORD>(process_access_status);
         return fail(
           direct_frame_init_stage_e::publisher_process_open,
           frame_io_e::transport_error,

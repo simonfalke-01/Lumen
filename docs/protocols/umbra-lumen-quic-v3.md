@@ -1,7 +1,11 @@
 # Umbra / Lumen direct QUIC protocol version 3
 
-Status: implemented and linked in Umbra and Lumen; cross-machine transport
-acceptance and performance validation remain pending.
+Status: abandoned experimental implementation. It remains documented only
+while its current code awaits replacement and deletion. It is not a design
+baseline or compatibility target for the clean-room
+[Lumen Streaming Protocol](lumen-streaming-protocol.md). See the
+[architecture rationale](lumen-streaming-protocol-rationale.md) and
+[ground-up rewrite plan](../lumen-streaming-protocol-rewrite-plan.md).
 
 Version 3 is the direct Umbra/Lumen transport. It uses one QUIC listener on one
 UDP port, keeps the existing deterministic control semantics, and removes the
