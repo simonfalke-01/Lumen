@@ -5,13 +5,14 @@
 
 #include "host_runtime.h"
 
-#include "../packet_classifier.h"
 #include "../core/rtp.h"
+#include "../input_plane/rate.h"
+#include "../packet_classifier.h"
 #include "../security/wolfssl_dtls_server.h"
 #include "../service.h"
 #include "../session_authority.h"
 #include "../ssrc_registry.h"
-#include "../input_plane/rate.h"
+#include "audio_sender.h"
 #include "control_server.h"
 #include "identity.h"
 #include "input_owner.h"
@@ -23,20 +24,22 @@
 #endif
 
 #if LUMEN_LSP_RUNTIME_AVAILABLE
-  #include <wolfssl/options.h>
-  #include <wolfssl/wolfcrypt/ed25519.h>
-  #include <wolfssl/wolfcrypt/random.h>
-  #include <wolfssl/wolfcrypt/hash.h>
-
+  #include "../../config.h"
+  #include "../../globals.h"
   #include "../../httpcommon.h"
   #include "../../process.h"
+
+  #include <wolfssl/options.h>
+  #include <wolfssl/wolfcrypt/ed25519.h>
+  #include <wolfssl/wolfcrypt/hash.h>
+  #include <wolfssl/wolfcrypt/random.h>
 #endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <limits>
 #include <mutex>
@@ -69,6 +72,29 @@ namespace lumen::lsp::runtime {
     constexpr std::uint32_t runtime_poll_milliseconds = 2;
     constexpr std::uint64_t invitation_lifetime_seconds = 10U * 60U;
     constexpr std::uint64_t attach_grace_microseconds = 10U * 1'000'000U;
+
+    /**
+     * @brief Normalize an SSRC to a deterministic nonzero value outside a reserved set.
+     *
+     * @param candidate Random candidate, possibly zero or colliding.
+     * @param reserved Already selected SSRCs.
+     * @return Unique nonzero SSRC, or zero only when the bounded search is exhausted.
+     */
+    std::uint32_t next_unique_nonzero_ssrc(
+      std::uint32_t candidate,
+      const std::span<const std::uint32_t> reserved
+    ) noexcept {
+      if (candidate == 0) {
+        candidate = 1;
+      }
+      for (std::size_t attempt = 0; attempt <= reserved.size(); ++attempt) {
+        if (std::ranges::find(reserved, candidate) == reserved.end()) {
+          return candidate;
+        }
+        candidate = candidate == std::numeric_limits<std::uint32_t>::max() ? 1U : candidate + 1U;
+      }
+      return 0;
+    }
 
     std::string lowercase_hex(const std::span<const std::uint8_t> bytes) {
       constexpr std::string_view digits = "0123456789abcdef";
@@ -120,7 +146,8 @@ namespace lumen::lsp::runtime {
     std::uint64_t utc_seconds() noexcept {
       return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
                                           std::chrono::system_clock::now().time_since_epoch()
-      ).count());
+      )
+                                          .count());
     }
 
     class PersistentTrustStore final: public ControlTrustStore {
@@ -271,7 +298,8 @@ namespace lumen::lsp::runtime {
               identity.application_public_key.data(),
               static_cast<word32>(identity.application_public_key.size()),
               &host_key_
-            ) != 0 || wc_ed25519_check_key(&host_key_) != 0) {
+            ) != 0 ||
+            wc_ed25519_check_key(&host_key_) != 0) {
           ready_ = false;
           return;
         }
@@ -313,7 +341,8 @@ namespace lumen::lsp::runtime {
                  signature.data(),
                  &size,
                  &host_key_
-               ) == 0 && size == signature.size();
+               ) == 0 &&
+               size == signature.size();
       }
 
       bool verify(
@@ -341,7 +370,8 @@ namespace lumen::lsp::runtime {
                                               static_cast<word32>(transcript.size()),
                                               &verified,
                                               &key
-                                            ) : imported;
+                                            ) :
+                                            imported;
         wc_ed25519_free(&key);
         return status == 0 && verified == 1;
       }
@@ -477,11 +507,15 @@ namespace lumen::lsp::runtime {
 
     void stop() noexcept override {
       unregister_runtime(this);
-      if (!active_) {
-        return;
-      }
       active_ = false;
       worker_.request_stop();
+      std::unique_ptr<ActiveAudioRuntime> audio;
+      {
+        std::scoped_lock lock(session_mutex_);
+        audio = std::move(audio_runtime_);
+      }
+      stop_audio_runtime(std::move(audio));
+      process_pending_audio_retirements();
       socket_.close();
       if (worker_.joinable()) {
         worker_.join();
@@ -492,12 +526,13 @@ namespace lumen::lsp::runtime {
       {
         std::scoped_lock lock(session_mutex_);
         if (authority_.snapshot().state != SessionState::ready) {
-          (void)authority_.stop_from_host(NeutralizationReason::service_shutdown);
+          (void) authority_.stop_from_host(NeutralizationReason::service_shutdown);
         }
         if (active_process_generation_ != 0) {
-          (void)proc::proc.terminate_lsp_generation(active_process_generation_);
+          (void) proc::proc.terminate_lsp_generation(active_process_generation_);
           active_process_generation_ = 0;
         }
+        active_audio_configuration_.reset();
       }
       pairing_uri_.reset();
     }
@@ -589,10 +624,223 @@ namespace lumen::lsp::runtime {
     }
 
   private:
+    /** @brief Joined ownership of one acknowledged host-audio capture and sender generation. */
+    struct ActiveAudioRuntime {
+      PeerEndpoint peer {};  ///< Association authorized to receive this generation.
+      std::uint32_t generation {};  ///< Exact active audio generation.
+      safe::mail_t mail;  ///< Local shutdown mailbox consumed by `audio::capture`.
+      std::shared_ptr<HostAudioSender> sender;  ///< Typed encoded-packet destination and SRTP worker.
+      std::jthread capture_thread;  ///< Host loopback capture owner.
+      bool remove_srtp_on_retirement {};  ///< Whether association loss deferred SRTP removal until after join.
+    };
+
     struct DtlsTimer {
       PeerEndpoint peer;  ///< Association being timed.
       std::uint64_t due_microseconds {};  ///< Monotonic due time.
     };
+
+    /**
+     * @brief Select the first exact supported audio offer in client order.
+     *
+     * @param request Authenticated START offer.
+     * @param generation Nonzero audio configuration generation.
+     * @param ssrc Fresh unique host audio SSRC.
+     * @return Exact built-in Opus tuple or no value when no offer is supported.
+     */
+    std::optional<AudioSelectionPayload> select_audio(
+      const StartRequestPayload &request,
+      const std::uint32_t generation,
+      const std::uint32_t ssrc
+    ) const noexcept {
+      if (!config::audio.stream || generation == 0 || ssrc == 0) {
+        return std::nullopt;
+      }
+      for (const auto &offer : request.audio_offers) {
+        const auto stream = audio::select_opus_stream_config(offer.channels, false);
+        if (!stream) {
+          continue;
+        }
+        const auto stream_maximum = std::min(2'048'000, stream->streams * 512'000);
+        const auto bitrate = std::min(offer.maximum_bitrate, static_cast<std::uint32_t>(stream->bitrate));
+        if (bitrate < 6'000 || bitrate > static_cast<std::uint32_t>(stream_maximum)) {
+          continue;
+        }
+        AudioSelectionPayload selected {
+          .audio_generation = generation,
+          .audio_ssrc = ssrc,
+          .audio_payload_type = 111,
+          .clock_rate = 48'000,
+          .channels = static_cast<std::uint8_t>(stream->channelCount),
+          .streams = static_cast<std::uint8_t>(stream->streams),
+          .coupled_streams = static_cast<std::uint8_t>(stream->coupledStreams),
+          .frame_samples = offer.frame_samples,
+          .bitrate = bitrate,
+          .inband_fec = offer.inband_fec,
+          .dtx = offer.dtx,
+          .initial_udp_payload_size = 1'200,
+          .initial_preroll_packets = 1,
+        };
+        std::copy_n(stream->mapping, stream->channelCount, selected.mapping.begin());
+        return selected;
+      }
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Stop and join one detached audio runtime without holding session authority locks.
+     *
+     * @param runtime Audio runtime ownership to release.
+     */
+    static void stop_audio_runtime(std::unique_ptr<ActiveAudioRuntime> runtime) noexcept {
+      if (!runtime) {
+        return;
+      }
+      if (runtime->sender) {
+        runtime->sender->close();
+      }
+      if (runtime->mail) {
+        runtime->mail->event<bool>(mail::shutdown)->raise(true);
+      }
+      if (runtime->capture_thread.joinable()) {
+        runtime->capture_thread.join();
+      }
+      if (runtime->sender) {
+        runtime->sender->join();
+      }
+    }
+
+    /**
+     * @brief Make an audio runtime quiescent without joining its worker threads.
+     *
+     * @param runtime Runtime being detached from an authority callback.
+     */
+    static void begin_audio_runtime_stop(ActiveAudioRuntime &runtime) noexcept {
+      if (runtime.sender) {
+        runtime.sender->close();
+      }
+      if (runtime.mail) {
+        runtime.mail->event<bool>(mail::shutdown)->raise(true);
+      }
+    }
+
+    /**
+     * @brief Queue a quiescent audio runtime for joining after the current receive callback.
+     *
+     * @param runtime Runtime ownership to retire.
+     */
+    void queue_audio_retirement(std::unique_ptr<ActiveAudioRuntime> runtime) noexcept {
+      if (!runtime) {
+        return;
+      }
+      begin_audio_runtime_stop(*runtime);
+      std::scoped_lock lock(session_mutex_);
+      for (auto &pending : pending_audio_retirements_) {
+        if (!pending) {
+          pending = std::move(runtime);
+          return;
+        }
+      }
+      std::terminate();
+    }
+
+    /** @brief Join every quiescent audio runtime outside DTLS/control callbacks and session locks. */
+    void process_pending_audio_retirements() noexcept {
+      while (true) {
+        std::unique_ptr<ActiveAudioRuntime> runtime;
+        {
+          std::scoped_lock lock(session_mutex_);
+          const auto pending = std::ranges::find_if(pending_audio_retirements_, [](const auto &candidate) {
+            return static_cast<bool>(candidate);
+          });
+          if (pending == pending_audio_retirements_.end()) {
+            return;
+          }
+          runtime = std::move(*pending);
+        }
+        const auto remove_srtp = runtime->remove_srtp_on_retirement;
+        const auto peer = runtime->peer;
+        stop_audio_runtime(std::move(runtime));
+        if (remove_srtp && srtp_) {
+          srtp_->remove_association(peer);
+        }
+      }
+    }
+
+    /**
+     * @brief Create the complete acknowledged capture and sender owner.
+     *
+     * @param peer Authenticated destination association.
+     * @param selection Acknowledged audio tuple.
+     * @return Started audio runtime or no value on allocation/thread failure.
+     */
+    std::unique_ptr<ActiveAudioRuntime> create_audio_runtime(
+      const PeerEndpoint &peer,
+      const AudioSelectionPayload &selection
+    ) noexcept {
+      std::array<std::uint8_t, 6> random_timeline {};
+      if (!srtp_ || !crypto_ || !crypto_->random(random_timeline)) {
+        return nullptr;
+      }
+      auto sequence = wire::read_be<std::uint16_t>(std::span<const std::uint8_t> {random_timeline}.first<2>());
+      auto timestamp = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {random_timeline}.subspan<2, 4>());
+      if (sequence == 0) {
+        sequence = 1;
+      }
+      if (timestamp == 0) {
+        timestamp = 1;
+      }
+      const auto family = peer.family == IpAddressFamily::ipv6 ? media::ip_family::ipv6 : media::ip_family::ipv4;
+      auto runtime = std::unique_ptr<ActiveAudioRuntime> {new (std::nothrow) ActiveAudioRuntime};
+      if (!runtime) {
+        return nullptr;
+      }
+      runtime->peer = peer;
+      runtime->generation = selection.audio_generation;
+      runtime->mail = std::shared_ptr<safe::mail_raw_t> {new (std::nothrow) safe::mail_raw_t};
+      runtime->sender = std::shared_ptr<HostAudioSender> {new (std::nothrow) HostAudioSender(
+        HostAudioSenderConfig {
+          .peer = peer,
+          .ssrc = selection.audio_ssrc,
+          .payload_type = selection.audio_payload_type,
+          .initial_sequence = sequence,
+          .initial_timestamp = timestamp,
+          .frame_samples = selection.frame_samples,
+          .path = {.family = family, .udp_payload_size = selection.initial_udp_payload_size},
+          .queue_capacity = 2,
+          .maximum_queue_age_microseconds = std::max<std::uint64_t>(
+            10'000,
+            static_cast<std::uint64_t>(selection.frame_samples) * 2'000'000ULL / 48'000ULL
+          ),
+          .sender_report_interval_microseconds = 1'000'000,
+        },
+        *srtp_
+      )};
+      if (!runtime->mail || !runtime->sender || !runtime->sender->ready() || !runtime->sender->start()) {
+        queue_audio_retirement(std::move(runtime));
+        return nullptr;
+      }
+      audio::config_t capture_config {};
+      capture_config.packetDuration = selection.frame_samples / 48;
+      capture_config.frameSamples = selection.frame_samples;
+      capture_config.channels = selection.channels;
+      capture_config.bitrate = static_cast<int>(selection.bitrate);
+      capture_config.captureQueueFrames = 2;
+      capture_config.flags[audio::config_t::INBAND_FEC] = selection.inband_fec;
+      capture_config.flags[audio::config_t::DTX] = selection.dtx;
+      try {
+        const auto mail = runtime->mail;
+        const auto sender = runtime->sender;
+        const auto destination = std::weak_ptr<audio::AudioPacketDestination> {sender};
+        runtime->capture_thread = std::jthread([mail, capture_config, destination, sender]() mutable {
+          audio::capture(std::move(mail), capture_config, destination);
+          sender->close();
+        });
+      } catch (...) {
+        queue_audio_retirement(std::move(runtime));
+        return nullptr;
+      }
+      return runtime;
+    }
 
     bool send(const PeerEndpoint &peer, const std::span<const std::uint8_t> frame) noexcept override {
       return dtls_ && dtls_->send_application_data(peer, frame) == WolfsslDtlsOperationResult::accepted;
@@ -622,6 +870,10 @@ namespace lumen::lsp::runtime {
       }
 
       const auto family = peer.family == IpAddressFamily::ipv6 ? input_plane::ip_family::ipv6 : input_plane::ip_family::ipv4;
+      const auto media_family = peer.family == IpAddressFamily::ipv6 ? media::ip_family::ipv6 : media::ip_family::ipv4;
+      if (!media::make_path_payload_limit(media_family, request.offered_maximum_udp_payload)) {
+        return std::unexpected(ControlStatus::malformed);
+      }
       const auto pointer_budget = input_plane::wire_bits_per_second(family, input_plane::pointer_payload_size, request.pointer_rate);
       const auto controller_budget = input_plane::wire_bits_per_second(family, 96, request.controller_rate);
       const auto sensor_budget = input_plane::wire_bits_per_second(family, 32, request.sensor_rate);
@@ -648,29 +900,50 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::internal_failure);
       }
 
-      std::array<std::uint8_t, 8> ssrc_bytes {};
+      std::array<std::uint8_t, 12> ssrc_bytes {};
       if (!crypto_->random(ssrc_bytes)) {
         return std::unexpected(ControlStatus::internal_failure);
       }
-      auto input_ssrc = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.first<4>());
-      auto acknowledgement_ssrc = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<4, 4>());
-      if (input_ssrc == 0) {
-        input_ssrc = 1;
-      }
-      if (acknowledgement_ssrc == 0 || acknowledgement_ssrc == input_ssrc) {
-        acknowledgement_ssrc = input_ssrc == std::numeric_limits<std::uint32_t>::max() ? input_ssrc - 1U : input_ssrc + 1U;
+      const auto input_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.first<4>()),
+        {}
+      );
+      const std::array input_reserved {input_ssrc};
+      const auto acknowledgement_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<4, 4>()),
+        input_reserved
+      );
+      const std::array audio_reserved {input_ssrc, acknowledgement_ssrc};
+      const auto audio_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<8, 4>()),
+        audio_reserved
+      );
+      const auto audio_selection = select_audio(request, start.generations.audio, audio_ssrc);
+      if (!audio_selection) {
+        return std::unexpected(ControlStatus::unsupported_media_tuple);
       }
       constexpr std::uint8_t input_payload_type = 96;
-      const SsrcAssignment assignment {
-        .ssrc = input_ssrc,
-        .payload_type = input_payload_type,
-        .lane = MediaLane::input,
-        .direction = MediaDirection::client_to_host,
-        .format = PayloadFormat::lsp_input,
-        .clock_rate = 1'000'000,
-        .generation = start.generations.input,
+      const std::array assignments {
+        SsrcAssignment {
+          .ssrc = input_ssrc,
+          .payload_type = input_payload_type,
+          .lane = MediaLane::input,
+          .direction = MediaDirection::client_to_host,
+          .format = PayloadFormat::lsp_input,
+          .clock_rate = 1'000'000,
+          .generation = start.generations.input,
+        },
+        SsrcAssignment {
+          .ssrc = audio_ssrc,
+          .payload_type = audio_selection->audio_payload_type,
+          .lane = MediaLane::audio,
+          .direction = MediaDirection::host_to_client,
+          .format = PayloadFormat::opus,
+          .clock_rate = audio_selection->clock_rate,
+          .generation = audio_selection->audio_generation,
+        },
       };
-      auto registry = SsrcRegistry::create(std::span<const SsrcAssignment> {&assignment, 1});
+      auto registry = SsrcRegistry::create(assignments);
       if (!registry) {
         return std::unexpected(ControlStatus::internal_failure);
       }
@@ -691,12 +964,12 @@ namespace lumen::lsp::runtime {
       );
       if (parsed_application.ec != std::errc {} || parsed_application.ptr != request.application_id.data() + request.application_id.size() ||
           numeric_application_id <= 0) {
-        (void)authority_.stop_from_host(NeutralizationReason::explicit_stop);
+        (void) authority_.stop_from_host(NeutralizationReason::explicit_stop);
         return std::unexpected(ControlStatus::malformed);
       }
       const auto launched = proc::proc.execute_lsp_if_idle(numeric_application_id);
       if (launched.status != 0 || launched.process_generation == 0) {
-        (void)authority_.stop_from_host(NeutralizationReason::explicit_stop);
+        (void) authority_.stop_from_host(NeutralizationReason::explicit_stop);
         return std::unexpected(launched.status == 409 ? ControlStatus::busy : ControlStatus::internal_failure);
       }
       const InputSessionMapping mapping {
@@ -710,8 +983,8 @@ namespace lumen::lsp::runtime {
         .input_payload_type = input_payload_type,
       };
       if (!input_owner_->configure(mapping)) {
-        (void)authority_.stop_from_host(NeutralizationReason::explicit_stop);
-        (void)proc::proc.terminate_lsp_generation(launched.process_generation);
+        (void) authority_.stop_from_host(NeutralizationReason::explicit_stop);
+        (void) proc::proc.terminate_lsp_generation(launched.process_generation);
         return std::unexpected(ControlStatus::internal_failure);
       }
       active_client_ = authority_client;
@@ -726,6 +999,11 @@ namespace lumen::lsp::runtime {
       last_attach_intent_ = {};
       detached_deadline_microseconds_ = 0;
       ssrc_registry_ = std::move(*registry);
+      active_audio_configuration_ = AudioConfigPayload {
+        .session_id = start.session_id,
+        .stream_generation = start.generations.stream,
+        .audio = *audio_selection,
+      };
       ++next_stream_generation_;
       return StartResponsePayload {
         .session_id = start.session_id,
@@ -741,6 +1019,7 @@ namespace lumen::lsp::runtime {
         .reconciliation_rate = request.reconciliation_rate,
         .reserved_input_wire_bits_per_second = total_budget,
         .baseline_required = true,
+        .audio = *audio_selection,
       };
     }
 
@@ -751,7 +1030,8 @@ namespace lumen::lsp::runtime {
       const AttachRequestPayload &request
     ) noexcept override {
       std::scoped_lock lock(session_mutex_);
-      if (request.intent_id == last_attach_intent_ || active_process_generation_ == 0 || proc::proc.running() <= 0) {
+      if (request.intent_id == last_attach_intent_ || active_process_generation_ == 0 || proc::proc.running() <= 0 ||
+          !active_audio_configuration_) {
         return std::unexpected(ControlStatus::stale_generation);
       }
       const auto previous_mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
@@ -759,18 +1039,24 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::busy);
       }
       Secret256 replacement_token {};
-      std::array<std::uint8_t, 8> ssrc_bytes {};
+      std::array<std::uint8_t, 12> ssrc_bytes {};
       if (!crypto_->random(replacement_token) || !crypto_->random(ssrc_bytes)) {
         return std::unexpected(ControlStatus::internal_failure);
       }
-      auto input_ssrc = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.first<4>());
-      auto acknowledgement_ssrc = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<4, 4>());
-      if (input_ssrc == 0) {
-        input_ssrc = 1;
-      }
-      if (acknowledgement_ssrc == 0 || acknowledgement_ssrc == input_ssrc) {
-        acknowledgement_ssrc = input_ssrc == std::numeric_limits<std::uint32_t>::max() ? input_ssrc - 1U : input_ssrc + 1U;
-      }
+      const auto input_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.first<4>()),
+        {}
+      );
+      const std::array input_reserved {input_ssrc};
+      const auto acknowledgement_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<4, 4>()),
+        input_reserved
+      );
+      const std::array audio_reserved {input_ssrc, acknowledgement_ssrc};
+      const auto audio_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<8, 4>()),
+        audio_reserved
+      );
       const AuthenticatedClient authority_client {
         .client_id = client.client_id,
         .connection_generation = connection_generation,
@@ -801,17 +1087,32 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::stale_generation);
       }
       const auto next_input_generation = prior_snapshot.generations.input + 1U;
+      const auto next_audio_generation = prior_snapshot.generations.audio + 1U;
+      auto audio_selection = active_audio_configuration_->audio;
+      audio_selection.audio_generation = next_audio_generation;
+      audio_selection.audio_ssrc = audio_ssrc;
       constexpr std::uint8_t input_payload_type = 96;
-      const SsrcAssignment assignment {
-        .ssrc = input_ssrc,
-        .payload_type = input_payload_type,
-        .lane = MediaLane::input,
-        .direction = MediaDirection::client_to_host,
-        .format = PayloadFormat::lsp_input,
-        .clock_rate = 1'000'000,
-        .generation = next_input_generation,
+      const std::array assignments {
+        SsrcAssignment {
+          .ssrc = input_ssrc,
+          .payload_type = input_payload_type,
+          .lane = MediaLane::input,
+          .direction = MediaDirection::client_to_host,
+          .format = PayloadFormat::lsp_input,
+          .clock_rate = 1'000'000,
+          .generation = next_input_generation,
+        },
+        SsrcAssignment {
+          .ssrc = audio_ssrc,
+          .payload_type = audio_selection.audio_payload_type,
+          .lane = MediaLane::audio,
+          .direction = MediaDirection::host_to_client,
+          .format = PayloadFormat::opus,
+          .clock_rate = audio_selection.clock_rate,
+          .generation = next_audio_generation,
+        },
       };
-      auto registry = SsrcRegistry::create(std::span<const SsrcAssignment> {&assignment, 1});
+      auto registry = SsrcRegistry::create(assignments);
       const InputSessionMapping mapping {
         .peer = peer,
         .client_id = client.client_id,
@@ -838,6 +1139,11 @@ namespace lumen::lsp::runtime {
       const auto snapshot = authority_.snapshot();
       active_client_ = authority_client;
       ssrc_registry_ = std::move(*registry);
+      active_audio_configuration_ = AudioConfigPayload {
+        .session_id = snapshot.session_id,
+        .stream_generation = snapshot.generations.stream,
+        .audio = audio_selection,
+      };
       last_attach_intent_ = request.intent_id;
       detached_deadline_microseconds_ = 0;
       if (previous_mapping && previous_mapping->peer != peer) {
@@ -858,7 +1164,46 @@ namespace lumen::lsp::runtime {
         .reconciliation_rate = active_rates_.reconciliation,
         .reserved_input_wire_bits_per_second = active_rates_.budget,
         .baseline_required = true,
+        .audio = audio_selection,
       };
+    }
+
+    bool audio_config_acknowledged(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      const std::uint32_t connection_generation,
+      const AudioConfigAckPayload &acknowledgement
+    ) noexcept override {
+      std::unique_ptr<ActiveAudioRuntime> prior_audio;
+      {
+        std::scoped_lock lock(session_mutex_);
+        const auto snapshot = authority_.snapshot();
+        if (!active_client_ || !active_audio_configuration_ ||
+            active_client_->client_id != client.client_id ||
+            active_client_->connection_generation != connection_generation ||
+            snapshot.session_id != acknowledgement.session_id ||
+            active_audio_configuration_->session_id != acknowledgement.session_id ||
+            active_audio_configuration_->stream_generation != snapshot.generations.stream ||
+            active_audio_configuration_->audio.audio_generation != acknowledgement.audio_generation) {
+          return false;
+        }
+        if (audio_runtime_ && audio_runtime_->peer == peer &&
+            audio_runtime_->generation == acknowledgement.audio_generation) {
+          return acknowledgement.status == ControlStatus::success;
+        }
+        if (acknowledgement.status == ControlStatus::success) {
+          auto replacement = create_audio_runtime(peer, active_audio_configuration_->audio);
+          if (!replacement) {
+            return false;
+          }
+          prior_audio = std::move(audio_runtime_);
+          audio_runtime_ = std::move(replacement);
+        } else {
+          prior_audio = std::move(audio_runtime_);
+        }
+      }
+      queue_audio_retirement(std::move(prior_audio));
+      return true;
     }
 
     ControlStatus stop_input(
@@ -866,35 +1211,42 @@ namespace lumen::lsp::runtime {
       const std::uint32_t connection_generation,
       const StopRequestPayload &request
     ) noexcept override {
-      std::scoped_lock lock(session_mutex_);
-      const AuthenticatedClient authority_client {
-        .client_id = client.client_id,
-        .connection_generation = connection_generation,
-        .revocation_generation = client.revocation_generation,
-        .permissions = client.permissions,
-      };
-      const auto stopped = authority_.stop_owned(authority_client, request.session_id);
-      if (stopped == AuthorityResult::permission_denied) {
-        return ControlStatus::permission_denied;
+      std::unique_ptr<ActiveAudioRuntime> audio;
+      bool process_stopped = false;
+      {
+        std::scoped_lock lock(session_mutex_);
+        const AuthenticatedClient authority_client {
+          .client_id = client.client_id,
+          .connection_generation = connection_generation,
+          .revocation_generation = client.revocation_generation,
+          .permissions = client.permissions,
+        };
+        const auto stopped = authority_.stop_owned(authority_client, request.session_id);
+        if (stopped == AuthorityResult::permission_denied) {
+          return ControlStatus::permission_denied;
+        }
+        if (stopped == AuthorityResult::not_owner || stopped == AuthorityResult::stale_generation) {
+          return ControlStatus::stale_generation;
+        }
+        if (stopped != AuthorityResult::accepted) {
+          return ControlStatus::malformed;
+        }
+        process_stopped = active_process_generation_ == 0 ||
+                          proc::proc.terminate_lsp_generation(active_process_generation_);
+        active_process_generation_ = 0;
+        active_client_.reset();
+        active_audio_configuration_.reset();
+        audio = std::move(audio_runtime_);
+        ssrc_registry_.reset();
+        detached_deadline_microseconds_ = 0;
+        last_attach_intent_ = {};
       }
-      if (stopped == AuthorityResult::not_owner || stopped == AuthorityResult::stale_generation) {
-        return ControlStatus::stale_generation;
-      }
-      if (stopped != AuthorityResult::accepted) {
-        return ControlStatus::malformed;
-      }
-      const auto process_stopped = active_process_generation_ == 0 ||
-                                   proc::proc.terminate_lsp_generation(active_process_generation_);
-      active_process_generation_ = 0;
-      active_client_.reset();
-      ssrc_registry_.reset();
-      detached_deadline_microseconds_ = 0;
-      last_attach_intent_ = {};
+      queue_audio_retirement(std::move(audio));
       return process_stopped ? ControlStatus::success : ControlStatus::internal_failure;
     }
 
     bool neutralize(const NeutralizationRequest &request) noexcept override {
-      (void)request;
+      (void) request;
       if (input_owner_) {
         input_owner_->neutralize();
       }
@@ -931,7 +1283,7 @@ namespace lumen::lsp::runtime {
 
     void run(const std::stop_token stop_token) noexcept {
       while (!stop_token.stop_requested() && active_) {
-        (void)socket_.wait_readable(runtime_poll_milliseconds);
+        (void) socket_.wait_readable(runtime_poll_milliseconds);
         const auto result = socket_.receive_batch(runtime_receive_batch, [this](const ReceivedDatagram &datagram) {
           if (classify_packet(datagram.payload) == PacketClass::dtls) {
             refresh_dtls_timer(datagram.peer, datagram.received_at_microseconds);
@@ -940,6 +1292,7 @@ namespace lumen::lsp::runtime {
             service_->receive(datagram.peer, datagram.payload);
           }
           process_pending_association_closes();
+          process_pending_audio_retirements();
           if (classify_packet(datagram.payload) == PacketClass::dtls) {
             refresh_dtls_timer(datagram.peer, datagram.received_at_microseconds);
           }
@@ -952,7 +1305,9 @@ namespace lumen::lsp::runtime {
           control_->tick(now);
         }
         process_dtls_timers(now);
+        process_pending_audio_retirements();
         process_detached_grace(now);
+        process_application_exit();
       }
       active_ = false;
     }
@@ -971,7 +1326,8 @@ namespace lumen::lsp::runtime {
       }
       const auto delay = static_cast<std::uint64_t>(seconds) * 1'000'000U;
       const auto due = now_microseconds > std::numeric_limits<std::uint64_t>::max() - delay ?
-                         std::numeric_limits<std::uint64_t>::max() : now_microseconds + delay;
+                         std::numeric_limits<std::uint64_t>::max() :
+                         now_microseconds + delay;
       if (iterator != dtls_timers_.end()) {
         iterator->due_microseconds = due;
       } else if (dtls_timers_.size() < 64) {
@@ -1015,27 +1371,53 @@ namespace lumen::lsp::runtime {
         auto peer = std::move(pending_association_closes_[--pending_association_close_count_]);
         pending_association_closes_[pending_association_close_count_] = {};
         if (dtls_) {
-          (void)dtls_->close_association(peer);
+          (void) dtls_->close_association(peer);
         }
       }
     }
 
     void process_detached_grace(const std::uint64_t now_microseconds) noexcept {
-      std::scoped_lock lock(session_mutex_);
-      if (detached_deadline_microseconds_ == 0 || now_microseconds < detached_deadline_microseconds_) {
-        return;
-      }
-      detached_deadline_microseconds_ = 0;
-      if (authority_.snapshot().state == SessionState::detached) {
-        (void)authority_.stop_from_host(NeutralizationReason::transport_loss);
-        if (active_process_generation_ != 0) {
-          (void)proc::proc.terminate_lsp_generation(active_process_generation_);
-          active_process_generation_ = 0;
+      std::unique_ptr<ActiveAudioRuntime> audio;
+      {
+        std::scoped_lock lock(session_mutex_);
+        if (detached_deadline_microseconds_ == 0 || now_microseconds < detached_deadline_microseconds_) {
+          return;
         }
+        detached_deadline_microseconds_ = 0;
+        if (authority_.snapshot().state == SessionState::detached) {
+          (void) authority_.stop_from_host(NeutralizationReason::transport_loss);
+          if (active_process_generation_ != 0) {
+            (void) proc::proc.terminate_lsp_generation(active_process_generation_);
+            active_process_generation_ = 0;
+          }
+          active_client_.reset();
+          active_audio_configuration_.reset();
+          audio = std::move(audio_runtime_);
+          ssrc_registry_.reset();
+          last_attach_intent_ = {};
+        }
+      }
+      stop_audio_runtime(std::move(audio));
+    }
+
+    /** @brief Stop media authority when the generation-owned application exits. */
+    void process_application_exit() noexcept {
+      std::unique_ptr<ActiveAudioRuntime> audio;
+      {
+        std::scoped_lock lock(session_mutex_);
+        if (active_process_generation_ == 0 || proc::proc.running() > 0) {
+          return;
+        }
+        (void) authority_.stop_from_host(NeutralizationReason::explicit_stop);
+        active_process_generation_ = 0;
         active_client_.reset();
+        active_audio_configuration_.reset();
+        audio = std::move(audio_runtime_);
         ssrc_registry_.reset();
+        detached_deadline_microseconds_ = 0;
         last_attach_intent_ = {};
       }
+      stop_audio_runtime(std::move(audio));
     }
 
     static bool dtls_send_callback(
@@ -1089,25 +1471,37 @@ namespace lumen::lsp::runtime {
 
     static void association_closed_callback(void *context, const PeerEndpoint &peer) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
-      std::scoped_lock session_lock(runtime.session_mutex_);
-      if (runtime.input_owner_) {
-        const auto mapping = runtime.input_owner_->mapping();
-        if (mapping && mapping->peer == peer) {
-          (void)runtime.authority_.transport_lost(mapping->connection_generation);
-          runtime.detached_deadline_microseconds_ = monotonic_microseconds() + attach_grace_microseconds;
-          runtime.ssrc_registry_.reset();
-          runtime.active_client_.reset();
+      std::unique_ptr<ActiveAudioRuntime> audio;
+      {
+        std::scoped_lock session_lock(runtime.session_mutex_);
+        if (runtime.input_owner_) {
+          const auto mapping = runtime.input_owner_->mapping();
+          if (mapping && mapping->peer == peer) {
+            (void) runtime.authority_.transport_lost(mapping->connection_generation);
+            runtime.detached_deadline_microseconds_ = monotonic_microseconds() + attach_grace_microseconds;
+            runtime.ssrc_registry_.reset();
+            runtime.active_client_.reset();
+          }
+        }
+        if (runtime.audio_runtime_ && runtime.audio_runtime_->peer == peer) {
+          audio = std::move(runtime.audio_runtime_);
+          audio->remove_srtp_on_retirement = true;
         }
       }
-      if (runtime.srtp_) {
+      const auto deferred_srtp_removal = static_cast<bool>(audio);
+      runtime.queue_audio_retirement(std::move(audio));
+      if (!deferred_srtp_removal && runtime.srtp_) {
         runtime.srtp_->remove_association(peer);
       }
       if (runtime.control_) {
         runtime.control_->association_closed(peer);
       }
-      const auto timer = std::ranges::find(runtime.dtls_timers_, peer, &DtlsTimer::peer);
-      if (timer != runtime.dtls_timers_.end()) {
-        runtime.dtls_timers_.erase(timer);
+      {
+        std::scoped_lock session_lock(runtime.session_mutex_);
+        const auto timer = std::ranges::find(runtime.dtls_timers_, peer, &DtlsTimer::peer);
+        if (timer != runtime.dtls_timers_.end()) {
+          runtime.dtls_timers_.erase(timer);
+        }
       }
     }
 
@@ -1180,11 +1574,7 @@ namespace lumen::lsp::runtime {
         return false;
       }
       const auto mapping = runtime.input_owner_->mapping();
-      return mapping && mapping->peer == peer && runtime.authority_.commit_input_baseline(
-                                                  *runtime.active_client_,
-                                                  session_generation,
-                                                  input_generation
-                                                ) == AuthorityResult::accepted;
+      return mapping && mapping->peer == peer && runtime.authority_.commit_input_baseline(*runtime.active_client_, session_generation, input_generation) == AuthorityResult::accepted;
     }
 
     HostRuntimeConfig config_;  ///< Immutable runtime configuration.
@@ -1201,8 +1591,11 @@ namespace lumen::lsp::runtime {
     SessionAuthority authority_;  ///< START/baseline/disconnect input authority state.
     std::optional<AuthenticatedClient> active_client_;  ///< Current input session owner.
     std::optional<SsrcRegistry> ssrc_registry_;  ///< Authenticated input SSRC mapping.
-    std::uint32_t next_stream_generation_ {1};  ///< Next nonzero input-only session generation.
+    std::optional<AudioConfigPayload> active_audio_configuration_;  ///< Selected or rekeyed audio tuple awaiting/holding ACK.
+    std::unique_ptr<ActiveAudioRuntime> audio_runtime_;  ///< Acknowledged capture and SRTP sender generation.
+    std::uint32_t next_stream_generation_ {1};  ///< Next nonzero LSP stream-session generation.
     std::uint64_t active_process_generation_ {};  ///< Generation-qualified LSP-owned application process.
+
     struct ActiveRates {
       std::uint32_t pointer {};  ///< Selected pointer reports/s.
       std::uint32_t controller {};  ///< Selected controller reports/s.
@@ -1210,12 +1603,14 @@ namespace lumen::lsp::runtime {
       std::uint32_t reconciliation {};  ///< Selected reconciliation reports/s.
       std::uint64_t budget {};  ///< Reserved input wire bits/s.
     } active_rates_;  ///< Retained input selection across ATTACH/rekey.
+
     Identifier128 last_attach_intent_ {};  ///< Last consumed attach intent, preventing semantic replay.
     std::uint64_t detached_deadline_microseconds_ {};  ///< Bounded process-hold deadline.
     mutable std::recursive_mutex session_mutex_;  ///< Synchronizes socket authority with the input apply worker.
     std::vector<DtlsTimer> dtls_timers_;  ///< Bounded association retransmission timers.
     std::array<PeerEndpoint, 64> pending_association_closes_ {};  ///< Old associations retired after response submission.
     std::size_t pending_association_close_count_ {};  ///< Live leading deferred-close entries.
+    std::array<std::unique_ptr<ActiveAudioRuntime>, 64> pending_audio_retirements_ {};  ///< Quiescent audio owners awaiting callback-safe joins.
     std::jthread worker_;  ///< Socket receive/control timer owner.
     std::optional<std::string> pairing_uri_;  ///< Current UI-bound invitation issuance copy.
     std::uint64_t pairing_expiration_utc_seconds_ {};  ///< Current invitation expiry.
@@ -1226,7 +1621,7 @@ namespace lumen::lsp::runtime {
 
   HostRuntimeCreateResult create_host_runtime(HostRuntimeConfig config) noexcept {
 #if !LUMEN_LSP_RUNTIME_AVAILABLE
-    (void)config;
+    (void) config;
     return {.status = RuntimeCreateStatus::provider_unavailable};
 #else
     if (!valid_runtime_config(config)) {

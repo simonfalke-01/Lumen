@@ -63,6 +63,8 @@ namespace audio {
       HOST_AUDIO,  ///< Host audio
       CUSTOM_SURROUND_PARAMS,  ///< Custom surround parameters
       CONTINUOUS_AUDIO,  ///< Continuous audio
+      INBAND_FEC,  ///< Enable negotiated Opus in-band forward error correction.
+      DTX,  ///< Enable negotiated Opus discontinuous transmission.
       MAX_FLAGS  ///< Maximum number of flags
     };
 
@@ -75,6 +77,7 @@ namespace audio {
     std::bitset<MAX_FLAGS> flags;  ///< Enabled audio feature flags.
     int bitrate {};  ///< Exact negotiated total Opus bitrate, or zero for legacy tier selection.
     std::uint32_t captureQueueFrames {};  ///< Optional PCM queue bound; zero retains the legacy 120 ms-derived default.
+    std::uint16_t frameSamples {};  ///< Exact negotiated 48 kHz frame samples; zero derives the legacy millisecond duration.
   };
 
   /**

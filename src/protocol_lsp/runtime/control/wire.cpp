@@ -16,6 +16,7 @@ namespace lumen::lsp::runtime {
     namespace cbor = lumen::protocol_common::cbor;
     constexpr std::size_t maximum_payload_bytes = 1'152;
     constexpr std::size_t maximum_applications = 64;
+    constexpr std::size_t maximum_audio_offers = 12;
 
     template<std::size_t Size>
     cbor::Value::Bytes bytes(const std::array<std::uint8_t, Size> &value) {
@@ -36,14 +37,19 @@ namespace lumen::lsp::runtime {
       return std::get_if<std::uint64_t>(&value.storage);
     }
 
+    /** @brief Return a borrowed boolean only when the CBOR value has exact boolean type. */
+    const bool *boolean_value(const cbor::Value &value) noexcept {
+      return std::get_if<bool>(&value.storage);
+    }
+
     cbor::Limits limits() noexcept {
       cbor::Limits value;
       value.max_encoded_bytes = maximum_payload_bytes;
       value.max_byte_string_bytes = ed25519_signature_size;
       value.max_text_bytes = 512;
       value.max_array_elements = maximum_applications;
-      value.max_map_entries = 16;
-      value.max_container_depth = 3;
+      value.max_map_entries = 30;
+      value.max_container_depth = 4;
       return value;
     }
 
@@ -83,6 +89,7 @@ namespace lumen::lsp::runtime {
         case ControlStatus::authentication_failed:
         case ControlStatus::permission_denied:
         case ControlStatus::busy:
+        case ControlStatus::unsupported_media_tuple:
         case ControlStatus::stale_generation:
         case ControlStatus::timeout:
         case ControlStatus::path_capacity_insufficient:
@@ -90,6 +97,41 @@ namespace lumen::lsp::runtime {
           return true;
       }
       return false;
+    }
+
+    /** @brief Validate one LSP/1 Opus duration expressed in 48 kHz samples. */
+    bool valid_audio_frame_samples(const std::uint64_t samples) noexcept {
+      return samples == 120 || samples == 240 || samples == 480 || samples == 960;
+    }
+
+    /** @brief Validate one built-in host Opus channel count. */
+    bool valid_audio_channels(const std::uint64_t channels) noexcept {
+      return channels == 2 || channels == 6 || channels == 8;
+    }
+
+    /** @brief Validate the exact selected audio tuple shared by three control messages. */
+    bool valid_audio_selection(const AudioSelectionPayload &audio) noexcept {
+      if (audio.audio_generation == 0 || audio.audio_ssrc == 0 || audio.audio_payload_type < 96 ||
+          audio.audio_payload_type > 127 || audio.clock_rate != 48'000 || !valid_audio_channels(audio.channels) ||
+          audio.streams == 0 || audio.streams > audio.channels || audio.coupled_streams > audio.streams ||
+          static_cast<std::uint16_t>(audio.streams) + audio.coupled_streams != audio.channels ||
+          !valid_audio_frame_samples(audio.frame_samples) || audio.bitrate < 6'000 ||
+          audio.bitrate > std::min<std::uint32_t>(2'048'000, static_cast<std::uint32_t>(audio.streams) * 512'000U) ||
+          audio.initial_udp_payload_size < 1'200 || audio.initial_udp_payload_size > 1'472 ||
+          audio.initial_preroll_packets != 1) {
+        return false;
+      }
+      return std::ranges::all_of(
+        std::span<const std::uint8_t> {audio.mapping}.first(audio.channels),
+        [&](const std::uint8_t value) {
+          return value < audio.channels;
+        }
+      );
+    }
+
+    /** @brief Copy the selected leading channel mapping into one CBOR byte string. */
+    cbor::Value::Bytes audio_mapping(const AudioSelectionPayload &audio) {
+      return {audio.mapping.begin(), audio.mapping.begin() + audio.channels};
     }
   }  // namespace
 
@@ -110,8 +152,12 @@ namespace lumen::lsp::runtime {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
-      {1, wire_version}, {2, static_cast<std::uint8_t>(payload.status)}, {3, payload.connection_generation},
-      {4, bytes(payload.host_id)}, {5, bytes(payload.host_identity_key)}, {6, bytes(payload.dtls_spki_sha256)},
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, payload.connection_generation},
+      {4, bytes(payload.host_id)},
+      {5, bytes(payload.host_identity_key)},
+      {6, bytes(payload.dtls_spki_sha256)},
       {7, bytes(payload.server_nonce)},
     });
   }
@@ -134,8 +180,11 @@ namespace lumen::lsp::runtime {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
-      {1, wire_version}, {2, static_cast<std::uint8_t>(payload.status)}, {3, payload.permissions.mask()},
-      {4, payload.revocation_generation}, {5, bytes(payload.signature)},
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, payload.permissions.mask()},
+      {4, payload.revocation_generation},
+      {5, bytes(payload.signature)},
     });
   }
 
@@ -156,8 +205,12 @@ namespace lumen::lsp::runtime {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
-      {1, wire_version}, {2, static_cast<std::uint8_t>(payload.status)}, {3, payload.permissions.mask()},
-      {4, payload.revocation_generation}, {5, payload.connection_generation}, {6, bytes(payload.signature)},
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, payload.permissions.mask()},
+      {4, payload.revocation_generation},
+      {5, payload.connection_generation},
+      {6, bytes(payload.signature)},
     });
   }
 
@@ -197,7 +250,7 @@ namespace lumen::lsp::runtime {
   }
 
   std::expected<StartRequestPayload, ControlWireError> decode_start(const std::span<const std::uint8_t> payload) {
-    const auto map = decode_map(payload, 7);
+    const auto map = decode_map(payload, 9);
     StartRequestPayload result;
     const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
     const auto *application = map ? std::get_if<std::string>(&(*map)[1].second.storage) : nullptr;
@@ -206,13 +259,47 @@ namespace lumen::lsp::runtime {
     const auto *sensor = map ? unsigned_value((*map)[4].second) : nullptr;
     const auto *reconciliation = map ? unsigned_value((*map)[5].second) : nullptr;
     const auto *budget = map ? unsigned_value((*map)[6].second) : nullptr;
+    const auto *offers = map ? std::get_if<cbor::Value::Array>(&(*map)[7].second.storage) : nullptr;
+    const auto *maximum_udp_payload = map ? unsigned_value((*map)[8].second) : nullptr;
     if (!map || version == nullptr || *version != wire_version || application == nullptr || application->empty() ||
         application->size() > 128 || pointer == nullptr || *pointer < 125 || *pointer > 16'000 || controller == nullptr ||
         *controller < 125 || *controller > 2'000 || sensor == nullptr || *sensor < 125 || *sensor > 4'000 ||
         reconciliation == nullptr || *reconciliation < 50 || *reconciliation > 1'000 || budget == nullptr ||
-        *budget == 0 || *budget > 32'000'000) {
+        *budget == 0 || *budget > 32'000'000 || offers == nullptr || offers->empty() ||
+        offers->size() > maximum_audio_offers || maximum_udp_payload == nullptr || *maximum_udp_payload < 1'200 ||
+        *maximum_udp_payload > 1'472) {
       return std::unexpected(ControlWireError::invalid_field);
     }
+    result.audio_offers.reserve(offers->size());
+    for (const auto &encoded_offer : *offers) {
+      const auto *offer = std::get_if<cbor::Value::Map>(&encoded_offer.storage);
+      if (offer == nullptr || offer->size() != 5) {
+        return std::unexpected(ControlWireError::invalid_shape);
+      }
+      for (std::size_t index = 0; index < offer->size(); ++index) {
+        if ((*offer)[index].first != index + 1) {
+          return std::unexpected(ControlWireError::invalid_shape);
+        }
+      }
+      const auto *channels = unsigned_value((*offer)[0].second);
+      const auto *frame_samples = unsigned_value((*offer)[1].second);
+      const auto *maximum_bitrate = unsigned_value((*offer)[2].second);
+      const auto *inband_fec = boolean_value((*offer)[3].second);
+      const auto *dtx = boolean_value((*offer)[4].second);
+      if (channels == nullptr || !valid_audio_channels(*channels) || frame_samples == nullptr ||
+          !valid_audio_frame_samples(*frame_samples) || maximum_bitrate == nullptr || *maximum_bitrate < 6'000 ||
+          *maximum_bitrate > 2'048'000 || inband_fec == nullptr || dtx == nullptr) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      result.audio_offers.push_back({
+        .channels = static_cast<std::uint8_t>(*channels),
+        .frame_samples = static_cast<std::uint16_t>(*frame_samples),
+        .maximum_bitrate = static_cast<std::uint32_t>(*maximum_bitrate),
+        .inband_fec = *inband_fec,
+        .dtx = *dtx,
+      });
+    }
+    auto audio_offers = std::move(result.audio_offers);
     result = {
       .application_id = *application,
       .pointer_rate = static_cast<std::uint32_t>(*pointer),
@@ -220,6 +307,8 @@ namespace lumen::lsp::runtime {
       .sensor_rate = static_cast<std::uint32_t>(*sensor),
       .reconciliation_rate = static_cast<std::uint32_t>(*reconciliation),
       .maximum_input_wire_bits_per_second = *budget,
+      .audio_offers = std::move(audio_offers),
+      .offered_maximum_udp_payload = static_cast<std::uint16_t>(*maximum_udp_payload),
     };
     return result;
   }
@@ -232,15 +321,41 @@ namespace lumen::lsp::runtime {
         payload.pointer_rate > 16'000 || payload.controller_rate < 125 || payload.controller_rate > 2'000 ||
         payload.sensor_rate < 125 || payload.sensor_rate > 4'000 || payload.reconciliation_rate < 50 ||
         payload.reconciliation_rate > 1'000 || payload.reserved_input_wire_bits_per_second == 0 ||
-        payload.reserved_input_wire_bits_per_second > 32'000'000 || !payload.baseline_required) {
+        payload.reserved_input_wire_bits_per_second > 32'000'000 || !payload.baseline_required ||
+        !valid_audio_selection(payload.audio) || payload.audio.audio_ssrc == payload.input_ssrc ||
+        payload.audio.audio_ssrc == payload.acknowledgement_ssrc || payload.audio.audio_payload_type == payload.input_payload_type) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
-      {1, wire_version}, {2, static_cast<std::uint8_t>(payload.status)}, {3, bytes(payload.session_id)},
-      {4, bytes(payload.attach_token)}, {5, payload.stream_generation}, {6, payload.input_generation},
-      {7, payload.input_ssrc}, {8, payload.acknowledgement_ssrc}, {9, payload.input_payload_type},
-      {10, payload.pointer_rate}, {11, payload.controller_rate}, {12, payload.sensor_rate},
-      {13, payload.reconciliation_rate}, {14, payload.reserved_input_wire_bits_per_second}, {15, cbor::Value {payload.baseline_required}},
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, bytes(payload.session_id)},
+      {4, bytes(payload.attach_token)},
+      {5, payload.stream_generation},
+      {6, payload.input_generation},
+      {7, payload.input_ssrc},
+      {8, payload.acknowledgement_ssrc},
+      {9, payload.input_payload_type},
+      {10, payload.pointer_rate},
+      {11, payload.controller_rate},
+      {12, payload.sensor_rate},
+      {13, payload.reconciliation_rate},
+      {14, payload.reserved_input_wire_bits_per_second},
+      {15, cbor::Value {payload.baseline_required}},
+      {16, payload.audio.audio_generation},
+      {17, payload.audio.audio_ssrc},
+      {18, payload.audio.audio_payload_type},
+      {19, payload.audio.clock_rate},
+      {20, payload.audio.channels},
+      {21, payload.audio.streams},
+      {22, payload.audio.coupled_streams},
+      {23, audio_mapping(payload.audio)},
+      {24, payload.audio.frame_samples},
+      {25, payload.audio.bitrate},
+      {26, cbor::Value {payload.audio.inband_fec}},
+      {27, cbor::Value {payload.audio.dtx}},
+      {28, payload.audio.initial_udp_payload_size},
+      {29, payload.audio.initial_preroll_packets},
     });
   }
 
@@ -282,16 +397,87 @@ namespace lumen::lsp::runtime {
         payload.pointer_rate > 16'000 || payload.controller_rate < 125 || payload.controller_rate > 2'000 ||
         payload.sensor_rate < 125 || payload.sensor_rate > 4'000 || payload.reconciliation_rate < 50 ||
         payload.reconciliation_rate > 1'000 || payload.reserved_input_wire_bits_per_second == 0 ||
-        payload.reserved_input_wire_bits_per_second > 32'000'000 || !payload.baseline_required) {
+        payload.reserved_input_wire_bits_per_second > 32'000'000 || !payload.baseline_required ||
+        !valid_audio_selection(payload.audio) || payload.audio.audio_ssrc == payload.input_ssrc ||
+        payload.audio.audio_ssrc == payload.acknowledgement_ssrc || payload.audio.audio_payload_type == payload.input_payload_type) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
-      {1, wire_version}, {2, static_cast<std::uint8_t>(payload.status)}, {3, bytes(payload.session_id)},
-      {4, bytes(payload.attach_token)}, {5, payload.connection_generation}, {6, payload.stream_generation},
-      {7, payload.input_generation}, {8, payload.input_ssrc}, {9, payload.acknowledgement_ssrc},
-      {10, payload.input_payload_type}, {11, payload.pointer_rate}, {12, payload.controller_rate},
-      {13, payload.sensor_rate}, {14, payload.reconciliation_rate}, {15, payload.reserved_input_wire_bits_per_second},
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, bytes(payload.session_id)},
+      {4, bytes(payload.attach_token)},
+      {5, payload.connection_generation},
+      {6, payload.stream_generation},
+      {7, payload.input_generation},
+      {8, payload.input_ssrc},
+      {9, payload.acknowledgement_ssrc},
+      {10, payload.input_payload_type},
+      {11, payload.pointer_rate},
+      {12, payload.controller_rate},
+      {13, payload.sensor_rate},
+      {14, payload.reconciliation_rate},
+      {15, payload.reserved_input_wire_bits_per_second},
       {16, cbor::Value {payload.baseline_required}},
+      {17, payload.audio.audio_generation},
+      {18, payload.audio.audio_ssrc},
+      {19, payload.audio.audio_payload_type},
+      {20, payload.audio.clock_rate},
+      {21, payload.audio.channels},
+      {22, payload.audio.streams},
+      {23, payload.audio.coupled_streams},
+      {24, audio_mapping(payload.audio)},
+      {25, payload.audio.frame_samples},
+      {26, payload.audio.bitrate},
+      {27, cbor::Value {payload.audio.inband_fec}},
+      {28, cbor::Value {payload.audio.dtx}},
+      {29, payload.audio.initial_udp_payload_size},
+      {30, payload.audio.initial_preroll_packets},
     });
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_audio_config(const AudioConfigPayload &payload) {
+    if (is_zero(payload.session_id) || payload.stream_generation == 0 || !valid_audio_selection(payload.audio)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, bytes(payload.session_id)},
+      {3, payload.stream_generation},
+      {4, payload.audio.audio_generation},
+      {5, payload.audio.audio_ssrc},
+      {6, payload.audio.audio_payload_type},
+      {7, payload.audio.clock_rate},
+      {8, payload.audio.channels},
+      {9, payload.audio.streams},
+      {10, payload.audio.coupled_streams},
+      {11, audio_mapping(payload.audio)},
+      {12, payload.audio.frame_samples},
+      {13, payload.audio.bitrate},
+      {14, cbor::Value {payload.audio.inband_fec}},
+      {15, cbor::Value {payload.audio.dtx}},
+      {16, payload.audio.initial_udp_payload_size},
+      {17, payload.audio.initial_preroll_packets},
+    });
+  }
+
+  std::expected<AudioConfigAckPayload, ControlWireError> decode_audio_config_ack(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 4);
+    AudioConfigAckPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *audio_generation = map ? unsigned_value((*map)[3].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || status == nullptr ||
+        *status > static_cast<std::uint8_t>(ControlStatus::internal_failure) ||
+        !fixed_bytes((*map)[2].second, result.session_id) || is_zero(result.session_id) ||
+        audio_generation == nullptr || *audio_generation == 0 ||
+        !valid_status(static_cast<ControlStatus>(*status))) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.status = static_cast<ControlStatus>(*status);
+    result.audio_generation = static_cast<std::uint32_t>(*audio_generation);
+    return result;
   }
 }  // namespace lumen::lsp::runtime

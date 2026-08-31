@@ -76,13 +76,13 @@ namespace lumen::lsp::runtime {
     [[nodiscard]] virtual std::optional<std::vector<ControlApplication>> snapshot() noexcept = 0;
   };
 
-  /** @brief Product authority boundary for the input-only START slice. */
+  /** @brief Product authority boundary for START, ATTACH, input, and host audio. */
   class ControlStartHandler {
   public:
     virtual ~ControlStartHandler() = default;
 
     /**
-     * @brief Commit one authenticated input-only START.
+     * @brief Commit one authenticated input-and-audio START.
      *
      * @param peer Exact authenticated association.
      * @param client Authenticated trusted-client record.
@@ -125,6 +125,22 @@ namespace lumen::lsp::runtime {
       const TrustedClient &client,
       std::uint32_t connection_generation,
       const AttachRequestPayload &request
+    ) noexcept = 0;
+
+    /**
+     * @brief Commit one authenticated AUDIO_CONFIG_ACK idempotently.
+     *
+     * @param peer Exact authenticated association.
+     * @param client Authenticated stream owner.
+     * @param connection_generation Current connection generation.
+     * @param acknowledgement Exact decoded audio acknowledgement.
+     * @return True when the acknowledgement matches current or already committed audio state.
+     */
+    virtual bool audio_config_acknowledged(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      std::uint32_t connection_generation,
+      const AudioConfigAckPayload &acknowledgement
     ) noexcept = 0;
   };
 

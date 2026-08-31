@@ -96,6 +96,7 @@ namespace lumen::lsp {
 
     generations_.connection = client.connection_generation;
     ++generations_.input;
+    ++generations_.audio;
     if (replacement_attach_token) {
       attach_token_ = *replacement_attach_token;
     }
@@ -132,7 +133,8 @@ namespace lumen::lsp {
       return AuthorityResult::token_mismatch;
     }
     if (generations_.connection == std::numeric_limits<std::uint32_t>::max() ||
-        generations_.input == std::numeric_limits<std::uint32_t>::max()) {
+        generations_.input == std::numeric_limits<std::uint32_t>::max() ||
+        generations_.audio == std::numeric_limits<std::uint32_t>::max()) {
       return AuthorityResult::generation_exhausted;
     }
     if (client.connection_generation <= generations_.connection) {

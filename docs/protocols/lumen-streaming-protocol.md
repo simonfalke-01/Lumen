@@ -8,9 +8,12 @@ wire/state primitives in section 15, the media packetization and bounded
 frame-pipeline primitives in sections 12 through 14, and the RTCP, repair,
 congestion, DPLPMTUD, and generation-fence state described in sections 7, 13,
 17, and 19.
-Those results do not claim a live LSP stream: production UDP ownership,
-wolfSSL/libSRTP protection, capture, platform input, decoder, renderer, and
-application lifecycle wiring remain in progress.
+Lumen additionally wires host capture and Opus encoding to a fresh
+generation-scoped audio SSRC only after authenticated `AUDIO_CONFIG_ACK`, then
+uses the production libSRTP and single-socket path for RTP and sender reports.
+That host-side boundary does not claim a live cross-product stream: Umbra audio
+receive/playout, video capture/decoder/renderer integration, and hardware
+qualification remain in progress.
 
 The Lumen Streaming Protocol (LSP) is the native, single-port protocol between
 Lumen and its clients. It is optimized for competitive game streaming on a

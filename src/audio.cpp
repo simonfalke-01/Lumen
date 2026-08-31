@@ -151,15 +151,20 @@ namespace audio {
       OPUS_APPLICATION_RESTRICTED_LOWDELAY,
       nullptr
     )};
-
-    opus_multistream_encoder_ctl(opus.get(), OPUS_SET_BITRATE(stream.bitrate));
-    opus_multistream_encoder_ctl(opus.get(), OPUS_SET_VBR(0));
+    if (!opus || opus_multistream_encoder_ctl(opus.get(), OPUS_SET_BITRATE(stream.bitrate)) != OPUS_OK ||
+        opus_multistream_encoder_ctl(opus.get(), OPUS_SET_VBR(0)) != OPUS_OK ||
+        opus_multistream_encoder_ctl(opus.get(), OPUS_SET_INBAND_FEC(config.flags[config_t::INBAND_FEC] ? 1 : 0)) != OPUS_OK ||
+        opus_multistream_encoder_ctl(opus.get(), OPUS_SET_PACKET_LOSS_PERC(config.flags[config_t::INBAND_FEC] ? 5 : 0)) != OPUS_OK ||
+        opus_multistream_encoder_ctl(opus.get(), OPUS_SET_DTX(config.flags[config_t::DTX] ? 1 : 0)) != OPUS_OK) {
+      BOOST_LOG(error) << "Couldn't configure the negotiated Opus encoder"sv;
+      return;
+    }
 
     BOOST_LOG(info) << "Opus initialized: "sv << stream.sampleRate / 1000 << " kHz, "sv
                     << stream.channelCount << " channels, "sv
                     << stream.bitrate / 1000 << " kbps (total), LOWDELAY"sv;
 
-    auto frame_size = config.packetDuration * stream.sampleRate / 1000;
+    auto frame_size = config.frameSamples != 0 ? config.frameSamples : config.packetDuration * stream.sampleRate / 1000;
     auto encode_and_publish = [&](std::span<const float> pcm, const std::uint64_t sample_position, const bool discontinuity) {
       buffer_t packet {1400};
       const int bytes = opus_multistream_encode_float(
@@ -285,7 +290,7 @@ namespace audio {
       }
     }
 
-    auto frame_size = config.packetDuration * stream.sampleRate / 1000;
+    auto frame_size = config.frameSamples != 0 ? config.frameSamples : config.packetDuration * stream.sampleRate / 1000;
     bool host_audio = config.flags[config_t::HOST_AUDIO];
     bool continuous_audio = config.flags[config_t::CONTINUOUS_AUDIO];
     auto mic = control->microphone(stream.mapping, stream.channelCount, stream.sampleRate, frame_size, continuous_audio, host_audio);
@@ -299,9 +304,8 @@ namespace audio {
     // Capture takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
-    const auto legacy_queue_frames = static_cast<std::uint32_t>(
-      std::max(1, 120 / std::max(config.packetDuration, 1))
-    );
+    const auto packet_duration_milliseconds = std::max(1, (frame_size * 1'000 + stream.sampleRate - 1) / stream.sampleRate);
+    const auto legacy_queue_frames = static_cast<std::uint32_t>(std::max(1, 120 / packet_duration_milliseconds));
     const auto maximum_queue_frames = config.captureQueueFrames == 0 ?
                                         legacy_queue_frames :
                                         std::clamp(config.captureQueueFrames, 1U, legacy_queue_frames);
