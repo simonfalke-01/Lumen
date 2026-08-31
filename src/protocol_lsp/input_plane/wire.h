@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "src/protocol_lsp/core/wire.h"
+#include "../core/wire.h"
 
 #include <algorithm>
 #include <array>

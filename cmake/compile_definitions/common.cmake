@@ -47,52 +47,59 @@ else()
     list(APPEND SUNSHINE_DEFINITIONS LUMEN_LSP_DEFAULT_ENABLED=0)
 endif()
 
-set(LUMEN_LSP_CORE_DIRECTORY "${CMAKE_SOURCE_DIR}/src/protocol_lsp")
-set(LUMEN_LSP_CORE_FILES
-        core/control.h
-        core/core.h
-        core/input.h
-        core/packet.h
-        core/rtp.h
-        core/telemetry.h
-        core/transport.h
-        core/wire.h
-        input_plane/feedback.h
-        input_plane/input_plane.h
-        input_plane/rate.h
-        input_plane/state.h
-        input_plane/wire.h
-        media/audio.h
-        media/av1.h
-        media/common.h
-        media/frame_pipeline.h
-        media/h264.h
-        media/hevc.h
-        media/media.h
-        transport/congestion.h
-        transport/generation_fence.h
-        transport/repair.h
-        transport/rtcp.h
-        transport/transport.h)
-set(LUMEN_LSP_CORE_DIGEST_INPUT "")
-foreach(LUMEN_LSP_CORE_FILE IN LISTS LUMEN_LSP_CORE_FILES)
+set(LUMEN_PHOTON_DIRECTORY "${CMAKE_SOURCE_DIR}/src/protocol_lsp")
+set(LUMEN_PHOTON_LOCK "${LUMEN_PHOTON_DIRECTORY}/photon.lock")
+set(LUMEN_PHOTON_MANIFEST "${LUMEN_PHOTON_DIRECTORY}/photon-source-manifest.txt")
+set(LUMEN_PHOTON_DIGEST "${LUMEN_PHOTON_DIRECTORY}/photon-source-digest.sha256")
+set(LUMEN_PHOTON_EXPECTED_LOCK
+        "repository=git@github.com:simonfalke-01/Photon.git\ncommit=d353901bb52ff22e2ad88833bdc8ae2bcc8f5423\ndigest=fc49b5a1e44fd01379283f865ef6e59fd4c605c58f04ef25b25f41eb625771e4\n")
+file(READ "${LUMEN_PHOTON_LOCK}" LUMEN_PHOTON_ACTUAL_LOCK)
+if(NOT LUMEN_PHOTON_ACTUAL_LOCK STREQUAL LUMEN_PHOTON_EXPECTED_LOCK)
+    message(FATAL_ERROR "Lumen's Photon lock does not match the reviewed repository, commit, and digest")
+endif()
+file(STRINGS "${LUMEN_PHOTON_MANIFEST}" LUMEN_PHOTON_FILES ENCODING UTF-8)
+if(NOT LUMEN_PHOTON_FILES)
+    message(FATAL_ERROR "Lumen's Photon source manifest is empty")
+endif()
+set(LUMEN_PHOTON_DIGEST_INPUT "")
+foreach(LUMEN_PHOTON_FILE IN LISTS LUMEN_PHOTON_FILES)
+    if(NOT LUMEN_PHOTON_FILE MATCHES "^(core|input_plane|media|transport)/[a-z0-9_]+\\.h$")
+        message(FATAL_ERROR "Invalid Photon source manifest entry: ${LUMEN_PHOTON_FILE}")
+    endif()
+    if(NOT EXISTS "${LUMEN_PHOTON_DIRECTORY}/${LUMEN_PHOTON_FILE}")
+        message(FATAL_ERROR "Missing mirrored Photon source: ${LUMEN_PHOTON_FILE}")
+    endif()
     file(SHA256
-            "${LUMEN_LSP_CORE_DIRECTORY}/${LUMEN_LSP_CORE_FILE}"
-            LUMEN_LSP_CORE_FILE_DIGEST)
-    string(TOLOWER "${LUMEN_LSP_CORE_FILE_DIGEST}" LUMEN_LSP_CORE_FILE_DIGEST)
-    string(APPEND LUMEN_LSP_CORE_DIGEST_INPUT
-            "${LUMEN_LSP_CORE_FILE}\n${LUMEN_LSP_CORE_FILE_DIGEST}\n")
+            "${LUMEN_PHOTON_DIRECTORY}/${LUMEN_PHOTON_FILE}"
+            LUMEN_PHOTON_FILE_DIGEST)
+    string(TOLOWER "${LUMEN_PHOTON_FILE_DIGEST}" LUMEN_PHOTON_FILE_DIGEST)
+    string(APPEND LUMEN_PHOTON_DIGEST_INPUT
+            "${LUMEN_PHOTON_FILE}\n${LUMEN_PHOTON_FILE_DIGEST}\n")
 endforeach()
-string(SHA256 LUMEN_LSP_CORE_ACTUAL_DIGEST "${LUMEN_LSP_CORE_DIGEST_INPUT}")
-file(READ
-        "${LUMEN_LSP_CORE_DIRECTORY}/core/source-digest.sha256"
-        LUMEN_LSP_CORE_EXPECTED_DIGEST)
-string(STRIP "${LUMEN_LSP_CORE_EXPECTED_DIGEST}" LUMEN_LSP_CORE_EXPECTED_DIGEST)
-string(TOLOWER "${LUMEN_LSP_CORE_EXPECTED_DIGEST}" LUMEN_LSP_CORE_EXPECTED_DIGEST)
-if(NOT LUMEN_LSP_CORE_ACTUAL_DIGEST STREQUAL LUMEN_LSP_CORE_EXPECTED_DIGEST)
+file(GLOB_RECURSE LUMEN_PHOTON_PRESENT_FILES
+        RELATIVE "${LUMEN_PHOTON_DIRECTORY}"
+        "${LUMEN_PHOTON_DIRECTORY}/core/*.h"
+        "${LUMEN_PHOTON_DIRECTORY}/input_plane/*.h"
+        "${LUMEN_PHOTON_DIRECTORY}/media/*.h"
+        "${LUMEN_PHOTON_DIRECTORY}/transport/*.h")
+set(LUMEN_PHOTON_EXPECTED_FILES ${LUMEN_PHOTON_FILES})
+list(SORT LUMEN_PHOTON_PRESENT_FILES)
+list(SORT LUMEN_PHOTON_EXPECTED_FILES)
+if(NOT LUMEN_PHOTON_PRESENT_FILES STREQUAL LUMEN_PHOTON_EXPECTED_FILES)
+    message(FATAL_ERROR "Lumen's mirrored Photon header set differs from photon-source-manifest.txt")
+endif()
+string(SHA256 LUMEN_PHOTON_ACTUAL_DIGEST "${LUMEN_PHOTON_DIGEST_INPUT}")
+file(READ "${LUMEN_PHOTON_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
+string(STRIP "${LUMEN_PHOTON_EXPECTED_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
+string(TOLOWER "${LUMEN_PHOTON_EXPECTED_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
+if(NOT LUMEN_PHOTON_EXPECTED_DIGEST STREQUAL "fc49b5a1e44fd01379283f865ef6e59fd4c605c58f04ef25b25f41eb625771e4")
+    message(FATAL_ERROR "Lumen's Photon digest file differs from photon.lock")
+endif()
+if(NOT LUMEN_PHOTON_ACTUAL_DIGEST STREQUAL LUMEN_PHOTON_EXPECTED_DIGEST)
     message(FATAL_ERROR
-            "Canonical LSP core digest mismatch: expected "
-            "${LUMEN_LSP_CORE_EXPECTED_DIGEST}, computed ${LUMEN_LSP_CORE_ACTUAL_DIGEST}")
+            "Pinned Photon LSP core digest mismatch: expected "
+            "${LUMEN_PHOTON_EXPECTED_DIGEST}, computed ${LUMEN_PHOTON_ACTUAL_DIGEST}. "
+            "Run scripts/sync-photon-core.sh --check for details.")
 endif()
 
 # setup assets directory

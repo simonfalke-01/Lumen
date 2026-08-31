@@ -44,7 +44,7 @@ smallest decisive verification both pass. Source-only scaffolding remains
 | Select DTLS 1.3 provider | **Done** | Commercial wolfSSL 5.9.2 selected; tag `v5.9.2-stable` pinned | Keep license material external to the repository |
 | macOS DTLS-SRTP provider proof | **Done** | Live DTLS 1.3 exchange proved `TLS_AES_128_GCM_SHA256`, X25519, HRR cookie, ALPN `lumen-stream/1`, `SRTP_AEAD_AES_128_GCM`, and identical 56-byte exporter output | Repeat the exact proof on Windows/UCRT64 |
 | libSRTP wolfCrypt backend | **In progress** | The reviewed libSRTP 2.8.0 patch and CMake target are integrated; AES-128-GCM SRTP/SRTCP protection, encrypted extensions, authentication, and replay rejection pass on macOS | Repeat the provider-enabled product build and 16-byte-tag RTP/SRTCP proof on Windows/UCRT64 |
-| Shared portable C++23 core | **Done** | LSPC, ACK/RTO/cache, RTP, input, media, repair, pacing, congestion, DPLPMTUD, and telemetry checks pass; Lumen commit `aab80c78` adds configuration-time pooled two-frame reassembly; aggregate digest `6f15029d…2c66` | Extend the canonical digest whenever shared core files intentionally change |
+| Shared portable C++23 core | **Done** | Photon is canonical at `git@github.com:simonfalke-01/Photon.git` commit `d353901bb52ff22e2ad88833bdc8ae2bcc8f5423`, aggregate digest `fc49b5a1…5771e4`; Lumen's offline lock/manifest/source-identity check and the LSPC, RTP, input, media, repair, pacing, congestion, DPLPMTUD, telemetry, and pooled-reassembly checks pass | Update Photon first, then advance each product's reviewed lock and source-identical mirror with its normal sync utility |
 | Umbra `CLSPCore` C ABI and mirror | **Done** | Umbra commits `7bcbaaf`, `2779806`, `0da9e46`, `2a8ce9d`, `094af81`, `81c945f`, and `eba2a0d`; ABI v1, digest gate, real UDP/kqueue wolfSSL/libSRTP runtime, retained complete-video buffers, allocation-free live frame reassembly, complete-Opus/timing callbacks, reverse-microphone sender, and provider-enabled warnings-as-errors product builds pass | Extend the ABI only at coarse input, completed-media, lifecycle, and telemetry boundaries |
 | Lumen configuration, build, UI, and discovery foundation | **Done** | LSP config/UI, real runtime factory, active-only `_lumen-stream._udp`, digest gate, application/test builds, web build, and focused config/mDNS/LSP checks pass | Repeat the provider-enabled full product link on Windows/UCRT64 |
 | LSP host security/session foundation | **In progress** | Real nonblocking UDP ownership, wolfSSL DTLS 1.3, libSRTP contexts, fresh LSP identity persistence, invitations, pairing/authentication, LSP-only trust, LSPC reliability, browsing, and trusted-client administration are wired | Run the first real Lumen↔Umbra authenticated pairing/browse session and repeat on Windows/UCRT64 |
@@ -114,6 +114,16 @@ Each retained capability is called through an LSP-owned typed boundary. No
 adapter may manufacture an old-protocol packet internally.
 
 ## 3. Repository layout
+
+Photon is the canonical repository for the source-identical portable C++23
+core. Lumen pins Photon by repository, commit, ordered source manifest, and
+aggregate digest in `src/protocol_lsp/photon.lock`, while retaining an in-tree
+mirror so normal builds and packaged products have no Git, network, submodule,
+or runtime dependency on Photon. `scripts/sync-photon-core.sh --check` verifies
+the local mirror entirely offline and also verifies a local Photon checkout
+when one is available; `--sync` advances only to the reviewed lock. Lumen's
+host runtime, platform integration, wolfSSL/libSRTP providers, and product
+state remain local to Lumen and are not part of Photon.
 
 ### 3.1 Planned Lumen modules
 
