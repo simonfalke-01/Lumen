@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <utility>
@@ -390,6 +391,7 @@ namespace lumen::lsp::media {
     malformed,  ///< Boundary, marker, identity, deadline, or duplicate bytes conflict.
     frame_too_large,  ///< Frame byte or fragment-count resource bound would be exceeded.
     evicted_and_stored,  ///< Oldest incomplete frame was evicted to retain this newer frame.
+    resource_exhausted,  ///< Preallocated storage is unavailable until a completed view is released.
   };
 
   /** @brief Frame-reassembly operation result. */
@@ -626,6 +628,353 @@ namespace lumen::lsp::media {
     std::array<frame_slot, 2> slots_ {};  ///< Hard-bounded incomplete-frame storage.
     std::size_t maximum_frame_size_ = competition_frame_size_limit;  ///< Per-frame encoded byte bound.
     std::uint64_t next_arrival_order_ = 1;  ///< Monotonic slot insertion order.
+  };
+
+  /** @brief One authenticated codec fragment copied into preallocated frame storage. */
+  struct pooled_frame_fragment {
+    frame_key key {};  ///< SSRC and extended timestamp identifying provisional assembly.
+    std::uint64_t frame_id = 0;  ///< Repeated nonzero frame ID, or zero when metadata was absent.
+    std::uint64_t extended_sequence = 0;  ///< Extended RTP sequence number.
+    std::uint64_t deadline_us = 0;  ///< Fixed frame receive/decode deadline.
+    bool starts_frame = false;  ///< Codec/frame-marking start indication.
+    bool ends_frame = false;  ///< Codec/frame-marking end indication.
+    bool marker = false;  ///< RTP marker bit, required exactly on the ending fragment.
+    std::span<const std::uint8_t> payload {};  ///< Transient authenticated codec bytes copied by `add()`.
+  };
+
+  /** @brief Borrowed completed-frame view valid until explicitly released. */
+  struct pooled_completed_frame_view {
+    frame_key key {};  ///< Completed SSRC and extended timestamp.
+    std::uint64_t frame_id = 0;  ///< Bound repeated nonzero frame ID.
+    std::uint64_t deadline_us = 0;  ///< Fixed frame deadline.
+    std::span<const std::span<const std::uint8_t>> slices {};  ///< Sequence-ordered immutable codec slices.
+    std::size_t total_size = 0;  ///< Sum of all slice byte counts.
+    std::uint64_t token = 0;  ///< Opaque nonzero release token.
+    std::uint8_t slot = 0;  ///< Internal preallocated slot index.
+
+    /** @brief Return whether this view names one live completed slot. */
+    [[nodiscard]] explicit operator bool() const noexcept {
+      return token != 0 && !slices.empty() && total_size != 0;
+    }
+  };
+
+  /** @brief Allocation-free pooled reassembly operation result. */
+  struct pooled_frame_reassembly_result {
+    frame_reassembly_status status = frame_reassembly_status::stored;  ///< Operation outcome.
+    pooled_completed_frame_view frame {};  ///< Completed borrowed frame only for `completed`.
+    std::optional<frame_key> evicted {};  ///< Oldest incomplete key evicted for a third frame.
+  };
+
+  /**
+   * @brief Two-frame reassembler whose packet metadata and bytes are allocated only at configuration.
+   *
+   * The caller must consume and release a completed view before another completed frame can reuse
+   * its slot. `add()`, `expire()`, completion, and release perform no heap allocation.
+   */
+  class pooled_video_frame_reassembler {
+  public:
+    /**
+     * @brief Allocate both frame byte regions and bounded fragment tables.
+     *
+     * @param maximum_frame_size Maximum completed codec bytes per frame.
+     * @param maximum_fragments Maximum RTP fragments retained per frame.
+     */
+    explicit pooled_video_frame_reassembler(
+      const std::size_t maximum_frame_size = competition_frame_size_limit,
+      const std::size_t maximum_fragments = maximum_fragments_per_frame
+    ) noexcept:
+        maximum_frame_size_(std::min(maximum_frame_size, absolute_frame_size_limit)),
+        maximum_fragments_(std::min(maximum_fragments, maximum_fragments_per_frame)) {
+      if (maximum_frame_size_ == 0 || maximum_fragments_ == 0) {
+        return;
+      }
+      ready_ = std::ranges::all_of(slots_, [&](frame_slot &slot) {
+        slot.bytes.reset(new (std::nothrow) std::uint8_t[maximum_frame_size_]);
+        slot.fragments.reset(new (std::nothrow) stored_fragment[maximum_fragments_]);
+        slot.ordered_slices.reset(new (std::nothrow) std::span<const std::uint8_t>[maximum_fragments_]);
+        return slot.bytes && slot.fragments && slot.ordered_slices;
+      });
+    }
+
+    /** @brief Return whether every bounded slot allocation succeeded. */
+    [[nodiscard]] bool ready() const noexcept {
+      return ready_;
+    }
+
+    /**
+     * @brief Copy one authenticated fragment and return a borrowed completed view when contiguous.
+     *
+     * @param fragment Authenticated transient fragment metadata and bytes.
+     * @param now_us Current monotonic time.
+     * @return Stored, duplicate, error, eviction, resource, or completion result.
+     */
+    [[nodiscard]] pooled_frame_reassembly_result add(
+      const pooled_frame_fragment &fragment,
+      const std::uint64_t now_us
+    ) noexcept {
+      if (!ready_) {
+        return {.status = frame_reassembly_status::resource_exhausted};
+      }
+      expire(now_us);
+      if (fragment.key.ssrc == 0 || fragment.payload.empty() || fragment.deadline_us <= now_us ||
+          fragment.marker != fragment.ends_frame) {
+        return {.status = fragment.deadline_us <= now_us ? frame_reassembly_status::expired : frame_reassembly_status::malformed};
+      }
+
+      auto *slot = find_slot(fragment.key);
+      std::optional<frame_key> evicted;
+      auto initial_status = frame_reassembly_status::stored;
+      if (slot == nullptr) {
+        slot = empty_slot();
+        if (slot == nullptr) {
+          slot = oldest_incomplete_slot();
+          if (slot == nullptr) {
+            return {.status = frame_reassembly_status::resource_exhausted};
+          }
+          evicted = slot->key;
+          reset(*slot);
+          initial_status = frame_reassembly_status::evicted_and_stored;
+        }
+        slot->occupied = true;
+        slot->key = fragment.key;
+        slot->deadline_us = fragment.deadline_us;
+        slot->arrival_order = next_arrival_order_++;
+        if (next_arrival_order_ == 0) {
+          next_arrival_order_ = 1;
+        }
+      } else if (slot->complete || slot->deadline_us != fragment.deadline_us) {
+        return {.status = slot->complete ? frame_reassembly_status::resource_exhausted : frame_reassembly_status::malformed};
+      }
+
+      if (fragment.frame_id != 0) {
+        if (slot->frame_id != 0 && slot->frame_id != fragment.frame_id) {
+          reset(*slot);
+          return {.status = frame_reassembly_status::malformed};
+        }
+        slot->frame_id = fragment.frame_id;
+      }
+
+      for (std::size_t index = 0; index < slot->fragment_count; ++index) {
+        const auto &existing = slot->fragments[index];
+        if (existing.extended_sequence != fragment.extended_sequence) {
+          continue;
+        }
+        const auto bytes = stored_bytes(*slot, existing);
+        if (existing.starts_frame == fragment.starts_frame && existing.ends_frame == fragment.ends_frame &&
+            std::ranges::equal(bytes, fragment.payload)) {
+          return {.status = frame_reassembly_status::duplicate, .evicted = evicted};
+        }
+        reset(*slot);
+        return {.status = frame_reassembly_status::malformed};
+      }
+
+      if ((slot->start_sequence && fragment.extended_sequence < *slot->start_sequence) ||
+          (slot->end_sequence && fragment.extended_sequence > *slot->end_sequence) ||
+          (fragment.starts_frame && slot->start_sequence) || (fragment.ends_frame && slot->end_sequence)) {
+        reset(*slot);
+        return {.status = frame_reassembly_status::malformed};
+      }
+      if (fragment.starts_frame) {
+        for (std::size_t index = 0; index < slot->fragment_count; ++index) {
+          if (slot->fragments[index].extended_sequence < fragment.extended_sequence) {
+            reset(*slot);
+            return {.status = frame_reassembly_status::malformed};
+          }
+        }
+        slot->start_sequence = fragment.extended_sequence;
+      }
+      if (fragment.ends_frame) {
+        for (std::size_t index = 0; index < slot->fragment_count; ++index) {
+          if (slot->fragments[index].extended_sequence > fragment.extended_sequence) {
+            reset(*slot);
+            return {.status = frame_reassembly_status::malformed};
+          }
+        }
+        slot->end_sequence = fragment.extended_sequence;
+      }
+
+      if (fragment.payload.size() > maximum_frame_size_ - slot->total_size ||
+          slot->fragment_count >= maximum_fragments_) {
+        reset(*slot);
+        return {.status = frame_reassembly_status::frame_too_large};
+      }
+      const auto offset = slot->write_offset;
+      std::copy(fragment.payload.begin(), fragment.payload.end(), slot->bytes.get() + static_cast<std::ptrdiff_t>(offset));
+      slot->fragments[slot->fragment_count++] = {
+        .extended_sequence = fragment.extended_sequence,
+        .offset = offset,
+        .size = fragment.payload.size(),
+        .starts_frame = fragment.starts_frame,
+        .ends_frame = fragment.ends_frame,
+      };
+      slot->write_offset += fragment.payload.size();
+      slot->total_size += fragment.payload.size();
+
+      if (!slot->start_sequence || !slot->end_sequence || *slot->end_sequence < *slot->start_sequence ||
+          *slot->end_sequence - *slot->start_sequence + 1 != slot->fragment_count) {
+        return {.status = initial_status, .evicted = evicted};
+      }
+
+      auto fragments = std::span<stored_fragment> {slot->fragments.get(), slot->fragment_count};
+      std::ranges::sort(fragments, {}, &stored_fragment::extended_sequence);
+      for (std::size_t index = 0; index < fragments.size(); ++index) {
+        if (fragments[index].extended_sequence != *slot->start_sequence + index) {
+          return {.status = initial_status, .evicted = evicted};
+        }
+        slot->ordered_slices[index] = stored_bytes(*slot, fragments[index]);
+      }
+      auto token = next_completion_token_++;
+      if (token == 0) {
+        token = next_completion_token_++;
+      }
+      if (token == 0) {
+        reset(*slot);
+        return {.status = frame_reassembly_status::resource_exhausted};
+      }
+      slot->complete = true;
+      slot->completion_token = token;
+      const auto slot_index = static_cast<std::uint8_t>(slot - slots_.data());
+      return {
+        .status = frame_reassembly_status::completed,
+        .frame = {
+          .key = slot->key,
+          .frame_id = slot->frame_id,
+          .deadline_us = slot->deadline_us,
+          .slices = {slot->ordered_slices.get(), slot->fragment_count},
+          .total_size = slot->total_size,
+          .token = token,
+          .slot = slot_index,
+        },
+        .evicted = evicted,
+      };
+    }
+
+    /**
+     * @brief Release one completed borrowed view and recycle its preallocated slot.
+     *
+     * @param frame Exact completed view returned by `add()`.
+     * @return True only when the live slot and token matched.
+     */
+    bool release(const pooled_completed_frame_view &frame) noexcept {
+      if (frame.slot >= slots_.size() || frame.token == 0) {
+        return false;
+      }
+      auto &slot = slots_[frame.slot];
+      if (!slot.occupied || !slot.complete || slot.completion_token != frame.token || slot.key != frame.key) {
+        return false;
+      }
+      reset(slot);
+      return true;
+    }
+
+    /** @brief Expire incomplete frames without invalidating unreleased completed views. */
+    std::size_t expire(const std::uint64_t now_us) noexcept {
+      std::size_t count = 0;
+      for (auto &slot : slots_) {
+        if (slot.occupied && !slot.complete && slot.deadline_us <= now_us) {
+          reset(slot);
+          ++count;
+        }
+      }
+      return count;
+    }
+
+    /** @brief Return the number of retained incomplete frames in the closed range zero through two. */
+    [[nodiscard]] std::size_t incomplete_frames() const noexcept {
+      return std::ranges::count_if(slots_, [](const frame_slot &slot) {
+        return slot.occupied && !slot.complete;
+      });
+    }
+
+  private:
+    /** @brief One preallocated fragment descriptor referencing slot-owned bytes. */
+    struct stored_fragment {
+      std::uint64_t extended_sequence = 0;  ///< Extended RTP sequence number.
+      std::size_t offset = 0;  ///< First byte inside slot storage.
+      std::size_t size = 0;  ///< Codec byte count.
+      bool starts_frame = false;  ///< Whether this fragment starts the frame.
+      bool ends_frame = false;  ///< Whether this fragment ends the frame.
+    };
+
+    /** @brief One lifetime-allocated frame byte region, descriptor table, and ordered view table. */
+    struct frame_slot {
+      std::unique_ptr<std::uint8_t[]> bytes;  ///< Fixed complete-frame byte region.
+      std::unique_ptr<stored_fragment[]> fragments;  ///< Fixed unordered fragment descriptors.
+      std::unique_ptr<std::span<const std::uint8_t>[]> ordered_slices;  ///< Fixed completion views.
+      frame_key key {};  ///< Provisional frame key.
+      std::uint64_t frame_id = 0;  ///< Bound repeated frame ID.
+      std::uint64_t deadline_us = 0;  ///< Fixed frame deadline.
+      std::uint64_t arrival_order = 0;  ///< Oldest-frame eviction order.
+      std::uint64_t completion_token = 0;  ///< Nonzero token while complete.
+      std::optional<std::uint64_t> start_sequence {};  ///< Observed start fragment.
+      std::optional<std::uint64_t> end_sequence {};  ///< Observed end fragment.
+      std::size_t fragment_count = 0;  ///< Populated descriptors.
+      std::size_t write_offset = 0;  ///< Next unused byte in `bytes`.
+      std::size_t total_size = 0;  ///< Total codec bytes.
+      bool occupied = false;  ///< Whether this slot retains a frame.
+      bool complete = false;  ///< Whether the caller owns a completed view.
+    };
+
+    /** @brief Return immutable stored fragment bytes. */
+    [[nodiscard]] static std::span<const std::uint8_t> stored_bytes(
+      const frame_slot &slot,
+      const stored_fragment &fragment
+    ) noexcept {
+      return {slot.bytes.get() + static_cast<std::ptrdiff_t>(fragment.offset), fragment.size};
+    }
+
+    /** @brief Reset metadata while retaining every lifetime allocation. */
+    static void reset(frame_slot &slot) noexcept {
+      slot.key = {};
+      slot.frame_id = 0;
+      slot.deadline_us = 0;
+      slot.arrival_order = 0;
+      slot.completion_token = 0;
+      slot.start_sequence.reset();
+      slot.end_sequence.reset();
+      slot.fragment_count = 0;
+      slot.write_offset = 0;
+      slot.total_size = 0;
+      slot.occupied = false;
+      slot.complete = false;
+    }
+
+    /** @brief Find an incomplete occupied slot by provisional frame key. */
+    [[nodiscard]] frame_slot *find_slot(const frame_key key) noexcept {
+      const auto iterator = std::ranges::find_if(slots_, [&](const frame_slot &slot) {
+        return slot.occupied && slot.key == key;
+      });
+      return iterator == slots_.end() ? nullptr : &*iterator;
+    }
+
+    /** @brief Find an unused allocated slot. */
+    [[nodiscard]] frame_slot *empty_slot() noexcept {
+      const auto iterator = std::ranges::find_if(slots_, [](const frame_slot &slot) {
+        return !slot.occupied;
+      });
+      return iterator == slots_.end() ? nullptr : &*iterator;
+    }
+
+    /** @brief Find the oldest incomplete slot without invalidating a completed caller view. */
+    [[nodiscard]] frame_slot *oldest_incomplete_slot() noexcept {
+      frame_slot *oldest = nullptr;
+      for (auto &slot : slots_) {
+        if (!slot.occupied || slot.complete) {
+          continue;
+        }
+        if (oldest == nullptr || slot.arrival_order < oldest->arrival_order) {
+          oldest = &slot;
+        }
+      }
+      return oldest;
+    }
+
+    std::array<frame_slot, 2> slots_ {};  ///< Hard-bounded lifetime-allocated frame slots.
+    std::size_t maximum_frame_size_ = competition_frame_size_limit;  ///< Bytes available in each slot.
+    std::size_t maximum_fragments_ = maximum_fragments_per_frame;  ///< Descriptors available in each slot.
+    std::uint64_t next_arrival_order_ = 1;  ///< Monotonic incomplete-frame insertion order.
+    std::uint64_t next_completion_token_ = 1;  ///< Monotonic completed-view release token.
+    bool ready_ = false;  ///< Whether every lifetime allocation succeeded.
   };
 
   /** @brief Hardware-decoder submission credit state constrained to two through four surfaces. */

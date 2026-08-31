@@ -368,6 +368,68 @@ TEST(LspMediaReassembly, RejectsMalformedBoundariesMarkersConflictsAndOversizeFr
   EXPECT_EQ(reassembler.add({.key = key, .extended_sequence = 3, .deadline_us = 1, .payload = retained({3})}, 1).status, frame_reassembly_status::expired);
 }
 
+TEST(LspMediaPooledReassembly, ReordersDuplicatesAndRecyclesCompletedStorageExplicitly) {
+  using namespace lumen::lsp::media;
+  pooled_video_frame_reassembler reassembler(64, 8);
+  ASSERT_TRUE(reassembler.ready());
+  const frame_key key {.ssrc = 7, .extended_timestamp = 90'000};
+  const std::array<std::uint8_t, 1> first {1};
+  const std::array<std::uint8_t, 1> middle {2};
+  const std::array<std::uint8_t, 1> final {3};
+
+  EXPECT_EQ(reassembler.add({.key = key, .extended_sequence = 11, .deadline_us = 10'000, .payload = middle}, 1).status, frame_reassembly_status::stored);
+  EXPECT_EQ(reassembler.add({.key = key, .frame_id = 44, .extended_sequence = 10, .deadline_us = 10'000, .starts_frame = true, .payload = first}, 1).status, frame_reassembly_status::stored);
+  EXPECT_EQ(reassembler.add({.key = key, .frame_id = 44, .extended_sequence = 10, .deadline_us = 10'000, .starts_frame = true, .payload = first}, 1).status, frame_reassembly_status::duplicate);
+  const auto completed = reassembler.add({.key = key, .frame_id = 44, .extended_sequence = 12, .deadline_us = 10'000, .ends_frame = true, .marker = true, .payload = final}, 1);
+  ASSERT_EQ(completed.status, frame_reassembly_status::completed);
+  ASSERT_TRUE(completed.frame);
+  EXPECT_EQ(completed.frame.frame_id, 44U);
+  ASSERT_EQ(completed.frame.slices.size(), 3U);
+  EXPECT_EQ(completed.frame.slices[0][0], 1U);
+  EXPECT_EQ(completed.frame.slices[1][0], 2U);
+  EXPECT_EQ(completed.frame.slices[2][0], 3U);
+  EXPECT_EQ(completed.frame.total_size, 3U);
+  EXPECT_EQ(reassembler.incomplete_frames(), 0U);
+  EXPECT_TRUE(reassembler.release(completed.frame));
+  EXPECT_FALSE(reassembler.release(completed.frame));
+}
+
+TEST(LspMediaPooledReassembly, PreservesCompletedViewsWhileBoundingLossEvictionAndExpiry) {
+  using namespace lumen::lsp::media;
+  pooled_video_frame_reassembler reassembler(8, 2);
+  ASSERT_TRUE(reassembler.ready());
+  const std::array<std::uint8_t, 1> one {1};
+  const frame_key complete_key {.ssrc = 1, .extended_timestamp = 1};
+  const auto completed = reassembler.add({
+                                           .key = complete_key,
+                                           .frame_id = 1,
+                                           .extended_sequence = 1,
+                                           .deadline_us = 100,
+                                           .starts_frame = true,
+                                           .ends_frame = true,
+                                           .marker = true,
+                                           .payload = one,
+                                         },
+                                         1);
+  ASSERT_EQ(completed.status, frame_reassembly_status::completed);
+
+  const frame_key second {.ssrc = 1, .extended_timestamp = 2};
+  const frame_key third {.ssrc = 1, .extended_timestamp = 3};
+  EXPECT_EQ(reassembler.add({.key = second, .extended_sequence = 2, .deadline_us = 100, .payload = one}, 1).status, frame_reassembly_status::stored);
+  const auto eviction = reassembler.add({.key = third, .extended_sequence = 3, .deadline_us = 100, .payload = one}, 1);
+  EXPECT_EQ(eviction.status, frame_reassembly_status::evicted_and_stored);
+  ASSERT_TRUE(eviction.evicted);
+  EXPECT_EQ(*eviction.evicted, second);
+  EXPECT_EQ(completed.frame.slices[0][0], 1U);
+  EXPECT_EQ(reassembler.expire(100), 1U);
+  EXPECT_TRUE(reassembler.release(completed.frame));
+
+  pooled_video_frame_reassembler fragment_limited(8, 1);
+  ASSERT_TRUE(fragment_limited.ready());
+  EXPECT_EQ(fragment_limited.add({.key = second, .extended_sequence = 1, .deadline_us = 100, .starts_frame = true, .payload = one}, 1).status, frame_reassembly_status::stored);
+  EXPECT_EQ(fragment_limited.add({.key = second, .extended_sequence = 2, .deadline_us = 100, .ends_frame = true, .marker = true, .payload = one}, 1).status, frame_reassembly_status::frame_too_large);
+}
+
 TEST(LspMediaDecodePipeline, EnforcesTwoToFourCreditsAndLatestFrameMailboxDepthOne) {
   using namespace lumen::lsp::media;
   decoder_credit_state credits;
