@@ -283,39 +283,47 @@ TEST(LspTransportRtx, RetainsTwoFrameGenerationsAndRequiresStrictDeadlineEligibi
   EXPECT_TRUE(lsp_transport::rtx_deadline_eligible(100, 201, {.reverse_feedback_microseconds = 25, .retransmission_serialization_microseconds = 25, .forward_delivery_microseconds = 25, .decode_safety_reserve_microseconds = 25}));
   EXPECT_FALSE(lsp_transport::rtx_deadline_eligible(100, 200, {.reverse_feedback_microseconds = 25, .retransmission_serialization_microseconds = 25, .forward_delivery_microseconds = 25, .decode_safety_reserve_microseconds = 25}));
 
-  std::array<lsp_transport::rtx_retained_packet, 6> slots {};
+  static std::array<
+    lsp_transport::rtx_retained_packet,
+    lsp_transport::required_rtx_retention_slots>
+    slots {};
   lsp_transport::rtx_retention retention(slots);
   std::vector<std::uint64_t> released;
   const auto release = [&released](const std::uint64_t token) {
     released.push_back(token);
   };
+  const auto descriptor = [](const std::uint64_t frame_id) {
+    return lsp_transport::rtx_frame_descriptor {
+      .frame_id = frame_id,
+      .frame_deadline_microseconds = 2'000,
+      .now_microseconds = 1'000,
+      .retention_origin_microseconds = 1'000,
+      .measured_rtt_microseconds = 500,
+      .source_ssrc = 5,
+      .video_generation = 7,
+    };
+  };
+  const auto first = retention.begin_frame(descriptor(10), release);
+  ASSERT_TRUE(first);
   ASSERT_EQ(
-    retention.retain(
-      {.reconstruction_token = 1, .frame_id = 10, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 100, .source_packet_bytes = 1'200},
-      1'000,
-      500,
-      release
-    ),
+    retention.retain(first.handle, {.reconstruction_token = 1, .source_sequence_number = 100, .source_packet_bytes = 1'200}),
     lsp_transport::rtx_retention_result::retained
   );
+  ASSERT_EQ(retention.commit_frame(first.handle, 1'000), lsp_transport::rtx_frame_result::accepted);
+  const auto second = retention.begin_frame(descriptor(11), release);
+  ASSERT_TRUE(second);
   ASSERT_EQ(
-    retention.retain(
-      {.reconstruction_token = 2, .frame_id = 11, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 101, .source_packet_bytes = 1'200},
-      1'000,
-      500,
-      release
-    ),
+    retention.retain(second.handle, {.reconstruction_token = 2, .source_sequence_number = 101, .source_packet_bytes = 1'200}),
     lsp_transport::rtx_retention_result::retained
   );
+  ASSERT_EQ(retention.commit_frame(second.handle, 1'000), lsp_transport::rtx_frame_result::accepted);
+  const auto third = retention.begin_frame(descriptor(12), release);
+  ASSERT_TRUE(third);
   ASSERT_EQ(
-    retention.retain(
-      {.reconstruction_token = 3, .frame_id = 12, .frame_deadline_microseconds = 2'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 102, .source_packet_bytes = 1'200},
-      1'000,
-      500,
-      release
-    ),
+    retention.retain(third.handle, {.reconstruction_token = 3, .source_sequence_number = 102, .source_packet_bytes = 1'200}),
     lsp_transport::rtx_retention_result::retained
   );
+  ASSERT_EQ(retention.commit_frame(third.handle, 1'000), lsp_transport::rtx_frame_result::accepted);
   ASSERT_EQ(retention.retained_frame_count(), lsp_transport::maximum_rtx_frame_generations);
   ASSERT_EQ(released.size(), std::size_t {1});
   EXPECT_EQ(released.front(), 1ULL);
@@ -329,53 +337,62 @@ TEST(LspTransportRtx, RetainsTwoFrameGenerationsAndRequiresStrictDeadlineEligibi
   );
   ASSERT_TRUE(eligible.has_value());
   EXPECT_EQ(eligible->reconstruction_token, 3ULL);
-  EXPECT_EQ(retention.prune(1'500, release), std::size_t {2});
+  const auto pruned = retention.prune_expired_frames(1'500, release);
+  EXPECT_EQ(pruned.frames_released, std::size_t {2});
+  EXPECT_EQ(pruned.tokens_released, std::size_t {2});
   EXPECT_EQ(retention.retained_bytes(), std::size_t {0});
 }
 
 TEST(LspTransportRtx, EnforcesTheSixteenMibibyteConnectionBoundWithoutPacketCopies) {
   constexpr auto half_capacity = lsp_transport::maximum_rtx_retained_bytes / 2U;
-  std::array<lsp_transport::rtx_retained_packet, 3> slots {};
+  static std::array<
+    lsp_transport::rtx_retained_packet,
+    lsp_transport::required_rtx_retention_slots>
+    slots {};
   lsp_transport::rtx_retention retention(slots);
+  const auto frame = retention.begin_frame(
+    {
+      .frame_id = 10,
+      .frame_deadline_microseconds = 10'000,
+      .now_microseconds = 1'000,
+      .retention_origin_microseconds = 1'000,
+      .measured_rtt_microseconds = 5'000,
+      .source_ssrc = 5,
+      .video_generation = 7,
+    },
+    [](const std::uint64_t) {
+    }
+  );
+  ASSERT_TRUE(frame);
   ASSERT_EQ(
     retention.retain(
-      {.reconstruction_token = 1, .frame_id = 10, .frame_deadline_microseconds = 10'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 1, .source_packet_bytes = half_capacity},
-      1'000,
-      5'000,
-      [](const std::uint64_t) {
-      }
+      frame.handle,
+      {.reconstruction_token = 1, .source_sequence_number = 1, .source_packet_bytes = half_capacity}
     ),
     lsp_transport::rtx_retention_result::retained
   );
   ASSERT_EQ(
     retention.retain(
-      {.reconstruction_token = 2, .frame_id = 10, .frame_deadline_microseconds = 10'000, .source_ssrc = 5, .video_generation = 7, .source_sequence_number = 2, .source_packet_bytes = half_capacity},
-      1'000,
-      5'000,
-      [](const std::uint64_t) {
-      }
+      frame.handle,
+      {.reconstruction_token = 2, .source_sequence_number = 2, .source_packet_bytes = half_capacity}
     ),
     lsp_transport::rtx_retention_result::retained
   );
   EXPECT_EQ(retention.retained_bytes(), lsp_transport::maximum_rtx_retained_bytes);
   EXPECT_EQ(
     retention.retain(
+      frame.handle,
       {
         .reconstruction_token = 3,
-        .frame_id = 10,
-        .frame_deadline_microseconds = 10'000,
-        .source_ssrc = 5,
-        .video_generation = 7,
         .source_sequence_number = 3,
         .source_packet_bytes = 1,
-      },
-      1'000,
-      5'000,
-      [](const std::uint64_t) {
       }
     ),
     lsp_transport::rtx_retention_result::byte_capacity_exceeded
   );
+  const auto aborted = retention.abort_frame(frame.handle, [](const std::uint64_t) {
+  });
+  EXPECT_EQ(aborted.tokens_released, std::size_t {2});
 }
 
 TEST(LspTransportRecovery, AllowsOneOutstandingIndependentFramePerEpoch) {

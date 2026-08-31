@@ -16,16 +16,16 @@ paired permission, and a successful Windows virtual-microphone probe; SRTP
 admission begins only after the matching generation-qualified
 `MICROPHONE_CONFIG_ACK`.
 Lumen now also freezes the sixteen-key `START`, 31/32-key START/ATTACH
-responses, 28-key SDR video selection, and schema-version-two
-`VIDEO_CONFIG/ACK` maps for the
-first H.264 High or HEVC Main slice. The host prepares and owns the exact
-Windows virtual display when enabled, proves the named hardware encoder tuple,
-and starts its bounded complete-access-unit RTP/SRTP sender only after the
-matching authenticated video acknowledgement. Fixed extension IDs 1 through 5
+responses, exact 30-key video selection, and video-schema-revision-three
+`VIDEO_CONFIG/ACK` maps for H.264, HEVC, and AV1. The host prepares and owns the
+exact Windows virtual display when enabled, proves the requested codec,
+profile, pixel class, and color tuple on the named hardware encoder, and starts
+its bounded RTP/SRTP sender only after the matching authenticated video
+acknowledgement. Fixed extension IDs 1 through 5
 carry visible frame marking and capture time plus RFC 6904-encrypted frame
-ID/recovery epoch,
-input watermark, and encoder timing. FlexFEC and RTX remain negotiated false in
-this first product slice.
+ID/recovery epoch, input watermark, and encoder timing. The selection carries
+nullable exact FlexFEC and RTX associations; unsupported hardware/color tuples
+fail closed instead of being approximated.
 Umbra now has the matching native receive/depacketization/reassembly,
 retained-frame ABI, VideoToolbox, Metal, and protected `LSPV` path. These
 implemented product boundaries do not claim a live cross-product stream or
@@ -125,16 +125,17 @@ LSP uses out-of-band deterministic CBOR negotiation and does not use SDP.
 
 - Protocol name: `Lumen Streaming Protocol`.
 - Abbreviation: `LSP` within Lumen and Umbra documentation.
-- Wire version: unsigned integer `1`; `VIDEO_CONFIG/ACK` payloads use dedicated
-  schema revision `2` at map key one.
+- Wire version: unsigned integer `1`; nested video offers/selections and
+  `VIDEO_CONFIG/ACK` use dedicated video schema revision `3`.
 - DTLS ALPN: exact ASCII `lumen-stream/1`.
 - Default UDP port: `48030`.
 - mDNS service type: `_lumen-stream._udp`.
 - Invitation URI: `umbra://pair/lsp1#<base64url>`.
 
 Every control message contains its assigned version discriminator. LSP/1 maps
-use wire version one except that `VIDEO_CONFIG` and `VIDEO_CONFIG_ACK` use
-their dedicated schema revision two at key one. RTP and RTCP formats are
+use wire version one except that nested video offers and selections and
+`VIDEO_CONFIG`/`VIDEO_CONFIG_ACK` use their dedicated schema revision three at
+key one. RTP and RTCP formats are
 selected only by an authenticated version-1 control negotiation. Unknown
 versions, message types, payload types, SSRCs, header-extension IDs, or control
 fields are rejected unless explicitly declared extensible.
@@ -522,39 +523,82 @@ corresponding configuration ACK is authenticated.
 The host may select a lower bitrate, resolution, or refresh rate only within an
 offered range. Strict offers fail instead of being adjusted.
 
-### 10.1 Frozen first SDR product slice
+### 10.1 Frozen video control schema revision three
 
-The implemented first video slice extends the previously committed ten-key
-`START` map to exactly sixteen keys. Keys 1 through 10 retain their input,
+`START` remains exactly sixteen keys. Keys 1 through 10 retain their input,
 audio, path, and nullable microphone meanings. Key 11 is network profile zero
 for adaptive-low-latency or one for competition. Key 12 is an ordered array of
-one through eight exact twelve-key video offers containing codec, profile,
-width, height, rational refresh, preferred and maximum bitrates, pixel format,
-delivery mode, and false FlexFEC/RTX flags. H.264/High is encoded as codec/profile
-`1/1`; HEVC/Main is `2/2`; pixel format and complete-access-unit delivery are
-both one. Keys 13 through 16 carry receive-batch capacity `1...64`, decoder
-surfaces `2...4`, render mailbox one, and a positive maximum capture-to-present
-budget in microseconds.
+one through eight exact 18-key video offers:
+
+| Key | Value |
+| ---: | --- |
+| 1 | video schema revision `3` |
+| 2...3 | codec and profile |
+| 4...5 | width and height |
+| 6...7 | rational refresh numerator and denominator |
+| 8...9 | preferred and maximum source bitrate, each at least 1,000 bits/s |
+| 10 | pixel class |
+| 11...13 | H.273 color primaries, transfer characteristic, and matrix coefficients |
+| 14 | full-range boolean |
+| 15 | delivery mode |
+| 16...17 | FlexFEC and RTX receive support booleans |
+| 18 | positive maximum complete-access-unit bytes, at most 16 MiB |
+
+Codec values are H.264 `1`, HEVC `2`, and AV1 `3`. Profiles are H.264 High
+`1`, H.264 High 4:4:4 Predictive `2`, HEVC Main `3`, HEVC Main10 `4`, HEVC
+Range Extensions `5`, AV1 Main `6`, and AV1 High `7`. Pixel classes are 4:2:0
+8-bit/NV12 `1`, 4:2:0 10-bit/P010 `2`, 4:4:4 8-bit `3`, and 4:4:4 10-bit `4`.
+Profile and pixel class must be a valid codec tuple. SDR uses H.273 BT.709
+primaries/transfer/matrix `1/1/1`. HDR10 uses BT.2020 primaries, SMPTE ST 2084
+PQ transfer, and BT.2020 non-constant-luminance matrix `9/16/9`. HLG uses
+`9/18/9`. HDR10 and HLG require a 10-bit HEVC or AV1 tuple and limited range.
+Keys 13 through 16 of the outer START map carry receive-batch capacity
+`1...64`, decoder surfaces `2...4`, render mailbox one, and a maximum
+capture-to-present budget of `1...1,000,000` microseconds.
 
 `START_RESPONSE` has exactly 31 keys and `ATTACH_RESPONSE` exactly 32. Their
-last key is the same exact 28-key video selection: video generation, primary
-SSRC/PT, 90 kHz clock, codec/profile, dimensions, rational refresh, selected
-bitrate, NV12-compatible 8-bit 4:2:0, Rec.709 primaries/transfer/matrix, limited
-range, 1,200-byte initial UDP payload, decoder surfaces, mailbox one,
-complete-access-unit delivery, extension IDs `1...5`, false FlexFEC/RTX, and a
-positive maximum frame-age budget no greater than START key 16. Extension IDs
-1 and 2 are visible frame marking and absolute capture time. IDs 3, 4, and 5
-are RFC 6904-encrypted frame ID, input watermark, and encoder timing.
+last key is the same exact 30-key video selection. Selection key 1 is video
+schema revision three. Keys 2 through 26 contain video generation, primary
+SSRC/PT, 90 kHz clock, the selected codec/profile/dimensions/refresh/bitrate,
+pixel and H.273 tuple, range, initial 1,200-byte UDP payload, decoder surfaces,
+mailbox one, delivery, and extension IDs `1...5`. Key 27 is null or exact
+FlexFEC map `{1: repair_ssrc, 2: repair_pt, 3: window_us,
+4: max_group_packets}` with maximum group packets exactly 15. Key 28 is null or
+exact RTX map `{1: rtx_ssrc, 2: rtx_pt, 3: apt}` whose `apt` equals the primary
+payload type. Keys 29 and 30 are the positive maximum frame age and maximum
+complete-access-unit bytes. Frame age and FlexFEC window are each at most
+1,000,000 microseconds, and the repair window cannot exceed frame age. Every
+SSRC is nonzero and distinct; repair payload types are dynamic, distinct from the primary and every different payload
+semantic, and generation-bound. Extension IDs 1 and 2 are visible frame
+marking and absolute capture time. IDs 3, 4, and 5 are RFC 6904-encrypted frame
+ID, input watermark, and encoder timing.
 
-`VIDEO_CONFIG` is an exact eight-key host request containing dedicated schema
-version `2`, session ID, stream generation, the selected 28-key video map, prefix-free codec
-parameter sets, nonzero frame-ID origin, nonzero recovery epoch, and maximum
-complete access-unit bytes. H.264 carries exactly SPS/PPS; HEVC carries exactly
-VPS/SPS/PPS. `VIDEO_CONFIG_ACK` is an exact five-key response containing the
-same dedicated schema version `2`, status, session ID, video generation, and
-decoder credit `2...4`.
-The LSPC error-response flag and non-success status must agree. No primary
-video SRTP packet is legal before a successful matching acknowledgement.
+`VIDEO_CONFIG` is an exact eight-key host request: video schema revision `3`,
+session ID, stream generation, the selected 30-key video map, codec
+configuration, nonzero frame-ID origin, nonzero recovery epoch, and nullable
+HDR metadata. Codec configuration is the exact map `{1: kind, 2: units}` where
+kind is H.264 `1`, HEVC `2`, or AV1 `3`; units are exactly prefix-free SPS/PPS,
+VPS/SPS/PPS, or one canonical low-overhead AV1 sequence-header OBU. HDR10/PQ
+requires the exact 13-key unsigned map containing RGB primary xy at keys 1...6,
+white xy at 7...8, maximum/minimum mastering luminance at 9...10, MaxCLL and
+MaxFALL at 11...12, and maximum full-frame luminance at 13. SDR and HLG require
+null because neither uses HDR10 static mastering metadata. `VIDEO_CONFIG_ACK`
+is an exact five-key response containing video schema revision `3`, status,
+session ID, video generation, and decoder credit `2...4`.
+
+The Windows host selects only a tuple proven by its current named capture and
+hardware-encoder generation. The current VDD/configuration boundary proves SDR
+8-bit BT.709 and HDR10/PQ 10-bit modes plus validated 4:4:4 where the active
+hardware-encoder probe reports it. HLG remains a valid wire tuple but fails
+host selection closed until the active Windows color pipeline can explicitly
+prove HLG output; it is never silently encoded as PQ. The LSPC error-response flag and
+non-success status must agree. No primary or repair video SRTP packet is legal
+before a successful matching acknowledgement.
+Before START commits authority or returns success, the host deterministically
+encodes the complete `VIDEO_CONFIG`, including canonical codec units and HDR
+metadata, under the 1,152-byte control limit. Failure unwinds the launched
+application generation and prepared display lease. ATTACH repeats this
+preflight after rotating generation and SSRC values but before authority moves.
 
 ## 11. RTP session and lane registry
 
@@ -586,6 +630,10 @@ configuration; the peer independently rejects duplicate SSRC or conflicting
 payload-type assignments. An unexpected SSRC never creates state. An SSRC
 collision discovered after activation ends the affected media generation and
 requires a new authenticated configuration rather than guessing ownership.
+ATTACH allocates every replacement SSRC outside both the new-generation set
+and every prior-generation input, acknowledgement, audio, microphone, primary,
+FlexFEC, and RTX SSRC, even after transport loss has retired the old live
+registry.
 
 ## 12. Common RTP profile
 

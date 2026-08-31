@@ -829,7 +829,7 @@ namespace video {
    */
   [[nodiscard]] bool active_encoder_is_nvenc();
 
-  /** @brief Hardware and recovery capability for one first-slice SDR codec. */
+  /** @brief Hardware, low-delay, and recovery capability for one probed LSP codec. */
   struct lsp_sdr_encoder_capability_t {
     bool supported {};  ///< Exact codec passed the committed encoder probe.
     bool hardware {};  ///< Selected encoder is not the software fallback.
@@ -838,10 +838,10 @@ namespace video {
   };
 
   /**
-   * @brief Query the committed encoder proof for SDR H.264 or HEVC LSP selection.
+   * @brief Query the committed encoder proof for H.264, HEVC, or AV1 LSP selection.
    *
-   * @param video_format Zero for H.264 or one for HEVC.
-   * @return Exact committed capability; all fields false for an unsupported value or stale probe.
+   * @param video_format Zero for H.264, one for HEVC, or two for AV1.
+   * @return Exact chosen-backend capability; all fields false for an unsupported value or stale probe.
    */
   [[nodiscard]] lsp_sdr_encoder_capability_t active_lsp_sdr_encoder_capability(int video_format) noexcept;
 

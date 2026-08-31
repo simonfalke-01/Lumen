@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -975,6 +976,510 @@ namespace lumen::lsp::media {
     std::uint64_t next_arrival_order_ = 1;  ///< Monotonic incomplete-frame insertion order.
     std::uint64_t next_completion_token_ = 1;  ///< Monotonic completed-view release token.
     bool ready_ = false;  ///< Whether every lifetime allocation succeeded.
+  };
+
+  /** @brief Authenticated packet-slab slice offered to the zero-copy frame reassembler. */
+  struct token_frame_fragment {
+    frame_key key {};  ///< SSRC and extended timestamp identifying provisional assembly.
+    std::uint64_t frame_id = 0;  ///< Repeated nonzero frame ID, or zero when metadata was absent.
+    std::uint64_t extended_sequence = 0;  ///< Extended RTP sequence number.
+    std::uint64_t deadline_us = 0;  ///< Fixed frame receive/decode deadline.
+    std::uint64_t slice_token = 0;  ///< Nonzero caller slab token retaining `payload` storage.
+    bool starts_frame = false;  ///< Codec/frame-marking start indication.
+    bool ends_frame = false;  ///< Codec/frame-marking end indication.
+    bool marker = false;  ///< RTP marker bit, required exactly on the ending fragment.
+    std::span<const std::uint8_t> payload {};  ///< Borrowed immutable codec bytes in the caller slab.
+  };
+
+  /** @brief One retained sequence-ordered caller-slab slice in a completed frame. */
+  struct token_frame_slice {
+    std::uint64_t extended_sequence = 0;  ///< Extended RTP sequence number.
+    std::uint64_t slice_token = 0;  ///< Nonzero retained caller slab token.
+    std::span<const std::uint8_t> bytes {};  ///< Immutable codec bytes valid while token is retained.
+    bool starts_frame = false;  ///< Whether this slice starts the completed frame.
+    bool ends_frame = false;  ///< Whether this slice ends the completed frame.
+  };
+
+  /** @brief Borrowed completed zero-copy frame valid until explicit release. */
+  struct token_completed_frame_view {
+    frame_key key {};  ///< Completed SSRC and extended timestamp.
+    std::uint64_t frame_id = 0;  ///< Bound repeated frame ID, or zero when unavailable.
+    std::uint64_t deadline_us = 0;  ///< Fixed frame deadline.
+    std::span<const token_frame_slice> slices {};  ///< Sequence-ordered retained caller-slab slices.
+    std::size_t total_size = 0;  ///< Sum of slice byte counts.
+    std::uint64_t completion_token = 0;  ///< Opaque nonzero completed-view generation.
+    std::uint8_t slot = 0;  ///< Internal fixed frame slot index.
+
+    /** @brief Return whether this view names one live completed frame. */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return completion_token != 0 && !slices.empty() && total_size != 0;
+    }
+  };
+
+  /** @brief Zero-copy reassembly result carrying an optional completed retained-slice view. */
+  struct token_frame_reassembly_result {
+    frame_reassembly_status status = frame_reassembly_status::stored;  ///< Operation outcome.
+    token_completed_frame_view frame {};  ///< Completed frame only for `completed`.
+    std::optional<frame_key> evicted {};  ///< Oldest incomplete frame released for a third frame.
+  };
+
+  /** @brief Caller-buffer coalescing failure for a completed retained-slice frame. */
+  enum class token_frame_coalesce_error : std::uint8_t {
+    none,  ///< Every ordered slice was copied.
+    stale_frame,  ///< View no longer names its completed slot generation.
+    destination_too_small,  ///< Caller buffer cannot contain the complete encoded frame.
+  };
+
+  /** @brief Result of optional direct coalescing into caller final-frame storage. */
+  struct token_frame_coalesce_result {
+    std::size_t bytes_written = 0;  ///< Complete encoded-frame bytes on success.
+    token_frame_coalesce_error error = token_frame_coalesce_error::none;  ///< Typed status.
+
+    /** @brief Return whether coalescing completed. */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return error == token_frame_coalesce_error::none;
+    }
+  };
+
+  /**
+   * @brief Allocation-free two-frame reassembler retaining caller packet-slab tokens without copy.
+   *
+   * The caller supplies two fixed fragment tables at construction. A successful insertion first
+   * calls `retain(slice_token)` and thereafter calls `release(slice_token)` exactly once on packet
+   * conflict, frame expiry, third-frame eviction, completed-view release, or `clear()`. Duplicate
+   * packets never retain the offered duplicate token. Completion sorts the fixed descriptor table
+   * and exposes ordered borrowed slices; decoder integrations may consume them directly or request
+   * one bounded coalescing copy into their final caller-owned buffer.
+   *
+   * The object must be cleared with the release callback before destruction while it retains frames.
+   */
+  class token_video_frame_reassembler {
+  public:
+    /**
+     * @brief Construct over caller-owned storage for exactly two bounded frame tables.
+     *
+     * @param slice_storage At least `2 * maximum_fragments` descriptors.
+     * @param maximum_frame_size Maximum codec bytes accepted per frame.
+     * @param maximum_fragments Maximum retained slices per frame.
+     */
+    constexpr explicit token_video_frame_reassembler(
+      const std::span<token_frame_slice> slice_storage,
+      const std::size_t maximum_frame_size = competition_frame_size_limit,
+      const std::size_t maximum_fragments = maximum_fragments_per_frame
+    ) noexcept:
+        maximum_frame_size_(std::min(maximum_frame_size, absolute_frame_size_limit)),
+        maximum_fragments_(std::min(maximum_fragments, maximum_fragments_per_frame)) {
+      if (maximum_frame_size_ == 0 || maximum_fragments_ == 0 ||
+          maximum_fragments_ > std::numeric_limits<std::size_t>::max() / slots_.size() ||
+          slice_storage.size() < maximum_fragments_ * slots_.size()) {
+        return;
+      }
+      for (std::size_t index = 0; index < slots_.size(); ++index) {
+        slots_[index].slices = slice_storage.subspan(index * maximum_fragments_, maximum_fragments_);
+        std::fill(slots_[index].slices.begin(), slots_[index].slices.end(), token_frame_slice {});
+      }
+      ready_ = true;
+    }
+
+    /** @brief Prevent duplicated ownership of retained caller slab tokens. */
+    token_video_frame_reassembler(const token_video_frame_reassembler &) = delete;
+
+    /** @brief Prevent duplicated ownership of retained caller slab tokens. */
+    token_video_frame_reassembler &operator=(const token_video_frame_reassembler &) = delete;
+
+    /** @brief Prevent moving storage-backed ownership without an explicit lifecycle handoff. */
+    token_video_frame_reassembler(token_video_frame_reassembler &&) = delete;
+
+    /** @brief Prevent moving storage-backed ownership without an explicit lifecycle handoff. */
+    token_video_frame_reassembler &operator=(token_video_frame_reassembler &&) = delete;
+
+    /**
+     * @brief Assert the documented release-before-destruction token ownership contract.
+     *
+     * Every successful retain callback must be balanced by `release()`, `expire()`, eviction, or
+     * `clear()` before destruction. Debug builds assert that no frame remains owned.
+     */
+    ~token_video_frame_reassembler() {
+      assert(empty());
+    }
+
+    /** @brief Return whether caller storage satisfies both fixed frame tables. */
+    [[nodiscard]] constexpr bool ready() const noexcept {
+      return ready_;
+    }
+
+    /**
+     * @brief Retain one authenticated caller-slab fragment without copying payload bytes.
+     *
+     * @tparam Retain Callable returning true after retaining one nonzero slice token.
+     * @tparam Release Callable releasing one previously retained slice token.
+     * @param fragment Authenticated fragment metadata, token, and borrowed codec bytes.
+     * @param now_us Current monotonic time.
+     * @param retain Called exactly once immediately before a new fragment becomes owned.
+     * @param release Called exactly once for retained tokens released during this operation.
+     * @return Stored, duplicate, completion, eviction, expiry, malformed, or resource status.
+     */
+    template<class Retain, class Release>
+    [[nodiscard]] constexpr token_frame_reassembly_result add(
+      const token_frame_fragment &fragment,
+      const std::uint64_t now_us,
+      Retain &&retain,
+      Release &&release
+    ) noexcept(noexcept(retain(std::uint64_t {})) && noexcept(release(std::uint64_t {}))) {
+      if (!ready_) {
+        return {.status = frame_reassembly_status::resource_exhausted};
+      }
+      if (fragment.key.ssrc == 0 || fragment.slice_token == 0 || fragment.payload.empty() ||
+          fragment.deadline_us <= now_us || fragment.marker != fragment.ends_frame) {
+        return {
+          .status = fragment.deadline_us <= now_us ?
+                      frame_reassembly_status::expired :
+                      frame_reassembly_status::malformed,
+        };
+      }
+
+      auto *slot = find_slot(fragment.key);
+      const auto extends_existing = slot != nullptr;
+      if (slot != nullptr && (slot->complete || slot->deadline_us != fragment.deadline_us)) {
+        return {.status = slot->complete ? frame_reassembly_status::resource_exhausted : frame_reassembly_status::malformed};
+      }
+      if (slot == nullptr) {
+        slot = empty_slot();
+        if (slot == nullptr) {
+          slot = oldest_incomplete_slot();
+          if (slot == nullptr) {
+            return {.status = frame_reassembly_status::resource_exhausted};
+          }
+        }
+      }
+
+      const auto existing_count = extends_existing ? slot->slice_count : 0U;
+      const auto existing_total = extends_existing ? slot->total_size : 0U;
+      auto staged_frame_id = extends_existing ? slot->frame_id : 0U;
+      auto staged_start = extends_existing ? slot->start_sequence : std::optional<std::uint64_t> {};
+      auto staged_end = extends_existing ? slot->end_sequence : std::optional<std::uint64_t> {};
+      if (fragment.frame_id != 0) {
+        if (staged_frame_id != 0 && staged_frame_id != fragment.frame_id) {
+          return {.status = frame_reassembly_status::malformed};
+        }
+        staged_frame_id = fragment.frame_id;
+      }
+
+      for (std::size_t index = 0; index < existing_count; ++index) {
+        const auto &existing = slot->slices[index];
+        if (existing.extended_sequence != fragment.extended_sequence) {
+          continue;
+        }
+        if (existing.starts_frame == fragment.starts_frame && existing.ends_frame == fragment.ends_frame &&
+            std::ranges::equal(existing.bytes, fragment.payload)) {
+          return {.status = frame_reassembly_status::duplicate};
+        }
+        return {.status = frame_reassembly_status::malformed};
+      }
+
+      if ((staged_start && fragment.extended_sequence < *staged_start) ||
+          (staged_end && fragment.extended_sequence > *staged_end) ||
+          (fragment.starts_frame && staged_start) || (fragment.ends_frame && staged_end)) {
+        return {.status = frame_reassembly_status::malformed};
+      }
+      if (fragment.starts_frame) {
+        for (std::size_t index = 0; index < existing_count; ++index) {
+          if (slot->slices[index].extended_sequence < fragment.extended_sequence) {
+            return {.status = frame_reassembly_status::malformed};
+          }
+        }
+        staged_start = fragment.extended_sequence;
+      }
+      if (fragment.ends_frame) {
+        for (std::size_t index = 0; index < existing_count; ++index) {
+          if (slot->slices[index].extended_sequence > fragment.extended_sequence) {
+            return {.status = frame_reassembly_status::malformed};
+          }
+        }
+        staged_end = fragment.extended_sequence;
+      }
+
+      if (fragment.payload.size() > maximum_frame_size_ - existing_total || existing_count >= maximum_fragments_) {
+        return {.status = frame_reassembly_status::frame_too_large};
+      }
+      if (!static_cast<bool>(retain(fragment.slice_token))) {
+        return {.status = frame_reassembly_status::resource_exhausted};
+      }
+
+      std::optional<frame_key> evicted;
+      auto initial_status = frame_reassembly_status::stored;
+      if (!extends_existing) {
+        if (slot->occupied) {
+          if (slot->deadline_us > now_us) {
+            evicted = slot->key;
+            initial_status = frame_reassembly_status::evicted_and_stored;
+          }
+          release_slot(*slot, release);
+        }
+        slot->occupied = true;
+        slot->key = fragment.key;
+        slot->deadline_us = fragment.deadline_us;
+        slot->arrival_order = next_arrival_order_++;
+        if (next_arrival_order_ == 0) {
+          next_arrival_order_ = 1;
+        }
+      }
+      slot->frame_id = staged_frame_id;
+      slot->start_sequence = staged_start;
+      slot->end_sequence = staged_end;
+      slot->slices[existing_count] = {
+        .extended_sequence = fragment.extended_sequence,
+        .slice_token = fragment.slice_token,
+        .bytes = fragment.payload,
+        .starts_frame = fragment.starts_frame,
+        .ends_frame = fragment.ends_frame,
+      };
+      slot->slice_count = existing_count + 1U;
+      slot->total_size = existing_total + fragment.payload.size();
+
+      if (!staged_start || !staged_end || *staged_end < *staged_start ||
+          *staged_end - *staged_start + 1 != slot->slice_count) {
+        return {.status = initial_status, .evicted = evicted};
+      }
+      auto slices = slot->slices.first(slot->slice_count);
+      std::ranges::sort(slices, {}, &token_frame_slice::extended_sequence);
+      for (std::size_t index = 0; index < slices.size(); ++index) {
+        assert(slices[index].extended_sequence == *staged_start + index);
+      }
+      if (next_completion_token_ == 0) {
+        next_completion_token_ = 1;
+      }
+      const auto completion_token = next_completion_token_++;
+      slot->complete = true;
+      slot->completion_token = completion_token;
+      return {
+        .status = frame_reassembly_status::completed,
+        .frame = {
+          .key = slot->key,
+          .frame_id = slot->frame_id,
+          .deadline_us = slot->deadline_us,
+          .slices = slices,
+          .total_size = slot->total_size,
+          .completion_token = completion_token,
+          .slot = static_cast<std::uint8_t>(slot - slots_.data()),
+        },
+        .evicted = evicted,
+      };
+    }
+
+    /**
+     * @brief Copy one live completed view directly into caller final-frame storage.
+     *
+     * @param frame Exact live completed view returned by `add()`.
+     * @param destination Caller final codec buffer.
+     * @return Complete byte count or typed stale/capacity failure.
+     */
+    [[nodiscard]] constexpr token_frame_coalesce_result coalesce(
+      const token_completed_frame_view &frame,
+      const std::span<std::uint8_t> destination
+    ) const noexcept {
+      if (!live(frame)) {
+        return {.error = token_frame_coalesce_error::stale_frame};
+      }
+      if (destination.size() < frame.total_size) {
+        return {.error = token_frame_coalesce_error::destination_too_small};
+      }
+      std::size_t offset = 0;
+      for (const auto &slice : frame.slices) {
+        std::copy(slice.bytes.begin(), slice.bytes.end(), destination.begin() + static_cast<std::ptrdiff_t>(offset));
+        offset += slice.bytes.size();
+      }
+      return {.bytes_written = offset};
+    }
+
+    /**
+     * @brief Release one completed view and every caller slab token it retains.
+     *
+     * @tparam Release Callable releasing one retained slice token.
+     * @param frame Exact live completed view returned by `add()`.
+     * @param release Integration token release callback.
+     * @return `true` when the completed generation matched and was released.
+     */
+    template<class Release>
+    constexpr bool release(
+      const token_completed_frame_view &frame,
+      Release &&release
+    ) noexcept(noexcept(release(std::uint64_t {}))) {
+      if (!live(frame)) {
+        return false;
+      }
+      release_slot(slots_[frame.slot], release);
+      return true;
+    }
+
+    /**
+     * @brief Expire incomplete frames without invalidating completed views.
+     *
+     * @tparam Release Callable releasing each retained slice token.
+     * @param now_us Current monotonic time.
+     * @param release Integration token release callback.
+     * @return Number of incomplete frames expired.
+     */
+    template<class Release>
+    constexpr std::size_t expire(
+      const std::uint64_t now_us,
+      Release &&release
+    ) noexcept(noexcept(release(std::uint64_t {}))) {
+      std::size_t expired = 0;
+      for (auto &slot : slots_) {
+        if (slot.occupied && !slot.complete && slot.deadline_us <= now_us) {
+          release_slot(slot, release);
+          ++expired;
+        }
+      }
+      return expired;
+    }
+
+    /**
+     * @brief Release every incomplete and completed frame before teardown.
+     *
+     * @tparam Release Callable releasing each retained slice token.
+     * @param release Integration token release callback.
+     * @return Number of frames released.
+     */
+    template<class Release>
+    constexpr std::size_t clear(Release &&release) noexcept(noexcept(release(std::uint64_t {}))) {
+      std::size_t released = 0;
+      for (auto &slot : slots_) {
+        if (slot.occupied) {
+          release_slot(slot, release);
+          ++released;
+        }
+      }
+      return released;
+    }
+
+    /**
+     * @brief Preserve one exact frame key while releasing every other occupied slot.
+     *
+     * The matching incomplete or completed slot retains its slices and completion generation
+     * unchanged. When no slot matches, the operation releases all occupied slots. Each removed
+     * slice token is passed to `release` exactly once.
+     *
+     * @tparam Release Callable releasing each retained slice token from removed frames.
+     * @param preserved_key Exact SSRC and extended timestamp to preserve.
+     * @param release Integration token release callback.
+     * @return Number of frame slots released.
+     */
+    template<class Release>
+    constexpr std::size_t clear_except(
+      const frame_key preserved_key,
+      Release &&release
+    ) noexcept(noexcept(release(std::uint64_t {}))) {
+      std::size_t released = 0;
+      for (auto &slot : slots_) {
+        if (slot.occupied && slot.key != preserved_key) {
+          release_slot(slot, release);
+          ++released;
+        }
+      }
+      return released;
+    }
+
+    /** @brief Return retained incomplete frame count in the closed range zero through two. */
+    [[nodiscard]] constexpr std::size_t incomplete_frames() const noexcept {
+      return static_cast<std::size_t>(std::ranges::count_if(slots_, [](const frame_slot &slot) {
+        return slot.occupied && !slot.complete;
+      }));
+    }
+
+    /** @brief Return whether no incomplete or completed frame retains caller slab tokens. */
+    [[nodiscard]] constexpr bool empty() const noexcept {
+      return std::ranges::none_of(slots_, [](const frame_slot &slot) {
+        return slot.occupied;
+      });
+    }
+
+  private:
+    /** @brief One caller-storage-backed incomplete or completed frame slot. */
+    struct frame_slot {
+      std::span<token_frame_slice> slices {};  ///< Fixed caller-owned fragment descriptor table.
+      frame_key key {};  ///< Provisional frame key.
+      std::uint64_t frame_id = 0;  ///< Bound repeated frame ID.
+      std::uint64_t deadline_us = 0;  ///< Fixed frame deadline.
+      std::uint64_t arrival_order = 0;  ///< Oldest incomplete-frame eviction order.
+      std::uint64_t completion_token = 0;  ///< Nonzero generation while complete.
+      std::optional<std::uint64_t> start_sequence {};  ///< Observed start fragment.
+      std::optional<std::uint64_t> end_sequence {};  ///< Observed end fragment.
+      std::size_t slice_count = 0;  ///< Populated retained slice descriptors.
+      std::size_t total_size = 0;  ///< Aggregate codec bytes.
+      bool occupied = false;  ///< Whether this slot retains a frame.
+      bool complete = false;  ///< Whether a caller owns its completed view.
+    };
+
+    /** @brief Return whether a completed view still matches its slot generation. */
+    [[nodiscard]] constexpr bool live(const token_completed_frame_view &frame) const noexcept {
+      if (frame.slot >= slots_.size() || frame.completion_token == 0) {
+        return false;
+      }
+      const auto &slot = slots_[frame.slot];
+      return slot.occupied && slot.complete && slot.completion_token == frame.completion_token &&
+             slot.key == frame.key && frame.slices.data() == slot.slices.data() &&
+             frame.slices.size() == slot.slice_count && frame.total_size == slot.total_size;
+    }
+
+    /** @brief Find one occupied frame by provisional key. */
+    [[nodiscard]] constexpr frame_slot *find_slot(const frame_key key) noexcept {
+      const auto found = std::ranges::find_if(slots_, [&](const frame_slot &slot) {
+        return slot.occupied && slot.key == key;
+      });
+      return found == slots_.end() ? nullptr : &*found;
+    }
+
+    /** @brief Find one unused fixed frame slot. */
+    [[nodiscard]] constexpr frame_slot *empty_slot() noexcept {
+      const auto found = std::ranges::find_if(slots_, [](const frame_slot &slot) {
+        return !slot.occupied;
+      });
+      return found == slots_.end() ? nullptr : &*found;
+    }
+
+    /** @brief Find the oldest incomplete frame without invalidating a completed view. */
+    [[nodiscard]] constexpr frame_slot *oldest_incomplete_slot() noexcept {
+      frame_slot *oldest = nullptr;
+      for (auto &slot : slots_) {
+        if (!slot.occupied || slot.complete) {
+          continue;
+        }
+        if (oldest == nullptr || slot.arrival_order < oldest->arrival_order) {
+          oldest = &slot;
+        }
+      }
+      return oldest;
+    }
+
+    /**
+     * @brief Release every token in one slot and reset metadata while preserving caller storage.
+     *
+     * @tparam Release Callable releasing one retained slice token.
+     * @param slot Occupied frame slot.
+     * @param release Integration token release callback.
+     */
+    template<class Release>
+    static constexpr void release_slot(
+      frame_slot &slot,
+      Release &release
+    ) noexcept(noexcept(release(std::uint64_t {}))) {
+      for (std::size_t index = 0; index < slot.slice_count; ++index) {
+        release(slot.slices[index].slice_token);
+        slot.slices[index] = {};
+      }
+      const auto storage = slot.slices;
+      slot = {};
+      slot.slices = storage;
+    }
+
+    std::array<frame_slot, 2> slots_ {};  ///< Two hard-bounded caller-storage frame slots.
+    std::size_t maximum_frame_size_ = competition_frame_size_limit;  ///< Per-frame byte bound.
+    std::size_t maximum_fragments_ = maximum_fragments_per_frame;  ///< Slices available per frame.
+    std::uint64_t next_arrival_order_ = 1;  ///< Monotonic incomplete-frame insertion order.
+    std::uint64_t next_completion_token_ = 1;  ///< Monotonic completed-view generation.
+    bool ready_ = false;  ///< Whether caller storage satisfied both frame tables.
   };
 
   /** @brief Hardware-decoder submission credit state constrained to two through four surfaces. */

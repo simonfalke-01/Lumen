@@ -229,7 +229,7 @@ TEST(LspMediaAv1, RejectsMalformedDescriptorsAndUnnormalizedObus) {
   EXPECT_EQ(lumen::lsp::media::packetize_av1(input, false, video_config()).error, lumen::lsp::media::packetization_error::malformed_codec_unit);
   constexpr std::array<std::uint8_t, 1> temporal_delimiter {0x10};
   const std::array<std::span<const std::uint8_t>, 1> delimiter_input {temporal_delimiter};
-  EXPECT_EQ(lumen::lsp::media::packetize_av1(delimiter_input, false, video_config()).error, lumen::lsp::media::packetization_error::malformed_codec_unit);
+  EXPECT_EQ(lumen::lsp::media::packetize_av1(delimiter_input, false, video_config()).error, lumen::lsp::media::packetization_error::empty_access_unit);
 }
 
 TEST(LspMediaOpus, UsesOnePacketNoFragmentationAndContinuousFortyEightKhzTimeline) {

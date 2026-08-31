@@ -35,7 +35,7 @@ namespace lumen::lsp::runtime {
     attach_response = 0x0203,  ///< Return rotated authority, token, SSRCs, and baseline requirement.
     stop = 0x0204,  ///< Stop the authenticated client's own session.
     stop_response = 0x0205,  ///< Return the terminal owner-qualified stop outcome.
-    video_config = 0x0210,  ///< Install one exact SDR H.264/HEVC decoder configuration.
+    video_config = 0x0210,  ///< Install one exact schema-revision-three video decoder configuration.
     video_config_ack = 0x0211,  ///< Authenticate client decoder readiness and initial credit.
     audio_config = 0x0212,  ///< Install one exact host Opus configuration before SRTP transmission.
     audio_config_ack = 0x0213,  ///< Authenticate client decoder readiness for one audio generation.
@@ -183,22 +183,48 @@ namespace lumen::lsp::runtime {
   enum class VideoCodec : std::uint8_t {
     h264 = 1,  ///< RFC 6184 H.264 non-interleaved mode.
     hevc = 2,  ///< RFC 7798 HEVC single-stream mode.
+    av1 = 3,  ///< AOM AV1 RTP payload-format version 1.0.0.
   };
 
-  /** @brief Exact codec-profile values for the first SDR product slice. */
+  /** @brief Exact codec-profile values for the LSP video schema. */
   enum class VideoProfile : std::uint8_t {
     h264_high = 1,  ///< H.264 High profile.
-    hevc_main = 2,  ///< HEVC Main profile.
+    h264_high_444_predictive = 2,  ///< H.264 High 4:4:4 Predictive profile.
+    hevc_main = 3,  ///< HEVC Main profile.
+    hevc_main10 = 4,  ///< HEVC Main 10 profile.
+    hevc_range_extensions = 5,  ///< HEVC Range Extensions profile; pixel class selects depth.
+    av1_main = 6,  ///< AV1 Main profile; pixel class selects 8-bit or 10-bit 4:2:0.
+    av1_high = 7,  ///< AV1 High profile; pixel class selects 8-bit or 10-bit 4:4:4.
   };
 
-  /** @brief Exact pixel-format value for NV12-compatible 8-bit 4:2:0. */
-  inline constexpr std::uint8_t video_pixel_format_nv12 = 1;
+  /** @brief Exact decoded pixel classes carried by video offers and selections. */
+  enum class VideoPixelClass : std::uint8_t {
+    yuv420_8 = 1,  ///< 8-bit 4:2:0, represented by NV12 on Windows.
+    yuv420_10 = 2,  ///< 10-bit 4:2:0, represented by P010 on Windows.
+    yuv444_8 = 3,  ///< 8-bit 4:4:4.
+    yuv444_10 = 4,  ///< 10-bit 4:4:4.
+  };
+
+  /** @brief Compatibility name for the schema's NV12-compatible 4:2:0 8-bit pixel class. */
+  inline constexpr VideoPixelClass video_pixel_format_nv12 = VideoPixelClass::yuv420_8;
+
+  /** @brief H.273 value for BT.709 color primaries, transfer, and matrix coefficients. */
+  inline constexpr std::uint8_t video_color_bt709 = 1;
+
+  /** @brief H.273 value for BT.2020 color primaries. */
+  inline constexpr std::uint8_t video_color_primaries_bt2020 = 9;
+
+  /** @brief H.273 value for BT.2020 non-constant-luminance matrix coefficients. */
+  inline constexpr std::uint8_t video_matrix_bt2020_ncl = 9;
+
+  /** @brief H.273 value for SMPTE ST 2084 perceptual-quantizer transfer. */
+  inline constexpr std::uint8_t video_transfer_pq = 16;
+
+  /** @brief H.273 value for ARIB STD-B67 hybrid-log-gamma transfer. */
+  inline constexpr std::uint8_t video_transfer_hlg = 18;
 
   /** @brief Exact complete-access-unit encoder-delivery value. */
   inline constexpr std::uint8_t video_delivery_complete_access_unit = 1;
-
-  /** @brief Exact SDR Rec.709 color-description value. */
-  inline constexpr std::uint8_t video_color_rec709 = 1;
 
   /** @brief Fixed visible RFC 9626 frame-marking extension identifier. */
   inline constexpr std::uint8_t video_frame_marking_extension_id = 1;
@@ -209,8 +235,14 @@ namespace lumen::lsp::runtime {
   /** @brief Fixed encrypted LSP frame-ID extension identifier. */
   inline constexpr std::uint8_t video_frame_id_extension_id = 3;
 
-  /** @brief Dedicated schema version for `VIDEO_CONFIG` and `VIDEO_CONFIG_ACK`. */
-  inline constexpr std::uint8_t video_configuration_schema_version = 2;
+  /** @brief Dedicated incompatible schema revision for all LSP video control maps. */
+  inline constexpr std::uint8_t video_schema_version = 3;
+
+  /** @brief Smallest realistic negotiated encoded-video source rate in bits per second. */
+  inline constexpr std::uint64_t video_minimum_bits_per_second = 1'000;
+
+  /** @brief Shared maximum frame-age and FlexFEC-window budget in microseconds. */
+  inline constexpr std::uint32_t video_maximum_frame_age_microseconds = 1'000'000;
 
   /** @brief Fixed encrypted LSP input-watermark extension identifier. */
   inline constexpr std::uint8_t video_input_watermark_extension_id = 4;
@@ -218,40 +250,60 @@ namespace lumen::lsp::runtime {
   /** @brief Fixed encrypted LSP encoder-timing extension identifier. */
   inline constexpr std::uint8_t video_encoder_timing_extension_id = 5;
 
-  /** @brief One exact twelve-key ordered SDR video offer in START key twelve. */
+  /** @brief One exact eighteen-key ordered video offer in START key twelve. */
   struct VideoOfferPayload {
-    VideoCodec codec {VideoCodec::h264};  ///< Offered H.264 or HEVC codec.
-    VideoProfile profile {VideoProfile::h264_high};  ///< Codec-matched High or Main profile.
+    VideoCodec codec {VideoCodec::h264};  ///< Offered H.264, HEVC, or AV1 codec.
+    VideoProfile profile {VideoProfile::h264_high};  ///< Codec-matched negotiated profile.
     std::uint32_t width {};  ///< Exact encoded width in pixels.
     std::uint32_t height {};  ///< Exact encoded height in pixels.
     std::uint32_t refresh_numerator {};  ///< Exact rational refresh numerator.
     std::uint32_t refresh_denominator {};  ///< Exact rational refresh denominator.
-    std::uint64_t preferred_bits_per_second {};  ///< Preferred encoded source-media rate.
-    std::uint64_t maximum_bits_per_second {};  ///< Maximum accepted encoded source-media rate.
-    std::uint8_t pixel_format {video_pixel_format_nv12};  ///< Exactly NV12-compatible 8-bit 4:2:0.
+    std::uint64_t preferred_bits_per_second {};  ///< Preferred encoded source-media rate, at least 1,000 bits/s.
+    std::uint64_t maximum_bits_per_second {};  ///< Maximum accepted source-media rate, at least 1,000 bits/s.
+    VideoPixelClass pixel_format {VideoPixelClass::yuv420_8};  ///< Exact chroma-sampling and bit-depth class.
+    std::uint8_t color_primaries {video_color_bt709};  ///< Exact H.273 color-primaries value.
+    std::uint8_t transfer_function {video_color_bt709};  ///< Exact H.273 transfer-characteristic value.
+    std::uint8_t matrix_coefficients {video_color_bt709};  ///< Exact H.273 matrix-coefficients value.
+    bool full_range {};  ///< Whether decoded luma/chroma use full range.
     std::uint8_t delivery {video_delivery_complete_access_unit};  ///< Exactly complete-access-unit delivery.
-    bool flexfec {};  ///< Required false in the first real video slice.
-    bool rtx {};  ///< Required false in the first real video slice.
+    bool flexfec {};  ///< Whether the client can receive negotiated RFC 8627 repair.
+    bool rtx {};  ///< Whether the client can receive negotiated RFC 4588 retransmission.
+    std::uint32_t maximum_complete_access_unit_bytes {};  ///< Client's positive complete-AU admission bound.
   };
 
-  /** @brief Exact twenty-eight-key selected SDR video tuple. */
+  /** @brief Exact negotiated RFC 8627 single-stream repair source. */
+  struct FlexFecSelectionPayload {
+    std::uint32_t repair_ssrc {};  ///< Random nonzero repair SSRC distinct from the primary source.
+    std::uint8_t repair_payload_type {};  ///< Dynamic FlexFEC RTP payload type.
+    std::uint32_t window_microseconds {};  ///< Frame-local repair window, one through 1,000,000 microseconds.
+    std::uint8_t maximum_group_packets {15};  ///< Exact maximum protected source packets per group.
+  };
+
+  /** @brief Exact negotiated RFC 4588 retransmission source. */
+  struct RtxSelectionPayload {
+    std::uint32_t rtx_ssrc {};  ///< Random nonzero RTX SSRC distinct from primary and repair sources.
+    std::uint8_t rtx_payload_type {};  ///< Dynamic RTX RTP payload type.
+    std::uint8_t associated_payload_type {};  ///< Exact primary-video payload type (`apt`).
+  };
+
+  /** @brief Exact thirty-key selected video tuple. */
   struct VideoSelectionPayload {
     std::uint32_t video_generation {};  ///< Nonzero video configuration generation.
     std::uint32_t primary_ssrc {};  ///< Random nonzero primary video SSRC.
     std::uint8_t primary_payload_type {};  ///< Dynamic primary RTP payload type.
     std::uint32_t clock_rate {90'000};  ///< Exact 90 kHz video clock.
-    VideoCodec codec {VideoCodec::h264};  ///< Selected H.264 or HEVC codec.
+    VideoCodec codec {VideoCodec::h264};  ///< Selected H.264, HEVC, or AV1 codec.
     VideoProfile profile {VideoProfile::h264_high};  ///< Selected matching codec profile.
     std::uint32_t width {};  ///< Selected encoded width.
     std::uint32_t height {};  ///< Selected encoded height.
     std::uint32_t refresh_numerator {};  ///< Selected rational refresh numerator.
     std::uint32_t refresh_denominator {};  ///< Selected rational refresh denominator.
-    std::uint64_t selected_bits_per_second {};  ///< Selected initial encoded source-media rate.
-    std::uint8_t pixel_format {video_pixel_format_nv12};  ///< Exactly NV12-compatible 8-bit 4:2:0.
-    std::uint8_t color_primaries {video_color_rec709};  ///< Exactly Rec.709 primaries.
-    std::uint8_t transfer_function {video_color_rec709};  ///< Exactly Rec.709 transfer.
-    std::uint8_t matrix_coefficients {video_color_rec709};  ///< Exactly Rec.709 matrix.
-    bool full_range {};  ///< Required false for the first SDR slice.
+    std::uint64_t selected_bits_per_second {};  ///< Selected source-media rate, at least 1,000 bits/s.
+    VideoPixelClass pixel_format {VideoPixelClass::yuv420_8};  ///< Exact selected pixel class.
+    std::uint8_t color_primaries {video_color_bt709};  ///< Exact H.273 color-primaries value.
+    std::uint8_t transfer_function {video_color_bt709};  ///< Exact H.273 transfer-characteristic value.
+    std::uint8_t matrix_coefficients {video_color_bt709};  ///< Exact H.273 matrix-coefficients value.
+    bool full_range {};  ///< Whether decoded luma/chroma use full range.
     std::uint16_t initial_udp_payload_size {1'200};  ///< Exact initial protected UDP maximum.
     std::uint8_t decoder_surfaces {};  ///< Negotiated hardware submissions, two through four.
     std::uint8_t render_mailbox {1};  ///< Exact render mailbox depth one.
@@ -261,12 +313,13 @@ namespace lumen::lsp::runtime {
     std::uint8_t frame_id_extension {video_frame_id_extension_id};  ///< Encrypted custom frame-ID extension ID.
     std::uint8_t input_watermark_extension {video_input_watermark_extension_id};  ///< Encrypted input-watermark extension ID.
     std::uint8_t encoder_timing_extension {video_encoder_timing_extension_id};  ///< Encrypted encoder-timing extension ID.
-    bool flexfec {};  ///< Required false in this slice.
-    bool rtx {};  ///< Required false in this slice.
-    std::uint32_t maximum_frame_age_microseconds {};  ///< Positive authenticated reassembly/admission deadline budget.
+    std::optional<FlexFecSelectionPayload> flexfec;  ///< Nullable authenticated FlexFEC association.
+    std::optional<RtxSelectionPayload> rtx;  ///< Nullable authenticated RTX association.
+    std::uint32_t maximum_frame_age_microseconds {};  ///< Authenticated frame-age budget, one through 1,000,000 microseconds.
+    std::uint32_t maximum_complete_access_unit_bytes {};  ///< Positive complete-AU parser/admission maximum.
   };
 
-  /** @brief Exact START sixteen-key request map including the first SDR video slice. */
+  /** @brief Exact START sixteen-key request map including video schema revision three. */
   struct StartRequestPayload {
     std::string application_id;  ///< Configured application ID selected for input ownership.
     std::uint32_t pointer_rate {};  ///< Requested pointer reports/s in 125 through 16,000.
@@ -278,7 +331,7 @@ namespace lumen::lsp::runtime {
     std::uint16_t offered_maximum_udp_payload {};  ///< Client path payload ceiling for the association family.
     std::optional<MicrophoneOfferPayload> microphone_offer;  ///< Null or exact reverse-microphone offer.
     VideoNetworkProfile network_profile {VideoNetworkProfile::adaptive_low_latency};  ///< Selected controller profile.
-    std::vector<VideoOfferPayload> video_offers;  ///< Ordered exact SDR offers, one through eight entries.
+    std::vector<VideoOfferPayload> video_offers;  ///< Ordered exact schema-revision-three offers, one through eight entries.
     std::uint8_t client_receive_batch_capacity {};  ///< Client receive batch capacity, one through 64.
     std::uint8_t decoder_surfaces {};  ///< Offered hardware decoder submissions, two through four.
     std::uint8_t render_mailbox {};  ///< Required exact depth one.
@@ -340,15 +393,38 @@ namespace lumen::lsp::runtime {
     VideoSelectionPayload video {};  ///< Advanced generation and fresh primary SSRC at key 32.
   };
 
+  /** @brief Exact codec-specific decoder configuration carried by VIDEO_CONFIG key five. */
+  struct VideoCodecConfigurationPayload {
+    VideoCodec kind {VideoCodec::h264};  ///< Codec discriminator matching the selected video codec.
+    std::vector<std::vector<std::uint8_t>> units;  ///< SPS/PPS, VPS/SPS/PPS, or one AV1 sequence-header OBU.
+  };
+
+  /** @brief Exact thirteen-key HDR10 static mastering and content-light metadata. */
+  struct HdrMetadataPayload {
+    std::uint16_t red_primary_x {};  ///< Red CIE 1931 x coordinate normalized to 50,000.
+    std::uint16_t red_primary_y {};  ///< Red CIE 1931 y coordinate normalized to 50,000.
+    std::uint16_t green_primary_x {};  ///< Green CIE 1931 x coordinate normalized to 50,000.
+    std::uint16_t green_primary_y {};  ///< Green CIE 1931 y coordinate normalized to 50,000.
+    std::uint16_t blue_primary_x {};  ///< Blue CIE 1931 x coordinate normalized to 50,000.
+    std::uint16_t blue_primary_y {};  ///< Blue CIE 1931 y coordinate normalized to 50,000.
+    std::uint16_t white_point_x {};  ///< White-point CIE 1931 x coordinate normalized to 50,000.
+    std::uint16_t white_point_y {};  ///< White-point CIE 1931 y coordinate normalized to 50,000.
+    std::uint16_t maximum_display_luminance {};  ///< Maximum mastering-display luminance in nits.
+    std::uint16_t minimum_display_luminance {};  ///< Minimum mastering-display luminance in 0.0001-nit units.
+    std::uint16_t maximum_content_light_level {};  ///< MaxCLL in nits, or zero when unknown.
+    std::uint16_t maximum_frame_average_light_level {};  ///< MaxFALL in nits, or zero when unknown.
+    std::uint16_t maximum_full_frame_luminance {};  ///< Display maximum full-frame luminance in nits, or zero.
+  };
+
   /** @brief Exact eight-key VIDEO_CONFIG host request. */
   struct VideoConfigPayload {
     Identifier128 session_id {};  ///< Active stream-session identifier.
     std::uint32_t stream_generation {};  ///< Active stream generation.
     VideoSelectionPayload video {};  ///< Exact selected video tuple repeated at key four.
-    std::vector<std::vector<std::uint8_t>> parameter_sets;  ///< Prefix-free SPS/PPS or VPS/SPS/PPS bytes.
+    VideoCodecConfigurationPayload codec_configuration {};  ///< Exact codec-specific decoder configuration map.
     std::uint64_t frame_id_origin {};  ///< Nonzero first frame-ID origin.
     std::uint32_t recovery_epoch {};  ///< Nonzero initial recovery epoch.
-    std::uint32_t maximum_complete_access_unit_bytes {};  ///< Bounded complete-AU parser/admission maximum.
+    std::optional<HdrMetadataPayload> hdr_metadata;  ///< Required static HDR metadata for PQ; null for SDR and HLG.
   };
 
   /** @brief Exact five-key VIDEO_CONFIG_ACK client response. */

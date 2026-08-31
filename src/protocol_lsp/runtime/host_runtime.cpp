@@ -414,11 +414,24 @@ namespace lumen::lsp::runtime {
              !config.host_name.empty() && config.host_name.size() <= 255;
     }
 
-    /** @brief Split bounded Annex-B codec initialization into prefix-free parameter sets. */
-    std::optional<std::vector<std::vector<std::uint8_t>>> split_video_parameter_sets(
+    /**
+     * @brief Split bounded encoder initialization into exact prefix-free video codec units.
+     *
+     * @param initialization Annex-B H.264/HEVC initialization or one low-overhead AV1 OBU.
+     * @param codec Negotiated codec that determines the exact required unit sequence.
+     * @return Prefix-free SPS/PPS, VPS/SPS/PPS, or AV1 sequence header; otherwise no value.
+     */
+    std::optional<std::vector<std::vector<std::uint8_t>>> split_video_codec_units(
       const std::span<const std::uint8_t> initialization,
       const VideoCodec codec
     ) {
+      if (codec == VideoCodec::av1) {
+        return initialization.empty() || initialization.size() > 512U ?
+                 std::nullopt :
+                 std::optional {std::vector<std::vector<std::uint8_t>> {
+                   {initialization.begin(), initialization.end()},
+                 }};
+      }
       const auto expected = codec == VideoCodec::h264 ? std::size_t {2} : std::size_t {3};
       std::vector<std::vector<std::uint8_t>> sets;
       sets.reserve(expected);
@@ -745,6 +758,7 @@ namespace lumen::lsp::runtime {
       std::uint64_t aggregate_pacing_bits_per_second {};  ///< Complete IP-layer pacing ceiling.
       std::uint64_t reserved_overhead_bits_per_second {};  ///< Host audio and control allowance.
       std::uint32_t feedback_sender_ssrc {};  ///< Negotiated client input SSRC for RTCP feedback.
+      std::uint32_t input_acknowledgement_ssrc {};  ///< Host LSPI sender SSRC retained across ATTACH allocation.
       std::uint32_t audio_feedback_ssrc {};  ///< Active host-audio SSRC admitted in aggregate CCFB.
       std::uint16_t path_payload_ceiling {1'200};  ///< Authenticated client/family DPLPMTUD ceiling.
       VideoNetworkProfile network_profile {VideoNetworkProfile::adaptive_low_latency};  ///< Selected controller profile.
@@ -1091,19 +1105,35 @@ namespace lumen::lsp::runtime {
       }};
     }
 
-    /** @brief Select and prove the first exact offered hardware SDR video tuple. */
+    /**
+     * @brief Select and prove the first exact offered Windows hardware video tuple.
+     *
+     * @param peer Authenticated peer whose address family constrains path accounting.
+     * @param request Exact decoded START request and ordered video offers.
+     * @param session_id Fresh nonzero session identifier.
+     * @param stream_generation Fresh nonzero stream generation.
+     * @param video_generation Fresh nonzero video generation.
+     * @param primary_ssrc Collision-free primary-video SSRC.
+     * @param repair_ssrc Collision-free candidate FlexFEC SSRC.
+     * @param rtx_ssrc Collision-free candidate RTX SSRC.
+     * @return Fully encoded/preflighted configuration or the exact START failure status.
+     */
     std::expected<ActiveVideoConfiguration, ControlStatus> select_video(
       const PeerEndpoint &peer,
       const StartRequestPayload &request,
       const Identifier128 &session_id,
       const std::uint32_t stream_generation,
       const std::uint32_t video_generation,
-      const std::uint32_t primary_ssrc
+      const std::uint32_t primary_ssrc,
+      const std::uint32_t repair_ssrc,
+      const std::uint32_t rtx_ssrc
     ) noexcept {
       const auto expected_profile = config_.host.profile == NetworkProfile::competition ?
                                       VideoNetworkProfile::competition :
                                       VideoNetworkProfile::adaptive_low_latency;
       if (request.network_profile != expected_profile || video_generation == 0 || primary_ssrc == 0 ||
+          repair_ssrc == 0 || rtx_ssrc == 0 || primary_ssrc == repair_ssrc || primary_ssrc == rtx_ssrc ||
+          repair_ssrc == rtx_ssrc ||
           is_zero(session_id) || stream_generation == 0 || proc::proc.running() > 0) {
         return std::unexpected(ControlStatus::unsupported_media_tuple);
       }
@@ -1120,7 +1150,20 @@ namespace lumen::lsp::runtime {
       }
       const auto competition_capacity = static_cast<std::uint64_t>(config_.host.competition_capacity_mbps) * 1'000'000ULL;
       for (const auto &offer : request.video_offers) {
-        const auto video_format = offer.codec == VideoCodec::h264 ? 0 : 1;
+        const auto video_format = offer.codec == VideoCodec::h264 ? 0 :
+                                  offer.codec == VideoCodec::hevc ? 1 :
+                                                                    2;
+        const auto ten_bit = offer.pixel_format == VideoPixelClass::yuv420_10 ||
+                             offer.pixel_format == VideoPixelClass::yuv444_10;
+        const auto yuv444 = offer.pixel_format == VideoPixelClass::yuv444_8 ||
+                            offer.pixel_format == VideoPixelClass::yuv444_10;
+        const auto hdr10 = offer.color_primaries == video_color_primaries_bt2020 &&
+                           offer.transfer_function == video_transfer_pq &&
+                           offer.matrix_coefficients == video_matrix_bt2020_ncl;
+        const auto hlg = offer.transfer_function == video_transfer_hlg;
+        if (hlg || (ten_bit != hdr10) || (hdr10 && offer.full_range)) {
+          continue;
+        }
         auto selected_bitrate = offer.preferred_bits_per_second;
         auto pacing_ceiling = offer.maximum_bits_per_second;
         if (request.network_profile == VideoNetworkProfile::competition) {
@@ -1130,7 +1173,7 @@ namespace lumen::lsp::runtime {
           pacing_ceiling = std::min(pacing_ceiling, competition_capacity);
           selected_bitrate = std::min(selected_bitrate, pacing_ceiling * 9U / 10U);
         }
-        if (selected_bitrate == 0 || selected_bitrate > pacing_ceiling ||
+        if (selected_bitrate < video_minimum_bits_per_second || selected_bitrate > pacing_ceiling ||
             selected_bitrate / 1'000U > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
           continue;
         }
@@ -1153,10 +1196,10 @@ namespace lumen::lsp::runtime {
             .bitrate = static_cast<int>(selected_bitrate / 1'000U),
             .slicesPerFrame = 1,
             .numRefFrames = 0,
-            .encoderCscMode = 2,
+            .encoderCscMode = 2 | static_cast<int>(offer.full_range),
             .videoFormat = video_format,
-            .dynamicRange = 0,
-            .chromaSamplingType = 0,
+            .dynamicRange = ten_bit ? 1 : 0,
+            .chromaSamplingType = yuv444 ? 1 : 0,
             .enableIntraRefresh = 0,
             .output_name = config::video.output_name,
             .optimization_policy = std::make_shared<const stream_policy::EffectiveStreamPolicy>(
@@ -1205,6 +1248,8 @@ namespace lumen::lsp::runtime {
           continue;
         }
         auto encoder_limits = platf::virtual_display::mode_limits_t {};
+        encoder_limits.supports_hdr10 = hdr10;
+        encoder_limits.supports_10bit = ten_bit;
         if (video_format == 0) {
           encoder_limits.maximum_width = 4'096;
           encoder_limits.maximum_height = 4'096;
@@ -1218,8 +1263,10 @@ namespace lumen::lsp::runtime {
               offer.width,
               offer.height,
               *refresh_ratio,
-              platf::virtual_display::dynamic_range_e::sdr,
-              8,
+              hdr10 ?
+                platf::virtual_display::dynamic_range_e::hdr10 :
+                platf::virtual_display::dynamic_range_e::sdr,
+              static_cast<std::uint8_t>(ten_bit ? 10 : 8),
             },
             platf::virtual_display::delivery_policy_e::latency,
             platf::virtual_display::fidelity_e::lossless
@@ -1267,16 +1314,51 @@ namespace lumen::lsp::runtime {
           (void) proc::proc.terminate_lsp_generation(launched.process_generation);
           return std::unexpected(ControlStatus::unsupported_media_tuple);
         }
+        const auto codec_supports_yuv444 = video::last_encoder_probe_supported_yuv444_for_codec[video_format];
+        const auto hdr420_supported =
+          (video_format == 1 && (video::active_hevc_mode == 3 || video::active_hevc_mode == 5)) ||
+          (video_format == 2 && (video::active_av1_mode == 3 || video::active_av1_mode == 5));
+        const auto hdr444_supported =
+          (video_format == 1 && (video::active_hevc_mode == 4 || video::active_hevc_mode == 5)) ||
+          (video_format == 2 && (video::active_av1_mode == 4 || video::active_av1_mode == 5));
+        if ((yuv444 && !codec_supports_yuv444) ||
+            (hdr10 && ((!yuv444 && !hdr420_supported) || (yuv444 && !hdr444_supported)))) {
+          (void) proc::proc.terminate_lsp_generation(launched.process_generation);
+          continue;
+        }
         selected.capture.enableIntraRefresh = capability.reference_invalidation ? 1 : 0;
         auto initialization = video::codec_initialization(selected.capture);
         if (!initialization) {
           (void) proc::proc.terminate_lsp_generation(launched.process_generation);
           return std::unexpected(ControlStatus::unsupported_media_tuple);
         }
-        auto parameter_sets = split_video_parameter_sets(*initialization, offer.codec);
-        if (!parameter_sets) {
+        auto codec_units = split_video_codec_units(*initialization, offer.codec);
+        if (!codec_units) {
           (void) proc::proc.terminate_lsp_generation(launched.process_generation);
           return std::unexpected(ControlStatus::unsupported_media_tuple);
+        }
+        std::optional<HdrMetadataPayload> hdr_metadata;
+        if (hdr10) {
+          const auto captured_metadata = video::active_hdr_metadata(selected.capture);
+          if (!captured_metadata) {
+            (void) proc::proc.terminate_lsp_generation(launched.process_generation);
+            continue;
+          }
+          hdr_metadata = HdrMetadataPayload {
+            .red_primary_x = captured_metadata->displayPrimaries[0].x,
+            .red_primary_y = captured_metadata->displayPrimaries[0].y,
+            .green_primary_x = captured_metadata->displayPrimaries[1].x,
+            .green_primary_y = captured_metadata->displayPrimaries[1].y,
+            .blue_primary_x = captured_metadata->displayPrimaries[2].x,
+            .blue_primary_y = captured_metadata->displayPrimaries[2].y,
+            .white_point_x = captured_metadata->whitePoint.x,
+            .white_point_y = captured_metadata->whitePoint.y,
+            .maximum_display_luminance = captured_metadata->maxDisplayLuminance,
+            .minimum_display_luminance = captured_metadata->minDisplayLuminance,
+            .maximum_content_light_level = captured_metadata->maxContentLightLevel,
+            .maximum_frame_average_light_level = captured_metadata->maxFrameAverageLightLevel,
+            .maximum_full_frame_luminance = captured_metadata->maxFullFrameLuminance,
+          };
         }
         std::array<std::uint8_t, 8> origin_bytes {};
         if (!crypto_->random(origin_bytes)) {
@@ -1287,6 +1369,10 @@ namespace lumen::lsp::runtime {
         if (frame_id_origin == 0) {
           frame_id_origin = 1;
         }
+        const auto maximum_access_unit_bytes = std::min<std::uint32_t>(
+          offer.maximum_complete_access_unit_bytes,
+          static_cast<std::uint32_t>(media::competition_frame_size_limit)
+        );
         selected.wire = {
           .session_id = session_id,
           .stream_generation = stream_generation,
@@ -1302,11 +1388,11 @@ namespace lumen::lsp::runtime {
             .refresh_numerator = offer.refresh_numerator,
             .refresh_denominator = offer.refresh_denominator,
             .selected_bits_per_second = selected_bitrate,
-            .pixel_format = video_pixel_format_nv12,
-            .color_primaries = video_color_rec709,
-            .transfer_function = video_color_rec709,
-            .matrix_coefficients = video_color_rec709,
-            .full_range = false,
+            .pixel_format = offer.pixel_format,
+            .color_primaries = offer.color_primaries,
+            .transfer_function = offer.transfer_function,
+            .matrix_coefficients = offer.matrix_coefficients,
+            .full_range = offer.full_range,
             .initial_udp_payload_size = 1'200,
             .decoder_surfaces = request.decoder_surfaces,
             .render_mailbox = 1,
@@ -1316,15 +1402,38 @@ namespace lumen::lsp::runtime {
             .frame_id_extension = video_frame_id_extension_id,
             .input_watermark_extension = video_input_watermark_extension_id,
             .encoder_timing_extension = video_encoder_timing_extension_id,
-            .flexfec = false,
-            .rtx = false,
+            .flexfec = offer.flexfec ?
+                         std::optional<FlexFecSelectionPayload> {FlexFecSelectionPayload {
+                           .repair_ssrc = repair_ssrc,
+                           .repair_payload_type = 98,
+                           .window_microseconds = request.maximum_capture_to_present_microseconds,
+                           .maximum_group_packets = 15,
+                         }} :
+                         std::nullopt,
+            .rtx = offer.rtx ?
+                     std::optional<RtxSelectionPayload> {RtxSelectionPayload {
+                       .rtx_ssrc = rtx_ssrc,
+                       .rtx_payload_type = 99,
+                       .associated_payload_type = 97,
+                     }} :
+                     std::nullopt,
             .maximum_frame_age_microseconds = request.maximum_capture_to_present_microseconds,
+            .maximum_complete_access_unit_bytes = maximum_access_unit_bytes,
           },
-          .parameter_sets = std::move(*parameter_sets),
+          .codec_configuration = {
+            .kind = offer.codec,
+            .units = std::move(*codec_units),
+          },
           .frame_id_origin = frame_id_origin,
           .recovery_epoch = 1,
-          .maximum_complete_access_unit_bytes = static_cast<std::uint32_t>(media::competition_frame_size_limit),
+          .hdr_metadata = hdr_metadata,
         };
+        const auto video_configuration_preflight = encode_video_config(selected.wire);
+        if (!video_configuration_preflight) {
+          (void) proc::proc.terminate_lsp_generation(launched.process_generation);
+          selected.display_lease.reset();
+          return std::unexpected(ControlStatus::unsupported_media_tuple);
+        }
         selected.aggregate_pacing_bits_per_second = pacing_ceiling;
         selected.process_generation = launched.process_generation;
         selected.reference_invalidation = capability.reference_invalidation;
@@ -1682,15 +1791,27 @@ namespace lumen::lsp::runtime {
       const std::uint8_t decoder_credit,
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease
     ) noexcept {
-      std::array<std::uint8_t, 6> random_timeline {};
+      std::array<std::uint8_t, 10> random_timeline {};
       const auto forward = find_forward_path(peer);
       if (!srtp_ || !crypto_ || !forward || !forward->path || !crypto_->random(random_timeline)) {
         return nullptr;
       }
       auto sequence = wire::read_be<std::uint16_t>(std::span<const std::uint8_t> {random_timeline}.first<2>());
-      auto timestamp = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {random_timeline}.subspan<2, 4>());
+      auto flexfec_sequence = selection.wire.video.flexfec ?
+                                wire::read_be<std::uint16_t>(std::span<const std::uint8_t> {random_timeline}.subspan<2, 2>()) :
+                                std::uint16_t {0};
+      auto rtx_sequence = selection.wire.video.rtx ?
+                            wire::read_be<std::uint16_t>(std::span<const std::uint8_t> {random_timeline}.subspan<4, 2>()) :
+                            std::uint16_t {0};
+      auto timestamp = wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {random_timeline}.subspan<6, 4>());
       if (sequence == 0) {
         sequence = 1;
+      }
+      if (selection.wire.video.flexfec && flexfec_sequence == 0) {
+        flexfec_sequence = 1;
+      }
+      if (selection.wire.video.rtx && rtx_sequence == 0) {
+        rtx_sequence = 1;
       }
       if (timestamp == 0) {
         timestamp = 1;
@@ -1711,10 +1832,12 @@ namespace lumen::lsp::runtime {
           .forward_path_generation = forward->generation,
           .video = selection.wire.video,
           .initial_sequence = sequence,
+          .initial_flexfec_sequence = flexfec_sequence,
+          .initial_rtx_sequence = rtx_sequence,
           .initial_timestamp = timestamp,
           .frame_id_origin = selection.wire.frame_id_origin,
           .initial_recovery_epoch = selection.wire.recovery_epoch,
-          .maximum_access_unit_bytes = selection.wire.maximum_complete_access_unit_bytes,
+          .maximum_access_unit_bytes = selection.wire.video.maximum_complete_access_unit_bytes,
           .maximum_capture_to_present_microseconds = selection.wire.video.maximum_frame_age_microseconds,
           .aggregate_pacing_bits_per_second = selection.aggregate_pacing_bits_per_second,
           .reserved_overhead_bits_per_second = selection.reserved_overhead_bits_per_second,
@@ -1865,7 +1988,7 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::internal_failure);
       }
 
-      std::array<std::uint8_t, 20> ssrc_bytes {};
+      std::array<std::uint8_t, 28> ssrc_bytes {};
       if (!crypto_->random(ssrc_bytes)) {
         return std::unexpected(ControlStatus::internal_failure);
       }
@@ -1893,6 +2016,16 @@ namespace lumen::lsp::runtime {
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<16, 4>()),
         video_reserved
       );
+      const std::array repair_reserved {input_ssrc, acknowledgement_ssrc, audio_ssrc, microphone_ssrc, video_ssrc};
+      const auto repair_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<20, 4>()),
+        repair_reserved
+      );
+      const std::array rtx_reserved {input_ssrc, acknowledgement_ssrc, audio_ssrc, microphone_ssrc, video_ssrc, repair_ssrc};
+      const auto rtx_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<24, 4>()),
+        rtx_reserved
+      );
       const auto audio_selection = select_audio(request, start.generations.audio, audio_ssrc);
       if (!audio_selection) {
         return std::unexpected(ControlStatus::unsupported_media_tuple);
@@ -1912,7 +2045,9 @@ namespace lumen::lsp::runtime {
         start.session_id,
         start.generations.stream,
         start.generations.video,
-        video_ssrc
+        video_ssrc,
+        repair_ssrc,
+        rtx_ssrc
       );
       if (!video_selection) {
         return std::unexpected(video_selection.error());
@@ -1931,6 +2066,7 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::path_capacity_insufficient);
       }
       video_selection->feedback_sender_ssrc = input_ssrc;
+      video_selection->input_acknowledgement_ssrc = acknowledgement_ssrc;
       video_selection->audio_feedback_ssrc = audio_ssrc;
       video_selection->path_payload_ceiling = request.offered_maximum_udp_payload;
       video_selection->network_profile = request.network_profile;
@@ -1943,7 +2079,7 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::path_capacity_insufficient);
       }
       constexpr std::uint8_t input_payload_type = 96;
-      std::array<SsrcAssignment, 4> assignments {
+      std::array<SsrcAssignment, 6> assignments {
         SsrcAssignment {
           .ssrc = input_ssrc,
           .payload_type = input_payload_type,
@@ -1967,13 +2103,41 @@ namespace lumen::lsp::runtime {
           .payload_type = video_selection->wire.video.primary_payload_type,
           .lane = MediaLane::video_primary,
           .direction = MediaDirection::host_to_client,
-          .format = video_selection->wire.video.codec == VideoCodec::h264 ? PayloadFormat::h264 : PayloadFormat::hevc,
+          .format = video_selection->wire.video.codec == VideoCodec::h264 ? PayloadFormat::h264 :
+                    video_selection->wire.video.codec == VideoCodec::hevc ? PayloadFormat::hevc :
+                                                                            PayloadFormat::av1,
           .clock_rate = video_selection->wire.video.clock_rate,
           .generation = video_selection->wire.video.video_generation,
         },
         SsrcAssignment {},
+        SsrcAssignment {},
+        SsrcAssignment {},
       };
       std::size_t assignment_count = 3;
+      if (video_selection->wire.video.flexfec) {
+        assignments[assignment_count++] = SsrcAssignment {
+          .ssrc = video_selection->wire.video.flexfec->repair_ssrc,
+          .payload_type = video_selection->wire.video.flexfec->repair_payload_type,
+          .lane = MediaLane::video_repair,
+          .direction = MediaDirection::host_to_client,
+          .format = PayloadFormat::flexfec,
+          .clock_rate = video_selection->wire.video.clock_rate,
+          .generation = video_selection->wire.video.video_generation,
+          .associated_primary_ssrc = video_selection->wire.video.primary_ssrc,
+        };
+      }
+      if (video_selection->wire.video.rtx) {
+        assignments[assignment_count++] = SsrcAssignment {
+          .ssrc = video_selection->wire.video.rtx->rtx_ssrc,
+          .payload_type = video_selection->wire.video.rtx->rtx_payload_type,
+          .lane = MediaLane::video_rtx,
+          .direction = MediaDirection::host_to_client,
+          .format = PayloadFormat::video_rtx,
+          .clock_rate = video_selection->wire.video.clock_rate,
+          .generation = video_selection->wire.video.video_generation,
+          .associated_primary_ssrc = video_selection->wire.video.primary_ssrc,
+        };
+      }
       if (*microphone_selection) {
         assignments[assignment_count++] = SsrcAssignment {
           .ssrc = (*microphone_selection)->microphone_ssrc,
@@ -2075,7 +2239,9 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::stale_generation);
       }
       if (request.intent_id == last_attach_intent_ || active_process_generation_ == 0 || proc::proc.running() <= 0 ||
-          !active_audio_configuration_ || !active_video_configuration_) {
+          !active_audio_configuration_ || !active_video_configuration_ ||
+          active_video_configuration_->feedback_sender_ssrc == 0 ||
+          active_video_configuration_->input_acknowledgement_ssrc == 0) {
         return std::unexpected(ControlStatus::stale_generation);
       }
       const auto previous_mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
@@ -2083,34 +2249,80 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::busy);
       }
       Secret256 replacement_token {};
-      std::array<std::uint8_t, 20> ssrc_bytes {};
+      std::array<std::uint8_t, 28> ssrc_bytes {};
       if (!crypto_->random(replacement_token) || !crypto_->random(ssrc_bytes)) {
         return std::unexpected(ControlStatus::internal_failure);
       }
+      std::array<std::uint32_t, SsrcRegistry::maximum_entries + 8U> reserved_ssrcs {};
+      std::size_t reserved_ssrc_count = 0;
+      reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->feedback_sender_ssrc;
+      reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->input_acknowledgement_ssrc;
+      reserved_ssrcs[reserved_ssrc_count++] = active_audio_configuration_->audio.audio_ssrc;
+      reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->wire.video.primary_ssrc;
+      if (active_microphone_configuration_) {
+        reserved_ssrcs[reserved_ssrc_count++] = active_microphone_configuration_->microphone.microphone_ssrc;
+      }
+      if (active_video_configuration_->wire.video.flexfec) {
+        reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->wire.video.flexfec->repair_ssrc;
+      }
+      if (active_video_configuration_->wire.video.rtx) {
+        reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->wire.video.rtx->rtx_ssrc;
+      }
       const auto input_ssrc = next_unique_nonzero_ssrc(
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.first<4>()),
-        {}
+        std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
-      const std::array input_reserved {input_ssrc};
+      if (input_ssrc == 0) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      reserved_ssrcs[reserved_ssrc_count++] = input_ssrc;
       const auto acknowledgement_ssrc = next_unique_nonzero_ssrc(
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<4, 4>()),
-        input_reserved
+        std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
-      const std::array audio_reserved {input_ssrc, acknowledgement_ssrc};
+      if (acknowledgement_ssrc == 0) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      reserved_ssrcs[reserved_ssrc_count++] = acknowledgement_ssrc;
       const auto audio_ssrc = next_unique_nonzero_ssrc(
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<8, 4>()),
-        audio_reserved
+        std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
-      const std::array microphone_reserved {input_ssrc, acknowledgement_ssrc, audio_ssrc};
+      if (audio_ssrc == 0) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      reserved_ssrcs[reserved_ssrc_count++] = audio_ssrc;
       const auto microphone_ssrc = next_unique_nonzero_ssrc(
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<12, 4>()),
-        microphone_reserved
+        std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
-      const std::array video_reserved {input_ssrc, acknowledgement_ssrc, audio_ssrc, microphone_ssrc};
+      if (microphone_ssrc == 0) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      reserved_ssrcs[reserved_ssrc_count++] = microphone_ssrc;
       const auto video_ssrc = next_unique_nonzero_ssrc(
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<16, 4>()),
-        video_reserved
+        std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
+      if (video_ssrc == 0) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      reserved_ssrcs[reserved_ssrc_count++] = video_ssrc;
+      const auto repair_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<20, 4>()),
+        std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
+      );
+      if (repair_ssrc == 0) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      reserved_ssrcs[reserved_ssrc_count++] = repair_ssrc;
+      const auto rtx_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<24, 4>()),
+        std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
+      );
+      if (rtx_ssrc == 0) {
+        return std::unexpected(ControlStatus::internal_failure);
+      }
       const AuthenticatedClient authority_client {
         .client_id = client.client_id,
         .connection_generation = connection_generation,
@@ -2163,7 +2375,14 @@ namespace lumen::lsp::runtime {
       }
       video_selection.wire.video.video_generation = next_video_generation;
       video_selection.wire.video.primary_ssrc = video_ssrc;
+      if (video_selection.wire.video.flexfec) {
+        video_selection.wire.video.flexfec->repair_ssrc = repair_ssrc;
+      }
+      if (video_selection.wire.video.rtx) {
+        video_selection.wire.video.rtx->rtx_ssrc = rtx_ssrc;
+      }
       video_selection.feedback_sender_ssrc = input_ssrc;
+      video_selection.input_acknowledgement_ssrc = acknowledgement_ssrc;
       video_selection.audio_feedback_ssrc = audio_ssrc;
       video_selection.wire.session_id = prior_snapshot.session_id;
       video_selection.wire.stream_generation = prior_snapshot.generations.stream;
@@ -2175,6 +2394,9 @@ namespace lumen::lsp::runtime {
       if (video_selection.wire.frame_id_origin == 0) {
         video_selection.wire.frame_id_origin = 1;
       }
+      if (!encode_video_config(video_selection.wire)) {
+        return std::unexpected(ControlStatus::unsupported_media_tuple);
+      }
       const auto initial_forward_rate = std::min(
         video_selection.aggregate_pacing_bits_per_second,
         video_selection.wire.video.selected_bits_per_second + video_selection.reserved_overhead_bits_per_second
@@ -2183,7 +2405,7 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::path_capacity_insufficient);
       }
       constexpr std::uint8_t input_payload_type = 96;
-      std::array<SsrcAssignment, 4> assignments {
+      std::array<SsrcAssignment, 6> assignments {
         SsrcAssignment {
           .ssrc = input_ssrc,
           .payload_type = input_payload_type,
@@ -2207,13 +2429,41 @@ namespace lumen::lsp::runtime {
           .payload_type = video_selection.wire.video.primary_payload_type,
           .lane = MediaLane::video_primary,
           .direction = MediaDirection::host_to_client,
-          .format = video_selection.wire.video.codec == VideoCodec::h264 ? PayloadFormat::h264 : PayloadFormat::hevc,
+          .format = video_selection.wire.video.codec == VideoCodec::h264 ? PayloadFormat::h264 :
+                    video_selection.wire.video.codec == VideoCodec::hevc ? PayloadFormat::hevc :
+                                                                           PayloadFormat::av1,
           .clock_rate = video_selection.wire.video.clock_rate,
           .generation = video_selection.wire.video.video_generation,
         },
         SsrcAssignment {},
+        SsrcAssignment {},
+        SsrcAssignment {},
       };
       std::size_t assignment_count = 3;
+      if (video_selection.wire.video.flexfec) {
+        assignments[assignment_count++] = SsrcAssignment {
+          .ssrc = video_selection.wire.video.flexfec->repair_ssrc,
+          .payload_type = video_selection.wire.video.flexfec->repair_payload_type,
+          .lane = MediaLane::video_repair,
+          .direction = MediaDirection::host_to_client,
+          .format = PayloadFormat::flexfec,
+          .clock_rate = video_selection.wire.video.clock_rate,
+          .generation = video_selection.wire.video.video_generation,
+          .associated_primary_ssrc = video_selection.wire.video.primary_ssrc,
+        };
+      }
+      if (video_selection.wire.video.rtx) {
+        assignments[assignment_count++] = SsrcAssignment {
+          .ssrc = video_selection.wire.video.rtx->rtx_ssrc,
+          .payload_type = video_selection.wire.video.rtx->rtx_payload_type,
+          .lane = MediaLane::video_rtx,
+          .direction = MediaDirection::host_to_client,
+          .format = PayloadFormat::video_rtx,
+          .clock_rate = video_selection.wire.video.clock_rate,
+          .generation = video_selection.wire.video.video_generation,
+          .associated_primary_ssrc = video_selection.wire.video.primary_ssrc,
+        };
+      }
       if (microphone_selection) {
         assignments[assignment_count++] = SsrcAssignment {
           .ssrc = microphone_selection->microphone_ssrc,
@@ -3126,6 +3376,12 @@ namespace lumen::lsp::runtime {
                 if (parsed.packet_type == transport::rtcp_transport_feedback_type &&
                     parsed.count == transport::rtcp_congestion_feedback_format) {
                   (void) sender.receive_congestion_feedback(parsed.packet, now);
+                } else if ((parsed.packet_type == transport::rtcp_transport_feedback_type &&
+                            parsed.count == transport::rtcp_generic_nack_format) ||
+                           (parsed.packet_type == transport::rtcp_payload_feedback_type &&
+                            (parsed.count == transport::rtcp_picture_loss_indication_format ||
+                             parsed.count == transport::rtcp_full_intra_request_format))) {
+                  (void) sender.receive_repair_feedback(parsed.packet, now);
                 }
                 offset += parsed.packet.size();
               }
@@ -3135,6 +3391,14 @@ namespace lumen::lsp::runtime {
           if (plaintext[1] == transport::rtcp_transport_feedback_type &&
               (plaintext[0] & 0x1fU) == transport::rtcp_congestion_feedback_format) {
             (void) sender.receive_congestion_feedback(plaintext, now);
+            return true;
+          }
+          if ((plaintext[1] == transport::rtcp_transport_feedback_type &&
+               (plaintext[0] & 0x1fU) == transport::rtcp_generic_nack_format) ||
+              (plaintext[1] == transport::rtcp_payload_feedback_type &&
+               ((plaintext[0] & 0x1fU) == transport::rtcp_picture_loss_indication_format ||
+                (plaintext[0] & 0x1fU) == transport::rtcp_full_intra_request_format))) {
+            (void) sender.receive_repair_feedback(plaintext, now);
             return true;
           }
         }

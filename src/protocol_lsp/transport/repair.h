@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -1484,168 +1485,371 @@ namespace lumen::lsp::transport {
            consume(estimate.decode_safety_reserve_microseconds);
   }
 
-  /** @brief Opaque reference to integration-owned source state sufficient to construct RFC 4588 RTX. */
+  /** @brief Number of values in the 16-bit RTP source sequence space. */
+  inline constexpr std::size_t rtx_sequence_space_size = std::size_t {1} << 16U;
+
+  /** @brief Fixed direct-index slots required for two simultaneous frame generations. */
+  inline constexpr std::size_t required_rtx_retention_slots =
+    maximum_rtx_frame_generations * rtx_sequence_space_size;
+
+  /** @brief Sentinel terminating one frame's intrusive retained-sequence list. */
+  inline constexpr std::uint32_t invalid_rtx_sequence_index = std::numeric_limits<std::uint32_t>::max();
+
+  /** @brief Opaque source state sufficient to construct one RFC 4588 packet. */
   struct rtx_packet_reference {
-    std::uint64_t reconstruction_token = 0;  ///< Nonzero retained reconstruction-state token.
-    std::uint64_t frame_id = 0;  ///< Encoded frame represented by the reconstruction state.
-    std::uint64_t frame_deadline_microseconds = 0;  ///< Absolute repair deadline.
-    std::uint32_t source_ssrc = 0;  ///< Primary source SSRC.
-    std::uint32_t video_generation = 0;  ///< Video configuration generation.
+    std::uint64_t reconstruction_token = 0;  ///< Unique nonzero integration-owned reconstruction token.
     std::uint16_t source_sequence_number = 0;  ///< Original primary RTP sequence number.
     std::size_t source_packet_bytes = 0;  ///< Complete original source RTP bytes represented by the token.
   };
 
-  /** @brief One caller-storage-backed RTX reconstruction retention entry. */
+  /** @brief One direct-index RTX reconstruction slot. */
   struct rtx_retained_packet {
-    rtx_packet_reference packet {};  ///< Opaque reconstruction reference and source metadata.
-    std::uint64_t expires_microseconds = 0;  ///< Earlier of frame repair deadline or one RTT.
-    std::uint64_t insertion_order = 0;  ///< Monotonic local insertion order.
-    bool occupied = false;  ///< Whether this slot retains one integration-owned token.
+    std::uint64_t reconstruction_token = 0;  ///< Live token, or zero after explicit packet erasure.
+    std::uint64_t frame_incarnation = 0;  ///< Lane incarnation that inserted this source sequence.
+    std::size_t source_packet_bytes = 0;  ///< Bytes charged while the token remains live.
+    std::uint32_t next_sequence_index = invalid_rtx_sequence_index;  ///< Next inserted sequence in this frame.
   };
 
-  /** @brief Result of retaining one source reconstruction token for possible RTX. */
+  /** @brief Metadata fixed for every source packet retained from one encoded frame. */
+  struct rtx_frame_descriptor {
+    std::uint64_t frame_id = 0;  ///< Nonzero encoded frame identifier.
+    std::uint64_t frame_deadline_microseconds = 0;  ///< Absolute repair deadline.
+    std::uint64_t now_microseconds = 0;  ///< Monotonic boundary time used for pruning and validation.
+    std::uint64_t retention_origin_microseconds = 0;  ///< Actual source retention/send origin.
+    std::uint64_t measured_rtt_microseconds = 0;  ///< Positive one-RTT retention bound.
+    std::uint32_t source_ssrc = 0;  ///< Primary source SSRC.
+    std::uint32_t video_generation = 0;  ///< Active video configuration generation.
+  };
+
+  /** @brief Stable handle for one building or committed frame lane incarnation. */
+  struct rtx_frame_handle {
+    std::uint64_t frame_id = 0;  ///< Encoded frame named by the handle.
+    std::uint64_t incarnation = 0;  ///< Lane reuse fence.
+    std::uint8_t lane = 0;  ///< Direct-index lane, zero or one.
+  };
+
+  /** @brief Transactional RTX frame lifecycle status. */
+  enum class rtx_frame_result : std::uint8_t {
+    accepted,  ///< Lifecycle operation completed.
+    invalid_storage,  ///< Fewer than 131072 direct-index slots were supplied.
+    invalid_frame,  ///< Frame, source, generation, or deadline metadata is invalid.
+    invalid_rtt,  ///< Frame begin requires a positive measured RTT.
+    expired,  ///< Frame retention expired before transactional commit.
+    build_in_progress,  ///< Another speculative frame must be committed or aborted first.
+    duplicate_frame,  ///< The frame identifier is already retained.
+    stale_handle,  ///< Handle does not name the current lane incarnation.
+    wrong_phase,  ///< Commit or abort does not match the frame's lifecycle phase.
+    empty_frame,  ///< A speculative frame with no retained packet cannot be committed.
+    order_exhausted,  ///< Monotonic frame order cannot advance safely.
+    frame_not_found,  ///< No active lane carries the requested frame identifier.
+  };
+
+  /** @brief Result of beginning one speculative RTX frame. */
+  struct rtx_frame_begin_result {
+    rtx_frame_handle handle {};  ///< Valid handle only when status is accepted.
+    std::size_t tokens_released = 0;  ///< Tokens released by boundary pruning or eviction.
+    rtx_frame_result status = rtx_frame_result::accepted;  ///< Typed begin status.
+
+    /** @brief Return whether a building frame was opened. */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return status == rtx_frame_result::accepted;
+    }
+  };
+
+  /** @brief Result of aborting, erasing, pruning, or clearing whole frames. */
+  struct rtx_frame_release_result {
+    std::size_t frames_released = 0;  ///< Frame lanes returned to the empty state.
+    std::size_t tokens_released = 0;  ///< Live reconstruction tokens released exactly once.
+    rtx_frame_result status = rtx_frame_result::accepted;  ///< Typed lifecycle status.
+
+    /** @brief Return whether the requested lifecycle operation completed. */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return status == rtx_frame_result::accepted;
+    }
+  };
+
+  /** @brief Result of retaining one packet in the current speculative frame. */
   enum class rtx_retention_result : std::uint8_t {
-    retained,  ///< Reference was retained without copying packet bytes.
-    invalid_packet,  ///< Token, frame, SSRC, generation, size, or deadline is invalid.
-    invalid_rtt,  ///< Positive measured RTT is required.
-    duplicate_packet,  ///< Same generation, SSRC, and source sequence is already retained.
-    byte_capacity_exceeded,  ///< Current frame alone cannot fit the 16 MiB connection limit.
-    slot_capacity_exceeded,  ///< Caller-provided metadata slots cannot retain the packet.
+    retained,  ///< Token ownership transferred into the building frame.
+    invalid_storage,  ///< Direct-index storage is undersized.
+    invalid_packet,  ///< Token or represented source size is invalid.
+    stale_handle,  ///< Handle does not name the current lane incarnation.
+    wrong_phase,  ///< Packets may only enter a building frame.
+    duplicate_packet,  ///< This sequence was already inserted in the frame incarnation.
+    byte_capacity_exceeded,  ///< Aggregate live source bytes would exceed 16 MiB.
   };
 
-  /** @brief Successful eligible RTX lookup result. */
+  /** @brief Successful strict-deadline RTX lookup result. */
   struct eligible_rtx_packet {
-    std::uint64_t reconstruction_token = 0;  ///< Integration-owned retained reconstruction-state token.
-    std::uint64_t frame_id = 0;  ///< Retained encoded frame generation.
+    std::uint64_t reconstruction_token = 0;  ///< Integration-owned retained reconstruction token.
+    std::uint64_t frame_id = 0;  ///< Newest committed encoded frame incarnation.
     std::uint32_t source_ssrc = 0;  ///< Original primary source SSRC.
-    std::uint32_t video_generation = 0;  ///< Active video generation retained with the token.
+    std::uint32_t video_generation = 0;  ///< Video generation retained with the token.
     std::uint16_t source_sequence_number = 0;  ///< RFC 4588 original sequence number.
     std::size_t source_packet_bytes = 0;  ///< Complete original source packet bytes.
   };
 
+  /** @brief Deterministic operation counts proving direct-index hot-path bounds. */
+  struct rtx_operation_counts {
+    std::uint64_t retain_slot_probes = 0;  ///< Exactly one direct slot probe per retain attempt.
+    std::uint64_t lookup_lane_probes = 0;  ///< Exactly two lane probes per NACK lookup.
+    std::uint64_t lookup_slot_probes = 0;  ///< At most two direct sequence-slot probes per lookup.
+    std::uint64_t boundary_slot_visits = 0;  ///< Inserted-list nodes visited only during frame release.
+  };
+
+  /** @brief Internal state of one of the two direct-index frame lanes. */
+  enum class rtx_frame_phase : std::uint8_t {
+    empty,  ///< Lane contains no frame.
+    building,  ///< Speculative packet tokens are retained but invisible to NACK lookup.
+    committed,  ///< Frame is visible to strict-deadline NACK lookup.
+  };
+
   /**
-   * @brief Caller-storage-backed RFC 4588 immutable source-retention state.
+   * @brief Allocation-free two-frame RFC 4588 direct-index retention.
    *
-   * Packet reconstruction state remains integration owned. This class stores only opaque retained
-   * tokens and bounded metadata, retaining at most two frame generations and 16 MiB. A token must
-   * reproduce the original RTP payload and required negotiated extensions after its source slab is
-   * SRTP-protected in place; it must never name ciphertext as if it were an RFC 4588 payload.
-   * Release callbacks retire evicted or explicitly erased tokens without heap allocation here.
+   * Each frame owns one 65536-entry lane indexed directly by source sequence number. Retain probes
+   * exactly one slot and NACK lookup probes at most one slot in each of two lanes, independent of
+   * packet count. A monotonically ordered lane resolves equal 16-bit sequences to the newest frame
+   * incarnation after wrap. Dense scans never occur: expiry and eviction traverse only the
+   * intrusive sequence list of a whole frame at explicit lifecycle boundaries.
+   *
+   * A token must reconstruct original plaintext RTP state after the source slab is SRTP-protected
+   * in place. Ownership transfers only from a successful `retain()` until exactly one packet erase,
+   * frame abort/erase, expiry, eviction, or `clear()` callback.
    */
   class rtx_retention {
   public:
     /**
-     * @brief Construct retention state over fixed caller-provided metadata slots.
+     * @brief Construct retention over two caller-owned 16-bit direct-index lanes.
      *
-     * @param slots Metadata storage allocated during connection setup.
+     * @param slots At least `required_rtx_retention_slots` fixed metadata entries.
      */
     constexpr explicit rtx_retention(const std::span<rtx_retained_packet> slots) noexcept:
-        slots_(slots) {
+        slots_(slots.first(std::min(slots.size(), required_rtx_retention_slots))) {
+      if (valid()) {
+        std::fill(slots_.begin(), slots_.end(), rtx_retained_packet {});
+      }
+    }
+
+    /** @brief Prevent duplicated ownership of retained reconstruction tokens. */
+    rtx_retention(const rtx_retention &) = delete;
+
+    /** @brief Prevent duplicated ownership of retained reconstruction tokens. */
+    rtx_retention &operator=(const rtx_retention &) = delete;
+
+    /** @brief Prevent moving storage-backed ownership without an explicit lifecycle handoff. */
+    rtx_retention(rtx_retention &&) = delete;
+
+    /** @brief Prevent moving storage-backed ownership without an explicit lifecycle handoff. */
+    rtx_retention &operator=(rtx_retention &&) = delete;
+
+    /**
+     * @brief Assert the documented clear-before-destruction ownership contract.
+     *
+     * Every successful `retain()` must be balanced through packet erase, frame release, or `clear()`
+     * before this object is destroyed. Debug builds assert that no token remains owned.
+     */
+    ~rtx_retention() {
+      assert(empty());
+    }
+
+    /** @brief Return whether the required two direct-index lanes are available. */
+    [[nodiscard]] constexpr bool valid() const noexcept {
+      return slots_.size() == required_rtx_retention_slots;
     }
 
     /**
-     * @brief Retain source reconstruction state until deadline or one RTT.
+     * @brief Begin one speculative frame and prune or evict only at this boundary.
      *
-     * @tparam Release Callable accepting an evicted nonzero token.
-     * @param packet Reconstruction token and media metadata.
-     * @param now_microseconds Current monotonic time.
-     * @param measured_rtt_microseconds Positive measured RTT.
-     * @param release Called once for each token evicted before insertion.
-     * @return Typed retention result.
+     * @tparam Release Callable accepting each released nonzero reconstruction token.
+     * @param descriptor Immutable frame scope and retention deadline inputs.
+     * @param release Called exactly once per token released by expiry or oldest-frame eviction.
+     * @return Building-frame handle, release counts, and typed status.
      */
     template<class Release>
-    constexpr rtx_retention_result retain(
-      const rtx_packet_reference &packet,
-      const std::uint64_t now_microseconds,
-      const std::uint64_t measured_rtt_microseconds,
+    constexpr rtx_frame_begin_result begin_frame(
+      const rtx_frame_descriptor &descriptor,
       Release &&release
     ) noexcept(noexcept(release(std::uint64_t {}))) {
-      prune(now_microseconds, release);
-      if (packet.reconstruction_token == 0 || packet.frame_id == 0 || packet.source_ssrc == 0 ||
-          packet.video_generation == 0 || packet.source_packet_bytes == 0 ||
-          packet.source_packet_bytes > maximum_rtx_retained_bytes ||
-          packet.frame_deadline_microseconds <= now_microseconds) {
+      if (!valid()) {
+        return {.status = rtx_frame_result::invalid_storage};
+      }
+      if (descriptor.frame_id == 0 || descriptor.source_ssrc == 0 || descriptor.video_generation == 0 ||
+          descriptor.frame_deadline_microseconds <= descriptor.now_microseconds ||
+          descriptor.retention_origin_microseconds > descriptor.now_microseconds) {
+        return {.status = rtx_frame_result::invalid_frame};
+      }
+      if (descriptor.measured_rtt_microseconds == 0) {
+        return {.status = rtx_frame_result::invalid_rtt};
+      }
+      const auto rtt_expiry = descriptor.retention_origin_microseconds >
+                                  std::numeric_limits<std::uint64_t>::max() - descriptor.measured_rtt_microseconds ?
+                                std::numeric_limits<std::uint64_t>::max() :
+                                descriptor.retention_origin_microseconds + descriptor.measured_rtt_microseconds;
+      const auto frame_expiry = std::min(descriptor.frame_deadline_microseconds, rtt_expiry);
+      if (descriptor.now_microseconds >= frame_expiry) {
+        return {.status = rtx_frame_result::expired};
+      }
+      for (const auto &lane : lanes_) {
+        if (lane.phase == rtx_frame_phase::building) {
+          return {.status = rtx_frame_result::build_in_progress};
+        }
+        if (lane.phase != rtx_frame_phase::empty && lane.frame_id == descriptor.frame_id) {
+          return {.status = rtx_frame_result::duplicate_frame};
+        }
+      }
+      if (frame_order_ == std::numeric_limits<std::uint64_t>::max()) {
+        return {.status = rtx_frame_result::order_exhausted};
+      }
+
+      auto pruned = prune_expired_frames(descriptor.now_microseconds, release);
+      auto lane_index = first_empty_lane();
+      if (!lane_index.has_value()) {
+        lane_index = oldest_committed_lane();
+        const auto evicted = release_lane(*lane_index, release);
+        pruned.frames_released += 1;
+        pruned.tokens_released += evicted;
+      }
+
+      auto &lane = lanes_[*lane_index];
+      ++lane.incarnation;
+      if (lane.incarnation == 0) {
+        lane.incarnation = 1;
+      }
+      ++frame_order_;
+      lane.phase = rtx_frame_phase::building;
+      lane.frame_id = descriptor.frame_id;
+      lane.frame_deadline_microseconds = descriptor.frame_deadline_microseconds;
+      lane.expires_microseconds = frame_expiry;
+      lane.frame_order = frame_order_;
+      lane.source_ssrc = descriptor.source_ssrc;
+      lane.video_generation = descriptor.video_generation;
+      lane.head_sequence_index = invalid_rtx_sequence_index;
+      lane.live_bytes = 0;
+      lane.live_packets = 0;
+      lane.inserted_packets = 0;
+      return {
+        .handle = {
+          .frame_id = lane.frame_id,
+          .incarnation = lane.incarnation,
+          .lane = static_cast<std::uint8_t>(*lane_index),
+        },
+        .tokens_released = pruned.tokens_released,
+      };
+    }
+
+    /**
+     * @brief Retain one reconstruction token in a building frame with one direct slot probe.
+     *
+     * The caller retains ownership on every failure. A successful call transfers ownership until a
+     * corresponding release callback. Reconstruction-token numeric uniqueness is a caller invariant.
+     *
+     * @param handle Current building-frame handle.
+     * @param packet Source sequence, byte charge, and reconstruction token.
+     * @return Typed retention status.
+     */
+    constexpr rtx_retention_result retain(
+      const rtx_frame_handle &handle,
+      const rtx_packet_reference &packet
+    ) noexcept {
+      if (!valid()) {
+        return rtx_retention_result::invalid_storage;
+      }
+      ++operation_counts_.retain_slot_probes;
+      auto *lane = lane_for(handle);
+      if (lane == nullptr) {
+        return rtx_retention_result::stale_handle;
+      }
+      if (lane->phase != rtx_frame_phase::building) {
+        return rtx_retention_result::wrong_phase;
+      }
+      if (packet.reconstruction_token == 0 || packet.source_packet_bytes == 0 ||
+          packet.source_packet_bytes > maximum_rtx_retained_bytes) {
         return rtx_retention_result::invalid_packet;
       }
-      if (measured_rtt_microseconds == 0) {
-        return rtx_retention_result::invalid_rtt;
+      auto &slot = slot_for(handle.lane, packet.source_sequence_number);
+      if (slot.frame_incarnation == lane->incarnation) {
+        return rtx_retention_result::duplicate_packet;
       }
-      for (const auto &slot : slots_) {
-        if (slot.occupied &&
-            (slot.packet.reconstruction_token == packet.reconstruction_token ||
-             (slot.packet.video_generation == packet.video_generation &&
-              slot.packet.source_ssrc == packet.source_ssrc &&
-              slot.packet.source_sequence_number == packet.source_sequence_number))) {
-          return rtx_retention_result::duplicate_packet;
-        }
+      if (retained_bytes_ > maximum_rtx_retained_bytes - packet.source_packet_bytes) {
+        return rtx_retention_result::byte_capacity_exceeded;
       }
-
-      while (!frame_is_retained(packet.frame_id) && retained_frame_count() >= maximum_rtx_frame_generations) {
-        evict_oldest_frame(release, 0);
-      }
-      while (retained_bytes_ > maximum_rtx_retained_bytes - packet.source_packet_bytes) {
-        if (!evict_oldest_frame(release, packet.frame_id)) {
-          return rtx_retention_result::byte_capacity_exceeded;
-        }
-      }
-
-      auto *slot = first_free_slot();
-      while (slot == nullptr) {
-        if (!evict_oldest_frame(release, packet.frame_id)) {
-          return rtx_retention_result::slot_capacity_exceeded;
-        }
-        slot = first_free_slot();
-      }
-      const auto rtt_expiry = now_microseconds > std::numeric_limits<std::uint64_t>::max() - measured_rtt_microseconds ?
-                                std::numeric_limits<std::uint64_t>::max() :
-                                now_microseconds + measured_rtt_microseconds;
-      ++insertion_order_;
-      if (insertion_order_ == 0) {
-        insertion_order_ = 1;
-      }
-      *slot = {
-        .packet = packet,
-        .expires_microseconds = std::min(packet.frame_deadline_microseconds, rtt_expiry),
-        .insertion_order = insertion_order_,
-        .occupied = true,
+      slot = {
+        .reconstruction_token = packet.reconstruction_token,
+        .frame_incarnation = lane->incarnation,
+        .source_packet_bytes = packet.source_packet_bytes,
+        .next_sequence_index = lane->head_sequence_index,
       };
+      lane->head_sequence_index = packet.source_sequence_number;
+      lane->live_bytes += packet.source_packet_bytes;
+      ++lane->live_packets;
+      ++lane->inserted_packets;
       retained_bytes_ += packet.source_packet_bytes;
       ++retained_packets_;
       return rtx_retention_result::retained;
     }
 
     /**
-     * @brief Release every reconstruction token whose frame deadline or one-RTT retention expired.
+     * @brief Atomically publish a nonempty speculative frame to NACK lookup.
      *
-     * @tparam Release Callable accepting one nonzero token.
-     * @param now_microseconds Current monotonic time.
-     * @param release Called once per expired reconstruction token.
-     * @return Number of expired packet references.
+     * @param handle Current building-frame handle.
+     * @param now_microseconds Monotonic commit time, checked against origin-based expiry.
+     * @return Typed lifecycle status.
      */
-    template<class Release>
-    constexpr std::size_t prune(
-      const std::uint64_t now_microseconds,
-      Release &&release
-    ) noexcept(noexcept(release(std::uint64_t {}))) {
-      std::size_t released = 0;
-      for (auto &slot : slots_) {
-        if (slot.occupied && now_microseconds >= slot.expires_microseconds) {
-          release_slot(slot, release);
-          ++released;
-        }
+    constexpr rtx_frame_result commit_frame(
+      const rtx_frame_handle &handle,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      auto *lane = lane_for(handle);
+      if (lane == nullptr) {
+        return rtx_frame_result::stale_handle;
       }
-      return released;
+      if (lane->phase != rtx_frame_phase::building) {
+        return rtx_frame_result::wrong_phase;
+      }
+      if (lane->live_packets == 0) {
+        return rtx_frame_result::empty_frame;
+      }
+      if (now_microseconds >= lane->expires_microseconds) {
+        return rtx_frame_result::expired;
+      }
+      lane->phase = rtx_frame_phase::committed;
+      return rtx_frame_result::accepted;
     }
 
     /**
-     * @brief Find a retained source packet only when an actual RTX remains deadline eligible.
+     * @brief Abort a speculative frame and release every accepted token exactly once.
+     *
+     * @tparam Release Callable accepting each released token.
+     * @param handle Current building-frame handle.
+     * @param release Integration token release callback.
+     * @return Frame/token release counts and typed status.
+     */
+    template<class Release>
+    constexpr rtx_frame_release_result abort_frame(
+      const rtx_frame_handle &handle,
+      Release &&release
+    ) noexcept(noexcept(release(std::uint64_t {}))) {
+      auto *lane = lane_for(handle);
+      if (lane == nullptr) {
+        return {.status = rtx_frame_result::stale_handle};
+      }
+      if (lane->phase != rtx_frame_phase::building) {
+        return {.status = rtx_frame_result::wrong_phase};
+      }
+      const auto released = release_lane(handle.lane, release);
+      return {.frames_released = 1, .tokens_released = released};
+    }
+
+    /**
+     * @brief Find the newest committed incarnation of a NACKed 16-bit sequence in O(1).
      *
      * @param video_generation Active video generation.
      * @param source_ssrc Primary source SSRC.
      * @param source_sequence_number NACKed primary sequence number.
      * @param now_microseconds Current monotonic time.
      * @param estimate Complete retransmission timing estimate.
-     * @return Opaque eligible source reference, or no value.
+     * @return Eligible newest reconstruction token, or no value.
      */
     [[nodiscard]] constexpr std::optional<eligible_rtx_packet> find_eligible(
       const std::uint32_t video_generation,
@@ -1654,34 +1858,51 @@ namespace lumen::lsp::transport {
       const std::uint64_t now_microseconds,
       const rtx_deadline_estimate &estimate
     ) const noexcept {
-      for (const auto &slot : slots_) {
-        if (slot.occupied && slot.packet.video_generation == video_generation &&
-            slot.packet.source_ssrc == source_ssrc &&
-            slot.packet.source_sequence_number == source_sequence_number &&
-            now_microseconds < slot.expires_microseconds &&
-            rtx_deadline_eligible(now_microseconds, slot.packet.frame_deadline_microseconds, estimate)) {
-          return eligible_rtx_packet {
-            .reconstruction_token = slot.packet.reconstruction_token,
-            .frame_id = slot.packet.frame_id,
-            .source_ssrc = slot.packet.source_ssrc,
-            .video_generation = slot.packet.video_generation,
-            .source_sequence_number = slot.packet.source_sequence_number,
-            .source_packet_bytes = slot.packet.source_packet_bytes,
-          };
+      const rtx_frame_lane *newest_lane = nullptr;
+      const rtx_retained_packet *newest_slot = nullptr;
+      for (std::size_t lane_index = 0; lane_index < lanes_.size(); ++lane_index) {
+        ++operation_counts_.lookup_lane_probes;
+        const auto &lane = lanes_[lane_index];
+        if (lane.phase != rtx_frame_phase::committed || lane.video_generation != video_generation ||
+            lane.source_ssrc != source_ssrc) {
+          continue;
+        }
+        ++operation_counts_.lookup_slot_probes;
+        const auto &slot = slot_for(lane_index, source_sequence_number);
+        if (slot.frame_incarnation != lane.incarnation) {
+          continue;
+        }
+        if (newest_lane == nullptr || lane.frame_order > newest_lane->frame_order) {
+          newest_lane = &lane;
+          newest_slot = &slot;
         }
       }
-      return std::nullopt;
+      if (newest_lane == nullptr) {
+        return std::nullopt;
+      }
+      if (newest_slot->reconstruction_token == 0 || now_microseconds >= newest_lane->expires_microseconds ||
+          !rtx_deadline_eligible(now_microseconds, newest_lane->frame_deadline_microseconds, estimate)) {
+        return std::nullopt;
+      }
+      return eligible_rtx_packet {
+        .reconstruction_token = newest_slot->reconstruction_token,
+        .frame_id = newest_lane->frame_id,
+        .source_ssrc = newest_lane->source_ssrc,
+        .video_generation = newest_lane->video_generation,
+        .source_sequence_number = source_sequence_number,
+        .source_packet_bytes = newest_slot->source_packet_bytes,
+      };
     }
 
     /**
-     * @brief Erase one retained source packet after repair, cancellation, or generation teardown.
+     * @brief Erase the newest committed incarnation of one sequence in O(1).
      *
-     * @tparam Release Callable accepting one nonzero reconstruction token.
-     * @param video_generation Video generation naming the packet.
-     * @param source_ssrc Primary source SSRC naming the packet.
-     * @param source_sequence_number Original source sequence number.
-     * @param release Called exactly once when a retained packet matches.
-     * @return `true` when one packet was erased.
+     * @tparam Release Callable accepting the released token.
+     * @param video_generation Active video generation.
+     * @param source_ssrc Primary source SSRC.
+     * @param source_sequence_number Resolved or retransmitted source sequence.
+     * @param release Integration token release callback.
+     * @return `true` when one live token was released.
      */
     template<class Release>
     constexpr bool erase(
@@ -1690,203 +1911,254 @@ namespace lumen::lsp::transport {
       const std::uint16_t source_sequence_number,
       Release &&release
     ) noexcept(noexcept(release(std::uint64_t {}))) {
-      for (auto &slot : slots_) {
-        if (slot.occupied && slot.packet.video_generation == video_generation &&
-            slot.packet.source_ssrc == source_ssrc &&
-            slot.packet.source_sequence_number == source_sequence_number) {
-          release_slot(slot, release);
-          return true;
+      std::optional<std::size_t> newest;
+      for (std::size_t lane_index = 0; lane_index < lanes_.size(); ++lane_index) {
+        const auto &lane = lanes_[lane_index];
+        if (lane.phase != rtx_frame_phase::committed || lane.video_generation != video_generation ||
+            lane.source_ssrc != source_ssrc) {
+          continue;
+        }
+        const auto &slot = slot_for(lane_index, source_sequence_number);
+        if (slot.frame_incarnation == lane.incarnation &&
+            (!newest.has_value() || lane.frame_order > lanes_[*newest].frame_order)) {
+          newest = lane_index;
         }
       }
-      return false;
-    }
-
-    /**
-     * @brief Erase one retained packet by its unique integration reconstruction token.
-     *
-     * @tparam Release Callable accepting the erased nonzero token.
-     * @param reconstruction_token Integration-owned token to remove.
-     * @param release Called exactly once when the token is retained.
-     * @return `true` when one packet was erased.
-     */
-    template<class Release>
-    constexpr bool erase_token(
-      const std::uint64_t reconstruction_token,
-      Release &&release
-    ) noexcept(noexcept(release(std::uint64_t {}))) {
-      if (reconstruction_token == 0) {
+      if (!newest.has_value()) {
         return false;
       }
-      for (auto &slot : slots_) {
-        if (slot.occupied && slot.packet.reconstruction_token == reconstruction_token) {
-          release_slot(slot, release);
-          return true;
-        }
+      if (slot_for(*newest, source_sequence_number).reconstruction_token == 0) {
+        return false;
       }
-      return false;
+      release_packet(*newest, source_sequence_number, release);
+      return true;
     }
 
     /**
-     * @brief Erase every retained reconstruction token for one encoded frame.
+     * @brief Erase one complete building or committed frame by identifier.
      *
-     * @tparam Release Callable accepting each erased nonzero token.
-     * @param frame_id Encoded frame whose retained source state is no longer useful.
-     * @param release Called exactly once for every matching packet.
-     * @return Number of packets erased.
+     * @tparam Release Callable accepting each released token.
+     * @param frame_id Encoded frame identifier.
+     * @param release Integration token release callback.
+     * @return Frame/token release counts and typed status.
      */
     template<class Release>
-    constexpr std::size_t erase_frame(
+    constexpr rtx_frame_release_result erase_frame(
       const std::uint64_t frame_id,
       Release &&release
     ) noexcept(noexcept(release(std::uint64_t {}))) {
-      std::size_t erased = 0;
-      for (auto &slot : slots_) {
-        if (slot.occupied && slot.packet.frame_id == frame_id) {
-          release_slot(slot, release);
-          ++erased;
+      for (std::size_t lane_index = 0; lane_index < lanes_.size(); ++lane_index) {
+        if (lanes_[lane_index].phase != rtx_frame_phase::empty && lanes_[lane_index].frame_id == frame_id) {
+          const auto released = release_lane(lane_index, release);
+          return {.frames_released = 1, .tokens_released = released};
         }
       }
-      return erased;
+      return {.status = rtx_frame_result::frame_not_found};
     }
 
     /**
-     * @brief Release every retained reconstruction token during stream teardown.
+     * @brief Prune expired committed frames at an explicit frame/timer boundary.
      *
-     * @tparam Release Callable accepting each erased nonzero token.
-     * @param release Called exactly once for every retained packet.
-     * @return Number of packets erased.
+     * @tparam Release Callable accepting each released token.
+     * @param now_microseconds Current monotonic time.
+     * @param release Integration token release callback.
+     * @return Aggregate frame/token release counts.
      */
     template<class Release>
-    constexpr std::size_t clear(Release &&release) noexcept(noexcept(release(std::uint64_t {}))) {
-      std::size_t erased = 0;
-      for (auto &slot : slots_) {
-        if (slot.occupied) {
-          release_slot(slot, release);
-          ++erased;
+    constexpr rtx_frame_release_result prune_expired_frames(
+      const std::uint64_t now_microseconds,
+      Release &&release
+    ) noexcept(noexcept(release(std::uint64_t {}))) {
+      rtx_frame_release_result result;
+      for (std::size_t lane_index = 0; lane_index < lanes_.size(); ++lane_index) {
+        if (lanes_[lane_index].phase == rtx_frame_phase::committed &&
+            now_microseconds >= lanes_[lane_index].expires_microseconds) {
+          result.tokens_released += release_lane(lane_index, release);
+          ++result.frames_released;
         }
       }
-      return erased;
+      return result;
     }
 
     /**
-     * @brief Return retained immutable source bytes.
+     * @brief Release every building or committed frame during stream teardown.
      *
-     * @return Aggregate represented source packet bytes, at most 16 MiB.
+     * @tparam Release Callable accepting each released token.
+     * @param release Integration token release callback.
+     * @return Aggregate frame/token release counts.
      */
+    template<class Release>
+    constexpr rtx_frame_release_result clear(Release &&release) noexcept(noexcept(release(std::uint64_t {}))) {
+      rtx_frame_release_result result;
+      for (std::size_t lane_index = 0; lane_index < lanes_.size(); ++lane_index) {
+        if (lanes_[lane_index].phase != rtx_frame_phase::empty) {
+          result.tokens_released += release_lane(lane_index, release);
+          ++result.frames_released;
+        }
+      }
+      frame_order_ = 0;
+      return result;
+    }
+
+    /** @brief Return aggregate represented source bytes, at most 16 MiB. */
     [[nodiscard]] constexpr std::size_t retained_bytes() const noexcept {
       return retained_bytes_;
     }
 
-    /**
-     * @brief Return retained packet-reference count.
-     *
-     * @return Occupied caller-storage slots.
-     */
+    /** @brief Return aggregate live reconstruction-token count. */
     [[nodiscard]] constexpr std::size_t retained_packets() const noexcept {
       return retained_packets_;
     }
 
-    /**
-     * @brief Return number of distinct retained frame generations.
-     *
-     * @return Zero through two frame generations.
-     */
+    /** @brief Return active building plus committed frame count, zero through two. */
     [[nodiscard]] constexpr std::size_t retained_frame_count() const noexcept {
-      std::uint64_t first_frame = 0;
-      std::size_t count = 0;
-      for (const auto &slot : slots_) {
-        if (!slot.occupied) {
-          continue;
-        }
-        if (count == 0) {
-          first_frame = slot.packet.frame_id;
-          count = 1;
-        } else if (slot.packet.frame_id != first_frame) {
-          return 2;
-        }
-      }
-      return count;
+      return static_cast<std::size_t>(std::count_if(lanes_.begin(), lanes_.end(), [](const rtx_frame_lane &lane) {
+        return lane.phase != rtx_frame_phase::empty;
+      }));
+    }
+
+    /** @brief Return whether no building or committed frame owns a reconstruction token. */
+    [[nodiscard]] constexpr bool empty() const noexcept {
+      return retained_packets_ == 0 && retained_frame_count() == 0;
+    }
+
+    /** @brief Return deterministic hot-path and boundary operation counts. */
+    [[nodiscard]] constexpr rtx_operation_counts operation_counts() const noexcept {
+      return operation_counts_;
+    }
+
+    /** @brief Reset diagnostic operation counts without changing retained state. */
+    constexpr void reset_operation_counts() noexcept {
+      operation_counts_ = {};
     }
 
   private:
-    /**
-     * @brief Return whether one frame currently has retained packets.
-     *
-     * @param frame_id Candidate frame ID.
-     * @return `true` when at least one occupied slot matches.
-     */
-    [[nodiscard]] constexpr bool frame_is_retained(const std::uint64_t frame_id) const noexcept {
-      return std::any_of(slots_.begin(), slots_.end(), [frame_id](const rtx_retained_packet &slot) {
-        return slot.occupied && slot.packet.frame_id == frame_id;
-      });
+    /** @brief Metadata for one direct-index frame lane. */
+    struct rtx_frame_lane {
+      rtx_frame_phase phase = rtx_frame_phase::empty;  ///< Current transactional lifecycle phase.
+      std::uint64_t frame_id = 0;  ///< Active encoded frame identifier.
+      std::uint64_t frame_deadline_microseconds = 0;  ///< Strict RTX repair deadline.
+      std::uint64_t expires_microseconds = 0;  ///< Earlier of deadline or one RTT from begin.
+      std::uint64_t frame_order = 0;  ///< Monotonic newest-incarnation ordering key.
+      std::uint64_t incarnation = 0;  ///< Lane reuse fence stored in direct slots.
+      std::uint32_t source_ssrc = 0;  ///< Primary source SSRC.
+      std::uint32_t video_generation = 0;  ///< Video generation.
+      std::uint32_t head_sequence_index = invalid_rtx_sequence_index;  ///< Intrusive inserted-list head.
+      std::size_t live_bytes = 0;  ///< Bytes charged by live tokens in this frame.
+      std::size_t live_packets = 0;  ///< Live token count after individual erasure.
+      std::size_t inserted_packets = 0;  ///< Inserted list nodes including erased tombstones.
+    };
+
+    /** @brief Return one mutable direct sequence slot. */
+    [[nodiscard]] constexpr rtx_retained_packet &slot_for(
+      const std::size_t lane,
+      const std::uint16_t sequence_number
+    ) noexcept {
+      return slots_[lane * rtx_sequence_space_size + sequence_number];
+    }
+
+    /** @brief Return one immutable direct sequence slot. */
+    [[nodiscard]] constexpr const rtx_retained_packet &slot_for(
+      const std::size_t lane,
+      const std::uint16_t sequence_number
+    ) const noexcept {
+      return slots_[lane * rtx_sequence_space_size + sequence_number];
+    }
+
+    /** @brief Resolve a fenced frame handle to its current lane. */
+    [[nodiscard]] constexpr rtx_frame_lane *lane_for(const rtx_frame_handle &handle) noexcept {
+      if (handle.lane >= lanes_.size()) {
+        return nullptr;
+      }
+      auto &lane = lanes_[handle.lane];
+      if (lane.phase == rtx_frame_phase::empty || lane.frame_id != handle.frame_id ||
+          lane.incarnation != handle.incarnation) {
+        return nullptr;
+      }
+      return &lane;
+    }
+
+    /** @brief Return the first empty lane, if any. */
+    [[nodiscard]] constexpr std::optional<std::size_t> first_empty_lane() const noexcept {
+      for (std::size_t index = 0; index < lanes_.size(); ++index) {
+        if (lanes_[index].phase == rtx_frame_phase::empty) {
+          return index;
+        }
+      }
+      return std::nullopt;
+    }
+
+    /** @brief Return the oldest committed lane when both lanes are active. */
+    [[nodiscard]] constexpr std::size_t oldest_committed_lane() const noexcept {
+      return lanes_[0].frame_order <= lanes_[1].frame_order ? 0U : 1U;
     }
 
     /**
-     * @brief Return the first unoccupied caller storage slot.
+     * @brief Release one live packet while preserving its inserted-list tombstone.
      *
-     * @return Slot pointer, or null when storage is full.
-     */
-    [[nodiscard]] constexpr rtx_retained_packet *first_free_slot() noexcept {
-      const auto found = std::find_if(slots_.begin(), slots_.end(), [](const rtx_retained_packet &slot) {
-        return !slot.occupied;
-      });
-      return found == slots_.end() ? nullptr : &*found;
-    }
-
-    /**
-     * @brief Release one occupied metadata slot and update aggregate bounds.
-     *
-     * @tparam Release Callable accepting one token.
-     * @param slot Occupied slot to release.
-     * @param release Integration packet-pool callback.
+     * @tparam Release Callable accepting the released token.
+     * @param lane_index Owning frame lane.
+     * @param sequence_number Direct source-sequence index.
+     * @param release Integration token release callback.
      */
     template<class Release>
-    constexpr void release_slot(
-      rtx_retained_packet &slot,
+    constexpr void release_packet(
+      const std::size_t lane_index,
+      const std::uint16_t sequence_number,
       Release &release
     ) noexcept(noexcept(release(std::uint64_t {}))) {
-      release(slot.packet.reconstruction_token);
-      retained_bytes_ -= slot.packet.source_packet_bytes;
+      auto &lane = lanes_[lane_index];
+      auto &slot = slot_for(lane_index, sequence_number);
+      release(slot.reconstruction_token);
+      retained_bytes_ -= slot.source_packet_bytes;
       --retained_packets_;
-      slot = {};
+      lane.live_bytes -= slot.source_packet_bytes;
+      --lane.live_packets;
+      slot.reconstruction_token = 0;
+      slot.source_packet_bytes = 0;
     }
 
     /**
-     * @brief Evict the oldest complete frame other than an optional protected frame.
+     * @brief Release every live token in one frame by its inserted sequence list.
      *
-     * @tparam Release Callable accepting one token.
-     * @param release Integration packet-pool callback.
-     * @param protected_frame Frame that must not be evicted, or zero.
-     * @return `true` when one frame was evicted.
+     * @tparam Release Callable accepting each released token.
+     * @param lane_index Frame lane to empty.
+     * @param release Integration token release callback.
+     * @return Number of live tokens released.
      */
     template<class Release>
-    constexpr bool evict_oldest_frame(
-      Release &release,
-      const std::uint64_t protected_frame
+    constexpr std::size_t release_lane(
+      const std::size_t lane_index,
+      Release &release
     ) noexcept(noexcept(release(std::uint64_t {}))) {
-      std::uint64_t oldest_frame = 0;
-      std::uint64_t oldest_order = std::numeric_limits<std::uint64_t>::max();
-      for (const auto &slot : slots_) {
-        if (slot.occupied && slot.packet.frame_id != protected_frame && slot.insertion_order < oldest_order) {
-          oldest_order = slot.insertion_order;
-          oldest_frame = slot.packet.frame_id;
+      auto &lane = lanes_[lane_index];
+      auto sequence_index = lane.head_sequence_index;
+      std::size_t released = 0;
+      std::size_t visited = 0;
+      while (sequence_index != invalid_rtx_sequence_index && visited < lane.inserted_packets) {
+        ++operation_counts_.boundary_slot_visits;
+        auto &slot = slot_for(lane_index, static_cast<std::uint16_t>(sequence_index));
+        const auto next = slot.next_sequence_index;
+        if (slot.frame_incarnation == lane.incarnation && slot.reconstruction_token != 0) {
+          release_packet(lane_index, static_cast<std::uint16_t>(sequence_index), release);
+          ++released;
         }
+        slot = {};
+        sequence_index = next;
+        ++visited;
       }
-      if (oldest_frame == 0) {
-        return false;
-      }
-      for (auto &slot : slots_) {
-        if (slot.occupied && slot.packet.frame_id == oldest_frame) {
-          release_slot(slot, release);
-        }
-      }
-      return true;
+      const auto incarnation = lane.incarnation;
+      lane = {};
+      lane.incarnation = incarnation;
+      return released;
     }
 
-    std::span<rtx_retained_packet> slots_ {};  ///< Caller-owned fixed metadata storage.
-    std::size_t retained_bytes_ = 0;  ///< Aggregate source bytes represented by retained tokens.
-    std::size_t retained_packets_ = 0;  ///< Occupied metadata slot count.
-    std::uint64_t insertion_order_ = 0;  ///< Local monotonic retention order.
+    std::span<rtx_retained_packet> slots_ {};  ///< Two caller-owned direct sequence-index lanes.
+    std::array<rtx_frame_lane, maximum_rtx_frame_generations> lanes_ {};  ///< Two active frame lanes.
+    std::size_t retained_bytes_ = 0;  ///< Aggregate source bytes represented by live tokens.
+    std::size_t retained_packets_ = 0;  ///< Aggregate live reconstruction-token count.
+    std::uint64_t frame_order_ = 0;  ///< Monotonic committed/newest incarnation order.
+    mutable rtx_operation_counts operation_counts_ {};  ///< Deterministic operation diagnostics.
   };
 
   /** @brief Cause that legitimately opens a frame-recovery epoch. */

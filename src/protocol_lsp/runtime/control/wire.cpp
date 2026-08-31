@@ -19,7 +19,7 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_applications = 64;
     constexpr std::size_t maximum_audio_offers = 12;
     constexpr std::size_t maximum_video_offers = 8;
-    constexpr std::size_t maximum_video_parameter_set_bytes = 512;
+    constexpr std::size_t maximum_video_codec_configuration_unit_bytes = 512;
 
     template<std::size_t Size>
     cbor::Value::Bytes bytes(const std::array<std::uint8_t, Size> &value) {
@@ -48,7 +48,7 @@ namespace lumen::lsp::runtime {
     cbor::Limits limits() noexcept {
       cbor::Limits value;
       value.max_encoded_bytes = maximum_payload_bytes;
-      value.max_byte_string_bytes = maximum_video_parameter_set_bytes;
+      value.max_byte_string_bytes = maximum_video_codec_configuration_unit_bytes;
       value.max_text_bytes = 512;
       value.max_array_elements = maximum_applications;
       value.max_map_entries = 32;
@@ -165,36 +165,154 @@ namespace lumen::lsp::runtime {
       }};
     }
 
-    /** @brief Return whether a codec and profile form one frozen SDR tuple. */
-    bool valid_video_codec_profile(const VideoCodec codec, const VideoProfile profile) noexcept {
-      return (codec == VideoCodec::h264 && profile == VideoProfile::h264_high) ||
-             (codec == VideoCodec::hevc && profile == VideoProfile::hevc_main);
+    /**
+     * @brief Return whether one codec, profile, and pixel class form a frozen video tuple.
+     *
+     * @param codec Negotiated video codec.
+     * @param profile Codec profile selected within that codec family.
+     * @param pixel Exact chroma-sampling and bit-depth class.
+     * @return True only for a schema-revision-three codec/profile/pixel tuple.
+     */
+    bool valid_video_codec_profile_pixel(
+      const VideoCodec codec,
+      const VideoProfile profile,
+      const VideoPixelClass pixel
+    ) noexcept {
+      switch (codec) {
+        case VideoCodec::h264:
+          return (profile == VideoProfile::h264_high && pixel == VideoPixelClass::yuv420_8) ||
+                 (profile == VideoProfile::h264_high_444_predictive && pixel == VideoPixelClass::yuv444_8);
+        case VideoCodec::hevc:
+          return (profile == VideoProfile::hevc_main && pixel == VideoPixelClass::yuv420_8) ||
+                 (profile == VideoProfile::hevc_main10 && pixel == VideoPixelClass::yuv420_10) ||
+                 (profile == VideoProfile::hevc_range_extensions &&
+                  (pixel == VideoPixelClass::yuv444_8 || pixel == VideoPixelClass::yuv444_10));
+        case VideoCodec::av1:
+          return (profile == VideoProfile::av1_main &&
+                  (pixel == VideoPixelClass::yuv420_8 || pixel == VideoPixelClass::yuv420_10)) ||
+                 (profile == VideoProfile::av1_high &&
+                  (pixel == VideoPixelClass::yuv444_8 || pixel == VideoPixelClass::yuv444_10));
+      }
+      return false;
     }
 
-    /** @brief Validate one exact ordered SDR video offer. */
+    /**
+     * @brief Return whether H.273 color values match the codec pixel-depth contract.
+     *
+     * @param codec Negotiated video codec.
+     * @param pixel Exact chroma-sampling and bit-depth class.
+     * @param primaries H.273 color-primaries value.
+     * @param transfer H.273 transfer-characteristic value.
+     * @param matrix H.273 matrix-coefficients value.
+     * @param full_range Whether decoded luma and chroma use full range.
+     * @return True only for exact BT.709 SDR, BT.2020/PQ, or BT.2020/HLG semantics.
+     */
+    bool valid_video_color_tuple(
+      const VideoCodec codec,
+      const VideoPixelClass pixel,
+      const std::uint8_t primaries,
+      const std::uint8_t transfer,
+      const std::uint8_t matrix,
+      const bool full_range
+    ) noexcept {
+      if (primaries == video_color_bt709 && transfer == video_color_bt709 &&
+          matrix == video_color_bt709) {
+        return true;
+      }
+      const auto ten_bit = pixel == VideoPixelClass::yuv420_10 || pixel == VideoPixelClass::yuv444_10;
+      return codec != VideoCodec::h264 && ten_bit && !full_range &&
+             primaries == video_color_primaries_bt2020 && matrix == video_matrix_bt2020_ncl &&
+             (transfer == video_transfer_pq || transfer == video_transfer_hlg);
+    }
+
+    /**
+     * @brief Validate one exact ordered video offer.
+     *
+     * @param offer Decoded eighteen-key video offer.
+     * @return True only when every codec, color, rate, delivery, and resource bound is valid.
+     */
     bool valid_video_offer(const VideoOfferPayload &offer) noexcept {
-      return valid_video_codec_profile(offer.codec, offer.profile) &&
+      return valid_video_codec_profile_pixel(offer.codec, offer.profile, offer.pixel_format) &&
+             valid_video_color_tuple(
+               offer.codec,
+               offer.pixel_format,
+               offer.color_primaries,
+               offer.transfer_function,
+               offer.matrix_coefficients,
+               offer.full_range
+             ) &&
              offer.width > 0 && offer.width <= 16'384 && offer.height > 0 && offer.height <= 16'384 &&
              offer.refresh_numerator > 0 && offer.refresh_denominator > 0 &&
-             offer.preferred_bits_per_second > 0 &&
+             offer.preferred_bits_per_second >= video_minimum_bits_per_second &&
              offer.preferred_bits_per_second <= offer.maximum_bits_per_second &&
+             offer.maximum_bits_per_second >= video_minimum_bits_per_second &&
              offer.maximum_bits_per_second <= 1'000'000'000ULL &&
-             offer.pixel_format == video_pixel_format_nv12 &&
-             offer.delivery == video_delivery_complete_access_unit && !offer.flexfec && !offer.rtx;
+             offer.delivery == video_delivery_complete_access_unit &&
+             offer.maximum_complete_access_unit_bytes > 0 &&
+             offer.maximum_complete_access_unit_bytes <= 16U * 1024U * 1024U;
     }
 
-    /** @brief Validate the exact first-slice selected SDR video tuple. */
+    /**
+     * @brief Validate one nullable FlexFEC association against its selected primary source.
+     *
+     * @param video Complete selected video tuple containing the nullable repair association.
+     * @return True for null or one exact bounded, collision-free FlexFEC selection.
+     */
+    bool valid_flexfec_selection(const VideoSelectionPayload &video) noexcept {
+      if (!video.flexfec) {
+        return true;
+      }
+      return video.flexfec->repair_ssrc != 0 && video.flexfec->repair_ssrc != video.primary_ssrc &&
+             video.flexfec->repair_payload_type >= 96 && video.flexfec->repair_payload_type <= 127 &&
+             video.flexfec->repair_payload_type != video.primary_payload_type &&
+             video.flexfec->window_microseconds > 0 &&
+             video.flexfec->window_microseconds <= video_maximum_frame_age_microseconds &&
+             video.flexfec->window_microseconds <= video.maximum_frame_age_microseconds &&
+             video.flexfec->maximum_group_packets == 15;
+    }
+
+    /**
+     * @brief Validate one nullable RTX association against its selected primary source.
+     *
+     * @param video Complete selected video tuple containing the nullable RTX association.
+     * @return True for null or one exact collision-free RFC 4588 selection.
+     */
+    bool valid_rtx_selection(const VideoSelectionPayload &video) noexcept {
+      if (!video.rtx) {
+        return true;
+      }
+      return video.rtx->rtx_ssrc != 0 && video.rtx->rtx_ssrc != video.primary_ssrc &&
+             video.rtx->rtx_payload_type >= 96 && video.rtx->rtx_payload_type <= 127 &&
+             video.rtx->rtx_payload_type != video.primary_payload_type &&
+             video.rtx->associated_payload_type == video.primary_payload_type &&
+             (!video.flexfec ||
+              (video.rtx->rtx_ssrc != video.flexfec->repair_ssrc &&
+               video.rtx->rtx_payload_type != video.flexfec->repair_payload_type));
+    }
+
+    /**
+     * @brief Validate the exact selected video tuple.
+     *
+     * @param video Thirty-key video selection model to validate before encoding.
+     * @return True only when all media, extension, repair, and resource invariants hold.
+     */
     bool valid_video_selection(const VideoSelectionPayload &video) noexcept {
       return video.video_generation != 0 && video.primary_ssrc != 0 &&
              video.primary_payload_type >= 96 && video.primary_payload_type <= 127 &&
-             video.clock_rate == 90'000 && valid_video_codec_profile(video.codec, video.profile) &&
+             video.clock_rate == 90'000 &&
+             valid_video_codec_profile_pixel(video.codec, video.profile, video.pixel_format) &&
+             valid_video_color_tuple(
+               video.codec,
+               video.pixel_format,
+               video.color_primaries,
+               video.transfer_function,
+               video.matrix_coefficients,
+               video.full_range
+             ) &&
              video.width > 0 && video.width <= 16'384 && video.height > 0 && video.height <= 16'384 &&
              video.refresh_numerator > 0 && video.refresh_denominator > 0 &&
-             video.selected_bits_per_second > 0 && video.selected_bits_per_second <= 1'000'000'000ULL &&
-             video.pixel_format == video_pixel_format_nv12 &&
-             video.color_primaries == video_color_rec709 &&
-             video.transfer_function == video_color_rec709 &&
-             video.matrix_coefficients == video_color_rec709 && !video.full_range &&
+             video.selected_bits_per_second >= video_minimum_bits_per_second &&
+             video.selected_bits_per_second <= 1'000'000'000ULL &&
              video.initial_udp_payload_size == 1'200 &&
              video.decoder_surfaces >= 2 && video.decoder_surfaces <= 4 &&
              video.render_mailbox == 1 && video.delivery == video_delivery_complete_access_unit &&
@@ -203,65 +321,279 @@ namespace lumen::lsp::runtime {
              video.frame_id_extension == video_frame_id_extension_id &&
              video.input_watermark_extension == video_input_watermark_extension_id &&
              video.encoder_timing_extension == video_encoder_timing_extension_id &&
-             !video.flexfec && !video.rtx && video.maximum_frame_age_microseconds > 0;
+             video.maximum_frame_age_microseconds > 0 &&
+             video.maximum_frame_age_microseconds <= video_maximum_frame_age_microseconds &&
+             video.maximum_complete_access_unit_bytes > 0 &&
+             video.maximum_complete_access_unit_bytes <= 16U * 1024U * 1024U &&
+             valid_flexfec_selection(video) && valid_rtx_selection(video);
     }
 
-    /** @brief Encode the frozen twenty-seven-key SDR video selection. */
-    cbor::Value video_selection(const VideoSelectionPayload &video) {
+    /**
+     * @brief Reject video primary/repair/RTX assignments that collide with another negotiated lane.
+     *
+     * @param video Validated video selection being compared.
+     * @param input_ssrc Negotiated client input SSRC.
+     * @param acknowledgement_ssrc Negotiated host input-acknowledgement SSRC.
+     * @param audio_ssrc Negotiated host-audio SSRC.
+     * @param microphone_ssrc Negotiated microphone SSRC, or zero when absent.
+     * @param input_payload_type Negotiated input RTP payload type.
+     * @param audio_payload_type Negotiated host-audio RTP payload type.
+     * @param microphone_payload_type Negotiated microphone payload type, or zero when absent.
+     * @return True when any video source or payload type conflicts with another lane.
+     */
+    bool video_selection_conflicts(
+      const VideoSelectionPayload &video,
+      const std::uint32_t input_ssrc,
+      const std::uint32_t acknowledgement_ssrc,
+      const std::uint32_t audio_ssrc,
+      const std::uint32_t microphone_ssrc,
+      const std::uint8_t input_payload_type,
+      const std::uint8_t audio_payload_type,
+      const std::uint8_t microphone_payload_type
+    ) noexcept {
+      const std::array reserved_ssrcs {input_ssrc, acknowledgement_ssrc, audio_ssrc, microphone_ssrc};
+      const std::array reserved_payload_types {input_payload_type, audio_payload_type, microphone_payload_type};
+      const auto ssrc_conflicts = [&](const std::uint32_t ssrc) {
+        return std::ranges::find(reserved_ssrcs, ssrc) != reserved_ssrcs.end();
+      };
+      const auto payload_type_conflicts = [&](const std::uint8_t payload_type) {
+        return std::ranges::find(reserved_payload_types, payload_type) != reserved_payload_types.end();
+      };
+      return ssrc_conflicts(video.primary_ssrc) || payload_type_conflicts(video.primary_payload_type) ||
+             (video.flexfec &&
+              (ssrc_conflicts(video.flexfec->repair_ssrc) ||
+               payload_type_conflicts(video.flexfec->repair_payload_type))) ||
+             (video.rtx &&
+              (ssrc_conflicts(video.rtx->rtx_ssrc) ||
+               payload_type_conflicts(video.rtx->rtx_payload_type)));
+    }
+
+    /**
+     * @brief Encode a nullable exact FlexFEC association.
+     *
+     * @param flexfec Optional validated FlexFEC selection.
+     * @return CBOR null or the exact four-key FlexFEC map.
+     */
+    cbor::Value flexfec_selection(const std::optional<FlexFecSelectionPayload> &flexfec) {
+      if (!flexfec) {
+        return cbor::Value {cbor::Null {}};
+      }
       return cbor::Value {cbor::Value::Map {
-        {1, video.video_generation},
-        {2, video.primary_ssrc},
-        {3, video.primary_payload_type},
-        {4, video.clock_rate},
-        {5, static_cast<std::uint8_t>(video.codec)},
-        {6, static_cast<std::uint8_t>(video.profile)},
-        {7, video.width},
-        {8, video.height},
-        {9, video.refresh_numerator},
-        {10, video.refresh_denominator},
-        {11, video.selected_bits_per_second},
-        {12, video.pixel_format},
-        {13, video.color_primaries},
-        {14, video.transfer_function},
-        {15, video.matrix_coefficients},
-        {16, cbor::Value {video.full_range}},
-        {17, video.initial_udp_payload_size},
-        {18, video.decoder_surfaces},
-        {19, video.render_mailbox},
-        {20, video.delivery},
-        {21, video.frame_marking_extension},
-        {22, video.absolute_capture_time_extension},
-        {23, video.frame_id_extension},
-        {24, video.input_watermark_extension},
-        {25, video.encoder_timing_extension},
-        {26, cbor::Value {video.flexfec}},
-        {27, cbor::Value {video.rtx}},
-        {28, video.maximum_frame_age_microseconds},
+        {1, flexfec->repair_ssrc},
+        {2, flexfec->repair_payload_type},
+        {3, flexfec->window_microseconds},
+        {4, flexfec->maximum_group_packets},
       }};
     }
 
-    /** @brief Validate prefix-free parameter sets for the selected codec. */
-    bool valid_parameter_sets(
-      const VideoCodec codec,
-      const std::vector<std::vector<std::uint8_t>> &sets
-    ) noexcept {
-      const auto expected = codec == VideoCodec::h264 ? std::size_t {2} : std::size_t {3};
-      if (sets.size() != expected) {
+    /**
+     * @brief Encode a nullable exact RTX association.
+     *
+     * @param rtx Optional validated RTX selection.
+     * @return CBOR null or the exact three-key RTX map.
+     */
+    cbor::Value rtx_selection(const std::optional<RtxSelectionPayload> &rtx) {
+      if (!rtx) {
+        return cbor::Value {cbor::Null {}};
+      }
+      return cbor::Value {cbor::Value::Map {
+        {1, rtx->rtx_ssrc},
+        {2, rtx->rtx_payload_type},
+        {3, rtx->associated_payload_type},
+      }};
+    }
+
+    /**
+     * @brief Encode the frozen thirty-key video selection.
+     *
+     * @param video Validated video selection.
+     * @return Exact deterministic-CBOR selection map.
+     */
+    cbor::Value video_selection(const VideoSelectionPayload &video) {
+      return cbor::Value {cbor::Value::Map {
+        {1, video_schema_version},
+        {2, video.video_generation},
+        {3, video.primary_ssrc},
+        {4, video.primary_payload_type},
+        {5, video.clock_rate},
+        {6, static_cast<std::uint8_t>(video.codec)},
+        {7, static_cast<std::uint8_t>(video.profile)},
+        {8, video.width},
+        {9, video.height},
+        {10, video.refresh_numerator},
+        {11, video.refresh_denominator},
+        {12, video.selected_bits_per_second},
+        {13, static_cast<std::uint8_t>(video.pixel_format)},
+        {14, video.color_primaries},
+        {15, video.transfer_function},
+        {16, video.matrix_coefficients},
+        {17, cbor::Value {video.full_range}},
+        {18, video.initial_udp_payload_size},
+        {19, video.decoder_surfaces},
+        {20, video.render_mailbox},
+        {21, video.delivery},
+        {22, video.frame_marking_extension},
+        {23, video.absolute_capture_time_extension},
+        {24, video.frame_id_extension},
+        {25, video.input_watermark_extension},
+        {26, video.encoder_timing_extension},
+        {27, flexfec_selection(video.flexfec)},
+        {28, rtx_selection(video.rtx)},
+        {29, video.maximum_frame_age_microseconds},
+        {30, video.maximum_complete_access_unit_bytes},
+      }};
+    }
+
+    /**
+     * @brief Validate one canonical low-overhead AV1 sequence-header OBU.
+     *
+     * @param unit Complete prefix-free OBU including its canonical size field.
+     * @return True only for one exact nonempty sequence-header OBU.
+     */
+    bool valid_av1_sequence_header(const std::span<const std::uint8_t> unit) noexcept {
+      if (unit.size() < 3 || (unit[0] & 0x81U) != 0 || ((unit[0] >> 3U) & 0x0fU) != 1U ||
+          (unit[0] & 0x02U) == 0) {
         return false;
       }
-      for (const auto &set : sets) {
-        if (set.empty() || set.size() > maximum_video_parameter_set_bytes ||
-            (set.size() >= 3 && set[0] == 0 && set[1] == 0 && (set[2] == 1 || (set.size() >= 4 && set[2] == 0 && set[3] == 1)))) {
+      std::size_t offset = 1;
+      if ((unit[0] & 0x04U) != 0) {
+        if (offset >= unit.size() || (unit[offset] & 0x07U) != 0) {
+          return false;
+        }
+        ++offset;
+      }
+      std::size_t payload_size = 0;
+      std::size_t shift = 0;
+      std::size_t leb_bytes = 0;
+      for (; leb_bytes < 8 && offset < unit.size(); ++leb_bytes, ++offset) {
+        const auto byte = unit[offset];
+        const auto value = static_cast<std::size_t>(byte & 0x7fU);
+        if (shift >= std::numeric_limits<std::size_t>::digits ||
+            value > (std::numeric_limits<std::size_t>::max() >> shift)) {
+          return false;
+        }
+        payload_size |= value << shift;
+        if ((byte & 0x80U) == 0) {
+          ++offset;
+          ++leb_bytes;
+          return payload_size != 0 && offset + payload_size == unit.size() &&
+                 (leb_bytes == 1 || value != 0);
+        }
+        shift += 7;
+      }
+      return false;
+    }
+
+    /**
+     * @brief Validate exact prefix-free codec configuration units.
+     *
+     * @param configuration Codec discriminator and ordered configuration units.
+     * @return True only for SPS/PPS, VPS/SPS/PPS, or one canonical AV1 sequence header.
+     */
+    bool valid_codec_configuration(const VideoCodecConfigurationPayload &configuration) noexcept {
+      const auto expected = configuration.kind == VideoCodec::h264 ? std::size_t {2} :
+                            configuration.kind == VideoCodec::hevc ? std::size_t {3} :
+                            configuration.kind == VideoCodec::av1  ? std::size_t {1} :
+                                                                     std::size_t {0};
+      if (expected == 0 || configuration.units.size() != expected) {
+        return false;
+      }
+      for (const auto &unit : configuration.units) {
+        if (unit.empty() || unit.size() > maximum_video_codec_configuration_unit_bytes ||
+            (unit.size() >= 3 && unit[0] == 0 && unit[1] == 0 &&
+             (unit[2] == 1 || (unit.size() >= 4 && unit[2] == 0 && unit[3] == 1)))) {
           return false;
         }
       }
-      if (codec == VideoCodec::h264) {
-        return (sets[0][0] & 0x1fU) == 7U && (sets[1][0] & 0x1fU) == 8U;
+      if (configuration.kind == VideoCodec::h264) {
+        return (configuration.units[0][0] & 0x1fU) == 7U &&
+               (configuration.units[1][0] & 0x1fU) == 8U;
       }
-      return sets[0].size() >= 2 && sets[1].size() >= 2 && sets[2].size() >= 2 &&
-             ((sets[0][0] >> 1U) & 0x3fU) == 32U &&
-             ((sets[1][0] >> 1U) & 0x3fU) == 33U &&
-             ((sets[2][0] >> 1U) & 0x3fU) == 34U;
+      if (configuration.kind == VideoCodec::hevc) {
+        return configuration.units[0].size() >= 2 && configuration.units[1].size() >= 2 &&
+               configuration.units[2].size() >= 2 &&
+               ((configuration.units[0][0] >> 1U) & 0x3fU) == 32U &&
+               ((configuration.units[1][0] >> 1U) & 0x3fU) == 33U &&
+               ((configuration.units[2][0] >> 1U) & 0x3fU) == 34U;
+      }
+      return valid_av1_sequence_header(configuration.units.front());
+    }
+
+    /**
+     * @brief Validate exact HDR10 mastering and content-light metadata.
+     *
+     * @param metadata Thirteen-field unsigned HDR10 metadata block.
+     * @return True only when chromaticity and luminance relationships are internally valid.
+     */
+    bool valid_hdr_metadata(const HdrMetadataPayload &metadata) noexcept {
+      const auto valid_point = [](const std::uint16_t x, const std::uint16_t y) {
+        return x != 0 && y != 0 && x <= 50'000U && y <= 50'000U;
+      };
+      if (!valid_point(metadata.red_primary_x, metadata.red_primary_y) ||
+          !valid_point(metadata.green_primary_x, metadata.green_primary_y) ||
+          !valid_point(metadata.blue_primary_x, metadata.blue_primary_y) ||
+          !valid_point(metadata.white_point_x, metadata.white_point_y) ||
+          metadata.maximum_display_luminance == 0 ||
+          static_cast<std::uint32_t>(metadata.minimum_display_luminance) >
+            static_cast<std::uint32_t>(metadata.maximum_display_luminance) * 10'000U ||
+          (metadata.maximum_content_light_level == 0) !=
+            (metadata.maximum_frame_average_light_level == 0) ||
+          metadata.maximum_frame_average_light_level > metadata.maximum_content_light_level ||
+          (metadata.maximum_full_frame_luminance != 0 &&
+           metadata.maximum_full_frame_luminance > metadata.maximum_display_luminance)) {
+        return false;
+      }
+      return !(metadata.red_primary_x == metadata.green_primary_x &&
+               metadata.red_primary_y == metadata.green_primary_y) &&
+             !(metadata.red_primary_x == metadata.blue_primary_x &&
+               metadata.red_primary_y == metadata.blue_primary_y) &&
+             !(metadata.green_primary_x == metadata.blue_primary_x &&
+               metadata.green_primary_y == metadata.blue_primary_y);
+    }
+
+    /**
+     * @brief Encode an exact codec-configuration map.
+     *
+     * @param configuration Validated codec discriminator and units.
+     * @return Exact two-key deterministic-CBOR codec-configuration map.
+     */
+    cbor::Value codec_configuration(const VideoCodecConfigurationPayload &configuration) {
+      cbor::Value::Array units;
+      units.reserve(configuration.units.size());
+      for (const auto &unit : configuration.units) {
+        units.emplace_back(cbor::Value::Bytes {unit.begin(), unit.end()});
+      }
+      return cbor::Value {cbor::Value::Map {
+        {1, static_cast<std::uint8_t>(configuration.kind)},
+        {2, std::move(units)},
+      }};
+    }
+
+    /**
+     * @brief Encode null or one exact thirteen-key HDR metadata map.
+     *
+     * @param metadata Optional validated HDR10 static metadata.
+     * @return CBOR null or the exact thirteen-key deterministic-CBOR metadata map.
+     */
+    cbor::Value hdr_metadata(const std::optional<HdrMetadataPayload> &metadata) {
+      if (!metadata) {
+        return cbor::Value {cbor::Null {}};
+      }
+      return cbor::Value {cbor::Value::Map {
+        {1, metadata->red_primary_x},
+        {2, metadata->red_primary_y},
+        {3, metadata->green_primary_x},
+        {4, metadata->green_primary_y},
+        {5, metadata->blue_primary_x},
+        {6, metadata->blue_primary_y},
+        {7, metadata->white_point_x},
+        {8, metadata->white_point_y},
+        {9, metadata->maximum_display_luminance},
+        {10, metadata->minimum_display_luminance},
+        {11, metadata->maximum_content_light_level},
+        {12, metadata->maximum_frame_average_light_level},
+        {13, metadata->maximum_full_frame_luminance},
+      }};
     }
   }  // namespace
 
@@ -427,6 +759,7 @@ namespace lumen::lsp::runtime {
         decoder_surfaces == nullptr || *decoder_surfaces < 2 || *decoder_surfaces > 4 ||
         render_mailbox == nullptr || *render_mailbox != 1 ||
         capture_to_present == nullptr || *capture_to_present == 0 ||
+        *capture_to_present > video_maximum_frame_age_microseconds ||
         *capture_to_present > std::numeric_limits<std::uint32_t>::max()) {
       return std::unexpected(ControlWireError::invalid_field);
     }
@@ -494,7 +827,7 @@ namespace lumen::lsp::runtime {
     decoded_video_offers.reserve(video_offers->size());
     for (const auto &encoded_video_offer : *video_offers) {
       const auto *offer = std::get_if<cbor::Value::Map>(&encoded_video_offer.storage);
-      if (offer == nullptr || offer->size() != 12) {
+      if (offer == nullptr || offer->size() != 18) {
         return std::unexpected(ControlWireError::invalid_shape);
       }
       for (std::size_t index = 0; index < offer->size(); ++index) {
@@ -502,30 +835,42 @@ namespace lumen::lsp::runtime {
           return std::unexpected(ControlWireError::invalid_shape);
         }
       }
-      const auto *codec = unsigned_value((*offer)[0].second);
-      const auto *profile = unsigned_value((*offer)[1].second);
-      const auto *width = unsigned_value((*offer)[2].second);
-      const auto *height = unsigned_value((*offer)[3].second);
-      const auto *refresh_numerator = unsigned_value((*offer)[4].second);
-      const auto *refresh_denominator = unsigned_value((*offer)[5].second);
-      const auto *preferred_bitrate = unsigned_value((*offer)[6].second);
-      const auto *maximum_bitrate = unsigned_value((*offer)[7].second);
-      const auto *pixel_format = unsigned_value((*offer)[8].second);
-      const auto *delivery = unsigned_value((*offer)[9].second);
-      const auto *flexfec = boolean_value((*offer)[10].second);
-      const auto *rtx = boolean_value((*offer)[11].second);
-      if (codec == nullptr || profile == nullptr || width == nullptr || height == nullptr ||
+      const auto *schema = unsigned_value((*offer)[0].second);
+      const auto *codec = unsigned_value((*offer)[1].second);
+      const auto *profile = unsigned_value((*offer)[2].second);
+      const auto *width = unsigned_value((*offer)[3].second);
+      const auto *height = unsigned_value((*offer)[4].second);
+      const auto *refresh_numerator = unsigned_value((*offer)[5].second);
+      const auto *refresh_denominator = unsigned_value((*offer)[6].second);
+      const auto *preferred_bitrate = unsigned_value((*offer)[7].second);
+      const auto *maximum_bitrate = unsigned_value((*offer)[8].second);
+      const auto *pixel_class = unsigned_value((*offer)[9].second);
+      const auto *color_primaries = unsigned_value((*offer)[10].second);
+      const auto *transfer_function = unsigned_value((*offer)[11].second);
+      const auto *matrix_coefficients = unsigned_value((*offer)[12].second);
+      const auto *full_range = boolean_value((*offer)[13].second);
+      const auto *delivery = unsigned_value((*offer)[14].second);
+      const auto *flexfec = boolean_value((*offer)[15].second);
+      const auto *rtx = boolean_value((*offer)[16].second);
+      const auto *maximum_access_unit = unsigned_value((*offer)[17].second);
+      if (schema == nullptr || *schema != video_schema_version || codec == nullptr ||
+          profile == nullptr || width == nullptr || height == nullptr ||
           refresh_numerator == nullptr || refresh_denominator == nullptr || preferred_bitrate == nullptr ||
-          maximum_bitrate == nullptr || pixel_format == nullptr || delivery == nullptr ||
-          flexfec == nullptr || rtx == nullptr ||
+          maximum_bitrate == nullptr || pixel_class == nullptr || color_primaries == nullptr ||
+          transfer_function == nullptr || matrix_coefficients == nullptr || full_range == nullptr ||
+          delivery == nullptr || flexfec == nullptr || rtx == nullptr || maximum_access_unit == nullptr ||
           *codec > std::numeric_limits<std::uint8_t>::max() ||
           *profile > std::numeric_limits<std::uint8_t>::max() ||
           *width > std::numeric_limits<std::uint32_t>::max() ||
           *height > std::numeric_limits<std::uint32_t>::max() ||
           *refresh_numerator > std::numeric_limits<std::uint32_t>::max() ||
           *refresh_denominator > std::numeric_limits<std::uint32_t>::max() ||
-          *pixel_format > std::numeric_limits<std::uint8_t>::max() ||
-          *delivery > std::numeric_limits<std::uint8_t>::max()) {
+          *pixel_class > std::numeric_limits<std::uint8_t>::max() ||
+          *color_primaries > std::numeric_limits<std::uint8_t>::max() ||
+          *transfer_function > std::numeric_limits<std::uint8_t>::max() ||
+          *matrix_coefficients > std::numeric_limits<std::uint8_t>::max() ||
+          *delivery > std::numeric_limits<std::uint8_t>::max() ||
+          *maximum_access_unit > std::numeric_limits<std::uint32_t>::max()) {
         return std::unexpected(ControlWireError::invalid_field);
       }
       VideoOfferPayload decoded {
@@ -537,10 +882,15 @@ namespace lumen::lsp::runtime {
         .refresh_denominator = static_cast<std::uint32_t>(*refresh_denominator),
         .preferred_bits_per_second = *preferred_bitrate,
         .maximum_bits_per_second = *maximum_bitrate,
-        .pixel_format = static_cast<std::uint8_t>(*pixel_format),
+        .pixel_format = static_cast<VideoPixelClass>(*pixel_class),
+        .color_primaries = static_cast<std::uint8_t>(*color_primaries),
+        .transfer_function = static_cast<std::uint8_t>(*transfer_function),
+        .matrix_coefficients = static_cast<std::uint8_t>(*matrix_coefficients),
+        .full_range = *full_range,
         .delivery = static_cast<std::uint8_t>(*delivery),
         .flexfec = *flexfec,
         .rtx = *rtx,
+        .maximum_complete_access_unit_bytes = static_cast<std::uint32_t>(*maximum_access_unit),
       };
       if (!valid_video_offer(decoded)) {
         return std::unexpected(ControlWireError::invalid_field);
@@ -584,13 +934,17 @@ namespace lumen::lsp::runtime {
                                 payload.microphone->microphone_ssrc == payload.audio.audio_ssrc ||
                                 payload.microphone->microphone_payload_type == payload.input_payload_type ||
                                 payload.microphone->microphone_payload_type == payload.audio.audio_payload_type)) ||
-        !valid_video_selection(payload.video) || payload.video.primary_ssrc == payload.input_ssrc ||
-        payload.video.primary_ssrc == payload.acknowledgement_ssrc ||
-        payload.video.primary_ssrc == payload.audio.audio_ssrc ||
-        payload.video.primary_payload_type == payload.input_payload_type ||
-        payload.video.primary_payload_type == payload.audio.audio_payload_type ||
-        (payload.microphone && (payload.video.primary_ssrc == payload.microphone->microphone_ssrc ||
-                                payload.video.primary_payload_type == payload.microphone->microphone_payload_type))) {
+        !valid_video_selection(payload.video) ||
+        video_selection_conflicts(
+          payload.video,
+          payload.input_ssrc,
+          payload.acknowledgement_ssrc,
+          payload.audio.audio_ssrc,
+          payload.microphone ? payload.microphone->microphone_ssrc : 0,
+          payload.input_payload_type,
+          payload.audio.audio_payload_type,
+          payload.microphone ? payload.microphone->microphone_payload_type : 0
+        )) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
@@ -675,13 +1029,17 @@ namespace lumen::lsp::runtime {
                                 payload.microphone->microphone_ssrc == payload.audio.audio_ssrc ||
                                 payload.microphone->microphone_payload_type == payload.input_payload_type ||
                                 payload.microphone->microphone_payload_type == payload.audio.audio_payload_type)) ||
-        !valid_video_selection(payload.video) || payload.video.primary_ssrc == payload.input_ssrc ||
-        payload.video.primary_ssrc == payload.acknowledgement_ssrc ||
-        payload.video.primary_ssrc == payload.audio.audio_ssrc ||
-        payload.video.primary_payload_type == payload.input_payload_type ||
-        payload.video.primary_payload_type == payload.audio.audio_payload_type ||
-        (payload.microphone && (payload.video.primary_ssrc == payload.microphone->microphone_ssrc ||
-                                payload.video.primary_payload_type == payload.microphone->microphone_payload_type))) {
+        !valid_video_selection(payload.video) ||
+        video_selection_conflicts(
+          payload.video,
+          payload.input_ssrc,
+          payload.acknowledgement_ssrc,
+          payload.audio.audio_ssrc,
+          payload.microphone ? payload.microphone->microphone_ssrc : 0,
+          payload.input_payload_type,
+          payload.audio.audio_payload_type,
+          payload.microphone ? payload.microphone->microphone_payload_type : 0
+        )) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
@@ -725,26 +1083,22 @@ namespace lumen::lsp::runtime {
   ) {
     if (is_zero(payload.session_id) || payload.stream_generation == 0 ||
         !valid_video_selection(payload.video) ||
-        !valid_parameter_sets(payload.video.codec, payload.parameter_sets) ||
+        payload.codec_configuration.kind != payload.video.codec ||
+        !valid_codec_configuration(payload.codec_configuration) ||
         payload.frame_id_origin == 0 || payload.recovery_epoch == 0 ||
-        payload.maximum_complete_access_unit_bytes == 0 ||
-        payload.maximum_complete_access_unit_bytes > 16U * 1024U * 1024U) {
+        (payload.video.transfer_function == video_transfer_pq) != payload.hdr_metadata.has_value() ||
+        (payload.hdr_metadata && !valid_hdr_metadata(*payload.hdr_metadata))) {
       return std::unexpected(ControlWireError::invalid_field);
     }
-    cbor::Value::Array parameter_sets;
-    parameter_sets.reserve(payload.parameter_sets.size());
-    for (const auto &set : payload.parameter_sets) {
-      parameter_sets.emplace_back(cbor::Value::Bytes {set.begin(), set.end()});
-    }
     return encode({
-      {1, video_configuration_schema_version},
+      {1, video_schema_version},
       {2, bytes(payload.session_id)},
       {3, payload.stream_generation},
       {4, video_selection(payload.video)},
-      {5, std::move(parameter_sets)},
+      {5, codec_configuration(payload.codec_configuration)},
       {6, payload.frame_id_origin},
       {7, payload.recovery_epoch},
-      {8, payload.maximum_complete_access_unit_bytes},
+      {8, hdr_metadata(payload.hdr_metadata)},
     });
   }
 
@@ -757,7 +1111,7 @@ namespace lumen::lsp::runtime {
     const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
     const auto *video_generation = map ? unsigned_value((*map)[3].second) : nullptr;
     const auto *decoder_credit = map ? unsigned_value((*map)[4].second) : nullptr;
-    if (!map || version == nullptr || *version != video_configuration_schema_version || status == nullptr ||
+    if (!map || version == nullptr || *version != video_schema_version || status == nullptr ||
         *status > static_cast<std::uint8_t>(ControlStatus::internal_failure) ||
         !fixed_bytes((*map)[2].second, result.session_id) || is_zero(result.session_id) ||
         video_generation == nullptr || *video_generation == 0 ||

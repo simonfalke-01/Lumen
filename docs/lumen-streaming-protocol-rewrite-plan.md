@@ -44,36 +44,38 @@ smallest decisive verification both pass. Source-only scaffolding remains
 | Select DTLS 1.3 provider | **Done** | Commercial wolfSSL 5.9.2 selected; tag `v5.9.2-stable` pinned | Keep license material external to the repository |
 | macOS DTLS-SRTP provider proof | **Done** | Live DTLS 1.3 exchange proved `TLS_AES_128_GCM_SHA256`, X25519, HRR cookie, ALPN `lumen-stream/1`, `SRTP_AEAD_AES_128_GCM`, and identical 56-byte exporter output | Repeat the exact proof on Windows/UCRT64 |
 | libSRTP wolfCrypt backend | **In progress** | The reviewed libSRTP 2.8.0 patch and CMake target are integrated; AES-128-GCM SRTP/SRTCP protection, encrypted extensions, authentication, and replay rejection pass on macOS | Repeat the provider-enabled product build and 16-byte-tag RTP/SRTCP proof on Windows/UCRT64 |
-| Shared portable C++23 core | **Done** | Photon is canonical at `git@github.com:simonfalke-01/Photon.git` commit `9ecda5b3a9c8f0738bcd6a436b38ddc81c463be8`, aggregate digest `95b38260…86fc594`; Lumen's offline lock/manifest/source-identity check and the LSPC, RTP, input, media, RFC 8627/4585/4588 repair, replay, pacing, congestion, DPLPMTUD, telemetry, and pooled-reassembly checks pass | Update Photon first, then advance each product's reviewed lock and source-identical mirror with its normal sync utility |
-| Umbra `CLSPCore` C ABI and mirror | **Done** | Umbra commits `7bcbaaf`, `2779806`, `0da9e46`, `2a8ce9d`, `094af81`, `81c945f`, and `eba2a0d`; ABI v1, digest gate, real UDP/kqueue wolfSSL/libSRTP runtime, retained complete-video buffers, allocation-free live frame reassembly, complete-Opus/timing callbacks, reverse-microphone sender, and provider-enabled warnings-as-errors product builds pass | Extend the ABI only at coarse input, completed-media, lifecycle, and telemetry boundaries |
+| Shared portable C++23 core | **Done** | Photon is canonical at `git@github.com:simonfalke-01/Photon.git` commit `82aca090343dad10bc9afec0af6a0783926659ae`, aggregate digest `1aeb5b57…7a55d41`; Lumen's offline lock/manifest/source-identity check and the LSPC, RTP, input, media, O(1) RFC 8627/4585/4588 repair, replay, pacing, congestion, DPLPMTUD, telemetry, AV1 receive, and token-retained recovery-preserving reassembly checks pass | Update Photon first, then advance each product's reviewed lock and source-identical mirror with its normal sync utility |
+| Umbra `CLSPCore` C ABI and mirror | **Done** | ABI v2, digest gate, real UDP/kqueue wolfSSL/libSRTP runtime, exact multi-SSRC policies, token-retained two-frame reassembly, retained complete encoded-access-unit buffers, complete-Opus/timing callbacks, reverse-microphone sender, and warnings-as-errors product builds pass | Extend the ABI only at coarse input, completed-media, lifecycle, and telemetry boundaries |
 | Lumen configuration, build, UI, and discovery foundation | **Done** | LSP config/UI, real runtime factory, active-only `_lumen-stream._udp`, digest gate, application/test builds, web build, and focused config/mDNS/LSP checks pass | Repeat the provider-enabled full product link on Windows/UCRT64 |
 | LSP host security/session foundation | **In progress** | Real nonblocking UDP ownership, wolfSSL DTLS 1.3, libSRTP contexts, fresh LSP identity persistence, invitations, pairing/authentication, LSP-only trust, LSPC reliability, browsing, and trusted-client administration are wired | Run the first real Lumen↔Umbra authenticated pairing/browse session and repeat on Windows/UCRT64 |
 | Frozen input wire/state primitives | **Done** | Ten focused tests pass across pointer/edge wire, device/sensor keys, baseline atomicity, loss/reorder, LSPI, LSPG, rates, and text barriers | Extend only when another input wire or safety invariant is implemented |
 | Remaining input schemas and product integration | **In progress** | Umbra commit `2df4cd2`; native IOHID/GameController input, public touch lifecycle, authenticated retry-safe LSPG ACKs, LED, CoreHaptics rumble, adaptive triggers, and motion commands are wired; Lumen applies all negotiated input classes and sends generation-qualified controller output | Prove the real Lumen↔Umbra path with physical 1/8 kHz pointer, controller, touch, and output devices |
 | Audio/video media primitives | **Done** | Seventeen focused tests verify H.264, HEVC, AV1, Opus, path limits, complete-frame admission, retained and pooled two-frame reassembly, decoder credits, and mailbox depth one; a direct 100,000-frame check records zero pooled-reassembly allocations after configuration | Extend only when another negotiated codec or frame-pipeline invariant is implemented |
-| Audio/video product integration | **In progress** | Lumen and Umbra wire host audio and reverse microphone. Lumen implements frozen first-slice SDR video negotiation, exact VDD/hardware-encoder proof, ACK-gated H.264/HEVC capture, allocation-free RTP emission, RFC 6904 extension policy, complete-frame admission, and bounded microbatch pacing without legacy transport reuse. Umbra commits `094af81`, `81c945f`, and `eba2a0d` implement matching native receive/depacketization, preallocated reassembly, retained-frame ABI, VideoToolbox/Metal delivery, and protected LSPV. | Run the first Windows-Lumen to macOS-Umbra media session and qualify the named hardware. |
+| Audio/video product integration | **In progress** | Lumen and Umbra wire host audio and reverse microphone. Both implement video schema revision three with exact H.264/HEVC/AV1, profile, pixel-class, H.273 SDR/HDR10/HLG, codec-configuration, HDR metadata, access-unit, and repair-association maps. Lumen proves the selected Windows capture/encoder tuple, rejects unproved HLG, preflights VIDEO_CONFIG before START/ATTACH commit, and keeps capture ACK-gated. Umbra derives offers from exact VideoToolbox/Metal probes, validates AV1 sequence-header color facts, uses latest-frame depth-one presentation, and fails conflicting decoded pixel/color/HDR state. | Run the first Windows-Lumen to macOS-Umbra media session on every hardware-proven tuple. |
 | Bounded transport state primitives | **Done** | Thirteen focused tests verify RTCP/AVPF, RFC 8888 cadence, LSPV coalescing, FEC-before-SRTP state, recovered-packet admission, RTX bounds, recovery epochs, congestion, PMTU, and generation fencing | Extend only when another transport wire or safety invariant is implemented |
-| Protected transport wire and product integration | **In progress** | Live SRTP/SRTCP covers input, audio, microphone, and primary video through one reviewed aggregate egress owner; RFC 6904 extensions, protected `LSPV`, exact-size `LSPP`, video SR/RR timing, and authenticated RFC 8888 feedback are wired. Video schema revision two carries `{frame_id, recovery_epoch}` on encrypted extension ID 3; recovery, dependency invalidation, packet admission, and retry are generation-fenced through terminal completion. | Integrate live FlexFEC and deadline-qualified RTX using the reviewed Photon wire primitives. |
+| Protected transport wire and product integration | **In progress** | Live SRTP/SRTCP covers input, audio, microphone, primary video, FlexFEC, and RTX through one reviewed aggregate egress owner and exact client SSRC policies. Lumen emits loss-activated frame-local FEC-before-SRTP parity, retains two O(1)-indexed successful AU generations for deadline-qualified RTX, and accounts primary/FEC/RTX RFC 8888 evidence independently. Umbra receives into pool slabs, retains same-frame repair slices without copies, authenticates recovered originals through one replay window, emits bounded urgent NACK retries, and preserves repair across recovery-epoch reorder. Recovery, dependency invalidation, packet admission, and retry are generation-fenced through terminal completion. | Live-prove loss, reorder, FlexFEC, RTX, recovery, and congestion convergence on Windows/macOS hardware. |
 | Reconnect, rekey, lifecycle, telemetry product surfaces | **In progress** | Lumen commit `b322abc3` plus current media integration rotate connection/input/audio/microphone/video authority and defer old DTLS/SRTP/VDD/media retirement; Umbra commits through `81c945f` preserve failed planned-rekey state and complete fresh decoder/router handoff before ACK | Run a live cross-process reconnect/rekey and validate every active media generation on hardware |
 | Final conformance, packaging, performance, and hardware qualification | **Pending** | None claimed | Run only after the complete live feature works |
 
-Current functional stop point: both products contain matching real LSP UDP,
+Current functional stop point: both products contain real LSP UDP,
 wolfSSL, libSRTP, control, trust, START/STOP/ATTACH, input, host-audio, reverse
-microphone, and primary SDR H.264/HEVC paths. Those compiled paths use real
+microphone, and primary video paths. Lumen's compiled control path now uses
+video schema revision three for H.264, HEVC, AV1, SDR, HDR10, HLG, 8/10-bit,
+and 4:2:0/4:4:4 tuples; only exact Windows capture/hardware-proven tuples are
+selectable, and HLG currently fails closed because the Windows configuration
+boundary cannot yet prove that transfer. The media paths use real
 platform capture, VDD/hardware encode, native authenticated media, bounded
 reassembly/credits, VideoToolbox, Metal, and generation-aware reconnect. No
 live picture or end-to-end latency claim is made until a Windows Lumen and
 macOS Umbra session is exercised. Authenticated multi-SSRC RFC 8888 feedback,
 media SR/RR timing, exact-size SRTCP DPLPMTUD, remote black-hole recovery, and
 frame-boundary path/rate changes are now product-wired on both sides.
-Host-to-client producers now use the shared aggregate egress owner and the
-first complete recovery epoch/`LSPV` boundary has passed focused product builds
-and independent correction review. FlexFEC/RTX remain product-integration work.
-The live Umbra
-video receiver now allocates its two frame byte regions, fragment descriptors,
-ordered slice views, and retained decoder-frame pool only when the authenticated
-video generation is configured; its packet and completed-frame reassembly path
-performs no heap allocation after that point.
+Host-to-client producers use the shared aggregate egress owner, and complete
+recovery, FlexFEC, RTX, multi-SSRC feedback, and `LSPV` paths have passed focused
+product builds and independent correction review. Umbra allocates its receive
+slabs, retained slice descriptors, and decoder-frame pool only when the
+authenticated video generation is configured; the steady packet/reassembly
+path performs no heap allocation and only the final decoder transform may copy.
 
 ## 2. Non-negotiable boundaries
 
@@ -663,8 +665,9 @@ Recover real loss without a full-IDR feedback loop.
    microseconds of competition-path reorder delay; and
 6. adaptive repair ratio.
 
-Current implementation status: video control schema revision two and the
-12-byte encrypted `{frame_id, recovery_epoch}` value are wired. Lumen seeds the
+Current implementation status: video control schema revision three, exact
+optional FlexFEC/RTX associations, and the 12-byte encrypted
+`{frame_id, recovery_epoch}` value are wired. Lumen seeds the
 Photon recovery controller from configuration, reserves the sole independent
 recovery frame before first packet commit, gates a second independent frame,
 confirms decode by same-epoch watermark, and permits one retry only after both
@@ -708,6 +711,14 @@ After the primary competition slice works:
 - add rational refresh values and variable-refresh presentation;
 - add adaptive resolution only when explicitly offered; and
 - add DPLPMTUD growth beyond 1,200 bytes.
+
+Current implementation status: the revision-three control wire, Windows host
+selection, codec-specific configuration, and fail-closed H.273 tuple validation
+are complete for H.264, HEVC, AV1, SDR, HDR10, HLG, 8/10-bit, and 4:2:0/4:4:4.
+Actual selection remains limited to the current capture/hardware-encoder
+generation's proof; the Windows configuration boundary does not yet prove HLG and therefore
+rejects it rather than encoding PQ. Live client decode and hardware
+qualification remain the stage exit gate.
 
 Each is a separate real vertical slice with its own direct scenario and
 regression tests.

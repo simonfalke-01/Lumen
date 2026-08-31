@@ -1665,10 +1665,12 @@ namespace video {
 
   lsp_sdr_encoder_capability_t active_lsp_sdr_encoder_capability(const int video_format) noexcept {
     const auto probe_lock = std::lock_guard(encoder_probe_mutex);
-    if (chosen_encoder == nullptr || (video_format != 0 && video_format != 1)) {
+    if (chosen_encoder == nullptr || video_format < 0 || video_format > 2) {
       return {};
     }
-    const auto &codec = video_format == 0 ? chosen_encoder->h264 : chosen_encoder->hevc;
+    const auto &codec = video_format == 0 ? chosen_encoder->h264 :
+                        video_format == 1 ? chosen_encoder->hevc :
+                                            chosen_encoder->av1;
     const auto supported = codec[encoder_t::PASSED];
     const auto hardware = supported && chosen_encoder != &software;
     const auto native_nvenc = hardware && chosen_encoder->name == "nvenc"sv;

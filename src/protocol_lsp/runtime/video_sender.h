@@ -1,6 +1,6 @@
 /**
  * @file src/protocol_lsp/runtime/video_sender.h
- * @brief Complete-access-unit LSP SDR H.264/HEVC RTP/SRTP sender ownership.
+ * @brief Complete-access-unit LSP H.264/HEVC/AV1 RTP/SRTP sender and repair ownership.
  */
 
 #pragma once
@@ -140,6 +140,81 @@ namespace lumen::lsp::runtime {
     return committed_packets != 0;
   }
 
+  /**
+   * @brief Return codec-payload headroom required by currently active repair.
+   *
+   * The 15-packet RFC 8627 short-mask form needs 16 bytes beyond the protected source RTP packet;
+   * RFC 4588 needs the two-byte original sequence number. Reserving the larger active form keeps
+   * every primary packet reconstructible without exceeding the path payload.
+   *
+   * @param flexfec_active Whether measured loss activates FlexFEC for this frame.
+   * @param rtx_selected Whether the generation negotiated RTX.
+   * @return Zero, two, or sixteen codec-payload bytes reserved from every primary packet.
+   */
+  [[nodiscard]] constexpr std::size_t video_repair_packetization_reserve(
+    const bool flexfec_active,
+    const bool rtx_selected
+  ) noexcept {
+    return flexfec_active ? 16U : rtx_selected ? 2U :
+                                                 0U;
+  }
+
+  /**
+   * @brief Clamp adaptive FlexFEC groups and strengthen independent frames.
+   *
+   * @param measured_group_packets Loss-selected source packets per parity group.
+   * @param independent Whether the frame is independently decodable or carries configuration.
+   * @return A short-mask group size from two through fifteen packets.
+   */
+  [[nodiscard]] constexpr std::size_t video_flexfec_group_packet_limit(
+    const std::size_t measured_group_packets,
+    const bool independent
+  ) noexcept {
+    const auto configured = std::clamp<std::size_t>(measured_group_packets, 2U, 15U);
+    return independent ? std::max<std::size_t>(2U, (configured + 1U) / 2U) : configured;
+  }
+
+  /**
+   * @brief Apply the competition-mode ordinary-delta RTX policy.
+   *
+   * @param profile Active video network profile.
+   * @param competition_delta_rtx Explicit local opt-in for delta RTX in competition mode.
+   * @param independent Whether the retained frame is independently decodable.
+   * @return True when the frame may be considered by the strict RTX deadline gate.
+   */
+  [[nodiscard]] constexpr bool video_rtx_frame_allowed(
+    const VideoNetworkProfile profile,
+    const bool competition_delta_rtx,
+    const bool independent
+  ) noexcept {
+    return profile != VideoNetworkProfile::competition || competition_delta_rtx || independent;
+  }
+
+  /**
+   * @brief Match one RFC 5104 FIR command against the retained idempotence tuple.
+   *
+   * @param retained Whether a prior command tuple exists.
+   * @param retained_sender_ssrc Prior feedback sender SSRC.
+   * @param retained_media_ssrc Prior targeted media SSRC.
+   * @param retained_sequence Prior FIR command sequence.
+   * @param sender_ssrc Candidate feedback sender SSRC.
+   * @param media_ssrc Candidate targeted media SSRC.
+   * @param sequence Candidate FIR command sequence.
+   * @return True only when the complete command tuple is a duplicate.
+   */
+  [[nodiscard]] constexpr bool video_fir_command_is_duplicate(
+    const bool retained,
+    const std::uint32_t retained_sender_ssrc,
+    const std::uint32_t retained_media_ssrc,
+    const std::uint8_t retained_sequence,
+    const std::uint32_t sender_ssrc,
+    const std::uint32_t media_ssrc,
+    const std::uint8_t sequence
+  ) noexcept {
+    return retained && retained_sender_ssrc == sender_ssrc && retained_media_ssrc == media_ssrc &&
+           retained_sequence == sequence;
+  }
+
   /** @brief Product action resulting from authenticated `LSPV` recovery evidence. */
   enum class VideoRecoveryFeedbackAction : std::uint8_t {
     ignored,  ///< Status is invalid, stale, or outside the current recovery epoch.
@@ -187,34 +262,49 @@ namespace lumen::lsp::runtime {
     std::uint32_t report_timestamp {};  ///< Final middle-32-bit NTP report timestamp.
   };
 
-  /** @brief Product admission result for negotiated video/audio RFC 8888 blocks. */
+  /** @brief Product admission result for negotiated primary/repair/audio RFC 8888 blocks. */
   enum class CongestionFeedbackContent : std::uint8_t {
     invalid,  ///< A block names an unnegotiated SSRC or configuration is invalid.
     audio_only,  ///< Packet contains only the active audio block and no video accounting.
-    video,  ///< Packet contains the active video block, with or without active audio.
+    video,  ///< Packet contains primary, FlexFEC, or RTX accounting, with or without audio.
   };
 
   /**
-   * @brief Classify structurally validated blocks against active host video/audio SSRCs.
+   * @brief Classify structurally validated blocks against active host forward-media SSRCs.
    *
    * @param packet Validated multi-block feedback view.
    * @param video_ssrc Active primary-video SSRC.
    * @param audio_ssrc Active host-audio SSRC.
-   * @return Invalid, audio-only cadence, or video-ledger content.
+   * @param flexfec_ssrc Negotiated FlexFEC SSRC, or zero when disabled.
+   * @param rtx_ssrc Negotiated RTX SSRC, or zero when disabled.
+   * @return Invalid, audio-only cadence, or forward-video/repair ledger content.
    */
   [[nodiscard]] constexpr CongestionFeedbackContent classify_congestion_feedback_content(
     const CongestionFeedbackPacketView &packet,
     const std::uint32_t video_ssrc,
-    const std::uint32_t audio_ssrc
+    const std::uint32_t audio_ssrc,
+    const std::uint32_t flexfec_ssrc = 0,
+    const std::uint32_t rtx_ssrc = 0
   ) noexcept {
     if (packet.block_count == 0 || packet.block_count > packet.blocks.size() ||
-        video_ssrc == 0 || audio_ssrc == 0 || video_ssrc == audio_ssrc) {
+        video_ssrc == 0 || audio_ssrc == 0 || video_ssrc == audio_ssrc ||
+        (flexfec_ssrc != 0 &&
+         (flexfec_ssrc == video_ssrc || flexfec_ssrc == audio_ssrc)) ||
+        (rtx_ssrc != 0 &&
+         (rtx_ssrc == video_ssrc || rtx_ssrc == audio_ssrc || rtx_ssrc == flexfec_ssrc))) {
       return CongestionFeedbackContent::invalid;
     }
     bool has_video = false;
     bool has_audio = false;
     for (std::size_t index = 0; index < packet.block_count; ++index) {
-      if (packet.blocks[index].media_ssrc == video_ssrc) {
+      for (std::size_t prior = 0; prior < index; ++prior) {
+        if (packet.blocks[prior].media_ssrc == packet.blocks[index].media_ssrc) {
+          return CongestionFeedbackContent::invalid;
+        }
+      }
+      if (packet.blocks[index].media_ssrc == video_ssrc ||
+          (flexfec_ssrc != 0 && packet.blocks[index].media_ssrc == flexfec_ssrc) ||
+          (rtx_ssrc != 0 && packet.blocks[index].media_ssrc == rtx_ssrc)) {
         has_video = true;
       } else if (packet.blocks[index].media_ssrc == audio_ssrc) {
         has_audio = true;
@@ -288,6 +378,8 @@ namespace lumen::lsp::runtime {
     std::uint32_t forward_path_generation {};  ///< Exact connection/path authority generation.
     VideoSelectionPayload video {};  ///< Frozen primary SSRC/PT/codec/extension selection.
     std::uint16_t initial_sequence {};  ///< Random initial RTP sequence number.
+    std::uint16_t initial_flexfec_sequence {};  ///< Random initial FlexFEC RTP sequence number when selected.
+    std::uint16_t initial_rtx_sequence {};  ///< Random initial RTX RTP sequence number when selected.
     std::uint32_t initial_timestamp {};  ///< Random nonzero initial 90 kHz timestamp.
     std::uint64_t frame_id_origin {};  ///< Random nonzero first frame ID.
     std::uint32_t initial_recovery_epoch {};  ///< Nonzero recovery epoch carried by `VIDEO_CONFIG`.
@@ -302,6 +394,7 @@ namespace lumen::lsp::runtime {
     media::ip_family family {media::ip_family::ipv4};  ///< Address family for complete wire accounting.
     safe::mail_t capture_mail;  ///< Local capture recovery and shutdown mailbox.
     bool reference_invalidation {};  ///< Whether pressure may invalidate references without IDR.
+    bool competition_delta_rtx {};  ///< Explicit local policy enabling ordinary delta RTX in competition mode.
 
     /**
      * @brief Validate all sender, path, pacing, and recovery invariants.
@@ -315,9 +408,29 @@ namespace lumen::lsp::runtime {
   struct HostVideoSenderSnapshot {
     std::uint64_t admitted_frames {};  ///< Complete access units admitted before first-packet send.
     std::uint64_t submitted_frames {};  ///< Frames whose complete primary RTP packet set was submitted.
-    std::uint64_t submitted_packets {};  ///< RTP packets protected and submitted.
+    std::uint64_t submitted_packets {};  ///< Primary-video RTP packets accepted by the kernel.
     std::uint64_t dropped_frames {};  ///< Whole frames dropped before first-packet submission.
-    std::uint64_t submitted_wire_bytes {};  ///< Complete IP/UDP/SRTP bytes charged to pacing.
+    std::uint64_t submitted_wire_bytes {};  ///< Complete primary-video IP/UDP/SRTP bytes charged.
+    std::uint64_t flexfec_submitted_packets {};  ///< Repair RTP packets accepted by the kernel.
+    std::uint64_t flexfec_submitted_wire_bytes {};  ///< Complete IP/UDP/SRTP FlexFEC bytes charged.
+    std::uint64_t flexfec_dropped_packets {};  ///< Selected parity packets that expired or failed locally.
+    std::uint64_t rtx_submitted_packets {};  ///< Deadline-eligible RTX packets accepted by the kernel.
+    std::uint64_t rtx_submitted_wire_bytes {};  ///< Complete IP/UDP/SRTP RTX bytes charged.
+    std::uint64_t rtx_dropped_packets {};  ///< Requested RTX packets that expired or failed locally.
+    std::uint64_t repair_feedback_packets {};  ///< Authenticated Generic NACK, PLI, and FIR packets accepted.
+    std::uint64_t repair_feedback_rejections {};  ///< Malformed or association-invalid repair feedback packets.
+    std::uint64_t primary_bytes_in_flight {};  ///< Unreported primary-video complete IP bytes.
+    std::uint64_t primary_delivered_bytes {};  ///< Newly reported delivered primary-video IP bytes.
+    std::uint64_t primary_lost_bytes {};  ///< Newly reported lost primary-video IP bytes.
+    std::uint64_t primary_ecn_ce_bytes {};  ///< Newly CE-marked primary-video IP bytes.
+    std::uint64_t flexfec_bytes_in_flight {};  ///< Unreported FlexFEC complete IP bytes.
+    std::uint64_t flexfec_delivered_bytes {};  ///< Newly reported delivered FlexFEC IP bytes.
+    std::uint64_t flexfec_lost_bytes {};  ///< Newly reported lost FlexFEC IP bytes.
+    std::uint64_t flexfec_ecn_ce_bytes {};  ///< Newly CE-marked FlexFEC IP bytes.
+    std::uint64_t rtx_bytes_in_flight {};  ///< Unreported RTX complete IP bytes.
+    std::uint64_t rtx_delivered_bytes {};  ///< Newly reported delivered RTX IP bytes.
+    std::uint64_t rtx_lost_bytes {};  ///< Newly reported lost RTX IP bytes.
+    std::uint64_t rtx_ecn_ce_bytes {};  ///< Newly CE-marked RTX IP bytes.
     std::uint64_t pressure_events {};  ///< Queue, admission, pacer, or socket pressure observations.
     std::uint8_t decoder_credit {};  ///< Latest validated client hardware-decoder credit.
     std::uint16_t current_path_payload {};  ///< Confirmed UDP payload used at frame boundaries.
@@ -329,6 +442,7 @@ namespace lumen::lsp::runtime {
     std::uint64_t feedback_lost_bytes {};  ///< Newly accounted complete IP-layer lost bytes.
     std::uint64_t path_probe_datagrams {};  ///< Freshly protected SRTCP LSPP transmissions.
     std::uint64_t path_probe_retries {};  ///< PROBE_TIMER retries with a new SRTCP index.
+    bool flexfec_active {};  ///< Whether measured loss currently activates frame-local parity.
     bool started {};  ///< Whether the sender worker started.
     bool closed {};  ///< Whether packet admission is closed.
     bool failed {};  ///< Whether a malformed frame or send failure stopped the worker.
@@ -338,9 +452,10 @@ namespace lumen::lsp::runtime {
    * @brief One-session bounded video egress, packet-slab, pacer, and SRTP owner.
    *
    * Capture/encode publishes at most one unsent encoded access unit through `egress()`. The sender
-   * owns one active frame, two preallocated complete-AU scratch slabs, one final RTP/SRTP slab, the
-   * 90 kHz timeline, frame IDs, exact boundary extensions, and aggregate byte pacing. FEC and RTX
-   * remain disabled without changing this ownership boundary.
+   * owns one staging/current plus two successful retained complete-AU slabs, fixed packet plans, final
+   * RTP/SRTP path slabs, independent primary/FlexFEC/RTX sequence spaces, the 90 kHz timeline, frame
+   * IDs, exact boundary extensions, and aggregate byte pacing. Clean-path FlexFEC emits no parity;
+   * measured loss activates bounded frame-local groups and RTX is built only after eligible NACK.
    */
   class HostVideoSender final {
   public:
@@ -419,6 +534,22 @@ namespace lumen::lsp::runtime {
 
     /** @brief Parse authenticated RFC 8888 CCFB and update independent forward congestion state. */
     bool receive_congestion_feedback(std::span<const std::uint8_t> packet, std::uint64_t now_microseconds) noexcept;
+
+    /**
+     * @brief Apply authenticated Generic NACK, PLI, or FIR video feedback.
+     *
+     * Generic NACK performs a second strict sender-side deadline test before constructing one RTX
+     * packet from the retained access unit. PLI and FIR coalesce into the generation-fenced recovery
+     * controller; neither FEC nor RTX failure opens a recovery epoch.
+     *
+     * @param packet Complete plaintext RTCP feedback packet after SRTCP authentication.
+     * @param now_microseconds Current monotonic receive time.
+     * @return True only when the feedback packet is structurally and semantically accepted.
+     */
+    bool receive_repair_feedback(
+      std::span<const std::uint8_t> packet,
+      std::uint64_t now_microseconds
+    ) noexcept;
 
     /**
      * @brief Apply one authenticated, generation-qualified `LSPV` status outside session locks.

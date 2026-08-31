@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/test_lsp_video_control.cpp
- * @brief Exact deterministic-CBOR checks for the first LSP SDR video product slice.
+ * @brief Exact deterministic-CBOR and sender-boundary checks for LSP video schema revision three.
  */
 
 #include "src/protocol_common/cbor.h"
@@ -12,12 +12,14 @@
 #include <array>
 #include <cstdint>
 #include <gtest/gtest.h>
+#include <optional>
 #include <variant>
 #include <vector>
 
 namespace {
   namespace cbor = lumen::protocol_common::cbor;
   namespace lsp = lumen::lsp::runtime;
+  namespace lsp_transport = lumen::lsp::transport;
 
   /** @brief Construct a nonzero fixed protocol identifier. */
   template<std::size_t Size>
@@ -42,9 +44,9 @@ namespace {
       .refresh_denominator = 1,
       .selected_bits_per_second = 100'000'000,
       .pixel_format = lsp::video_pixel_format_nv12,
-      .color_primaries = lsp::video_color_rec709,
-      .transfer_function = lsp::video_color_rec709,
-      .matrix_coefficients = lsp::video_color_rec709,
+      .color_primaries = lsp::video_color_bt709,
+      .transfer_function = lsp::video_color_bt709,
+      .matrix_coefficients = lsp::video_color_bt709,
       .full_range = false,
       .initial_udp_payload_size = 1'200,
       .decoder_surfaces = 3,
@@ -55,9 +57,19 @@ namespace {
       .frame_id_extension = 3,
       .input_watermark_extension = 4,
       .encoder_timing_extension = 5,
-      .flexfec = false,
-      .rtx = false,
+      .flexfec = lsp::FlexFecSelectionPayload {
+        .repair_ssrc = 5,
+        .repair_payload_type = 98,
+        .window_microseconds = 20'000,
+        .maximum_group_packets = 15,
+      },
+      .rtx = lsp::RtxSelectionPayload {
+        .rtx_ssrc = 6,
+        .rtx_payload_type = 99,
+        .associated_payload_type = 97,
+      },
       .maximum_frame_age_microseconds = 20'000,
+      .maximum_complete_access_unit_bytes = 16U * 1024U * 1024U,
     };
   }
 
@@ -101,7 +113,7 @@ namespace {
   }
 }  // namespace
 
-TEST(LspVideoControlWire, DecodesExactSixteenKeyStartAndRejectsRepairInFirstSlice) {
+TEST(LspVideoControlWire, DecodesExactSixteenKeyStartWithEighteenKeyVideoOffers) {
   const cbor::Value audio_offer {cbor::Value::Map {
     {1, 2U},
     {2, 240U},
@@ -110,20 +122,26 @@ TEST(LspVideoControlWire, DecodesExactSixteenKeyStartAndRejectsRepairInFirstSlic
     {5, cbor::Value {true}},
   }};
   auto video_offer = cbor::Value::Map {
-    {1, 1U},
+    {1, 3U},
     {2, 1U},
-    {3, 1'920U},
-    {4, 1'080U},
-    {5, 240U},
-    {6, 1U},
-    {7, 100'000'000U},
-    {8, 120'000'000U},
-    {9, 1U},
+    {3, 1U},
+    {4, 1'920U},
+    {5, 1'080U},
+    {6, 240U},
+    {7, 1U},
+    {8, 100'000'000U},
+    {9, 120'000'000U},
     {10, 1U},
-    {11, cbor::Value {false}},
-    {12, cbor::Value {false}},
+    {11, 1U},
+    {12, 1U},
+    {13, 1U},
+    {14, cbor::Value {false}},
+    {15, 1U},
+    {16, cbor::Value {true}},
+    {17, cbor::Value {true}},
+    {18, 16U * 1'024U * 1'024U},
   };
-  const auto encode_start = [&](const cbor::Value::Map &offer) {
+  const auto encode_start = [&](const cbor::Value::Map &offer, const std::uint32_t capture_to_present) {
     return cbor::encode(cbor::Value {cbor::Value::Map {
                           {1, 1U},
                           {2, "1"},
@@ -140,24 +158,35 @@ TEST(LspVideoControlWire, DecodesExactSixteenKeyStartAndRejectsRepairInFirstSlic
                           {13, 64U},
                           {14, 3U},
                           {15, 1U},
-                          {16, 20'000U},
+                          {16, capture_to_present},
                         }})
       .bytes;
   };
 
-  const auto decoded = lsp::decode_start(encode_start(video_offer));
+  const auto decoded = lsp::decode_start(encode_start(video_offer, 20'000));
   ASSERT_TRUE(decoded);
   ASSERT_EQ(decoded->video_offers.size(), std::size_t {1});
   EXPECT_EQ(decoded->network_profile, lsp::VideoNetworkProfile::adaptive_low_latency);
   EXPECT_EQ(decoded->video_offers[0].codec, lsp::VideoCodec::h264);
+  EXPECT_TRUE(decoded->video_offers[0].flexfec);
+  EXPECT_TRUE(decoded->video_offers[0].rtx);
   EXPECT_EQ(decoded->decoder_surfaces, 3U);
   EXPECT_EQ(decoded->maximum_capture_to_present_microseconds, 20'000U);
+  EXPECT_TRUE(lsp::decode_start(encode_start(video_offer, lsp::video_maximum_frame_age_microseconds)));
 
-  video_offer[10].second = cbor::Value {true};
-  EXPECT_FALSE(lsp::decode_start(encode_start(video_offer)));
+  video_offer[0].second = cbor::Value {2U};
+  EXPECT_FALSE(lsp::decode_start(encode_start(video_offer, 20'000)));
+  video_offer[0].second = cbor::Value {3U};
+  video_offer[2].second = cbor::Value {3U};
+  EXPECT_FALSE(lsp::decode_start(encode_start(video_offer, 20'000)));
+  video_offer[2].second = cbor::Value {1U};
+  video_offer[7].second = cbor::Value {999U};
+  EXPECT_FALSE(lsp::decode_start(encode_start(video_offer, 20'000)));
+  video_offer[7].second = cbor::Value {100'000'000U};
+  EXPECT_FALSE(lsp::decode_start(encode_start(video_offer, 1'000'001)));
 }
 
-TEST(LspVideoControlWire, EncodesExactTopLevelAndTwentyEightKeyVideoSelections) {
+TEST(LspVideoControlWire, EncodesExactTopLevelAndThirtyKeyVideoSelections) {
   const auto response = lsp::encode_start_response(start_response());
   ASSERT_TRUE(response);
   const auto decoded = cbor::decode(*response);
@@ -167,13 +196,48 @@ TEST(LspVideoControlWire, EncodesExactTopLevelAndTwentyEightKeyVideoSelections) 
   ASSERT_EQ(top->size(), std::size_t {31});
   const auto *video = std::get_if<cbor::Value::Map>(&(*top)[30].second.storage);
   ASSERT_NE(video, nullptr);
-  EXPECT_EQ(video->size(), std::size_t {28});
-  EXPECT_EQ((*video)[27].first, 28U);
-  EXPECT_EQ(*std::get_if<std::uint64_t>(&(*video)[27].second.storage), 20'000U);
+  EXPECT_EQ(video->size(), std::size_t {30});
+  EXPECT_EQ(std::get<std::uint64_t>((*video)[0].second.storage), 3U);
+  EXPECT_EQ(std::get<cbor::Value::Map>((*video)[26].second.storage).size(), 4U);
+  EXPECT_EQ(std::get<cbor::Value::Map>((*video)[27].second.storage).size(), 3U);
+  EXPECT_EQ(std::get<std::uint64_t>((*video)[28].second.storage), 20'000U);
+  EXPECT_EQ(std::get<std::uint64_t>((*video)[29].second.storage), 16U * 1'024U * 1'024U);
 
   auto invalid = start_response();
   invalid.video.maximum_frame_age_microseconds = 0;
   EXPECT_FALSE(lsp::encode_start_response(invalid));
+  invalid = start_response();
+  invalid.video.flexfec->maximum_group_packets = 14;
+  EXPECT_FALSE(lsp::encode_start_response(invalid));
+  invalid = start_response();
+  invalid.video.rtx->associated_payload_type = 100;
+  EXPECT_FALSE(lsp::encode_start_response(invalid));
+  invalid = start_response();
+  invalid.video.selected_bits_per_second = 999;
+  EXPECT_FALSE(lsp::encode_start_response(invalid));
+  invalid = start_response();
+  invalid.video.maximum_frame_age_microseconds = lsp::video_maximum_frame_age_microseconds + 1U;
+  EXPECT_FALSE(lsp::encode_start_response(invalid));
+  invalid = start_response();
+  invalid.video.flexfec->window_microseconds = lsp::video_maximum_frame_age_microseconds + 1U;
+  invalid.video.maximum_frame_age_microseconds = lsp::video_maximum_frame_age_microseconds;
+  EXPECT_FALSE(lsp::encode_start_response(invalid));
+  auto maximum_age = start_response();
+  maximum_age.video.maximum_frame_age_microseconds = lsp::video_maximum_frame_age_microseconds;
+  maximum_age.video.flexfec->window_microseconds = lsp::video_maximum_frame_age_microseconds;
+  EXPECT_TRUE(lsp::encode_start_response(maximum_age));
+
+  auto without_repair = start_response();
+  without_repair.video.flexfec.reset();
+  without_repair.video.rtx.reset();
+  const auto without_repair_bytes = lsp::encode_start_response(without_repair);
+  ASSERT_TRUE(without_repair_bytes);
+  const auto without_repair_value = cbor::decode(*without_repair_bytes);
+  ASSERT_TRUE(without_repair_value);
+  const auto &without_repair_top = std::get<cbor::Value::Map>(without_repair_value.value->storage);
+  const auto &without_repair_video = std::get<cbor::Value::Map>(without_repair_top[30].second.storage);
+  EXPECT_TRUE(std::holds_alternative<cbor::Null>(without_repair_video[26].second.storage));
+  EXPECT_TRUE(std::holds_alternative<cbor::Null>(without_repair_video[27].second.storage));
 
   auto attached = lsp::AttachResponsePayload {
     .session_id = start_response().session_id,
@@ -181,8 +245,8 @@ TEST(LspVideoControlWire, EncodesExactTopLevelAndTwentyEightKeyVideoSelections) 
     .connection_generation = 2,
     .stream_generation = 1,
     .input_generation = 2,
-    .input_ssrc = 5,
-    .acknowledgement_ssrc = 6,
+    .input_ssrc = 9,
+    .acknowledgement_ssrc = 10,
     .input_payload_type = 96,
     .pointer_rate = 1'000,
     .controller_rate = 250,
@@ -203,15 +267,18 @@ TEST(LspVideoControlWire, EncodesExactTopLevelAndTwentyEightKeyVideoSelections) 
   EXPECT_EQ(std::get<cbor::Value::Map>(attach_value.value->storage).size(), std::size_t {32});
 }
 
-TEST(LspVideoControlWire, FreezesVideoConfigParameterSetsAndFiveKeyAcknowledgement) {
+TEST(LspVideoControlWire, FreezesVideoConfigCodecMapHdrNullAndFiveKeyAcknowledgement) {
   const lsp::VideoConfigPayload configuration {
     .session_id = filled<16>(1),
     .stream_generation = 1,
     .video = video_selection(),
-    .parameter_sets = {{0x67, 0x64, 0x00, 0x1f}, {0x68, 0xee, 0x3c, 0x80}},
+    .codec_configuration = {
+      .kind = lsp::VideoCodec::h264,
+      .units = {{0x67, 0x64, 0x00, 0x1f}, {0x68, 0xee, 0x3c, 0x80}},
+    },
     .frame_id_origin = 10,
     .recovery_epoch = 1,
-    .maximum_complete_access_unit_bytes = 16U * 1024U * 1024U,
+    .hdr_metadata = std::nullopt,
   };
   const auto encoded = lsp::encode_video_config(configuration);
   ASSERT_TRUE(encoded);
@@ -220,9 +287,22 @@ TEST(LspVideoControlWire, FreezesVideoConfigParameterSetsAndFiveKeyAcknowledgeme
   ASSERT_TRUE(decoded);
   const auto &map = std::get<cbor::Value::Map>(decoded.value->storage);
   ASSERT_EQ(map.size(), std::size_t {8});
-  EXPECT_EQ(std::get<std::uint64_t>(map[0].second.storage), 2U);
-  EXPECT_EQ(std::get<cbor::Value::Map>(map[3].second.storage).size(), std::size_t {28});
-  EXPECT_EQ(std::get<cbor::Value::Array>(map[4].second.storage).size(), std::size_t {2});
+  EXPECT_EQ(std::get<std::uint64_t>(map[0].second.storage), 3U);
+  EXPECT_EQ(std::get<cbor::Value::Map>(map[3].second.storage).size(), std::size_t {30});
+  const auto &codec_configuration = std::get<cbor::Value::Map>(map[4].second.storage);
+  ASSERT_EQ(codec_configuration.size(), 2U);
+  EXPECT_EQ(std::get<std::uint64_t>(codec_configuration[0].second.storage), 1U);
+  EXPECT_EQ(std::get<cbor::Value::Array>(codec_configuration[1].second.storage).size(), std::size_t {2});
+  EXPECT_TRUE(std::holds_alternative<cbor::Null>(map[7].second.storage));
+
+  auto oversized_configuration = configuration;
+  oversized_configuration.codec_configuration.units = {
+    std::vector<std::uint8_t>(512, 0),
+    std::vector<std::uint8_t>(512, 0),
+  };
+  oversized_configuration.codec_configuration.units[0][0] = 0x67;
+  oversized_configuration.codec_configuration.units[1][0] = 0x68;
+  EXPECT_FALSE(lsp::encode_video_config(oversized_configuration));
 
   const auto encode_ack = [&](const std::uint8_t schema_version) {
     return cbor::encode(cbor::Value {cbor::Value::Map {
@@ -234,22 +314,106 @@ TEST(LspVideoControlWire, FreezesVideoConfigParameterSetsAndFiveKeyAcknowledgeme
                         }})
       .bytes;
   };
-  const auto ack_bytes = encode_ack(2);
+  const auto ack_bytes = encode_ack(3);
   const auto ack = lsp::decode_video_config_ack(ack_bytes);
   ASSERT_TRUE(ack);
   EXPECT_EQ(ack->decoder_credit, 3U);
   EXPECT_EQ(ack->video_generation, configuration.video.video_generation);
 
-  EXPECT_FALSE(lsp::decode_video_config_ack(encode_ack(1)));
+  EXPECT_FALSE(lsp::decode_video_config_ack(encode_ack(2)));
+}
+
+TEST(LspVideoControlWire, ValidatesCodecProfilePixelAndH273ColorTuples) {
+  auto response = start_response();
+  response.video.profile = lsp::VideoProfile::h264_high_444_predictive;
+  response.video.pixel_format = lsp::VideoPixelClass::yuv444_8;
+  EXPECT_TRUE(lsp::encode_start_response(response));
+
+  response.video.codec = lsp::VideoCodec::hevc;
+  response.video.profile = lsp::VideoProfile::hevc_main10;
+  response.video.pixel_format = lsp::VideoPixelClass::yuv420_10;
+  response.video.color_primaries = lsp::video_color_primaries_bt2020;
+  response.video.transfer_function = lsp::video_transfer_pq;
+  response.video.matrix_coefficients = lsp::video_matrix_bt2020_ncl;
+  EXPECT_TRUE(lsp::encode_start_response(response));
+
+  response.video.codec = lsp::VideoCodec::av1;
+  response.video.profile = lsp::VideoProfile::av1_high;
+  response.video.pixel_format = lsp::VideoPixelClass::yuv444_10;
+  response.video.transfer_function = lsp::video_transfer_hlg;
+  EXPECT_TRUE(lsp::encode_start_response(response));
+
+  response.video.profile = lsp::VideoProfile::av1_main;
+  EXPECT_FALSE(lsp::encode_start_response(response));
+  response.video.profile = lsp::VideoProfile::av1_high;
+  response.video.full_range = true;
+  EXPECT_FALSE(lsp::encode_start_response(response));
+  response.video.full_range = false;
+  response.video.codec = lsp::VideoCodec::h264;
+  response.video.profile = lsp::VideoProfile::h264_high;
+  response.video.pixel_format = lsp::VideoPixelClass::yuv420_10;
+  EXPECT_FALSE(lsp::encode_start_response(response));
+}
+
+TEST(LspVideoControlWire, EncodesExactHdrMetadataAndCanonicalAv1CodecConfiguration) {
+  auto selection = video_selection();
+  selection.codec = lsp::VideoCodec::av1;
+  selection.profile = lsp::VideoProfile::av1_main;
+  selection.pixel_format = lsp::VideoPixelClass::yuv420_10;
+  selection.color_primaries = lsp::video_color_primaries_bt2020;
+  selection.transfer_function = lsp::video_transfer_pq;
+  selection.matrix_coefficients = lsp::video_matrix_bt2020_ncl;
+  const lsp::HdrMetadataPayload metadata {
+    .red_primary_x = 35'400,
+    .red_primary_y = 14'600,
+    .green_primary_x = 8'500,
+    .green_primary_y = 39'850,
+    .blue_primary_x = 6'550,
+    .blue_primary_y = 2'300,
+    .white_point_x = 15'635,
+    .white_point_y = 16'450,
+    .maximum_display_luminance = 1'000,
+    .minimum_display_luminance = 1,
+    .maximum_content_light_level = 1'000,
+    .maximum_frame_average_light_level = 400,
+    .maximum_full_frame_luminance = 600,
+  };
+  lsp::VideoConfigPayload configuration {
+    .session_id = filled<16>(1),
+    .stream_generation = 1,
+    .video = selection,
+    .codec_configuration = {
+      .kind = lsp::VideoCodec::av1,
+      .units = {{0x0a, 0x01, 0x00}},
+    },
+    .frame_id_origin = 10,
+    .recovery_epoch = 1,
+    .hdr_metadata = metadata,
+  };
+  const auto encoded = lsp::encode_video_config(configuration);
+  ASSERT_TRUE(encoded);
+  const auto decoded = cbor::decode(*encoded);
+  ASSERT_TRUE(decoded);
+  const auto &map = std::get<cbor::Value::Map>(decoded.value->storage);
+  EXPECT_EQ(std::get<cbor::Value::Map>(map[4].second.storage).size(), 2U);
+  EXPECT_EQ(std::get<cbor::Value::Map>(map[7].second.storage).size(), 13U);
+
+  configuration.hdr_metadata.reset();
+  EXPECT_FALSE(lsp::encode_video_config(configuration));
+  configuration.video.transfer_function = lsp::video_transfer_hlg;
+  EXPECT_TRUE(lsp::encode_video_config(configuration));
+  configuration.video.transfer_function = lsp::video_transfer_pq;
+  configuration.hdr_metadata = metadata;
+  configuration.hdr_metadata->white_point_x = 0;
+  EXPECT_FALSE(lsp::encode_video_config(configuration));
+  configuration.hdr_metadata = metadata;
+  configuration.codec_configuration.units[0] = {0x0a, 0x81, 0x00, 0x00};
+  EXPECT_FALSE(lsp::encode_video_config(configuration));
 }
 
 TEST(LspVideoRecoveryWire, SerializesFrameIdentityAndRecoveryEpochAsTwelveNetworkOrderBytes) {
   std::array<std::uint8_t, lsp::video_frame_identity_extension_size> extension {};
-  ASSERT_TRUE(lsp::write_video_frame_identity_extension(
-    extension,
-    0x0102030405060708ULL,
-    0x11121314U
-  ));
+  ASSERT_TRUE(lsp::write_video_frame_identity_extension(extension, 0x0102030405060708ULL, 0x11121314U));
   EXPECT_EQ(
     extension,
     (std::array<std::uint8_t, 12> {
@@ -355,56 +519,11 @@ TEST(LspVideoRecoveryWire, InvalidatesBlockedDependenciesAndRejectsStaleIndepend
   EXPECT_TRUE(lsp::video_recovery_drop_requires_dependency_invalidation(true, false, true));
   EXPECT_TRUE(lsp::video_recovery_drop_requires_dependency_invalidation(false, true, false));
   EXPECT_FALSE(lsp::video_recovery_drop_requires_dependency_invalidation(false, true, true));
-  EXPECT_TRUE(lsp::video_independent_satisfies_dependency_fence(
-    true,
-    0,
-    12,
-    20,
-    20,
-    20,
-    101,
-    100
-  ));
-  EXPECT_TRUE(lsp::video_independent_satisfies_dependency_fence(
-    false,
-    12,
-    12,
-    20,
-    20,
-    20,
-    101,
-    100
-  ));
-  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
-    false,
-    11,
-    12,
-    19,
-    20,
-    20,
-    101,
-    100
-  ));
-  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
-    true,
-    0,
-    12,
-    20,
-    19,
-    20,
-    101,
-    100
-  ));
-  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
-    true,
-    0,
-    12,
-    20,
-    20,
-    20,
-    100,
-    100
-  ));
+  EXPECT_TRUE(lsp::video_independent_satisfies_dependency_fence(true, 0, 12, 20, 20, 20, 101, 100));
+  EXPECT_TRUE(lsp::video_independent_satisfies_dependency_fence(false, 12, 12, 20, 20, 20, 101, 100));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(false, 11, 12, 19, 20, 20, 101, 100));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(true, 0, 12, 20, 19, 20, 101, 100));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(true, 0, 12, 20, 20, 20, 100, 100));
 }
 
 TEST(LspVideoRecoveryWire, QualifiesTerminalInvalidationAndCoalescesConcurrentQueuedRanges) {
@@ -440,26 +559,8 @@ TEST(LspVideoRecoveryWire, QualifiesTerminalInvalidationAndCoalescesConcurrentQu
 TEST(LspVideoRecoveryWire, NewerConcurrentDependencyBreakWinsOverOlderIndependentRestore) {
   EXPECT_EQ(lsp::bind_video_invalidation_dependency_generation(40, 42, 41), 42U);
   EXPECT_EQ(lsp::bind_video_invalidation_dependency_generation(43, 42, 44), 44U);
-  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
-    true,
-    0,
-    15,
-    15,
-    40,
-    41,
-    501,
-    500
-  ));
-  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(
-    false,
-    15,
-    15,
-    40,
-    40,
-    41,
-    501,
-    500
-  ));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(true, 0, 15, 15, 40, 41, 501, 500));
+  EXPECT_FALSE(lsp::video_independent_satisfies_dependency_fence(false, 15, 15, 40, 40, 41, 501, 500));
 }
 
 TEST(LspVideoRecoveryWire, GenerationQualifiedReservationStopsDependentAtNextPacketBoundary) {
@@ -531,6 +632,104 @@ TEST(LspPathProbeWire, ClassifiesIntermediateReductionAgainstItsConfirmedGenerat
   );
 }
 
+TEST(LspVideoRepairAdmission, ReservesExactPacketHeadroomAndBoundsFrameLocalGroups) {
+  EXPECT_EQ(lsp::video_repair_packetization_reserve(false, false), 0U);
+  EXPECT_EQ(lsp::video_repair_packetization_reserve(false, true), 2U);
+  EXPECT_EQ(lsp::video_repair_packetization_reserve(true, false), 16U);
+  EXPECT_EQ(lsp::video_repair_packetization_reserve(true, true), 16U);
+
+  EXPECT_EQ(lsp::video_flexfec_group_packet_limit(1, false), 2U);
+  EXPECT_EQ(lsp::video_flexfec_group_packet_limit(15, false), 15U);
+  EXPECT_EQ(lsp::video_flexfec_group_packet_limit(64, false), 15U);
+  EXPECT_EQ(lsp::video_flexfec_group_packet_limit(15, true), 8U);
+  EXPECT_EQ(lsp::video_flexfec_group_packet_limit(5, true), 3U);
+  EXPECT_EQ(lsp::video_flexfec_group_packet_limit(2, true), 2U);
+
+  EXPECT_TRUE(lsp::video_rtx_frame_allowed(lsp::VideoNetworkProfile::adaptive_low_latency, false, false));
+  EXPECT_FALSE(lsp::video_rtx_frame_allowed(lsp::VideoNetworkProfile::competition, false, false));
+  EXPECT_TRUE(lsp::video_rtx_frame_allowed(lsp::VideoNetworkProfile::competition, false, true));
+  EXPECT_TRUE(lsp::video_rtx_frame_allowed(lsp::VideoNetworkProfile::competition, true, false));
+
+  EXPECT_TRUE(lsp::video_fir_command_is_duplicate(true, 10, 20, 7, 10, 20, 7));
+  EXPECT_FALSE(lsp::video_fir_command_is_duplicate(false, 10, 20, 7, 10, 20, 7));
+  EXPECT_FALSE(lsp::video_fir_command_is_duplicate(true, 10, 20, 7, 10, 20, 8));
+  EXPECT_FALSE(lsp::video_fir_command_is_duplicate(true, 10, 20, 7, 11, 20, 7));
+}
+
+TEST(LspVideoRepairAdmission, CompetitionDeltaFramesCannotEvictIndependentRetention) {
+  static std::array<
+    lsp_transport::rtx_retained_packet,
+    lsp_transport::required_rtx_retention_slots>
+    slots {};
+  lsp_transport::rtx_retention retention(slots);
+  std::vector<std::uint64_t> released;
+  const auto release = [&released](const std::uint64_t token) {
+    released.push_back(token);
+  };
+  ASSERT_TRUE(lsp::video_rtx_frame_allowed(lsp::VideoNetworkProfile::competition, false, true));
+  const auto independent = retention.begin_frame(
+    {
+      .frame_id = 100,
+      .frame_deadline_microseconds = 10'000,
+      .now_microseconds = 1'000,
+      .retention_origin_microseconds = 1'000,
+      .measured_rtt_microseconds = 5'000,
+      .source_ssrc = 5,
+      .video_generation = 7,
+    },
+    release
+  );
+  ASSERT_TRUE(independent);
+  ASSERT_EQ(
+    retention.retain(
+      independent.handle,
+      {.reconstruction_token = 1, .source_sequence_number = 42, .source_packet_bytes = 1'200}
+    ),
+    lsp_transport::rtx_retention_result::retained
+  );
+  ASSERT_EQ(
+    retention.commit_frame(independent.handle, 1'000),
+    lsp_transport::rtx_frame_result::accepted
+  );
+
+  const auto begin_if_allowed = [&](const std::uint64_t frame_id, const bool frame_independent) {
+    std::optional<lsp_transport::rtx_frame_begin_result> result;
+    if (lsp::video_rtx_frame_allowed(
+          lsp::VideoNetworkProfile::competition,
+          false,
+          frame_independent
+        )) {
+      result = retention.begin_frame(
+        {
+          .frame_id = frame_id,
+          .frame_deadline_microseconds = 10'000,
+          .now_microseconds = 1'000,
+          .retention_origin_microseconds = 1'000,
+          .measured_rtt_microseconds = 5'000,
+          .source_ssrc = 5,
+          .video_generation = 7,
+        },
+        release
+      );
+    }
+    return result;
+  };
+  EXPECT_FALSE(begin_if_allowed(101, false).has_value());
+  EXPECT_FALSE(begin_if_allowed(102, false).has_value());
+  EXPECT_EQ(retention.retained_frame_count(), 1U);
+  const auto eligible = retention.find_eligible(7, 5, 42, 1'100, {});
+  ASSERT_TRUE(eligible);
+  EXPECT_EQ(eligible->frame_id, 100U);
+  EXPECT_EQ(eligible->reconstruction_token, 1U);
+  EXPECT_TRUE(released.empty());
+
+  const auto cleared = retention.clear(release);
+  EXPECT_EQ(cleared.frames_released, 1U);
+  EXPECT_EQ(cleared.tokens_released, 1U);
+  ASSERT_EQ(released.size(), 1U);
+  EXPECT_EQ(released.front(), 1U);
+}
+
 TEST(LspCongestionFeedbackWire, ParsesVideoAndOddCountAudioBlocksThroughFinalTimestamp) {
   std::array<std::uint8_t, 36> packet {};
   packet[0] = static_cast<std::uint8_t>(0x80U | 11U);
@@ -565,6 +764,23 @@ TEST(LspCongestionFeedbackWire, ParsesVideoAndOddCountAudioBlocksThroughFinalTim
   EXPECT_EQ(
     lsp::classify_congestion_feedback_content(*parsed, 20, 30),
     lsp::CongestionFeedbackContent::video
+  );
+  auto repair_feedback = *parsed;
+  repair_feedback.blocks[2].media_ssrc = 40;
+  repair_feedback.block_count = 3;
+  EXPECT_EQ(
+    lsp::classify_congestion_feedback_content(repair_feedback, 20, 30, 40, 50),
+    lsp::CongestionFeedbackContent::video
+  );
+  repair_feedback.blocks[2].media_ssrc = 50;
+  EXPECT_EQ(
+    lsp::classify_congestion_feedback_content(repair_feedback, 20, 30, 40, 50),
+    lsp::CongestionFeedbackContent::video
+  );
+  repair_feedback.blocks[2].media_ssrc = 20;
+  EXPECT_EQ(
+    lsp::classify_congestion_feedback_content(repair_feedback, 20, 30, 40, 50),
+    lsp::CongestionFeedbackContent::invalid
   );
 
   packet[31] = 1;

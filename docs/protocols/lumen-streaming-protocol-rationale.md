@@ -210,6 +210,12 @@ LSP defines its exact controller behavior rather than claiming generic SCReAM
 interoperability. RFC 8298 is an algorithmic reference, while RFC 8888 is the
 wire feedback format.
 
+Video negotiation rejects source rates below 1,000 bits/s as non-operational
+rather than admitting a positive-but-useless pacing contract. The shared video
+frame-age and FlexFEC-window ceiling is one second; repair is additionally
+bounded by the selected frame age. These frozen limits keep arithmetic and
+retention bounded without prescribing a high-latency operating target.
+
 A separate competition-LAN controller may start at an operator-provisioned
 rate without slow start. It still has an aggregate shaper, ECN/loss circuit
 breaker, and a hard maximum rate. It is not an excuse to transmit at NIC line
@@ -252,12 +258,33 @@ Codec configuration is acknowledged over reliable control before dependent
 media is accepted. Required parameter sets are also repeated in-band at the
 codec-defined recovery boundary.
 
-The video configuration maps use a dedicated schema revision two without
-renaming LSP/1 or changing the surrounding control protocol. Revision two
-binds each repeated encrypted frame identity to its recovery epoch as one
-12-byte network-order value. This lets authenticated decoded-frame feedback
-confirm the exact outstanding recovery attempt and prevents an old epoch from
-clearing or retrying a newer one.
+The video control maps use a dedicated schema revision three without renaming
+LSP/1 or changing the surrounding control protocol. Revision three tags every
+offer and selection, adds exact H.264/HEVC/AV1 profile, pixel-class, H.273
+color, access-unit, FlexFEC, and RTX contracts, and replaces an ambiguous array
+of parameter sets with a codec-discriminated exact configuration map. PQ alone
+carries the exact HDR10 mastering/content-light block; SDR and HLG carry null,
+so HLG cannot be mistaken for PQ static metadata. The revision retains the
+12-byte encrypted frame identity containing frame ID and recovery epoch. This
+lets authenticated decoded-frame feedback confirm the exact outstanding
+recovery attempt and prevents an old epoch from clearing or retrying a newer
+one.
+
+The Windows selector is deliberately proof-bound. It maps only exact tuples
+accepted by the current capture/VDD and named hardware encoder generation and
+rejects unsupported bit depth, chroma, transfer, or static-metadata combinations
+instead of applying a nearby legacy configuration. HLG is frozen on the wire
+but remains unselectable until the Windows color pipeline exposes an explicit
+HLG configuration proof; treating it as PQ would be a semantic and visual
+failure.
+
+Selection is transactional: Lumen pre-encodes the entire path-safe decoder
+configuration before START commits session authority. This validates canonical
+codec initialization, HDR metadata, selection consistency, and the 1,152-byte
+bound at the point where failure can still terminate the launched generation
+and release its display lease. ATTACH performs the same preflight after
+generation rotation and excludes all prior-generation SSRCs, avoiding replay
+namespace reuse while the old association retires.
 
 ## 12. Throughput model
 
