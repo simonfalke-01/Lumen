@@ -104,6 +104,77 @@ namespace lumen::lsp::media {
     bool marker = false;  ///< RFC 7587 talkspurt marker supplied by `opus_sender_timeline`.
   };
 
+  /** @brief Allocation-free RFC 7587 RTP packet write result. */
+  struct opus_packet_write_result {
+    std::size_t bytes_written = 0;  ///< Complete plaintext RTP bytes written on success.
+    packetization_error error = packetization_error::none;  ///< Packetization status.
+
+    /**
+     * @brief Return whether the complete packet was written.
+     *
+     * @return `true` only when `error` is `packetization_error::none`.
+     */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return error == packetization_error::none;
+    }
+  };
+
+  /**
+   * @brief Write one complete Opus packet into caller-owned RFC 7587 RTP storage.
+   *
+   * The function performs no allocation, fragmentation, FEC, or RTX construction. The destination
+   * contains plaintext RTP and must retain room outside the returned span for the SRTP provider's
+   * authentication tag.
+   *
+   * @param opus_packet Complete encoded Opus packet.
+   * @param config RTP, path-payload, and talkspurt-marker configuration.
+   * @param destination Caller-owned plaintext RTP storage.
+   * @return Complete byte count and typed failure.
+   */
+  [[nodiscard]] constexpr opus_packet_write_result write_opus_rtp_packet(
+    const std::span<const std::uint8_t> opus_packet,
+    const opus_packetization_config &config,
+    const std::span<std::uint8_t> destination
+  ) noexcept {
+    if (opus_packet.empty()) {
+      return {.error = packetization_error::empty_codec_unit};
+    }
+    if (opus_packet.size() > maximum_opus_packet_size) {
+      return {.error = packetization_error::codec_unit_too_large};
+    }
+    if (!valid_dynamic_payload_type(config.stream.payload_type) || config.stream.ssrc == 0 ||
+        config.path.udp_payload_size < initial_udp_payload_size ||
+        config.path.udp_payload_size > (config.path.family == ip_family::ipv4 ? ipv4_udp_payload_ceiling : ipv6_udp_payload_ceiling)) {
+      return {.error = packetization_error::invalid_rtp_configuration};
+    }
+    const auto packet_size = rtp_fixed_header_size + opus_packet.size();
+    if (packet_size + srtp_aead_tag_size > config.path.udp_payload_size) {
+      return {.error = packetization_error::packet_exceeds_path};
+    }
+    if (destination.size() < packet_size) {
+      return {.error = packetization_error::packet_exceeds_path};
+    }
+    const rtp_fixed_header header {
+      .padding = false,
+      .extension = false,
+      .marker = config.marker,
+      .payload_type = config.stream.payload_type,
+      .csrc_count = 0,
+      .sequence_number = config.stream.first_sequence_number,
+      .timestamp = config.stream.timestamp,
+      .ssrc = config.stream.ssrc,
+    };
+    const auto header_result = write_rtp_fixed_header(header, {}, destination.first(packet_size));
+    if (!header_result) {
+      return {.error = packetization_error::invalid_rtp_configuration};
+    }
+    std::ranges::copy(
+      opus_packet,
+      destination.begin() + static_cast<std::ptrdiff_t>(rtp_fixed_header_size)
+    );
+    return {.bytes_written = packet_size};
+  }
+
   /**
    * @brief Packetize one complete Opus packet into exactly one RFC 7587 RTP packet.
    *
@@ -119,44 +190,15 @@ namespace lumen::lsp::media {
   ) {
     packetization_result result;
     result.next_sequence_number = config.stream.first_sequence_number;
-    if (opus_packet.empty()) {
-      result.error = packetization_error::empty_codec_unit;
-      return result;
-    }
-    if (opus_packet.size() > maximum_opus_packet_size) {
-      result.error = packetization_error::codec_unit_too_large;
-      return result;
-    }
-    if (!valid_dynamic_payload_type(config.stream.payload_type) || config.stream.ssrc == 0 ||
-        config.path.udp_payload_size < initial_udp_payload_size ||
-        config.path.udp_payload_size > (config.path.family == ip_family::ipv4 ? ipv4_udp_payload_ceiling : ipv6_udp_payload_ceiling)) {
-      result.error = packetization_error::invalid_rtp_configuration;
-      return result;
-    }
     const auto packet_size = rtp_fixed_header_size + opus_packet.size();
-    if (packet_size + srtp_aead_tag_size > config.path.udp_payload_size) {
-      result.error = packetization_error::packet_exceeds_path;
-      return result;
-    }
-
     rtp_packet packet;
     packet.role = frame_packet_role::first_and_final;
     packet.bytes.resize(packet_size);
-    const rtp_fixed_header header {
-      .padding = false,
-      .extension = false,
-      .marker = config.marker,
-      .payload_type = config.stream.payload_type,
-      .csrc_count = 0,
-      .sequence_number = config.stream.first_sequence_number,
-      .timestamp = config.stream.timestamp,
-      .ssrc = config.stream.ssrc,
-    };
-    if (!write_rtp_fixed_header(header, {}, packet.bytes)) {
-      result.error = packetization_error::invalid_rtp_configuration;
+    const auto written = write_opus_rtp_packet(opus_packet, config, packet.bytes);
+    if (!written) {
+      result.error = written.error;
       return result;
     }
-    std::ranges::copy(opus_packet, packet.bytes.begin() + static_cast<std::ptrdiff_t>(rtp_fixed_header_size));
     result.packets.push_back(std::move(packet));
     ++result.next_sequence_number;
     return result;

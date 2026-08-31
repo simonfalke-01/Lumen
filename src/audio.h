@@ -11,6 +11,7 @@
 
 #include <bitset>
 #include <memory>
+#include <optional>
 
 namespace audio {
   /**
@@ -73,7 +74,23 @@ namespace audio {
 
     std::bitset<MAX_FLAGS> flags;  ///< Enabled audio feature flags.
     int bitrate {};  ///< Exact negotiated total Opus bitrate, or zero for legacy tier selection.
+    std::uint32_t captureQueueFrames {};  ///< Optional PCM queue bound; zero retains the legacy 120 ms-derived default.
   };
+
+  /**
+   * @brief Select one built-in validated Opus layout without legacy fallback behavior.
+   *
+   * This strict selector is intended for authenticated native-protocol negotiation. Existing
+   * GameStream parsing retains its current internal fallback behavior.
+   *
+   * @param channels Requested channel count; supported values are 2, 6, and 8.
+   * @param high_quality Whether to select the corresponding high-bitrate layout.
+   * @return Stable built-in stream configuration, or no value for an unsupported channel count.
+   */
+  [[nodiscard]] std::optional<opus_stream_config_t> select_opus_stream_config(
+    int channels,
+    bool high_quality
+  ) noexcept;
 
   /**
    * @brief Shared audio device state used while streams are active.

@@ -24,14 +24,17 @@ namespace audio {
    * @brief Owning pointer for an Opus multistream encoder.
    */
   using opus_t = util::safe_ptr<OpusMSEncoder, opus_multistream_encoder_destroy>;
+
   /**
    * @brief Shared queue carrying captured PCM sample buffers to the encoder thread.
    */
   struct captured_frame_t {
-    std::vector<float> samples;
-    std::uint64_t sample_position {};
-    std::uint32_t gap_frames {};
+    std::vector<float> samples;  ///< Complete interleaved PCM frame.
+    std::uint64_t sample_position {};  ///< Exact first-sample position at 48 kHz.
+    std::uint32_t gap_frames {};  ///< Missing frames represented by silence before this frame.
+    bool discontinuity {};  ///< Whether capture reinitialization invalidated prior continuity.
   };
+
   using sample_queue_t = std::shared_ptr<safe::queue_t<captured_frame_t>>;
 
   static int start_audio_control(audio_ctx_t &ctx);
@@ -157,11 +160,14 @@ namespace audio {
                     << stream.bitrate / 1000 << " kbps (total), LOWDELAY"sv;
 
     auto frame_size = config.packetDuration * stream.sampleRate / 1000;
-    auto encode_and_publish = [&](std::span<const float> pcm, const std::uint64_t sample_position,
-                                  const bool discontinuity) {
+    auto encode_and_publish = [&](std::span<const float> pcm, const std::uint64_t sample_position, const bool discontinuity) {
       buffer_t packet {1400};
       const int bytes = opus_multistream_encode_float(
-        opus.get(), pcm.data(), frame_size, std::begin(packet), static_cast<opus_int32>(packet.size())
+        opus.get(),
+        pcm.data(),
+        frame_size,
+        std::begin(packet),
+        static_cast<opus_int32>(packet.size())
       );
       if (bytes < 0) {
         BOOST_LOG(error) << "Couldn't encode audio: "sv << opus_strerror(bytes);
@@ -196,7 +202,11 @@ namespace audio {
           return;
         }
       }
-      const auto result = encode_and_publish(sample->samples, sample->sample_position, false);
+      const auto result = encode_and_publish(
+        sample->samples,
+        sample->sample_position,
+        sample->discontinuity && sample->gap_frames == 0
+      );
       if (!result || *result == AudioPacketDestination::enqueue_result_e::closed) {
         return;
       }
@@ -289,9 +299,12 @@ namespace audio {
     // Capture takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
-    const auto maximum_queue_frames = static_cast<std::uint32_t>(
+    const auto legacy_queue_frames = static_cast<std::uint32_t>(
       std::max(1, 120 / std::max(config.packetDuration, 1))
     );
+    const auto maximum_queue_frames = config.captureQueueFrames == 0 ?
+                                        legacy_queue_frames :
+                                        std::clamp(config.captureQueueFrames, 1U, legacy_queue_frames);
     auto samples = std::make_shared<sample_queue_t::element_type>(maximum_queue_frames);
     auto encoding = std::make_shared<std::atomic_bool>(true);
     std::jthread thread {encodeThread, samples, config, std::move(destination), encoding};
@@ -310,6 +323,7 @@ namespace audio {
 
     std::uint64_t next_sample_position {};
     std::uint32_t pending_gap_frames {};
+    bool pending_discontinuity {};
     while (!shutdown_event->peek() && encoding->load(std::memory_order_acquire)) {
       std::vector<float> sample_buffer;
       sample_buffer.resize(samples_per_frame);
@@ -322,6 +336,7 @@ namespace audio {
           continue;
         case platf::capture_e::reinit:
           BOOST_LOG(info) << "Reinitializing audio capture"sv;
+          pending_discontinuity = true;
           mic.reset();
           do {
             mic = control->microphone(stream.mapping, stream.channelCount, stream.sampleRate, frame_size, continuous_audio, host_audio);
@@ -338,9 +353,11 @@ namespace audio {
         .samples = std::move(sample_buffer),
         .sample_position = next_sample_position,
         .gap_frames = pending_gap_frames,
+        .discontinuity = pending_discontinuity,
       };
       if (samples->raise(std::move(captured))) {
         pending_gap_frames = 0;
+        pending_discontinuity = false;
       } else if (pending_gap_frames != UINT32_MAX) {
         ++pending_gap_frames;
       }
@@ -383,6 +400,20 @@ namespace audio {
         return SURROUND71 + shift;
     }
     return STEREO;
+  }
+
+  std::optional<opus_stream_config_t> select_opus_stream_config(
+    const int channels,
+    const bool high_quality
+  ) noexcept {
+    switch (channels) {
+      case 2:
+      case 6:
+      case 8:
+        return stream_configs[map_stream(channels, high_quality)];
+      default:
+        return std::nullopt;
+    }
   }
 
   int start_audio_control(audio_ctx_t &ctx) {

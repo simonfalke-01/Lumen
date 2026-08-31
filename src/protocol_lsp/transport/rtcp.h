@@ -175,6 +175,67 @@ namespace lumen::lsp::transport {
     }
   };
 
+  /** @brief RFC 3550 sender information for one active RTP source. */
+  struct sender_report {
+    std::uint32_t sender_ssrc = 0;  ///< SSRC of the RTP source described by this report.
+    std::uint32_t ntp_seconds = 0;  ///< Most-significant 32 bits of the NTP timestamp.
+    std::uint32_t ntp_fraction = 0;  ///< Least-significant 32-bit NTP fractional seconds.
+    std::uint32_t rtp_timestamp = 0;  ///< RTP sampling timestamp corresponding to the NTP instant.
+    std::uint32_t packet_count = 0;  ///< Sender packet count modulo 2^32.
+    std::uint32_t octet_count = 0;  ///< Sender codec-payload octet count modulo 2^32.
+  };
+
+  /** @brief Typed RFC 3550 sender-report serialization failure. */
+  enum class sender_report_error : std::uint8_t {
+    none,  ///< A complete sender report was written.
+    invalid_ssrc,  ///< Sender SSRC is zero.
+    destination_too_small,  ///< Destination cannot contain the fixed 28-byte report.
+  };
+
+  /** @brief RFC 3550 sender-report serialization result. */
+  struct sender_report_write_result {
+    std::size_t bytes_written = 0;  ///< Complete RTCP packet bytes written on success.
+    sender_report_error error = sender_report_error::none;  ///< Serialization status.
+
+    /**
+     * @brief Return whether serialization succeeded.
+     *
+     * @return `true` only for a complete valid sender report.
+     */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return error == sender_report_error::none;
+    }
+  };
+
+  /**
+   * @brief Serialize one report-block-free RFC 3550 sender report.
+   *
+   * @param report Sender timing and cumulative counters.
+   * @param destination Caller-owned packet storage.
+   * @return Fixed 28-byte write result and typed status.
+   */
+  [[nodiscard]] constexpr sender_report_write_result write_sender_report(
+    const sender_report &report,
+    const std::span<std::uint8_t> destination
+  ) noexcept {
+    if (report.sender_ssrc == 0) {
+      return {.error = sender_report_error::invalid_ssrc};
+    }
+    constexpr auto required = std::size_t {28};
+    if (destination.size() < required) {
+      return {.error = sender_report_error::destination_too_small};
+    }
+    const auto packet = destination.first(required);
+    detail::write_rtcp_header(packet, 0, rtcp_sender_report_type);
+    detail::write_u32(packet.subspan(4, 4), report.sender_ssrc);
+    detail::write_u32(packet.subspan(8, 4), report.ntp_seconds);
+    detail::write_u32(packet.subspan(12, 4), report.ntp_fraction);
+    detail::write_u32(packet.subspan(16, 4), report.rtp_timestamp);
+    detail::write_u32(packet.subspan(20, 4), report.packet_count);
+    detail::write_u32(packet.subspan(24, 4), report.octet_count);
+    return {.bytes_written = required};
+  }
+
   /**
    * @brief Parse one RTCP packet from the start of a datagram without allocation.
    *

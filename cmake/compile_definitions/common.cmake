@@ -227,6 +227,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/control_server.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/control/wire.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/control/wire.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/audio_sender.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/audio_sender.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/host_runtime.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/host_runtime.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/identity.cpp"
