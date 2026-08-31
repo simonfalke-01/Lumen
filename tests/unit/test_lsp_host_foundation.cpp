@@ -424,6 +424,7 @@ TEST(LspSessionAuthority, NeutralizesBeforeAttachAndRequiresFreshBaseline) {
   EXPECT_EQ(token_verifier.calls, 2U);
   EXPECT_EQ(authority.snapshot().generations.connection, 11U);
   EXPECT_EQ(authority.snapshot().generations.input, 61U);
+  EXPECT_EQ(authority.snapshot().generations.video, 31U);
   EXPECT_EQ(authority.authorize_input(owner.client_id, 10, 20, 60), lsp::AuthorityResult::stale_generation);
   EXPECT_EQ(authority.authorize_input(owner.client_id, 11, 20, 61), lsp::AuthorityResult::baseline_required);
 }
@@ -460,6 +461,7 @@ TEST(LspSessionAuthority, AttachPreflightIsReadOnlyAndSuccessfulRekeyRotatesToke
   EXPECT_EQ(neutralizer.calls, 1U);
   EXPECT_EQ(authority.snapshot().generations.connection, 15U);
   EXPECT_EQ(authority.snapshot().generations.input, 61U);
+  EXPECT_EQ(authority.snapshot().generations.video, 31U);
 
   ASSERT_EQ(authority.transport_lost(15), lsp::AuthorityResult::accepted);
   fresh_owner.connection_generation = 16;

@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 
 namespace lumen::lsp::runtime {
   /** @brief Authenticated input-only session mapping installed by START_RESPONSE. */
@@ -115,6 +116,13 @@ namespace lumen::lsp::runtime {
 
     /** @brief Return the active mapping, or no value when input authority is absent. */
     [[nodiscard]] std::optional<InputSessionMapping> mapping() const noexcept;
+
+    /**
+     * @brief Snapshot the greatest platform-applied state and contiguous edge watermark.
+     *
+     * @return Applied state sequence and edge identifier; both zero before baseline authority.
+     */
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> applied_watermark() const noexcept;
 
   private:
     class Impl;

@@ -30,6 +30,7 @@ namespace lumen::lsp::runtime {
 #if LUMEN_LSP_LIBSRTP_AVAILABLE
     constexpr std::size_t maximum_protected_packet_bytes = 2'048;
     constexpr std::size_t maximum_srtp_trailer_bytes = 64;
+    constexpr std::array<int, 3> encrypted_header_extension_ids {3, 4, 5};
     constexpr std::size_t srtp_master_material_size = srtp_aes_128_key_size + srtp_aead_salt_size;
 
     void clear_secret(const std::span<std::uint8_t> bytes) noexcept {
@@ -62,8 +63,8 @@ namespace lumen::lsp::runtime {
         ready_ = false;
       }
 #else
-      (void)callbacks_;
-      (void)maximum_associations_;
+      (void) callbacks_;
+      (void) maximum_associations_;
 #endif
     }
 
@@ -87,9 +88,9 @@ namespace lumen::lsp::runtime {
       const std::span<const std::uint8_t> datagram
     ) noexcept {
 #if !LUMEN_LSP_LIBSRTP_AVAILABLE
-      (void)peer;
-      (void)packet_class;
-      (void)datagram;
+      (void) peer;
+      (void) packet_class;
+      (void) datagram;
       return ProviderDatagramResult::fatal;
 #else
       std::scoped_lock lock(mutex_);
@@ -120,8 +121,8 @@ namespace lumen::lsp::runtime {
 
     bool install(const PeerEndpoint &peer, const DtlsSrtpKeyMaterial &key_material) noexcept {
 #if !LUMEN_LSP_LIBSRTP_AVAILABLE
-      (void)peer;
-      (void)key_material;
+      (void) peer;
+      (void) key_material;
       return false;
 #else
       std::scoped_lock lock(mutex_);
@@ -151,6 +152,8 @@ namespace lumen::lsp::runtime {
       inbound_policy.key = inbound_material.data();
       inbound_policy.window_size = 128;
       inbound_policy.allow_repeat_tx = 0;
+      inbound_policy.enc_xtn_hdr = const_cast<int *>(encrypted_header_extension_ids.data());
+      inbound_policy.enc_xtn_hdr_count = static_cast<int>(encrypted_header_extension_ids.size());
       inbound_policy.next = nullptr;
 
       srtp_policy_t outbound_policy {};
@@ -160,11 +163,14 @@ namespace lumen::lsp::runtime {
       outbound_policy.key = outbound_material.data();
       outbound_policy.window_size = 128;
       outbound_policy.allow_repeat_tx = 0;
+      outbound_policy.enc_xtn_hdr = const_cast<int *>(encrypted_header_extension_ids.data());
+      outbound_policy.enc_xtn_hdr_count = static_cast<int>(encrypted_header_extension_ids.size());
       outbound_policy.next = nullptr;
 
       const auto inbound_status = srtp_create(&association.inbound, &inbound_policy);
       const auto outbound_status = inbound_status == srtp_err_status_ok ?
-                                     srtp_create(&association.outbound, &outbound_policy) : srtp_err_status_fail;
+                                     srtp_create(&association.outbound, &outbound_policy) :
+                                     srtp_err_status_fail;
       clear_secret(inbound_material);
       clear_secret(outbound_material);
       if (inbound_status != srtp_err_status_ok || outbound_status != srtp_err_status_ok) {
@@ -183,7 +189,7 @@ namespace lumen::lsp::runtime {
 
     bool remove(const PeerEndpoint &peer) noexcept {
 #if !LUMEN_LSP_LIBSRTP_AVAILABLE
-      (void)peer;
+      (void) peer;
       return false;
 #else
       std::scoped_lock lock(mutex_);
@@ -203,9 +209,9 @@ namespace lumen::lsp::runtime {
       const std::span<const std::uint8_t> plaintext
     ) noexcept {
 #if !LUMEN_LSP_LIBSRTP_AVAILABLE
-      (void)peer;
-      (void)packet_class;
-      (void)plaintext;
+      (void) peer;
+      (void) packet_class;
+      (void) plaintext;
       return false;
 #else
       std::scoped_lock lock(mutex_);
@@ -220,13 +226,44 @@ namespace lumen::lsp::runtime {
       const auto status = packet_class == SecurePacketClass::rtcp ?
                             srtp_protect_rtcp(associations_[index].outbound, packet.data(), &size) :
                             srtp_protect(associations_[index].outbound, packet.data(), &size);
-      const auto sent = status == srtp_err_status_ok && size > 0 && callbacks_.send_datagram(
-                                                                      callbacks_.context,
-                                                                      peer,
-                                                                      std::span<const std::uint8_t> {packet.data(), static_cast<std::size_t>(size)}
-                                                                    );
+      const auto sent = status == srtp_err_status_ok && size > 0 && callbacks_.send_datagram(callbacks_.context, peer, std::span<const std::uint8_t> {packet.data(), static_cast<std::size_t>(size)});
       clear_secret(packet);
       return sent;
+#endif
+    }
+
+    bool protect_and_send_in_place(
+      const PeerEndpoint &peer,
+      const SecurePacketClass packet_class,
+      const std::span<std::uint8_t> packet_storage,
+      const std::size_t plaintext_bytes
+    ) noexcept {
+#if !LUMEN_LSP_LIBSRTP_AVAILABLE
+      (void) peer;
+      (void) packet_class;
+      (void) packet_storage;
+      (void) plaintext_bytes;
+      return false;
+#else
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      const auto required_trailer = packet_class == SecurePacketClass::rtcp ? std::size_t {20} : std::size_t {16};
+      if (!ready_ || index == associations_.size() || plaintext_bytes == 0 ||
+          packet_storage.size() > maximum_protected_packet_bytes ||
+          plaintext_bytes > packet_storage.size() || packet_storage.size() - plaintext_bytes < required_trailer) {
+        return false;
+      }
+      auto size = static_cast<int>(plaintext_bytes);
+      const auto status = packet_class == SecurePacketClass::rtcp ?
+                            srtp_protect_rtcp(associations_[index].outbound, packet_storage.data(), &size) :
+                            srtp_protect(associations_[index].outbound, packet_storage.data(), &size);
+      return status == srtp_err_status_ok && size > 0 &&
+             static_cast<std::size_t>(size) <= packet_storage.size() &&
+             callbacks_.send_datagram(
+               callbacks_.context,
+               peer,
+               std::span<const std::uint8_t> {packet_storage.data(), static_cast<std::size_t>(size)}
+             );
 #endif
     }
 
@@ -311,6 +348,15 @@ namespace lumen::lsp::runtime {
     const std::span<const std::uint8_t> plaintext
   ) noexcept {
     return impl_ && impl_->protect_and_send(peer, packet_class, plaintext);
+  }
+
+  bool LibsrtpServerProvider::protect_and_send_in_place(
+    const PeerEndpoint &peer,
+    const SecurePacketClass packet_class,
+    const std::span<std::uint8_t> packet_storage,
+    const std::size_t plaintext_bytes
+  ) noexcept {
+    return impl_ && impl_->protect_and_send_in_place(peer, packet_class, packet_storage, plaintext_bytes);
   }
 
   std::size_t LibsrtpServerProvider::association_count() const noexcept {

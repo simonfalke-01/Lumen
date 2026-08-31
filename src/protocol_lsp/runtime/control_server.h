@@ -76,7 +76,7 @@ namespace lumen::lsp::runtime {
     [[nodiscard]] virtual std::optional<std::vector<ControlApplication>> snapshot() noexcept = 0;
   };
 
-  /** @brief Product authority boundary for START, ATTACH, input, audio, and microphone. */
+  /** @brief Product authority boundary for START, ATTACH, input, video, audio, and microphone. */
   class ControlStartHandler {
   public:
     virtual ~ControlStartHandler() = default;
@@ -125,6 +125,34 @@ namespace lumen::lsp::runtime {
       const TrustedClient &client,
       std::uint32_t connection_generation,
       const AttachRequestPayload &request
+    ) noexcept = 0;
+
+    /**
+     * @brief Copy the exact VIDEO_CONFIG prepared by the latest successful START or ATTACH.
+     *
+     * @param session_id Active session identifier.
+     * @param video_generation Exact selected video generation.
+     * @return Borrowed complete configuration, or null when authority changed.
+     */
+    [[nodiscard]] virtual const VideoConfigPayload *video_configuration(
+      const Identifier128 &session_id,
+      std::uint32_t video_generation
+    ) noexcept = 0;
+
+    /**
+     * @brief Commit one authenticated VIDEO_CONFIG_ACK idempotently.
+     *
+     * @param peer Exact authenticated association.
+     * @param client Authenticated stream owner.
+     * @param connection_generation Current connection generation.
+     * @param acknowledgement Exact decoded video acknowledgement.
+     * @return True when the acknowledgement matches current or already committed video state.
+     */
+    virtual bool video_config_acknowledged(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      std::uint32_t connection_generation,
+      const VideoConfigAckPayload &acknowledgement
     ) noexcept = 0;
 
     /**

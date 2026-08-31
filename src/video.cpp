@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cstring>
 #include <list>
 #include <limits>
 #include <mutex>
@@ -654,6 +655,13 @@ namespace video {
       request_idr_frame();
     }
 
+    /** @copydoc encode_session_t::try_invalidate_ref_frames_without_idr */
+    bool try_invalidate_ref_frames_without_idr(int64_t first_frame, int64_t last_frame) override {
+      (void) first_frame;
+      (void) last_frame;
+      return false;
+    }
+
     avcodec_ctx_t avcodec_ctx;  ///< FFmpeg codec context owned by the encode session.
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Platform device used by the FFmpeg hardware encoder.
 
@@ -726,6 +734,11 @@ namespace video {
       if (!device->nvenc->invalidate_ref_frames(first_frame, last_frame)) {
         force_idr = true;
       }
+    }
+
+    /** @copydoc encode_session_t::try_invalidate_ref_frames_without_idr */
+    bool try_invalidate_ref_frames_without_idr(int64_t first_frame, int64_t last_frame) override {
+      return device && device->nvenc && device->nvenc->invalidate_ref_frames(first_frame, last_frame);
     }
 
     /**
@@ -1623,6 +1636,23 @@ namespace video {
     return chosen_encoder != nullptr && chosen_encoder->name == "nvenc"sv;
   }
 
+  lsp_sdr_encoder_capability_t active_lsp_sdr_encoder_capability(const int video_format) noexcept {
+    const auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    if (chosen_encoder == nullptr || (video_format != 0 && video_format != 1)) {
+      return {};
+    }
+    const auto &codec = video_format == 0 ? chosen_encoder->h264 : chosen_encoder->hevc;
+    const auto supported = codec[encoder_t::PASSED];
+    const auto hardware = supported && chosen_encoder != &software;
+    const auto native_nvenc = hardware && chosen_encoder->name == "nvenc"sv;
+    return {
+      .supported = supported,
+      .hardware = hardware,
+      .verified_low_delay = hardware,
+      .reference_invalidation = native_nvenc && last_encoder_probe_supported_ref_frames_invalidation,
+    };
+  }
+
   std::optional<encoder_probe_device_identity_t> active_encoder_probe_device_identity() {
     const auto probe_lock = std::lock_guard(encoder_probe_mutex);
     const auto current_identity = current_encoder_probe_identity();
@@ -2189,6 +2219,59 @@ namespace video {
     return -1;
   }
 
+  bool materialize_lsp_access_unit(
+    packet_raw_t &packet,
+    const std::span<std::uint8_t> destination,
+    std::size_t &bytes_written
+  ) noexcept {
+    bytes_written = 0;
+    if (packet.data() == nullptr || packet.data_size() == 0 || packet.data_size() > destination.size()) {
+      return false;
+    }
+    std::copy_n(packet.data(), packet.data_size(), destination.begin());
+    bytes_written = packet.data_size();
+    if (!packet.is_idr() || packet.replacements == nullptr) {
+      return true;
+    }
+    for (const auto &replacement : *packet.replacements) {
+      if (replacement.old.empty()) {
+        continue;
+      }
+      const auto old_bytes = std::span<const std::uint8_t> {
+        reinterpret_cast<const std::uint8_t *>(replacement.old.data()),
+        replacement.old.size()
+      };
+      const auto new_bytes = std::span<const std::uint8_t> {
+        reinterpret_cast<const std::uint8_t *>(replacement._new.data()),
+        replacement._new.size()
+      };
+      const auto active = destination.first(bytes_written);
+      const auto match = std::search(active.begin(), active.end(), old_bytes.begin(), old_bytes.end());
+      if (match == active.end()) {
+        bytes_written = 0;
+        return false;
+      }
+      const auto offset = static_cast<std::size_t>(std::distance(active.begin(), match));
+      const auto tail_offset = offset + old_bytes.size();
+      const auto tail_size = bytes_written - tail_offset;
+      if (new_bytes.size() > old_bytes.size()) {
+        const auto growth = new_bytes.size() - old_bytes.size();
+        if (growth > destination.size() - bytes_written) {
+          bytes_written = 0;
+          return false;
+        }
+        std::memmove(destination.data() + tail_offset + growth, destination.data() + tail_offset, tail_size);
+        bytes_written += growth;
+      } else if (old_bytes.size() > new_bytes.size()) {
+        const auto shrink = old_bytes.size() - new_bytes.size();
+        std::memmove(destination.data() + offset + new_bytes.size(), destination.data() + tail_offset, tail_size);
+        bytes_written -= shrink;
+      }
+      std::copy(new_bytes.begin(), new_bytes.end(), destination.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+    return true;
+  }
+
   /**
    * @brief Create an AVCodec encode session.
    *
@@ -2709,7 +2792,11 @@ namespace video {
 
       while (invalidate_ref_frames_events->peek()) {
         if (auto frames = invalidate_ref_frames_events->pop(0ms)) {
-          session->invalidate_ref_frames(frames->first, frames->second);
+          if (config.client_protocol == stream_policy::ClientProtocol::lumen_streaming_protocol) {
+            (void) session->try_invalidate_ref_frames_without_idr(frames->first, frames->second);
+          } else {
+            session->invalidate_ref_frames(frames->first, frames->second);
+          }
         }
       }
 
@@ -3059,7 +3146,11 @@ namespace video {
 
           while (ctx->invalidate_ref_frames_events->peek()) {
             if (auto frames = ctx->invalidate_ref_frames_events->pop(0ms)) {
-              pos->session->invalidate_ref_frames(frames->first, frames->second);
+              if (ctx->config.client_protocol == stream_policy::ClientProtocol::lumen_streaming_protocol) {
+                (void) pos->session->try_invalidate_ref_frames_without_idr(frames->first, frames->second);
+              } else {
+                pos->session->invalidate_ref_frames(frames->first, frames->second);
+              }
             }
           }
 

@@ -174,6 +174,23 @@ namespace lumen::lsp::runtime {
       control_rto rto {true};  ///< Local-path initial RTO.
       std::uint64_t next_message_id {1};  ///< Next outbound logical message ID.
 
+      struct PendingVideoConfig {
+        Identifier128 session_id {};  ///< Exact configured session identifier.
+        std::uint32_t video_generation {};  ///< Exact configured video generation.
+        std::uint64_t request_id {};  ///< Random request identifier echoed by VIDEO_CONFIG_ACK.
+        std::uint64_t message_id {};  ///< Reliable outbound message identifier.
+        bool active {};  ///< Whether a matching acknowledgement remains pending.
+      } pending_video;  ///< At most one pending video configuration per connection.
+
+      struct AcceptedVideoAck {
+        std::uint64_t request_id {};  ///< VIDEO_CONFIG request identifier answered by this frame.
+        std::array<std::uint8_t, maximum_control_frame_bytes> frame {};  ///< Byte-identical accepted ACK.
+        std::size_t size {};  ///< Populated leading bytes in `frame`.
+      };
+
+      std::array<AcceptedVideoAck, 4> accepted_video_acks {};  ///< Bounded recent ACK cache across rekeys.
+      std::size_t next_video_ack_slot {};  ///< Ring slot replaced by the next accepted video ACK.
+
       struct PendingAudioConfig {
         AudioConfigPayload payload {};  ///< Exact configuration awaiting client installation.
         std::uint64_t request_id {};  ///< Random request identifier echoed by AUDIO_CONFIG_ACK.
@@ -363,6 +380,9 @@ namespace lumen::lsp::runtime {
       }
       const auto message_type = static_cast<ControlMessageType>(parsed.header.message_type);
       if (has_flag(parsed.header.flags, lspc_flag::response)) {
+        if (message_type == ControlMessageType::video_config_ack) {
+          return video_config_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        }
         if (message_type == ControlMessageType::audio_config_ack) {
           return audio_config_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
         }
@@ -418,6 +438,8 @@ namespace lumen::lsp::runtime {
           return attach_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::stop:
           return stop_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::video_config:
+        case ControlMessageType::video_config_ack:
         case ControlMessageType::audio_config:
         case ControlMessageType::audio_config_ack:
         case ControlMessageType::microphone_config:
@@ -496,12 +518,15 @@ namespace lumen::lsp::runtime {
           return ControlMessageType::attach_response;
         case ControlMessageType::stop:
           return ControlMessageType::stop_response;
+        case ControlMessageType::video_config:
+          return ControlMessageType::video_config_ack;
         case ControlMessageType::audio_config:
           return ControlMessageType::audio_config_ack;
         case ControlMessageType::audio_config_ack:
         case ControlMessageType::microphone_config:
           return ControlMessageType::microphone_config_ack;
         case ControlMessageType::microphone_config_ack:
+        case ControlMessageType::video_config_ack:
         case ControlMessageType::server_hello:
         case ControlMessageType::pair_response:
         case ControlMessageType::auth_response:
@@ -606,6 +631,114 @@ namespace lumen::lsp::runtime {
       return transport_.send(connection.peer, storage);
     }
 
+    /** @brief Reliably send one server-originated VIDEO_CONFIG after START or ATTACH response. */
+    bool send_video_config(
+      Connection &connection,
+      const VideoConfigPayload &configuration,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (connection.pending_video.active || connection.next_message_id == 0) {
+        return false;
+      }
+      const auto payload = encode_video_config(configuration);
+      std::array<std::uint8_t, 8> request_bytes {};
+      if (!payload || !crypto_.random(request_bytes)) {
+        return false;
+      }
+      std::uint64_t request_id = 0;
+      for (const auto byte : request_bytes) {
+        request_id = (request_id << 8U) | byte;
+      }
+      if (request_id == 0) {
+        request_id = 1;
+      }
+      std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
+      const lspc_header header {
+        .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
+        .message_type = static_cast<std::uint16_t>(ControlMessageType::video_config),
+        .connection_generation = connection.generation,
+        .payload_length = static_cast<std::uint32_t>(payload->size()),
+        .message_id = connection.next_message_id,
+        .request_id = request_id,
+        .acknowledgement_base = connection.inbound.base(),
+        .acknowledgement_bitmap = connection.inbound.bitmap(),
+      };
+      const auto serialized = serialize_lspc(header, *payload, storage);
+      if (!serialized) {
+        return false;
+      }
+      const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
+      if (connection.outbound.store(
+            connection.next_message_id,
+            frame,
+            now_microseconds,
+            saturating_add(now_microseconds, response_deadline_microseconds),
+            connection.rto
+          ) != outbound_store_result::stored) {
+        return false;
+      }
+      connection.pending_video = {
+        .session_id = configuration.session_id,
+        .video_generation = configuration.video.video_generation,
+        .request_id = request_id,
+        .message_id = connection.next_message_id,
+        .active = true,
+      };
+      ++connection.next_message_id;
+      return transport_.send(connection.peer, frame);
+    }
+
+    /** @brief Validate and commit one idempotent VIDEO_CONFIG_ACK response. */
+    bool video_config_ack(
+      Connection &connection,
+      const std::span<const std::uint8_t> frame,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      (void) now_microseconds;
+      const auto accepted_duplicate = std::ranges::find_if(connection.accepted_video_acks, [&](const Connection::AcceptedVideoAck &accepted) {
+        return accepted.size == frame.size() && accepted.request_id == header.request_id &&
+               std::ranges::equal(std::span<const std::uint8_t> {accepted.frame}.first(accepted.size), frame);
+      });
+      const auto observed = connection.inbound.observe(header.message_id);
+      if (observed != receive_id_result::accepted) {
+        if (accepted_duplicate != connection.accepted_video_acks.end()) {
+          return send_acknowledgement_only(connection);
+        }
+        transport_.close(connection.peer);
+        return false;
+      }
+      if (!connection.hello_complete || !connection.authenticated_client ||
+          header.connection_generation != connection.generation || header.request_id == 0 ||
+          !connection.pending_video.active || header.request_id != connection.pending_video.request_id ||
+          frame.size() > maximum_control_frame_bytes) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      const auto acknowledgement = decode_video_config_ack(payload);
+      if (!acknowledgement || acknowledgement->session_id != connection.pending_video.session_id ||
+          acknowledgement->video_generation != connection.pending_video.video_generation ||
+          has_flag(header.flags, lspc_flag::error_response) != (acknowledgement->status != ControlStatus::success) ||
+          !start_handler_.video_config_acknowledged(
+            connection.peer,
+            *connection.authenticated_client,
+            connection.generation,
+            *acknowledgement
+          )) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      connection.outbound.acknowledge(connection.pending_video.message_id, 0);
+      connection.pending_video.active = false;
+      auto &accepted = connection.accepted_video_acks[connection.next_video_ack_slot];
+      accepted.request_id = header.request_id;
+      std::ranges::copy(frame, accepted.frame.begin());
+      accepted.size = frame.size();
+      connection.next_video_ack_slot = (connection.next_video_ack_slot + 1U) % connection.accepted_video_acks.size();
+      return send_acknowledgement_only(connection);
+    }
+
     /**
      * @brief Reliably send one server-originated AUDIO_CONFIG after START or ATTACH response.
      *
@@ -633,6 +766,9 @@ namespace lumen::lsp::runtime {
       }
       if (request_id == 0) {
         request_id = 1;
+      }
+      if (request_id == connection.pending_video.request_id) {
+        request_id = request_id == std::numeric_limits<std::uint64_t>::max() ? 1U : request_id + 1U;
       }
       std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
       const lspc_header header {
@@ -751,6 +887,9 @@ namespace lumen::lsp::runtime {
         request_id = 1;
       }
       if (request_id == connection.pending_audio.request_id) {
+        request_id = request_id == std::numeric_limits<std::uint64_t>::max() ? 1U : request_id + 1U;
+      }
+      if (request_id == connection.pending_video.request_id) {
         request_id = request_id == std::numeric_limits<std::uint64_t>::max() ? 1U : request_id + 1U;
       }
       std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
@@ -1059,6 +1198,13 @@ namespace lumen::lsp::runtime {
       if (!response || !send_response(connection, request, header, ControlMessageType::start_response, *response, false, now_microseconds)) {
         return false;
       }
+      const auto video_configuration = start_handler_.video_configuration(
+        selected->session_id,
+        selected->video.video_generation
+      );
+      if (video_configuration == nullptr || !send_video_config(connection, *video_configuration, now_microseconds)) {
+        return false;
+      }
       if (!send_audio_config(
             connection,
             AudioConfigPayload {
@@ -1140,6 +1286,13 @@ namespace lumen::lsp::runtime {
       }
       const auto response = encode_attach_response(*attached);
       if (!response || !send_response(connection, request, header, ControlMessageType::attach_response, *response, false, now_microseconds)) {
+        return false;
+      }
+      const auto video_configuration = start_handler_.video_configuration(
+        attached->session_id,
+        attached->video.video_generation
+      );
+      if (video_configuration == nullptr || !send_video_config(connection, *video_configuration, now_microseconds)) {
         return false;
       }
       if (!send_audio_config(

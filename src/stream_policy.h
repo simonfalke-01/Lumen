@@ -31,6 +31,7 @@ namespace stream_policy {
     third_party_extension,
     umbra_legacy,
     umbra_v2,
+    lumen_streaming_protocol,  ///< Native LSP connection, distinct from legacy GameStream.
   };
 
   /**

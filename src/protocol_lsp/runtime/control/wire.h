@@ -35,6 +35,8 @@ namespace lumen::lsp::runtime {
     attach_response = 0x0203,  ///< Return rotated authority, token, SSRCs, and baseline requirement.
     stop = 0x0204,  ///< Stop the authenticated client's own session.
     stop_response = 0x0205,  ///< Return the terminal owner-qualified stop outcome.
+    video_config = 0x0210,  ///< Install one exact SDR H.264/HEVC decoder configuration.
+    video_config_ack = 0x0211,  ///< Authenticate client decoder readiness and initial credit.
     audio_config = 0x0212,  ///< Install one exact host Opus configuration before SRTP transmission.
     audio_config_ack = 0x0213,  ///< Authenticate client decoder readiness for one audio generation.
     microphone_config = 0x0214,  ///< Install one exact reverse Opus microphone configuration.
@@ -169,7 +171,97 @@ namespace lumen::lsp::runtime {
     std::uint16_t initial_udp_payload_size {1'200};  ///< Initial protected UDP payload maximum.
   };
 
-  /** @brief Exact START ten-key request map for input, audio, and optional microphone. */
+  /** @brief Network profile values carried by START key eleven. */
+  enum class VideoNetworkProfile : std::uint8_t {
+    adaptive_low_latency = 0,  ///< Safe delay-adaptive default.
+    competition = 1,  ///< Explicitly provisioned competition-LAN mode.
+  };
+
+  /** @brief Codec values carried by the frozen video offer and selection maps. */
+  enum class VideoCodec : std::uint8_t {
+    h264 = 1,  ///< RFC 6184 H.264 non-interleaved mode.
+    hevc = 2,  ///< RFC 7798 HEVC single-stream mode.
+  };
+
+  /** @brief Exact codec-profile values for the first SDR product slice. */
+  enum class VideoProfile : std::uint8_t {
+    h264_high = 1,  ///< H.264 High profile.
+    hevc_main = 2,  ///< HEVC Main profile.
+  };
+
+  /** @brief Exact pixel-format value for NV12-compatible 8-bit 4:2:0. */
+  inline constexpr std::uint8_t video_pixel_format_nv12 = 1;
+
+  /** @brief Exact complete-access-unit encoder-delivery value. */
+  inline constexpr std::uint8_t video_delivery_complete_access_unit = 1;
+
+  /** @brief Exact SDR Rec.709 color-description value. */
+  inline constexpr std::uint8_t video_color_rec709 = 1;
+
+  /** @brief Fixed visible RFC 9626 frame-marking extension identifier. */
+  inline constexpr std::uint8_t video_frame_marking_extension_id = 1;
+
+  /** @brief Fixed RFC 8872 absolute-capture-time extension identifier. */
+  inline constexpr std::uint8_t video_absolute_capture_time_extension_id = 2;
+
+  /** @brief Fixed encrypted LSP frame-ID extension identifier. */
+  inline constexpr std::uint8_t video_frame_id_extension_id = 3;
+
+  /** @brief Fixed encrypted LSP input-watermark extension identifier. */
+  inline constexpr std::uint8_t video_input_watermark_extension_id = 4;
+
+  /** @brief Fixed encrypted LSP encoder-timing extension identifier. */
+  inline constexpr std::uint8_t video_encoder_timing_extension_id = 5;
+
+  /** @brief One exact twelve-key ordered SDR video offer in START key twelve. */
+  struct VideoOfferPayload {
+    VideoCodec codec {VideoCodec::h264};  ///< Offered H.264 or HEVC codec.
+    VideoProfile profile {VideoProfile::h264_high};  ///< Codec-matched High or Main profile.
+    std::uint32_t width {};  ///< Exact encoded width in pixels.
+    std::uint32_t height {};  ///< Exact encoded height in pixels.
+    std::uint32_t refresh_numerator {};  ///< Exact rational refresh numerator.
+    std::uint32_t refresh_denominator {};  ///< Exact rational refresh denominator.
+    std::uint64_t preferred_bits_per_second {};  ///< Preferred encoded source-media rate.
+    std::uint64_t maximum_bits_per_second {};  ///< Maximum accepted encoded source-media rate.
+    std::uint8_t pixel_format {video_pixel_format_nv12};  ///< Exactly NV12-compatible 8-bit 4:2:0.
+    std::uint8_t delivery {video_delivery_complete_access_unit};  ///< Exactly complete-access-unit delivery.
+    bool flexfec {};  ///< Required false in the first real video slice.
+    bool rtx {};  ///< Required false in the first real video slice.
+  };
+
+  /** @brief Exact twenty-eight-key selected SDR video tuple. */
+  struct VideoSelectionPayload {
+    std::uint32_t video_generation {};  ///< Nonzero video configuration generation.
+    std::uint32_t primary_ssrc {};  ///< Random nonzero primary video SSRC.
+    std::uint8_t primary_payload_type {};  ///< Dynamic primary RTP payload type.
+    std::uint32_t clock_rate {90'000};  ///< Exact 90 kHz video clock.
+    VideoCodec codec {VideoCodec::h264};  ///< Selected H.264 or HEVC codec.
+    VideoProfile profile {VideoProfile::h264_high};  ///< Selected matching codec profile.
+    std::uint32_t width {};  ///< Selected encoded width.
+    std::uint32_t height {};  ///< Selected encoded height.
+    std::uint32_t refresh_numerator {};  ///< Selected rational refresh numerator.
+    std::uint32_t refresh_denominator {};  ///< Selected rational refresh denominator.
+    std::uint64_t selected_bits_per_second {};  ///< Selected initial encoded source-media rate.
+    std::uint8_t pixel_format {video_pixel_format_nv12};  ///< Exactly NV12-compatible 8-bit 4:2:0.
+    std::uint8_t color_primaries {video_color_rec709};  ///< Exactly Rec.709 primaries.
+    std::uint8_t transfer_function {video_color_rec709};  ///< Exactly Rec.709 transfer.
+    std::uint8_t matrix_coefficients {video_color_rec709};  ///< Exactly Rec.709 matrix.
+    bool full_range {};  ///< Required false for the first SDR slice.
+    std::uint16_t initial_udp_payload_size {1'200};  ///< Exact initial protected UDP maximum.
+    std::uint8_t decoder_surfaces {};  ///< Negotiated hardware submissions, two through four.
+    std::uint8_t render_mailbox {1};  ///< Exact render mailbox depth one.
+    std::uint8_t delivery {video_delivery_complete_access_unit};  ///< Exactly complete-access-unit delivery.
+    std::uint8_t frame_marking_extension {video_frame_marking_extension_id};  ///< Visible RFC 9626 extension ID.
+    std::uint8_t absolute_capture_time_extension {video_absolute_capture_time_extension_id};  ///< RFC 8872 extension ID.
+    std::uint8_t frame_id_extension {video_frame_id_extension_id};  ///< Encrypted custom frame-ID extension ID.
+    std::uint8_t input_watermark_extension {video_input_watermark_extension_id};  ///< Encrypted input-watermark extension ID.
+    std::uint8_t encoder_timing_extension {video_encoder_timing_extension_id};  ///< Encrypted encoder-timing extension ID.
+    bool flexfec {};  ///< Required false in this slice.
+    bool rtx {};  ///< Required false in this slice.
+    std::uint32_t maximum_frame_age_microseconds {};  ///< Positive authenticated reassembly/admission deadline budget.
+  };
+
+  /** @brief Exact START sixteen-key request map including the first SDR video slice. */
   struct StartRequestPayload {
     std::string application_id;  ///< Configured application ID selected for input ownership.
     std::uint32_t pointer_rate {};  ///< Requested pointer reports/s in 125 through 16,000.
@@ -180,9 +272,15 @@ namespace lumen::lsp::runtime {
     std::vector<AudioOfferPayload> audio_offers;  ///< Ordered exact audio offers, one through twelve entries.
     std::uint16_t offered_maximum_udp_payload {};  ///< Client path payload ceiling for the association family.
     std::optional<MicrophoneOfferPayload> microphone_offer;  ///< Null or exact reverse-microphone offer.
+    VideoNetworkProfile network_profile {VideoNetworkProfile::adaptive_low_latency};  ///< Selected controller profile.
+    std::vector<VideoOfferPayload> video_offers;  ///< Ordered exact SDR offers, one through eight entries.
+    std::uint8_t client_receive_batch_capacity {};  ///< Client receive batch capacity, one through 64.
+    std::uint8_t decoder_surfaces {};  ///< Offered hardware decoder submissions, two through four.
+    std::uint8_t render_mailbox {};  ///< Required exact depth one.
+    std::uint32_t maximum_capture_to_present_microseconds {};  ///< Positive end-to-end admission budget.
   };
 
-  /** @brief Exact START_RESPONSE 30-key response map. */
+  /** @brief Exact START_RESPONSE 31-key response map. */
   struct StartResponsePayload {
     ControlStatus status {ControlStatus::success};  ///< START outcome.
     Identifier128 session_id {};  ///< Random stream-session identifier.
@@ -200,6 +298,7 @@ namespace lumen::lsp::runtime {
     bool baseline_required {true};  ///< Always true for a fresh authority.
     AudioSelectionPayload audio {};  ///< Selected audio tuple encoded at keys 16 through 29.
     std::optional<MicrophoneSelectionPayload> microphone;  ///< Null or selected microphone tuple at key 30.
+    VideoSelectionPayload video {};  ///< Exact selected video tuple at key 31.
   };
 
   /** @brief Exact STOP map `{1: version, 2: session_id}`. */
@@ -214,7 +313,7 @@ namespace lumen::lsp::runtime {
     Identifier128 intent_id {};  ///< Fresh nonzero idempotent attach intent identifier.
   };
 
-  /** @brief Exact ATTACH_RESPONSE 31-key response map. */
+  /** @brief Exact ATTACH_RESPONSE 32-key response map. */
   struct AttachResponsePayload {
     ControlStatus status {ControlStatus::success};  ///< Transfer outcome.
     Identifier128 session_id {};  ///< Retained session identifier.
@@ -233,6 +332,26 @@ namespace lumen::lsp::runtime {
     bool baseline_required {true};  ///< Always true after authority transfer.
     AudioSelectionPayload audio {};  ///< Fresh audio tuple encoded at keys 17 through 30.
     std::optional<MicrophoneSelectionPayload> microphone;  ///< Null or fresh microphone tuple at key 31.
+    VideoSelectionPayload video {};  ///< Advanced generation and fresh primary SSRC at key 32.
+  };
+
+  /** @brief Exact eight-key VIDEO_CONFIG host request. */
+  struct VideoConfigPayload {
+    Identifier128 session_id {};  ///< Active stream-session identifier.
+    std::uint32_t stream_generation {};  ///< Active stream generation.
+    VideoSelectionPayload video {};  ///< Exact selected video tuple repeated at key four.
+    std::vector<std::vector<std::uint8_t>> parameter_sets;  ///< Prefix-free SPS/PPS or VPS/SPS/PPS bytes.
+    std::uint64_t frame_id_origin {};  ///< Nonzero first frame-ID origin.
+    std::uint32_t recovery_epoch {};  ///< Nonzero initial recovery epoch.
+    std::uint32_t maximum_complete_access_unit_bytes {};  ///< Bounded complete-AU parser/admission maximum.
+  };
+
+  /** @brief Exact five-key VIDEO_CONFIG_ACK client response. */
+  struct VideoConfigAckPayload {
+    ControlStatus status {ControlStatus::success};  ///< Client configuration result.
+    Identifier128 session_id {};  ///< Exact active session identifier.
+    std::uint32_t video_generation {};  ///< Acknowledged video configuration generation.
+    std::uint8_t decoder_credit {};  ///< Initial freshness-bounded decoder credit, two through four.
   };
 
   /** @brief Exact 17-key AUDIO_CONFIG host request. */
@@ -307,6 +426,12 @@ namespace lumen::lsp::runtime {
 
   /** @brief Encode exact ATTACH_RESPONSE deterministic CBOR. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_attach_response(const AttachResponsePayload &payload);
+
+  /** @brief Encode exact VIDEO_CONFIG deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_video_config(const VideoConfigPayload &payload);
+
+  /** @brief Decode exact VIDEO_CONFIG_ACK deterministic CBOR. */
+  [[nodiscard]] std::expected<VideoConfigAckPayload, ControlWireError> decode_video_config_ack(std::span<const std::uint8_t> payload);
 
   /** @brief Encode exact AUDIO_CONFIG deterministic CBOR. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_audio_config(const AudioConfigPayload &payload);

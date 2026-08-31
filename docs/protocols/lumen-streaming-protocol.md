@@ -15,9 +15,20 @@ Its reverse direction selects a microphone only with explicit client offer,
 paired permission, and a successful Windows virtual-microphone probe; SRTP
 admission begins only after the matching generation-qualified
 `MICROPHONE_CONFIG_ACK`.
-That host-side boundary does not claim a live cross-product stream: Umbra audio
-receive/playout, video capture/decoder/renderer integration, and hardware
-qualification remain in progress.
+Lumen now also freezes the sixteen-key `START`, 31/32-key START/ATTACH
+responses, 28-key SDR video selection, and `VIDEO_CONFIG/ACK` schemas for the
+first H.264 High or HEVC Main slice. The host prepares and owns the exact
+Windows virtual display when enabled, proves the named hardware encoder tuple,
+and starts its bounded complete-access-unit RTP/SRTP sender only after the
+matching authenticated video acknowledgement. Fixed extension IDs 1 through 5
+carry visible frame marking and capture time plus RFC 6904-encrypted frame ID,
+input watermark, and encoder timing. FlexFEC and RTX remain negotiated false in
+this first product slice.
+Umbra now has the matching native receive/depacketization/reassembly,
+retained-frame ABI, VideoToolbox, Metal, and protected `LSPV` path. These
+implemented product boundaries do not claim a live cross-product stream or
+hardware qualification until the Windows host and macOS client run the exact
+negotiated slice together.
 
 The Lumen Streaming Protocol (LSP) is the native, single-port protocol between
 Lumen and its clients. It is optimized for competitive game streaming on a
@@ -500,6 +511,39 @@ corresponding configuration ACK is authenticated.
 The host may select a lower bitrate, resolution, or refresh rate only within an
 offered range. Strict offers fail instead of being adjusted.
 
+### 10.1 Frozen first SDR product slice
+
+The implemented first video slice extends the previously committed ten-key
+`START` map to exactly sixteen keys. Keys 1 through 10 retain their input,
+audio, path, and nullable microphone meanings. Key 11 is network profile zero
+for adaptive-low-latency or one for competition. Key 12 is an ordered array of
+one through eight exact twelve-key video offers containing codec, profile,
+width, height, rational refresh, preferred and maximum bitrates, pixel format,
+delivery mode, and false FlexFEC/RTX flags. H.264/High is encoded as codec/profile
+`1/1`; HEVC/Main is `2/2`; pixel format and complete-access-unit delivery are
+both one. Keys 13 through 16 carry receive-batch capacity `1...64`, decoder
+surfaces `2...4`, render mailbox one, and a positive maximum capture-to-present
+budget in microseconds.
+
+`START_RESPONSE` has exactly 31 keys and `ATTACH_RESPONSE` exactly 32. Their
+last key is the same exact 28-key video selection: video generation, primary
+SSRC/PT, 90 kHz clock, codec/profile, dimensions, rational refresh, selected
+bitrate, NV12-compatible 8-bit 4:2:0, Rec.709 primaries/transfer/matrix, limited
+range, 1,200-byte initial UDP payload, decoder surfaces, mailbox one,
+complete-access-unit delivery, extension IDs `1...5`, false FlexFEC/RTX, and a
+positive maximum frame-age budget no greater than START key 16. Extension IDs
+1 and 2 are visible frame marking and absolute capture time. IDs 3, 4, and 5
+are RFC 6904-encrypted frame ID, input watermark, and encoder timing.
+
+`VIDEO_CONFIG` is an exact eight-key host request containing version, session
+ID, stream generation, the selected 28-key video map, prefix-free codec
+parameter sets, nonzero frame-ID origin, nonzero recovery epoch, and maximum
+complete access-unit bytes. H.264 carries exactly SPS/PPS; HEVC carries exactly
+VPS/SPS/PPS. `VIDEO_CONFIG_ACK` is an exact five-key response containing
+version, status, session ID, video generation, and decoder credit `2...4`.
+The LSPC error-response flag and non-success status must agree. No primary
+video SRTP packet is legal before a successful matching acknowledgement.
+
 ## 11. RTP session and lane registry
 
 All real-time lanes form one RTP session on the LSP five-tuple. Every active
@@ -851,6 +895,16 @@ decode submissions, and current render-mailbox occupancy. The client sends it
 on each decode completion or capacity transition, subject to one coalesced
 packet per 500 microseconds. It is observation, decoder credit, and recovery
 input, never an unauthenticated encoder command.
+
+The frozen plaintext `LSPV` packet is a 56-byte SRTCP APP packet: version two,
+subtype zero, PT 204, RTCP length 13, sender SSRC equal to the negotiated client
+input SSRC, and name `LSPV`. Offsets 12 through 15 contain LSP version one,
+deadline-miss bit zero, decoder status `0...3`, and maximum decoder credit
+`2...4`. Offsets 16, 20, and 24 contain session generation, video generation,
+and recovery epoch. Offsets 28, 36, and 44 contain the three largest frame IDs.
+Offsets 52 and 53 contain in-flight decode submissions and mailbox occupancy;
+offsets 54 through 55 are zero. Generation, ordering, credit, and capacity are
+validated only after SRTCP authentication.
 
 The host's complete-frame admission includes the client's most recent decoder
 credit and measured decode-completion rate. Credit is a freshness-bounded hint,

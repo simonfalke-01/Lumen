@@ -480,6 +480,15 @@ namespace video {
      * @param last_frame Last frame.
      */
     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
+
+    /**
+     * @brief Attempt reference invalidation without ever converting failure into an IDR request.
+     *
+     * @param first_frame First lost frame.
+     * @param last_frame Last lost frame.
+     * @return True only when native reference invalidation was accepted.
+     */
+    virtual bool try_invalidate_ref_frames_without_idr(int64_t first_frame, int64_t last_frame) = 0;
   };
 
   // encoders
@@ -682,6 +691,23 @@ namespace video {
   using packet_t = std::unique_ptr<packet_raw_t>;
 
   /**
+   * @brief Materialize one encoded access unit into caller-owned LSP frame storage.
+   *
+   * Required key-frame SPS/VPS substitutions are applied without allocating or changing the
+   * encoder-owned packet. The output never contains legacy transport framing.
+   *
+   * @param packet Encoded frame and optional codec-byte replacement rules.
+   * @param destination Fixed caller-owned complete-access-unit storage.
+   * @param bytes_written Receives the populated leading byte count.
+   * @return True only when the complete transformed access unit fits and every replacement matches.
+   */
+  bool materialize_lsp_access_unit(
+    packet_raw_t &packet,
+    std::span<std::uint8_t> destination,
+    std::size_t &bytes_written
+  ) noexcept;
+
+  /**
    * @brief Raw HDR metadata fields parsed from the display backend.
    */
   struct hdr_info_raw_t {
@@ -738,6 +764,22 @@ namespace video {
    * @return True only while the current probe generation selects NVENC.
    */
   [[nodiscard]] bool active_encoder_is_nvenc();
+
+  /** @brief Hardware and recovery capability for one first-slice SDR codec. */
+  struct lsp_sdr_encoder_capability_t {
+    bool supported {};  ///< Exact codec passed the committed encoder probe.
+    bool hardware {};  ///< Selected encoder is not the software fallback.
+    bool verified_low_delay {};  ///< Hardware tuple passed Lumen's no-B-frame low-delay probe.
+    bool reference_invalidation {};  ///< Native reference invalidation is available without forcing IDR.
+  };
+
+  /**
+   * @brief Query the committed encoder proof for SDR H.264 or HEVC LSP selection.
+   *
+   * @param video_format Zero for H.264 or one for HEVC.
+   * @return Exact committed capability; all fields false for an unsupported value or stale probe.
+   */
+  [[nodiscard]] lsp_sdr_encoder_capability_t active_lsp_sdr_encoder_capability(int video_format) noexcept;
 
   /**
    * @brief Return the exact device identity from the committed active encoder probe generation.

@@ -161,6 +161,12 @@ namespace lumen::lsp::runtime {
       return mapping_;
     }
 
+    /** @brief Snapshot greatest applied state and contiguous edge under the owner lock. */
+    std::pair<std::uint64_t, std::uint64_t> applied_watermark() const noexcept {
+      std::scoped_lock lock(mutex_);
+      return {highest_applied_state_, edges_.applied_through()};
+    }
+
     bool receive_rtcp(const PeerEndpoint &peer, const std::span<const std::uint8_t> packet) noexcept {
       std::scoped_lock lock(mutex_);
       if (!mapping_ || peer != mapping_->peer || packet.size() < 8 || (packet[0] >> 6U) != 2 || packet[1] != 204 ||
@@ -822,5 +828,10 @@ namespace lumen::lsp::runtime {
 
   std::optional<InputSessionMapping> InputOwner::mapping() const noexcept {
     return impl_ ? impl_->mapping() : std::nullopt;
+  }
+
+  /** @copydoc InputOwner::applied_watermark */
+  std::pair<std::uint64_t, std::uint64_t> InputOwner::applied_watermark() const noexcept {
+    return impl_ ? impl_->applied_watermark() : std::pair<std::uint64_t, std::uint64_t> {};
   }
 }  // namespace lumen::lsp::runtime

@@ -120,6 +120,22 @@ namespace lumen::lsp::runtime {
     ) noexcept;
 
     /**
+     * @brief Protect a final caller-owned RTP slab in place and atomically submit it.
+     *
+     * @param peer Exact established association.
+     * @param packet_class RTP or RTCP classification.
+     * @param packet_storage Writable final slab including SRTP trailer capacity.
+     * @param plaintext_bytes Populated leading plaintext bytes.
+     * @return True only when in-place protection and exact datagram submission succeed.
+     */
+    bool protect_and_send_in_place(
+      const PeerEndpoint &peer,
+      SecurePacketClass packet_class,
+      std::span<std::uint8_t> packet_storage,
+      std::size_t plaintext_bytes
+    ) noexcept;
+
+    /**
      * @brief Return the number of installed association context pairs.
      *
      * @return Current association count.

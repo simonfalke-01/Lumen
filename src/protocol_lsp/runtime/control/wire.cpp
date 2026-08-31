@@ -8,6 +8,7 @@
 #include "../../../protocol_common/cbor.h"
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <variant>
 
@@ -17,6 +18,8 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_payload_bytes = 1'152;
     constexpr std::size_t maximum_applications = 64;
     constexpr std::size_t maximum_audio_offers = 12;
+    constexpr std::size_t maximum_video_offers = 8;
+    constexpr std::size_t maximum_video_parameter_set_bytes = 512;
 
     template<std::size_t Size>
     cbor::Value::Bytes bytes(const std::array<std::uint8_t, Size> &value) {
@@ -45,10 +48,10 @@ namespace lumen::lsp::runtime {
     cbor::Limits limits() noexcept {
       cbor::Limits value;
       value.max_encoded_bytes = maximum_payload_bytes;
-      value.max_byte_string_bytes = ed25519_signature_size;
+      value.max_byte_string_bytes = maximum_video_parameter_set_bytes;
       value.max_text_bytes = 512;
       value.max_array_elements = maximum_applications;
-      value.max_map_entries = 31;
+      value.max_map_entries = 32;
       value.max_container_depth = 4;
       return value;
     }
@@ -160,6 +163,105 @@ namespace lumen::lsp::runtime {
         {9, cbor::Value {microphone->dtx}},
         {10, microphone->initial_udp_payload_size},
       }};
+    }
+
+    /** @brief Return whether a codec and profile form one frozen SDR tuple. */
+    bool valid_video_codec_profile(const VideoCodec codec, const VideoProfile profile) noexcept {
+      return (codec == VideoCodec::h264 && profile == VideoProfile::h264_high) ||
+             (codec == VideoCodec::hevc && profile == VideoProfile::hevc_main);
+    }
+
+    /** @brief Validate one exact ordered SDR video offer. */
+    bool valid_video_offer(const VideoOfferPayload &offer) noexcept {
+      return valid_video_codec_profile(offer.codec, offer.profile) &&
+             offer.width > 0 && offer.width <= 16'384 && offer.height > 0 && offer.height <= 16'384 &&
+             offer.refresh_numerator > 0 && offer.refresh_denominator > 0 &&
+             offer.preferred_bits_per_second > 0 &&
+             offer.preferred_bits_per_second <= offer.maximum_bits_per_second &&
+             offer.maximum_bits_per_second <= 1'000'000'000ULL &&
+             offer.pixel_format == video_pixel_format_nv12 &&
+             offer.delivery == video_delivery_complete_access_unit && !offer.flexfec && !offer.rtx;
+    }
+
+    /** @brief Validate the exact first-slice selected SDR video tuple. */
+    bool valid_video_selection(const VideoSelectionPayload &video) noexcept {
+      return video.video_generation != 0 && video.primary_ssrc != 0 &&
+             video.primary_payload_type >= 96 && video.primary_payload_type <= 127 &&
+             video.clock_rate == 90'000 && valid_video_codec_profile(video.codec, video.profile) &&
+             video.width > 0 && video.width <= 16'384 && video.height > 0 && video.height <= 16'384 &&
+             video.refresh_numerator > 0 && video.refresh_denominator > 0 &&
+             video.selected_bits_per_second > 0 && video.selected_bits_per_second <= 1'000'000'000ULL &&
+             video.pixel_format == video_pixel_format_nv12 &&
+             video.color_primaries == video_color_rec709 &&
+             video.transfer_function == video_color_rec709 &&
+             video.matrix_coefficients == video_color_rec709 && !video.full_range &&
+             video.initial_udp_payload_size == 1'200 &&
+             video.decoder_surfaces >= 2 && video.decoder_surfaces <= 4 &&
+             video.render_mailbox == 1 && video.delivery == video_delivery_complete_access_unit &&
+             video.frame_marking_extension == video_frame_marking_extension_id &&
+             video.absolute_capture_time_extension == video_absolute_capture_time_extension_id &&
+             video.frame_id_extension == video_frame_id_extension_id &&
+             video.input_watermark_extension == video_input_watermark_extension_id &&
+             video.encoder_timing_extension == video_encoder_timing_extension_id &&
+             !video.flexfec && !video.rtx && video.maximum_frame_age_microseconds > 0;
+    }
+
+    /** @brief Encode the frozen twenty-seven-key SDR video selection. */
+    cbor::Value video_selection(const VideoSelectionPayload &video) {
+      return cbor::Value {cbor::Value::Map {
+        {1, video.video_generation},
+        {2, video.primary_ssrc},
+        {3, video.primary_payload_type},
+        {4, video.clock_rate},
+        {5, static_cast<std::uint8_t>(video.codec)},
+        {6, static_cast<std::uint8_t>(video.profile)},
+        {7, video.width},
+        {8, video.height},
+        {9, video.refresh_numerator},
+        {10, video.refresh_denominator},
+        {11, video.selected_bits_per_second},
+        {12, video.pixel_format},
+        {13, video.color_primaries},
+        {14, video.transfer_function},
+        {15, video.matrix_coefficients},
+        {16, cbor::Value {video.full_range}},
+        {17, video.initial_udp_payload_size},
+        {18, video.decoder_surfaces},
+        {19, video.render_mailbox},
+        {20, video.delivery},
+        {21, video.frame_marking_extension},
+        {22, video.absolute_capture_time_extension},
+        {23, video.frame_id_extension},
+        {24, video.input_watermark_extension},
+        {25, video.encoder_timing_extension},
+        {26, cbor::Value {video.flexfec}},
+        {27, cbor::Value {video.rtx}},
+        {28, video.maximum_frame_age_microseconds},
+      }};
+    }
+
+    /** @brief Validate prefix-free parameter sets for the selected codec. */
+    bool valid_parameter_sets(
+      const VideoCodec codec,
+      const std::vector<std::vector<std::uint8_t>> &sets
+    ) noexcept {
+      const auto expected = codec == VideoCodec::h264 ? std::size_t {2} : std::size_t {3};
+      if (sets.size() != expected) {
+        return false;
+      }
+      for (const auto &set : sets) {
+        if (set.empty() || set.size() > maximum_video_parameter_set_bytes ||
+            (set.size() >= 3 && set[0] == 0 && set[1] == 0 && (set[2] == 1 || (set.size() >= 4 && set[2] == 0 && set[3] == 1)))) {
+          return false;
+        }
+      }
+      if (codec == VideoCodec::h264) {
+        return (sets[0][0] & 0x1fU) == 7U && (sets[1][0] & 0x1fU) == 8U;
+      }
+      return sets[0].size() >= 2 && sets[1].size() >= 2 && sets[2].size() >= 2 &&
+             ((sets[0][0] >> 1U) & 0x3fU) == 32U &&
+             ((sets[1][0] >> 1U) & 0x3fU) == 33U &&
+             ((sets[2][0] >> 1U) & 0x3fU) == 34U;
     }
   }  // namespace
 
@@ -278,7 +380,7 @@ namespace lumen::lsp::runtime {
   }
 
   std::expected<StartRequestPayload, ControlWireError> decode_start(const std::span<const std::uint8_t> payload) {
-    const auto map = decode_map(payload, 10);
+    const auto map = decode_map(payload, 16);
     StartRequestPayload result;
     const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
     const auto *application = map ? std::get_if<std::string>(&(*map)[1].second.storage) : nullptr;
@@ -291,13 +393,26 @@ namespace lumen::lsp::runtime {
     const auto *maximum_udp_payload = map ? unsigned_value((*map)[8].second) : nullptr;
     const auto *microphone_null = map ? std::get_if<cbor::Null>(&(*map)[9].second.storage) : nullptr;
     const auto *microphone_map = map ? std::get_if<cbor::Value::Map>(&(*map)[9].second.storage) : nullptr;
+    const auto *network_profile = map ? unsigned_value((*map)[10].second) : nullptr;
+    const auto *video_offers = map ? std::get_if<cbor::Value::Array>(&(*map)[11].second.storage) : nullptr;
+    const auto *receive_batch = map ? unsigned_value((*map)[12].second) : nullptr;
+    const auto *decoder_surfaces = map ? unsigned_value((*map)[13].second) : nullptr;
+    const auto *render_mailbox = map ? unsigned_value((*map)[14].second) : nullptr;
+    const auto *capture_to_present = map ? unsigned_value((*map)[15].second) : nullptr;
     if (!map || version == nullptr || *version != wire_version || application == nullptr || application->empty() ||
         application->size() > 128 || pointer == nullptr || *pointer < 125 || *pointer > 16'000 || controller == nullptr ||
         *controller < 125 || *controller > 2'000 || sensor == nullptr || *sensor < 125 || *sensor > 4'000 ||
         reconciliation == nullptr || *reconciliation < 50 || *reconciliation > 1'000 || budget == nullptr ||
         *budget == 0 || *budget > 32'000'000 || offers == nullptr || offers->empty() ||
         offers->size() > maximum_audio_offers || maximum_udp_payload == nullptr || *maximum_udp_payload < 1'200 ||
-        *maximum_udp_payload > 1'472 || (microphone_null == nullptr && microphone_map == nullptr)) {
+        *maximum_udp_payload > 1'472 || (microphone_null == nullptr && microphone_map == nullptr) ||
+        network_profile == nullptr || *network_profile > static_cast<std::uint8_t>(VideoNetworkProfile::competition) ||
+        video_offers == nullptr || video_offers->empty() || video_offers->size() > maximum_video_offers ||
+        receive_batch == nullptr || *receive_batch == 0 || *receive_batch > 64 ||
+        decoder_surfaces == nullptr || *decoder_surfaces < 2 || *decoder_surfaces > 4 ||
+        render_mailbox == nullptr || *render_mailbox != 1 ||
+        capture_to_present == nullptr || *capture_to_present == 0 ||
+        *capture_to_present > std::numeric_limits<std::uint32_t>::max()) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     result.audio_offers.reserve(offers->size());
@@ -360,6 +475,63 @@ namespace lumen::lsp::runtime {
         .required = *required,
       };
     }
+    std::vector<VideoOfferPayload> decoded_video_offers;
+    decoded_video_offers.reserve(video_offers->size());
+    for (const auto &encoded_video_offer : *video_offers) {
+      const auto *offer = std::get_if<cbor::Value::Map>(&encoded_video_offer.storage);
+      if (offer == nullptr || offer->size() != 12) {
+        return std::unexpected(ControlWireError::invalid_shape);
+      }
+      for (std::size_t index = 0; index < offer->size(); ++index) {
+        if ((*offer)[index].first != index + 1) {
+          return std::unexpected(ControlWireError::invalid_shape);
+        }
+      }
+      const auto *codec = unsigned_value((*offer)[0].second);
+      const auto *profile = unsigned_value((*offer)[1].second);
+      const auto *width = unsigned_value((*offer)[2].second);
+      const auto *height = unsigned_value((*offer)[3].second);
+      const auto *refresh_numerator = unsigned_value((*offer)[4].second);
+      const auto *refresh_denominator = unsigned_value((*offer)[5].second);
+      const auto *preferred_bitrate = unsigned_value((*offer)[6].second);
+      const auto *maximum_bitrate = unsigned_value((*offer)[7].second);
+      const auto *pixel_format = unsigned_value((*offer)[8].second);
+      const auto *delivery = unsigned_value((*offer)[9].second);
+      const auto *flexfec = boolean_value((*offer)[10].second);
+      const auto *rtx = boolean_value((*offer)[11].second);
+      if (codec == nullptr || profile == nullptr || width == nullptr || height == nullptr ||
+          refresh_numerator == nullptr || refresh_denominator == nullptr || preferred_bitrate == nullptr ||
+          maximum_bitrate == nullptr || pixel_format == nullptr || delivery == nullptr ||
+          flexfec == nullptr || rtx == nullptr ||
+          *codec > std::numeric_limits<std::uint8_t>::max() ||
+          *profile > std::numeric_limits<std::uint8_t>::max() ||
+          *width > std::numeric_limits<std::uint32_t>::max() ||
+          *height > std::numeric_limits<std::uint32_t>::max() ||
+          *refresh_numerator > std::numeric_limits<std::uint32_t>::max() ||
+          *refresh_denominator > std::numeric_limits<std::uint32_t>::max() ||
+          *pixel_format > std::numeric_limits<std::uint8_t>::max() ||
+          *delivery > std::numeric_limits<std::uint8_t>::max()) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      VideoOfferPayload decoded {
+        .codec = static_cast<VideoCodec>(*codec),
+        .profile = static_cast<VideoProfile>(*profile),
+        .width = static_cast<std::uint32_t>(*width),
+        .height = static_cast<std::uint32_t>(*height),
+        .refresh_numerator = static_cast<std::uint32_t>(*refresh_numerator),
+        .refresh_denominator = static_cast<std::uint32_t>(*refresh_denominator),
+        .preferred_bits_per_second = *preferred_bitrate,
+        .maximum_bits_per_second = *maximum_bitrate,
+        .pixel_format = static_cast<std::uint8_t>(*pixel_format),
+        .delivery = static_cast<std::uint8_t>(*delivery),
+        .flexfec = *flexfec,
+        .rtx = *rtx,
+      };
+      if (!valid_video_offer(decoded)) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      decoded_video_offers.push_back(decoded);
+    }
     result = {
       .application_id = *application,
       .pointer_rate = static_cast<std::uint32_t>(*pointer),
@@ -370,6 +542,12 @@ namespace lumen::lsp::runtime {
       .audio_offers = std::move(audio_offers),
       .offered_maximum_udp_payload = static_cast<std::uint16_t>(*maximum_udp_payload),
       .microphone_offer = microphone_offer,
+      .network_profile = static_cast<VideoNetworkProfile>(*network_profile),
+      .video_offers = std::move(decoded_video_offers),
+      .client_receive_batch_capacity = static_cast<std::uint8_t>(*receive_batch),
+      .decoder_surfaces = static_cast<std::uint8_t>(*decoder_surfaces),
+      .render_mailbox = static_cast<std::uint8_t>(*render_mailbox),
+      .maximum_capture_to_present_microseconds = static_cast<std::uint32_t>(*capture_to_present),
     };
     return result;
   }
@@ -390,7 +568,14 @@ namespace lumen::lsp::runtime {
                                 payload.microphone->microphone_ssrc == payload.acknowledgement_ssrc ||
                                 payload.microphone->microphone_ssrc == payload.audio.audio_ssrc ||
                                 payload.microphone->microphone_payload_type == payload.input_payload_type ||
-                                payload.microphone->microphone_payload_type == payload.audio.audio_payload_type))) {
+                                payload.microphone->microphone_payload_type == payload.audio.audio_payload_type)) ||
+        !valid_video_selection(payload.video) || payload.video.primary_ssrc == payload.input_ssrc ||
+        payload.video.primary_ssrc == payload.acknowledgement_ssrc ||
+        payload.video.primary_ssrc == payload.audio.audio_ssrc ||
+        payload.video.primary_payload_type == payload.input_payload_type ||
+        payload.video.primary_payload_type == payload.audio.audio_payload_type ||
+        (payload.microphone && (payload.video.primary_ssrc == payload.microphone->microphone_ssrc ||
+                                payload.video.primary_payload_type == payload.microphone->microphone_payload_type))) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
@@ -424,6 +609,7 @@ namespace lumen::lsp::runtime {
       {28, payload.audio.initial_udp_payload_size},
       {29, payload.audio.initial_preroll_packets},
       {30, microphone_selection(payload.microphone)},
+      {31, video_selection(payload.video)},
     });
   }
 
@@ -473,7 +659,14 @@ namespace lumen::lsp::runtime {
                                 payload.microphone->microphone_ssrc == payload.acknowledgement_ssrc ||
                                 payload.microphone->microphone_ssrc == payload.audio.audio_ssrc ||
                                 payload.microphone->microphone_payload_type == payload.input_payload_type ||
-                                payload.microphone->microphone_payload_type == payload.audio.audio_payload_type))) {
+                                payload.microphone->microphone_payload_type == payload.audio.audio_payload_type)) ||
+        !valid_video_selection(payload.video) || payload.video.primary_ssrc == payload.input_ssrc ||
+        payload.video.primary_ssrc == payload.acknowledgement_ssrc ||
+        payload.video.primary_ssrc == payload.audio.audio_ssrc ||
+        payload.video.primary_payload_type == payload.input_payload_type ||
+        payload.video.primary_payload_type == payload.audio.audio_payload_type ||
+        (payload.microphone && (payload.video.primary_ssrc == payload.microphone->microphone_ssrc ||
+                                payload.video.primary_payload_type == payload.microphone->microphone_payload_type))) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
@@ -508,7 +701,60 @@ namespace lumen::lsp::runtime {
       {29, payload.audio.initial_udp_payload_size},
       {30, payload.audio.initial_preroll_packets},
       {31, microphone_selection(payload.microphone)},
+      {32, video_selection(payload.video)},
     });
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_video_config(
+    const VideoConfigPayload &payload
+  ) {
+    if (is_zero(payload.session_id) || payload.stream_generation == 0 ||
+        !valid_video_selection(payload.video) ||
+        !valid_parameter_sets(payload.video.codec, payload.parameter_sets) ||
+        payload.frame_id_origin == 0 || payload.recovery_epoch == 0 ||
+        payload.maximum_complete_access_unit_bytes == 0 ||
+        payload.maximum_complete_access_unit_bytes > 16U * 1024U * 1024U) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    cbor::Value::Array parameter_sets;
+    parameter_sets.reserve(payload.parameter_sets.size());
+    for (const auto &set : payload.parameter_sets) {
+      parameter_sets.emplace_back(cbor::Value::Bytes {set.begin(), set.end()});
+    }
+    return encode({
+      {1, wire_version},
+      {2, bytes(payload.session_id)},
+      {3, payload.stream_generation},
+      {4, video_selection(payload.video)},
+      {5, std::move(parameter_sets)},
+      {6, payload.frame_id_origin},
+      {7, payload.recovery_epoch},
+      {8, payload.maximum_complete_access_unit_bytes},
+    });
+  }
+
+  std::expected<VideoConfigAckPayload, ControlWireError> decode_video_config_ack(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 5);
+    VideoConfigAckPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *video_generation = map ? unsigned_value((*map)[3].second) : nullptr;
+    const auto *decoder_credit = map ? unsigned_value((*map)[4].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || status == nullptr ||
+        *status > static_cast<std::uint8_t>(ControlStatus::internal_failure) ||
+        !fixed_bytes((*map)[2].second, result.session_id) || is_zero(result.session_id) ||
+        video_generation == nullptr || *video_generation == 0 ||
+        *video_generation > std::numeric_limits<std::uint32_t>::max() ||
+        decoder_credit == nullptr || *decoder_credit < 2 || *decoder_credit > 4 ||
+        !valid_status(static_cast<ControlStatus>(*status))) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.status = static_cast<ControlStatus>(*status);
+    result.video_generation = static_cast<std::uint32_t>(*video_generation);
+    result.decoder_credit = static_cast<std::uint8_t>(*decoder_credit);
+    return result;
   }
 
   std::expected<std::vector<std::uint8_t>, ControlWireError> encode_audio_config(const AudioConfigPayload &payload) {
