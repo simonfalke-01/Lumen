@@ -3,6 +3,12 @@
  * @brief Native nonblocking single-port UDP ownership for the LSP host runtime.
  */
 
+#ifdef __APPLE__
+  #ifndef __APPLE_USE_RFC_3542
+    #define __APPLE_USE_RFC_3542
+  #endif
+#endif
+
 #include "udp_socket.h"
 
 #ifdef _WIN32
@@ -48,6 +54,24 @@ namespace lumen::lsp::runtime {
       return WSAGetLastError() == WSAEWOULDBLOCK;
     }
 
+    bool configure_no_fragment(const SOCKET socket) noexcept {
+      const DWORD mode = IP_PMTUDISC_PROBE;
+      return setsockopt(
+               socket,
+               IPPROTO_IP,
+               IP_MTU_DISCOVER,
+               reinterpret_cast<const char *>(&mode),
+               sizeof(mode)
+             ) == 0 &&
+             setsockopt(
+               socket,
+               IPPROTO_IPV6,
+               IPV6_MTU_DISCOVER,
+               reinterpret_cast<const char *>(&mode),
+               sizeof(mode)
+             ) == 0;
+    }
+
     void close_socket(const SOCKET socket) noexcept {
       closesocket(socket);
     }
@@ -60,6 +84,19 @@ namespace lumen::lsp::runtime {
 
     bool would_block_error() noexcept {
       return errno == EAGAIN || errno == EWOULDBLOCK;
+    }
+
+
+    bool configure_no_fragment(const int socket) noexcept {
+#if defined(__linux__)
+      const int ipv4_mode = IP_PMTUDISC_PROBE;
+      const int ipv6_mode = IPV6_PMTUDISC_PROBE;
+      return setsockopt(socket, IPPROTO_IP, IP_MTU_DISCOVER, &ipv4_mode, sizeof(ipv4_mode)) == 0 &&
+             setsockopt(socket, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &ipv6_mode, sizeof(ipv6_mode)) == 0;
+#else
+      const int enabled = 1;
+      return setsockopt(socket, IPPROTO_IPV6, IPV6_DONTFRAG, &enabled, sizeof(enabled)) == 0;
+#endif
     }
 
     void close_socket(const int socket) noexcept {
@@ -87,6 +124,12 @@ namespace lumen::lsp::runtime {
       }
       if (storage.ss_family == AF_INET6) {
         const auto &address = reinterpret_cast<const sockaddr_in6 &>(storage);
+        if (IN6_IS_ADDR_V4MAPPED(&address.sin6_addr)) {
+          in_addr mapped {};
+          std::memcpy(&mapped, &address.sin6_addr.s6_addr[12], sizeof(mapped));
+          return inet_ntop(AF_INET, &mapped, text.data(), static_cast<SocketLength>(text.size())) != nullptr ?
+                   std::string {text.data()} : std::string {};
+        }
         return inet_ntop(AF_INET6, &address.sin6_addr, text.data(), static_cast<SocketLength>(text.size())) != nullptr ?
                  std::string {text.data()} : std::string {};
       }
@@ -104,6 +147,10 @@ namespace lumen::lsp::runtime {
     }
 
     IpAddressFamily address_family(const sockaddr_storage &storage) noexcept {
+      if (storage.ss_family == AF_INET6 &&
+          IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<const sockaddr_in6 &>(storage).sin6_addr)) {
+        return IpAddressFamily::ipv4;
+      }
       return storage.ss_family == AF_INET6 ? IpAddressFamily::ipv6 : IpAddressFamily::ipv4;
     }
 
@@ -114,11 +161,18 @@ namespace lumen::lsp::runtime {
     ) noexcept {
       std::memset(&storage, 0, sizeof(storage));
       if (peer.family == IpAddressFamily::ipv4) {
-        auto &address = reinterpret_cast<sockaddr_in &>(storage);
-        address.sin_family = AF_INET;
-        address.sin_port = htons(peer.remote_port);
+        in_addr mapped {};
+        if (inet_pton(AF_INET, peer.remote_address.c_str(), &mapped) != 1) {
+          return false;
+        }
+        auto &address = reinterpret_cast<sockaddr_in6 &>(storage);
+        address.sin6_family = AF_INET6;
+        address.sin6_port = htons(peer.remote_port);
+        address.sin6_addr.s6_addr[10] = 0xff;
+        address.sin6_addr.s6_addr[11] = 0xff;
+        std::memcpy(&address.sin6_addr.s6_addr[12], &mapped, sizeof(mapped));
         size = sizeof(address);
-        return inet_pton(AF_INET, peer.remote_address.c_str(), &address.sin_addr) == 1;
+        return true;
       }
       if (peer.family == IpAddressFamily::ipv6) {
         auto &address = reinterpret_cast<sockaddr_in6 &>(storage);
@@ -153,6 +207,7 @@ namespace lumen::lsp::runtime {
 
     int dual_stack = 0;
     if (setsockopt(native, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char *>(&dual_stack), sizeof(dual_stack)) != 0 ||
+        !configure_no_fragment(native) ||
         !set_nonblocking(native)) {
       close_socket(native);
       return false;
@@ -282,15 +337,22 @@ namespace lumen::lsp::runtime {
     const PeerEndpoint &peer,
     const std::span<const std::uint8_t> datagram
   ) noexcept {
+    return send_datagram_result(peer, datagram) == UdpSendResult::sent;
+  }
+
+  UdpSendResult NativeUdpSocket::send_datagram_result(
+    const PeerEndpoint &peer,
+    const std::span<const std::uint8_t> datagram
+  ) noexcept {
     if (!open() || !peer.valid() || peer.local_port != bound_port_ || datagram.empty() ||
         datagram.size() > maximum_runtime_datagram_size) {
-      return false;
+      return UdpSendResult::fatal;
     }
 
     sockaddr_storage remote {};
     SocketLength remote_size = 0;
     if (!encode_destination(peer, remote, remote_size)) {
-      return false;
+      return UdpSendResult::fatal;
     }
 #ifdef _WIN32
     const auto sent = sendto(
@@ -301,7 +363,14 @@ namespace lumen::lsp::runtime {
       reinterpret_cast<const sockaddr *>(&remote),
       remote_size
     );
-    return sent != SOCKET_ERROR && static_cast<std::size_t>(sent) == datagram.size();
+    if (sent != SOCKET_ERROR && static_cast<std::size_t>(sent) == datagram.size()) {
+      return UdpSendResult::sent;
+    }
+    const auto error = WSAGetLastError();
+    if (error == WSAEMSGSIZE) {
+      return UdpSendResult::message_too_large;
+    }
+    return error == WSAEWOULDBLOCK || error == WSAENOBUFS ? UdpSendResult::would_block : UdpSendResult::fatal;
 #else
     const auto sent = sendto(
       handle_,
@@ -311,7 +380,14 @@ namespace lumen::lsp::runtime {
       reinterpret_cast<const sockaddr *>(&remote),
       remote_size
     );
-    return sent >= 0 && static_cast<std::size_t>(sent) == datagram.size();
+    if (sent >= 0 && static_cast<std::size_t>(sent) == datagram.size()) {
+      return UdpSendResult::sent;
+    }
+    if (errno == EMSGSIZE) {
+      return UdpSendResult::message_too_large;
+    }
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS ?
+             UdpSendResult::would_block : UdpSendResult::fatal;
 #endif
   }
 

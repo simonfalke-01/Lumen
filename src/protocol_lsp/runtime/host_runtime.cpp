@@ -86,6 +86,7 @@ namespace lumen::lsp::runtime {
     constexpr std::uint32_t runtime_poll_milliseconds = 2;
     constexpr std::uint64_t invitation_lifetime_seconds = 10U * 60U;
     constexpr std::uint64_t attach_grace_microseconds = 10U * 1'000'000U;
+    constexpr std::array<std::uint8_t, 4> lspp_app_name {'L', 'S', 'P', 'P'};  ///< Exact path-probe APP name.
 
     /**
      * @brief Normalize an SSRC to a deterministic nonzero value outside a reserved set.
@@ -630,6 +631,7 @@ namespace lumen::lsp::runtime {
         }
         active_audio_configuration_.reset();
         active_video_configuration_.reset();
+        pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
         pending_old_peer_after_attach_.reset();
         video_start_pending_ = false;
@@ -739,6 +741,11 @@ namespace lumen::lsp::runtime {
       VideoConfigPayload wire {};  ///< Exact configuration sent reliably to the client.
       video::config_t capture {};  ///< New LSP-owned capture/encoder configuration.
       std::uint64_t aggregate_pacing_bits_per_second {};  ///< Complete IP-layer pacing ceiling.
+      std::uint64_t reserved_overhead_bits_per_second {};  ///< Host audio and control allowance.
+      std::uint32_t feedback_sender_ssrc {};  ///< Negotiated client input SSRC for RTCP feedback.
+      std::uint32_t audio_feedback_ssrc {};  ///< Active host-audio SSRC admitted in aggregate CCFB.
+      std::uint16_t path_payload_ceiling {1'200};  ///< Authenticated client/family DPLPMTUD ceiling.
+      VideoNetworkProfile network_profile {VideoNetworkProfile::adaptive_low_latency};  ///< Selected controller profile.
       std::uint64_t process_generation {};  ///< Application launched after exact display preparation.
       bool reference_invalidation {};  ///< Native no-IDR reference invalidation capability.
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease;  ///< Prepared VDD owner before ACK.
@@ -758,6 +765,14 @@ namespace lumen::lsp::runtime {
     struct DtlsTimer {
       PeerEndpoint peer;  ///< Association being timed.
       std::uint64_t due_microseconds {};  ///< Monotonic due time.
+    };
+
+    /** @brief Authenticated reverse-path intent awaiting one exact protected client LSPP. */
+    struct PendingInboundPathProbe {
+      PeerEndpoint peer {};  ///< Exact association that established the intent.
+      PathProbePayload probe {};  ///< Expected logical identifier and protected size.
+      std::uint64_t deadline_microseconds {};  ///< Control-owned bounded receive deadline.
+      bool active {};  ///< Whether an authenticated data probe remains expected.
     };
 
     /**
@@ -1464,6 +1479,11 @@ namespace lumen::lsp::runtime {
           .maximum_access_unit_bytes = selection.wire.maximum_complete_access_unit_bytes,
           .maximum_capture_to_present_microseconds = selection.wire.video.maximum_frame_age_microseconds,
           .aggregate_pacing_bits_per_second = selection.aggregate_pacing_bits_per_second,
+          .reserved_overhead_bits_per_second = selection.reserved_overhead_bits_per_second,
+          .path_payload_ceiling = selection.path_payload_ceiling,
+          .feedback_sender_ssrc = selection.feedback_sender_ssrc,
+          .audio_feedback_ssrc = selection.audio_feedback_ssrc,
+          .network_profile = selection.network_profile,
           .family = family,
           .capture_mail = runtime->mail,
           .reference_invalidation = selection.reference_invalidation,
@@ -1522,6 +1542,7 @@ namespace lumen::lsp::runtime {
         active_client_.reset();
         active_audio_configuration_.reset();
         active_video_configuration_.reset();
+        pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
         audio = std::move(audio_runtime_);
         video = std::move(video_runtime_);
@@ -1643,7 +1664,7 @@ namespace lumen::lsp::runtime {
       if (!microphone_selection) {
         return std::unexpected(microphone_selection.error());
       }
-      const auto video_selection = select_video(
+      auto video_selection = select_video(
         peer,
         request,
         start.session_id,
@@ -1654,6 +1675,12 @@ namespace lumen::lsp::runtime {
       if (!video_selection) {
         return std::unexpected(video_selection.error());
       }
+      video_selection->reserved_overhead_bits_per_second =
+        static_cast<std::uint64_t>(audio_selection->bitrate) + 256'000U;
+      video_selection->feedback_sender_ssrc = input_ssrc;
+      video_selection->audio_feedback_ssrc = audio_ssrc;
+      video_selection->path_payload_ceiling = request.offered_maximum_udp_payload;
+      video_selection->network_profile = request.network_profile;
       constexpr std::uint8_t input_payload_type = 96;
       std::array<SsrcAssignment, 4> assignments {
         SsrcAssignment {
@@ -1870,6 +1897,8 @@ namespace lumen::lsp::runtime {
       }
       video_selection.wire.video.video_generation = next_video_generation;
       video_selection.wire.video.primary_ssrc = video_ssrc;
+      video_selection.feedback_sender_ssrc = input_ssrc;
+      video_selection.audio_feedback_ssrc = audio_ssrc;
       video_selection.wire.session_id = prior_snapshot.session_id;
       video_selection.wire.stream_generation = prior_snapshot.generations.stream;
       std::array<std::uint8_t, 8> frame_origin_bytes {};
@@ -2143,6 +2172,79 @@ namespace lumen::lsp::runtime {
       return true;
     }
 
+    /** @copydoc ControlStartHandler::path_probe_intent_acknowledged */
+    bool path_probe_intent_acknowledged(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      const std::uint64_t now_microseconds
+    ) noexcept override {
+      std::scoped_lock lock(session_mutex_);
+      return video_runtime_ && video_runtime_->peer == peer && video_runtime_->sender &&
+             video_runtime_->sender->send_path_probe(probe, now_microseconds);
+    }
+
+    /** @copydoc ControlStartHandler::path_probe_requested */
+    bool path_probe_requested(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      const std::uint64_t deadline_microseconds
+    ) noexcept override {
+      std::scoped_lock lock(session_mutex_);
+      const auto mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
+      if (!mapping || mapping->peer != peer || !active_video_configuration_ ||
+          probe.udp_payload_size > active_video_configuration_->path_payload_ceiling ||
+          pending_inbound_path_probe_.active ||
+          std::ranges::find(recent_inbound_path_probe_ids_, probe.probe_id) != recent_inbound_path_probe_ids_.end()) {
+        return false;
+      }
+      pending_inbound_path_probe_ = {
+        .peer = peer,
+        .probe = probe,
+        .deadline_microseconds = deadline_microseconds,
+        .active = true,
+      };
+      return true;
+    }
+
+    /** @copydoc ControlStartHandler::path_probe_acknowledged */
+    bool path_probe_acknowledged(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe
+    ) noexcept override {
+      std::scoped_lock lock(session_mutex_);
+      return video_runtime_ && video_runtime_->peer == peer && video_runtime_->sender &&
+             video_runtime_->sender->acknowledge_path_probe(probe);
+    }
+
+    /** @copydoc ControlStartHandler::path_probe_rejected */
+    bool path_probe_rejected(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      const ControlStatus status
+    ) noexcept override {
+      std::scoped_lock lock(session_mutex_);
+      if (!video_runtime_ || video_runtime_->peer != peer || !video_runtime_->sender) {
+        return false;
+      }
+      switch (status) {
+        case ControlStatus::timeout:
+          return video_runtime_->sender->reject_path_probe(probe);
+        case ControlStatus::busy:
+        case ControlStatus::stale_generation:
+        case ControlStatus::path_capacity_insufficient:
+          return video_runtime_->sender->rollback_path_probe(probe);
+        case ControlStatus::malformed:
+        case ControlStatus::unsupported:
+        case ControlStatus::authentication_failed:
+        case ControlStatus::permission_denied:
+        case ControlStatus::unsupported_media_tuple:
+        case ControlStatus::internal_failure:
+        case ControlStatus::success:
+          return false;
+      }
+      return false;
+    }
+
     ControlStatus stop_input(
       const TrustedClient &client,
       const std::uint32_t connection_generation,
@@ -2176,6 +2278,7 @@ namespace lumen::lsp::runtime {
         active_client_.reset();
         active_audio_configuration_.reset();
         active_video_configuration_.reset();
+        pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
         audio = std::move(audio_runtime_);
         video = std::move(video_runtime_);
@@ -2254,6 +2357,7 @@ namespace lumen::lsp::runtime {
         if (control_) {
           control_->tick(now);
         }
+        process_path_probes(now);
         process_dtls_timers(now);
         process_pending_video_retirements();
         process_pending_audio_retirements();
@@ -2307,6 +2411,53 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /** @brief Drive one host DPLPMTUD search and retire reverse intents on their control deadline. */
+    void process_path_probes(const std::uint64_t now_microseconds) noexcept {
+      std::shared_ptr<HostVideoSender> sender;
+      PeerEndpoint peer;
+      {
+        std::scoped_lock lock(session_mutex_);
+        if (pending_inbound_path_probe_.active &&
+            now_microseconds >= pending_inbound_path_probe_.deadline_microseconds) {
+          pending_inbound_path_probe_ = {};
+        }
+        if (video_runtime_ && video_runtime_->sender) {
+          sender = video_runtime_->sender;
+          peer = video_runtime_->peer;
+        }
+      }
+      if (!sender || !control_ || !crypto_) {
+        return;
+      }
+
+      const auto interval = control_->path_probe_interval(peer);
+      const auto before = sender->outstanding_path_probe();
+      if (!sender->tick_path_probe(now_microseconds, interval)) {
+        fail_required_video_session(peer);
+        return;
+      }
+      const auto after = sender->outstanding_path_probe();
+      if (before && !after) {
+        (void) control_->cancel_path_probe(peer, *before);
+      }
+      if (after) {
+        return;
+      }
+
+      std::array<std::uint8_t, 8> probe_id_bytes {};
+      if (!crypto_->random(probe_id_bytes)) {
+        return;
+      }
+      auto probe_id = wire::read_be<std::uint64_t>(probe_id_bytes);
+      if (probe_id == 0) {
+        probe_id = 1;
+      }
+      const auto probe = sender->begin_path_probe(probe_id, now_microseconds, interval);
+      if (probe && !control_->start_path_probe(peer, *probe, now_microseconds)) {
+        (void) sender->rollback_path_probe(*probe);
+      }
+    }
+
     void queue_association_close(PeerEndpoint peer) noexcept {
       for (std::size_t index = 0; index < pending_association_close_count_; ++index) {
         if (pending_association_closes_[index] == peer) {
@@ -2348,6 +2499,7 @@ namespace lumen::lsp::runtime {
           active_client_.reset();
           active_audio_configuration_.reset();
           active_video_configuration_.reset();
+          pending_inbound_path_probe_ = {};
           active_microphone_configuration_.reset();
           audio = std::move(audio_runtime_);
           video = std::move(video_runtime_);
@@ -2380,6 +2532,7 @@ namespace lumen::lsp::runtime {
         active_client_.reset();
         active_audio_configuration_.reset();
         active_video_configuration_.reset();
+        pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
         audio = std::move(audio_runtime_);
         video = std::move(video_runtime_);
@@ -2453,6 +2606,9 @@ namespace lumen::lsp::runtime {
       std::unique_ptr<LspMicrophoneReceiver> microphone;
       {
         std::scoped_lock session_lock(runtime.session_mutex_);
+        if (runtime.pending_inbound_path_probe_.active && runtime.pending_inbound_path_probe_.peer == peer) {
+          runtime.pending_inbound_path_probe_ = {};
+        }
         if (runtime.input_owner_) {
           const auto mapping = runtime.input_owner_->mapping();
           if (mapping && mapping->peer == peer) {
@@ -2505,7 +2661,8 @@ namespace lumen::lsp::runtime {
       void *context,
       const PeerEndpoint &peer,
       const SecurePacketClass packet_class,
-      const std::span<const std::uint8_t> plaintext
+      const std::span<const std::uint8_t> plaintext,
+      const std::size_t protected_bytes
     ) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
       std::scoped_lock session_lock(runtime.session_mutex_);
@@ -2514,6 +2671,22 @@ namespace lumen::lsp::runtime {
       }
       if (packet_class == SecurePacketClass::rtcp) {
         const auto mapping = runtime.input_owner_->mapping();
+        if (plaintext.size() >= 12U && std::ranges::equal(lspp_app_name, plaintext.subspan<8, 4>())) {
+          if (!mapping || mapping->peer != peer || !runtime.pending_inbound_path_probe_.active ||
+              runtime.pending_inbound_path_probe_.peer != peer) {
+            return true;
+          }
+          const auto probe = parse_path_probe_datagram(plaintext, protected_bytes, mapping->input_ssrc);
+          if (!probe || *probe != runtime.pending_inbound_path_probe_.probe || !runtime.control_ ||
+              !runtime.control_->complete_path_probe(peer, *probe, monotonic_microseconds())) {
+            return true;
+          }
+          runtime.recent_inbound_path_probe_ids_[runtime.next_recent_inbound_path_probe_id_] = probe->probe_id;
+          runtime.next_recent_inbound_path_probe_id_ =
+            (runtime.next_recent_inbound_path_probe_id_ + 1U) % runtime.recent_inbound_path_probe_ids_.size();
+          runtime.pending_inbound_path_probe_ = {};
+          return true;
+        }
         if (plaintext.size() >= 12U && std::ranges::equal(transport::lspv_app_name, plaintext.subspan<8, 4>())) {
           if (!mapping || mapping->peer != peer || !runtime.active_video_configuration_ ||
               !runtime.video_runtime_ || runtime.video_runtime_->peer != peer) {
@@ -2535,6 +2708,34 @@ namespace lumen::lsp::runtime {
             runtime.fail_required_video_session(peer);
           }
           return true;
+        }
+        if (runtime.video_runtime_ && runtime.video_runtime_->peer == peer && runtime.video_runtime_->sender &&
+            plaintext.size() >= 4U) {
+          auto &sender = *runtime.video_runtime_->sender;
+          const auto now = monotonic_microseconds();
+          if (plaintext[1] == transport::rtcp_sender_report_type ||
+              plaintext[1] == transport::rtcp_receiver_report_type) {
+            if (sender.receive_compound_rtcp(plaintext, now)) {
+              std::size_t offset = 0;
+              while (offset < plaintext.size()) {
+                const auto parsed = transport::parse_rtcp_packet(plaintext.subspan(offset));
+                if (!parsed) {
+                  break;
+                }
+                if (parsed.packet_type == transport::rtcp_transport_feedback_type &&
+                    parsed.count == transport::rtcp_congestion_feedback_format) {
+                  (void) sender.receive_congestion_feedback(parsed.packet, now);
+                }
+                offset += parsed.packet.size();
+              }
+            }
+            return true;
+          }
+          if (plaintext[1] == transport::rtcp_transport_feedback_type &&
+              (plaintext[0] & 0x1fU) == transport::rtcp_congestion_feedback_format) {
+            (void) sender.receive_congestion_feedback(plaintext, now);
+            return true;
+          }
         }
         const auto input_accepted = runtime.input_owner_->receive_rtcp(peer, plaintext);
         const auto microphone_accepted = !runtime.microphone_runtime_ ||
@@ -2562,12 +2763,22 @@ namespace lumen::lsp::runtime {
       return true;
     }
 
-    static bool secure_send_callback(
+    static ProtectedSendResult secure_send_callback(
       void *context,
       const PeerEndpoint &peer,
       const std::span<const std::uint8_t> datagram
     ) noexcept {
-      return static_cast<ProductHostRuntime *>(context)->socket_.send_datagram(peer, datagram);
+      switch (static_cast<ProductHostRuntime *>(context)->socket_.send_datagram_result(peer, datagram)) {
+        case UdpSendResult::sent:
+          return ProtectedSendResult::sent;
+        case UdpSendResult::would_block:
+          return ProtectedSendResult::would_block;
+        case UdpSendResult::message_too_large:
+          return ProtectedSendResult::message_too_large;
+        case UdpSendResult::fatal:
+          return ProtectedSendResult::fatal;
+      }
+      return ProtectedSendResult::fatal;
     }
 
     static bool input_digest_callback(
@@ -2625,6 +2836,9 @@ namespace lumen::lsp::runtime {
     std::unique_ptr<ActiveVideoRuntime> video_runtime_;  ///< Acknowledged capture/encode/RTP/SRTP video generation.
     std::optional<MicrophoneConfigPayload> active_microphone_configuration_;  ///< Selected reverse microphone tuple.
     std::unique_ptr<LspMicrophoneReceiver> microphone_runtime_;  ///< Acknowledged reverse microphone writer.
+    PendingInboundPathProbe pending_inbound_path_probe_ {};  ///< One authenticated reverse probe intent.
+    std::array<std::uint64_t, 64> recent_inbound_path_probe_ids_ {};  ///< Session replay fence for completed probes.
+    std::size_t next_recent_inbound_path_probe_id_ {};  ///< Next reverse-probe replay-cache replacement slot.
     std::uint32_t next_stream_generation_ {1};  ///< Next nonzero LSP stream-session generation.
     std::uint64_t active_process_generation_ {};  ///< Generation-qualified LSP-owned application process.
 

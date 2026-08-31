@@ -489,6 +489,14 @@ namespace video {
      * @return True only when native reference invalidation was accepted.
      */
     virtual bool try_invalidate_ref_frames_without_idr(int64_t first_frame, int64_t last_frame) = 0;
+
+    /**
+     * @brief Apply a new LSP encoder target at the next frame boundary without requesting IDR.
+     *
+     * @param bits_per_second Positive encoded source-media target.
+     * @return True only when the active encoder accepted the new rate.
+     */
+    virtual bool reconfigure_bitrate(std::uint32_t bits_per_second) = 0;
   };
 
   // encoders

@@ -1509,6 +1509,33 @@ never longer than one video frame interval in competition mode. Feedback is
 reduced-size protected RTCP under RFC 5506 and is charged to the reverse-path
 pacer.
 
+The frozen congestion-control feedback packet is RTPFB PT `205`, FMT `11`.
+After the RTCP sender SSRC, each stream block contains media SSRC, 16-bit
+`begin_seq`, 16-bit `num_reports`, and exactly `num_reports` 16-bit
+`R:1 | ECN:2 | ATO:13` metrics for the half-open range
+`[begin_seq, begin_seq + num_reports)`. An odd metric count is followed by one
+zero 16-bit alignment word. The packet ends with the middle 32 bits of an NTP
+timestamp. One packet contains at most 16,384 metrics. Later bounded overlap
+may correct lost to received and may upgrade a duplicate reception to ECN-CE;
+it cannot regress received to lost or account the same bytes twice.
+
+Reduced-size feedback is admitted only after a fresh regular compound RTCP
+packet beginning with SR/RR and containing the feedback sender's SDES CNAME.
+Video SR and authenticated RR LSR/DLSR fields establish media SRTT and RTTVAR.
+Zero-report and fully duplicate reports refresh neither capacity nor pacing,
+and accepted feedback observes the 500-microsecond hard floor. The host does
+not enable ECT marking until its socket path records real ancillary ECN state;
+it never manufactures ECN observations.
+
+During the first live host integration, one packet may contain the active
+primary-video and host-audio SSRC blocks in either order. Lumen validates both
+blocks completely but feeds only video-ledger bytes into the video-owned
+controller. A structurally valid audio-only packet advances the common
+feedback cadence and report timestamp but performs no video-ledger or
+controller update. It does not fabricate audio delivery or loss bytes. Actual audio,
+control, and video accounting moves together into the shared `HostForwardPath`
+aggregate egress owner.
+
 ### 17.2 Adaptive low-latency profile
 
 The adaptive controller maintains:
@@ -1624,14 +1651,47 @@ it can be decoded independently.
 
 ## 19. DPLPMTUD
 
-LSP probes use authenticated DTLS control messages padded to the candidate UDP
-payload size. Probe ACK names the random probe ID and exact received size.
+LSP probes establish intent with reliable authenticated `PATH_PROBE` control,
+then send one exact-size protected SRTCP APP packet named `LSPP`. The control
+map is exactly `{1: version, 2: nonzero probe_id, 3: UDP payload size}`;
+`PATH_PROBE_ACK` repeats the exact map. `LSPP` uses the primary video SSRC in
+the host-to-client direction and the negotiated client input SSRC in reverse.
+Its plaintext offsets are sender SSRC at 4, name at 8, version at 12, zero at
+13, declared protected size at 14, probe ID at 16, and zero probe padding from
+24 onward. The RTCP length covers the complete plaintext APP packet. The
+sender queries libSRTP's SRTCP trailer length so the protected UDP datagram is
+exactly the declared candidate size. Any APP or RFC 3550 padding byte is
+validated.
 
 - Probes carry no application data.
+- The active-family socket disables local IP fragmentation before bind; the
+  listener fails closed if that policy cannot be installed. Windows uses
+  protocol-owned PMTU discovery for both IPv4 and IPv6 on the dual-stack
+  socket, while Darwin validates `IPV6_DONTFRAG` for native and mapped-v4
+  output.
 - Only one probe is outstanding.
+- The conservative LSP `PROBE_TIMER` is at least 15 seconds and permits three
+  fresh SRTCP-index transmissions.
+- Authenticated control intent remains live for 60 seconds so it cannot expire
+  before the complete three-attempt data-probe budget.
+- A local would-block retry reuses the exact protected bytes; a PROBE_TIMER
+  retry freshly protects the same logical ID and size with a new SRTCP index.
 - Probe loss does not by itself trigger congestion reduction.
 - Probe frequency is at most once per RTT outside initial search.
 - A confirmed black hole immediately reduces the current maximum.
+- A kernel `EMSGSIZE` on a payload above 1,200 bytes is independent black-hole
+  evidence: the current frame is abandoned with reference recovery, 1,200 is
+  applied at the next frame boundary, and congestion capacity is unchanged.
+- A protected video packet rejected with transient would-block is retained and
+  retried byte-identically until its frame deadline; the consumed SRTP index is
+  never reused or reprotected.
+- Silent downstream MTU reduction is confirmed separately from congestion by
+  sustained absence of authenticated large-packet delivery while at least
+  eight large packets were sent and fresh smaller RTP or SR/RR delivery proves
+  the path remains live. This also reconfirms 1,200 at the next frame boundary.
+- A failed candidate or black-hole fallback starts a 600-second PMTU raise
+  timer. Bounded upward search reopens after it elapses, even when an
+  intervening smaller binary-search candidate succeeded.
 - Increasing packet size does not increase the byte pacing rate.
 - Video changes packetization only on a frame boundary.
 

@@ -56,6 +56,7 @@ namespace mail {
   MAIL(touch_port);  ///< Touch port.
   MAIL(idr);  ///< IDR.
   MAIL(invalidate_ref_frames);  ///< Invalidate ref frames.
+  MAIL(lsp_bitrate);  ///< LSP frame-boundary encoder bitrate in bits per second.
   MAIL(gamepad_feedback);  ///< Gamepad feedback.
   MAIL(hdr);  ///< HDR.
 #undef MAIL

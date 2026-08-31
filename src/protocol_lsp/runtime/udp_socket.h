@@ -35,6 +35,14 @@ namespace lumen::lsp::runtime {
     fatal,  ///< A native socket error prevents continued operation.
   };
 
+  /** @brief Exact disposition of one nonblocking UDP send attempt. */
+  enum class UdpSendResult : std::uint8_t {
+    sent,  ///< The kernel accepted the complete datagram.
+    would_block,  ///< Transient socket pressure permits an exact-byte retry.
+    message_too_large,  ///< Kernel path state rejected this UDP payload size.
+    fatal,  ///< Invalid state or a non-transient socket error forbids retry.
+  };
+
   /**
    * @brief Native Winsock/POSIX implementation of LSP's one-port UDP boundary.
    *
@@ -92,6 +100,18 @@ namespace lumen::lsp::runtime {
     ) noexcept;
 
     /**
+     * @brief Send with a typed transient-versus-fatal disposition.
+     *
+     * @param peer Destination five-tuple originally produced by this socket.
+     * @param datagram Complete UDP payload.
+     * @return Exact nonblocking send disposition.
+     */
+    UdpSendResult send_datagram_result(
+      const PeerEndpoint &peer,
+      std::span<const std::uint8_t> datagram
+    ) noexcept;
+
+    /**
      * @brief Return the actual bound port.
      *
      * @return Nonzero port while bound, otherwise zero.
@@ -114,7 +134,7 @@ namespace lumen::lsp::runtime {
     inline static constexpr NativeHandle invalid_handle = -1;  ///< Invalid POSIX file descriptor.
 #endif
 
-    NativeHandle handle_ {invalid_handle};  ///< Owned native socket.
+    NativeHandle handle_ {invalid_handle};  ///< Owned dual-stack no-fragment socket.
     std::uint16_t bound_port_ {};  ///< Actual numeric local port.
   };
 

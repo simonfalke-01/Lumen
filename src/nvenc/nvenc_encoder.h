@@ -81,6 +81,14 @@ namespace nvenc {
      * @return `true` on success, `false` on error.
      */
     virtual bool invalidate_ref_frames(std::uint64_t first_frame, std::uint64_t last_frame) = 0;
+
+    /**
+     * @brief Reconfigure average/maximum bitrate without resetting references or forcing IDR.
+     *
+     * @param bits_per_second Positive new rate-control target.
+     * @return True only when the live encoder accepted the reconfiguration.
+     */
+    virtual bool reconfigure_bitrate(std::uint32_t bits_per_second) = 0;
   };
 
 }  // namespace nvenc

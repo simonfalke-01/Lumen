@@ -662,6 +662,24 @@ namespace video {
       return false;
     }
 
+    /** @copydoc encode_session_t::reconfigure_bitrate */
+    bool reconfigure_bitrate(const std::uint32_t bits_per_second) override {
+      if (!avcodec_ctx || bits_per_second == 0) {
+        return false;
+      }
+      const auto prior_bit_rate = avcodec_ctx->bit_rate;
+      const auto prior_max_rate = avcodec_ctx->rc_max_rate;
+      if (av_opt_set_int(avcodec_ctx.get(), "b", bits_per_second, 0) < 0 ||
+          av_opt_set_int(avcodec_ctx.get(), "maxrate", bits_per_second, 0) < 0) {
+        (void) av_opt_set_int(avcodec_ctx.get(), "b", prior_bit_rate, 0);
+        (void) av_opt_set_int(avcodec_ctx.get(), "maxrate", prior_max_rate, 0);
+        return false;
+      }
+      avcodec_ctx->bit_rate = bits_per_second;
+      avcodec_ctx->rc_max_rate = bits_per_second;
+      return true;
+    }
+
     avcodec_ctx_t avcodec_ctx;  ///< FFmpeg codec context owned by the encode session.
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Platform device used by the FFmpeg hardware encoder.
 
@@ -741,6 +759,11 @@ namespace video {
       return device && device->nvenc && device->nvenc->invalidate_ref_frames(first_frame, last_frame);
     }
 
+    /** @copydoc encode_session_t::reconfigure_bitrate */
+    bool reconfigure_bitrate(const std::uint32_t bits_per_second) override {
+      return device && device->nvenc && device->nvenc->reconfigure_bitrate(bits_per_second);
+    }
+
     /**
      * @brief Submit the next frame to NVENC and return the encoded payload.
      *
@@ -775,6 +798,7 @@ namespace video {
     egress_queue_t *egress;  ///< Per-session scheduler receiving encoded video packets for the stream sender.
     safe::mail_raw_t::event_t<bool> idr_events;  ///< Event raised when an IDR frame is requested.
     safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Reference ranges requiring encoder recovery.
+    safe::mail_raw_t::event_t<std::uint32_t> bitrate_events;  ///< LSP frame-boundary bitrate targets.
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;  ///< Event carrying updated HDR metadata.
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;  ///< Event carrying updated touch viewport metadata.
 
@@ -2774,6 +2798,7 @@ namespace video {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto bitrate_events = mail->event<std::uint32_t>(mail::lsp_bitrate);
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2797,6 +2822,14 @@ namespace video {
           } else {
             session->invalidate_ref_frames(frames->first, frames->second);
           }
+        }
+      }
+
+      while (bitrate_events->peek()) {
+        const auto bits_per_second = bitrate_events->pop(0ms);
+        if (bits_per_second && !session->reconfigure_bitrate(*bits_per_second)) {
+          BOOST_LOG(error) << "LSP encoder rejected a frame-boundary bitrate update"sv;
+          return;
         }
       }
 
@@ -3153,6 +3186,13 @@ namespace video {
               }
             }
           }
+          while (ctx->bitrate_events->peek()) {
+            const auto bits_per_second = ctx->bitrate_events->pop(0ms);
+            if (bits_per_second && !pos->session->reconfigure_bitrate(*bits_per_second)) {
+              ec = platf::capture_e::error;
+              return false;
+            }
+          }
 
           if (ctx->idr_events->peek()) {
             pos->session->request_idr_frame();
@@ -3399,6 +3439,7 @@ namespace video {
         &egress,
         std::move(idr_events),
         mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames),
+        mail->event<std::uint32_t>(mail::lsp_bitrate),
         mail->event<hdr_info_t>(mail::hdr),
         mail->event<input::touch_port_t>(mail::touch_port),
         config,

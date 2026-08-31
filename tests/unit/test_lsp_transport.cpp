@@ -402,8 +402,8 @@ TEST(LspTransportCongestion, DefaultsAdaptiveAndRequiresAnExplicitCompetitionCei
     .queue_delay_trend_microseconds = 1,
   });
   auto state = adaptive.snapshot();
-  EXPECT_EQ(state.pacing_bits_per_second, 90'000'000ULL);
-  EXPECT_EQ(state.encoder_bits_per_second, 70'000'000ULL);
+  EXPECT_EQ(state.pacing_bits_per_second, 101'000'000ULL);
+  EXPECT_EQ(state.encoder_bits_per_second, 81'000'000ULL);
   adaptive.apply_feedback({
     .delivered_bytes = 10'000,
     .lost_bytes = 1'000,
@@ -414,7 +414,7 @@ TEST(LspTransportCongestion, DefaultsAdaptiveAndRequiresAnExplicitCompetitionCei
     .queue_delay_trend_microseconds = 0,
   });
   state = adaptive.snapshot();
-  EXPECT_EQ(state.pacing_bits_per_second, 72'000'000ULL);
+  EXPECT_EQ(state.pacing_bits_per_second, 80'800'000ULL);
   EXPECT_EQ(state.lost_bytes, 1'000ULL);
   EXPECT_EQ(state.ecn_ce_bytes, 100ULL);
 }
@@ -441,6 +441,25 @@ TEST(LspTransportPathMtu, Probes1200Then1400ThenTheAddressFamilyCeiling) {
   EXPECT_EQ(path.candidate_payload_bytes(), 0);
   EXPECT_EQ(path.confirm_black_hole(1'200), lsp_transport::path_mtu_result::accepted);
   EXPECT_EQ(path.current_payload_bytes(), 1'200);
+}
+
+TEST(LspTransportPathMtu, RaiseTimerReopensCeilingAfterSmallerBinarySuccess) {
+  lsp_transport::path_mtu_discovery path({
+    .ip_version = lsp_transport::path_ip_version::ipv4,
+    .sender_interface_limit = 1'472,
+    .receiver_advertised_limit = 1'472,
+    .operator_configured_limit = 1'472,
+  });
+  ASSERT_EQ(path.start_probe(1, 0, 0), lsp_transport::path_mtu_result::accepted);
+  ASSERT_EQ(path.probe_timed_out(), lsp_transport::path_mtu_result::accepted);
+  ASSERT_GT(path.candidate_payload_bytes(), 1'200);
+  ASSERT_LT(path.candidate_payload_bytes(), 1'400);
+  const auto binary_candidate = path.candidate_payload_bytes();
+  ASSERT_EQ(path.start_probe(2, 100, 100), lsp_transport::path_mtu_result::accepted);
+  ASSERT_EQ(path.acknowledge_probe(2, binary_candidate), lsp_transport::path_mtu_result::accepted);
+  EXPECT_LT(path.candidate_payload_bytes(), 1'400);
+  ASSERT_EQ(path.raise_timer_elapsed(), lsp_transport::path_mtu_result::accepted);
+  EXPECT_EQ(path.candidate_payload_bytes(), 1'472);
 }
 
 TEST(LspTransportGenerationFence, TransfersAuthorityOnlyAfterFreshAuthenticationAndNeutralization) {

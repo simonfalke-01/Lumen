@@ -186,6 +186,33 @@ namespace lumen::lsp::runtime {
       std::uint32_t connection_generation,
       const MicrophoneConfigAckPayload &acknowledgement
     ) noexcept = 0;
+
+    /** @brief Emit the protected exact-size SRTCP probe after peer LSPC intent acknowledgement. */
+    virtual bool path_probe_intent_acknowledged(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      std::uint64_t now_microseconds
+    ) noexcept = 0;
+
+    /** @brief Install one authenticated peer-initiated reverse path-probe intent. */
+    virtual bool path_probe_requested(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      std::uint64_t deadline_microseconds
+    ) noexcept = 0;
+
+    /** @brief Commit one authenticated PATH_PROBE_ACK for the host's outstanding probe. */
+    virtual bool path_probe_acknowledged(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe
+    ) noexcept = 0;
+
+    /** @brief Retire one peer-rejected host probe without closing the association. */
+    virtual bool path_probe_rejected(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      ControlStatus status
+    ) noexcept = 0;
   };
 
   /**
@@ -423,6 +450,49 @@ namespace lumen::lsp::runtime {
      * @param now_microseconds Current monotonic timestamp.
      */
     void tick(std::uint64_t now_microseconds) noexcept;
+
+    /**
+     * @brief Reliably establish intent for one host-originated exact-size SRTCP probe.
+     *
+     * @param peer Exact authenticated association.
+     * @param probe Nonzero identifier and candidate payload size.
+     * @param now_microseconds Monotonic send time.
+     * @return True when retained and first-transmitted.
+     */
+    bool start_path_probe(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /**
+     * @brief Complete one peer probe after authenticating its exact-size `LSPP` datagram.
+     *
+     * @param peer Exact authenticated association.
+     * @param probe Matched identifier and received protected size.
+     * @param now_microseconds Monotonic completion time.
+     * @return True when the reliable PATH_PROBE_ACK response was retained and sent.
+     */
+    bool complete_path_probe(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /**
+     * @brief Retire one host-originated probe after its complete PROBE_TIMER budget expires.
+     *
+     * @param peer Exact authenticated association.
+     * @param probe Exact outstanding logical probe.
+     * @return True when the matching semantic request was retired.
+     */
+    bool cancel_path_probe(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe
+    ) noexcept;
+
+    /** @brief Return the path-safe current control RTO used as a probe interval. */
+    [[nodiscard]] std::uint64_t path_probe_interval(const PeerEndpoint &peer) const noexcept;
 
     /** @brief Return current association count. */
     [[nodiscard]] std::size_t connection_count() const noexcept;

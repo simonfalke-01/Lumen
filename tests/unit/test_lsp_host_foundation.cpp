@@ -9,7 +9,9 @@
 #include "src/protocol_lsp/session_authority.h"
 #include "src/protocol_lsp/ssrc_registry.h"
 #include "src/protocol_lsp/types.h"
+#include "src/protocol_lsp/runtime/udp_socket.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <gtest/gtest.h>
@@ -296,6 +298,33 @@ TEST(LspHostService, BindsOnePortAndDispatchesOnlyDefinedPacketClasses) {
   EXPECT_FALSE(service.active());
   EXPECT_EQ(socket.close_calls, 1U);
   EXPECT_EQ(service.receive(peer, std::array<std::uint8_t, 1> {22}), lsp::DatagramResult::inactive);
+}
+
+TEST(LspNativeUdpSocket, BindsNoFragmentDualStackAndPreservesMappedIpv4Peers) {
+  lsp::runtime::NativeUdpSocket socket;
+  ASSERT_TRUE(socket.bind(0));
+  ASSERT_NE(socket.bound_port(), 0U);
+  const lsp::PeerEndpoint loopback {
+    .family = lsp::IpAddressFamily::ipv4,
+    .local_address = "0.0.0.0",
+    .local_port = socket.bound_port(),
+    .remote_address = "127.0.0.1",
+    .remote_port = socket.bound_port(),
+  };
+  constexpr std::array<std::uint8_t, 4> payload {1, 2, 3, 4};
+  ASSERT_EQ(socket.send_datagram_result(loopback, payload), lsp::runtime::UdpSendResult::sent);
+  ASSERT_TRUE(socket.wait_readable(100));
+  bool received = false;
+  EXPECT_EQ(
+    socket.receive_batch(1, [&](const lsp::runtime::ReceivedDatagram &datagram) {
+      received = datagram.peer.family == lsp::IpAddressFamily::ipv4 &&
+                 datagram.peer.remote_address == "127.0.0.1" &&
+                 std::ranges::equal(datagram.payload, payload);
+    }),
+    lsp::runtime::ReceiveBatchResult::drained
+  );
+  EXPECT_TRUE(received);
+  socket.close();
 }
 
 TEST(LspInvitation, RoundTripsExactDeterministicFragmentUri) {

@@ -27,6 +27,7 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_application_name_bytes = 256;
     constexpr std::size_t maximum_application_image_bytes = 512;
     constexpr std::uint64_t response_deadline_microseconds = 1'000'000;
+    constexpr std::uint64_t path_probe_semantic_deadline_microseconds = 60'000'000;  ///< Covers all legal LSPP retries plus margin.
 
     template<std::size_t Size>
     cbor::Value::Bytes bytes(const std::array<std::uint8_t, Size> &value) {
@@ -222,6 +223,32 @@ namespace lumen::lsp::runtime {
 
       std::array<AcceptedMicrophoneAck, 4> accepted_microphone_acks {};  ///< Bounded ACK cache across rekeys.
       std::size_t next_microphone_ack_slot {};  ///< Ring slot replaced by the next accepted microphone ACK.
+
+      struct PendingOutboundPathProbe {
+        PathProbePayload probe {};  ///< Exact intent and protected candidate size.
+        std::uint64_t request_id {};  ///< Random response correlation identifier.
+        std::uint64_t message_id {};  ///< Reliable intent message identifier.
+        std::uint64_t deadline_microseconds {};  ///< Full semantic probe lifetime.
+        bool datagram_sent {};  ///< Whether peer LSPC acknowledgement released `LSPP` transmission.
+        bool active {};  ///< Whether PATH_PROBE_ACK remains outstanding.
+      } outbound_path_probe;  ///< One host-originated probe per direction.
+
+      struct PendingInboundPathProbe {
+        PathProbePayload probe {};  ///< Authenticated peer intent awaiting exact `LSPP`.
+        packet_slab<maximum_control_frame_bytes> request {};  ///< Byte-identical request for response caching.
+        lspc_header header {};  ///< Original request correlation and generation fields.
+        std::uint64_t deadline_microseconds {};  ///< Bounded authenticated datagram deadline.
+        bool active {};  ///< Whether an exact protected probe remains expected.
+      } inbound_path_probe;  ///< One peer-originated reverse probe.
+
+      struct AcceptedPathProbeAck {
+        std::uint64_t request_id {};  ///< PATH_PROBE request answered by this exact frame.
+        std::array<std::uint8_t, maximum_control_frame_bytes> frame {};  ///< Byte-identical accepted ACK.
+        std::size_t size {};  ///< Populated leading bytes.
+      };
+
+      std::array<AcceptedPathProbeAck, 4> accepted_path_probe_acks {};  ///< Bounded ACK duplicate cache.
+      std::size_t next_path_probe_ack_slot {};  ///< Next ACK cache replacement slot.
       bool hello_complete {};  ///< Whether CLIENT_HELLO completed.
     };
 
@@ -367,7 +394,25 @@ namespace lumen::lsp::runtime {
         transport_.close(peer);
         return false;
       }
+      const auto release_path_probe = connection.outbound_path_probe.active &&
+                                      !connection.outbound_path_probe.datagram_sent &&
+                                      acknowledgement_covers(
+                                        parsed.header.acknowledgement_base,
+                                        parsed.header.acknowledgement_bitmap,
+                                        connection.outbound_path_probe.message_id
+                                      );
       connection.outbound.acknowledge(parsed.header.acknowledgement_base, parsed.header.acknowledgement_bitmap);
+      if (release_path_probe) {
+        if (!start_handler_.path_probe_intent_acknowledged(
+              connection.peer,
+              connection.outbound_path_probe.probe,
+              now_microseconds
+            )) {
+          transport_.close(peer);
+          return false;
+        }
+        connection.outbound_path_probe.datagram_sent = true;
+      }
 
       if (has_flag(parsed.header.flags, lspc_flag::acknowledgement_only)) {
         const auto observed = connection.inbound.observe(parsed.header.message_id);
@@ -389,6 +434,9 @@ namespace lumen::lsp::runtime {
         if (message_type == ControlMessageType::microphone_config_ack) {
           return microphone_config_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
         }
+        if (message_type == ControlMessageType::path_probe_ack) {
+          return path_probe_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        }
         transport_.close(peer);
         return false;
       }
@@ -402,6 +450,16 @@ namespace lumen::lsp::runtime {
         return transport_.send(peer, cached.response);
       }
       if (cached.result == response_cache_result::conflicting_request) {
+        transport_.close(peer);
+        return false;
+      }
+
+      if (message_type == ControlMessageType::path_probe && connection.inbound_path_probe.active &&
+          parsed.header.request_id == connection.inbound_path_probe.header.request_id) {
+        if (connection.inbound_path_probe.request.bytes().size() == frame.size() &&
+            std::ranges::equal(connection.inbound_path_probe.request.bytes(), frame)) {
+          return send_acknowledgement_only(connection);
+        }
         transport_.close(peer);
         return false;
       }
@@ -438,12 +496,15 @@ namespace lumen::lsp::runtime {
           return attach_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::stop:
           return stop_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::path_probe:
+          return receive_path_probe(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::video_config:
         case ControlMessageType::video_config_ack:
         case ControlMessageType::audio_config:
         case ControlMessageType::audio_config_ack:
         case ControlMessageType::microphone_config:
         case ControlMessageType::microphone_config_ack:
+        case ControlMessageType::path_probe_ack:
         case ControlMessageType::client_hello:
         case ControlMessageType::server_hello:
         case ControlMessageType::pair_response:
@@ -461,6 +522,40 @@ namespace lumen::lsp::runtime {
       std::scoped_lock lock(mutex_);
       for (std::size_t index = 0; index < connections_.size();) {
         auto &connection = connections_[index];
+        if (connection.inbound_path_probe.active &&
+            now_microseconds >= connection.inbound_path_probe.deadline_microseconds) {
+          const auto request = connection.inbound_path_probe.request;
+          const auto header = connection.inbound_path_probe.header;
+          connection.inbound_path_probe = {};
+          if (!send_error(
+                connection,
+                request.bytes(),
+                header,
+                ControlMessageType::path_probe_ack,
+                ControlStatus::timeout,
+                now_microseconds
+              )) {
+            const auto peer = connection.peer;
+            transport_.close(peer);
+            if (const auto remaining = find(peer); remaining != connections_.size()) {
+              connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+            }
+            continue;
+          }
+        }
+        if (connection.outbound_path_probe.active &&
+            now_microseconds >= connection.outbound_path_probe.deadline_microseconds) {
+          const auto probe = connection.outbound_path_probe.probe;
+          if (!start_handler_.path_probe_rejected(connection.peer, probe, ControlStatus::timeout)) {
+            const auto peer = connection.peer;
+            transport_.close(peer);
+            if (const auto remaining = find(peer); remaining != connections_.size()) {
+              connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+            }
+            continue;
+          }
+          connection.outbound_path_probe = {};
+        }
         if (connection.outbound.has_failed(now_microseconds)) {
           const auto peer = connection.peer;
           transport_.close(peer);
@@ -484,6 +579,12 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    [[nodiscard]] std::uint64_t path_probe_interval(const PeerEndpoint &peer) const noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      return index == connections_.size() ? 0 : std::max<std::uint64_t>(1'000'000U, connections_[index].rto.timeout_microseconds());
+    }
+
     [[nodiscard]] std::size_t connection_count() const noexcept {
       std::scoped_lock lock(mutex_);
       return connections_.size();
@@ -496,10 +597,65 @@ namespace lumen::lsp::runtime {
       }));
     }
 
+    /** @brief Expose host-originated probe initiation to the owning server facade. */
+    bool start_path_probe_public(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      return start_path_probe(peer, probe, now_microseconds);
+    }
+
+    /** @brief Expose peer-originated probe completion to the owning server facade. */
+    bool complete_path_probe_public(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      return complete_path_probe(peer, probe, now_microseconds);
+    }
+
+    /** @brief Retire only the exact outstanding host probe after data-plane timeout. */
+    bool cancel_path_probe(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe
+    ) noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (index == connections_.size()) {
+        return false;
+      }
+      auto &pending = connections_[index].outbound_path_probe;
+      if (!pending.active || pending.probe != probe) {
+        return false;
+      }
+      pending = {};
+      return true;
+    }
+
   private:
     [[nodiscard]] std::size_t find(const PeerEndpoint &peer) const noexcept {
       const auto iterator = std::ranges::find(connections_, peer, &Connection::peer);
       return static_cast<std::size_t>(std::distance(connections_.begin(), iterator));
+    }
+
+    /** @brief Return whether one selective-ACK field explicitly covers a message ID. */
+    [[nodiscard]] static bool acknowledgement_covers(
+      const std::uint64_t base,
+      const std::uint64_t bitmap,
+      const std::uint64_t message_id
+    ) noexcept {
+      if (message_id == 0 || base == 0) {
+        return false;
+      }
+      if (message_id == base) {
+        return true;
+      }
+      if (message_id > base) {
+        return false;
+      }
+      const auto distance = base - message_id;
+      return distance <= 64U && (bitmap & (std::uint64_t {1} << (distance - 1U))) != 0;
     }
 
     static ControlMessageType response_type(const ControlMessageType request) noexcept {
@@ -525,8 +681,11 @@ namespace lumen::lsp::runtime {
         case ControlMessageType::audio_config_ack:
         case ControlMessageType::microphone_config:
           return ControlMessageType::microphone_config_ack;
+        case ControlMessageType::path_probe:
+          return ControlMessageType::path_probe_ack;
         case ControlMessageType::microphone_config_ack:
         case ControlMessageType::video_config_ack:
+        case ControlMessageType::path_probe_ack:
         case ControlMessageType::server_hello:
         case ControlMessageType::pair_response:
         case ControlMessageType::auth_response:
@@ -736,6 +895,175 @@ namespace lumen::lsp::runtime {
       std::ranges::copy(frame, accepted.frame.begin());
       accepted.size = frame.size();
       connection.next_video_ack_slot = (connection.next_video_ack_slot + 1U) % connection.accepted_video_acks.size();
+      return send_acknowledgement_only(connection);
+    }
+
+    /** @brief Retain and transmit one reliable host-originated PATH_PROBE intent. */
+    bool start_path_probe(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (index == connections_.size()) {
+        return false;
+      }
+      auto &connection = connections_[index];
+      if (!connection.authenticated_client || connection.outbound_path_probe.active ||
+          connection.next_message_id == 0) {
+        return false;
+      }
+      const auto payload = encode_path_probe(probe);
+      std::array<std::uint8_t, 8> request_bytes {};
+      if (!payload || !crypto_.random(request_bytes)) {
+        return false;
+      }
+      std::uint64_t request_id = 0;
+      for (const auto byte : request_bytes) {
+        request_id = (request_id << 8U) | byte;
+      }
+      if (request_id == 0) request_id = 1;
+      std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
+      const lspc_header header {
+        .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
+        .message_type = static_cast<std::uint16_t>(ControlMessageType::path_probe),
+        .connection_generation = connection.generation,
+        .payload_length = static_cast<std::uint32_t>(payload->size()),
+        .message_id = connection.next_message_id,
+        .request_id = request_id,
+        .acknowledgement_base = connection.inbound.base(),
+        .acknowledgement_bitmap = connection.inbound.bitmap(),
+      };
+      const auto serialized = serialize_lspc(header, *payload, storage);
+      if (!serialized) return false;
+      const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
+      if (connection.outbound.store(
+            connection.next_message_id,
+            frame,
+            now_microseconds,
+            saturating_add(now_microseconds, response_deadline_microseconds),
+            connection.rto
+          ) != outbound_store_result::stored) {
+        return false;
+      }
+      connection.outbound_path_probe = {
+        .probe = probe,
+        .request_id = request_id,
+        .message_id = connection.next_message_id,
+        .deadline_microseconds = saturating_add(now_microseconds, path_probe_semantic_deadline_microseconds),
+        .datagram_sent = false,
+        .active = true,
+      };
+      ++connection.next_message_id;
+      return transport_.send(peer, frame);
+    }
+
+    /** @brief Retain one peer intent until its exact protected LSPP arrives. */
+    bool receive_path_probe(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      const auto decoded = decode_path_probe(payload);
+      if (!decoded) {
+        return send_error(connection, request, header, ControlMessageType::path_probe_ack, ControlStatus::malformed, now_microseconds);
+      }
+      if (connection.inbound_path_probe.active) {
+        return send_error(connection, request, header, ControlMessageType::path_probe_ack, ControlStatus::busy, now_microseconds);
+      }
+      const auto deadline = saturating_add(now_microseconds, path_probe_semantic_deadline_microseconds);
+      if (!start_handler_.path_probe_requested(connection.peer, *decoded, deadline) ||
+          !connection.inbound_path_probe.request.assign(request)) {
+        return send_error(connection, request, header, ControlMessageType::path_probe_ack, ControlStatus::busy, now_microseconds);
+      }
+      connection.inbound_path_probe.probe = *decoded;
+      connection.inbound_path_probe.header = header;
+      connection.inbound_path_probe.deadline_microseconds = deadline;
+      connection.inbound_path_probe.active = true;
+      return send_acknowledgement_only(connection);
+    }
+
+    /** @brief Send the reliable semantic ACK after exact authenticated peer LSPP admission. */
+    bool complete_path_probe(
+      const PeerEndpoint &peer,
+      const PathProbePayload &probe,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (index == connections_.size()) return false;
+      auto &connection = connections_[index];
+      if (!connection.inbound_path_probe.active || connection.inbound_path_probe.probe != probe) return false;
+      const auto payload = encode_path_probe(probe);
+      if (!payload || !send_response(
+                        connection,
+                        connection.inbound_path_probe.request.bytes(),
+                        connection.inbound_path_probe.header,
+                        ControlMessageType::path_probe_ack,
+                        *payload,
+                        false,
+                        now_microseconds
+                      )) {
+        return false;
+      }
+      connection.inbound_path_probe = {};
+      return true;
+    }
+
+    /** @brief Validate one host-originated PATH_PROBE_ACK and cache exact duplicates. */
+    bool path_probe_ack(
+      Connection &connection,
+      const std::span<const std::uint8_t> frame,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      (void) now_microseconds;
+      const auto duplicate = std::ranges::find_if(connection.accepted_path_probe_acks, [&](const Connection::AcceptedPathProbeAck &accepted) {
+        return accepted.size == frame.size() && accepted.request_id == header.request_id &&
+               std::ranges::equal(std::span<const std::uint8_t> {accepted.frame}.first(accepted.size), frame);
+      });
+      const auto observed = connection.inbound.observe(header.message_id);
+      if (observed != receive_id_result::accepted) {
+        if (duplicate != connection.accepted_path_probe_acks.end()) return send_acknowledgement_only(connection);
+        transport_.close(connection.peer);
+        return false;
+      }
+      if (!connection.authenticated_client || !connection.outbound_path_probe.active ||
+          !connection.outbound_path_probe.datagram_sent || header.request_id == 0 ||
+          header.request_id != connection.outbound_path_probe.request_id) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      const auto rejected = has_flag(header.flags, lspc_flag::error_response);
+      if (rejected) {
+        const auto status = decode_control_error(payload);
+        if (!status || !start_handler_.path_probe_rejected(
+                         connection.peer,
+                         connection.outbound_path_probe.probe,
+                         *status
+                       )) {
+          transport_.close(connection.peer);
+          return false;
+        }
+      } else {
+        const auto decoded = decode_path_probe(payload);
+        if (!decoded || *decoded != connection.outbound_path_probe.probe ||
+            !start_handler_.path_probe_acknowledged(connection.peer, *decoded)) {
+          transport_.close(connection.peer);
+          return false;
+        }
+      }
+      connection.outbound.acknowledge(connection.outbound_path_probe.message_id, 0);
+      connection.outbound_path_probe = {};
+      auto &accepted = connection.accepted_path_probe_acks[connection.next_path_probe_ack_slot];
+      accepted.request_id = header.request_id;
+      std::ranges::copy(frame, accepted.frame.begin());
+      accepted.size = frame.size();
+      connection.next_path_probe_ack_slot = (connection.next_path_probe_ack_slot + 1U) % connection.accepted_path_probe_acks.size();
       return send_acknowledgement_only(connection);
     }
 
@@ -1395,6 +1723,33 @@ namespace lumen::lsp::runtime {
     if (impl_) {
       impl_->tick(now_microseconds);
     }
+  }
+
+  bool HostControlServer::start_path_probe(
+    const PeerEndpoint &peer,
+    const PathProbePayload &probe,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->start_path_probe_public(peer, probe, now_microseconds);
+  }
+
+  bool HostControlServer::complete_path_probe(
+    const PeerEndpoint &peer,
+    const PathProbePayload &probe,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->complete_path_probe_public(peer, probe, now_microseconds);
+  }
+
+  bool HostControlServer::cancel_path_probe(
+    const PeerEndpoint &peer,
+    const PathProbePayload &probe
+  ) noexcept {
+    return impl_ && impl_->cancel_path_probe(peer, probe);
+  }
+
+  std::uint64_t HostControlServer::path_probe_interval(const PeerEndpoint &peer) const noexcept {
+    return impl_ ? impl_->path_probe_interval(peer) : 0;
   }
 
   std::size_t HostControlServer::connection_count() const noexcept {

@@ -41,6 +41,8 @@ namespace lumen::lsp::runtime {
     audio_config_ack = 0x0213,  ///< Authenticate client decoder readiness for one audio generation.
     microphone_config = 0x0214,  ///< Install one exact reverse Opus microphone configuration.
     microphone_config_ack = 0x0215,  ///< Authenticate client sender readiness for one microphone generation.
+    path_probe = 0x0300,  ///< Establish authenticated intent for one exact-size SRTCP path probe.
+    path_probe_ack = 0x0301,  ///< Confirm one authenticated exact-size path probe.
   };
 
   /** @brief Stable control status codes from the normative LSP registry. */
@@ -382,6 +384,15 @@ namespace lumen::lsp::runtime {
     std::uint32_t microphone_generation {};  ///< Acknowledged microphone generation.
   };
 
+  /** @brief Exact three-key PATH_PROBE or PATH_PROBE_ACK payload. */
+  struct PathProbePayload {
+    std::uint64_t probe_id {};  ///< Random nonzero authenticated probe identifier.
+    std::uint16_t udp_payload_size {};  ///< Exact protected UDP payload size.
+
+    /** @brief Compare the exact probe identifier and size. */
+    [[nodiscard]] bool operator==(const PathProbePayload &) const noexcept = default;
+  };
+
   /** @brief Decode exact CLIENT_HELLO deterministic CBOR. */
   [[nodiscard]] std::expected<ClientHelloPayload, ControlWireError> decode_client_hello(std::span<const std::uint8_t> payload);
 
@@ -408,6 +419,9 @@ namespace lumen::lsp::runtime {
 
   /** @brief Encode exact error map `{1: version, 2: status}`. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_control_error(ControlStatus status);
+
+  /** @brief Decode an exact two-key generic control error payload. */
+  [[nodiscard]] std::expected<ControlStatus, ControlWireError> decode_control_error(std::span<const std::uint8_t> payload);
 
   /** @brief Decode exact input, audio, and optional-microphone START deterministic CBOR. */
   [[nodiscard]] std::expected<StartRequestPayload, ControlWireError> decode_start(std::span<const std::uint8_t> payload);
@@ -444,4 +458,10 @@ namespace lumen::lsp::runtime {
 
   /** @brief Decode exact MICROPHONE_CONFIG_ACK deterministic CBOR. */
   [[nodiscard]] std::expected<MicrophoneConfigAckPayload, ControlWireError> decode_microphone_config_ack(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact PATH_PROBE or PATH_PROBE_ACK deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_path_probe(const PathProbePayload &payload);
+
+  /** @brief Decode exact PATH_PROBE or PATH_PROBE_ACK deterministic CBOR. */
+  [[nodiscard]] std::expected<PathProbePayload, ControlWireError> decode_path_probe(std::span<const std::uint8_t> payload);
 }  // namespace lumen::lsp::runtime

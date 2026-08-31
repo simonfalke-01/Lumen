@@ -299,6 +299,54 @@ namespace lumen::lsp {
     }
 
     /**
+     * @brief Change rate or path bounds without granting fresh startup credit or erasing debt.
+     *
+     * Credit is first accrued under the prior configuration through `now_microseconds`, then
+     * clamped to the new submission horizon. No partition receives additional credit merely
+     * because feedback changed a rate or DPLPMTUD confirmed a packet size.
+     *
+     * @param config Replacement pacing configuration.
+     * @param now_microseconds Monotonic reconfiguration time.
+     * @return True only when the replacement configuration is valid.
+     */
+    constexpr bool reconfigure(
+      const pacer_config config,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      const auto replacement_error = validate(config);
+      if (replacement_error != pacer_error::none) {
+        return false;
+      }
+      if (initialized_) {
+        update(now_microseconds);
+      }
+      config_ = config;
+      error_ = replacement_error;
+      if (!initialized_) {
+        last_update_microseconds_ = now_microseconds;
+        return true;
+      }
+      const auto common_rate = config_.pacing_bits_per_second - config_.input_reserve_bits_per_second;
+      const auto aggregate_cap = std::max<std::uint64_t>(
+        config_.path_datagram_bytes,
+        earned_bytes(config_.pacing_bits_per_second, config_.submission_horizon_microseconds)
+      );
+      const auto common_cap = common_rate == 0 ? 0 : std::max<std::uint64_t>(
+        config_.path_datagram_bytes,
+        earned_bytes(common_rate, config_.submission_horizon_microseconds)
+      );
+      const auto input_cap = config_.input_reserve_bits_per_second == 0 ? 0 : std::max<std::uint64_t>(
+        config_.path_datagram_bytes,
+        earned_bytes(config_.input_reserve_bits_per_second, config_.submission_horizon_microseconds)
+      );
+      aggregate_credit_ = std::min(aggregate_credit_, aggregate_cap);
+      common_credit_ = std::min(common_credit_, common_cap);
+      input_credit_ = std::min(input_credit_, input_cap);
+      last_update_microseconds_ = now_microseconds;
+      return true;
+    }
+
+    /**
      * @brief Grant a leading microbatch and consume its earned byte credit.
      *
      * Requested sizes must include complete IP/UDP/SRTP/RTP or DTLS accounting. Input may consume

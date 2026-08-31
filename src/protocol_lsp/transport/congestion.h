@@ -110,7 +110,31 @@ namespace lumen::lsp::transport {
 
       const auto loss = feedback.lost_bytes != 0;
       const auto ecn = feedback.ecn_ce_bytes != 0;
-      const auto positive_delay = feedback.queue_delay_trend_microseconds > 0;
+      filtered_queue_delay_trend_microseconds_ = static_cast<std::int32_t>(
+        (static_cast<std::int64_t>(filtered_queue_delay_trend_microseconds_) * 7 +
+         feedback.queue_delay_trend_microseconds) /
+        8
+      );
+      if (filtered_queue_delay_trend_microseconds_ > 0) {
+        accumulated_queue_growth_microseconds_ = std::min<std::uint64_t>(
+          static_cast<std::uint64_t>(config_.queue_delay_budget_microseconds) * 4U,
+          accumulated_queue_growth_microseconds_ +
+            static_cast<std::uint32_t>(filtered_queue_delay_trend_microseconds_)
+        );
+        positive_queue_intervals_ = static_cast<std::uint8_t>(std::min<unsigned int>(
+          255U,
+          static_cast<unsigned int>(positive_queue_intervals_) + 1U
+        ));
+      } else {
+        const auto recovery = static_cast<std::uint64_t>(
+          std::max<std::int64_t>(1, -static_cast<std::int64_t>(filtered_queue_delay_trend_microseconds_))
+        );
+        accumulated_queue_growth_microseconds_ =
+          accumulated_queue_growth_microseconds_ > recovery ? accumulated_queue_growth_microseconds_ - recovery : 0;
+        positive_queue_intervals_ = 0;
+      }
+      const auto positive_delay = positive_queue_intervals_ >= 3U &&
+                                  accumulated_queue_growth_microseconds_ > config_.queue_delay_budget_microseconds;
       const auto rtt_violation = feedback.smoothed_rtt_microseconds > config_.maximum_rtt_microseconds;
       if (loss || ecn || positive_delay || rtt_violation) {
         const auto reduction_percent = (loss || ecn || rtt_violation) ? 80U : 90U;
@@ -119,6 +143,15 @@ namespace lumen::lsp::transport {
         pacing_bits_per_second_ = std::max(config_.minimum_pacing_bits_per_second, reduced);
         minimum_unsustainable_ = prior == config_.minimum_pacing_bits_per_second &&
                                  pacing_bits_per_second_ == config_.minimum_pacing_bits_per_second;
+        if (positive_delay) {
+          accumulated_queue_growth_microseconds_ /= 2U;
+          positive_queue_intervals_ = 0;
+        }
+        return;
+      }
+
+      if (filtered_queue_delay_trend_microseconds_ > 0) {
+        minimum_unsustainable_ = false;
         return;
       }
 
@@ -267,6 +300,9 @@ namespace lumen::lsp::transport {
     std::uint32_t smoothed_rtt_microseconds_ = 0;  ///< Latest smoothed RTT.
     std::uint32_t rtt_variation_microseconds_ = 0;  ///< Latest RTT variation.
     std::int32_t queue_delay_trend_microseconds_ = 0;  ///< Latest signed delay trend.
+    std::int32_t filtered_queue_delay_trend_microseconds_ = 0;  ///< Low-pass trend excluding ATO quantization noise.
+    std::uint64_t accumulated_queue_growth_microseconds_ = 0;  ///< Sustained positive queue growth against budget.
+    std::uint8_t positive_queue_intervals_ = 0;  ///< Consecutive filtered positive-trend intervals.
     bool minimum_unsustainable_ = false;  ///< Whether impairment persisted at minimum rate.
   };
 
@@ -491,6 +527,23 @@ namespace lumen::lsp::transport {
       );
       current_payload_bytes_ = fallback_payload_bytes;
       outstanding_ = {};
+      fast_search_complete_ = true;
+      return path_mtu_result::accepted;
+    }
+
+    /**
+     * @brief Reopen bounded upward search after RFC 8899's PMTU_RAISE_TIMER.
+     *
+     * The largest authenticated safe payload remains unchanged. Only prior failed-candidate state
+     * is forgotten so a later probe can test whether the path recovered.
+     *
+     * @return Accepted when a larger ceiling can be searched, otherwise a typed idle result.
+     */
+    constexpr path_mtu_result raise_timer_elapsed() noexcept {
+      if (!valid_) return path_mtu_result::invalid_configuration;
+      if (outstanding_) return path_mtu_result::probe_outstanding;
+      if (current_payload_bytes_ >= ceiling_payload_bytes_) return path_mtu_result::no_candidate;
+      upper_exclusive_ = static_cast<std::uint32_t>(ceiling_payload_bytes_) + 1U;
       fast_search_complete_ = true;
       return path_mtu_result::accepted;
     }

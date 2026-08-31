@@ -27,8 +27,8 @@
 
 namespace lumen::lsp::runtime {
   namespace {
+    constexpr std::size_t maximum_protected_packet_bytes = 2'048;  ///< Provider-wide bounded UDP payload slab.
 #if LUMEN_LSP_LIBSRTP_AVAILABLE
-    constexpr std::size_t maximum_protected_packet_bytes = 2'048;
     constexpr std::size_t maximum_srtp_trailer_bytes = 64;
     constexpr std::array<int, 3> encrypted_header_extension_ids {3, 4, 5};
     constexpr std::size_t srtp_master_material_size = srtp_aes_128_key_size + srtp_aead_salt_size;
@@ -112,7 +112,8 @@ namespace lumen::lsp::runtime {
         callbacks_.context,
         peer,
         packet_class,
-        std::span<const std::uint8_t> {packet.data(), static_cast<std::size_t>(size)}
+        std::span<const std::uint8_t> {packet.data(), static_cast<std::size_t>(size)},
+        datagram.size()
       );
       clear_secret(packet);
       return accepted ? ProviderDatagramResult::accepted : ProviderDatagramResult::fatal;
@@ -226,7 +227,12 @@ namespace lumen::lsp::runtime {
       const auto status = packet_class == SecurePacketClass::rtcp ?
                             srtp_protect_rtcp(associations_[index].outbound, packet.data(), &size) :
                             srtp_protect(associations_[index].outbound, packet.data(), &size);
-      const auto sent = status == srtp_err_status_ok && size > 0 && callbacks_.send_datagram(callbacks_.context, peer, std::span<const std::uint8_t> {packet.data(), static_cast<std::size_t>(size)});
+      const auto sent = status == srtp_err_status_ok && size > 0 &&
+                        callbacks_.send_datagram(
+                          callbacks_.context,
+                          peer,
+                          std::span<const std::uint8_t> {packet.data(), static_cast<std::size_t>(size)}
+                        ) == ProtectedSendResult::sent;
       clear_secret(packet);
       return sent;
 #endif
@@ -238,6 +244,90 @@ namespace lumen::lsp::runtime {
       const std::span<std::uint8_t> packet_storage,
       const std::size_t plaintext_bytes
     ) noexcept {
+      std::size_t protected_bytes = 0;
+      return protect_and_send_in_place_result(
+               peer,
+               packet_class,
+               packet_storage,
+               plaintext_bytes,
+               protected_bytes
+             ) == ProtectedSendResult::sent;
+    }
+
+    ProtectedSendResult protect_and_send_in_place_result(
+      const PeerEndpoint &peer,
+      const SecurePacketClass packet_class,
+      const std::span<std::uint8_t> packet_storage,
+      const std::size_t plaintext_bytes,
+      std::size_t &protected_bytes
+    ) noexcept {
+      protected_bytes = 0;
+#if !LUMEN_LSP_LIBSRTP_AVAILABLE
+      (void) peer;
+      (void) packet_class;
+      (void) packet_storage;
+      (void) plaintext_bytes;
+      return ProtectedSendResult::fatal;
+#else
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      std::uint32_t required_trailer = 0;
+      const auto trailer_status = index == associations_.size() ? srtp_err_status_bad_param :
+                                  packet_class == SecurePacketClass::rtcp ?
+                                    srtp_get_protect_rtcp_trailer_length(associations_[index].outbound, 0, 0, &required_trailer) :
+                                    srtp_get_protect_trailer_length(associations_[index].outbound, 0, 0, &required_trailer);
+      if (!ready_ || index == associations_.size() || trailer_status != srtp_err_status_ok || plaintext_bytes == 0 ||
+          packet_storage.size() > maximum_protected_packet_bytes ||
+          plaintext_bytes > packet_storage.size() || packet_storage.size() - plaintext_bytes < required_trailer) {
+        return ProtectedSendResult::fatal;
+      }
+      auto size = static_cast<int>(plaintext_bytes);
+      const auto status = packet_class == SecurePacketClass::rtcp ?
+                            srtp_protect_rtcp(associations_[index].outbound, packet_storage.data(), &size) :
+                            srtp_protect(associations_[index].outbound, packet_storage.data(), &size);
+      if (status != srtp_err_status_ok || size <= 0 ||
+          static_cast<std::size_t>(size) > packet_storage.size()) {
+        return ProtectedSendResult::fatal;
+      }
+      protected_bytes = static_cast<std::size_t>(size);
+      return callbacks_.send_datagram(
+        callbacks_.context,
+        peer,
+        std::span<const std::uint8_t> {packet_storage.data(), protected_bytes}
+      );
+#endif
+    }
+
+    [[nodiscard]] std::optional<std::size_t> protect_trailer_length(
+      const PeerEndpoint &peer,
+      const SecurePacketClass packet_class
+    ) const noexcept {
+#if !LUMEN_LSP_LIBSRTP_AVAILABLE
+      (void) peer;
+      (void) packet_class;
+      return std::nullopt;
+#else
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (!ready_ || index == associations_.size()) {
+        return std::nullopt;
+      }
+      std::uint32_t length = 0;
+      const auto status = packet_class == SecurePacketClass::rtcp ?
+                            srtp_get_protect_rtcp_trailer_length(associations_[index].outbound, 0, 0, &length) :
+                            srtp_get_protect_trailer_length(associations_[index].outbound, 0, 0, &length);
+      return status == srtp_err_status_ok && length != 0 ? std::optional<std::size_t> {length} : std::nullopt;
+#endif
+    }
+
+    bool protect_in_place(
+      const PeerEndpoint &peer,
+      const SecurePacketClass packet_class,
+      const std::span<std::uint8_t> packet_storage,
+      const std::size_t plaintext_bytes,
+      std::size_t &protected_bytes
+    ) noexcept {
+      protected_bytes = 0;
 #if !LUMEN_LSP_LIBSRTP_AVAILABLE
       (void) peer;
       (void) packet_class;
@@ -247,24 +337,38 @@ namespace lumen::lsp::runtime {
 #else
       std::scoped_lock lock(mutex_);
       const auto index = find(peer);
-      const auto required_trailer = packet_class == SecurePacketClass::rtcp ? std::size_t {20} : std::size_t {16};
       if (!ready_ || index == associations_.size() || plaintext_bytes == 0 ||
-          packet_storage.size() > maximum_protected_packet_bytes ||
-          plaintext_bytes > packet_storage.size() || packet_storage.size() - plaintext_bytes < required_trailer) {
+          plaintext_bytes > packet_storage.size() || packet_storage.size() > maximum_protected_packet_bytes) {
+        return false;
+      }
+      std::uint32_t trailer = 0;
+      const auto trailer_status = packet_class == SecurePacketClass::rtcp ?
+                                    srtp_get_protect_rtcp_trailer_length(associations_[index].outbound, 0, 0, &trailer) :
+                                    srtp_get_protect_trailer_length(associations_[index].outbound, 0, 0, &trailer);
+      if (trailer_status != srtp_err_status_ok || packet_storage.size() - plaintext_bytes < trailer) {
         return false;
       }
       auto size = static_cast<int>(plaintext_bytes);
       const auto status = packet_class == SecurePacketClass::rtcp ?
                             srtp_protect_rtcp(associations_[index].outbound, packet_storage.data(), &size) :
                             srtp_protect(associations_[index].outbound, packet_storage.data(), &size);
-      return status == srtp_err_status_ok && size > 0 &&
-             static_cast<std::size_t>(size) <= packet_storage.size() &&
-             callbacks_.send_datagram(
-               callbacks_.context,
-               peer,
-               std::span<const std::uint8_t> {packet_storage.data(), static_cast<std::size_t>(size)}
-             );
+      if (status != srtp_err_status_ok || size <= 0 || static_cast<std::size_t>(size) > packet_storage.size()) {
+        return false;
+      }
+      protected_bytes = static_cast<std::size_t>(size);
+      return true;
 #endif
+    }
+
+    ProtectedSendResult send_protected(
+      const PeerEndpoint &peer,
+      const std::span<const std::uint8_t> protected_packet
+    ) noexcept {
+      if (!ready_ || !peer.valid() || protected_packet.empty() ||
+          protected_packet.size() > maximum_protected_packet_bytes) {
+        return ProtectedSendResult::fatal;
+      }
+      return callbacks_.send_datagram(callbacks_.context, peer, protected_packet);
     }
 
     [[nodiscard]] std::size_t association_count() const noexcept {
@@ -357,6 +461,48 @@ namespace lumen::lsp::runtime {
     const std::size_t plaintext_bytes
   ) noexcept {
     return impl_ && impl_->protect_and_send_in_place(peer, packet_class, packet_storage, plaintext_bytes);
+  }
+
+  ProtectedSendResult LibsrtpServerProvider::protect_and_send_in_place_result(
+    const PeerEndpoint &peer,
+    const SecurePacketClass packet_class,
+    const std::span<std::uint8_t> packet_storage,
+    const std::size_t plaintext_bytes,
+    std::size_t &protected_bytes
+  ) noexcept {
+    return impl_ ?
+             impl_->protect_and_send_in_place_result(
+               peer,
+               packet_class,
+               packet_storage,
+               plaintext_bytes,
+               protected_bytes
+             ) :
+             ProtectedSendResult::fatal;
+  }
+
+  std::optional<std::size_t> LibsrtpServerProvider::protect_trailer_length(
+    const PeerEndpoint &peer,
+    const SecurePacketClass packet_class
+  ) const noexcept {
+    return impl_ ? impl_->protect_trailer_length(peer, packet_class) : std::nullopt;
+  }
+
+  bool LibsrtpServerProvider::protect_in_place(
+    const PeerEndpoint &peer,
+    const SecurePacketClass packet_class,
+    const std::span<std::uint8_t> packet_storage,
+    const std::size_t plaintext_bytes,
+    std::size_t &protected_bytes
+  ) noexcept {
+    return impl_ && impl_->protect_in_place(peer, packet_class, packet_storage, plaintext_bytes, protected_bytes);
+  }
+
+  ProtectedSendResult LibsrtpServerProvider::send_protected(
+    const PeerEndpoint &peer,
+    const std::span<const std::uint8_t> protected_packet
+  ) noexcept {
+    return impl_ ? impl_->send_protected(peer, protected_packet) : ProtectedSendResult::fatal;
   }
 
   std::size_t LibsrtpServerProvider::association_count() const noexcept {

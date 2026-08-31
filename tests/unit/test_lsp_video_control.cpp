@@ -4,8 +4,11 @@
  */
 
 #include "src/protocol_common/cbor.h"
+#include "src/protocol_lsp/core/wire.h"
 #include "src/protocol_lsp/runtime/control/wire.h"
+#include "src/protocol_lsp/runtime/video_sender.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <gtest/gtest.h>
@@ -232,4 +235,124 @@ TEST(LspVideoControlWire, FreezesVideoConfigParameterSetsAndFiveKeyAcknowledgeme
   ASSERT_TRUE(ack);
   EXPECT_EQ(ack->decoder_credit, 3U);
   EXPECT_EQ(ack->video_generation, configuration.video.video_generation);
+}
+
+TEST(LspPathProbeWire, FreezesExactControlMapAndValidatesEveryLsppByte) {
+  const lsp::PathProbePayload probe {
+    .probe_id = 0x0102030405060708ULL,
+    .udp_payload_size = 1'200,
+  };
+  const auto encoded = lsp::encode_path_probe(probe);
+  ASSERT_TRUE(encoded);
+  const auto value = cbor::decode(*encoded);
+  ASSERT_TRUE(value);
+  const auto &map = std::get<cbor::Value::Map>(value.value->storage);
+  ASSERT_EQ(map.size(), 3U);
+  EXPECT_EQ(lsp::decode_path_probe(*encoded), probe);
+  auto trailing = *encoded;
+  trailing.push_back(0);
+  EXPECT_FALSE(lsp::decode_path_probe(trailing));
+  const auto timeout = lsp::encode_control_error(lsp::ControlStatus::timeout);
+  ASSERT_TRUE(timeout);
+  EXPECT_EQ(lsp::decode_control_error(*timeout), lsp::ControlStatus::timeout);
+
+  std::vector<std::uint8_t> lspp(1'180, 0);
+  lspp[0] = 0x80;
+  lspp[1] = 204;
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {lspp}.subspan<2, 2>(), 294);
+  lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {lspp}.subspan<4, 4>(), 77);
+  std::copy_n("LSPP", 4, lspp.begin() + 8);
+  lspp[12] = 1;
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {lspp}.subspan<14, 2>(), 1'200);
+  lumen::lsp::wire::write_be<std::uint64_t>(std::span<std::uint8_t> {lspp}.subspan<16, 8>(), probe.probe_id);
+  EXPECT_EQ(lsp::parse_path_probe_datagram(lspp, 1'200, 77), probe);
+  lspp[24] = 1;
+  EXPECT_FALSE(lsp::parse_path_probe_datagram(lspp, 1'200, 77));
+  lspp[24] = 0;
+  EXPECT_FALSE(lsp::parse_path_probe_datagram(lspp, 1'199, 77));
+  EXPECT_FALSE(lsp::parse_path_probe_datagram(lspp, 1'200, 78));
+}
+
+TEST(LspPathProbeWire, ClassifiesIntermediateReductionAgainstItsConfirmedGeneration) {
+  EXPECT_EQ(
+    lsp::classify_path_packet_size(1'400, 1'400),
+    lsp::PathPacketSizeClass::confirmed_size
+  );
+  EXPECT_EQ(
+    lsp::classify_path_packet_size(1'250, 1'400),
+    lsp::PathPacketSizeClass::smaller
+  );
+  EXPECT_EQ(
+    lsp::classify_path_packet_size(1'300, 1'300),
+    lsp::PathPacketSizeClass::confirmed_size
+  );
+  EXPECT_EQ(
+    lsp::classify_path_packet_size(1'250, 1'300),
+    lsp::PathPacketSizeClass::smaller
+  );
+  EXPECT_EQ(
+    lsp::classify_path_packet_size(1'400, 1'300),
+    lsp::PathPacketSizeClass::invalid
+  );
+}
+
+TEST(LspCongestionFeedbackWire, ParsesVideoAndOddCountAudioBlocksThroughFinalTimestamp) {
+  std::array<std::uint8_t, 36> packet {};
+  packet[0] = static_cast<std::uint8_t>(0x80U | 11U);
+  packet[1] = 205;
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan<2, 2>(), 8);
+  lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan<4, 4>(), 10);
+
+  lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan<8, 4>(), 20);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan<12, 2>(), 100);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan<14, 2>(), 2);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan<16, 2>(), 0x8001);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan<18, 2>(), 0);
+
+  lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan<20, 4>(), 30);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan<24, 2>(), 200);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan<26, 2>(), 1);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {packet}.subspan<28, 2>(), 0x8002);
+  lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {packet}.subspan<32, 4>(), 0x12345678);
+
+  const auto parsed = lsp::parse_congestion_feedback_packet(packet, 10);
+  ASSERT_TRUE(parsed);
+  ASSERT_EQ(parsed->block_count, 2U);
+  EXPECT_EQ(parsed->blocks[0].media_ssrc, 20U);
+  EXPECT_EQ(parsed->blocks[0].begin_sequence, 100U);
+  EXPECT_EQ(parsed->blocks[0].report_count, 2U);
+  EXPECT_EQ(parsed->blocks[0].metrics.size(), 4U);
+  EXPECT_EQ(parsed->blocks[1].media_ssrc, 30U);
+  EXPECT_EQ(parsed->blocks[1].begin_sequence, 200U);
+  EXPECT_EQ(parsed->blocks[1].report_count, 1U);
+  EXPECT_EQ(parsed->blocks[1].metrics.size(), 2U);
+  EXPECT_EQ(parsed->report_timestamp, 0x12345678U);
+  EXPECT_EQ(
+    lsp::classify_congestion_feedback_content(*parsed, 20, 30),
+    lsp::CongestionFeedbackContent::video
+  );
+
+  packet[31] = 1;
+  EXPECT_FALSE(lsp::parse_congestion_feedback_packet(packet, 10));
+
+  std::array<std::uint8_t, 24> audio_only {};
+  audio_only[0] = static_cast<std::uint8_t>(0x80U | 11U);
+  audio_only[1] = 205;
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {audio_only}.subspan<2, 2>(), 5);
+  lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {audio_only}.subspan<4, 4>(), 10);
+  lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {audio_only}.subspan<8, 4>(), 30);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {audio_only}.subspan<12, 2>(), 200);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {audio_only}.subspan<14, 2>(), 1);
+  lumen::lsp::wire::write_be<std::uint16_t>(std::span<std::uint8_t> {audio_only}.subspan<16, 2>(), 0x8002);
+  lumen::lsp::wire::write_be<std::uint32_t>(std::span<std::uint8_t> {audio_only}.subspan<20, 4>(), 0x12345679);
+  const auto parsed_audio_only = lsp::parse_congestion_feedback_packet(audio_only, 10);
+  ASSERT_TRUE(parsed_audio_only);
+  EXPECT_EQ(
+    lsp::classify_congestion_feedback_content(*parsed_audio_only, 20, 30),
+    lsp::CongestionFeedbackContent::audio_only
+  );
+  EXPECT_EQ(
+    lsp::classify_congestion_feedback_content(*parsed_audio_only, 20, 31),
+    lsp::CongestionFeedbackContent::invalid
+  );
 }

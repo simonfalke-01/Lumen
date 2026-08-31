@@ -811,6 +811,9 @@ namespace NVENC_NAMESPACE {
     if (!initialize_encoder_resources(init_params)) {
       return false;
     }
+    active_encode_config_ = enc_config;
+    active_initialize_params_ = init_params;
+    active_initialize_params_.encodeConfig = &active_encode_config_;
 
     auto frame_size_format = stat_trackers::two_digits_after_decimal();
     BOOST_LOG(debug) << "NvEnc: requested encoded frame size "
@@ -1058,6 +1061,40 @@ namespace NVENC_NAMESPACE {
       }
     }
 
+    return true;
+  }
+
+  bool nvenc_base::reconfigure_bitrate(const std::uint32_t bits_per_second) {
+    if (!encoder || !nvenc || bits_per_second == 0 || active_initialize_params_.encodeConfig == nullptr) {
+      return false;
+    }
+    const auto prior = active_encode_config_.rcParams;
+    active_encode_config_.rcParams.averageBitRate = bits_per_second;
+    active_encode_config_.rcParams.maxBitRate = bits_per_second;
+    if (prior.averageBitRate != 0 && prior.vbvBufferSize != 0) {
+      active_encode_config_.rcParams.vbvBufferSize = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(
+          std::numeric_limits<std::uint32_t>::max(),
+          static_cast<std::uint64_t>(prior.vbvBufferSize) * bits_per_second / prior.averageBitRate
+        )
+      );
+      active_encode_config_.rcParams.vbvInitialDelay = std::min(
+        active_encode_config_.rcParams.vbvInitialDelay,
+        active_encode_config_.rcParams.vbvBufferSize
+      );
+    }
+    NV_ENC_RECONFIGURE_PARAMS params = {NV_ENC_RECONFIGURE_PARAMS_VER};
+    params.reInitEncodeParams = active_initialize_params_;
+    params.reInitEncodeParams.encodeConfig = &active_encode_config_;
+    params.resetEncoder = 0;
+    params.forceIDR = 0;
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &params))) {
+      active_encode_config_.rcParams = prior;
+      BOOST_LOG(error) << "NvEnc: bitrate-only NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
+      return false;
+    }
+    active_initialize_params_ = params.reInitEncodeParams;
+    active_initialize_params_.encodeConfig = &active_encode_config_;
     return true;
   }
 

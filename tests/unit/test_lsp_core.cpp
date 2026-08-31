@@ -279,6 +279,31 @@ TEST(LspTransportCore, PacerEnforcesInputReserveQuantumAndEightDatagramLimit) {
   EXPECT_EQ(invalid.error(), lumen::lsp::pacer_error::invalid_input_reserve);
 }
 
+TEST(LspTransportCore, PacerReconfigureNeverGrantsFreshStartupCredit) {
+  lumen::lsp::aggregate_pacer pacer({
+    .pacing_bits_per_second = 8'000'000,
+    .input_reserve_bits_per_second = 0,
+    .path_datagram_bytes = 1'228,
+    .quantum_microseconds = 100,
+    .submission_horizon_microseconds = 200,
+    .max_datagrams_per_batch = 8,
+  });
+  ASSERT_EQ(pacer.error(), lumen::lsp::pacer_error::none);
+  pacer.reset(1'000);
+  constexpr std::array<std::uint16_t, 1> packet {1'228};
+  EXPECT_EQ(pacer.grant(packet, false, 1'000).datagrams, 1U);
+  EXPECT_EQ(pacer.grant(packet, false, 1'000).datagrams, 0U);
+  ASSERT_TRUE(pacer.reconfigure({
+    .pacing_bits_per_second = 16'000'000,
+    .input_reserve_bits_per_second = 0,
+    .path_datagram_bytes = 1'428,
+    .quantum_microseconds = 100,
+    .submission_horizon_microseconds = 200,
+    .max_datagrams_per_batch = 8,
+  }, 1'000));
+  EXPECT_EQ(pacer.grant(packet, false, 1'000).datagrams, 0U);
+}
+
 TEST(LspTransportCore, CompetitionRequiresCapacityAndCongestionExcludesReservedOverhead) {
   lumen::lsp::congestion_controller unavailable({
     .profile = lumen::lsp::congestion_profile::competition_lan,

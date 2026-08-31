@@ -44,7 +44,7 @@ smallest decisive verification both pass. Source-only scaffolding remains
 | Select DTLS 1.3 provider | **Done** | Commercial wolfSSL 5.9.2 selected; tag `v5.9.2-stable` pinned | Keep license material external to the repository |
 | macOS DTLS-SRTP provider proof | **Done** | Live DTLS 1.3 exchange proved `TLS_AES_128_GCM_SHA256`, X25519, HRR cookie, ALPN `lumen-stream/1`, `SRTP_AEAD_AES_128_GCM`, and identical 56-byte exporter output | Repeat the exact proof on Windows/UCRT64 |
 | libSRTP wolfCrypt backend | **In progress** | The reviewed libSRTP 2.8.0 patch and CMake target are integrated; AES-128-GCM SRTP/SRTCP protection, encrypted extensions, authentication, and replay rejection pass on macOS | Repeat the provider-enabled product build and 16-byte-tag RTP/SRTCP proof on Windows/UCRT64 |
-| Shared portable C++23 core | **Done** | LSPC, ACK/RTO/cache, RTP, input, media, repair, pacing, congestion, DPLPMTUD, and telemetry checks pass; Lumen commit `aab80c78` adds configuration-time pooled two-frame reassembly; aggregate digest `aabe7048…60681` | Extend the canonical digest whenever shared core files intentionally change |
+| Shared portable C++23 core | **Done** | LSPC, ACK/RTO/cache, RTP, input, media, repair, pacing, congestion, DPLPMTUD, and telemetry checks pass; Lumen commit `aab80c78` adds configuration-time pooled two-frame reassembly; aggregate digest `6f15029d…2c66` | Extend the canonical digest whenever shared core files intentionally change |
 | Umbra `CLSPCore` C ABI and mirror | **Done** | Umbra commits `7bcbaaf`, `2779806`, `0da9e46`, `2a8ce9d`, `094af81`, `81c945f`, and `eba2a0d`; ABI v1, digest gate, real UDP/kqueue wolfSSL/libSRTP runtime, retained complete-video buffers, allocation-free live frame reassembly, complete-Opus/timing callbacks, reverse-microphone sender, and provider-enabled warnings-as-errors product builds pass | Extend the ABI only at coarse input, completed-media, lifecycle, and telemetry boundaries |
 | Lumen configuration, build, UI, and discovery foundation | **Done** | LSP config/UI, real runtime factory, active-only `_lumen-stream._udp`, digest gate, application/test builds, web build, and focused config/mDNS/LSP checks pass | Repeat the provider-enabled full product link on Windows/UCRT64 |
 | LSP host security/session foundation | **In progress** | Real nonblocking UDP ownership, wolfSSL DTLS 1.3, libSRTP contexts, fresh LSP identity persistence, invitations, pairing/authentication, LSP-only trust, LSPC reliability, browsing, and trusted-client administration are wired | Run the first real Lumen↔Umbra authenticated pairing/browse session and repeat on Windows/UCRT64 |
@@ -53,7 +53,7 @@ smallest decisive verification both pass. Source-only scaffolding remains
 | Audio/video media primitives | **Done** | Seventeen focused tests verify H.264, HEVC, AV1, Opus, path limits, complete-frame admission, retained and pooled two-frame reassembly, decoder credits, and mailbox depth one; a direct 100,000-frame check records zero pooled-reassembly allocations after configuration | Extend only when another negotiated codec or frame-pipeline invariant is implemented |
 | Audio/video product integration | **In progress** | Lumen and Umbra wire host audio and reverse microphone. Lumen implements frozen first-slice SDR video negotiation, exact VDD/hardware-encoder proof, ACK-gated H.264/HEVC capture, allocation-free RTP emission, RFC 6904 extension policy, complete-frame admission, and bounded microbatch pacing without legacy transport reuse. Umbra commits `094af81`, `81c945f`, and `eba2a0d` implement matching native receive/depacketization, preallocated reassembly, retained-frame ABI, VideoToolbox/Metal delivery, and protected LSPV. | Run the first Windows-Lumen to macOS-Umbra media session and qualify the named hardware. |
 | Bounded transport state primitives | **Done** | Thirteen focused tests verify RTCP/AVPF, RFC 8888 cadence, LSPV coalescing, FEC-before-SRTP state, recovered-packet admission, RTX bounds, recovery epochs, congestion, PMTU, and generation fencing | Extend only when another transport wire or safety invariant is implemented |
-| Protected transport wire and product integration | **In progress** | Live SRTP/SRTCP covers input, audio, microphone, and primary video; RFC 6904 extensions and exact protected 56-byte `LSPV` decoder/render feedback are wired, while dependency-independent repair, congestion, and PMTU state is available | Integrate RFC 8888, FlexFEC/RTX, recovery epochs, and DPLPMTUD into the live primary-video path |
+| Protected transport wire and product integration | **In progress** | Live SRTP/SRTCP covers input, audio, microphone, and primary video; RFC 6904 extensions, protected `LSPV`, exact-size `LSPP`, video SR/RR timing, and authenticated RFC 8888 forward-path feedback are wired. The video sender applies path and encoder targets at frame boundaries and preserves pacer debt across rate changes. | Route audio and control through the same host-to-client aggregate egress credit owner, then integrate FlexFEC/RTX and recovery epochs. |
 | Reconnect, rekey, lifecycle, telemetry product surfaces | **In progress** | Lumen commit `b322abc3` plus current media integration rotate connection/input/audio/microphone/video authority and defer old DTLS/SRTP/VDD/media retirement; Umbra commits through `81c945f` preserve failed planned-rekey state and complete fresh decoder/router handoff before ACK | Run a live cross-process reconnect/rekey and validate every active media generation on hardware |
 | Final conformance, packaging, performance, and hardware qualification | **Pending** | None claimed | Run only after the complete live feature works |
 
@@ -63,12 +63,15 @@ microphone, and primary SDR H.264/HEVC paths. Those compiled paths use real
 platform capture, VDD/hardware encode, native authenticated media, bounded
 reassembly/credits, VideoToolbox, Metal, and generation-aware reconnect. No
 live picture or end-to-end latency claim is made until a Windows Lumen and
-macOS Umbra session is exercised. FlexFEC/RTX, full recovery, RFC 8888 control,
-and DPLPMTUD remain product-integration work. The live Umbra video receiver now
-allocates its two frame byte regions, fragment descriptors, ordered slice views,
-and retained decoder-frame pool only when the authenticated video generation is
-configured; its packet and completed-frame reassembly path performs no heap
-allocation after that point.
+macOS Umbra session is exercised. Authenticated multi-SSRC RFC 8888 feedback,
+media SR/RR timing, exact-size SRTCP DPLPMTUD, remote black-hole recovery, and
+frame-boundary path/rate changes are now product-wired on both sides.
+Host-to-client audio/control still require the shared aggregate egress owner;
+FlexFEC/RTX and full recovery remain product-integration work. The live Umbra
+video receiver now allocates its two frame byte regions, fragment descriptors,
+ordered slice views, and retained decoder-frame pool only when the authenticated
+video generation is configured; its packet and completed-frame reassembly path
+performs no heap allocation after that point.
 
 ## 2. Non-negotiable boundaries
 
@@ -866,17 +869,22 @@ streaming as available.
 ## 22. Current implementation boundary
 
 The retired protocol deletion and dependency-independent portable foundations
-are complete. Security integration remains gated by Stage 0:
+are complete. The macOS development path has passed the live wolfSSL DTLS 1.3,
+DTLS-SRTP exporter, and libSRTP AES-GCM proofs. The remaining Stage 0 boundary
+is production-platform evidence:
 
-1. prove the pinned wolfSSL 5.9.2 DTLS 1.3 provider on both platforms;
-2. prove DTLS-SRTP exporter interoperability on Windows and macOS;
-3. prove AES-GCM SRTP/SRTCP through libSRTP; and
-4. record throughput and packaging evidence.
+1. repeat the pinned wolfSSL 5.9.2 DTLS 1.3 and DTLS-SRTP exporter proof on
+   Windows/UCRT64;
+2. repeat AES-GCM SRTP/SRTCP through the wolfCrypt-backed libSRTP package on
+   Windows/UCRT64; and
+3. record production throughput and packaging evidence.
 
-No product path may claim authenticated LSP operation until that proof passes.
+The current macOS provider-enabled product builds may claim authenticated LSP
+operation. No Windows packaging, interoperability, throughput, or hardware
+qualification claim is made until the remaining evidence passes.
 
 ## 23. Implementation start
 
 The user resumed implementation. The rewrite proceeds through the functional
-stages above, with the DTLS/SRTP security boundary remaining fail-closed until
-the complete Stage 0 proof passes on both production platforms.
+stages above. Provider initialization remains fail-closed, while production
+claims remain bounded to the platform evidence recorded in the ledger.

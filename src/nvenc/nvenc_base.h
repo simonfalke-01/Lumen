@@ -88,6 +88,9 @@ namespace NVENC_NAMESPACE {
      */
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) override;
 
+    /** @copydoc ::nvenc::nvenc_encoder::reconfigure_bitrate() */
+    bool reconfigure_bitrate(std::uint32_t bits_per_second) override;
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -221,6 +224,8 @@ namespace NVENC_NAMESPACE {
     std::optional<::nvenc::hdr_static_metadata_t> hdr_static_metadata_;  ///< Current validated HDR10 block.
     std::optional<::nvenc::hdr_codec_e> hdr_codec_;  ///< SDK 13 codec metadata destination.
     bool hdr_static_metadata_changed_ {};  ///< Force an IDR before publishing a changed static block.
+    NV_ENC_INITIALIZE_PARAMS active_initialize_params_ {};  ///< Stable live reconfiguration basis.
+    NV_ENC_CONFIG active_encode_config_ {};  ///< Stable live rate-control configuration.
 #if NVENC_SDK_VERSION >= 1300
     MASTERING_DISPLAY_INFO mastering_display_info_ {};  ///< SDK-owned pointer target for IDR submission.
     CONTENT_LIGHT_LEVEL content_light_level_ {};  ///< SDK-owned pointer target for IDR submission.

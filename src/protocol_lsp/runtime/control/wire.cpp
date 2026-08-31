@@ -379,6 +379,21 @@ namespace lumen::lsp::runtime {
     return encode({{1, wire_version}, {2, static_cast<std::uint8_t>(status)}});
   }
 
+  std::expected<ControlStatus, ControlWireError> decode_control_error(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 2);
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || status == nullptr ||
+        *status > static_cast<std::uint8_t>(ControlStatus::internal_failure) ||
+        !valid_status(static_cast<ControlStatus>(*status)) ||
+        static_cast<ControlStatus>(*status) == ControlStatus::success) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return static_cast<ControlStatus>(*status);
+  }
+
   std::expected<StartRequestPayload, ControlWireError> decode_start(const std::span<const std::uint8_t> payload) {
     const auto map = decode_map(payload, 16);
     StartRequestPayload result;
@@ -843,5 +858,35 @@ namespace lumen::lsp::runtime {
     result.status = static_cast<ControlStatus>(*status);
     result.microphone_generation = static_cast<std::uint32_t>(*microphone_generation);
     return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_path_probe(
+    const PathProbePayload &payload
+  ) {
+    if (payload.probe_id == 0 || payload.udp_payload_size < 1'200 || payload.udp_payload_size > 1'472) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, payload.probe_id},
+      {3, payload.udp_payload_size},
+    });
+  }
+
+  std::expected<PathProbePayload, ControlWireError> decode_path_probe(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 3);
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *probe_id = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *udp_payload_size = map ? unsigned_value((*map)[2].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || probe_id == nullptr || *probe_id == 0 ||
+        udp_payload_size == nullptr || *udp_payload_size < 1'200 || *udp_payload_size > 1'472) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return PathProbePayload {
+      .probe_id = *probe_id,
+      .udp_payload_size = static_cast<std::uint16_t>(*udp_payload_size),
+    };
   }
 }  // namespace lumen::lsp::runtime
