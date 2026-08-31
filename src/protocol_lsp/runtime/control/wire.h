@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -28,14 +29,16 @@ namespace lumen::lsp::runtime {
     auth_response = 0x0021,  ///< Return authentication outcome and permission state.
     list_applications = 0x0100,  ///< Request configured applications.
     applications = 0x0101,  ///< Return the bounded application snapshot.
-    start = 0x0200,  ///< Request authenticated input and ordered host-audio capabilities.
-    start_response = 0x0201,  ///< Return exact input authority and selected audio tuple.
+    start = 0x0200,  ///< Request input, ordered host audio, and optional reverse microphone.
+    start_response = 0x0201,  ///< Return exact input, audio, and nullable microphone selection.
     attach = 0x0202,  ///< Transfer an existing session to a fresh authenticated association.
     attach_response = 0x0203,  ///< Return rotated authority, token, SSRCs, and baseline requirement.
     stop = 0x0204,  ///< Stop the authenticated client's own session.
     stop_response = 0x0205,  ///< Return the terminal owner-qualified stop outcome.
     audio_config = 0x0212,  ///< Install one exact host Opus configuration before SRTP transmission.
     audio_config_ack = 0x0213,  ///< Authenticate client decoder readiness for one audio generation.
+    microphone_config = 0x0214,  ///< Install one exact reverse Opus microphone configuration.
+    microphone_config_ack = 0x0215,  ///< Authenticate client sender readiness for one microphone generation.
   };
 
   /** @brief Stable control status codes from the normative LSP registry. */
@@ -142,7 +145,31 @@ namespace lumen::lsp::runtime {
     std::uint8_t initial_preroll_packets {1};  ///< Required one-packet receiver preroll.
   };
 
-  /** @brief Exact START nine-key request map for input plus ordered audio offers. */
+  /** @brief Exact six-key optional reverse-microphone offer carried by START key ten. */
+  struct MicrophoneOfferPayload {
+    std::uint8_t channels {1};  ///< Exact mono channel count.
+    std::uint16_t frame_samples {960};  ///< Exact 20 ms frame size at 48 kHz.
+    std::uint32_t maximum_bitrate {};  ///< Offered total Opus bitrate ceiling.
+    bool inband_fec {};  ///< Whether Opus in-band FEC may be selected.
+    bool dtx {};  ///< Whether Opus DTX may be selected.
+    bool required {};  ///< Whether START must fail instead of selecting null.
+  };
+
+  /** @brief Exact ten-key selected reverse-microphone tuple. */
+  struct MicrophoneSelectionPayload {
+    std::uint32_t microphone_generation {};  ///< Nonzero microphone configuration generation.
+    std::uint32_t microphone_ssrc {};  ///< Random nonzero client microphone SSRC.
+    std::uint8_t microphone_payload_type {};  ///< Dynamic Opus RTP payload type.
+    std::uint32_t clock_rate {48'000};  ///< Exact Opus RTP clock rate.
+    std::uint8_t channels {1};  ///< Exact mono channel count.
+    std::uint16_t frame_samples {960};  ///< Exact 20 ms frame size.
+    std::uint32_t bitrate {};  ///< Selected Opus bitrate.
+    bool inband_fec {};  ///< Selected Opus FEC state.
+    bool dtx {};  ///< Selected Opus DTX state.
+    std::uint16_t initial_udp_payload_size {1'200};  ///< Initial protected UDP payload maximum.
+  };
+
+  /** @brief Exact START ten-key request map for input, audio, and optional microphone. */
   struct StartRequestPayload {
     std::string application_id;  ///< Configured application ID selected for input ownership.
     std::uint32_t pointer_rate {};  ///< Requested pointer reports/s in 125 through 16,000.
@@ -152,9 +179,10 @@ namespace lumen::lsp::runtime {
     std::uint64_t maximum_input_wire_bits_per_second {};  ///< Client input budget ceiling up to 32 Mbps.
     std::vector<AudioOfferPayload> audio_offers;  ///< Ordered exact audio offers, one through twelve entries.
     std::uint16_t offered_maximum_udp_payload {};  ///< Client path payload ceiling for the association family.
+    std::optional<MicrophoneOfferPayload> microphone_offer;  ///< Null or exact reverse-microphone offer.
   };
 
-  /** @brief Exact START_RESPONSE 29-key response map. */
+  /** @brief Exact START_RESPONSE 30-key response map. */
   struct StartResponsePayload {
     ControlStatus status {ControlStatus::success};  ///< START outcome.
     Identifier128 session_id {};  ///< Random stream-session identifier.
@@ -171,6 +199,7 @@ namespace lumen::lsp::runtime {
     std::uint64_t reserved_input_wire_bits_per_second {};  ///< Exact reserved aggregate input budget.
     bool baseline_required {true};  ///< Always true for a fresh authority.
     AudioSelectionPayload audio {};  ///< Selected audio tuple encoded at keys 16 through 29.
+    std::optional<MicrophoneSelectionPayload> microphone;  ///< Null or selected microphone tuple at key 30.
   };
 
   /** @brief Exact STOP map `{1: version, 2: session_id}`. */
@@ -185,7 +214,7 @@ namespace lumen::lsp::runtime {
     Identifier128 intent_id {};  ///< Fresh nonzero idempotent attach intent identifier.
   };
 
-  /** @brief Exact ATTACH_RESPONSE 30-key response map. */
+  /** @brief Exact ATTACH_RESPONSE 31-key response map. */
   struct AttachResponsePayload {
     ControlStatus status {ControlStatus::success};  ///< Transfer outcome.
     Identifier128 session_id {};  ///< Retained session identifier.
@@ -203,6 +232,7 @@ namespace lumen::lsp::runtime {
     std::uint64_t reserved_input_wire_bits_per_second {};  ///< Retained reverse input budget.
     bool baseline_required {true};  ///< Always true after authority transfer.
     AudioSelectionPayload audio {};  ///< Fresh audio tuple encoded at keys 17 through 30.
+    std::optional<MicrophoneSelectionPayload> microphone;  ///< Null or fresh microphone tuple at key 31.
   };
 
   /** @brief Exact 17-key AUDIO_CONFIG host request. */
@@ -217,6 +247,20 @@ namespace lumen::lsp::runtime {
     ControlStatus status {ControlStatus::success};  ///< Client configuration result.
     Identifier128 session_id {};  ///< Exact active session identifier.
     std::uint32_t audio_generation {};  ///< Acknowledged audio configuration generation.
+  };
+
+  /** @brief Exact 13-key MICROPHONE_CONFIG host request. */
+  struct MicrophoneConfigPayload {
+    Identifier128 session_id {};  ///< Active stream-session identifier.
+    std::uint32_t stream_generation {};  ///< Active stream generation.
+    MicrophoneSelectionPayload microphone {};  ///< Exact selected microphone tuple at keys 4 through 13.
+  };
+
+  /** @brief Exact four-key MICROPHONE_CONFIG_ACK client response. */
+  struct MicrophoneConfigAckPayload {
+    ControlStatus status {ControlStatus::success};  ///< Client configuration result.
+    Identifier128 session_id {};  ///< Exact active session identifier.
+    std::uint32_t microphone_generation {};  ///< Acknowledged microphone generation.
   };
 
   /** @brief Decode exact CLIENT_HELLO deterministic CBOR. */
@@ -246,10 +290,10 @@ namespace lumen::lsp::runtime {
   /** @brief Encode exact error map `{1: version, 2: status}`. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_control_error(ControlStatus status);
 
-  /** @brief Decode exact input-and-audio START deterministic CBOR. */
+  /** @brief Decode exact input, audio, and optional-microphone START deterministic CBOR. */
   [[nodiscard]] std::expected<StartRequestPayload, ControlWireError> decode_start(std::span<const std::uint8_t> payload);
 
-  /** @brief Encode exact input-and-audio START_RESPONSE deterministic CBOR. */
+  /** @brief Encode exact input, audio, and nullable-microphone START_RESPONSE deterministic CBOR. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_start_response(const StartResponsePayload &payload);
 
   /** @brief Decode exact owner-qualified STOP deterministic CBOR. */
@@ -269,4 +313,10 @@ namespace lumen::lsp::runtime {
 
   /** @brief Decode exact AUDIO_CONFIG_ACK deterministic CBOR. */
   [[nodiscard]] std::expected<AudioConfigAckPayload, ControlWireError> decode_audio_config_ack(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact MICROPHONE_CONFIG deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_microphone_config(const MicrophoneConfigPayload &payload);
+
+  /** @brief Decode exact MICROPHONE_CONFIG_ACK deterministic CBOR. */
+  [[nodiscard]] std::expected<MicrophoneConfigAckPayload, ControlWireError> decode_microphone_config_ack(std::span<const std::uint8_t> payload);
 }  // namespace lumen::lsp::runtime

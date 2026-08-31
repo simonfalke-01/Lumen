@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -28,12 +29,27 @@ namespace client_microphone {
 
   /** @brief Stable identity for the single host microphone writer. */
   struct writer_owner_t {
-    std::uint64_t id;  ///< Nonzero launch-session identifier.
+    /** @brief Protocol namespace preventing legacy and LSP writer identity collisions. */
+    enum class protocol_e : std::uint8_t {
+      legacy,  ///< Legacy GameStream/LMC1 writer.
+      lsp,  ///< LSP SRTP microphone writer.
+    };
+
+    protocol_e protocol {protocol_e::legacy};  ///< Protocol namespace owning the writer.
+    std::uint64_t id {};  ///< Nonzero protocol-qualified owner identifier.
 
     friend bool operator==(const writer_owner_t &, const writer_owner_t &) = default;
 
     /** @return Owner identity for an RTSP launch session. */
     static writer_owner_t legacy(std::uint32_t launch_session_id);
+
+    /**
+     * @brief Construct a generation-qualified LSP writer owner.
+     *
+     * @param microphone_generation Nonzero LSP microphone generation.
+     * @return Distinct LSP writer identity.
+     */
+    static writer_owner_t lsp(std::uint32_t microphone_generation);
   };
 
   /** @brief Claim the process-wide writer for an exact tagged owner. */
@@ -64,6 +80,11 @@ namespace client_microphone {
     std::uint32_t timestamp;  ///< Wrapping 48 kHz sample timestamp for the frame.
     packet_kind_e kind {packet_kind_e::opus};  ///< Authenticated packet content type.
     std::vector<std::uint8_t> payload;  ///< Opus packet bytes.
+    std::array<std::uint8_t, MAX_OPUS_PAYLOAD_SIZE> fixed_payload {};  ///< Allocation-free LSP Opus storage.
+    std::uint16_t fixed_payload_size {};  ///< Populated leading bytes in `fixed_payload`; zero selects `payload`.
+
+    /** @brief Return encoded bytes from fixed LSP storage or the legacy vector. */
+    [[nodiscard]] std::span<const std::uint8_t> payload_view() const noexcept;
   };
 
   /**
@@ -262,9 +283,10 @@ namespace client_microphone {
      *
      * @param decoder Decoder used for ordinary, FEC, and PLC frames.
      * @param sink Platform endpoint that receives decoded PCM.
+     * @param inband_fec Whether a following Opus packet may repair one lost frame.
      * @throws std::invalid_argument If `decoder` is null.
      */
-    receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink);
+    receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, bool inband_fec = true);
 
     /**
      * @brief Stop the active generation and destroy the receiver.
@@ -365,7 +387,14 @@ namespace client_microphone {
    */
   class clocked_receiver_t {
   public:
-    clocked_receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink);
+    /**
+     * @brief Construct an independently clocked bounded receiver.
+     *
+     * @param decoder Opus decoder ownership.
+     * @param sink Platform injection sink.
+     * @param inband_fec Whether next-packet FEC is negotiated; defaults to legacy enabled behavior.
+     */
+    clocked_receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, bool inband_fec = true);
     ~clocked_receiver_t();
 
     clocked_receiver_t(const clocked_receiver_t &) = delete;

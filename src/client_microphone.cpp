@@ -26,7 +26,11 @@ namespace client_microphone {
   }  // namespace
 
   writer_owner_t writer_owner_t::legacy(const std::uint32_t launch_session_id) {
-    return {launch_session_id};
+    return {.protocol = protocol_e::legacy, .id = launch_session_id};
+  }
+
+  writer_owner_t writer_owner_t::lsp(const std::uint32_t microphone_generation) {
+    return {.protocol = protocol_e::lsp, .id = microphone_generation};
   }
 
   bool claim_writer(const writer_owner_t owner) {
@@ -45,6 +49,15 @@ namespace client_microphone {
     if (writer_owner == owner) {
       writer_owner.reset();
     }
+  }
+
+  std::span<const std::uint8_t> packet_t::payload_view() const noexcept {
+    if (fixed_payload_size > fixed_payload.size()) {
+      return {};
+    }
+    return fixed_payload_size == 0 ?
+             std::span<const std::uint8_t> {payload} :
+             std::span<const std::uint8_t> {fixed_payload}.first(fixed_payload_size);
   }
 
   /**
@@ -142,7 +155,13 @@ namespace client_microphone {
     std::uint64_t sequence;  ///< Monotonic packet sequence number.
     std::uint32_t timestamp;  ///< Wrapping sample timestamp validated against the sequence.
     packet_kind_e kind;  ///< Authenticated content represented by the packet.
-    std::vector<std::uint8_t> payload;  ///< Validated encoded Opus packet bytes.
+    std::array<std::uint8_t, MAX_OPUS_PAYLOAD_SIZE> payload {};  ///< Fixed validated Opus packet bytes.
+    std::uint16_t payload_size {};  ///< Populated leading bytes in `payload`.
+
+    /** @brief Return the exact fixed encoded payload. */
+    [[nodiscard]] std::span<const std::uint8_t> payload_view() const noexcept {
+      return std::span<const std::uint8_t> {payload}.first(payload_size);
+    }
   };
 
   /**
@@ -162,6 +181,7 @@ namespace client_microphone {
     bool scheduled {};  ///< Whether the first packet established a playout deadline.
     bool played {};  ///< Whether the first playout deadline has passed.
     bool inactivity_flushed {};  ///< Whether the current no-packet interval was already flushed.
+    bool inband_fec {true};  ///< Whether a following Opus packet may repair one missing frame.
 
     /**
      * @brief Construct internal state around injected dependencies.
@@ -169,9 +189,10 @@ namespace client_microphone {
      * @param decoder Decoder owned by the receiver.
      * @param sink Platform sink borrowed by the receiver.
      */
-    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink):
+    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec):
         decoder(std::move(decoder)),
-        sink(sink) {
+        sink(sink),
+        inband_fec(inband_fec) {
       packets.reserve(MAX_QUEUED_PACKETS);
     }
 
@@ -204,13 +225,13 @@ namespace client_microphone {
           used_silence = true;
           decoded_samples = static_cast<int>(SAMPLES_PER_FRAME);
         } else {
-          decoded_samples = decoder->decode(current->payload, false, pcm);
+          decoded_samples = decoder->decode(current->payload_view(), false, pcm);
         }
         packets.erase(current);
       } else if (const auto next = find(expected_sequence + 1U); next != packets.end()) {
-        if (next->kind == packet_kind_e::opus) {
+        if (inband_fec && next->kind == packet_kind_e::opus) {
           used_fec = true;
-          decoded_samples = decoder->decode(next->payload, true, pcm);
+          decoded_samples = decoder->decode(next->payload_view(), true, pcm);
         } else {
           used_plc = true;
           decoded_samples = decoder->conceal(pcm);
@@ -257,12 +278,12 @@ namespace client_microphone {
     }
   };
 
-  receiver_t::receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink) {
+  receiver_t::receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec) {
     if (!decoder) {
       throw std::invalid_argument("Client microphone receiver requires a decoder");
     }
 
-    impl_ = std::make_unique<impl_t>(std::move(decoder), sink);
+    impl_ = std::make_unique<impl_t>(std::move(decoder), sink, inband_fec);
   }
 
   receiver_t::~receiver_t() {
@@ -313,15 +334,21 @@ namespace client_microphone {
       ++impl_->stats.wrong_generation_packets;
       return submit_result_e::wrong_generation;
     }
-    if (packet.kind == packet_kind_e::opus && packet.payload.empty()) {
+    const auto payload = packet.payload_view();
+    if (packet.fixed_payload_size > MAX_OPUS_PAYLOAD_SIZE ||
+        (packet.fixed_payload_size != 0 && !packet.payload.empty())) {
       ++impl_->stats.invalid_payload_packets;
       return submit_result_e::invalid_payload;
     }
-    if (packet.kind == packet_kind_e::silence && !packet.payload.empty()) {
+    if (packet.kind == packet_kind_e::opus && payload.empty()) {
       ++impl_->stats.invalid_payload_packets;
       return submit_result_e::invalid_payload;
     }
-    if (packet.payload.size() > MAX_OPUS_PAYLOAD_SIZE) {
+    if (packet.kind == packet_kind_e::silence && !payload.empty()) {
+      ++impl_->stats.invalid_payload_packets;
+      return submit_result_e::invalid_payload;
+    }
+    if (payload.size() > MAX_OPUS_PAYLOAD_SIZE) {
       ++impl_->stats.invalid_payload_packets;
       return submit_result_e::payload_too_large;
     }
@@ -382,7 +409,14 @@ namespace client_microphone {
       return submit_result_e::queue_full;
     }
 
-    impl_->packets.push_back({packet.sequence, packet.timestamp, packet.kind, std::move(packet.payload)});
+    queued_packet_t queued {
+      .sequence = packet.sequence,
+      .timestamp = packet.timestamp,
+      .kind = packet.kind,
+      .payload_size = static_cast<std::uint16_t>(payload.size()),
+    };
+    std::ranges::copy(payload, queued.payload.begin());
+    impl_->packets.push_back(std::move(queued));
     impl_->last_packet = now;
     impl_->inactivity_flushed = false;
     ++impl_->stats.accepted_packets;
@@ -471,11 +505,8 @@ namespace client_microphone {
     bool shut_down {};  ///< Whether `shutdown_worker()` permanently closed this wrapper.
     std::jthread worker;  ///< Independent monotonic playout worker; declared last to start after state initialization.
 
-    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink):
-        receiver(std::move(decoder), sink),
-        worker([this](const std::stop_token token) {
-          run(token);
-        }) {
+    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec):
+        receiver(std::move(decoder), sink, inband_fec) {
     }
 
     ~impl_t() {
@@ -534,8 +565,12 @@ namespace client_microphone {
     }
   };
 
-  clocked_receiver_t::clocked_receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink):
-      impl_(std::make_unique<impl_t>(std::move(decoder), sink)) {
+  clocked_receiver_t::clocked_receiver_t(
+    std::unique_ptr<decoder_t> decoder,
+    sink_t &sink,
+    const bool inband_fec
+  ):
+      impl_(std::make_unique<impl_t>(std::move(decoder), sink, inband_fec)) {
   }
 
   clocked_receiver_t::~clocked_receiver_t() = default;
@@ -546,6 +581,16 @@ namespace client_microphone {
       return false;
     }
     const auto started = impl_->receiver.reset(generation, clock_t::now());
+    if (started && !impl_->worker.joinable()) {
+      try {
+        impl_->worker = std::jthread([impl = impl_.get()](const std::stop_token token) {
+          impl->run(token);
+        });
+      } catch (...) {
+        impl_->receiver.stop();
+        return false;
+      }
+    }
     impl_->notify_change();
     return started;
   }

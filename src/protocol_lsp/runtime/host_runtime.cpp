@@ -17,7 +17,12 @@
 #include "identity.h"
 #include "input_owner.h"
 #include "libsrtp_provider.h"
+#include "microphone_receiver.h"
 #include "udp_socket.h"
+
+#ifdef _WIN32
+  #include "../../platform/windows/virtual_microphone.h"
+#endif
 
 #ifndef LUMEN_LSP_RUNTIME_AVAILABLE
   #define LUMEN_LSP_RUNTIME_AVAILABLE 0
@@ -510,12 +515,18 @@ namespace lumen::lsp::runtime {
       active_ = false;
       worker_.request_stop();
       std::unique_ptr<ActiveAudioRuntime> audio;
+      std::unique_ptr<LspMicrophoneReceiver> microphone;
       {
         std::scoped_lock lock(session_mutex_);
         audio = std::move(audio_runtime_);
+        microphone = std::move(microphone_runtime_);
       }
       stop_audio_runtime(std::move(audio));
+      if (microphone) {
+        microphone->shutdown();
+      }
       process_pending_audio_retirements();
+      process_pending_microphone_retirements();
       socket_.close();
       if (worker_.joinable()) {
         worker_.join();
@@ -533,6 +544,7 @@ namespace lumen::lsp::runtime {
           active_process_generation_ = 0;
         }
         active_audio_configuration_.reset();
+        active_microphone_configuration_.reset();
       }
       pairing_uri_.reset();
     }
@@ -687,6 +699,60 @@ namespace lumen::lsp::runtime {
     }
 
     /**
+     * @brief Select an optional reverse microphone only with permission and a real platform probe.
+     *
+     * @param request Authenticated START offer.
+     * @param client Trusted client permissions.
+     * @param generation Nonzero microphone generation.
+     * @param ssrc Fresh unique client microphone SSRC.
+     * @return Null selection, exact selection, or the required-offer failure status.
+     */
+    std::expected<std::optional<MicrophoneSelectionPayload>, ControlStatus> select_microphone(
+      const StartRequestPayload &request,
+      const TrustedClient &client,
+      const std::uint32_t generation,
+      const std::uint32_t ssrc
+    ) const noexcept {
+      if (!request.microphone_offer) {
+        return std::optional<MicrophoneSelectionPayload> {};
+      }
+      const auto required = request.microphone_offer->required;
+      if (!client.permissions.contains(Permission::microphone)) {
+        return required ?
+                 std::expected<std::optional<MicrophoneSelectionPayload>, ControlStatus> {std::unexpected(ControlStatus::permission_denied)} :
+                 std::expected<std::optional<MicrophoneSelectionPayload>, ControlStatus> {std::optional<MicrophoneSelectionPayload> {}};
+      }
+      bool available = false;
+  #ifdef _WIN32
+      if (config::audio.client_microphone) {
+        try {
+          auto sink = platf::win_audio::make_virtual_microphone();
+          available = sink && sink->probe();
+        } catch (...) {
+          available = false;
+        }
+      }
+  #endif
+      if (!available || generation == 0 || ssrc == 0) {
+        return required ?
+                 std::expected<std::optional<MicrophoneSelectionPayload>, ControlStatus> {std::unexpected(ControlStatus::unsupported_media_tuple)} :
+                 std::expected<std::optional<MicrophoneSelectionPayload>, ControlStatus> {std::optional<MicrophoneSelectionPayload> {}};
+      }
+      return std::optional<MicrophoneSelectionPayload> {MicrophoneSelectionPayload {
+        .microphone_generation = generation,
+        .microphone_ssrc = ssrc,
+        .microphone_payload_type = 112,
+        .clock_rate = 48'000,
+        .channels = 1,
+        .frame_samples = 960,
+        .bitrate = std::min<std::uint32_t>(64'000, request.microphone_offer->maximum_bitrate),
+        .inband_fec = request.microphone_offer->inband_fec,
+        .dtx = request.microphone_offer->dtx,
+        .initial_udp_payload_size = 1'200,
+      }};
+    }
+
+    /**
      * @brief Stop and join one detached audio runtime without holding session authority locks.
      *
      * @param runtime Audio runtime ownership to release.
@@ -764,6 +830,74 @@ namespace lumen::lsp::runtime {
           srtp_->remove_association(peer);
         }
       }
+    }
+
+    /** @brief Queue a microphone receiver for destruction after the current callback. */
+    void queue_microphone_retirement(std::unique_ptr<LspMicrophoneReceiver> receiver) noexcept {
+      if (!receiver) {
+        return;
+      }
+      std::scoped_lock lock(session_mutex_);
+      for (auto &pending : pending_microphone_retirements_) {
+        if (!pending) {
+          pending = std::move(receiver);
+          return;
+        }
+      }
+      std::terminate();
+    }
+
+    /** @brief Stop, join, and release every deferred microphone writer outside callbacks. */
+    void process_pending_microphone_retirements() noexcept {
+      while (true) {
+        std::unique_ptr<LspMicrophoneReceiver> receiver;
+        {
+          std::scoped_lock lock(session_mutex_);
+          const auto pending = std::ranges::find_if(pending_microphone_retirements_, [](const auto &candidate) {
+            return static_cast<bool>(candidate);
+          });
+          if (pending == pending_microphone_retirements_.end()) {
+            return;
+          }
+          receiver = std::move(*pending);
+        }
+        receiver->shutdown();
+      }
+    }
+
+    /** @brief Create the real Windows virtual microphone and bounded clocked receiver. */
+    std::unique_ptr<LspMicrophoneReceiver> create_microphone_runtime(
+      const PeerEndpoint &peer,
+      const MicrophoneSelectionPayload &selection
+    ) noexcept {
+  #ifdef _WIN32
+      try {
+        auto sink = platf::win_audio::make_virtual_microphone();
+        if (!sink || !sink->probe()) {
+          return nullptr;
+        }
+        return LspMicrophoneReceiver::create(
+          MicrophoneReceiverConfig {
+            .peer = peer,
+            .generation = selection.microphone_generation,
+            .ssrc = selection.microphone_ssrc,
+            .payload_type = selection.microphone_payload_type,
+            .clock_rate = selection.clock_rate,
+            .channels = selection.channels,
+            .frame_samples = selection.frame_samples,
+            .inband_fec = selection.inband_fec,
+            .dtx = selection.dtx,
+          },
+          std::move(sink)
+        );
+      } catch (...) {
+        return nullptr;
+      }
+  #else
+      (void) peer;
+      (void) selection;
+      return nullptr;
+  #endif
     }
 
     /**
@@ -900,7 +1034,7 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::internal_failure);
       }
 
-      std::array<std::uint8_t, 12> ssrc_bytes {};
+      std::array<std::uint8_t, 16> ssrc_bytes {};
       if (!crypto_->random(ssrc_bytes)) {
         return std::unexpected(ControlStatus::internal_failure);
       }
@@ -918,12 +1052,26 @@ namespace lumen::lsp::runtime {
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<8, 4>()),
         audio_reserved
       );
+      const std::array microphone_reserved {input_ssrc, acknowledgement_ssrc, audio_ssrc};
+      const auto microphone_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<12, 4>()),
+        microphone_reserved
+      );
       const auto audio_selection = select_audio(request, start.generations.audio, audio_ssrc);
       if (!audio_selection) {
         return std::unexpected(ControlStatus::unsupported_media_tuple);
       }
+      const auto microphone_selection = select_microphone(
+        request,
+        client,
+        start.generations.microphone,
+        microphone_ssrc
+      );
+      if (!microphone_selection) {
+        return std::unexpected(microphone_selection.error());
+      }
       constexpr std::uint8_t input_payload_type = 96;
-      const std::array assignments {
+      std::array<SsrcAssignment, 3> assignments {
         SsrcAssignment {
           .ssrc = input_ssrc,
           .payload_type = input_payload_type,
@@ -942,8 +1090,21 @@ namespace lumen::lsp::runtime {
           .clock_rate = audio_selection->clock_rate,
           .generation = audio_selection->audio_generation,
         },
+        SsrcAssignment {},
       };
-      auto registry = SsrcRegistry::create(assignments);
+      std::size_t assignment_count = 2;
+      if (*microphone_selection) {
+        assignments[assignment_count++] = SsrcAssignment {
+          .ssrc = (*microphone_selection)->microphone_ssrc,
+          .payload_type = (*microphone_selection)->microphone_payload_type,
+          .lane = MediaLane::microphone,
+          .direction = MediaDirection::client_to_host,
+          .format = PayloadFormat::opus,
+          .clock_rate = (*microphone_selection)->clock_rate,
+          .generation = (*microphone_selection)->microphone_generation,
+        };
+      }
+      auto registry = SsrcRegistry::create(std::span<const SsrcAssignment> {assignments}.first(assignment_count));
       if (!registry) {
         return std::unexpected(ControlStatus::internal_failure);
       }
@@ -1004,6 +1165,13 @@ namespace lumen::lsp::runtime {
         .stream_generation = start.generations.stream,
         .audio = *audio_selection,
       };
+      active_microphone_configuration_ = *microphone_selection ?
+                                           std::optional<MicrophoneConfigPayload> {MicrophoneConfigPayload {
+                                             .session_id = start.session_id,
+                                             .stream_generation = start.generations.stream,
+                                             .microphone = **microphone_selection,
+                                           }} :
+                                           std::nullopt;
       ++next_stream_generation_;
       return StartResponsePayload {
         .session_id = start.session_id,
@@ -1020,6 +1188,7 @@ namespace lumen::lsp::runtime {
         .reserved_input_wire_bits_per_second = total_budget,
         .baseline_required = true,
         .audio = *audio_selection,
+        .microphone = *microphone_selection,
       };
     }
 
@@ -1039,7 +1208,7 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::busy);
       }
       Secret256 replacement_token {};
-      std::array<std::uint8_t, 12> ssrc_bytes {};
+      std::array<std::uint8_t, 16> ssrc_bytes {};
       if (!crypto_->random(replacement_token) || !crypto_->random(ssrc_bytes)) {
         return std::unexpected(ControlStatus::internal_failure);
       }
@@ -1056,6 +1225,11 @@ namespace lumen::lsp::runtime {
       const auto audio_ssrc = next_unique_nonzero_ssrc(
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<8, 4>()),
         audio_reserved
+      );
+      const std::array microphone_reserved {input_ssrc, acknowledgement_ssrc, audio_ssrc};
+      const auto microphone_ssrc = next_unique_nonzero_ssrc(
+        wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.subspan<12, 4>()),
+        microphone_reserved
       );
       const AuthenticatedClient authority_client {
         .client_id = client.client_id,
@@ -1088,11 +1262,19 @@ namespace lumen::lsp::runtime {
       }
       const auto next_input_generation = prior_snapshot.generations.input + 1U;
       const auto next_audio_generation = prior_snapshot.generations.audio + 1U;
+      const auto next_microphone_generation = prior_snapshot.generations.microphone + 1U;
       auto audio_selection = active_audio_configuration_->audio;
       audio_selection.audio_generation = next_audio_generation;
       audio_selection.audio_ssrc = audio_ssrc;
+      auto microphone_selection = active_microphone_configuration_ ?
+                                    std::optional<MicrophoneSelectionPayload> {active_microphone_configuration_->microphone} :
+                                    std::nullopt;
+      if (microphone_selection) {
+        microphone_selection->microphone_generation = next_microphone_generation;
+        microphone_selection->microphone_ssrc = microphone_ssrc;
+      }
       constexpr std::uint8_t input_payload_type = 96;
-      const std::array assignments {
+      std::array<SsrcAssignment, 3> assignments {
         SsrcAssignment {
           .ssrc = input_ssrc,
           .payload_type = input_payload_type,
@@ -1111,8 +1293,21 @@ namespace lumen::lsp::runtime {
           .clock_rate = audio_selection.clock_rate,
           .generation = next_audio_generation,
         },
+        SsrcAssignment {},
       };
-      auto registry = SsrcRegistry::create(assignments);
+      std::size_t assignment_count = 2;
+      if (microphone_selection) {
+        assignments[assignment_count++] = SsrcAssignment {
+          .ssrc = microphone_selection->microphone_ssrc,
+          .payload_type = microphone_selection->microphone_payload_type,
+          .lane = MediaLane::microphone,
+          .direction = MediaDirection::client_to_host,
+          .format = PayloadFormat::opus,
+          .clock_rate = microphone_selection->clock_rate,
+          .generation = microphone_selection->microphone_generation,
+        };
+      }
+      auto registry = SsrcRegistry::create(std::span<const SsrcAssignment> {assignments}.first(assignment_count));
       const InputSessionMapping mapping {
         .peer = peer,
         .client_id = client.client_id,
@@ -1144,6 +1339,13 @@ namespace lumen::lsp::runtime {
         .stream_generation = snapshot.generations.stream,
         .audio = audio_selection,
       };
+      active_microphone_configuration_ = microphone_selection ?
+                                           std::optional<MicrophoneConfigPayload> {MicrophoneConfigPayload {
+                                             .session_id = snapshot.session_id,
+                                             .stream_generation = snapshot.generations.stream,
+                                             .microphone = *microphone_selection,
+                                           }} :
+                                           std::nullopt;
       last_attach_intent_ = request.intent_id;
       detached_deadline_microseconds_ = 0;
       if (previous_mapping && previous_mapping->peer != peer) {
@@ -1165,6 +1367,7 @@ namespace lumen::lsp::runtime {
         .reserved_input_wire_bits_per_second = active_rates_.budget,
         .baseline_required = true,
         .audio = audio_selection,
+        .microphone = microphone_selection,
       };
     }
 
@@ -1206,12 +1409,51 @@ namespace lumen::lsp::runtime {
       return true;
     }
 
+    bool microphone_config_acknowledged(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      const std::uint32_t connection_generation,
+      const MicrophoneConfigAckPayload &acknowledgement
+    ) noexcept override {
+      std::unique_ptr<LspMicrophoneReceiver> prior_microphone;
+      {
+        std::scoped_lock lock(session_mutex_);
+        const auto snapshot = authority_.snapshot();
+        if (!active_client_ || !active_microphone_configuration_ ||
+            active_client_->client_id != client.client_id ||
+            active_client_->connection_generation != connection_generation ||
+            snapshot.session_id != acknowledgement.session_id ||
+            active_microphone_configuration_->session_id != acknowledgement.session_id ||
+            active_microphone_configuration_->stream_generation != snapshot.generations.stream ||
+            active_microphone_configuration_->microphone.microphone_generation != acknowledgement.microphone_generation) {
+          return false;
+        }
+        if (microphone_runtime_ && microphone_runtime_->peer() == peer &&
+            microphone_runtime_->generation() == acknowledgement.microphone_generation) {
+          return acknowledgement.status == ControlStatus::success;
+        }
+        if (acknowledgement.status == ControlStatus::success) {
+          auto replacement = create_microphone_runtime(peer, active_microphone_configuration_->microphone);
+          if (!replacement) {
+            return false;
+          }
+          prior_microphone = std::move(microphone_runtime_);
+          microphone_runtime_ = std::move(replacement);
+        } else {
+          prior_microphone = std::move(microphone_runtime_);
+        }
+      }
+      queue_microphone_retirement(std::move(prior_microphone));
+      return true;
+    }
+
     ControlStatus stop_input(
       const TrustedClient &client,
       const std::uint32_t connection_generation,
       const StopRequestPayload &request
     ) noexcept override {
       std::unique_ptr<ActiveAudioRuntime> audio;
+      std::unique_ptr<LspMicrophoneReceiver> microphone;
       bool process_stopped = false;
       {
         std::scoped_lock lock(session_mutex_);
@@ -1236,12 +1478,15 @@ namespace lumen::lsp::runtime {
         active_process_generation_ = 0;
         active_client_.reset();
         active_audio_configuration_.reset();
+        active_microphone_configuration_.reset();
         audio = std::move(audio_runtime_);
+        microphone = std::move(microphone_runtime_);
         ssrc_registry_.reset();
         detached_deadline_microseconds_ = 0;
         last_attach_intent_ = {};
       }
       queue_audio_retirement(std::move(audio));
+      queue_microphone_retirement(std::move(microphone));
       return process_stopped ? ControlStatus::success : ControlStatus::internal_failure;
     }
 
@@ -1293,6 +1538,7 @@ namespace lumen::lsp::runtime {
           }
           process_pending_association_closes();
           process_pending_audio_retirements();
+          process_pending_microphone_retirements();
           if (classify_packet(datagram.payload) == PacketClass::dtls) {
             refresh_dtls_timer(datagram.peer, datagram.received_at_microseconds);
           }
@@ -1306,6 +1552,7 @@ namespace lumen::lsp::runtime {
         }
         process_dtls_timers(now);
         process_pending_audio_retirements();
+        process_pending_microphone_retirements();
         process_detached_grace(now);
         process_application_exit();
       }
@@ -1378,6 +1625,7 @@ namespace lumen::lsp::runtime {
 
     void process_detached_grace(const std::uint64_t now_microseconds) noexcept {
       std::unique_ptr<ActiveAudioRuntime> audio;
+      std::unique_ptr<LspMicrophoneReceiver> microphone;
       {
         std::scoped_lock lock(session_mutex_);
         if (detached_deadline_microseconds_ == 0 || now_microseconds < detached_deadline_microseconds_) {
@@ -1392,17 +1640,23 @@ namespace lumen::lsp::runtime {
           }
           active_client_.reset();
           active_audio_configuration_.reset();
+          active_microphone_configuration_.reset();
           audio = std::move(audio_runtime_);
+          microphone = std::move(microphone_runtime_);
           ssrc_registry_.reset();
           last_attach_intent_ = {};
         }
       }
       stop_audio_runtime(std::move(audio));
+      if (microphone) {
+        microphone->shutdown();
+      }
     }
 
     /** @brief Stop media authority when the generation-owned application exits. */
     void process_application_exit() noexcept {
       std::unique_ptr<ActiveAudioRuntime> audio;
+      std::unique_ptr<LspMicrophoneReceiver> microphone;
       {
         std::scoped_lock lock(session_mutex_);
         if (active_process_generation_ == 0 || proc::proc.running() > 0) {
@@ -1412,12 +1666,17 @@ namespace lumen::lsp::runtime {
         active_process_generation_ = 0;
         active_client_.reset();
         active_audio_configuration_.reset();
+        active_microphone_configuration_.reset();
         audio = std::move(audio_runtime_);
+        microphone = std::move(microphone_runtime_);
         ssrc_registry_.reset();
         detached_deadline_microseconds_ = 0;
         last_attach_intent_ = {};
       }
       stop_audio_runtime(std::move(audio));
+      if (microphone) {
+        microphone->shutdown();
+      }
     }
 
     static bool dtls_send_callback(
@@ -1472,6 +1731,7 @@ namespace lumen::lsp::runtime {
     static void association_closed_callback(void *context, const PeerEndpoint &peer) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
       std::unique_ptr<ActiveAudioRuntime> audio;
+      std::unique_ptr<LspMicrophoneReceiver> microphone;
       {
         std::scoped_lock session_lock(runtime.session_mutex_);
         if (runtime.input_owner_) {
@@ -1487,9 +1747,13 @@ namespace lumen::lsp::runtime {
           audio = std::move(runtime.audio_runtime_);
           audio->remove_srtp_on_retirement = true;
         }
+        if (runtime.microphone_runtime_ && runtime.microphone_runtime_->peer() == peer) {
+          microphone = std::move(runtime.microphone_runtime_);
+        }
       }
       const auto deferred_srtp_removal = static_cast<bool>(audio);
       runtime.queue_audio_retirement(std::move(audio));
+      runtime.queue_microphone_retirement(std::move(microphone));
       if (!deferred_srtp_removal && runtime.srtp_) {
         runtime.srtp_->remove_association(peer);
       }
@@ -1517,7 +1781,10 @@ namespace lumen::lsp::runtime {
         return true;
       }
       if (packet_class == SecurePacketClass::rtcp) {
-        return runtime.input_owner_->receive_rtcp(peer, plaintext);
+        const auto input_accepted = runtime.input_owner_->receive_rtcp(peer, plaintext);
+        const auto microphone_accepted = !runtime.microphone_runtime_ ||
+                                         runtime.microphone_runtime_->receive_rtcp(peer, plaintext);
+        return input_accepted && microphone_accepted;
       }
       if (!runtime.ssrc_registry_) {
         return true;
@@ -1527,11 +1794,17 @@ namespace lumen::lsp::runtime {
         return true;
       }
       const auto *assignment = runtime.ssrc_registry_->find(rtp.header.ssrc);
-      if (assignment == nullptr || assignment->lane != MediaLane::input ||
-          assignment->payload_type != rtp.header.payload_type || assignment->generation == 0) {
+      if (assignment == nullptr || assignment->payload_type != rtp.header.payload_type || assignment->generation == 0) {
         return true;
       }
-      return runtime.input_owner_->receive(peer, plaintext);
+      if (assignment->lane == MediaLane::input) {
+        return runtime.input_owner_->receive(peer, plaintext);
+      }
+      if (assignment->lane == MediaLane::microphone && runtime.microphone_runtime_ &&
+          runtime.microphone_runtime_->generation() == assignment->generation) {
+        return runtime.microphone_runtime_->receive_rtp(peer, plaintext);
+      }
+      return true;
     }
 
     static bool secure_send_callback(
@@ -1593,6 +1866,8 @@ namespace lumen::lsp::runtime {
     std::optional<SsrcRegistry> ssrc_registry_;  ///< Authenticated input SSRC mapping.
     std::optional<AudioConfigPayload> active_audio_configuration_;  ///< Selected or rekeyed audio tuple awaiting/holding ACK.
     std::unique_ptr<ActiveAudioRuntime> audio_runtime_;  ///< Acknowledged capture and SRTP sender generation.
+    std::optional<MicrophoneConfigPayload> active_microphone_configuration_;  ///< Selected reverse microphone tuple.
+    std::unique_ptr<LspMicrophoneReceiver> microphone_runtime_;  ///< Acknowledged reverse microphone writer.
     std::uint32_t next_stream_generation_ {1};  ///< Next nonzero LSP stream-session generation.
     std::uint64_t active_process_generation_ {};  ///< Generation-qualified LSP-owned application process.
 
@@ -1611,6 +1886,7 @@ namespace lumen::lsp::runtime {
     std::array<PeerEndpoint, 64> pending_association_closes_ {};  ///< Old associations retired after response submission.
     std::size_t pending_association_close_count_ {};  ///< Live leading deferred-close entries.
     std::array<std::unique_ptr<ActiveAudioRuntime>, 64> pending_audio_retirements_ {};  ///< Quiescent audio owners awaiting callback-safe joins.
+    std::array<std::unique_ptr<LspMicrophoneReceiver>, 64> pending_microphone_retirements_ {};  ///< Microphone owners awaiting callback-safe destruction.
     std::jthread worker_;  ///< Socket receive/control timer owner.
     std::optional<std::string> pairing_uri_;  ///< Current UI-bound invitation issuance copy.
     std::uint64_t pairing_expiration_utc_seconds_ {};  ///< Current invitation expiry.

@@ -11,6 +11,10 @@ congestion, DPLPMTUD, and generation-fence state described in sections 7, 13,
 Lumen additionally wires host capture and Opus encoding to a fresh
 generation-scoped audio SSRC only after authenticated `AUDIO_CONFIG_ACK`, then
 uses the production libSRTP and single-socket path for RTP and sender reports.
+Its reverse direction selects a microphone only with explicit client offer,
+paired permission, and a successful Windows virtual-microphone probe; SRTP
+admission begins only after the matching generation-qualified
+`MICROPHONE_CONFIG_ACK`.
 That host-side boundary does not claim a live cross-product stream: Umbra audio
 receive/playout, video capture/decoder/renderer integration, and hardware
 qualification remain in progress.

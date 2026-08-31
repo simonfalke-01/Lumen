@@ -189,6 +189,22 @@ namespace lumen::lsp::runtime {
 
       std::array<AcceptedAudioAck, 4> accepted_audio_acks {};  ///< Bounded recent ACK cache across same-association updates.
       std::size_t next_audio_ack_slot {};  ///< Ring slot replaced by the next accepted ACK.
+
+      struct PendingMicrophoneConfig {
+        MicrophoneConfigPayload payload {};  ///< Exact configuration awaiting client installation.
+        std::uint64_t request_id {};  ///< Random request identifier echoed by MICROPHONE_CONFIG_ACK.
+        std::uint64_t message_id {};  ///< Reliable outbound message identifier.
+        bool active {};  ///< Whether a matching acknowledgement remains pending.
+      } pending_microphone;  ///< At most one pending microphone configuration per connection.
+
+      struct AcceptedMicrophoneAck {
+        std::uint64_t request_id {};  ///< MICROPHONE_CONFIG request answered by this frame.
+        std::array<std::uint8_t, maximum_control_frame_bytes> frame {};  ///< Byte-identical accepted ACK.
+        std::size_t size {};  ///< Populated leading bytes in `frame`.
+      };
+
+      std::array<AcceptedMicrophoneAck, 4> accepted_microphone_acks {};  ///< Bounded ACK cache across rekeys.
+      std::size_t next_microphone_ack_slot {};  ///< Ring slot replaced by the next accepted microphone ACK.
       bool hello_complete {};  ///< Whether CLIENT_HELLO completed.
     };
 
@@ -347,11 +363,14 @@ namespace lumen::lsp::runtime {
       }
       const auto message_type = static_cast<ControlMessageType>(parsed.header.message_type);
       if (has_flag(parsed.header.flags, lspc_flag::response)) {
-        if (message_type != ControlMessageType::audio_config_ack) {
-          transport_.close(peer);
-          return false;
+        if (message_type == ControlMessageType::audio_config_ack) {
+          return audio_config_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
         }
-        return audio_config_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        if (message_type == ControlMessageType::microphone_config_ack) {
+          return microphone_config_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        }
+        transport_.close(peer);
+        return false;
       }
       if (parsed.header.request_id == 0) {
         transport_.close(peer);
@@ -401,6 +420,8 @@ namespace lumen::lsp::runtime {
           return stop_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::audio_config:
         case ControlMessageType::audio_config_ack:
+        case ControlMessageType::microphone_config:
+        case ControlMessageType::microphone_config_ack:
         case ControlMessageType::client_hello:
         case ControlMessageType::server_hello:
         case ControlMessageType::pair_response:
@@ -478,6 +499,9 @@ namespace lumen::lsp::runtime {
         case ControlMessageType::audio_config:
           return ControlMessageType::audio_config_ack;
         case ControlMessageType::audio_config_ack:
+        case ControlMessageType::microphone_config:
+          return ControlMessageType::microphone_config_ack;
+        case ControlMessageType::microphone_config_ack:
         case ControlMessageType::server_hello:
         case ControlMessageType::pair_response:
         case ControlMessageType::auth_response:
@@ -705,6 +729,116 @@ namespace lumen::lsp::runtime {
       return send_acknowledgement_only(connection);
     }
 
+    /** @brief Reliably send one server-originated MICROPHONE_CONFIG. */
+    bool send_microphone_config(
+      Connection &connection,
+      const MicrophoneConfigPayload &configuration,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (connection.pending_microphone.active || connection.next_message_id == 0) {
+        return false;
+      }
+      const auto payload = encode_microphone_config(configuration);
+      std::array<std::uint8_t, 8> request_bytes {};
+      if (!payload || !crypto_.random(request_bytes)) {
+        return false;
+      }
+      std::uint64_t request_id = 0;
+      for (const auto byte : request_bytes) {
+        request_id = (request_id << 8U) | byte;
+      }
+      if (request_id == 0) {
+        request_id = 1;
+      }
+      if (request_id == connection.pending_audio.request_id) {
+        request_id = request_id == std::numeric_limits<std::uint64_t>::max() ? 1U : request_id + 1U;
+      }
+      std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
+      const lspc_header header {
+        .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
+        .message_type = static_cast<std::uint16_t>(ControlMessageType::microphone_config),
+        .connection_generation = connection.generation,
+        .payload_length = static_cast<std::uint32_t>(payload->size()),
+        .message_id = connection.next_message_id,
+        .request_id = request_id,
+        .acknowledgement_base = connection.inbound.base(),
+        .acknowledgement_bitmap = connection.inbound.bitmap(),
+      };
+      const auto serialized = serialize_lspc(header, *payload, storage);
+      if (!serialized) {
+        return false;
+      }
+      const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
+      if (connection.outbound.store(
+            connection.next_message_id,
+            frame,
+            now_microseconds,
+            saturating_add(now_microseconds, response_deadline_microseconds),
+            connection.rto
+          ) != outbound_store_result::stored) {
+        return false;
+      }
+      connection.pending_microphone = {
+        .payload = configuration,
+        .request_id = request_id,
+        .message_id = connection.next_message_id,
+        .active = true,
+      };
+      ++connection.next_message_id;
+      return transport_.send(connection.peer, frame);
+    }
+
+    /** @brief Validate and commit one idempotent MICROPHONE_CONFIG_ACK response. */
+    bool microphone_config_ack(
+      Connection &connection,
+      const std::span<const std::uint8_t> frame,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      (void) now_microseconds;
+      const auto accepted_duplicate = std::ranges::find_if(connection.accepted_microphone_acks, [&](const Connection::AcceptedMicrophoneAck &accepted) {
+        return accepted.size == frame.size() && accepted.request_id == header.request_id &&
+               std::ranges::equal(std::span<const std::uint8_t> {accepted.frame}.first(accepted.size), frame);
+      });
+      const auto observed = connection.inbound.observe(header.message_id);
+      if (observed != receive_id_result::accepted) {
+        if (accepted_duplicate != connection.accepted_microphone_acks.end()) {
+          return send_acknowledgement_only(connection);
+        }
+        transport_.close(connection.peer);
+        return false;
+      }
+      if (!connection.hello_complete || !connection.authenticated_client ||
+          header.connection_generation != connection.generation || header.request_id == 0 ||
+          !connection.pending_microphone.active || header.request_id != connection.pending_microphone.request_id ||
+          frame.size() > maximum_control_frame_bytes) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      const auto acknowledgement = decode_microphone_config_ack(payload);
+      if (!acknowledgement || acknowledgement->session_id != connection.pending_microphone.payload.session_id ||
+          acknowledgement->microphone_generation != connection.pending_microphone.payload.microphone.microphone_generation ||
+          has_flag(header.flags, lspc_flag::error_response) != (acknowledgement->status != ControlStatus::success) ||
+          !start_handler_.microphone_config_acknowledged(
+            connection.peer,
+            *connection.authenticated_client,
+            connection.generation,
+            *acknowledgement
+          )) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      connection.outbound.acknowledge(connection.pending_microphone.message_id, 0);
+      connection.pending_microphone.active = false;
+      auto &accepted = connection.accepted_microphone_acks[connection.next_microphone_ack_slot];
+      accepted.request_id = header.request_id;
+      std::ranges::copy(frame, accepted.frame.begin());
+      accepted.size = frame.size();
+      connection.next_microphone_ack_slot = (connection.next_microphone_ack_slot + 1U) % connection.accepted_microphone_acks.size();
+      return send_acknowledgement_only(connection);
+    }
+
     bool client_hello(
       Connection &connection,
       const std::span<const std::uint8_t> request,
@@ -925,15 +1059,26 @@ namespace lumen::lsp::runtime {
       if (!response || !send_response(connection, request, header, ControlMessageType::start_response, *response, false, now_microseconds)) {
         return false;
       }
-      return send_audio_config(
-        connection,
-        AudioConfigPayload {
-          .session_id = selected->session_id,
-          .stream_generation = selected->stream_generation,
-          .audio = selected->audio,
-        },
-        now_microseconds
-      );
+      if (!send_audio_config(
+            connection,
+            AudioConfigPayload {
+              .session_id = selected->session_id,
+              .stream_generation = selected->stream_generation,
+              .audio = selected->audio,
+            },
+            now_microseconds
+          )) {
+        return false;
+      }
+      return !selected->microphone || send_microphone_config(
+                                        connection,
+                                        MicrophoneConfigPayload {
+                                          .session_id = selected->session_id,
+                                          .stream_generation = selected->stream_generation,
+                                          .microphone = *selected->microphone,
+                                        },
+                                        now_microseconds
+                                      );
     }
 
     bool stop_input(
@@ -997,15 +1142,26 @@ namespace lumen::lsp::runtime {
       if (!response || !send_response(connection, request, header, ControlMessageType::attach_response, *response, false, now_microseconds)) {
         return false;
       }
-      return send_audio_config(
-        connection,
-        AudioConfigPayload {
-          .session_id = attached->session_id,
-          .stream_generation = attached->stream_generation,
-          .audio = attached->audio,
-        },
-        now_microseconds
-      );
+      if (!send_audio_config(
+            connection,
+            AudioConfigPayload {
+              .session_id = attached->session_id,
+              .stream_generation = attached->stream_generation,
+              .audio = attached->audio,
+            },
+            now_microseconds
+          )) {
+        return false;
+      }
+      return !attached->microphone || send_microphone_config(
+                                        connection,
+                                        MicrophoneConfigPayload {
+                                          .session_id = attached->session_id,
+                                          .stream_generation = attached->stream_generation,
+                                          .microphone = *attached->microphone,
+                                        },
+                                        now_microseconds
+                                      );
     }
 
     const HostIdentity &identity_;  ///< Stable LSP-only identity.

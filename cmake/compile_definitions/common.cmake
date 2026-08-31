@@ -237,6 +237,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/input_owner.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/libsrtp_provider.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/libsrtp_provider.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/microphone_receiver.cpp"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/microphone_receiver.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/udp_socket.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/udp_socket.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/wolfssl_dtls_server.h"
