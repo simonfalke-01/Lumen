@@ -516,33 +516,48 @@ TEST(LspTransportPathMtu, RaiseTimerReopensCeilingAfterSmallerBinarySuccess) {
 TEST(LspTransportGenerationFence, TransfersAuthorityOnlyAfterFreshAuthenticationAndNeutralization) {
   lsp_transport::reconnect_generation_fence fence;
   EXPECT_EQ(fence.initialize(1, 10), lsp_transport::generation_fence_result::accepted);
-  EXPECT_TRUE(fence.accepts_input_packet(1, 10));
+  EXPECT_TRUE(fence.accepts_input_packet(1, 10, 1));
   EXPECT_EQ(fence.begin_fresh_association(2), lsp_transport::generation_fence_result::accepted);
-  EXPECT_TRUE(fence.accepts_input_packet(1, 10));
+  EXPECT_TRUE(fence.accepts_input_packet(1, 10, 1));
   EXPECT_FALSE(fence.accepts_connection_packet(2));
   EXPECT_EQ(fence.mark_candidate_authenticated(2), lsp_transport::generation_fence_result::accepted);
-  EXPECT_EQ(fence.commit_attach(11), lsp_transport::generation_fence_result::input_not_neutralized);
-  EXPECT_EQ(fence.neutralize_old_input(), lsp_transport::generation_fence_result::accepted);
-  EXPECT_FALSE(fence.accepts_input_packet(1, 10));
-  EXPECT_EQ(fence.commit_attach(11), lsp_transport::generation_fence_result::accepted);
+  EXPECT_EQ(fence.commit_attach(2, 11), lsp_transport::generation_fence_result::input_not_neutralized);
+  EXPECT_EQ(fence.neutralize_old_input(2), lsp_transport::generation_fence_result::accepted);
+  EXPECT_FALSE(fence.accepts_input_packet(1, 10, 1));
+  EXPECT_EQ(fence.commit_attach(2, 11), lsp_transport::generation_fence_result::accepted);
   EXPECT_FALSE(fence.accepts_connection_packet(1));
-  EXPECT_FALSE(fence.accepts_input_packet(2, 10));
-  EXPECT_TRUE(fence.accepts_input_packet(2, 11));
+  EXPECT_FALSE(fence.accepts_input_packet(2, 10, 2));
+  EXPECT_FALSE(fence.accepts_input_packet(2, 11, 1));
+  EXPECT_TRUE(fence.accepts_input_packet(2, 11, 2));
+  EXPECT_EQ(fence.retire_old_association(1), lsp_transport::generation_fence_result::accepted);
 }
 
 TEST(LspTransportGenerationFence, FailedPostNeutralizationRekeyRequiresANewBaseline) {
+  constexpr std::uint64_t required_baseline_id = 0x1122'3344'5566'7788ULL;
   lsp_transport::reconnect_generation_fence fence;
-  ASSERT_EQ(fence.initialize(1, 10), lsp_transport::generation_fence_result::accepted);
-  ASSERT_EQ(fence.begin_fresh_association(2), lsp_transport::generation_fence_result::accepted);
-  ASSERT_EQ(fence.mark_candidate_authenticated(2), lsp_transport::generation_fence_result::accepted);
-  ASSERT_EQ(fence.neutralize_old_input(), lsp_transport::generation_fence_result::accepted);
-  ASSERT_EQ(fence.cancel_candidate(), lsp_transport::generation_fence_result::accepted);
-  EXPECT_TRUE(fence.accepts_connection_packet(1));
-  EXPECT_FALSE(fence.accepts_input_packet(1, 10));
-  EXPECT_TRUE(fence.snapshot().baseline_required);
-  EXPECT_EQ(
-    fence.restore_old_authority_after_baseline(11),
+  ASSERT_EQ(fence.initialize(7, 23), lsp_transport::generation_fence_result::accepted);
+  ASSERT_EQ(fence.begin_fresh_association(8), lsp_transport::generation_fence_result::accepted);
+  ASSERT_EQ(fence.mark_candidate_authenticated(8), lsp_transport::generation_fence_result::accepted);
+  ASSERT_EQ(fence.neutralize_old_input(8), lsp_transport::generation_fence_result::accepted);
+  ASSERT_EQ(
+    fence.reject_attach(8, required_baseline_id),
     lsp_transport::generation_fence_result::accepted
   );
-  EXPECT_TRUE(fence.accepts_input_packet(1, 11));
+  EXPECT_TRUE(fence.accepts_connection_packet(7));
+  EXPECT_FALSE(fence.accepts_input_packet(7, 23, 7));
+  EXPECT_TRUE(fence.snapshot().baseline_required);
+  EXPECT_EQ(
+    fence.acknowledge_old_neutral_baseline(7, 23, required_baseline_id - 1),
+    lsp_transport::generation_fence_result::baseline_mismatch
+  );
+  EXPECT_EQ(
+    fence.acknowledge_old_neutral_baseline(7, 23, required_baseline_id),
+    lsp_transport::generation_fence_result::accepted
+  );
+  EXPECT_EQ(fence.snapshot().active_input_generation, 23U);
+  EXPECT_EQ(fence.snapshot().input_authority_epoch, 8U);
+  EXPECT_FALSE(fence.accepts_input_packet(7, 23, 7));
+  EXPECT_TRUE(fence.accepts_input_packet(7, 23, 8));
+  EXPECT_EQ(fence.begin_fresh_association(8), lsp_transport::generation_fence_result::invalid_generation);
+  EXPECT_EQ(fence.begin_fresh_association(9), lsp_transport::generation_fence_result::accepted);
 }

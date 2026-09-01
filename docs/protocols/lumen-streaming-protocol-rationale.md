@@ -286,6 +286,40 @@ and release its display lease. ATTACH performs the same preflight after
 generation rotation and excludes all prior-generation SSRCs, avoiding replay
 namespace reuse while the old association retires.
 
+ATTACH makes the successor token client-selected so a lost success response is
+recoverable without guessing whether the host committed. The client already
+knows both possible current tokens: after reconnecting it can present the
+successor selected by the ambiguous attempt under a fresh intent and select a
+new successor. A host-generated replacement would strand this case. Exact
+same-association intent caching prevents duplicate side effects, while an old
+intent on a different connection generation fails stale.
+
+Closing the old association on video ACK alone creates cross-lane races: audio
+may not exist, a required microphone may have failed, the neutral baseline may
+not yet authorize input, or video capture may still be waiting for prior VDD
+ownership to quiesce. Lumen therefore uses one generation-qualified aggregate
+readiness barrier. Multiple prior peers are retained in a bounded deduplicated
+set and close only after the neutral baseline's urgent LSPI ACK enters aggregate
+output and mandatory audio, microphone policy, video ACK, and video activation
+all succeed. A definite pre-commit rejection leaves
+the old peer untouched; a post-commit required-lane failure terminates the new
+authority rather than reviving stale keys or token state.
+
+The host retains at most 64 semantic ATTACH outcomes and 64 deduplicated
+retiring peers, and records at most 512 unique SSRC assignments for the live
+session. Exact remaining SSRC-history capacity and every fallible video/config
+copy are checked before authority mutation; the committed side uses only
+preflighted fixed-capacity writes and noexcept moves. Three seconds bounds the
+aggregate readiness wait. Timeout is terminal because rollback after a
+possibly observed success would reintroduce ambiguous token and key authority.
+
+DPLPMTUD is successor-owned during handoff. Continuing to probe a retiring
+association can change a path ceiling that no longer governs new media and can
+keep reliable control alive after teardown should begin. Cancelling its
+outstanding intent, treating late authenticated ACKs as harmless, and leaving
+the prior SRTP/path installed until the aggregate barrier preserves both path
+isolation and deterministic retirement.
+
 ## 12. Throughput model
 
 LSP is designed for at least 100,000 aggregate authenticated RTP packets per

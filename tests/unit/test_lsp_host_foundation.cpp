@@ -450,8 +450,9 @@ TEST(LspSessionAuthority, NeutralizesBeforeAttachAndRequiresFreshBaseline) {
 
   auto fresh_owner = owner;
   fresh_owner.connection_generation = 11;
-  EXPECT_EQ(authority.attach(fresh_owner, start.session_id, filled<32>(10)), lsp::AuthorityResult::token_mismatch);
-  ASSERT_EQ(authority.attach(fresh_owner, start.session_id, start.attach_token), lsp::AuthorityResult::accepted);
+  const auto successor = filled<32>(11);
+  EXPECT_EQ(authority.attach(fresh_owner, start.session_id, filled<32>(10), successor), lsp::AuthorityResult::token_mismatch);
+  ASSERT_EQ(authority.attach(fresh_owner, start.session_id, start.attach_token, successor), lsp::AuthorityResult::accepted);
   EXPECT_EQ(token_verifier.calls, 2U);
   EXPECT_EQ(authority.snapshot().generations.connection, 11U);
   EXPECT_EQ(authority.snapshot().generations.input, 61U);
@@ -480,6 +481,12 @@ TEST(LspSessionAuthority, AttachPreflightIsReadOnlyAndSuccessfulRekeyRotatesToke
   EXPECT_EQ(authority.authorize_input(owner.client_id, 10, 20, 60), lsp::AuthorityResult::accepted);
 
   EXPECT_EQ(
+    authority.prepare_attach(fresh_owner, start.session_id, start.attach_token, start.attach_token),
+    lsp::AuthorityResult::malformed
+  );
+  EXPECT_EQ(neutralizer.calls, 0U);
+
+  EXPECT_EQ(
     authority.prepare_attach(fresh_owner, start.session_id, start.attach_token, replacement),
     lsp::AuthorityResult::accepted
   );
@@ -497,11 +504,11 @@ TEST(LspSessionAuthority, AttachPreflightIsReadOnlyAndSuccessfulRekeyRotatesToke
   ASSERT_EQ(authority.transport_lost(15), lsp::AuthorityResult::accepted);
   fresh_owner.connection_generation = 16;
   EXPECT_EQ(
-    authority.prepare_attach(fresh_owner, start.session_id, start.attach_token),
+    authority.prepare_attach(fresh_owner, start.session_id, start.attach_token, filled<32>(12)),
     lsp::AuthorityResult::token_mismatch
   );
   EXPECT_EQ(
-    authority.prepare_attach(fresh_owner, start.session_id, replacement),
+    authority.prepare_attach(fresh_owner, start.session_id, replacement, filled<32>(12)),
     lsp::AuthorityResult::accepted
   );
 }
@@ -536,7 +543,7 @@ TEST(LspSessionAuthority, NeutralizationFailurePreventsAuthorityTransfer) {
   EXPECT_EQ(authority.snapshot().state, lsp::SessionState::faulted);
 
   owner.connection_generation = 11;
-  EXPECT_EQ(authority.attach(owner, start.session_id, start.attach_token), lsp::AuthorityResult::invalid_state);
+  EXPECT_EQ(authority.attach(owner, start.session_id, start.attach_token, filled<32>(11)), lsp::AuthorityResult::invalid_state);
 }
 
 TEST(LspSessionAuthority, AttachFailsClosedWithoutTokenVerifier) {
@@ -548,7 +555,7 @@ TEST(LspSessionAuthority, AttachFailsClosedWithoutTokenVerifier) {
   ASSERT_EQ(authority.transport_lost(10), lsp::AuthorityResult::accepted);
   owner.connection_generation = 11;
   EXPECT_EQ(
-    authority.attach(owner, start.session_id, start.attach_token),
+    authority.attach(owner, start.session_id, start.attach_token, filled<32>(11)),
     lsp::AuthorityResult::security_provider_unavailable
   );
   EXPECT_EQ(authority.snapshot().state, lsp::SessionState::detached);

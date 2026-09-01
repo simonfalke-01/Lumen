@@ -75,9 +75,9 @@ namespace lumen::lsp {
     const AuthenticatedClient &client,
     const Identifier128 &session_id,
     const Secret256 &attach_token,
-    const std::optional<Secret256> replacement_attach_token
+    const Secret256 &successor_attach_token
   ) noexcept {
-    const auto prepared = prepare_attach(client, session_id, attach_token, replacement_attach_token);
+    const auto prepared = prepare_attach(client, session_id, attach_token, successor_attach_token);
     if (prepared != AuthorityResult::accepted) {
       return prepared;
     }
@@ -99,9 +99,7 @@ namespace lumen::lsp {
     ++generations_.video;
     ++generations_.audio;
     ++generations_.microphone;
-    if (replacement_attach_token) {
-      attach_token_ = *replacement_attach_token;
-    }
+    attach_token_ = successor_attach_token;
     effective_permissions_ = client.permissions;
     revocation_generation_ = client.revocation_generation;
     input_baseline_complete_ = false;
@@ -113,13 +111,13 @@ namespace lumen::lsp {
     const AuthenticatedClient &client,
     const Identifier128 &session_id,
     const Secret256 &attach_token,
-    const std::optional<Secret256> &replacement_attach_token
+    const Secret256 &successor_attach_token
   ) const noexcept {
     if (state_ != SessionState::detached && state_ != SessionState::streaming) {
       return AuthorityResult::invalid_state;
     }
-    if (!client.valid() || is_zero(session_id) || is_zero(attach_token) ||
-        (replacement_attach_token && is_zero(*replacement_attach_token))) {
+    if (!client.valid() || is_zero(session_id) || is_zero(attach_token) || is_zero(successor_attach_token) ||
+        attach_token == successor_attach_token) {
       return AuthorityResult::malformed;
     }
     if (!client.permissions.contains(Permission::start_attach)) {

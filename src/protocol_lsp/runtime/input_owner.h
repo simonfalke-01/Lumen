@@ -27,6 +27,7 @@ namespace lumen::lsp::runtime {
     std::uint32_t input_ssrc {};  ///< Negotiated client input RTP SSRC.
     std::uint32_t acknowledgement_ssrc {};  ///< Host SRTCP LSPI sender SSRC.
     std::uint8_t input_payload_type {};  ///< Negotiated dynamic LSP input payload type.
+    bool controller_output_enabled {};  ///< Whether current fresh authentication permits haptics and LED output.
 
     /** @brief Return whether every authority/mapping field is valid. */
     [[nodiscard]] bool valid() const noexcept;
@@ -51,9 +52,18 @@ namespace lumen::lsp::runtime {
       std::uint32_t input_generation
     ) noexcept;
 
+    /** @brief Report that the accepted neutral baseline's urgent LSPI ACK entered aggregate output. */
+    using BaselineAcknowledged = void (*)(
+      void *context,
+      const PeerEndpoint &peer,
+      std::uint32_t session_generation,
+      std::uint32_t input_generation
+    ) noexcept;
+
     void *context {};  ///< Opaque callback context.
     VerifyDigest verify_digest {};  ///< Required baseline verifier.
     BaselineCommitted baseline_committed {};  ///< Required SessionAuthority commit callback.
+    BaselineAcknowledged baseline_acknowledged {};  ///< Required replacement-readiness callback after ACK admission.
   };
 
   /**

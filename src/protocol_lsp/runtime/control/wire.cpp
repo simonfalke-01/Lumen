@@ -1001,12 +1001,14 @@ namespace lumen::lsp::runtime {
   }
 
   std::expected<AttachRequestPayload, ControlWireError> decode_attach(const std::span<const std::uint8_t> payload) {
-    const auto map = decode_map(payload, 4);
+    const auto map = decode_map(payload, 5);
     AttachRequestPayload result;
     const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
     if (!map || version == nullptr || *version != wire_version || !fixed_bytes((*map)[1].second, result.session_id) ||
         !fixed_bytes((*map)[2].second, result.attach_token) || !fixed_bytes((*map)[3].second, result.intent_id) ||
-        is_zero(result.session_id) || is_zero(result.attach_token) || is_zero(result.intent_id)) {
+        !fixed_bytes((*map)[4].second, result.successor_attach_token) || is_zero(result.session_id) ||
+        is_zero(result.attach_token) || is_zero(result.intent_id) || is_zero(result.successor_attach_token) ||
+        result.attach_token == result.successor_attach_token) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return result;

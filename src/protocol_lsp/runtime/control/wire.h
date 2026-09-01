@@ -364,18 +364,19 @@ namespace lumen::lsp::runtime {
     Identifier128 session_id {};  ///< Exact session identifier returned by START_RESPONSE.
   };
 
-  /** @brief Exact ATTACH four-key request map. */
+  /** @brief Exact ATTACH five-key request map. */
   struct AttachRequestPayload {
     Identifier128 session_id {};  ///< Existing session identifier.
     Secret256 attach_token {};  ///< Current single-use attach token.
     Identifier128 intent_id {};  ///< Fresh nonzero idempotent attach intent identifier.
+    Secret256 successor_attach_token {};  ///< Client-selected nonzero successor token installed only on commit.
   };
 
   /** @brief Exact ATTACH_RESPONSE 32-key response map. */
   struct AttachResponsePayload {
     ControlStatus status {ControlStatus::success};  ///< Transfer outcome.
     Identifier128 session_id {};  ///< Retained session identifier.
-    Secret256 attach_token {};  ///< Fresh replacement token; the presented token is retired.
+    Secret256 attach_token {};  ///< Exact client-selected successor token; the presented token is retired.
     std::uint32_t connection_generation {};  ///< New authoritative connection generation.
     std::uint32_t stream_generation {};  ///< Retained stream-session generation.
     std::uint32_t input_generation {};  ///< Advanced input authority generation.

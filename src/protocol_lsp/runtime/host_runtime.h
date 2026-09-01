@@ -33,12 +33,36 @@ namespace lumen::lsp::runtime {
     bool enabled {};  ///< Whether new authentication is allowed.
   };
 
+  /** @brief Terminal state of the most recent reconnect or planned-rekey attempt. */
+  enum class ReconnectOutcome : std::uint8_t {
+    none,  ///< No ATTACH attempt has been observed.
+    rejected,  ///< ATTACH failed before authority or token commit.
+    committed,  ///< Authority committed and the replacement readiness barrier is pending.
+    ready,  ///< Input and every negotiated media lane reached the replacement readiness barrier.
+    failed,  ///< A post-commit association or required-lane failure ended the handoff.
+  };
+
+  /** @brief Secret-free aggregate ATTACH lifecycle telemetry for administration surfaces. */
+  struct ReconnectTelemetrySnapshot {
+    std::uint64_t attempts {};  ///< Distinct semantic ATTACH attempts.
+    std::uint64_t committed {};  ///< Attempts that atomically rotated authority and the attach token.
+    std::uint64_t completed {};  ///< Committed attempts that reached the full readiness barrier.
+    std::uint64_t rejected {};  ///< Attempts rejected before commit while prior authority remained unchanged.
+    std::uint64_t failed {};  ///< Committed attempts that failed before the full readiness barrier.
+    std::uint32_t latest_connection_generation {};  ///< Latest attempted nonzero replacement generation.
+    ReconnectOutcome latest_outcome {ReconnectOutcome::none};  ///< Latest terminal or intermediate outcome.
+    std::uint64_t latest_request_to_commit_microseconds {};  ///< Latest request-to-authority-commit duration.
+    std::uint64_t latest_commit_to_ready_microseconds {};  ///< Latest commit-to-full-readiness duration.
+    std::uint64_t latest_total_microseconds {};  ///< Latest request-to-terminal-outcome duration.
+  };
+
   /** @brief Web-safe runtime status without key material or invitation secrets. */
   struct RuntimeAdministrationSnapshot {
     bool active {};  ///< Whether the real UDP listener is active.
     NetworkProfile profile {NetworkProfile::adaptive_low_latency};  ///< Configured network profile.
     std::uint16_t port {};  ///< Configured LSP port.
     std::optional<std::string> invitation_uri;  ///< Current one-time invitation URI, when unexpired.
+    ReconnectTelemetrySnapshot reconnect {};  ///< Secret-free reconnect/rekey timings and outcomes.
   };
 
   /**

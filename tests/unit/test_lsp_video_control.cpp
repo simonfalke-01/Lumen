@@ -267,6 +267,41 @@ TEST(LspVideoControlWire, EncodesExactTopLevelAndThirtyKeyVideoSelections) {
   EXPECT_EQ(std::get<cbor::Value::Map>(attach_value.value->storage).size(), std::size_t {32});
 }
 
+TEST(LspVideoControlWire, DecodesExactFiveKeyAttachWithClientSelectedSuccessor) {
+  const auto session_id = filled<16>(1);
+  const auto attach_token = filled<32>(2);
+  const auto intent_id = filled<16>(3);
+  const auto successor = filled<32>(4);
+  const auto encode_attach = [&](const std::array<std::uint8_t, 32> &candidate) {
+    return cbor::encode(cbor::Value {cbor::Value::Map {
+                          {1, 1U},
+                          {2, cbor::Value::Bytes(session_id.begin(), session_id.end())},
+                          {3, cbor::Value::Bytes(attach_token.begin(), attach_token.end())},
+                          {4, cbor::Value::Bytes(intent_id.begin(), intent_id.end())},
+                          {5, cbor::Value::Bytes(candidate.begin(), candidate.end())},
+                        }})
+      .bytes;
+  };
+
+  const auto decoded = lsp::decode_attach(encode_attach(successor));
+  ASSERT_TRUE(decoded);
+  EXPECT_EQ(decoded->session_id, session_id);
+  EXPECT_EQ(decoded->attach_token, attach_token);
+  EXPECT_EQ(decoded->intent_id, intent_id);
+  EXPECT_EQ(decoded->successor_attach_token, successor);
+
+  EXPECT_FALSE(lsp::decode_attach(encode_attach(attach_token)));
+  EXPECT_FALSE(lsp::decode_attach(encode_attach({})));
+  const auto four_keys = cbor::encode(cbor::Value {cbor::Value::Map {
+                                        {1, 1U},
+                                        {2, cbor::Value::Bytes(session_id.begin(), session_id.end())},
+                                        {3, cbor::Value::Bytes(attach_token.begin(), attach_token.end())},
+                                        {4, cbor::Value::Bytes(intent_id.begin(), intent_id.end())},
+                                      }})
+                           .bytes;
+  EXPECT_FALSE(lsp::decode_attach(four_keys));
+}
+
 TEST(LspVideoControlWire, FreezesVideoConfigCodecMapHdrNullAndFiveKeyAcknowledgement) {
   const lsp::VideoConfigPayload configuration {
     .session_id = filled<16>(1),

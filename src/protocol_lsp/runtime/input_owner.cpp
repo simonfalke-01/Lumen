@@ -69,7 +69,7 @@ namespace lumen::lsp::runtime {
         srtp_ {srtp},
         verifier_ {*this},
         platform_ {input::alloc_lsp_platform_input(platform_feedback_callback, this)} {
-      if (!callbacks_.verify_digest || !callbacks_.baseline_committed || !platform_) {
+      if (!callbacks_.verify_digest || !callbacks_.baseline_committed || !callbacks_.baseline_acknowledged || !platform_) {
         return;
       }
       try {
@@ -128,6 +128,7 @@ namespace lumen::lsp::runtime {
       ack_pending_since_ = 0;
       ack_pending_records_ = 0;
       ack_urgent_ = false;
+      baseline_acknowledged_id_ = 0;
     }
 
     bool ready_for_configuration(const InputSessionMapping &mapping) const noexcept {
@@ -171,6 +172,7 @@ namespace lumen::lsp::runtime {
       ack_pending_since_ = 0;
       ack_pending_records_ = 0;
       ack_urgent_ = false;
+      baseline_acknowledged_id_ = 0;
       input::neutralize_lsp_platform_input(*platform_);
     }
 
@@ -255,8 +257,9 @@ namespace lumen::lsp::runtime {
             return;
           }
           if (size_ == 0) {
-            flush_pending_ack(monotonic_microseconds());
+            const auto acknowledged = flush_pending_ack(monotonic_microseconds());
             lock.unlock();
+            notify_baseline_acknowledged(acknowledged);
             retry_controller_commands();
             continue;
           }
@@ -270,8 +273,12 @@ namespace lumen::lsp::runtime {
           mapping = *mapping_;
         }
         process(mapping, packet.bytes());
-        std::scoped_lock lock(mutex_);
-        flush_pending_ack(monotonic_microseconds());
+        std::optional<InputSessionMapping> acknowledged;
+        {
+          std::scoped_lock lock(mutex_);
+          acknowledged = flush_pending_ack(monotonic_microseconds());
+        }
+        notify_baseline_acknowledged(acknowledged);
       }
     }
 
@@ -704,16 +711,20 @@ namespace lumen::lsp::runtime {
       ack_mapping_ = mapping;
       ack_receive_time_ = receive_time;
       ack_apply_time_ = apply_time;
-      flush_pending_ack(apply_time);
     }
 
-    /** @brief Send the newest coalesced LSPI state once its floor/window threshold is due. */
-    void flush_pending_ack(const std::uint64_t now) noexcept {
+    /**
+     * @brief Send due LSPI state and return the first admitted baseline ACK mapping.
+     *
+     * @param now Current monotonic scheduler time.
+     * @return Mapping whose baseline ACK entered aggregate output, or no value.
+     */
+    [[nodiscard]] std::optional<InputSessionMapping> flush_pending_ack(const std::uint64_t now) noexcept {
       const auto ordinary_due = ack_pending_records_ >= 8U ||
                                 (now >= ack_pending_since_ && now - ack_pending_since_ >= 1'000U);
       if (!ack_pending_ || !mapping_ || *mapping_ != ack_mapping_ || (!ack_urgent_ && !ordinary_due) ||
           !ack_scheduler_.due(now)) {
-        return;
+        return std::nullopt;
       }
       if (send_ack(ack_mapping_, ack_receive_time_, ack_apply_time_)) {
         ack_scheduler_.mark_sent(now);
@@ -721,6 +732,27 @@ namespace lumen::lsp::runtime {
         ack_pending_since_ = 0;
         ack_pending_records_ = 0;
         ack_urgent_ = false;
+        if (baseline_.committed() && baseline_.baseline_id() != baseline_acknowledged_id_) {
+          baseline_acknowledged_id_ = baseline_.baseline_id();
+          return ack_mapping_;
+        }
+      }
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Notify host lifecycle outside the input-owner lock after baseline ACK admission.
+     *
+     * @param mapping Acknowledged mapping returned by `flush_pending_ack()`, or no value.
+     */
+    void notify_baseline_acknowledged(const std::optional<InputSessionMapping> &mapping) noexcept {
+      if (mapping && callbacks_.baseline_acknowledged) {
+        callbacks_.baseline_acknowledged(
+          callbacks_.context,
+          mapping->peer,
+          mapping->session_generation,
+          mapping->input_generation
+        );
       }
     }
 
@@ -815,7 +847,8 @@ namespace lumen::lsp::runtime {
 
     void handle_feedback(const platf::gamepad_feedback_msg_t &message) noexcept {
       std::scoped_lock lock(mutex_);
-      if (!mapping_ || message.identity.input_generation != mapping_->input_generation ||
+      if (!mapping_ || !mapping_->controller_output_enabled ||
+          message.identity.input_generation != mapping_->input_generation ||
           message.identity.id >= controller_generations_.size()) {
         return;
       }
@@ -1014,6 +1047,7 @@ namespace lumen::lsp::runtime {
     std::uint8_t ack_pending_records_ {};  ///< Saturating new-record count for the eight-record threshold.
     bool ack_pending_ {};  ///< Whether current acknowledgement state awaits its legal send instant.
     bool ack_urgent_ {};  ///< Whether baseline or edge state requests the earliest legal send.
+    std::uint64_t baseline_acknowledged_id_ {};  ///< Last baseline whose urgent LSPI ACK entered aggregate output.
     std::jthread worker_;  ///< Dedicated ordered platform apply owner.
     std::atomic<std::uint64_t> sent_feedback_wire_bytes_ {};  ///< Complete final-sent IP/UDP bytes for LSPI and LSPG.
     bool ready_ {};  ///< Callback/platform/worker readiness.

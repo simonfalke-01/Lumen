@@ -26,6 +26,13 @@ carry visible frame marking and capture time plus RFC 6904-encrypted frame
 ID/recovery epoch, input watermark, and encoder timing. The selection carries
 nullable exact FlexFEC and RTX associations; unsupported hardware/color tuples
 fail closed instead of being approximated.
+ATTACH uses a client-selected successor token and an idempotent intent. Lumen
+commits that exact token only after all fallible replacement resources pass
+preflight, retains every prior-session SSRC as a replay-namespace fence, and
+does not close retiring associations until the successor has a committed
+neutral input baseline whose urgent LSPI acknowledgement entered aggregate
+output, mandatory audio, terminal microphone policy, and an acknowledged,
+activated video generation.
 Umbra now has the matching native receive/depacketization/reassembly,
 retained-frame ABI, VideoToolbox, Metal, and protected `LSPV` path. These
 implemented product boundaries do not claim a live cross-product stream or
@@ -352,10 +359,49 @@ An accepted `START` returns a random 256-bit attach token. On transport loss,
 the host immediately neutralizes pressed inputs and holds the process/capture
 session for a bounded grace interval.
 
-A fresh authenticated connection may send `ATTACH` with the session ID, token,
-and a fresh intent ID. Success advances connection and input generations,
-installs new SSRCs and keys, and requires a complete input baseline before
-edges are accepted. The prior association cannot regain authority.
+A fresh authenticated connection sends the exact five-key `ATTACH` map
+`{1: version, 2: session_id, 3: current_attach_token, 4: intent_id,
+5: successor_attach_token}`. Both tokens and the intent ID are nonzero, and
+the successor token differs from the current token. Success advances every
+connection-scoped media and input generation, installs fresh SSRCs and keys,
+echoes the exact successor token at `ATTACH_RESPONSE` key 4, and requires a
+complete neutral input baseline before edges are accepted. The host installs
+the successor token atomically with authority transfer; it never substitutes
+host-selected token material.
+
+An exact duplicate intent on the same association returns its cached terminal
+response without repeating side effects. If success is ambiguous because the
+association is lost before the response arrives, the client opens another
+authenticated association and moves forward: it presents the previously
+selected successor as the current token, supplies a new intent ID, and selects
+another distinct successor. Repeating the old intent on a different
+connection generation is stale. A definite rejection before commit leaves the
+prior association and token authoritative. After commit, the prior association
+cannot regain authority.
+
+Retiring associations remain bounded and deduplicated. The host closes them
+only after the successor's complete neutral baseline is committed and its
+urgent LSPI acknowledgement enters aggregate output, mandatory host audio
+reaches successful terminal configuration, an absent or optional microphone
+reaches terminal policy (a required microphone must be active), and video is
+both acknowledged and capture/sender activated. A newer forward-recovery
+ATTACH may supersede an incomplete successor without overwriting older
+retiring peers.
+
+Fresh authentication is re-evaluated at every ATTACH. Loss of optional
+microphone permission omits the replacement microphone generation and retires
+the old receiver; loss of required microphone permission rejects before
+commit. Controller output is independently carried in the replacement input
+mapping, so haptics and LED commands stop immediately when that permission is
+absent even though client-to-host input remains authorized.
+
+The committed readiness barrier expires after three seconds. Expiry is a
+forward-terminal failure: the host closes the successor and every retiring
+association, terminates the held stream, and never revives the predecessor
+token, generation, input authority, SRTP context, or media runtime. Retiring
+associations pause DPLPMTUD; outstanding host probes are cancelled from
+reliable control and rolled back locally, and a late authenticated probe ACK
+is acknowledged without changing path state.
 
 ## 8. Reliable control over DTLS
 
@@ -519,6 +565,12 @@ corresponding configuration ACK is authenticated.
   rates plus reserved input wire budget;
 - initial UDP payload size; and
 - capture-path status.
+
+`ATTACH_RESPONSE` has the same retained session selection plus advanced
+connection/input/audio/microphone/video generations, fresh SSRCs for every
+selected lane, and the exact client-selected successor token. All replacement
+SSRCs are excluded from every SSRC previously assigned during the live
+session, not only the immediately preceding generation.
 
 The host may select a lower bitrate, resolution, or refresh rate only within an
 offered range. Strict offers fail instead of being adjusted.
@@ -1834,6 +1886,12 @@ workers. Hot counters are thread-owned, cache-line separated, and updated
 without a contended global atomic per packet. A snapshot epoch or equivalent
 bounded mechanism aggregates them at no more than 4 Hz for presentation.
 
+Reconnect telemetry contains no token, intent, identity, certificate, peer
+address, or key material. The host administration snapshot reports attempt,
+pre-commit rejection, commit, full-readiness, and post-commit failure counts;
+the latest connection generation and outcome; and request-to-commit,
+commit-to-ready, and request-to-terminal durations.
+
 ## 21. Resource bounds
 
 Initial hard bounds are:
@@ -1845,6 +1903,10 @@ Initial hard bounds are:
 | active stream per connection | 1 |
 | control frames outstanding per direction | 64 |
 | cached terminal control responses | 64 per connection |
+| cached successful ATTACH intents | 64 per live session |
+| retiring ATTACH associations | 64 per live session |
+| live-session SSRC history | 512 nonzero unique assignments |
+| committed ATTACH readiness | 1 successor, 3-second deadline |
 | control payload | one current path-safe DTLS datagram; padded DPLPMTUD probe only exception |
 | large object | 16 MiB |
 | buffered large-object data | 32 MiB per connection |

@@ -249,6 +249,8 @@ namespace lumen::lsp::runtime {
 
       std::array<AcceptedPathProbeAck, 4> accepted_path_probe_acks {};  ///< Bounded ACK duplicate cache.
       std::size_t next_path_probe_ack_slot {};  ///< Next ACK cache replacement slot.
+      std::array<std::uint64_t, 4> cancelled_path_probe_request_ids {};  ///< Retired requests whose late ACK is harmless.
+      std::size_t next_cancelled_path_probe_slot {};  ///< Next cancelled-request replacement slot.
       bool hello_complete {};  ///< Whether CLIENT_HELLO completed.
     };
 
@@ -629,6 +631,10 @@ namespace lumen::lsp::runtime {
       if (!pending.active || pending.probe != probe) {
         return false;
       }
+      connections_[index].outbound.acknowledge(pending.message_id, 0);
+      connections_[index].cancelled_path_probe_request_ids[connections_[index].next_cancelled_path_probe_slot] = pending.request_id;
+      connections_[index].next_cancelled_path_probe_slot =
+        (connections_[index].next_cancelled_path_probe_slot + 1U) % connections_[index].cancelled_path_probe_request_ids.size();
       pending = {};
       return true;
     }
@@ -796,7 +802,11 @@ namespace lumen::lsp::runtime {
       const VideoConfigPayload &configuration,
       const std::uint64_t now_microseconds
     ) noexcept {
-      if (connection.pending_video.active || connection.next_message_id == 0) {
+      if (connection.pending_video.active) {
+        return connection.pending_video.session_id == configuration.session_id &&
+               connection.pending_video.video_generation == configuration.video.video_generation;
+      }
+      if (connection.next_message_id == 0) {
         return false;
       }
       const auto payload = encode_video_config(configuration);
@@ -808,9 +818,7 @@ namespace lumen::lsp::runtime {
       for (const auto byte : request_bytes) {
         request_id = (request_id << 8U) | byte;
       }
-      if (request_id == 0) {
-        request_id = 1;
-      }
+      if (request_id == 0) request_id = 1;
       std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
       const lspc_header header {
         .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
@@ -823,9 +831,7 @@ namespace lumen::lsp::runtime {
         .acknowledgement_bitmap = connection.inbound.bitmap(),
       };
       const auto serialized = serialize_lspc(header, *payload, storage);
-      if (!serialized) {
-        return false;
-      }
+      if (!serialized) return false;
       const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
       if (connection.outbound.store(
             connection.next_message_id,
@@ -923,7 +929,9 @@ namespace lumen::lsp::runtime {
       for (const auto byte : request_bytes) {
         request_id = (request_id << 8U) | byte;
       }
-      if (request_id == 0) request_id = 1;
+      if (request_id == 0) {
+        request_id = 1;
+      }
       std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
       const lspc_header header {
         .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
@@ -936,7 +944,9 @@ namespace lumen::lsp::runtime {
         .acknowledgement_bitmap = connection.inbound.bitmap(),
       };
       const auto serialized = serialize_lspc(header, *payload, storage);
-      if (!serialized) return false;
+      if (!serialized) {
+        return false;
+      }
       const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
       if (connection.outbound.store(
             connection.next_message_id,
@@ -1032,8 +1042,26 @@ namespace lumen::lsp::runtime {
         transport_.close(connection.peer);
         return false;
       }
-      if (!connection.authenticated_client || !connection.outbound_path_probe.active ||
-          !connection.outbound_path_probe.datagram_sent || header.request_id == 0 ||
+      if (!connection.authenticated_client || header.request_id == 0) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      if (!connection.outbound_path_probe.active) {
+        const auto cancelled = std::ranges::find(connection.cancelled_path_probe_request_ids, header.request_id);
+        if (cancelled == connection.cancelled_path_probe_request_ids.end()) {
+          transport_.close(connection.peer);
+          return false;
+        }
+        *cancelled = 0;
+        auto &accepted = connection.accepted_path_probe_acks[connection.next_path_probe_ack_slot];
+        accepted.request_id = header.request_id;
+        std::ranges::copy(frame, accepted.frame.begin());
+        accepted.size = frame.size();
+        connection.next_path_probe_ack_slot =
+          (connection.next_path_probe_ack_slot + 1U) % connection.accepted_path_probe_acks.size();
+        return send_acknowledgement_only(connection);
+      }
+      if (!connection.outbound_path_probe.datagram_sent ||
           header.request_id != connection.outbound_path_probe.request_id) {
         transport_.close(connection.peer);
         return false;
@@ -1080,7 +1108,11 @@ namespace lumen::lsp::runtime {
       const AudioConfigPayload &configuration,
       const std::uint64_t now_microseconds
     ) noexcept {
-      if (connection.pending_audio.active || connection.next_message_id == 0) {
+      if (connection.pending_audio.active) {
+        return connection.pending_audio.payload.session_id == configuration.session_id &&
+               connection.pending_audio.payload.audio.audio_generation == configuration.audio.audio_generation;
+      }
+      if (connection.next_message_id == 0) {
         return false;
       }
       const auto payload = encode_audio_config(configuration);
@@ -1199,7 +1231,12 @@ namespace lumen::lsp::runtime {
       const MicrophoneConfigPayload &configuration,
       const std::uint64_t now_microseconds
     ) noexcept {
-      if (connection.pending_microphone.active || connection.next_message_id == 0) {
+      if (connection.pending_microphone.active) {
+        return connection.pending_microphone.payload.session_id == configuration.session_id &&
+               connection.pending_microphone.payload.microphone.microphone_generation ==
+                 configuration.microphone.microphone_generation;
+      }
+      if (connection.next_message_id == 0) {
         return false;
       }
       const auto payload = encode_microphone_config(configuration);

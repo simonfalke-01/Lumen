@@ -8,7 +8,6 @@
 #include "types.h"
 
 #include <cstdint>
-#include <optional>
 
 namespace lumen::lsp {
   /**
@@ -200,14 +199,14 @@ namespace lumen::lsp {
      * @param client Fresh authenticated connection for the same owner.
      * @param session_id Session identifier returned by START.
      * @param attach_token Secret returned by START.
-     * @param replacement_attach_token Optional fresh token that atomically retires the presented token on success.
+     * @param successor_attach_token Fresh nonzero token that atomically retires the presented token on success.
      * @return Exact transition result.
      */
     AuthorityResult attach(
       const AuthenticatedClient &client,
       const Identifier128 &session_id,
       const Secret256 &attach_token,
-      std::optional<Secret256> replacement_attach_token = std::nullopt
+      const Secret256 &successor_attach_token
     ) noexcept;
 
     /**
@@ -219,14 +218,14 @@ namespace lumen::lsp {
      * @param client Fresh authenticated connection for the same owner.
      * @param session_id Existing session identifier.
      * @param attach_token Presented current token.
-     * @param replacement_attach_token Optional nonzero replacement token.
+     * @param successor_attach_token Required nonzero replacement token distinct from the presented token.
      * @return Exact result that `attach()` will return absent an intervening mutation or neutralization failure.
      */
     [[nodiscard]] AuthorityResult prepare_attach(
       const AuthenticatedClient &client,
       const Identifier128 &session_id,
       const Secret256 &attach_token,
-      const std::optional<Secret256> &replacement_attach_token = std::nullopt
+      const Secret256 &successor_attach_token
     ) const noexcept;
 
     /**

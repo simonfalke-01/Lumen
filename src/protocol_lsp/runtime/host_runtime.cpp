@@ -59,6 +59,7 @@
 #include <ranges>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 
 namespace platf::virtual_display {
   class session_lease_t;
@@ -88,6 +89,7 @@ namespace lumen::lsp::runtime {
     constexpr std::uint32_t runtime_poll_milliseconds = 2;
     constexpr std::uint64_t invitation_lifetime_seconds = 10U * 60U;
     constexpr std::uint64_t attach_grace_microseconds = 10U * 1'000'000U;
+    constexpr std::uint64_t attach_readiness_deadline_microseconds = 3U * 1'000'000U;
     constexpr std::array<std::uint8_t, 4> lspp_app_name {'L', 'S', 'P', 'P'};  ///< Exact path-probe APP name.
 
     /**
@@ -540,6 +542,7 @@ namespace lumen::lsp::runtime {
                                                     .context = this,
                                                     .verify_digest = input_digest_callback,
                                                     .baseline_committed = input_baseline_callback,
+                                                    .baseline_acknowledged = input_baseline_acknowledged_callback,
                                                   },
                                                   *srtp_);
       if (!input_owner_) {
@@ -648,8 +651,9 @@ namespace lumen::lsp::runtime {
         active_video_configuration_.reset();
         pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
-        pending_old_peer_after_attach_.reset();
-        video_start_pending_ = false;
+        active_microphone_required_ = false;
+        clear_attach_lifecycle();
+        clear_session_ssrc_history();
       }
       pairing_uri_.reset();
     }
@@ -682,11 +686,17 @@ namespace lumen::lsp::runtime {
     }
 
     RuntimeAdministrationSnapshot administration_snapshot() const override {
+      ReconnectTelemetrySnapshot reconnect;
+      {
+        std::scoped_lock lock(session_mutex_);
+        reconnect = reconnect_telemetry_;
+      }
       return {
         .active = active(),
         .profile = config_.host.profile,
         .port = config_.host.port,
         .invitation_uri = pairing_invitation_uri(),
+        .reconnect = reconnect,
       };
     }
 
@@ -753,6 +763,17 @@ namespace lumen::lsp::runtime {
 
     /** @brief Prepared VIDEO_CONFIG plus host-only hardware capture and pacing selection. */
     struct ActiveVideoConfiguration {
+      /** @brief Construct an empty configuration for fallible pre-commit staging. */
+      ActiveVideoConfiguration() = default;
+      /** @brief Copy only while ATTACH can still fail without authority mutation. */
+      ActiveVideoConfiguration(const ActiveVideoConfiguration &) = default;
+      /** @brief Copy-assign only while ATTACH can still fail without authority mutation. */
+      ActiveVideoConfiguration &operator=(const ActiveVideoConfiguration &) = default;
+      /** @brief Move staged configuration into committed authority without allocation. */
+      ActiveVideoConfiguration(ActiveVideoConfiguration &&) noexcept = default;
+      /** @brief Move-assign staged configuration into committed authority without allocation. */
+      ActiveVideoConfiguration &operator=(ActiveVideoConfiguration &&) noexcept = default;
+
       VideoConfigPayload wire {};  ///< Exact configuration sent reliably to the client.
       video::config_t capture {};  ///< New LSP-owned capture/encoder configuration.
       std::uint64_t aggregate_pacing_bits_per_second {};  ///< Complete IP-layer pacing ceiling.
@@ -767,6 +788,9 @@ namespace lumen::lsp::runtime {
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease;  ///< Prepared VDD owner before ACK.
     };
 
+    static_assert(std::is_nothrow_move_assignable_v<ActiveVideoConfiguration>);
+    static_assert(std::is_nothrow_move_assignable_v<std::optional<ActiveVideoConfiguration>>);
+
     /** @brief Joined ownership of one acknowledged video capture and sender generation. */
     struct ActiveVideoRuntime {
       PeerEndpoint peer {};  ///< Association authorized to receive this generation.
@@ -776,6 +800,40 @@ namespace lumen::lsp::runtime {
       std::jthread capture_thread;  ///< Existing capture/VDD/hardware encoder owner.
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease;  ///< Active exact VDD generation owner.
       bool remove_srtp_on_retirement {};  ///< Whether association loss deferred SRTP removal until join.
+    };
+
+    /** @brief One committed ATTACH waiting for every replacement authority boundary. */
+    struct AttachReadinessBarrier {
+      PeerEndpoint successor_peer {};  ///< Fresh authenticated association receiving the replacement authority.
+      std::uint32_t connection_generation {};  ///< Exact fresh connection generation.
+      std::uint32_t input_generation {};  ///< Exact fresh input generation.
+      std::uint32_t audio_generation {};  ///< Exact fresh audio generation.
+      std::uint32_t video_generation {};  ///< Exact fresh video generation.
+      std::uint32_t microphone_generation {};  ///< Fresh microphone generation, or zero when absent.
+      std::uint64_t request_started_microseconds {};  ///< Monotonic start of the semantic ATTACH attempt.
+      std::uint64_t committed_microseconds {};  ///< Monotonic authority/token commit time.
+      std::uint64_t deadline_microseconds {};  ///< Bounded generation-qualified full-readiness deadline.
+      bool input_baseline_ready {};  ///< Complete neutral baseline committed and urgent ACK scheduled.
+      bool audio_ready {};  ///< Mandatory host audio configuration reached a successful terminal state.
+      bool video_acknowledged {};  ///< Client accepted the exact replacement video generation.
+      bool video_activated {};  ///< Replacement capture and sender ownership are live.
+      bool microphone_selected {};  ///< A reverse microphone generation was negotiated.
+      bool microphone_required {};  ///< Rejection or local activation failure is session-fatal.
+      bool microphone_terminal {};  ///< Selected microphone reached success or optional rejection.
+      bool microphone_ready {};  ///< Selected microphone runtime is active.
+      bool active {};  ///< Whether this barrier owns current successor readiness.
+    };
+
+    /** @brief Bounded semantic ATTACH outcome retained for exact same-association replay. */
+    struct AttachIntentOutcome {
+      Identifier128 intent_id {};  ///< Client-selected idempotence identifier.
+      Identifier128 session_id {};  ///< Session named by the request.
+      Secret256 attach_token {};  ///< Presented predecessor token retained only in process memory.
+      Secret256 successor_attach_token {};  ///< Client-selected successor retained only in process memory.
+      PeerEndpoint peer {};  ///< Exact association on which the side effect committed.
+      std::uint32_t connection_generation {};  ///< Exact connection generation of the cached response.
+      AttachResponsePayload response {};  ///< Byte-semantically identical successful response values.
+      bool active {};  ///< Whether this cache entry is populated.
     };
 
     /** @brief Shared callback-safe owner of one connection-generation aggregate path. */
@@ -1516,7 +1574,7 @@ namespace lumen::lsp::runtime {
         const auto remove_srtp = runtime->remove_srtp_on_retirement;
         const auto peer = runtime->peer;
         stop_audio_runtime(std::move(runtime));
-        if (remove_srtp && srtp_) {
+        if (remove_srtp && srtp_ && !is_retiring_attach_peer(peer)) {
           retire_forward_path(peer);
           srtp_->remove_association(peer);
         }
@@ -1576,6 +1634,8 @@ namespace lumen::lsp::runtime {
     void process_pending_video_retirements() noexcept {
       while (true) {
         std::unique_ptr<ActiveVideoRuntime> runtime;
+        bool replacement_activation_failed = false;
+        PeerEndpoint failed_replacement_peer;
         {
           std::scoped_lock lock(session_mutex_);
           const auto pending = std::ranges::find_if(pending_video_retirements_, [](const auto &candidate) {
@@ -1585,8 +1645,15 @@ namespace lumen::lsp::runtime {
             if (video_start_pending_ && video_runtime_ && active_video_configuration_) {
               video_start_pending_ = false;
               if (!start_video_capture(*video_runtime_, *active_video_configuration_)) {
+                replacement_activation_failed = true;
+                failed_replacement_peer = video_runtime_->peer;
                 runtime = std::move(video_runtime_);
               } else {
+                if (attach_readiness_.active && attach_readiness_.successor_peer == video_runtime_->peer &&
+                    attach_readiness_.video_generation == video_runtime_->generation) {
+                  attach_readiness_.video_activated = true;
+                }
+                complete_attach_readiness_if_possible();
                 return;
               }
             } else {
@@ -1602,9 +1669,13 @@ namespace lumen::lsp::runtime {
         const auto remove_srtp = runtime->remove_srtp_on_retirement;
         const auto peer = runtime->peer;
         stop_video_runtime(std::move(runtime));
-        if (remove_srtp && srtp_) {
+        if (remove_srtp && srtp_ && !is_retiring_attach_peer(peer)) {
           retire_forward_path(peer);
           srtp_->remove_association(peer);
+        }
+        if (replacement_activation_failed) {
+          fail_required_video_session(failed_replacement_peer);
+          return;
         }
       }
     }
@@ -1886,6 +1957,237 @@ namespace lumen::lsp::runtime {
       return true;
     }
 
+    /**
+     * @brief Return whether one cached semantic ATTACH exactly matches the request and association.
+     *
+     * @param cached Retained successful semantic ATTACH outcome.
+     * @param peer Association presenting the repeated intent.
+     * @param connection_generation Current association generation.
+     * @param request Repeated decoded ATTACH request.
+     * @return True only for an exact same-association semantic replay.
+     */
+    [[nodiscard]] bool matches_attach_intent(
+      const AttachIntentOutcome &cached,
+      const PeerEndpoint &peer,
+      const std::uint32_t connection_generation,
+      const AttachRequestPayload &request
+    ) const noexcept {
+      return cached.active && cached.peer == peer && cached.connection_generation == connection_generation &&
+             cached.intent_id == request.intent_id && cached.session_id == request.session_id && crypto_ &&
+             crypto_->equal_secret(cached.attach_token, request.attach_token) &&
+             crypto_->equal_secret(cached.successor_attach_token, request.successor_attach_token);
+    }
+
+    /**
+     * @brief Find a retained ATTACH outcome by its globally session-unique intent identifier.
+     *
+     * @param intent_id Nonzero client-selected semantic intent identifier.
+     * @return Borrowed retained outcome, or null when the bounded cache has no match.
+     */
+    [[nodiscard]] const AttachIntentOutcome *find_attach_intent(const Identifier128 &intent_id) const noexcept {
+      const auto found = std::ranges::find_if(attach_intent_outcomes_, [&](const AttachIntentOutcome &candidate) {
+        return candidate.active && candidate.intent_id == intent_id;
+      });
+      return found == attach_intent_outcomes_.end() ? nullptr : &*found;
+    }
+
+    /**
+     * @brief Retain one successful semantic ATTACH in the bounded replay ring.
+     *
+     * @param peer Association on which authority committed.
+     * @param connection_generation Exact committed connection generation.
+     * @param request Original decoded semantic request.
+     * @param response Exact successful response values.
+     */
+    void remember_attach_intent(
+      const PeerEndpoint &peer,
+      const std::uint32_t connection_generation,
+      const AttachRequestPayload &request,
+      const AttachResponsePayload &response
+    ) noexcept {
+      attach_intent_outcomes_[next_attach_intent_outcome_] = {
+        .intent_id = request.intent_id,
+        .session_id = request.session_id,
+        .attach_token = request.attach_token,
+        .successor_attach_token = request.successor_attach_token,
+        .peer = peer,
+        .connection_generation = connection_generation,
+        .response = response,
+        .active = true,
+      };
+      next_attach_intent_outcome_ = (next_attach_intent_outcome_ + 1U) % attach_intent_outcomes_.size();
+    }
+
+    /**
+     * @brief Preflight exact persistent SSRC-history capacity and uniqueness without mutation.
+     *
+     * @param ssrcs Complete new-generation SSRC set.
+     * @return True only when every value is nonzero, unique, new to the session, and fits the 512-entry history.
+     */
+    [[nodiscard]] bool can_retain_session_ssrcs(const std::span<const std::uint32_t> ssrcs) const noexcept {
+      std::array<std::uint32_t, 8> additions {};
+      std::size_t addition_count = 0;
+      const auto history = std::span {session_ssrc_history_}.first(session_ssrc_history_count_);
+      for (const auto ssrc : ssrcs) {
+        if (ssrc == 0 || std::ranges::find(history, ssrc) != history.end() ||
+            std::ranges::find(std::span {additions}.first(addition_count), ssrc) !=
+              std::span {additions}.first(addition_count).end()) {
+          return false;
+        }
+        if (addition_count == additions.size()) {
+          return false;
+        }
+        additions[addition_count++] = ssrc;
+      }
+      if (addition_count > session_ssrc_history_.size() - session_ssrc_history_count_) {
+        return false;
+      }
+      return true;
+    }
+
+    /**
+     * @brief Commit SSRCs already accepted by `can_retain_session_ssrcs()` without failure.
+     *
+     * @param ssrcs Exact preflighted SSRC span.
+     */
+    void retain_preflighted_session_ssrcs(const std::span<const std::uint32_t> ssrcs) noexcept {
+      std::ranges::copy(
+        ssrcs,
+        session_ssrc_history_.begin() + static_cast<std::ptrdiff_t>(session_ssrc_history_count_)
+      );
+      session_ssrc_history_count_ += ssrcs.size();
+    }
+
+    /** @brief Erase the completed session's SSRC replay-namespace history. */
+    void clear_session_ssrc_history() noexcept {
+      std::ranges::fill(session_ssrc_history_, 0);
+      session_ssrc_history_count_ = 0;
+    }
+
+    /**
+     * @brief Deduplicate and retain one preflighted prior association until full successor readiness.
+     *
+     * @param peer Prior association candidate.
+     * @param successor Fresh authoritative association that must never enter its own retirement set.
+     */
+    void retain_preflighted_retiring_peer(const PeerEndpoint &peer, const PeerEndpoint &successor) noexcept {
+      if (!peer.valid() || peer == successor) {
+        return;
+      }
+      const auto live = std::span {retiring_attach_peers_}.first(retiring_attach_peer_count_);
+      if (std::ranges::find(live, peer) != live.end()) {
+        return;
+      }
+      retiring_attach_peers_[retiring_attach_peer_count_++] = peer;
+    }
+
+    /**
+     * @brief Return whether a committed successor barrier still owns delayed teardown for one peer.
+     *
+     * @param peer Association queried by media retirement or path discovery.
+     * @return True while the aggregate successor barrier still protects the peer's SRTP/path ownership.
+     */
+    [[nodiscard]] bool is_retiring_attach_peer(const PeerEndpoint &peer) const noexcept {
+      std::scoped_lock lock(session_mutex_);
+      const auto retiring = std::span {retiring_attach_peers_}.first(retiring_attach_peer_count_);
+      return std::ranges::find(retiring, peer) != retiring.end();
+    }
+
+    /**
+     * @brief Record one pre-commit rejection while leaving the prior authority untouched.
+     *
+     * @param connection_generation Rejected fresh association generation.
+     * @param started_microseconds Monotonic semantic request start.
+     */
+    void record_reconnect_rejected(
+      const std::uint32_t connection_generation,
+      const std::uint64_t started_microseconds
+    ) noexcept {
+      ++reconnect_telemetry_.rejected;
+      reconnect_telemetry_.latest_connection_generation = connection_generation;
+      reconnect_telemetry_.latest_outcome = ReconnectOutcome::rejected;
+      reconnect_telemetry_.latest_request_to_commit_microseconds = 0;
+      reconnect_telemetry_.latest_commit_to_ready_microseconds = 0;
+      reconnect_telemetry_.latest_total_microseconds = monotonic_microseconds() - started_microseconds;
+    }
+
+    /** @brief Record and clear a committed replacement that failed before full readiness. */
+    void record_reconnect_failed() noexcept {
+      if (!attach_readiness_.active) {
+        return;
+      }
+      ++reconnect_telemetry_.failed;
+      reconnect_telemetry_.latest_connection_generation = attach_readiness_.connection_generation;
+      reconnect_telemetry_.latest_outcome = ReconnectOutcome::failed;
+      reconnect_telemetry_.latest_commit_to_ready_microseconds = 0;
+      reconnect_telemetry_.latest_total_microseconds =
+        monotonic_microseconds() - attach_readiness_.request_started_microseconds;
+      attach_readiness_ = {};
+    }
+
+    /** @brief Queue every retained prior association after all replacement lanes are ready. */
+    void complete_attach_readiness_if_possible() noexcept {
+      std::scoped_lock lock(session_mutex_);
+      if (!attach_readiness_.active || !attach_readiness_.input_baseline_ready || !attach_readiness_.audio_ready ||
+          !attach_readiness_.video_acknowledged || !attach_readiness_.video_activated ||
+          (attach_readiness_.microphone_selected &&
+           (!attach_readiness_.microphone_terminal ||
+            (attach_readiness_.microphone_required && !attach_readiness_.microphone_ready)))) {
+        return;
+      }
+      std::size_t required_close_slots = 0;
+      for (std::size_t index = 0; index < retiring_attach_peer_count_; ++index) {
+        const auto &retiring = retiring_attach_peers_[index];
+        if (retiring == attach_readiness_.successor_peer) {
+          continue;
+        }
+        const auto pending = std::span {pending_association_closes_}.first(pending_association_close_count_);
+        if (std::ranges::find(pending, retiring) == pending.end()) {
+          ++required_close_slots;
+        }
+      }
+      if (required_close_slots > pending_association_closes_.size() - pending_association_close_count_) {
+        return;
+      }
+      for (std::size_t index = 0; index < retiring_attach_peer_count_; ++index) {
+        if (retiring_attach_peers_[index] != attach_readiness_.successor_peer) {
+          (void) queue_association_close(retiring_attach_peers_[index]);
+        }
+        retiring_attach_peers_[index] = {};
+      }
+      retiring_attach_peer_count_ = 0;
+      const auto ready_at = monotonic_microseconds();
+      ++reconnect_telemetry_.completed;
+      reconnect_telemetry_.latest_connection_generation = attach_readiness_.connection_generation;
+      reconnect_telemetry_.latest_outcome = ReconnectOutcome::ready;
+      reconnect_telemetry_.latest_commit_to_ready_microseconds = ready_at - attach_readiness_.committed_microseconds;
+      reconnect_telemetry_.latest_total_microseconds = ready_at - attach_readiness_.request_started_microseconds;
+      attach_readiness_ = {};
+    }
+
+    /** @brief Queue every retained prior association during terminal session teardown. */
+    void queue_all_retiring_attach_peers() noexcept {
+      for (std::size_t index = 0; index < retiring_attach_peer_count_; ++index) {
+        (void) queue_association_close(retiring_attach_peers_[index]);
+        retiring_attach_peers_[index] = {};
+      }
+      retiring_attach_peer_count_ = 0;
+    }
+
+    /** @brief Clear secret-bearing intent cache and every incomplete handoff owner. */
+    void clear_attach_lifecycle() noexcept {
+      record_reconnect_failed();
+      for (auto &outcome : attach_intent_outcomes_) {
+        outcome = {};
+      }
+      next_attach_intent_outcome_ = 0;
+      for (std::size_t index = 0; index < retiring_attach_peer_count_; ++index) {
+        retiring_attach_peers_[index] = {};
+      }
+      retiring_attach_peer_count_ = 0;
+      video_start_pending_ = false;
+    }
+
     /** @brief Terminate a session whose required authenticated video configuration failed. */
     void fail_required_video_session(const PeerEndpoint &peer) noexcept {
       std::unique_ptr<ActiveAudioRuntime> audio;
@@ -1905,18 +2207,16 @@ namespace lumen::lsp::runtime {
         active_video_configuration_.reset();
         pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
+        active_microphone_required_ = false;
         audio = std::move(audio_runtime_);
         video = std::move(video_runtime_);
         microphone = std::move(microphone_runtime_);
         ssrc_registry_.reset();
         detached_deadline_microseconds_ = 0;
-        last_attach_intent_ = {};
-        video_start_pending_ = false;
-        queue_association_close(peer);
-        if (pending_old_peer_after_attach_ && *pending_old_peer_after_attach_ != peer) {
-          queue_association_close(*pending_old_peer_after_attach_);
-        }
-        pending_old_peer_after_attach_.reset();
+        (void) queue_association_close(peer);
+        queue_all_retiring_attach_peers();
+        clear_attach_lifecycle();
+        clear_session_ssrc_history();
       }
       queue_audio_retirement(std::move(audio));
       queue_video_retirement(std::move(video));
@@ -1956,6 +2256,7 @@ namespace lumen::lsp::runtime {
       if (proc::proc.running() > 0) {
         return std::unexpected(ControlStatus::busy);
       }
+      clear_session_ssrc_history();
 
       const auto family = peer.family == IpAddressFamily::ipv6 ? input_plane::ip_family::ipv6 : input_plane::ip_family::ipv4;
       const auto media_family = peer.family == IpAddressFamily::ipv6 ? media::ip_family::ipv6 : media::ip_family::ipv4;
@@ -2154,6 +2455,27 @@ namespace lumen::lsp::runtime {
         (void) proc::proc.terminate_lsp_generation(video_selection->process_generation);
         return std::unexpected(ControlStatus::internal_failure);
       }
+      std::array<std::uint32_t, 7> assigned_ssrcs {
+        input_ssrc,
+        acknowledgement_ssrc,
+        audio_selection->audio_ssrc,
+        video_selection->wire.video.primary_ssrc,
+      };
+      std::size_t assigned_ssrc_count = 4;
+      if (*microphone_selection) {
+        assigned_ssrcs[assigned_ssrc_count++] = (*microphone_selection)->microphone_ssrc;
+      }
+      if (video_selection->wire.video.flexfec) {
+        assigned_ssrcs[assigned_ssrc_count++] = video_selection->wire.video.flexfec->repair_ssrc;
+      }
+      if (video_selection->wire.video.rtx) {
+        assigned_ssrcs[assigned_ssrc_count++] = video_selection->wire.video.rtx->rtx_ssrc;
+      }
+      const auto assigned_ssrc_span = std::span {assigned_ssrcs}.first(assigned_ssrc_count);
+      if (!can_retain_session_ssrcs(assigned_ssrc_span)) {
+        (void) proc::proc.terminate_lsp_generation(video_selection->process_generation);
+        return std::unexpected(ControlStatus::internal_failure);
+      }
       const AuthenticatedClient authority_client {
         .client_id = client.client_id,
         .connection_generation = connection_generation,
@@ -2174,12 +2496,14 @@ namespace lumen::lsp::runtime {
         .input_ssrc = input_ssrc,
         .acknowledgement_ssrc = acknowledgement_ssrc,
         .input_payload_type = input_payload_type,
+        .controller_output_enabled = client.permissions.contains(Permission::controller_output),
       };
       if (!input_owner_->configure(mapping)) {
         (void) authority_.stop_from_host(NeutralizationReason::explicit_stop);
         (void) proc::proc.terminate_lsp_generation(video_selection->process_generation);
         return std::unexpected(ControlStatus::internal_failure);
       }
+      retain_preflighted_session_ssrcs(assigned_ssrc_span);
       active_client_ = authority_client;
       active_process_generation_ = video_selection->process_generation;
       active_rates_ = {
@@ -2189,7 +2513,7 @@ namespace lumen::lsp::runtime {
         .reconciliation = request.reconciliation_rate,
         .budget = total_budget,
       };
-      last_attach_intent_ = {};
+      clear_attach_lifecycle();
       detached_deadline_microseconds_ = 0;
       ssrc_registry_ = std::move(*registry);
       active_audio_configuration_ = AudioConfigPayload {
@@ -2204,6 +2528,7 @@ namespace lumen::lsp::runtime {
                                              .microphone = **microphone_selection,
                                            }} :
                                            std::nullopt;
+      active_microphone_required_ = request.microphone_offer && request.microphone_offer->required;
       const auto response_video = video_selection->wire.video;
       active_video_configuration_ = std::move(*video_selection);
       ++next_stream_generation_;
@@ -2234,46 +2559,81 @@ namespace lumen::lsp::runtime {
       const AttachRequestPayload &request
     ) noexcept override {
       std::scoped_lock lock(session_mutex_);
-      const auto forward = find_forward_path(peer);
-      if (!forward || !forward->path || forward->generation != connection_generation) {
+      if (const auto *cached = find_attach_intent(request.intent_id)) {
+        if (matches_attach_intent(*cached, peer, connection_generation, request)) {
+          return cached->response;
+        }
         return std::unexpected(ControlStatus::stale_generation);
       }
-      if (request.intent_id == last_attach_intent_ || active_process_generation_ == 0 || proc::proc.running() <= 0 ||
+      const auto attempt_started_microseconds = monotonic_microseconds();
+      ++reconnect_telemetry_.attempts;
+      reconnect_telemetry_.latest_connection_generation = connection_generation;
+      const auto reject = [&](const ControlStatus status) -> std::expected<AttachResponsePayload, ControlStatus> {
+        record_reconnect_rejected(connection_generation, attempt_started_microseconds);
+        return std::unexpected(status);
+      };
+      const auto forward = find_forward_path(peer);
+      if (!forward || !forward->path || forward->generation != connection_generation) {
+        return reject(ControlStatus::stale_generation);
+      }
+      if (active_process_generation_ == 0 || proc::proc.running() <= 0 ||
           !active_audio_configuration_ || !active_video_configuration_ ||
           active_video_configuration_->feedback_sender_ssrc == 0 ||
           active_video_configuration_->input_acknowledgement_ssrc == 0) {
-        return std::unexpected(ControlStatus::stale_generation);
+        return reject(ControlStatus::stale_generation);
       }
       const auto previous_mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
-      if (previous_mapping && previous_mapping->peer != peer && pending_association_close_count_ == pending_association_closes_.size()) {
-        return std::unexpected(ControlStatus::busy);
+      std::array<PeerEndpoint, 4> retiring_candidates {};
+      std::size_t retiring_candidate_count = 0;
+      const auto add_retiring_candidate = [&](const PeerEndpoint &candidate) {
+        if (!candidate.valid() || candidate == peer ||
+            std::ranges::find(std::span {retiring_candidates}.first(retiring_candidate_count), candidate) !=
+              std::span {retiring_candidates}.first(retiring_candidate_count).end()) {
+          return;
+        }
+        retiring_candidates[retiring_candidate_count++] = candidate;
+      };
+      if (previous_mapping) {
+        add_retiring_candidate(previous_mapping->peer);
       }
-      Secret256 replacement_token {};
+      if (audio_runtime_) {
+        add_retiring_candidate(audio_runtime_->peer);
+      }
+      if (video_runtime_) {
+        add_retiring_candidate(video_runtime_->peer);
+      }
+      if (microphone_runtime_) {
+        add_retiring_candidate(microphone_runtime_->peer());
+      }
+      std::size_t additional_retiring_peers = 0;
+      const auto retained = std::span {retiring_attach_peers_}.first(retiring_attach_peer_count_);
+      for (std::size_t index = 0; index < retiring_candidate_count; ++index) {
+        if (std::ranges::find(retained, retiring_candidates[index]) == retained.end()) {
+          ++additional_retiring_peers;
+        }
+      }
+      if (additional_retiring_peers > retiring_attach_peers_.size() - retiring_attach_peer_count_) {
+        return reject(ControlStatus::busy);
+      }
       std::array<std::uint8_t, 28> ssrc_bytes {};
-      if (!crypto_->random(replacement_token) || !crypto_->random(ssrc_bytes)) {
-        return std::unexpected(ControlStatus::internal_failure);
+      if (!crypto_->random(ssrc_bytes)) {
+        return reject(ControlStatus::internal_failure);
       }
-      std::array<std::uint32_t, SsrcRegistry::maximum_entries + 8U> reserved_ssrcs {};
-      std::size_t reserved_ssrc_count = 0;
-      reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->feedback_sender_ssrc;
-      reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->input_acknowledgement_ssrc;
-      reserved_ssrcs[reserved_ssrc_count++] = active_audio_configuration_->audio.audio_ssrc;
-      reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->wire.video.primary_ssrc;
-      if (active_microphone_configuration_) {
-        reserved_ssrcs[reserved_ssrc_count++] = active_microphone_configuration_->microphone.microphone_ssrc;
+      std::array<std::uint32_t, 520> reserved_ssrcs {};
+      if (session_ssrc_history_count_ > reserved_ssrcs.size() - 7U) {
+        return reject(ControlStatus::busy);
       }
-      if (active_video_configuration_->wire.video.flexfec) {
-        reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->wire.video.flexfec->repair_ssrc;
-      }
-      if (active_video_configuration_->wire.video.rtx) {
-        reserved_ssrcs[reserved_ssrc_count++] = active_video_configuration_->wire.video.rtx->rtx_ssrc;
-      }
+      std::ranges::copy(
+        std::span {session_ssrc_history_}.first(session_ssrc_history_count_),
+        reserved_ssrcs.begin()
+      );
+      auto reserved_ssrc_count = session_ssrc_history_count_;
       const auto input_ssrc = next_unique_nonzero_ssrc(
         wire::read_be<std::uint32_t>(std::span<const std::uint8_t> {ssrc_bytes}.first<4>()),
         std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
       if (input_ssrc == 0) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       reserved_ssrcs[reserved_ssrc_count++] = input_ssrc;
       const auto acknowledgement_ssrc = next_unique_nonzero_ssrc(
@@ -2281,7 +2641,7 @@ namespace lumen::lsp::runtime {
         std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
       if (acknowledgement_ssrc == 0) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       reserved_ssrcs[reserved_ssrc_count++] = acknowledgement_ssrc;
       const auto audio_ssrc = next_unique_nonzero_ssrc(
@@ -2289,7 +2649,7 @@ namespace lumen::lsp::runtime {
         std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
       if (audio_ssrc == 0) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       reserved_ssrcs[reserved_ssrc_count++] = audio_ssrc;
       const auto microphone_ssrc = next_unique_nonzero_ssrc(
@@ -2297,7 +2657,7 @@ namespace lumen::lsp::runtime {
         std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
       if (microphone_ssrc == 0) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       reserved_ssrcs[reserved_ssrc_count++] = microphone_ssrc;
       const auto video_ssrc = next_unique_nonzero_ssrc(
@@ -2305,7 +2665,7 @@ namespace lumen::lsp::runtime {
         std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
       if (video_ssrc == 0) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       reserved_ssrcs[reserved_ssrc_count++] = video_ssrc;
       const auto repair_ssrc = next_unique_nonzero_ssrc(
@@ -2313,7 +2673,7 @@ namespace lumen::lsp::runtime {
         std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
       if (repair_ssrc == 0) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       reserved_ssrcs[reserved_ssrc_count++] = repair_ssrc;
       const auto rtx_ssrc = next_unique_nonzero_ssrc(
@@ -2321,7 +2681,7 @@ namespace lumen::lsp::runtime {
         std::span<const std::uint32_t> {reserved_ssrcs}.first(reserved_ssrc_count)
       );
       if (rtx_ssrc == 0) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       const AuthenticatedClient authority_client {
         .client_id = client.client_id,
@@ -2333,25 +2693,28 @@ namespace lumen::lsp::runtime {
         authority_client,
         request.session_id,
         request.attach_token,
-        replacement_token
+        request.successor_attach_token
       );
       if (prepared == AuthorityResult::permission_denied) {
-        return std::unexpected(ControlStatus::permission_denied);
+        return reject(ControlStatus::permission_denied);
       }
       if (prepared == AuthorityResult::token_mismatch) {
-        return std::unexpected(ControlStatus::authentication_failed);
+        return reject(ControlStatus::authentication_failed);
       }
       if (prepared == AuthorityResult::not_owner || prepared == AuthorityResult::stale_generation ||
           prepared == AuthorityResult::generation_exhausted) {
-        return std::unexpected(ControlStatus::stale_generation);
+        return reject(ControlStatus::stale_generation);
+      }
+      if (prepared == AuthorityResult::malformed) {
+        return reject(ControlStatus::malformed);
       }
       if (prepared != AuthorityResult::accepted) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       const auto prior_snapshot = authority_.snapshot();
       if (prior_snapshot.generations.input == std::numeric_limits<std::uint32_t>::max() ||
           prior_snapshot.generations.video == std::numeric_limits<std::uint32_t>::max()) {
-        return std::unexpected(ControlStatus::stale_generation);
+        return reject(ControlStatus::stale_generation);
       }
       const auto next_input_generation = prior_snapshot.generations.input + 1U;
       const auto next_video_generation = prior_snapshot.generations.video + 1U;
@@ -2360,7 +2723,11 @@ namespace lumen::lsp::runtime {
       auto audio_selection = active_audio_configuration_->audio;
       audio_selection.audio_generation = next_audio_generation;
       audio_selection.audio_ssrc = audio_ssrc;
-      auto microphone_selection = active_microphone_configuration_ ?
+      const auto microphone_permitted = client.permissions.contains(Permission::microphone);
+      if (active_microphone_configuration_ && active_microphone_required_ && !microphone_permitted) {
+        return reject(ControlStatus::permission_denied);
+      }
+      auto microphone_selection = active_microphone_configuration_ && microphone_permitted ?
                                     std::optional<MicrophoneSelectionPayload> {active_microphone_configuration_->microphone} :
                                     std::nullopt;
       if (microphone_selection) {
@@ -2371,7 +2738,7 @@ namespace lumen::lsp::runtime {
       try {
         video_selection = *active_video_configuration_;
       } catch (...) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       video_selection.wire.video.video_generation = next_video_generation;
       video_selection.wire.video.primary_ssrc = video_ssrc;
@@ -2388,21 +2755,21 @@ namespace lumen::lsp::runtime {
       video_selection.wire.stream_generation = prior_snapshot.generations.stream;
       std::array<std::uint8_t, 8> frame_origin_bytes {};
       if (!crypto_->random(frame_origin_bytes)) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
       video_selection.wire.frame_id_origin = wire::read_be<std::uint64_t>(frame_origin_bytes);
       if (video_selection.wire.frame_id_origin == 0) {
         video_selection.wire.frame_id_origin = 1;
       }
       if (!encode_video_config(video_selection.wire)) {
-        return std::unexpected(ControlStatus::unsupported_media_tuple);
+        return reject(ControlStatus::unsupported_media_tuple);
       }
       const auto initial_forward_rate = std::min(
         video_selection.aggregate_pacing_bits_per_second,
         video_selection.wire.video.selected_bits_per_second + video_selection.reserved_overhead_bits_per_second
       );
       if (!forward->path->reconfigure(initial_forward_rate, video_selection.wire.video.initial_udp_payload_size)) {
-        return std::unexpected(ControlStatus::path_capacity_insufficient);
+        return reject(ControlStatus::path_capacity_insufficient);
       }
       constexpr std::uint8_t input_payload_type = 96;
       std::array<SsrcAssignment, 6> assignments {
@@ -2486,20 +2853,61 @@ namespace lumen::lsp::runtime {
         .input_ssrc = input_ssrc,
         .acknowledgement_ssrc = acknowledgement_ssrc,
         .input_payload_type = input_payload_type,
+        .controller_output_enabled = client.permissions.contains(Permission::controller_output),
       };
       if (!registry || !input_owner_ || !input_owner_->ready_for_configuration(mapping)) {
-        return std::unexpected(ControlStatus::internal_failure);
+        return reject(ControlStatus::internal_failure);
       }
+      std::array<std::uint32_t, 7> assigned_ssrcs {
+        input_ssrc,
+        acknowledgement_ssrc,
+        audio_selection.audio_ssrc,
+        video_selection.wire.video.primary_ssrc,
+      };
+      std::size_t assigned_ssrc_count = 4;
+      if (microphone_selection) {
+        assigned_ssrcs[assigned_ssrc_count++] = microphone_selection->microphone_ssrc;
+      }
+      if (video_selection.wire.video.flexfec) {
+        assigned_ssrcs[assigned_ssrc_count++] = video_selection.wire.video.flexfec->repair_ssrc;
+      }
+      if (video_selection.wire.video.rtx) {
+        assigned_ssrcs[assigned_ssrc_count++] = video_selection.wire.video.rtx->rtx_ssrc;
+      }
+      const auto assigned_ssrc_span = std::span {assigned_ssrcs}.first(assigned_ssrc_count);
+      if (!can_retain_session_ssrcs(assigned_ssrc_span)) {
+        return reject(ControlStatus::busy);
+      }
+      const AttachResponsePayload response {
+        .session_id = prior_snapshot.session_id,
+        .attach_token = request.successor_attach_token,
+        .connection_generation = connection_generation,
+        .stream_generation = prior_snapshot.generations.stream,
+        .input_generation = next_input_generation,
+        .input_ssrc = input_ssrc,
+        .acknowledgement_ssrc = acknowledgement_ssrc,
+        .input_payload_type = input_payload_type,
+        .pointer_rate = active_rates_.pointer,
+        .controller_rate = active_rates_.controller,
+        .sensor_rate = active_rates_.sensor,
+        .reconciliation_rate = active_rates_.reconciliation,
+        .reserved_input_wire_bits_per_second = active_rates_.budget,
+        .baseline_required = true,
+        .audio = audio_selection,
+        .microphone = microphone_selection,
+        .video = video_selection.wire.video,
+      };
       const auto result = authority_.attach(
         authority_client,
         request.session_id,
         request.attach_token,
-        replacement_token
+        request.successor_attach_token
       );
       if (result != AuthorityResult::accepted) {
-        return std::unexpected(result == AuthorityResult::neutralization_failed ? ControlStatus::internal_failure : ControlStatus::stale_generation);
+        return reject(result == AuthorityResult::neutralization_failed ? ControlStatus::internal_failure : ControlStatus::stale_generation);
       }
       input_owner_->commit_configuration(mapping);
+      retain_preflighted_session_ssrcs(assigned_ssrc_span);
       const auto snapshot = authority_.snapshot();
       active_client_ = authority_client;
       ssrc_registry_ = std::move(*registry);
@@ -2515,31 +2923,46 @@ namespace lumen::lsp::runtime {
                                              .microphone = *microphone_selection,
                                            }} :
                                            std::nullopt;
-      active_video_configuration_ = video_selection;
-      last_attach_intent_ = request.intent_id;
-      detached_deadline_microseconds_ = 0;
-      if (previous_mapping && previous_mapping->peer != peer) {
-        pending_old_peer_after_attach_ = previous_mapping->peer;
+      if (!microphone_selection && microphone_runtime_) {
+        queue_microphone_retirement(std::move(microphone_runtime_));
       }
-      return AttachResponsePayload {
-        .session_id = snapshot.session_id,
-        .attach_token = replacement_token,
+      active_video_configuration_ = std::move(video_selection);
+      detached_deadline_microseconds_ = 0;
+      video_start_pending_ = false;
+      for (std::size_t index = 0; index < retiring_candidate_count; ++index) {
+        retain_preflighted_retiring_peer(retiring_candidates[index], peer);
+      }
+      if (pending_inbound_path_probe_.active && is_retiring_attach_peer(pending_inbound_path_probe_.peer)) {
+        pending_inbound_path_probe_ = {};
+      }
+      record_reconnect_failed();
+      const auto committed_microseconds = monotonic_microseconds();
+      attach_readiness_ = {
+        .successor_peer = peer,
         .connection_generation = snapshot.generations.connection,
-        .stream_generation = snapshot.generations.stream,
         .input_generation = snapshot.generations.input,
-        .input_ssrc = input_ssrc,
-        .acknowledgement_ssrc = acknowledgement_ssrc,
-        .input_payload_type = input_payload_type,
-        .pointer_rate = active_rates_.pointer,
-        .controller_rate = active_rates_.controller,
-        .sensor_rate = active_rates_.sensor,
-        .reconciliation_rate = active_rates_.reconciliation,
-        .reserved_input_wire_bits_per_second = active_rates_.budget,
-        .baseline_required = true,
-        .audio = audio_selection,
-        .microphone = microphone_selection,
-        .video = video_selection.wire.video,
+        .audio_generation = audio_selection.audio_generation,
+        .video_generation = response.video.video_generation,
+        .microphone_generation = microphone_selection ? microphone_selection->microphone_generation : 0,
+        .request_started_microseconds = attempt_started_microseconds,
+        .committed_microseconds = committed_microseconds,
+        .deadline_microseconds = committed_microseconds >
+                                     std::numeric_limits<std::uint64_t>::max() - attach_readiness_deadline_microseconds ?
+                                   std::numeric_limits<std::uint64_t>::max() :
+                                   committed_microseconds + attach_readiness_deadline_microseconds,
+        .microphone_selected = microphone_selection.has_value(),
+        .microphone_required = active_microphone_required_,
+        .microphone_terminal = !microphone_selection,
+        .active = true,
       };
+      ++reconnect_telemetry_.committed;
+      reconnect_telemetry_.latest_connection_generation = snapshot.generations.connection;
+      reconnect_telemetry_.latest_outcome = ReconnectOutcome::committed;
+      reconnect_telemetry_.latest_request_to_commit_microseconds = committed_microseconds - attempt_started_microseconds;
+      reconnect_telemetry_.latest_commit_to_ready_microseconds = 0;
+      reconnect_telemetry_.latest_total_microseconds = reconnect_telemetry_.latest_request_to_commit_microseconds;
+      remember_attach_intent(peer, connection_generation, request, response);
+      return response;
     }
 
     /** @copydoc ControlStartHandler::video_configuration */
@@ -2578,13 +3001,23 @@ namespace lumen::lsp::runtime {
         }
         if (video_runtime_ && video_runtime_->peer == peer &&
             video_runtime_->generation == acknowledgement.video_generation) {
+          if (acknowledgement.status == ControlStatus::success && attach_readiness_.active &&
+              attach_readiness_.successor_peer == peer &&
+              attach_readiness_.connection_generation == connection_generation &&
+              attach_readiness_.video_generation == acknowledgement.video_generation) {
+            attach_readiness_.video_acknowledged = true;
+            attach_readiness_.video_activated = video_runtime_->capture_thread.joinable();
+          }
+          complete_attach_readiness_if_possible();
           return acknowledgement.status == ControlStatus::success;
         }
         if (acknowledgement.status != ControlStatus::success) {
           fail_required_video_session(peer);
           return true;
         }
-        auto display_lease = video_runtime_ ? video_runtime_->display_lease : active_video_configuration_->display_lease;
+        auto display_lease = video_runtime_ ?
+                               std::move(video_runtime_->display_lease) :
+                               std::move(active_video_configuration_->display_lease);
         auto replacement = create_video_runtime(
           peer,
           *active_video_configuration_,
@@ -2602,7 +3035,11 @@ namespace lumen::lsp::runtime {
           prior_video->remove_srtp_on_retirement = !audio_owns_old_srtp;
         }
         video_runtime_ = std::move(replacement);
-        active_video_configuration_->display_lease.reset();
+        if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
+            attach_readiness_.connection_generation == connection_generation &&
+            attach_readiness_.video_generation == acknowledgement.video_generation) {
+          attach_readiness_.video_acknowledged = true;
+        }
         if (replacing_active_video) {
           video_start_pending_ = true;
         } else if (!start_video_capture(*video_runtime_, *active_video_configuration_)) {
@@ -2610,13 +3047,14 @@ namespace lumen::lsp::runtime {
           queue_video_retirement(std::move(failed_replacement));
           fail_required_video_session(peer);
           return true;
-        }
-        if (pending_old_peer_after_attach_) {
-          queue_association_close(*pending_old_peer_after_attach_);
-          pending_old_peer_after_attach_.reset();
+        } else if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
+                   attach_readiness_.connection_generation == connection_generation &&
+                   attach_readiness_.video_generation == acknowledgement.video_generation) {
+          attach_readiness_.video_activated = true;
         }
       }
       queue_video_retirement(std::move(prior_video));
+      complete_attach_readiness_if_possible();
       return true;
     }
 
@@ -2641,20 +3079,34 @@ namespace lumen::lsp::runtime {
         }
         if (audio_runtime_ && audio_runtime_->peer == peer &&
             audio_runtime_->generation == acknowledgement.audio_generation) {
+          if (acknowledgement.status == ControlStatus::success && attach_readiness_.active &&
+              attach_readiness_.successor_peer == peer &&
+              attach_readiness_.connection_generation == connection_generation &&
+              attach_readiness_.audio_generation == acknowledgement.audio_generation) {
+            attach_readiness_.audio_ready = true;
+          }
+          complete_attach_readiness_if_possible();
           return acknowledgement.status == ControlStatus::success;
         }
-        if (acknowledgement.status == ControlStatus::success) {
-          auto replacement = create_audio_runtime(peer, active_audio_configuration_->audio);
-          if (!replacement) {
-            return false;
-          }
-          prior_audio = std::move(audio_runtime_);
-          audio_runtime_ = std::move(replacement);
-        } else {
-          prior_audio = std::move(audio_runtime_);
+        if (acknowledgement.status != ControlStatus::success) {
+          fail_required_video_session(peer);
+          return true;
+        }
+        auto replacement = create_audio_runtime(peer, active_audio_configuration_->audio);
+        if (!replacement) {
+          fail_required_video_session(peer);
+          return true;
+        }
+        prior_audio = std::move(audio_runtime_);
+        audio_runtime_ = std::move(replacement);
+        if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
+            attach_readiness_.connection_generation == connection_generation &&
+            attach_readiness_.audio_generation == acknowledgement.audio_generation) {
+          attach_readiness_.audio_ready = true;
         }
       }
       queue_audio_retirement(std::move(prior_audio));
+      complete_attach_readiness_if_possible();
       return true;
     }
 
@@ -2679,20 +3131,44 @@ namespace lumen::lsp::runtime {
         }
         if (microphone_runtime_ && microphone_runtime_->peer() == peer &&
             microphone_runtime_->generation() == acknowledgement.microphone_generation) {
+          if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
+              attach_readiness_.connection_generation == connection_generation &&
+              attach_readiness_.microphone_generation == acknowledgement.microphone_generation) {
+            attach_readiness_.microphone_terminal = true;
+            attach_readiness_.microphone_ready = acknowledgement.status == ControlStatus::success;
+          }
+          complete_attach_readiness_if_possible();
           return acknowledgement.status == ControlStatus::success;
         }
         if (acknowledgement.status == ControlStatus::success) {
           auto replacement = create_microphone_runtime(peer, active_microphone_configuration_->microphone);
           if (!replacement) {
-            return false;
+            if (active_microphone_required_) {
+              fail_required_video_session(peer);
+              return true;
+            }
+            prior_microphone = std::move(microphone_runtime_);
+          } else {
+            prior_microphone = std::move(microphone_runtime_);
+            microphone_runtime_ = std::move(replacement);
+          }
+        } else {
+          if (active_microphone_required_) {
+            fail_required_video_session(peer);
+            return true;
           }
           prior_microphone = std::move(microphone_runtime_);
-          microphone_runtime_ = std::move(replacement);
-        } else {
-          prior_microphone = std::move(microphone_runtime_);
+        }
+        if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
+            attach_readiness_.connection_generation == connection_generation &&
+            attach_readiness_.microphone_generation == acknowledgement.microphone_generation) {
+          attach_readiness_.microphone_terminal = true;
+          attach_readiness_.microphone_ready = microphone_runtime_ && microphone_runtime_->peer() == peer &&
+                                               microphone_runtime_->generation() == acknowledgement.microphone_generation;
         }
       }
       queue_microphone_retirement(std::move(prior_microphone));
+      complete_attach_readiness_if_possible();
       return true;
     }
 
@@ -2703,6 +3179,9 @@ namespace lumen::lsp::runtime {
       const std::uint64_t now_microseconds
     ) noexcept override {
       std::scoped_lock lock(session_mutex_);
+      if (is_retiring_attach_peer(peer)) {
+        return true;
+      }
       return video_runtime_ && video_runtime_->peer == peer && video_runtime_->sender &&
              video_runtime_->sender->send_path_probe(probe, now_microseconds);
     }
@@ -2736,6 +3215,9 @@ namespace lumen::lsp::runtime {
       const PathProbePayload &probe
     ) noexcept override {
       std::scoped_lock lock(session_mutex_);
+      if (is_retiring_attach_peer(peer)) {
+        return true;
+      }
       return video_runtime_ && video_runtime_->peer == peer && video_runtime_->sender &&
              video_runtime_->sender->acknowledge_path_probe(probe);
     }
@@ -2747,6 +3229,9 @@ namespace lumen::lsp::runtime {
       const ControlStatus status
     ) noexcept override {
       std::scoped_lock lock(session_mutex_);
+      if (is_retiring_attach_peer(peer)) {
+        return true;
+      }
       if (!video_runtime_ || video_runtime_->peer != peer || !video_runtime_->sender) {
         return false;
       }
@@ -2804,14 +3289,15 @@ namespace lumen::lsp::runtime {
         active_video_configuration_.reset();
         pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
+        active_microphone_required_ = false;
         audio = std::move(audio_runtime_);
         video = std::move(video_runtime_);
         microphone = std::move(microphone_runtime_);
         ssrc_registry_.reset();
         detached_deadline_microseconds_ = 0;
-        last_attach_intent_ = {};
-        pending_old_peer_after_attach_.reset();
-        video_start_pending_ = false;
+        queue_all_retiring_attach_peers();
+        clear_attach_lifecycle();
+        clear_session_ssrc_history();
       }
       queue_audio_retirement(std::move(audio));
       queue_video_retirement(std::move(video));
@@ -2872,7 +3358,7 @@ namespace lumen::lsp::runtime {
             end_dtls_provider_output(datagram.peer);
           }
           if (datagram_result_requires_association_close(disposition)) {
-            queue_association_close(datagram.peer);
+            (void) queue_association_close(datagram.peer);
           }
           process_pending_audio_retirements();
           process_pending_video_retirements();
@@ -2901,6 +3387,7 @@ namespace lumen::lsp::runtime {
         process_pending_association_closes();
         process_audio_failure();
         process_video_failure();
+        process_attach_readiness_deadline(now);
         process_detached_grace(now);
         process_application_exit();
       }
@@ -2970,6 +3457,14 @@ namespace lumen::lsp::runtime {
         return;
       }
 
+      if (is_retiring_attach_peer(peer)) {
+        if (const auto outstanding = sender->outstanding_path_probe()) {
+          (void) control_->cancel_path_probe(peer, *outstanding);
+          (void) sender->rollback_path_probe(*outstanding);
+        }
+        return;
+      }
+
       const auto interval = control_->path_probe_interval(peer);
       const auto before = sender->outstanding_path_probe();
       if (!sender->tick_path_probe(now_microseconds, interval)) {
@@ -2998,15 +3493,18 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    void queue_association_close(PeerEndpoint peer) noexcept {
+    [[nodiscard]] bool queue_association_close(PeerEndpoint peer) noexcept {
+      std::scoped_lock lock(session_mutex_);
       for (std::size_t index = 0; index < pending_association_close_count_; ++index) {
         if (pending_association_closes_[index] == peer) {
-          return;
+          return true;
         }
       }
       if (pending_association_close_count_ < pending_association_closes_.size()) {
         pending_association_closes_[pending_association_close_count_++] = std::move(peer);
+        return true;
       }
+      return false;
     }
 
     void process_pending_association_closes() noexcept {
@@ -3014,8 +3512,12 @@ namespace lumen::lsp::runtime {
       while (pending_association_close_count_ != 0) {
         auto peer = std::move(pending_association_closes_[--pending_association_close_count_]);
         pending_association_closes_[pending_association_close_count_] = {};
-        if (dtls_) {
-          (void) dtls_->close_association(peer);
+        const auto callback_will_retire = dtls_ && dtls_->close_association(peer);
+        if (!callback_will_retire) {
+          retire_forward_path(peer);
+          if (srtp_) {
+            srtp_->remove_association(peer);
+          }
         }
       }
     }
@@ -3044,6 +3546,31 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /**
+     * @brief Terminate a committed successor that misses its generation-qualified readiness deadline.
+     *
+     * @param now_microseconds Current socket-owner monotonic time.
+     */
+    void process_attach_readiness_deadline(const std::uint64_t now_microseconds) noexcept {
+      std::optional<PeerEndpoint> expired_peer;
+      {
+        std::scoped_lock lock(session_mutex_);
+        if (!attach_readiness_.active || now_microseconds < attach_readiness_.deadline_microseconds) {
+          return;
+        }
+        const auto snapshot = authority_.snapshot();
+        if (snapshot.state == SessionState::streaming &&
+            snapshot.generations.connection == attach_readiness_.connection_generation) {
+          expired_peer = attach_readiness_.successor_peer;
+        } else {
+          record_reconnect_failed();
+        }
+      }
+      if (expired_peer) {
+        fail_required_video_session(*expired_peer);
+      }
+    }
+
     void process_detached_grace(const std::uint64_t now_microseconds) noexcept {
       std::unique_ptr<ActiveAudioRuntime> audio;
       std::unique_ptr<ActiveVideoRuntime> video;
@@ -3065,13 +3592,14 @@ namespace lumen::lsp::runtime {
           active_video_configuration_.reset();
           pending_inbound_path_probe_ = {};
           active_microphone_configuration_.reset();
+          active_microphone_required_ = false;
           audio = std::move(audio_runtime_);
           video = std::move(video_runtime_);
           microphone = std::move(microphone_runtime_);
           ssrc_registry_.reset();
-          last_attach_intent_ = {};
-          pending_old_peer_after_attach_.reset();
-          video_start_pending_ = false;
+          queue_all_retiring_attach_peers();
+          clear_attach_lifecycle();
+          clear_session_ssrc_history();
         }
       }
       stop_audio_runtime(std::move(audio));
@@ -3098,14 +3626,15 @@ namespace lumen::lsp::runtime {
         active_video_configuration_.reset();
         pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
+        active_microphone_required_ = false;
         audio = std::move(audio_runtime_);
         video = std::move(video_runtime_);
         microphone = std::move(microphone_runtime_);
         ssrc_registry_.reset();
         detached_deadline_microseconds_ = 0;
-        last_attach_intent_ = {};
-        pending_old_peer_after_attach_.reset();
-        video_start_pending_ = false;
+        queue_all_retiring_attach_peers();
+        clear_attach_lifecycle();
+        clear_session_ssrc_history();
       }
       stop_audio_runtime(std::move(audio));
       stop_video_runtime(std::move(video));
@@ -3251,14 +3780,9 @@ namespace lumen::lsp::runtime {
             runtime.detached_deadline_microseconds_ = monotonic_microseconds() + attach_grace_microseconds;
             runtime.ssrc_registry_.reset();
             runtime.active_client_.reset();
-            if (runtime.pending_old_peer_after_attach_) {
-              runtime.queue_association_close(*runtime.pending_old_peer_after_attach_);
-              if (runtime.video_runtime_ && runtime.video_runtime_->peer == *runtime.pending_old_peer_after_attach_) {
-                video = std::move(runtime.video_runtime_);
-              }
-              runtime.pending_old_peer_after_attach_.reset();
-              runtime.video_start_pending_ = false;
-            }
+            runtime.record_reconnect_failed();
+            runtime.queue_all_retiring_attach_peers();
+            runtime.video_start_pending_ = false;
           }
         }
         if (runtime.audio_runtime_ && runtime.audio_runtime_->peer == peer) {
@@ -3451,14 +3975,35 @@ namespace lumen::lsp::runtime {
       }
       const auto snapshot = runtime.authority_.snapshot();
       const auto forward = runtime.find_forward_path(peer);
-      return snapshot.generations.connection == runtime.active_client_->connection_generation &&
-             snapshot.generations.stream == session_generation && snapshot.generations.input == input_generation &&
-             forward && forward->generation == snapshot.generations.connection &&
-             runtime.authority_.commit_input_baseline(
-               *runtime.active_client_,
-               session_generation,
-               input_generation
-             ) == AuthorityResult::accepted;
+      const auto committed = snapshot.generations.connection == runtime.active_client_->connection_generation &&
+                             snapshot.generations.stream == session_generation && snapshot.generations.input == input_generation &&
+                             forward && forward->generation == snapshot.generations.connection &&
+                             runtime.authority_.commit_input_baseline(
+                               *runtime.active_client_,
+                               session_generation,
+                               input_generation
+                             ) == AuthorityResult::accepted;
+      return committed;
+    }
+
+    /** @brief Advance successor readiness only after the neutral baseline LSPI ACK entered aggregate output. */
+    static void input_baseline_acknowledged_callback(
+      void *context,
+      const PeerEndpoint &peer,
+      const std::uint32_t session_generation,
+      const std::uint32_t input_generation
+    ) noexcept {
+      auto &runtime = *static_cast<ProductHostRuntime *>(context);
+      std::scoped_lock session_lock(runtime.session_mutex_);
+      const auto snapshot = runtime.authority_.snapshot();
+      if (runtime.attach_readiness_.active && runtime.attach_readiness_.successor_peer == peer &&
+          runtime.attach_readiness_.connection_generation == snapshot.generations.connection &&
+          snapshot.generations.stream == session_generation &&
+          runtime.attach_readiness_.input_generation == input_generation &&
+          snapshot.generations.input == input_generation && snapshot.input_baseline_complete) {
+        runtime.attach_readiness_.input_baseline_ready = true;
+        runtime.complete_attach_readiness_if_possible();
+      }
     }
 
     HostRuntimeConfig config_;  ///< Immutable runtime configuration.
@@ -3480,6 +4025,7 @@ namespace lumen::lsp::runtime {
     std::optional<ActiveVideoConfiguration> active_video_configuration_;  ///< Hardware-proven selected video tuple awaiting/holding ACK.
     std::unique_ptr<ActiveVideoRuntime> video_runtime_;  ///< Acknowledged capture/encode/RTP/SRTP video generation.
     std::optional<MicrophoneConfigPayload> active_microphone_configuration_;  ///< Selected reverse microphone tuple.
+    bool active_microphone_required_ {};  ///< Whether failure of the selected reverse microphone is session-fatal.
     std::unique_ptr<LspMicrophoneReceiver> microphone_runtime_;  ///< Acknowledged reverse microphone writer.
     PendingInboundPathProbe pending_inbound_path_probe_ {};  ///< One authenticated reverse probe intent.
     std::array<std::uint64_t, 64> recent_inbound_path_probe_ids_ {};  ///< Session replay fence for completed probes.
@@ -3495,8 +4041,14 @@ namespace lumen::lsp::runtime {
       std::uint64_t budget {};  ///< Reserved input wire bits/s.
     } active_rates_;  ///< Retained input selection across ATTACH/rekey.
 
-    Identifier128 last_attach_intent_ {};  ///< Last consumed attach intent, preventing semantic replay.
-    std::optional<PeerEndpoint> pending_old_peer_after_attach_;  ///< Old association retained until fresh video configuration succeeds.
+    std::array<AttachIntentOutcome, 64> attach_intent_outcomes_ {};  ///< Bounded semantic-success replay cache for the active session.
+    std::size_t next_attach_intent_outcome_ {};  ///< Next replacement slot in the ATTACH intent ring.
+    std::array<std::uint32_t, 512> session_ssrc_history_ {};  ///< Every SSRC assigned during the active session, without overwrite.
+    std::size_t session_ssrc_history_count_ {};  ///< Live leading session SSRC history entries.
+    AttachReadinessBarrier attach_readiness_ {};  ///< Current successor's aggregate authority/media readiness barrier.
+    std::array<PeerEndpoint, 64> retiring_attach_peers_ {};  ///< Deduplicated prior associations retained until full successor readiness.
+    std::size_t retiring_attach_peer_count_ {};  ///< Live leading retiring-association entries.
+    ReconnectTelemetrySnapshot reconnect_telemetry_ {};  ///< Secret-free reconnect/rekey administration counters and timings.
     bool video_start_pending_ {};  ///< Fresh capture waits for prior VDD/frame-source ownership to join.
     std::uint64_t detached_deadline_microseconds_ {};  ///< Bounded process-hold deadline.
     mutable std::mutex forward_path_mutex_;  ///< Dedicated path lookup/lifetime lock, never used for session authority.

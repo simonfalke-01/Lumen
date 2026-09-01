@@ -1187,6 +1187,29 @@ namespace confighttp {
   }
 
   /**
+   * @brief Return the stable Web API name for one LSP reconnect outcome.
+   *
+   * @param outcome Secret-free runtime reconnect outcome.
+   * @return Public reconnect outcome name.
+   */
+  std::string_view lsp_reconnect_outcome_name(const lumen::lsp::runtime::ReconnectOutcome outcome) noexcept {
+    using lumen::lsp::runtime::ReconnectOutcome;
+    switch (outcome) {
+      case ReconnectOutcome::none:
+        return "none"sv;
+      case ReconnectOutcome::rejected:
+        return "rejected"sv;
+      case ReconnectOutcome::committed:
+        return "committed"sv;
+      case ReconnectOutcome::ready:
+        return "ready"sv;
+      case ReconnectOutcome::failed:
+        return "failed"sv;
+    }
+    return "unknown"sv;
+  }
+
+  /**
    * @brief Send a non-cacheable LSP administration JSON response.
    *
    * @param response Shared HTTPS response object.
@@ -1282,12 +1305,25 @@ namespace confighttp {
       return;
     }
 
+    const nlohmann::json reconnect {
+      {"attempts", snapshot->reconnect.attempts},
+      {"committed", snapshot->reconnect.committed},
+      {"completed", snapshot->reconnect.completed},
+      {"rejected", snapshot->reconnect.rejected},
+      {"failed", snapshot->reconnect.failed},
+      {"latestConnectionGeneration", snapshot->reconnect.latest_connection_generation},
+      {"latestOutcome", lsp_reconnect_outcome_name(snapshot->reconnect.latest_outcome)},
+      {"latestRequestToCommitMicroseconds", snapshot->reconnect.latest_request_to_commit_microseconds},
+      {"latestCommitToReadyMicroseconds", snapshot->reconnect.latest_commit_to_ready_microseconds},
+      {"latestTotalMicroseconds", snapshot->reconnect.latest_total_microseconds},
+    };
     send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
       {"status", true},
       {"active", snapshot->active},
       {"port", snapshot->port},
       {"profile", lsp_profile_name(snapshot->profile)},
       {"hasInvitation", snapshot->invitation_uri.has_value()},
+      {"reconnect", reconnect},
     });
   }
 
