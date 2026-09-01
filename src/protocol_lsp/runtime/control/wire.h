@@ -19,12 +19,25 @@ namespace lumen::lsp::runtime {
   /** @brief Ed25519 signature size used by LSP pairing and authentication. */
   inline constexpr std::size_t ed25519_signature_size = 64;
 
+  /** @brief Fixed uncompressed P-256 point width used by LSP PIN pairing. */
+  inline constexpr std::size_t pairing_spake_point_size = 65;
+
+  /** @brief Fixed SPAKE confirmation width used by LSP PIN pairing. */
+  inline constexpr std::size_t pairing_confirmation_size = 32;
+
+  /** @brief Dedicated incompatible schema revision for all PIN pairing maps. */
+  inline constexpr std::uint8_t pairing_schema_version = 1;
+
   /** @brief Exact LSP/1 control-message registry values implemented by this slice. */
   enum class ControlMessageType : std::uint16_t {
     client_hello = 0x0001,  ///< Establish connection generation and nonces.
     server_hello = 0x0002,  ///< Return host identity and connection generation.
-    pair_request = 0x0010,  ///< Admit one single-use invitation and client identity.
-    pair_response = 0x0011,  ///< Return pairing outcome and effective permission state.
+    pair_begin = 0x0010,  ///< Begin one bounded PIN/SPAKE pairing session.
+    pair_pending = 0x0011,  ///< Return the pending session and effective permission ceiling.
+    pair_poll = 0x0012,  ///< Poll one pending session without blocking the socket owner.
+    pair_challenge = 0x0013,  ///< Return the admin-approved SPAKE challenge.
+    pair_finish = 0x0014,  ///< Authenticate the client confirmation and identity signature.
+    pair_result = 0x0015,  ///< Return the persisted trust result and host confirmation.
     auth_request = 0x0020,  ///< Authenticate an already trusted client identity.
     auth_response = 0x0021,  ///< Return authentication outcome and permission state.
     list_applications = 0x0100,  ///< Request configured applications.
@@ -50,7 +63,7 @@ namespace lumen::lsp::runtime {
     success = 0,  ///< Operation completed.
     malformed = 1,  ///< Frame or deterministic-CBOR payload is invalid.
     unsupported = 2,  ///< Version, type, or capability is unsupported.
-    authentication_failed = 3,  ///< Invitation or signature authentication failed.
+    authentication_failed = 3,  ///< PIN confirmation, identity signature, or trusted authentication failed.
     permission_denied = 4,  ///< Authenticated client lacks the required permission.
     busy = 5,  ///< Bounded resource is unavailable.
     unsupported_media_tuple = 6,  ///< Offered audio or video capabilities have no supported exact selection.
@@ -83,21 +96,59 @@ namespace lumen::lsp::runtime {
     Secret256 server_nonce {};  ///< Fresh nonzero server nonce.
   };
 
-  /** @brief Exact PAIR_REQUEST six-key request map. */
-  struct PairRequestPayload {
+  /** @brief Exact nine-key PAIR_BEGIN request. */
+  struct PairBeginPayload {
     Identifier128 client_id {};  ///< Stable client identifier.
     PublicKey256 client_identity_key {};  ///< Proposed client Ed25519 public key.
-    Identifier128 invitation_id {};  ///< Presented invitation identifier.
-    Secret256 invitation_secret {};  ///< Presented single-use invitation secret.
-    std::array<std::uint8_t, ed25519_signature_size> signature {};  ///< Client transcript signature.
+    std::string client_name;  ///< Display name containing one through 64 UTF-8 bytes.
+    Identifier128 client_pairing_nonce {};  ///< Fresh pairing-specific client nonce.
+    Identifier128 scrypt_salt {};  ///< Fresh client-selected scrypt salt.
+    std::array<std::uint8_t, pairing_spake_point_size> point_a {};  ///< Uncompressed P-256 SPAKE point `pA`.
+    PermissionSet requested_permissions {};  ///< Requested permission subset.
   };
 
-  /** @brief Exact PAIR_RESPONSE five-key response map. */
-  struct PairResponsePayload {
-    ControlStatus status {ControlStatus::success};  ///< Operation status.
-    PermissionSet permissions {};  ///< Effective permissions.
-    std::uint32_t revocation_generation {};  ///< Nonzero trust generation.
-    std::array<std::uint8_t, ed25519_signature_size> signature {};  ///< Host transcript signature.
+  /** @brief Exact six-key PAIR_PENDING response. */
+  struct PairPendingPayload {
+    ControlStatus status {ControlStatus::success};  ///< Pending-session creation or poll status.
+    Identifier128 pairing_session_id {};  ///< Random nonzero PIN-session identifier.
+    std::uint64_t expires_at_utc_seconds {};  ///< Absolute 120-second session expiry.
+    PermissionSet effective_permissions {};  ///< Host-ceiling intersection fixed for the session.
+  };
+
+  /** @brief Exact three-key PAIR_POLL request. */
+  struct PairPollPayload {
+    Identifier128 pairing_session_id {};  ///< Pending session returned by PAIR_PENDING.
+  };
+
+  /** @brief Exact seven-key PAIR_CHALLENGE response. */
+  struct PairChallengePayload {
+    Identifier128 pairing_session_id {};  ///< Approved pending session.
+    std::uint32_t approval_generation {};  ///< Nonzero generation binding admin approval and finish.
+    std::array<std::uint8_t, pairing_spake_point_size> point_b {};  ///< Uncompressed host SPAKE point `pB`.
+    PermissionSet effective_permissions {};  ///< Fixed approved permission set.
+    std::uint64_t expires_at_utc_seconds {};  ///< Unchanged session expiry.
+  };
+
+  /** @brief Exact six-key PAIR_FINISH request. */
+  struct PairFinishPayload {
+    Identifier128 pairing_session_id {};  ///< Approved pending session.
+    std::uint32_t approval_generation {};  ///< Exact generation returned by PAIR_CHALLENGE.
+    std::array<std::uint8_t, pairing_confirmation_size> confirmation_a {};  ///< Client SPAKE confirmation `cA`.
+    std::array<std::uint8_t, ed25519_signature_size> client_signature {};  ///< Client identity signature over the bound transcript.
+
+    /** @brief Compare an exact semantic FINISH for completed-result replay. */
+    bool operator==(const PairFinishPayload &) const noexcept = default;
+  };
+
+  /** @brief Exact nine-key PAIR_RESULT response. */
+  struct PairResultPayload {
+    ControlStatus status {ControlStatus::success};  ///< Persisted trust and confirmation result.
+    Identifier128 pairing_session_id {};  ///< Terminal pairing session.
+    std::uint32_t approval_generation {};  ///< Exact completed approval generation.
+    PermissionSet permissions {};  ///< Persisted effective permissions.
+    std::uint32_t revocation_generation {};  ///< Nonzero persisted trust generation.
+    std::array<std::uint8_t, pairing_confirmation_size> confirmation_b {};  ///< Host SPAKE confirmation `cB`.
+    std::array<std::uint8_t, ed25519_signature_size> host_signature {};  ///< Host identity signature over the result transcript.
   };
 
   /** @brief Exact AUTH_REQUEST three-key request map. */
@@ -479,11 +530,23 @@ namespace lumen::lsp::runtime {
   /** @brief Encode exact SERVER_HELLO deterministic CBOR. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_server_hello(const ServerHelloPayload &payload);
 
-  /** @brief Decode exact PAIR_REQUEST deterministic CBOR. */
-  [[nodiscard]] std::expected<PairRequestPayload, ControlWireError> decode_pair_request(std::span<const std::uint8_t> payload);
+  /** @brief Decode exact PAIR_BEGIN deterministic CBOR. */
+  [[nodiscard]] std::expected<PairBeginPayload, ControlWireError> decode_pair_begin(std::span<const std::uint8_t> payload);
 
-  /** @brief Encode exact PAIR_RESPONSE deterministic CBOR. */
-  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_pair_response(const PairResponsePayload &payload);
+  /** @brief Encode exact PAIR_PENDING deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_pair_pending(const PairPendingPayload &payload);
+
+  /** @brief Decode exact PAIR_POLL deterministic CBOR. */
+  [[nodiscard]] std::expected<PairPollPayload, ControlWireError> decode_pair_poll(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact PAIR_CHALLENGE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_pair_challenge(const PairChallengePayload &payload);
+
+  /** @brief Decode exact PAIR_FINISH deterministic CBOR. */
+  [[nodiscard]] std::expected<PairFinishPayload, ControlWireError> decode_pair_finish(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact PAIR_RESULT deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_pair_result(const PairResultPayload &payload);
 
   /** @brief Decode exact AUTH_REQUEST deterministic CBOR. */
   [[nodiscard]] std::expected<AuthRequestPayload, ControlWireError> decode_auth_request(std::span<const std::uint8_t> payload);

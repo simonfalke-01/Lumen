@@ -624,29 +624,114 @@ namespace lumen::lsp::runtime {
     });
   }
 
-  std::expected<PairRequestPayload, ControlWireError> decode_pair_request(const std::span<const std::uint8_t> payload) {
-    const auto map = decode_map(payload, 6);
-    PairRequestPayload result;
+  std::expected<PairBeginPayload, ControlWireError> decode_pair_begin(const std::span<const std::uint8_t> payload) {
+    const auto map = decode_map(payload, 9);
+    PairBeginPayload result;
     const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
-    if (!map || version == nullptr || *version != wire_version || !fixed_bytes((*map)[1].second, result.client_id) ||
-        !fixed_bytes((*map)[2].second, result.client_identity_key) || !fixed_bytes((*map)[3].second, result.invitation_id) ||
-        !fixed_bytes((*map)[4].second, result.invitation_secret) || !fixed_bytes((*map)[5].second, result.signature) ||
-        is_zero(result.client_id) || is_zero(result.client_identity_key)) {
+    const auto *schema = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *client_name = map ? std::get_if<std::string>(&(*map)[4].second.storage) : nullptr;
+    const auto *permissions = map ? unsigned_value((*map)[8].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || schema == nullptr ||
+        *schema != pairing_schema_version || !fixed_bytes((*map)[2].second, result.client_id) ||
+        !fixed_bytes((*map)[3].second, result.client_identity_key) || client_name == nullptr ||
+        client_name->empty() || client_name->size() > 64 || !cbor::is_valid_utf8(*client_name) ||
+        !fixed_bytes((*map)[5].second, result.client_pairing_nonce) ||
+        !fixed_bytes((*map)[6].second, result.scrypt_salt) ||
+        !fixed_bytes((*map)[7].second, result.point_a) || permissions == nullptr ||
+        *permissions > std::numeric_limits<std::uint32_t>::max() || is_zero(result.client_id) ||
+        is_zero(result.client_identity_key) || is_zero(result.client_pairing_nonce) ||
+        is_zero(result.scrypt_salt) || is_zero(result.point_a) || result.point_a[0] != 0x04) {
       return std::unexpected(ControlWireError::invalid_field);
     }
+    const auto requested_permissions = PermissionSet::from_mask(static_cast<std::uint32_t>(*permissions));
+    if (!requested_permissions) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.client_name = *client_name;
+    result.requested_permissions = *requested_permissions;
     return result;
   }
 
-  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_pair_response(const PairResponsePayload &payload) {
-    if (!valid_status(payload.status) || payload.revocation_generation == 0 || is_zero(payload.signature)) {
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_pair_pending(const PairPendingPayload &payload) {
+    if (payload.status != ControlStatus::success || is_zero(payload.pairing_session_id) ||
+        payload.expires_at_utc_seconds == 0 || payload.effective_permissions.mask() == 0) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
       {1, wire_version},
       {2, static_cast<std::uint8_t>(payload.status)},
-      {3, payload.permissions.mask()},
-      {4, payload.revocation_generation},
-      {5, bytes(payload.signature)},
+      {3, pairing_schema_version},
+      {4, bytes(payload.pairing_session_id)},
+      {5, payload.expires_at_utc_seconds},
+      {6, payload.effective_permissions.mask()},
+    });
+  }
+
+  std::expected<PairPollPayload, ControlWireError> decode_pair_poll(const std::span<const std::uint8_t> payload) {
+    const auto map = decode_map(payload, 3);
+    PairPollPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *schema = map ? unsigned_value((*map)[1].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || schema == nullptr ||
+        *schema != pairing_schema_version || !fixed_bytes((*map)[2].second, result.pairing_session_id) ||
+        is_zero(result.pairing_session_id)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_pair_challenge(const PairChallengePayload &payload) {
+    if (is_zero(payload.pairing_session_id) || payload.approval_generation == 0 || is_zero(payload.point_b) ||
+        payload.point_b[0] != 0x04 || payload.effective_permissions.mask() == 0 ||
+        payload.expires_at_utc_seconds == 0) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, pairing_schema_version},
+      {3, bytes(payload.pairing_session_id)},
+      {4, payload.approval_generation},
+      {5, bytes(payload.point_b)},
+      {6, payload.effective_permissions.mask()},
+      {7, payload.expires_at_utc_seconds},
+    });
+  }
+
+  std::expected<PairFinishPayload, ControlWireError> decode_pair_finish(const std::span<const std::uint8_t> payload) {
+    const auto map = decode_map(payload, 6);
+    PairFinishPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *schema = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *approval_generation = map ? unsigned_value((*map)[3].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || schema == nullptr ||
+        *schema != pairing_schema_version || !fixed_bytes((*map)[2].second, result.pairing_session_id) ||
+        approval_generation == nullptr || *approval_generation == 0 ||
+        *approval_generation > std::numeric_limits<std::uint32_t>::max() ||
+        !fixed_bytes((*map)[4].second, result.confirmation_a) ||
+        !fixed_bytes((*map)[5].second, result.client_signature) || is_zero(result.pairing_session_id) ||
+        is_zero(result.confirmation_a) || is_zero(result.client_signature)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.approval_generation = static_cast<std::uint32_t>(*approval_generation);
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_pair_result(const PairResultPayload &payload) {
+    if (payload.status != ControlStatus::success || is_zero(payload.pairing_session_id) ||
+        payload.approval_generation == 0 || payload.permissions.mask() == 0 ||
+        payload.revocation_generation == 0 || is_zero(payload.confirmation_b) || is_zero(payload.host_signature)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, pairing_schema_version},
+      {4, bytes(payload.pairing_session_id)},
+      {5, payload.approval_generation},
+      {6, payload.permissions.mask()},
+      {7, payload.revocation_generation},
+      {8, bytes(payload.confirmation_b)},
+      {9, bytes(payload.host_signature)},
     });
   }
 

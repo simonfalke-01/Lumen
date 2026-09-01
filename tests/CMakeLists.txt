@@ -109,6 +109,9 @@ set(TEST_DEFINITIONS)  # list will be appended as needed
 
 # this indicates we're building tests in case sunshine needs to adjust some code or add private tests
 list(APPEND TEST_DEFINITIONS SUNSHINE_TESTS)
+if(LUMEN_ENABLE_LSP_RUNTIME)
+    list(APPEND TEST_DEFINITIONS LSP_SPAKE2_TESTING=1)
+endif()
 list(APPEND TEST_DEFINITIONS SUNSHINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 list(APPEND TEST_DEFINITIONS SUNSHINE_TEST_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}")
 

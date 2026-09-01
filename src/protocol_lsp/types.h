@@ -19,10 +19,10 @@ namespace lumen::lsp {
   inline constexpr std::string_view discovery_service = "_lumen-stream._udp";  ///< LSP mDNS service type.
   inline constexpr std::size_t maximum_controller_slots = 16;  ///< Bounded controller-instance slots tracked by one session.
 
-  using Identifier128 = std::array<std::uint8_t, 16>;  ///< Fixed-width host, client, session, and invitation identifier.
+  using Identifier128 = std::array<std::uint8_t, 16>;  ///< Fixed-width host, client, and session identifier.
   using PublicKey256 = std::array<std::uint8_t, 32>;  ///< Ed25519 public key bytes.
   using Digest256 = std::array<std::uint8_t, 32>;  ///< SHA-256 digest bytes.
-  using Secret256 = std::array<std::uint8_t, 32>;  ///< Fixed-width invitation or attach secret.
+  using Secret256 = std::array<std::uint8_t, 32>;  ///< Fixed-width nonce, confirmation, digest, or attach secret.
 
   /**
    * @brief Return whether every byte in a fixed-width protocol value is zero.

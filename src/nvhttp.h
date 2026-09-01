@@ -173,7 +173,7 @@ namespace nvhttp {
    *
    * @warning These controls bound online abuse only. The legacy GameStream
    * four-digit PIN transcript remains susceptible to a passive offline search
-   * of all 10,000 PINs; a modern PAKE or high-entropy invitation is required to
+   * of all 10,000 PINs; a modern PAKE is required to
    * remove that protocol-level limitation.
    */
   class pairing_session_manager_t {

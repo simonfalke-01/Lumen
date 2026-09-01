@@ -5,6 +5,8 @@
 
 #include "wolfssl_dtls_server.h"
 
+#include "secure_zero.h"
+
 // clang-format off
 #include <wolfssl/options.h>
 #include <wolfssl/error-ssl.h>
@@ -40,6 +42,7 @@ namespace lumen::lsp {
     constexpr std::string_view wolfssl_cipher_iana_name = "TLS_AES_128_GCM_SHA256";
     constexpr std::string_view required_group = "X25519";
     constexpr std::string_view required_srtp_profile = "SRTP_AEAD_AES_128_GCM";
+    constexpr std::uint8_t empty_exporter_context = 0;  ///< Nonnull sentinel for an explicit empty TLS exporter context.
     constexpr std::size_t cookie_secret_size = 32;
     constexpr std::size_t maximum_dtls_application_record = 16U * 1024U;
     constexpr std::size_t maximum_records_per_datagram = 32;
@@ -52,28 +55,6 @@ namespace lumen::lsp {
       std::span<const std::uint8_t> encoded;  ///< Complete tag-length-value bytes.
       std::span<const std::uint8_t> content;  ///< Value bytes only.
     };
-
-    /**
-     * @brief Clear secret bytes without permitting dead-store elimination.
-     *
-     * @param bytes Mutable secret bytes.
-     */
-    void clear_secret(const std::span<std::uint8_t> bytes) noexcept {
-      volatile std::uint8_t *cursor = bytes.data();
-      for (std::size_t index = 0; index < bytes.size(); ++index) {
-        cursor[index] = 0;
-      }
-    }
-
-    /**
-     * @brief Clear and release one secret byte vector.
-     *
-     * @param bytes Secret vector.
-     */
-    void clear_secret(std::vector<std::uint8_t> &bytes) noexcept {
-      clear_secret(std::span<std::uint8_t> {bytes});
-      bytes.clear();
-    }
 
     /**
      * @brief Return whether a byte span contains at least one nonzero byte.
@@ -187,7 +168,7 @@ namespace lumen::lsp {
     }
 
     /**
-     * @brief Derive the invitation-compatible SHA-256 SPKI digest.
+     * @brief Derive the PIN-discovery-compatible SHA-256 SPKI digest.
      *
      * @param certificate_der Complete strict-DER certificate.
      * @return SPKI digest, or no value for parse or hash failure.
@@ -374,8 +355,8 @@ namespace lumen::lsp {
       }
       associations_.clear();
       context_.reset();
-      clear_secret(private_key_der_);
-      clear_secret(cookie_secret_);
+      secure_zero(private_key_der_);
+      secure_zero(cookie_secret_);
     }
 
     /**
@@ -731,7 +712,6 @@ namespace lumen::lsp {
             WOLFSSL_ALPN_FAILED_ON_MISMATCH
           ) != WOLFSSL_SUCCESS ||
           wolfSSL_set_tlsext_use_srtp(session.get(), required_srtp_profile.data()) != 0 ||
-          wolfSSL_no_ticket_TLSv13(session.get()) != 0 ||
           wolfSSL_send_hrr_cookie(
             session.get(),
             cookie_secret_.data(),
@@ -859,7 +839,22 @@ namespace lumen::lsp {
       const auto exporter_result = wolfSSL_export_dtls_srtp_keying_material(session, exporter.data(), &exporter_size);
       if (exporter_result != WOLFSSL_SUCCESS ||
           exporter_size != exporter.size()) {
-        clear_secret(exporter);
+        secure_zero(exporter);
+        return false;
+      }
+      PairingExporter pairing_exporter;
+      if (wolfSSL_export_keying_material(
+            session,
+            pairing_exporter.data(),
+            pairing_exporter.size(),
+            pairing_exporter_label.data(),
+            pairing_exporter_label.size(),
+            &empty_exporter_context,
+            0,
+            1
+          ) != WOLFSSL_SUCCESS) {
+        secure_zero(exporter);
+        secure_zero(pairing_exporter);
         return false;
       }
       wolfSSL_FreeArrays(session);
@@ -867,13 +862,16 @@ namespace lumen::lsp {
       DtlsAssociationSecurity security {
         .server_spki_sha256 = server_spki_sha256_,
         .srtp = split_exporter(exporter),
+        .pairing_exporter = pairing_exporter,
       };
-      clear_secret(exporter);
+      secure_zero(exporter);
+      secure_zero(pairing_exporter);
       const auto admitted = callbacks_.association_ready(callbacks_.context, association.peer, security);
-      clear_secret(security.srtp.client_write_key);
-      clear_secret(security.srtp.server_write_key);
-      clear_secret(security.srtp.client_write_salt);
-      clear_secret(security.srtp.server_write_salt);
+      secure_zero(security.srtp.client_write_key);
+      secure_zero(security.srtp.server_write_key);
+      secure_zero(security.srtp.client_write_salt);
+      secure_zero(security.srtp.server_write_salt);
+      secure_zero(security.pairing_exporter);
       if (!admitted) {
         return false;
       }
@@ -901,21 +899,21 @@ namespace lumen::lsp {
                 association.peer,
                 std::span<const std::uint8_t> {plaintext.data(), static_cast<std::size_t>(size)}
               )) {
-            clear_secret(plaintext);
+            secure_zero(plaintext);
             return ProviderDatagramResult::fatal;
           }
-          clear_secret(std::span<std::uint8_t> {plaintext.data(), static_cast<std::size_t>(size)});
+          secure_zero(std::span<std::uint8_t> {plaintext.data(), static_cast<std::size_t>(size)});
           continue;
         }
 
-        clear_secret(plaintext);
+        secure_zero(plaintext);
         const auto error = wolfSSL_get_error(association.session.get(), size);
         if (error == WOLFSSL_ERROR_WANT_READ || error == WOLFSSL_ERROR_WANT_WRITE) {
           return ProviderDatagramResult::accepted;
         }
         return ProviderDatagramResult::dropped;
       }
-      clear_secret(plaintext);
+      secure_zero(plaintext);
       return ProviderDatagramResult::fatal;
     }
 
@@ -957,7 +955,7 @@ namespace lumen::lsp {
     std::vector<std::uint8_t> certificate_der_;  ///< Canonical DER leaf certificate.
     std::vector<std::uint8_t> private_key_der_;  ///< Secret DER private key.
     std::vector<std::uint8_t> cookie_secret_;  ///< Shared address-bound HRR HMAC secret.
-    Digest256 server_spki_sha256_ {};  ///< Invitation-compatible server SPKI digest.
+    Digest256 server_spki_sha256_ {};  ///< PIN-discovery-compatible server SPKI digest.
     WolfsslDtlsServerCallbacks callbacks_;  ///< Product/socket callbacks.
     std::vector<Association> associations_;  ///< Durable post-cookie associations.
     std::size_t maximum_associations_ {};  ///< Durable association bound.

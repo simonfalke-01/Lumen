@@ -16,7 +16,8 @@
     }
     .lsp-status-strip.is-active { border-inline-start-color: var(--bs-success); }
     .lsp-status-value { font-variant-numeric: tabular-nums; }
-    .lsp-invitation-uri { min-height: 7rem; overflow-wrap: anywhere; resize: vertical; }
+    .lsp-pin-input { max-width: 13rem; letter-spacing: .35em; font-variant-numeric: tabular-nums; }
+    .lsp-pairing-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1rem; align-items: center; }
     .lsp-permissions { display: grid; grid-template-columns: repeat(3, minmax(8.5rem, 1fr)); gap: .5rem 1rem; }
     .lsp-client-id { max-width: 22rem; overflow-wrap: anywhere; }
     .lsp-client-row[aria-busy="true"] { opacity: .72; }
@@ -33,6 +34,7 @@
       .lsp-status-profile { grid-row: 3; }
       .lsp-permissions { grid-template-columns: 1fr; }
       .lsp-client-id { max-width: 14rem; }
+      .lsp-pairing-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -89,34 +91,54 @@
               <h2 id="lsp-pairing-title" class="h4 mb-1">{{ $t('lsp_clients.pairing') }}</h2>
               <p class="text-body-secondary mb-0">{{ $t('lsp_clients.pairing_desc') }}</p>
             </div>
-            <button v-if="invitation" class="btn btn-outline-danger" type="button"
-                    :disabled="invitationBusy" @click="revokeInvitation">
+            <button v-if="pendingPairings.length" class="btn btn-outline-danger" type="button"
+                    :disabled="pairingBusy" @click="cancelPairing">
               <trash-2 :size="17" class="icon"></trash-2>
-              {{ $t('lsp_clients.revoke_invitation') }}
+              {{ $t('lsp_clients.cancel_pairing') }}
             </button>
           </div>
 
-          <div v-if="invitationError" class="alert alert-danger" role="alert">{{ invitationError }}</div>
-          <div v-if="invitation" class="card">
-            <div class="card-body p-4">
-              <label for="lspInvitationUri" class="form-label">{{ $t('lsp_clients.invitation_uri') }}</label>
-              <textarea id="lspInvitationUri" class="form-control font-monospace lsp-invitation-uri"
-                        readonly spellcheck="false" :value="invitation"></textarea>
-              <div class="d-flex flex-wrap align-items-center gap-3 mt-3">
-                <button class="btn btn-primary" type="button" :disabled="copying" @click="copyInvitation">
-                  <copy :size="17" class="icon"></copy>
-                  {{ copied ? $t('lsp_clients.copied') : $t('lsp_clients.copy_invitation') }}
-                </button>
-                <span class="small text-body-secondary">{{ $t('lsp_clients.invitation_expiry') }}</span>
+          <div v-if="pairingError" class="alert alert-danger" role="alert">{{ pairingError }}</div>
+          <div v-if="pendingPairings.length" class="border-top">
+            <div v-for="pairing in pendingPairings" :key="pairing.sessionId" class="lsp-pairing-row py-3 border-bottom">
+              <div class="d-flex gap-3 align-items-start">
+                <input v-model="selectedPairingId" class="form-check-input mt-1" type="radio"
+                       name="lspPairingSession" :value="pairing.sessionId"
+                       :aria-label="$t('lsp_clients.select_pairing', { name: pairing.clientName })">
+                <div>
+                  <div class="fw-semibold">
+                    {{ pairing.clientName }}
+                    <span class="badge text-bg-warning ms-2">{{ $t('lsp_clients.unverified_name') }}</span>
+                  </div>
+                  <div class="small font-monospace text-body-secondary">{{ pairing.clientId }}</div>
+                  <div class="small font-monospace text-body-secondary">{{ pairing.identityKeyFingerprint }}</div>
+                  <div class="small mt-1">
+                    {{ $t('lsp_clients.pending_permissions') }}:
+                    {{ pairingPermissionLabels(pairing.permissions) }}
+                    <span class="font-monospace text-body-secondary">(0x{{ Number(pairing.permissions).toString(16) }})</span>
+                  </div>
+                </div>
+                <div class="small text-body-secondary">
+                  {{ pairingStateLabel(pairing.state) }} · {{ $t('lsp_clients.challenge_count', { count: pairing.challengesUsed }) }}
+                </div>
               </div>
+              <div class="small text-body-secondary">{{ pairingExpiry(pairing.expiresAt) }}</div>
             </div>
+            <form class="d-flex flex-wrap align-items-end gap-3 mt-4" @submit.prevent="submitPairingPin">
+              <div>
+                <label for="lspPairingPin" class="form-label">{{ $t('lsp_clients.pin_label') }}</label>
+                <input id="lspPairingPin" v-model="pairingPin" class="form-control form-control-lg lsp-pin-input"
+                       type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+                       autocomplete="one-time-code" spellcheck="false" required>
+              </div>
+              <button class="btn btn-primary btn-lg" type="submit"
+                      :disabled="pairingBusy || !selectedPairingId || !/^\d{6}$/.test(pairingPin)">
+                {{ pairingBusy ? $t('_common.loading') : $t('lsp_clients.approve_pin') }}
+              </button>
+            </form>
           </div>
           <div v-else class="py-4 border-top border-bottom">
-            <p class="mb-3 text-body-secondary">{{ $t('lsp_clients.no_invitation') }}</p>
-            <button class="btn btn-primary" type="button" :disabled="invitationBusy" @click="issueInvitation">
-              <link-2 :size="18" class="icon"></link-2>
-              {{ invitationBusy ? $t('_common.loading') : $t('lsp_clients.issue_invitation') }}
-            </button>
+            <p class="mb-0 text-body-secondary">{{ $t('lsp_clients.no_pending_pairing') }}</p>
           </div>
         </section>
 
@@ -221,7 +243,7 @@
       persistLspClientPatch,
     } from './lsp_client_state'
     import { buildLspPermissionUpdate, hasLspPermission } from './lsp_permissions'
-    import { Copy, Link2, RefreshCw, Trash2 } from '@lucide/vue'
+    import { RefreshCw, Trash2 } from '@lucide/vue'
 
     const permissionOptions = [
       { bit: 0, label: 'lsp_clients.permission_browse' },
@@ -234,7 +256,7 @@
     ]
 
     const app = createApp({
-      components: { Navbar, Copy, Link2, RefreshCw, Trash2 },
+      components: { Navbar, RefreshCw, Trash2 },
       data() {
         return {
           permissionOptions,
@@ -243,11 +265,12 @@
           initialError: '',
           refreshing: false,
           runtime: null,
-          invitation: null,
-          invitationBusy: false,
-          invitationError: '',
-          copying: false,
-          copied: false,
+          pendingPairings: [],
+          selectedPairingId: '',
+          pairingPin: '',
+          pairingBusy: false,
+          pairingError: '',
+          pairingPollTimer: null,
           clients: [],
           clientsLoading: false,
           clientsError: '',
@@ -268,6 +291,12 @@
       },
       mounted() {
         this.initialize()
+        this.pairingPollTimer = window.setInterval(() => {
+          if (this.csrfToken && !this.initialLoading && !this.pairingBusy) this.loadPairing()
+        }, 2000)
+      },
+      beforeUnmount() {
+        if (this.pairingPollTimer !== null) window.clearInterval(this.pairingPollTimer)
       },
       methods: {
         hasPermission: hasLspPermission,
@@ -308,62 +337,78 @@
               port: Number(result.port),
               profile: result.profile,
             }
-            await Promise.all([this.loadInvitation(), this.loadClients()])
+            await Promise.all([this.loadPairing(), this.loadClients()])
           } catch (error) {
             this.initialError = error.message
           } finally {
             this.refreshing = false
           }
         },
-        async loadInvitation() {
-          this.invitationError = ''
+        async loadPairing() {
+          this.pairingError = ''
           try {
-            const result = await this.requestJson('./api/lsp/invitation')
-            this.invitation = typeof result.invitation === 'string' ? result.invitation : null
-          } catch (error) {
-            this.invitationError = error.message
-          }
-        },
-        async issueInvitation() {
-          this.invitationBusy = true
-          this.invitationError = ''
-          try {
-            const result = await this.requestJson('./api/lsp/invitation', { method: 'POST' })
-            if (typeof result.invitation !== 'string' || !result.invitation.startsWith('umbra://pair/lsp1#')) {
-              throw new Error(this.$t('lsp_clients.request_failed'))
+            const result = await this.requestJson('./api/lsp/pairing')
+            this.pendingPairings = Array.isArray(result.pending) ? result.pending : []
+            if (!this.pendingPairings.some(pairing => pairing.sessionId === this.selectedPairingId)) {
+              this.selectedPairingId = this.pendingPairings[0]?.sessionId || ''
             }
-            this.invitation = result.invitation
           } catch (error) {
-            this.invitationError = error.message
-          } finally {
-            this.invitationBusy = false
+            this.pairingError = error.message
           }
         },
-        async revokeInvitation() {
-          this.invitationBusy = true
-          this.invitationError = ''
+        async submitPairingPin() {
+          if (!/^\d{6}$/.test(this.pairingPin) || !this.selectedPairingId) return
+          this.pairingBusy = true
+          this.pairingError = ''
           try {
-            await this.requestJson('./api/lsp/invitation', { method: 'DELETE' })
-            this.invitation = null
-            this.copied = false
+            await this.requestJson('./api/lsp/pairing/pin', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'text/plain',
+                'X-LSP-Pairing-Session': this.selectedPairingId,
+              },
+              body: this.pairingPin,
+            })
+            this.pairingPin = ''
+            await this.loadPairing()
           } catch (error) {
-            this.invitationError = error.message
+            this.pairingError = error.message
           } finally {
-            this.invitationBusy = false
+            this.pairingBusy = false
           }
         },
-        async copyInvitation() {
-          this.copying = true
-          this.invitationError = ''
+        async cancelPairing() {
+          this.pairingBusy = true
+          this.pairingError = ''
           try {
-            await navigator.clipboard.writeText(this.invitation)
-            this.copied = true
-            window.setTimeout(() => { this.copied = false }, 1800)
+            await this.requestJson('./api/lsp/pairing', { method: 'DELETE' })
+            this.pendingPairings = []
+            this.selectedPairingId = ''
+            this.pairingPin = ''
           } catch (error) {
-            this.invitationError = this.$t('lsp_clients.copy_failed')
+            this.pairingError = error.message
           } finally {
-            this.copying = false
+            this.pairingBusy = false
           }
+        },
+        pairingStateLabel(state) {
+          const labels = {
+            'awaiting-pin': 'lsp_clients.state_awaiting_pin',
+            deriving: 'lsp_clients.state_deriving',
+            'challenge-ready': 'lsp_clients.state_challenge_ready',
+            cooldown: 'lsp_clients.state_cooldown',
+          }
+          return this.$t(labels[state] || 'lsp_clients.state_unknown')
+        },
+        pairingPermissionLabels(mask) {
+          return this.permissionOptions
+            .filter(permission => (Number(mask) & (1 << permission.bit)) !== 0)
+            .map(permission => this.$t(permission.label))
+            .join(', ')
+        },
+        pairingExpiry(expiresAt) {
+          const seconds = Math.max(0, Number(expiresAt) - Math.floor(Date.now() / 1000))
+          return this.$t('lsp_clients.expires_in', { seconds })
         },
         async loadClients() {
           const refreshRevision = this.clientMutationRevision

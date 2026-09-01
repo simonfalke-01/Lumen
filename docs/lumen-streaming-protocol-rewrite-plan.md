@@ -47,7 +47,7 @@ smallest decisive verification both pass. Source-only scaffolding remains
 | Shared portable C++23 core | **Done** | Photon is canonical at `git@github.com:simonfalke-01/Photon.git` commit `b32af9c516a81cf055b687b5aa88565b9927cec9`, aggregate digest `27c71a42…d2757f6`; Lumen's offline lock/manifest/source-identity check and the LSPC, RTP, input, media, O(1) repair, replay, pacing, congestion, DPLPMTUD, telemetry, AV1 receive, token-retained reassembly, and reconnect-fence checks pass | Update Photon first, then advance each product's reviewed lock and source-identical mirror with its normal sync utility |
 | Umbra `CLSPCore` C ABI and mirror | **Done** | ABI v2, digest gate, real UDP/kqueue wolfSSL/libSRTP runtime, exact multi-SSRC policies, token-retained two-frame reassembly, retained complete encoded-access-unit buffers, complete-Opus/timing callbacks, reverse-microphone sender, and warnings-as-errors product builds pass | Extend the ABI only at coarse input, completed-media, lifecycle, and telemetry boundaries |
 | Lumen configuration, build, UI, and discovery foundation | **Done** | LSP config/UI, real runtime factory, active-only `_lumen-stream._udp`, digest gate, application/test builds, web build, and focused config/mDNS/LSP checks pass | Repeat the provider-enabled full product link on Windows/UCRT64 |
-| LSP host security/session foundation | **In progress** | Real nonblocking UDP ownership, wolfSSL DTLS 1.3, libSRTP contexts, fresh LSP identity persistence, invitations, pairing/authentication, LSP-only trust, LSPC reliability, browsing, and trusted-client administration are wired | Run the first real Lumen↔Umbra authenticated pairing/browse session and repeat on Windows/UCRT64 |
+| LSP host security/session foundation | **In progress** | Real nonblocking UDP ownership, wolfSSL DTLS 1.3, libSRTP contexts, fresh LSP identity persistence, dedicated-exporter SPAKE2-P256 six-digit PIN pairing, pairing/authentication, LSP-only trust, LSPC reliability, browsing, and trusted-client administration are wired. URI/QR invitations are removed; max-four 120-second sessions use selected-session async scrypt, uniqueness/rate fences, atomic insert-if-absent trust, exact completed-result replay, and persist before success. | Run the first real Lumen↔Umbra PIN pairing/browse session, including lost RESULT recovery, and repeat on Windows/UCRT64 |
 | Frozen input wire/state primitives | **Done** | Ten focused tests pass across pointer/edge wire, device/sensor keys, baseline atomicity, loss/reorder, LSPI, LSPG, rates, and text barriers | Extend only when another input wire or safety invariant is implemented |
 | Remaining input schemas and product integration | **In progress** | Umbra commit `2df4cd2`; native IOHID/GameController input, public touch lifecycle, authenticated retry-safe LSPG ACKs, LED, CoreHaptics rumble, adaptive triggers, and motion commands are wired; Lumen applies all negotiated input classes and sends generation-qualified controller output | Prove the real Lumen↔Umbra path with physical 1/8 kHz pointer, controller, touch, and output devices |
 | Audio/video media primitives | **Done** | Seventeen focused tests verify H.264, HEVC, AV1, Opus, path limits, complete-frame admission, retained and pooled two-frame reassembly, decoder credits, and mailbox depth one; a direct 100,000-frame check records zero pooled-reassembly allocations after configuration | Extend only when another negotiated codec or frame-pipeline invariant is implemented |
@@ -179,7 +179,7 @@ Sources/UmbraLSPTransport/
 
 Sources/UmbraLSP/
   LSPClientSession.swift           auth and connection state
-  LSPPairing.swift                 invitation and pairing
+  LSPPairing.swift                 numeric PIN and SPAKE pairing
   LSPNegotiation.swift             START/config schemas
   LSPSessionCoordinator.swift      product integration
 ```
@@ -357,7 +357,7 @@ Pair, authenticate, browse applications, and stop over the new connection.
 
 ### Work
 
-- Implement invitation encoding and parsing.
+- Implement numeric-PIN SPAKE2 pairing and dedicated exporter binding.
 - Add server cookie admission and DTLS association ownership.
 - Implement host pin and application identity verification.
 - Implement the 48-byte LSPC frame.
@@ -376,7 +376,7 @@ request and observe exactly one side effect with a cached response.
 
 ### Tests retained
 
-- invitation canonical encoding;
+- PIN control-map, AAD, confirmation, and identity-signature encoding;
 - complete authentication transcripts;
 - ACK bitmap and wrap rejection;
 - forward message-ID jump beyond the 64-frame live window;

@@ -12,11 +12,15 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 
 namespace lumen::lsp {
   inline constexpr std::size_t dtls_srtp_exporter_size = 56;  ///< RFC 5764 exporter size for AES-128-GCM.
   inline constexpr std::size_t srtp_aes_128_key_size = 16;  ///< AES-128 SRTP master-key size.
   inline constexpr std::size_t srtp_aead_salt_size = 12;  ///< RFC 7714 AEAD SRTP master-salt size.
+  inline constexpr std::size_t pairing_exporter_size = 32;  ///< Dedicated LSP pairing exporter size.
+  inline constexpr std::string_view pairing_exporter_label =
+    "EXPORTER-Lumen-LSP-Pairing-v1";  ///< Dedicated TLS exporter label; never reused for SRTP.
 
   /**
    * @brief Directional RFC 5764 keying material exported by one DTLS association.
@@ -32,12 +36,16 @@ namespace lumen::lsp {
     std::array<std::uint8_t, srtp_aead_salt_size> server_write_salt {};  ///< Server-to-client SRTP master salt.
   };
 
+  using PairingExporter =
+    std::array<std::uint8_t, pairing_exporter_size>;  ///< Per-association pairing transcript binding.
+
   /**
    * @brief Authenticated security result for a completed LSP DTLS association.
    */
   struct DtlsAssociationSecurity {
     Digest256 server_spki_sha256 {};  ///< SHA-256 of the server certificate's complete DER SubjectPublicKeyInfo.
     DtlsSrtpKeyMaterial srtp {};  ///< Directional SRTP master keys and salts.
+    PairingExporter pairing_exporter {};  ///< Dedicated TLS exporter with the LSP pairing label and empty context.
   };
 
   /**

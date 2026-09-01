@@ -10,7 +10,9 @@
 #include "../input_plane/rate.h"
 #include "../media/frame_pipeline.h"
 #include "../packet_classifier.h"
+#include "../security/secure_zero.h"
 #include "../security/wolfssl_dtls_server.h"
+#include "../security/wolfssl_spake2.h"
 #include "../service.h"
 #include "../session_authority.h"
 #include "../ssrc_registry.h"
@@ -87,7 +89,6 @@ namespace lumen::lsp::runtime {
   namespace {
     constexpr std::size_t runtime_receive_batch = 64;
     constexpr std::uint32_t runtime_poll_milliseconds = 2;
-    constexpr std::uint64_t invitation_lifetime_seconds = 10U * 60U;
     constexpr std::uint64_t attach_grace_microseconds = 10U * 1'000'000U;
     constexpr std::uint64_t attach_readiness_deadline_microseconds = 3U * 1'000'000U;
     constexpr std::array<std::uint8_t, 4> lspp_app_name {'L', 'S', 'P', 'P'};  ///< Exact path-probe APP name.
@@ -218,6 +219,55 @@ namespace lumen::lsp::runtime {
           state.put(base + ".revocation_generation", client.revocation_generation);
           state.put(base + ".enabled", client.enabled);
         });
+      }
+
+      TrustInsertResult insert_if_absent(
+        const TrustedClient &client,
+        TrustedClient &effective
+      ) noexcept override {
+        if (!client.valid()) {
+          return TrustInsertResult::failure;
+        }
+        auto outcome = TrustInsertResult::failure;
+        try {
+          const auto base = "lsp.trusted_clients." + lowercase_hex(client.client_id);
+          const auto updated = http::update_state_file(state_file_.string(), [&](http::state_file_tree_t &state) {
+            const auto stored_key = state.get_optional<std::string>(base + ".identity_key");
+            const auto stored_permissions = state.get_optional<std::uint32_t>(base + ".permissions");
+            const auto stored_revocation = state.get_optional<std::uint32_t>(base + ".revocation_generation");
+            const auto stored_enabled = state.get_optional<bool>(base + ".enabled");
+            if (stored_key || stored_permissions || stored_revocation || stored_enabled) {
+              TrustedClient stored {.client_id = client.client_id};
+              const auto permission_set = stored_permissions ? PermissionSet::from_mask(*stored_permissions) : std::nullopt;
+              if (!stored_key || !permission_set || !stored_revocation ||
+                  !decode_hex(*stored_key, stored.identity_key)) {
+                outcome = TrustInsertResult::failure;
+                return;
+              }
+              stored.permissions = *permission_set;
+              stored.revocation_generation = *stored_revocation;
+              stored.enabled = stored_enabled.value_or(true);
+              if (!stored.valid()) {
+                outcome = TrustInsertResult::failure;
+                return;
+              }
+              effective = stored;
+              outcome = stored.identity_key == client.identity_key ?
+                          TrustInsertResult::identical :
+                          TrustInsertResult::conflict;
+              return;
+            }
+            state.put(base + ".identity_key", lowercase_hex(client.identity_key));
+            state.put(base + ".permissions", client.permissions.mask());
+            state.put(base + ".revocation_generation", client.revocation_generation);
+            state.put(base + ".enabled", client.enabled);
+            effective = client;
+            outcome = TrustInsertResult::inserted;
+          });
+          return updated ? outcome : TrustInsertResult::failure;
+        } catch (...) {
+          return TrustInsertResult::failure;
+        }
       }
 
       std::vector<TrustedClientSummary> list() noexcept {
@@ -411,9 +461,67 @@ namespace lumen::lsp::runtime {
       bool ready_ {};  ///< Complete crypto-boundary readiness.
     };
 
+    /** @brief Control-server adapter retaining one confirmed wolfSSL host SPAKE session. */
+    class WolfsslControlPairingSession final: public ControlPairingSpakeSession {
+    public:
+      /** @brief Adopt one initialized wolfSSL host session. */
+      explicit WolfsslControlPairingSession(std::unique_ptr<WolfsslSpake2HostSession> session) noexcept:
+          session_ {std::move(session)} {
+      }
+
+      bool finish(
+        const std::array<std::uint8_t, pairing_confirmation_size> &confirmation_a,
+        std::array<std::uint8_t, pairing_confirmation_size> &confirmation_b
+      ) noexcept override {
+        if (!session_) {
+          return false;
+        }
+        Spake2SharedKey shared_key {};
+        const auto status = session_->verify_client_confirmation(confirmation_a, confirmation_b, shared_key);
+        secure_zero(shared_key);
+        session_.reset();
+        return status == Spake2Status::success;
+      }
+
+    private:
+      std::unique_ptr<WolfsslSpake2HostSession> session_;  ///< Secret provider session consumed exactly once.
+    };
+
+    /** @brief Dedicated-worker adapter from control pairing inputs to wolfSSL SPAKE2-P256. */
+    class WolfsslControlPairingProvider final: public ControlPairingProvider {
+    public:
+      std::unique_ptr<ControlPairingSpakeSession> approve(
+        const ControlPairingApprovalInput &input,
+        std::array<std::uint8_t, pairing_spake_point_size> &point_b
+      ) noexcept override {
+        std::array<char, spake2_pin_size> pin {};
+        std::ranges::transform(input.pin_digits, pin.begin(), [](const std::uint8_t digit) {
+          return static_cast<char>(digit);
+        });
+        Spake2Status status {Spake2Status::crypto_failure};
+        auto session = WolfsslSpake2HostSession::create(
+          Spake2Inputs {
+            .pin = std::string_view {pin.data(), pin.size()},
+            .salt = input.scrypt_salt,
+            .identity_a = input.client_id,
+            .identity_b = input.host_id,
+          },
+          status
+        );
+        secure_zero(pin);
+        if (!session || status != Spake2Status::success ||
+            session->receive_client_point(input.point_a, input.final_aad, point_b) != Spake2Status::success) {
+          point_b = {};
+          return nullptr;
+        }
+        return std::unique_ptr<ControlPairingSpakeSession> {
+          new (std::nothrow) WolfsslControlPairingSession {std::move(session)}
+        };
+      }
+    };
+
     bool valid_runtime_config(const HostRuntimeConfig &config) noexcept {
-      return config.host.valid() && !config.identity_file.empty() && !config.state_file.empty() &&
-             !config.host_name.empty() && config.host_name.size() <= 255;
+      return config.host.valid() && !config.identity_file.empty() && !config.state_file.empty();
     }
 
     /**
@@ -525,9 +633,10 @@ namespace lumen::lsp::runtime {
       }
       identity_ = std::move(*identity);
       crypto_ = std::make_unique<WolfsslControlCrypto>(identity_);
+      pairing_provider_ = std::make_unique<WolfsslControlPairingProvider>();
       trust_store_ = std::make_unique<PersistentTrustStore>(config_.state_file);
       applications_ = std::make_unique<ProcessApplicationProvider>();
-      if (!crypto_ || !crypto_->ready() || !trust_store_ || !applications_) {
+      if (!crypto_ || !crypto_->ready() || !pairing_provider_ || !trust_store_ || !applications_) {
         return RuntimeCreateStatus::crypto_failed;
       }
 
@@ -574,6 +683,8 @@ namespace lumen::lsp::runtime {
         *applications_,
         static_cast<ControlStartHandler &>(*this),
         *crypto_,
+        *pairing_provider_,
+        config_.host.pairing_permissions,
         static_cast<ControlTransport &>(*this)
       );
       if (!control_) {
@@ -590,10 +701,6 @@ namespace lumen::lsp::runtime {
       const auto result = service_->start();
       if (result != ServiceStartResult::started) {
         return result;
-      }
-      if (!create_pairing_invitation()) {
-        service_->stop();
-        return ServiceStartResult::dtls_provider_not_ready;
       }
       active_ = true;
       try {
@@ -655,7 +762,9 @@ namespace lumen::lsp::runtime {
         clear_attach_lifecycle();
         clear_session_ssrc_history();
       }
-      pairing_uri_.reset();
+      if (control_) {
+        control_->cancel_pairings();
+      }
     }
 
     [[nodiscard]] bool active() const noexcept override {
@@ -673,16 +782,10 @@ namespace lumen::lsp::runtime {
           {"v", "1"},
           {"id", lowercase_hex(identity_.host_id)},
           {"caps", capability_hex(config_.host.pairing_permissions)},
+          {"pair", "pin1"},
+          {"spki", lowercase_hex(dtls_->server_spki_sha256())},
         },
       };
-    }
-
-    std::optional<std::string> pairing_invitation_uri() const override {
-      std::scoped_lock lock(administration_mutex_);
-      if (!active_ || utc_seconds() >= pairing_expiration_utc_seconds_) {
-        return std::nullopt;
-      }
-      return pairing_uri_;
     }
 
     RuntimeAdministrationSnapshot administration_snapshot() const override {
@@ -695,9 +798,26 @@ namespace lumen::lsp::runtime {
         .active = active(),
         .profile = config_.host.profile,
         .port = config_.host.port,
-        .invitation_uri = pairing_invitation_uri(),
+        .pending_pairings = control_ ? control_->pairing_count(utc_seconds()) : 0,
         .reconnect = reconnect,
       };
+    }
+
+    std::vector<PendingPairingSummary> pending_pairings() noexcept override {
+      return control_ ? control_->pending_pairings(utc_seconds()) : std::vector<PendingPairingSummary> {};
+    }
+
+    std::size_t submit_pairing_pin(
+      const Identifier128 &pairing_session_id,
+      const std::array<std::uint8_t, 6> &pin_digits
+    ) noexcept override {
+      return active_ && control_ ? control_->submit_pairing_pin(pairing_session_id, pin_digits, utc_seconds()) : 0;
+    }
+
+    void cancel_pairings() noexcept override {
+      if (control_) {
+        control_->cancel_pairings();
+      }
     }
 
     std::vector<TrustedClientSummary> trusted_clients() noexcept override {
@@ -726,28 +846,6 @@ namespace lumen::lsp::runtime {
         control_->disconnect_client(client_id);
       }
       return true;
-    }
-
-    std::optional<std::string> issue_pairing_invitation() noexcept override {
-      std::scoped_lock lock(administration_mutex_);
-      if (!active_ || !control_) {
-        return std::nullopt;
-      }
-      control_->revoke_invitations();
-      pairing_uri_.reset();
-      if (!create_pairing_invitation()) {
-        return std::nullopt;
-      }
-      return pairing_uri_;
-    }
-
-    void revoke_pairing_invitation() noexcept override {
-      std::scoped_lock lock(administration_mutex_);
-      if (control_) {
-        control_->revoke_invitations();
-      }
-      pairing_uri_.reset();
-      pairing_expiration_utc_seconds_ = 0;
     }
 
   private:
@@ -3317,30 +3415,6 @@ namespace lumen::lsp::runtime {
       return crypto_ && crypto_->equal_secret(presented, expected);
     }
 
-    bool create_pairing_invitation() noexcept {
-      PairingInvitation invitation {
-        .host_id = identity_.host_id,
-        .host_identity_key = identity_.application_public_key,
-        .dtls_spki_sha256 = dtls_->server_spki_sha256(),
-        .port = config_.host.port,
-        .host = config_.host_name,
-        .expires_at_utc_seconds = utc_seconds() + invitation_lifetime_seconds,
-        .offered_permissions = config_.host.pairing_permissions,
-      };
-      if (!crypto_->random(invitation.invitation_id) || !crypto_->random(invitation.invitation_secret) ||
-          !control_->add_invitation(invitation)) {
-        return false;
-      }
-      auto encoded = encode_invitation_uri(invitation);
-      std::ranges::fill(invitation.invitation_secret, 0);
-      if (!encoded) {
-        return false;
-      }
-      pairing_uri_ = std::move(*encoded);
-      pairing_expiration_utc_seconds_ = invitation.expires_at_utc_seconds;
-      return true;
-    }
-
     void run(const std::stop_token stop_token) noexcept {
       while (!stop_token.stop_requested() && active_) {
         (void) socket_.wait_readable(runtime_poll_milliseconds);
@@ -3733,7 +3807,7 @@ namespace lumen::lsp::runtime {
           !runtime.srtp_->install_association(peer, security.srtp)) {
         return false;
       }
-      const auto generation = runtime.control_->association_ready(peer);
+      const auto generation = runtime.control_->association_ready(peer, security.pairing_exporter);
       if (generation == 0) {
         runtime.srtp_->remove_association(peer);
         return false;
@@ -4010,6 +4084,7 @@ namespace lumen::lsp::runtime {
     HostIdentity identity_;  ///< Fresh LSP-only identity and credentials.
     NativeUdpSocket socket_;  ///< One nonblocking application socket.
     std::unique_ptr<WolfsslControlCrypto> crypto_;  ///< Application identity crypto.
+    std::unique_ptr<WolfsslControlPairingProvider> pairing_provider_;  ///< Dedicated-worker wolfSSL SPAKE adapter.
     std::unique_ptr<PersistentTrustStore> trust_store_;  ///< Distinct LSP trust persistence.
     std::unique_ptr<ProcessApplicationProvider> applications_;  ///< Product application snapshot.
     std::unique_ptr<LibsrtpServerProvider> srtp_;  ///< Concrete SRTP/SRTCP provider.
@@ -4064,10 +4139,7 @@ namespace lumen::lsp::runtime {
     std::array<std::unique_ptr<ActiveVideoRuntime>, 64> pending_video_retirements_ {};  ///< Video owners awaiting callback-safe capture/sender joins.
     std::array<std::unique_ptr<LspMicrophoneReceiver>, 64> pending_microphone_retirements_ {};  ///< Microphone owners awaiting callback-safe destruction.
     std::jthread worker_;  ///< Socket receive/control timer owner.
-    std::optional<std::string> pairing_uri_;  ///< Current UI-bound invitation issuance copy.
-    std::uint64_t pairing_expiration_utc_seconds_ {};  ///< Current invitation expiry.
     std::atomic<bool> active_ {};  ///< Listener/worker availability.
-    mutable std::recursive_mutex administration_mutex_;  ///< Synchronizes invitation and web administration state.
   };
 #endif
 
@@ -4104,6 +4176,26 @@ namespace lumen::lsp::runtime {
     return registered_runtime ? registered_runtime->trusted_clients() : std::vector<TrustedClientSummary> {};
   }
 
+  std::vector<PendingPairingSummary> administration_pending_pairings() {
+    std::scoped_lock lock(runtime_registry_mutex);
+    return registered_runtime ? registered_runtime->pending_pairings() : std::vector<PendingPairingSummary> {};
+  }
+
+  std::size_t administration_submit_pairing_pin(
+    const Identifier128 &pairing_session_id,
+    const std::array<std::uint8_t, 6> &pin_digits
+  ) {
+    std::scoped_lock lock(runtime_registry_mutex);
+    return registered_runtime ? registered_runtime->submit_pairing_pin(pairing_session_id, pin_digits) : 0;
+  }
+
+  void administration_cancel_pairings() {
+    std::scoped_lock lock(runtime_registry_mutex);
+    if (registered_runtime) {
+      registered_runtime->cancel_pairings();
+    }
+  }
+
   bool administration_update_trusted_client(
     const Identifier128 &client_id,
     const PermissionSet permissions,
@@ -4118,15 +4210,4 @@ namespace lumen::lsp::runtime {
     return registered_runtime && registered_runtime->revoke_trusted_client(client_id);
   }
 
-  std::optional<std::string> administration_issue_pairing_invitation() {
-    std::scoped_lock lock(runtime_registry_mutex);
-    return registered_runtime ? registered_runtime->issue_pairing_invitation() : std::nullopt;
-  }
-
-  void administration_revoke_pairing_invitation() {
-    std::scoped_lock lock(runtime_registry_mutex);
-    if (registered_runtime) {
-      registered_runtime->revoke_pairing_invitation();
-    }
-  }
 }  // namespace lumen::lsp::runtime

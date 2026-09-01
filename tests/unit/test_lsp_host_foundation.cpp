@@ -3,7 +3,6 @@
  * @brief Concrete invariant tests for the host-side LSP foundation.
  */
 
-#include "src/protocol_lsp/invitation.h"
 #include "src/protocol_lsp/packet_classifier.h"
 #include "src/protocol_lsp/runtime/udp_socket.h"
 #include "src/protocol_lsp/service.h"
@@ -31,21 +30,6 @@ namespace {
 
   lsp::PermissionSet permissions(const std::uint32_t mask = lsp::PermissionSet::default_pairing_mask) {
     return *lsp::PermissionSet::from_mask(mask);
-  }
-
-  lsp::PairingInvitation invitation() {
-    return {
-      .version = lsp::wire_version,
-      .host_id = filled<16>(1),
-      .host_identity_key = filled<32>(2),
-      .dtls_spki_sha256 = filled<32>(3),
-      .port = lsp::default_udp_port,
-      .host = "lumen-host.local",
-      .invitation_id = filled<16>(4),
-      .invitation_secret = filled<32>(5),
-      .expires_at_utc_seconds = 1'900'000'000,
-      .offered_permissions = permissions(),
-    };
   }
 
   lsp::AuthenticatedClient client(const std::uint32_t connection_generation = 10) {
@@ -327,27 +311,6 @@ TEST(LspNativeUdpSocket, BindsNoFragmentDualStackAndPreservesMappedIpv4Peers) {
   );
   EXPECT_TRUE(received);
   socket.close();
-}
-
-TEST(LspInvitation, RoundTripsExactDeterministicFragmentUri) {
-  const auto model = invitation();
-  const auto first = lsp::encode_invitation_uri(model);
-  ASSERT_TRUE(first);
-  ASSERT_TRUE(first->starts_with(lsp::invitation_uri_prefix));
-  EXPECT_EQ(first->find('='), std::string::npos);
-  const auto decoded = lsp::decode_invitation_uri(*first);
-  ASSERT_TRUE(decoded);
-  EXPECT_EQ(*decoded, model);
-  EXPECT_EQ(lsp::encode_invitation_uri(*decoded), first);
-  EXPECT_FALSE(decoded->expired(decoded->expires_at_utc_seconds - 1));
-  EXPECT_TRUE(decoded->expired(decoded->expires_at_utc_seconds));
-
-  EXPECT_EQ(lsp::decode_invitation_uri(*first + "=").error(), lsp::InvitationError::invalid_base64url);
-  EXPECT_EQ(lsp::decode_invitation_uri("https://pair/lsp1#abc").error(), lsp::InvitationError::invalid_uri);
-  EXPECT_EQ(lsp::decode_invitation_uri("umbra://pair/lsp1#_w").error(), lsp::InvitationError::invalid_cbor);
-  auto zero_secret = model;
-  zero_secret.invitation_secret = {};
-  EXPECT_EQ(lsp::encode_invitation_uri(zero_secret).error(), lsp::InvitationError::invalid_model);
 }
 
 TEST(LspSsrcRegistry, AcceptsExactLaneMappingsAndRejectsAmbiguity) {

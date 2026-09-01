@@ -40,6 +40,8 @@ TEST(MdnsServiceDescriptorTest, AcceptsLegacyAndExactLspRecords) {
       {"v", "1"},
       {"id", "00112233445566778899aabbccddeeff"},
       {"caps", "0000000000000057"},
+      {"pair", "pin1"},
+      {"spki", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"},
     },
   };
   EXPECT_TRUE(platf::publish::valid_service(legacy));
@@ -61,6 +63,12 @@ TEST(MdnsServiceDescriptorTest, AcceptsLegacyAndExactLspRecords) {
   auto invalid_capabilities = lsp;
   invalid_capabilities.txt[2].second = "57";
   EXPECT_FALSE(platf::publish::valid_service(invalid_capabilities));
+  auto invalid_pairing = lsp;
+  invalid_pairing.txt[3].second = "uri1";
+  EXPECT_FALSE(platf::publish::valid_service(invalid_pairing));
+  auto invalid_spki = lsp;
+  invalid_spki.txt[4].second = "0011";
+  EXPECT_FALSE(platf::publish::valid_service(invalid_spki));
 }
 
 /**

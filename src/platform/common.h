@@ -1326,10 +1326,12 @@ namespace platf {
                         (character >= 'a' && character <= 'f');
                });
       };
-      return service.type == LSP_SERVICE_TYPE && service.txt.size() == 3 &&
+      return service.type == LSP_SERVICE_TYPE && service.txt.size() == 5 &&
              service.txt[0] == std::pair {std::string {"v"}, std::string {"1"}} &&
              service.txt[1].first == "id" && lowercase_hex(service.txt[1].second, 32) &&
-             service.txt[2].first == "caps" && lowercase_hex(service.txt[2].second, 16);
+             service.txt[2].first == "caps" && lowercase_hex(service.txt[2].second, 16) &&
+             service.txt[3] == std::pair {std::string {"pair"}, std::string {"pin1"}} &&
+             service.txt[4].first == "spki" && lowercase_hex(service.txt[4].second, 64);
     }
 
     /**

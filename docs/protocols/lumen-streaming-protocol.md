@@ -75,7 +75,7 @@ remain external variables. Implementations report measured stages separately.
 
 Wire version 1 defines:
 
-- discovery and pairing invitations;
+- discovery and numeric-PIN SPAKE2 pairing;
 - DTLS peer authentication and client authorization;
 - deterministic reliable control over DTLS datagrams;
 - application enumeration, start, attach, stop, and teardown;
@@ -137,7 +137,8 @@ LSP uses out-of-band deterministic CBOR negotiation and does not use SDP.
 - DTLS ALPN: exact ASCII `lumen-stream/1`.
 - Default UDP port: `48030`.
 - mDNS service type: `_lumen-stream._udp`.
-- Invitation URI: `umbra://pair/lsp1#<base64url>`.
+- Pairing discovery: TXT `pair=pin1` plus lowercase `spki=<sha256>`.
+- Pairing schema: unsigned integer `1` within PIN control maps.
 
 Every control message contains its assigned version discriminator. LSP/1 maps
 use wire version one except that nested video offers and selections and
@@ -243,27 +244,95 @@ Every later connection verifies both identities. Certificate rotation is a
 signed, acknowledged control operation and never follows an untrusted network
 hint.
 
-### 6.3 Pairing invitation
+### 6.3 Numeric PIN pairing
 
-The base64url invitation body is deterministic CBOR containing exactly:
+Discovery advertises `pair=pin1` and the lowercase SHA-256 SPKI digest in TXT
+key `spki`. No URI, QR code, bearer invitation, or migrated trust participates
+in LSP pairing. Umbra selects a discovered host and displays a random six-digit
+PIN. The user enters those exact digits in the authenticated Lumen
+administration surface.
 
-| Key | Value |
-| ---: | --- |
-| 1 | wire version `1` |
-| 2 | host ID, 16 bytes |
-| 3 | host Ed25519 public key, 32 bytes |
-| 4 | DTLS leaf SPKI SHA-256, 32 bytes |
-| 5 | nonzero UDP port |
-| 6 | hostname or IP literal |
-| 7 | random invitation ID, 16 bytes |
-| 8 | random single-use invitation secret, 32 bytes |
-| 9 | expiration, whole UTC seconds |
-| 10 | offered permission mask |
+Pairing uses RFC 9382 SPAKE2-P256 with scrypt `N=32768`, `r=8`, `p=1`, a
+client-selected 16-byte salt, uncompressed 65-byte SEC1 points, full 32-byte
+HMAC-SHA-256 confirmations, and Ed25519 identity signatures. Lumen performs
+scrypt and host-point work on a dedicated worker, never the UDP socket or HTTP
+thread. It retains at most four sessions host-wide, one per source address and
+association, for exactly 120 seconds. Each session permits at most three
+approval generations with a retry cooldown. Pending client IDs and Ed25519
+keys are independently unique. PIN administration names one non-secret session
+ID in `X-LSP-Pairing-Session`, while the `text/plain` body remains exactly six
+ASCII digits. The host validates `Content-Length: 6` before allocating or
+reading the body, never logs or echoes it, and unrelated pending clients
+consume no challenge attempt.
 
-The fragment portion of the URI prevents normal HTTP referral leakage. The
-invitation secret is accepted once, expires, and is stored only as a salted
-verifier on the host. Pairing signs the complete client and server nonce
-transcript with both application identity keys.
+POLL starts with a 20 ms floor and doubles to at most one second. Four
+consecutive early POLLs trigger a one-second cooldown; accepted POLLs reset the
+early-abuse counter. The administration API publishes the proposed client ID,
+SHA-256 key fingerprint, effective permissions, and explicitly unverified
+client-supplied name without any PIN, point, confirmation, nonce, AAD, or
+exporter material.
+
+PIN-to-scalar derivation is frozen as follows; implementations MUST NOT apply
+Unicode normalization, decimal conversion, a terminating NUL, a protocol
+label, or either identity to these inputs:
+
+1. `password` is exactly the six ASCII digit bytes as displayed and entered,
+   in left-to-right order. Every byte must be `0x30...0x39`.
+2. `salt_input` is exactly the 16 bytes of the `PAIR_BEGIN` `scrypt_salt`
+   value, in unchanged wire order.
+3. `dk = scrypt(password, salt_input, N=32768, r=8, p=1, dkLen=32)`.
+4. `integer = OS2IP(dk)`, interpreting `dk` as one unsigned big-endian
+   integer.
+5. `w = integer mod q`, where the P-256 subgroup order is
+   `q = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551`.
+6. `w` is encoded in TT as exactly 32 unsigned big-endian bytes. A zero result
+   is rejected, all derived state is cleared, and the pairing attempt is
+   restarted with a fresh random `scrypt_salt`; the same zero scalar is never
+   used or silently changed to one.
+
+The fixed PIN-to-w vector is:
+
+| Value | Hexadecimal bytes |
+| --- | --- |
+| PIN ASCII | `313233343536` (`123456`) |
+| `salt_input` | `000102030405060708090a0b0c0d0e0f` |
+| 32-byte scrypt output | `2c96fb20f5af7503bd94936a79d3e5e0a068ee179925f84628b9ca753cb0199d` |
+| 32-byte `w` | `2c96fb20f5af7503bd94936a79d3e5e0a068ee179925f84628b9ca753cb0199d` |
+
+The request/response-only registry freezes these maps:
+
+- `PAIR_BEGIN` exact nine keys: wire/schema, client ID, client Ed25519 key,
+  UTF-8 name, client pairing nonce, scrypt salt, `pA`, requested permissions;
+- `PAIR_PENDING` exact six keys: wire/status/schema, host session ID, absolute
+  expiry, effective permissions;
+- `PAIR_POLL` exact three keys: wire/schema/session ID;
+- `PAIR_CHALLENGE` exact seven keys: wire/schema/session ID, approval
+  generation, `pB`, effective permissions, unchanged expiry;
+- `PAIR_FINISH` exact six keys: wire/schema/session ID, approval generation,
+  `cA`, client Ed25519 signature; and
+- `PAIR_RESULT` exact nine keys: wire/status/schema/session ID, approval
+  generation, permissions, persisted revocation generation, `cB`, host
+  Ed25519 signature.
+
+SPAKE confirmation AAD is exact deterministic CBOR with 18 ordered fields:
+label, pairing schema, host ID/key/SPKI, client ID/key, host pairing session,
+client pairing nonce, connection and approval generations, both 32-byte hello
+nonces, scrypt salt, requested and effective permissions, expiry, and the
+dedicated 32-byte TLS exporter from label
+`EXPORTER-Lumen-LSP-Pairing-v1` with empty context. It never reuses the
+DTLS-SRTP exporter. SPAKE TT independently binds both identities and points.
+Trust is persisted before success is sent. Failure never falls back to legacy
+pairing and never creates partial LSP trust. Persistence uses atomic
+insert-if-absent semantics: it cannot overwrite or reset an existing client.
+An identical ID/key recovery preserves the existing permissions and revocation
+generation. BEGIN must request every stored permission, and PENDING,
+confirmation AAD, CHALLENGE, and RESULT all bind the stored effective mask; a
+concurrent permission change fails the attempt instead of changing its result.
+The host retains four exact completed RESULT payloads keyed by
+session, identity, and association so duplicate FINISH can recover a lost
+response independently of the request-ID cache. After association loss, the
+same identity may repeat PIN pairing safely and receive the unchanged trust
+record.
 
 ### 6.4 SRTP profile
 
@@ -500,8 +569,12 @@ product control operation is enabled. The top-level message types are reserved:
 | ---: | --- | --- |
 | `0x0001` | `CLIENT_HELLO` | client to host |
 | `0x0002` | `SERVER_HELLO` | host to client |
-| `0x0010` | `PAIR_REQUEST` | client to host |
-| `0x0011` | `PAIR_RESPONSE` | host to client |
+| `0x0010` | `PAIR_BEGIN` | client to host |
+| `0x0011` | `PAIR_PENDING` | host to client |
+| `0x0012` | `PAIR_POLL` | client to host |
+| `0x0013` | `PAIR_CHALLENGE` | host to client |
+| `0x0014` | `PAIR_FINISH` | client to host |
+| `0x0015` | `PAIR_RESULT` | host to client |
 | `0x0020` | `AUTH_REQUEST` | client to host |
 | `0x0021` | `AUTH_RESPONSE` | host to client |
 | `0x0100` | `LIST_APPLICATIONS` | client to host |
@@ -1903,6 +1976,11 @@ Initial hard bounds are:
 | active stream per connection | 1 |
 | control frames outstanding per direction | 64 |
 | cached terminal control responses | 64 per connection |
+| pending PIN pairing sessions | 4 host-wide, one per source and association |
+| completed PIN RESULT replay | 4 exact session/identity/association entries |
+| PIN session lifetime | 120 seconds |
+| PIN challenge attempts | 3 per session with cooldown |
+| PIN poll interval | 20 ms exponential floor, 1-second ceiling |
 | cached successful ATTACH intents | 64 per live session |
 | retiring ATTACH associations | 64 per live session |
 | live-session SSRC history | 512 nonzero unique assignments |
@@ -2030,7 +2108,7 @@ interoperability freeze. Product integration must additionally freeze:
 
 - deterministic CBOR schemas for every control type;
 - complete LSPC positive and hostile vectors;
-- invitation and pairing transcripts;
+- PIN/SPAKE pairing maps, AAD, confirmations, and identity-signature transcripts;
 - DTLS-SRTP exporter vectors;
 - SSRC and payload-type negotiation examples;
 - RTP packets for every codec and header-extension combination;

@@ -219,8 +219,6 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/input_plane/rate.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/input_plane/state.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/input_plane/wire.h"
-        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/invitation.cpp"
-        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/invitation.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/audio.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/av1.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/media/common.h"
@@ -253,6 +251,7 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/video_sender.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/runtime/video_sender.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/wolfssl_dtls_server.h"
+        "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/secure_zero.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security_provider.h"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/service.cpp"
         "${CMAKE_SOURCE_DIR}/src/protocol_lsp/service.h"
@@ -314,6 +313,7 @@ set(SUNSHINE_TARGET_FILES
 
 if(LUMEN_ENABLE_LSP_RUNTIME)
     list(APPEND SUNSHINE_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/wolfssl_spake2.cpp"
             "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/wolfssl_dtls_server.cpp")
     list(APPEND SUNSHINE_DEFINITIONS
             LUMEN_LSP_WOLFSSL_AVAILABLE=1

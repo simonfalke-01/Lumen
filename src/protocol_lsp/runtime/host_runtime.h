@@ -6,7 +6,9 @@
 #pragma once
 
 #include "../service.h"
+#include "control_server.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -56,12 +58,12 @@ namespace lumen::lsp::runtime {
     std::uint64_t latest_total_microseconds {};  ///< Latest request-to-terminal-outcome duration.
   };
 
-  /** @brief Web-safe runtime status without key material or invitation secrets. */
+  /** @brief Web-safe runtime status without key, PIN, SPAKE, or exporter material. */
   struct RuntimeAdministrationSnapshot {
     bool active {};  ///< Whether the real UDP listener is active.
     NetworkProfile profile {NetworkProfile::adaptive_low_latency};  ///< Configured network profile.
     std::uint16_t port {};  ///< Configured LSP port.
-    std::optional<std::string> invitation_uri;  ///< Current one-time invitation URI, when unexpired.
+    std::size_t pending_pairings {};  ///< Nonexpired PIN sessions awaiting approval or completion.
     ReconnectTelemetrySnapshot reconnect {};  ///< Secret-free reconnect/rekey timings and outcomes.
   };
 
@@ -72,7 +74,6 @@ namespace lumen::lsp::runtime {
     HostConfig host;  ///< Validated listener and permission configuration.
     std::filesystem::path identity_file;  ///< Exact LSP-only identity path.
     std::filesystem::path state_file;  ///< Shared state file containing only the `lsp` trust subtree for this runtime.
-    std::string host_name;  ///< Hostname carried by fresh pairing invitations.
   };
 
   /**
@@ -86,7 +87,7 @@ namespace lumen::lsp::runtime {
     crypto_failed,  ///< wolfCrypt application identity initialization failed.
     srtp_failed,  ///< libSRTP process/provider initialization failed.
     dtls_failed,  ///< wolfSSL exact-policy provider initialization failed.
-    control_failed,  ///< Control owner or first invitation could not be initialized.
+    control_failed,  ///< Control owner or PIN pairing worker could not be initialized.
     allocation_failed,  ///< A bounded product owner could not be allocated.
   };
 
@@ -117,19 +118,26 @@ namespace lumen::lsp::runtime {
      */
     [[nodiscard]] virtual std::optional<DiscoveryDescriptor> discovery() const = 0;
 
-    /**
-     * @brief Return the current short-lived invitation URI.
-     *
-     * The URI is an application/UI boundary and must not be written to normal
-     * logs. The runtime retains only this issuance copy; control admission
-     * retains a salted verifier and consumes it once.
-     *
-     * @return Current URI while active and unexpired.
-     */
-    [[nodiscard]] virtual std::optional<std::string> pairing_invitation_uri() const = 0;
-
-    /** @brief Return the web-safe runtime status and current invitation. */
+    /** @brief Return the web-safe runtime status and pending PIN-session count. */
     [[nodiscard]] virtual RuntimeAdministrationSnapshot administration_snapshot() const = 0;
+
+    /** @brief Return secret-free pending PIN pairing sessions. */
+    [[nodiscard]] virtual std::vector<PendingPairingSummary> pending_pairings() noexcept = 0;
+
+    /**
+     * @brief Queue one six-digit PIN for asynchronous SPAKE derivation.
+     *
+     * @param pairing_session_id Non-secret selected pending session.
+     * @param pin_digits Exact six ASCII decimal digits.
+     * @return Number of pending sessions admitted to worker processing.
+     */
+    virtual std::size_t submit_pairing_pin(
+      const Identifier128 &pairing_session_id,
+      const std::array<std::uint8_t, 6> &pin_digits
+    ) noexcept = 0;
+
+    /** @brief Cancel every pending LSP PIN pairing session. */
+    virtual void cancel_pairings() noexcept = 0;
 
     /** @brief Return every persisted LSP trusted client without public keys or secrets. */
     [[nodiscard]] virtual std::vector<TrustedClientSummary> trusted_clients() noexcept = 0;
@@ -154,12 +162,6 @@ namespace lumen::lsp::runtime {
      * @return True only after persistent removal.
      */
     virtual bool revoke_trusted_client(const Identifier128 &client_id) noexcept = 0;
-
-    /** @brief Rotate and return a new short-lived single-use pairing invitation. */
-    [[nodiscard]] virtual std::optional<std::string> issue_pairing_invitation() noexcept = 0;
-
-    /** @brief Revoke the current unconsumed pairing invitation. */
-    virtual void revoke_pairing_invitation() noexcept = 0;
   };
 
   /**
@@ -186,17 +188,23 @@ namespace lumen::lsp::runtime {
   /** @brief Return the process runtime's persisted trusted clients. */
   [[nodiscard]] std::vector<TrustedClientSummary> administration_trusted_clients();
 
+  /** @brief Return the process runtime's secret-free pending PIN sessions. */
+  [[nodiscard]] std::vector<PendingPairingSummary> administration_pending_pairings();
+
+  /** @brief Queue a six-digit PIN for the process runtime's pending sessions. */
+  std::size_t administration_submit_pairing_pin(
+    const Identifier128 &pairing_session_id,
+    const std::array<std::uint8_t, 6> &pin_digits
+  );
+
+  /** @brief Cancel every process-runtime pending PIN session. */
+  void administration_cancel_pairings();
+
   /** @brief Update one process-runtime trusted client. */
   bool administration_update_trusted_client(const Identifier128 &client_id, PermissionSet permissions, bool enabled);
 
   /** @brief Revoke one process-runtime trusted client. */
   bool administration_revoke_trusted_client(const Identifier128 &client_id);
-
-  /** @brief Rotate and return the process runtime's pairing invitation. */
-  [[nodiscard]] std::optional<std::string> administration_issue_pairing_invitation();
-
-  /** @brief Revoke the process runtime's current invitation. */
-  void administration_revoke_pairing_invitation();
 
   /**
    * @brief Return compile-time production-provider availability.

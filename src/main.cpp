@@ -50,7 +50,7 @@ namespace {
    */
   [[nodiscard]] lumen::lsp::HostConfig lsp_host_config() noexcept {
     const auto pairing_permissions = lumen::lsp::PermissionSet::from_mask(config::lsp.pairing_permissions)
-                                         .value_or(lumen::lsp::PermissionSet::default_pairing());
+                                       .value_or(lumen::lsp::PermissionSet::default_pairing());
     return {
       .enabled = config::lsp.enabled,
       .port = config::lsp.port,
@@ -542,7 +542,6 @@ int main(int argc, char *argv[]) {
       .host = lsp_host_config(),
       .identity_file = platf::appdata() / "credentials" / "lsp_identity_v1.bin",
       .state_file = config::nvhttp.file_state,
-      .host_name = config::nvhttp.sunshine_name,
     });
     if (created.status != lumen::lsp::runtime::RuntimeCreateStatus::ready || !created.runtime) {
       BOOST_LOG(warning) << "LSP is unavailable on UDP port "sv << config::lsp.port << ": "sv

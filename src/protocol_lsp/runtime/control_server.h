@@ -5,21 +5,31 @@
 
 #pragma once
 
-#include "../invitation.h"
+#include "../security/secure_zero.h"
 #include "control/wire.h"
 #include "identity.h"
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace lumen::lsp::runtime {
   /** @brief Maximum path-safe DTLS application record used by initial LSP control. */
   inline constexpr std::size_t maximum_control_frame_bytes = 1'200;
+
+  /** @brief Dedicated TLS pairing-exporter width bound into every PIN pairing transcript. */
+  inline constexpr std::size_t pairing_dtls_exporter_size = 32;
+
+  /** @brief Dedicated label-separated exporter retained only for an association's pairing state. */
+  using PairingDtlsExporter = std::array<std::uint8_t, pairing_dtls_exporter_size>;
 
   /**
    * @brief Persisted LSP trusted-client record.
@@ -33,6 +43,14 @@ namespace lumen::lsp::runtime {
 
     /** @brief Return whether every trust field is valid. */
     [[nodiscard]] bool valid() const noexcept;
+  };
+
+  /** @brief Atomic persistent pairing insertion outcome. */
+  enum class TrustInsertResult : std::uint8_t {
+    inserted,  ///< New client identity was persisted.
+    identical,  ///< The same client ID/key already exists and was not modified.
+    conflict,  ///< Client ID already belongs to a different identity key.
+    failure,  ///< Persistence or stored-record validation failed.
   };
 
   /**
@@ -59,6 +77,18 @@ namespace lumen::lsp::runtime {
      * @return True only after persistence succeeds.
      */
     virtual bool upsert(const TrustedClient &client) noexcept = 0;
+
+    /**
+     * @brief Atomically insert new trust without overwriting any existing client.
+     *
+     * @param client Proposed initial trust record.
+     * @param effective Persisted record on inserted or identical success.
+     * @return Exact insertion outcome.
+     */
+    virtual TrustInsertResult insert_if_absent(
+      const TrustedClient &client,
+      TrustedClient &effective
+    ) noexcept = 0;
   };
 
   /**
@@ -281,6 +311,94 @@ namespace lumen::lsp::runtime {
     ) noexcept = 0;
   };
 
+  /** @brief Complete fixed PIN/SPAKE approval input executed away from socket and HTTP threads. */
+  struct ControlPairingApprovalInput {
+    std::array<std::uint8_t, 6> pin_digits {};  ///< Exact six ASCII decimal digits entered by the administrator.
+    Identifier128 scrypt_salt {};  ///< Client-selected 16-byte scrypt salt.
+    Identifier128 client_id {};  ///< SPAKE identity A and paired-client identity.
+    Identifier128 host_id {};  ///< SPAKE identity B and stable host identity.
+    std::array<std::uint8_t, pairing_spake_point_size> point_a {};  ///< Client uncompressed P-256 point.
+    std::vector<std::uint8_t> final_aad;  ///< Exact deterministic transcript binding exporter and challenge fields.
+
+    /** @brief Construct empty single-owner approval input. */
+    ControlPairingApprovalInput() = default;
+    ControlPairingApprovalInput(const ControlPairingApprovalInput &) = delete;
+    ControlPairingApprovalInput &operator=(const ControlPairingApprovalInput &) = delete;
+
+    /** @brief Transfer approval ownership and clear the moved-from PIN and AAD. */
+    ControlPairingApprovalInput(ControlPairingApprovalInput &&other) noexcept {
+      move_from(std::move(other));
+    }
+
+    /** @brief Clear current secrets before transferring another approval input. */
+    ControlPairingApprovalInput &operator=(ControlPairingApprovalInput &&other) noexcept {
+      if (this != &other) {
+        clear();
+        move_from(std::move(other));
+      }
+      return *this;
+    }
+
+    /** @brief Securely clear all secret-bearing approval bytes. */
+    ~ControlPairingApprovalInput() {
+      clear();
+    }
+
+    /** @brief Securely clear PIN and final confirmation AAD. */
+    void clear() noexcept {
+      secure_zero(pin_digits);
+      secure_zero(final_aad);
+    }
+
+  private:
+    /** @brief Move fields without retaining duplicated secret bytes in the source. */
+    void move_from(ControlPairingApprovalInput &&other) noexcept {
+      pin_digits = other.pin_digits;
+      scrypt_salt = other.scrypt_salt;
+      client_id = other.client_id;
+      host_id = other.host_id;
+      point_a = other.point_a;
+      final_aad = std::move(other.final_aad);
+      other.clear();
+    }
+  };
+
+  /** @brief One host SPAKE session retained only from challenge publication through FINISH. */
+  class ControlPairingSpakeSession {
+  public:
+    virtual ~ControlPairingSpakeSession() = default;
+
+    /**
+     * @brief Verify `cA` and produce `cB` without releasing key material to control code.
+     *
+     * @param confirmation_a Exact client confirmation.
+     * @param confirmation_b Host confirmation destination.
+     * @return True only after peer confirmation succeeds.
+     */
+    virtual bool finish(
+      const std::array<std::uint8_t, pairing_confirmation_size> &confirmation_a,
+      std::array<std::uint8_t, pairing_confirmation_size> &confirmation_b
+    ) noexcept = 0;
+  };
+
+  /** @brief Synchronous SPAKE provider called only by the dedicated pairing worker. */
+  class ControlPairingProvider {
+  public:
+    virtual ~ControlPairingProvider() = default;
+
+    /**
+     * @brief Perform scrypt and host-point creation for one approved PIN attempt.
+     *
+     * @param input Complete immutable approval input.
+     * @param point_b Host uncompressed P-256 point destination.
+     * @return Retained host session or null on invalid point/provider failure.
+     */
+    [[nodiscard]] virtual std::unique_ptr<ControlPairingSpakeSession> approve(
+      const ControlPairingApprovalInput &input,
+      std::array<std::uint8_t, pairing_spake_point_size> &point_b
+    ) noexcept = 0;
+  };
+
   /**
    * @brief Exact DTLS application-record output and association-close boundary.
    */
@@ -308,39 +426,127 @@ namespace lumen::lsp::runtime {
     virtual void close(const PeerEndpoint &peer) noexcept = 0;
   };
 
-  /**
-   * @brief One active single-use pairing invitation admission record.
-   */
-  struct PendingInvitation {
-    Identifier128 invitation_id {};  ///< Random invitation identifier.
-    Secret256 verifier_salt {};  ///< Random salt retained with the verifier.
-    Digest256 secret_verifier {};  ///< SHA-256 of salt, invitation ID, and secret.
-    std::uint64_t expires_at_utc_seconds {};  ///< Whole-second expiration.
-    PermissionSet permissions {};  ///< Maximum permissions granted by admission.
-    bool consumed {};  ///< Whether a prior successful pairing used the invitation.
+  /** @brief Web-safe state of one pending PIN pairing session. */
+  enum class PairingAdministrationState : std::uint8_t {
+    awaiting_pin,  ///< Waiting for a six-digit administrator entry.
+    deriving,  ///< Dedicated worker is running scrypt and SPAKE point derivation.
+    challenge_ready,  ///< Client may poll the published generation-qualified challenge.
+    cooldown,  ///< A failed challenge is waiting for its bounded retry delay.
+  };
 
-    /** @brief Return whether required fields are nonzero and unconsumed. */
-    [[nodiscard]] bool valid() const noexcept;
+  /** @brief Secret-free pending PIN pairing summary for authenticated administration. */
+  struct PendingPairingSummary {
+    Identifier128 pairing_session_id {};  ///< Random pending session identifier.
+    Identifier128 client_id {};  ///< Proposed stable client identifier.
+    Digest256 identity_key_fingerprint {};  ///< SHA-256 of the proposed Ed25519 public key.
+    std::string client_name;  ///< Client-provided display name.
+    bool client_name_verified {};  ///< Always false until FINISH identity verification succeeds.
+    PermissionSet effective_permissions {};  ///< Host-ceiling intersection fixed at BEGIN.
+    std::uint64_t expires_at_utc_seconds {};  ///< Absolute 120-second expiry.
+    std::uint8_t challenges_used {};  ///< Approval challenges consumed, zero through three.
+    PairingAdministrationState state {PairingAdministrationState::awaiting_pin};  ///< Coarse current state.
+  };
+
+  /** @brief Result of one PIN-session POLL rate admission. */
+  enum class PairingPollResult : std::uint8_t {
+    accepted,  ///< Poll is legal and advances exponential backoff.
+    too_early,  ///< Poll arrived before its floor and increments abuse state.
+    cooldown,  ///< Four early polls triggered or remain within cooldown.
+  };
+
+  /** @brief Allocation-free 20-ms-through-1-s PIN POLL limiter. */
+  struct PairingPollLimiter {
+    std::uint64_t next_poll_microseconds {};  ///< Earliest legal next POLL.
+    std::uint64_t interval_microseconds {20'000};  ///< Current exponential interval.
+    std::uint64_t cooldown_until_microseconds {};  ///< One-second early-abuse cooldown.
+    std::uint8_t early_count {};  ///< Consecutive early POLLs.
+
+    /**
+     * @brief Admit one monotonic POLL and update bounded backoff state.
+     *
+     * @param now_microseconds Current monotonic receive time.
+     * @return Accepted, too-early, or cooldown disposition.
+     */
+    PairingPollResult admit(const std::uint64_t now_microseconds) noexcept {
+      if (now_microseconds < cooldown_until_microseconds) {
+        return PairingPollResult::cooldown;
+      }
+      if (now_microseconds < next_poll_microseconds) {
+        ++early_count;
+        if (early_count >= 4) {
+          early_count = 0;
+          cooldown_until_microseconds = now_microseconds > std::numeric_limits<std::uint64_t>::max() - 1'000'000 ?
+                                          std::numeric_limits<std::uint64_t>::max() :
+                                          now_microseconds + 1'000'000;
+          return PairingPollResult::cooldown;
+        }
+        return PairingPollResult::too_early;
+      }
+      early_count = 0;
+      next_poll_microseconds = now_microseconds > std::numeric_limits<std::uint64_t>::max() - interval_microseconds ?
+                                 std::numeric_limits<std::uint64_t>::max() :
+                                 now_microseconds + interval_microseconds;
+      interval_microseconds = std::min<std::uint64_t>(1'000'000, interval_microseconds * 2U);
+      return PairingPollResult::accepted;
+    }
+  };
+
+  /** @brief Exact non-secret/session-bound fields encoded into PIN confirmation AAD. */
+  struct PairingTranscriptBindings {
+    Identifier128 host_id {};  ///< Stable host identity.
+    PublicKey256 host_identity_key {};  ///< Host Ed25519 public key.
+    Digest256 dtls_spki_sha256 {};  ///< Pinned host certificate SPKI.
+    Identifier128 client_id {};  ///< Proposed stable client identity.
+    PublicKey256 client_identity_key {};  ///< Proposed client Ed25519 public key.
+    Identifier128 pairing_session_id {};  ///< Host-selected pending session identifier.
+    Identifier128 client_pairing_nonce {};  ///< BEGIN pairing nonce.
+    std::uint32_t connection_generation {};  ///< Authenticated DTLS connection generation.
+    std::uint32_t approval_generation {};  ///< Current admin challenge generation.
+    Secret256 client_hello_nonce {};  ///< CLIENT_HELLO nonce.
+    Secret256 server_hello_nonce {};  ///< SERVER_HELLO nonce.
+    Identifier128 scrypt_salt {};  ///< BEGIN scrypt salt.
+    PermissionSet requested_permissions {};  ///< Original BEGIN request.
+    PermissionSet effective_permissions {};  ///< Host-ceiling intersection.
+    std::uint64_t expires_at_utc_seconds {};  ///< Absolute session expiry.
+    PairingDtlsExporter pairing_exporter {};  ///< Dedicated label-separated TLS exporter.
   };
 
   /**
-   * @brief Build the exact deterministic client pairing-signature transcript.
+   * @brief Encode the exact 18-field deterministic pairing confirmation AAD.
    *
-   * @param host_id Stable host identifier.
-   * @param client_id Stable client identifier.
-   * @param invitation_id Presented invitation identifier.
-   * @param client_nonce CLIENT_HELLO nonce.
-   * @param server_nonce SERVER_HELLO nonce.
-   * @param permissions Offered permission mask.
-   * @return Deterministic CBOR transcript bytes, or no value on allocation/encoding failure.
+   * @param bindings Complete association, identity, permission, expiry, and exporter bindings.
+   * @return Deterministic CBOR bytes, or no value for incomplete bindings.
    */
-  [[nodiscard]] std::optional<std::vector<std::uint8_t>> pairing_signature_transcript(
-    const Identifier128 &host_id,
-    const Identifier128 &client_id,
-    const Identifier128 &invitation_id,
-    const Secret256 &client_nonce,
-    const Secret256 &server_nonce,
-    PermissionSet permissions
+  [[nodiscard]] std::optional<std::vector<std::uint8_t>> pairing_confirmation_aad(
+    const PairingTranscriptBindings &bindings
+  );
+
+  /**
+   * @brief Encode the exact client identity-signature transcript.
+   *
+   * @param aad Exact 18-field confirmation AAD.
+   * @param confirmation_a Verified client SPAKE confirmation.
+   * @return Deterministic signature transcript, or no value for invalid inputs.
+   */
+  [[nodiscard]] std::optional<std::vector<std::uint8_t>> pairing_client_signature_transcript(
+    std::span<const std::uint8_t> aad,
+    const std::array<std::uint8_t, pairing_confirmation_size> &confirmation_a
+  );
+
+  /**
+   * @brief Encode the exact host identity-signature transcript.
+   *
+   * @param aad Exact 18-field confirmation AAD.
+   * @param confirmation_a Verified client SPAKE confirmation.
+   * @param confirmation_b Host SPAKE confirmation.
+   * @param revocation_generation Persisted trust generation.
+   * @return Deterministic signature transcript, or no value for invalid inputs.
+   */
+  [[nodiscard]] std::optional<std::vector<std::uint8_t>> pairing_host_signature_transcript(
+    std::span<const std::uint8_t> aad,
+    const std::array<std::uint8_t, pairing_confirmation_size> &confirmation_a,
+    const std::array<std::uint8_t, pairing_confirmation_size> &confirmation_b,
+    std::uint32_t revocation_generation
   );
 
   /**
@@ -375,6 +581,8 @@ namespace lumen::lsp::runtime {
      * @param applications Application snapshot provider.
      * @param start_handler START, ATTACH, and STOP product authority owner.
      * @param crypto Randomness and Ed25519 provider.
+     * @param pairing_provider Synchronous SPAKE provider used only by the dedicated worker.
+     * @param pairing_permissions Host permission ceiling intersected with every BEGIN request.
      * @param transport Exact DTLS record sender.
      * @param maximum_connections Bound from one through 64.
      */
@@ -385,6 +593,8 @@ namespace lumen::lsp::runtime {
       ControlApplicationProvider &applications,
       ControlStartHandler &start_handler,
       ControlCrypto &crypto,
+      ControlPairingProvider &pairing_provider,
+      PermissionSet pairing_permissions,
       ControlTransport &transport,
       std::size_t maximum_connections = 64
     ) noexcept;
@@ -392,27 +602,20 @@ namespace lumen::lsp::runtime {
     HostControlServer(const HostControlServer &) = delete;
     HostControlServer &operator=(const HostControlServer &) = delete;
 
-    /** @brief Destroy all bounded connection and invitation state. */
+    /** @brief Stop the pairing worker and destroy all bounded connection and PIN-session state. */
     ~HostControlServer();
-
-    /**
-     * @brief Add one valid single-use invitation and retain only a salted verifier.
-     *
-     * @param invitation Complete invitation; its secret is not retained.
-     * @return True when retained; false when invalid or at capacity.
-     */
-    bool add_invitation(const PairingInvitation &invitation) noexcept;
-
-    /** @brief Revoke every unconsumed invitation and clear its verifier. */
-    void revoke_invitations() noexcept;
 
     /**
      * @brief Admit a newly authenticated DTLS association and assign a generation.
      *
      * @param peer Exact association five-tuple.
+     * @param exporter Exact raw DTLS exporter bound into any PIN pairing on this association.
      * @return Nonzero connection generation, or zero at capacity/random failure.
      */
-    std::uint32_t association_ready(const PeerEndpoint &peer) noexcept;
+    std::uint32_t association_ready(
+      const PeerEndpoint &peer,
+      const PairingDtlsExporter &exporter
+    ) noexcept;
 
     /**
      * @brief Remove all control authority for a closed association.
@@ -434,7 +637,7 @@ namespace lumen::lsp::runtime {
      * @param peer Exact established association.
      * @param frame Complete LSPC frame.
      * @param now_microseconds Monotonic receive timestamp.
-     * @param now_utc_seconds Whole UTC seconds used only for invitation expiry.
+     * @param now_utc_seconds Whole UTC seconds used only for PIN-session expiry and cooldown.
      * @return True when the record was accepted or safely rejected with a response.
      */
     bool receive(
@@ -497,8 +700,40 @@ namespace lumen::lsp::runtime {
     /** @brief Return current association count. */
     [[nodiscard]] std::size_t connection_count() const noexcept;
 
-    /** @brief Return retained unconsumed invitation count. */
-    [[nodiscard]] std::size_t invitation_count() const noexcept;
+    /**
+     * @brief Return every secret-free pending PIN session after retiring expired state.
+     *
+     * @param now_utc_seconds Current whole-second UTC time.
+     * @return Pending session summaries without PIN, point, confirmation, or exporter material.
+     */
+    [[nodiscard]] std::vector<PendingPairingSummary> pending_pairings(std::uint64_t now_utc_seconds) noexcept;
+
+    /**
+     * @brief Queue one six-digit PIN for one selected eligible pending session.
+     *
+     * Scrypt and SPAKE work executes only on the dedicated pairing worker.
+     *
+     * @param pairing_session_id Non-secret selected session identifier.
+     * @param pin_digits Exact six ASCII decimal digits.
+     * @param now_utc_seconds Current whole-second UTC time.
+     * @return Number of sessions admitted to asynchronous derivation.
+     */
+    std::size_t submit_pairing_pin(
+      const Identifier128 &pairing_session_id,
+      const std::array<std::uint8_t, 6> &pin_digits,
+      std::uint64_t now_utc_seconds
+    ) noexcept;
+
+    /** @brief Cancel and clear every pending LSP PIN pairing session. */
+    void cancel_pairings() noexcept;
+
+    /**
+     * @brief Return current nonexpired pending PIN session count.
+     *
+     * @param now_utc_seconds Current whole-second UTC time.
+     * @return Zero through four pending sessions.
+     */
+    [[nodiscard]] std::size_t pairing_count(std::uint64_t now_utc_seconds) noexcept;
 
   private:
     class Impl;

@@ -38,6 +38,11 @@ set(WOLFSSL_CURVE25519 yes CACHE STRING "Enable X25519" FORCE)
 set(WOLFSSL_ED25519 yes CACHE STRING "Enable LSP application identity keys" FORCE)
 set(WOLFSSL_AESGCM yes CACHE STRING "Enable required AES-GCM" FORCE)
 set(WOLFSSL_HKDF yes CACHE STRING "Enable TLS 1.3 HKDF" FORCE)
+set(WOLFSSL_PWDBASED yes CACHE STRING "Enable wolfCrypt password derivation" FORCE)
+set(WOLFSSL_PUBLIC_MP yes CACHE STRING "Expose reviewed wolfCrypt scalar APIs" FORCE)
+set(WOLFSSL_HARDEN yes CACHE STRING "Require timing resistance and blinding" FORCE)
+set(WOLFSSL_ECC yes CACHE STRING "Enable hardened P-256 SPAKE2 operations" FORCE)
+set(WOLFSSL_SP_MATH_ALL yes CACHE STRING "Use reviewed SP math implementation" FORCE)
 set(WOLFSSL_KEYGEN yes CACHE STRING "Enable fresh LSP identity key generation" FORCE)
 set(WOLFSSL_CERTGEN yes CACHE STRING "Enable fresh LSP certificate generation" FORCE)
 set(WOLFSSL_CERTEXT yes CACHE STRING "Enable generated certificate extensions" FORCE)
@@ -57,6 +62,30 @@ FetchContent_MakeAvailable(lumen_wolfssl)
 if(NOT TARGET wolfssl::wolfssl)
     message(FATAL_ERROR "Pinned wolfSSL did not provide wolfssl::wolfssl")
 endif()
+
+# wolfSSL 5.9.2's CMake profile has no first-class scrypt or public ECC
+# add/double switches. Keep the library and every consumer on one reviewed
+# configuration rather than defining private ABI-shaping macros in a source
+# file. The generated header is also installed by Umbra's matching bootstrap.
+set(_lumen_wolfssl_spake2_include
+        "${lumen_wolfssl_BINARY_DIR}/lsp-spake2-include")
+file(MAKE_DIRECTORY "${_lumen_wolfssl_spake2_include}/wolfssl")
+file(WRITE "${_lumen_wolfssl_spake2_include}/wolfssl/lsp_spake2_settings.h"
+        "#pragma once\n"
+        "#include <wolfssl/options.h>\n"
+        "#ifndef HAVE_SCRYPT\n#define HAVE_SCRYPT\n#endif\n"
+        "#ifndef WOLFSSL_PUBLIC_MP\n#define WOLFSSL_PUBLIC_MP\n#endif\n"
+        "#ifndef WOLFSSL_PUBLIC_ECC_ADD_DBL\n#define WOLFSSL_PUBLIC_ECC_ADD_DBL\n#endif\n"
+        "#ifndef WOLFSSL_ECC_GEN_REJECT_SAMPLING\n#define WOLFSSL_ECC_GEN_REJECT_SAMPLING\n#endif\n"
+        "#ifndef WOLFSSL_SP_MATH_ALL\n#define WOLFSSL_SP_MATH_ALL\n#endif\n")
+target_compile_definitions(wolfssl PUBLIC
+        HAVE_SCRYPT
+        WOLFSSL_PUBLIC_MP
+        WOLFSSL_PUBLIC_ECC_ADD_DBL
+        WOLFSSL_ECC_GEN_REJECT_SAMPLING
+        WOLFSSL_SP_MATH_ALL)
+target_include_directories(wolfssl PUBLIC
+        "$<BUILD_INTERFACE:${_lumen_wolfssl_spake2_include}>")
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     # GCC 15 diagnoses wolfSSL's size-checked GCM counter helper as an
     # out-of-bounds write after inlining even though the runtime size is the
@@ -133,3 +162,4 @@ unset(_lumen_saved_build_shared_libs)
 unset(_lumen_libsrtp_patch_check)
 unset(_lumen_libsrtp_patch_result)
 unset(_lumen_libsrtp_reverse_check)
+unset(_lumen_wolfssl_spake2_include)

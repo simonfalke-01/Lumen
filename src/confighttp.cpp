@@ -17,7 +17,9 @@
 
 // lib includes
 #include <boost/algorithm/string.hpp>
+#include <boost/asio/buffers_iterator.hpp>
 #include <boost/asio/ssl/context.hpp>
+#include <boost/asio/streambuf.hpp>
 #include <boost/filesystem.hpp>
 #include <nlohmann/json.hpp>
 #include <Simple-Web-Server/crypto.hpp>
@@ -45,6 +47,7 @@
 #include "platform/common.h"
 #include "process.h"
 #include "protocol_lsp/runtime/host_runtime.h"
+#include "protocol_lsp/security/secure_zero.h"
 #include "rtsp.h"
 #include "utility.h"
 #include "uuid.h"
@@ -1136,6 +1139,17 @@ namespace confighttp {
     return encoded;
   }
 
+  /** @brief Convert one LSP SHA-256 fingerprint to lowercase hexadecimal. */
+  std::string encode_lsp_fingerprint(const lumen::lsp::Digest256 &fingerprint) {
+    constexpr std::string_view digits = "0123456789abcdef";
+    std::string encoded(fingerprint.size() * 2, '0');
+    for (std::size_t index = 0; index < fingerprint.size(); ++index) {
+      encoded[index * 2] = digits[fingerprint[index] >> 4U];
+      encoded[index * 2 + 1] = digits[fingerprint[index] & 0x0fU];
+    }
+    return encoded;
+  }
+
   /**
    * @brief Decode one canonical LSP client identifier.
    *
@@ -1209,6 +1223,72 @@ namespace confighttp {
     return "unknown"sv;
   }
 
+  /** @brief Return one stable secret-free PIN pairing state name. */
+  std::string_view lsp_pairing_state_name(const lumen::lsp::runtime::PairingAdministrationState state) noexcept {
+    using lumen::lsp::runtime::PairingAdministrationState;
+    switch (state) {
+      case PairingAdministrationState::awaiting_pin:
+        return "awaiting-pin"sv;
+      case PairingAdministrationState::deriving:
+        return "deriving"sv;
+      case PairingAdministrationState::challenge_ready:
+        return "challenge-ready"sv;
+      case PairingAdministrationState::cooldown:
+        return "cooldown"sv;
+    }
+    return "unknown"sv;
+  }
+
+  /** @brief Scope guard that wipes the original LSP PIN request body on every handler exit. */
+  class LspPinRequestBodyGuard {
+  public:
+    /** @brief Retain the request without allocating or reading its body. */
+    explicit LspPinRequestBodyGuard(req_https_t request) noexcept:
+        request_ {std::move(request)} {
+    }
+
+    LspPinRequestBodyGuard(const LspPinRequestBodyGuard &) = delete;
+    LspPinRequestBodyGuard &operator=(const LspPinRequestBodyGuard &) = delete;
+
+    /** @brief Wipe and consume the underlying HTTP request buffer. */
+    ~LspPinRequestBodyGuard() {
+      auto *buffer = dynamic_cast<boost::asio::streambuf *>(request_->content.rdbuf());
+      if (buffer == nullptr) {
+        return;
+      }
+      const auto data = buffer->data();
+      for (auto iterator = boost::asio::buffers_begin(data); iterator != boost::asio::buffers_end(data); ++iterator) {
+        auto &byte = const_cast<char &>(*iterator);
+        byte = 0;
+      }
+      buffer->consume(buffer->size());
+    }
+
+  private:
+    req_https_t request_;  ///< Request retaining the original buffer through scope exit.
+  };
+
+  /** @brief Scope-owned PIN copies for the LSP administration handler. */
+  class LspPinSubmissionSecrets {
+  public:
+    /** @brief Copy the exact bounded request body after its length and session pass preflight. */
+    explicit LspPinSubmissionSecrets(const req_https_t &request):
+        pin {request->content.string()} {
+    }
+
+    LspPinSubmissionSecrets(const LspPinSubmissionSecrets &) = delete;
+    LspPinSubmissionSecrets &operator=(const LspPinSubmissionSecrets &) = delete;
+
+    /** @brief Wipe every PIN copy on scope exit. */
+    ~LspPinSubmissionSecrets() {
+      lumen::lsp::secure_zero(std::span<char> {pin.data(), pin.size()});
+      lumen::lsp::secure_zero(digits);
+    }
+
+    std::string pin;  ///< Exact six-byte body copy, securely cleared on scope exit.
+    std::array<std::uint8_t, 6> digits {};  ///< Validated worker input, securely cleared on scope exit.
+  };
+
   /**
    * @brief Send a non-cacheable LSP administration JSON response.
    *
@@ -1245,18 +1325,17 @@ namespace confighttp {
     const std::string_view error
   ) {
     send_lsp_admin_response(response, status, {
-      {"status", false},
-      {"error", error},
-    });
+                                                {"status", false},
+                                                {"error", error},
+                                              });
   }
 
   /**
    * @brief Enforce authenticated trusted-LAN access and an explicit CSRF token.
    *
    * General Web UI routes retain their existing origin-aware CSRF behavior.
-   * LSP invitation and trust administration always requires the token header,
-   * including same-origin GET requests, because responses may contain a live
-   * bearer invitation.
+   * LSP PIN and trust administration always requires the token header,
+   * including same-origin GET requests.
    *
    * @param response Shared HTTPS response object.
    * @param request Shared HTTPS request object.
@@ -1318,79 +1397,17 @@ namespace confighttp {
       {"latestTotalMicroseconds", snapshot->reconnect.latest_total_microseconds},
     };
     send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
-      {"status", true},
-      {"active", snapshot->active},
-      {"port", snapshot->port},
-      {"profile", lsp_profile_name(snapshot->profile)},
-      {"hasInvitation", snapshot->invitation_uri.has_value()},
-      {"reconnect", reconnect},
-    });
+                                                                           {"status", true},
+                                                                           {"active", snapshot->active},
+                                                                           {"port", snapshot->port},
+                                                                           {"profile", lsp_profile_name(snapshot->profile)},
+                                                                           {"pendingPairings", snapshot->pending_pairings},
+                                                                           {"reconnect", reconnect},
+                                                                         });
   }
 
-  /**
-   * @brief Return the current unconsumed LSP pairing invitation.
-   *
-   * The invitation is returned only to the authenticated response and is never
-   * passed to request logging.
-   *
-   * @api_examples{/api/lsp/invitation| GET| null}
-   */
-  void getLspInvitation(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-
-    const auto snapshot = lumen::lsp::runtime::administration_snapshot();
-    if (!snapshot) {
-      send_lsp_admin_error(
-        response,
-        SimpleWeb::StatusCode::server_error_service_unavailable,
-        "LSP runtime is unavailable"
-      );
-      return;
-    }
-
-    nlohmann::json output_tree {
-      {"status", true},
-      {"invitation", nullptr},
-    };
-    if (snapshot->invitation_uri) {
-      output_tree["invitation"] = *snapshot->invitation_uri;
-    }
-    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, output_tree);
-  }
-
-  /**
-   * @brief Rotate and return the current LSP pairing invitation.
-   *
-   * @api_examples{/api/lsp/invitation| POST| null}
-   */
-  void issueLspInvitation(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-
-    const auto invitation = lumen::lsp::runtime::administration_issue_pairing_invitation();
-    if (!invitation) {
-      send_lsp_admin_error(
-        response,
-        SimpleWeb::StatusCode::server_error_service_unavailable,
-        "LSP could not issue an invitation"
-      );
-      return;
-    }
-    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
-      {"status", true},
-      {"invitation", *invitation},
-    });
-  }
-
-  /**
-   * @brief Revoke the current unconsumed LSP pairing invitation.
-   *
-   * @api_examples{/api/lsp/invitation| DELETE| null}
-   */
-  void revokeLspInvitation(const resp_https_t &response, const req_https_t &request) {
+  /** @brief Return secret-free pending LSP PIN pairing sessions. */
+  void getLspPairing(const resp_https_t &response, const req_https_t &request) {
     if (!authorize_lsp_administration(response, request)) {
       return;
     }
@@ -1402,8 +1419,89 @@ namespace confighttp {
       );
       return;
     }
+    nlohmann::json pending = nlohmann::json::array();
+    for (const auto &pairing : lumen::lsp::runtime::administration_pending_pairings()) {
+      pending.push_back({
+        {"sessionId", encode_lsp_client_id(pairing.pairing_session_id)},
+        {"clientId", encode_lsp_client_id(pairing.client_id)},
+        {"identityKeyFingerprint", encode_lsp_fingerprint(pairing.identity_key_fingerprint)},
+        {"clientName", pairing.client_name},
+        {"clientNameVerified", pairing.client_name_verified},
+        {"permissions", pairing.effective_permissions.mask()},
+        {"expiresAt", pairing.expires_at_utc_seconds},
+        {"challengesUsed", pairing.challenges_used},
+        {"state", lsp_pairing_state_name(pairing.state)},
+      });
+    }
+    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                           {"status", true},
+                                                                           {"pending", std::move(pending)},
+                                                                         });
+  }
 
-    lumen::lsp::runtime::administration_revoke_pairing_invitation();
+  /**
+   * @brief Queue one exact six-digit PIN without logging or echoing it.
+   */
+  void submitLspPairingPin(const resp_https_t &response, const req_https_t &request) {
+    LspPinRequestBodyGuard request_body_guard {request};
+    if (!check_content_type(response, request, "text/plain")) {
+      return;
+    }
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+    const auto content_length = request->header.find("Content-Length");
+    if (content_length == request->header.end() || content_length->second != "6") {
+      send_lsp_admin_error(response, SimpleWeb::StatusCode::client_error_bad_request, "PIN body must be exactly six bytes");
+      return;
+    }
+    const auto session_header = request->header.find("X-LSP-Pairing-Session");
+    const auto pairing_session_id = session_header == request->header.end() ?
+                                      std::nullopt :
+                                      decode_lsp_client_id(session_header->second);
+    if (!pairing_session_id) {
+      send_lsp_admin_error(response, SimpleWeb::StatusCode::client_error_bad_request, "A selected pairing session is required");
+      return;
+    }
+    LspPinSubmissionSecrets secrets {request};
+    if (secrets.pin.size() != 6 || std::ranges::any_of(secrets.pin, [](const char digit) {
+          return digit < '0' || digit > '9';
+        })) {
+      send_lsp_admin_error(response, SimpleWeb::StatusCode::client_error_bad_request, "PIN must contain exactly six digits");
+      return;
+    }
+    std::ranges::transform(secrets.pin, secrets.digits.begin(), [](const char digit) {
+      return static_cast<std::uint8_t>(digit);
+    });
+    const auto submitted = lumen::lsp::runtime::administration_submit_pairing_pin(*pairing_session_id, secrets.digits);
+    if (submitted == 0) {
+      send_lsp_admin_error(
+        response,
+        SimpleWeb::StatusCode::client_error_conflict,
+        "No pending LSP client can accept a PIN yet"
+      );
+      return;
+    }
+    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                           {"status", true},
+                                                                           {"submitted", submitted},
+                                                                         });
+  }
+
+  /** @brief Cancel every pending LSP PIN pairing session. */
+  void cancelLspPairing(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+    if (!lumen::lsp::runtime::administration_snapshot()) {
+      send_lsp_admin_error(
+        response,
+        SimpleWeb::StatusCode::server_error_service_unavailable,
+        "LSP runtime is unavailable"
+      );
+      return;
+    }
+    lumen::lsp::runtime::administration_cancel_pairings();
     send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
   }
 
@@ -1435,9 +1533,9 @@ namespace confighttp {
       });
     }
     send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
-      {"status", true},
-      {"clients", std::move(clients)},
-    });
+                                                                           {"status", true},
+                                                                           {"clients", std::move(clients)},
+                                                                         });
   }
 
   /**
@@ -2479,9 +2577,9 @@ namespace confighttp {
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
     server.resource["^/api/csrf-token$"]["GET"] = getCSRFToken;
     server.resource["^/api/lsp/status$"]["GET"] = getLspStatus;
-    server.resource["^/api/lsp/invitation$"]["GET"] = getLspInvitation;
-    server.resource["^/api/lsp/invitation$"]["POST"] = issueLspInvitation;
-    server.resource["^/api/lsp/invitation$"]["DELETE"] = revokeLspInvitation;
+    server.resource["^/api/lsp/pairing$"]["GET"] = getLspPairing;
+    server.resource["^/api/lsp/pairing$"]["DELETE"] = cancelLspPairing;
+    server.resource["^/api/lsp/pairing/pin$"]["POST"] = submitLspPairingPin;
     server.resource["^/api/lsp/clients$"]["GET"] = getLspClients;
     server.resource["^/api/lsp/clients$"]["PATCH"] = updateLspClient;
     server.resource["^/api/lsp/clients$"]["DELETE"] = revokeLspClient;
