@@ -32,8 +32,6 @@ namespace lumen::lsp::runtime {
     constexpr std::uint64_t pairing_retry_cooldown_seconds = 2;
     constexpr std::uint8_t maximum_pairing_challenges = 3;
     constexpr std::size_t maximum_applications = 64;
-    constexpr std::size_t maximum_application_id_bytes = 128;
-    constexpr std::size_t maximum_application_name_bytes = 256;
     constexpr std::size_t maximum_application_image_bytes = 512;
     constexpr std::uint64_t response_deadline_microseconds = 1'000'000;
     constexpr std::uint64_t path_probe_semantic_deadline_microseconds = 60'000'000;  ///< Covers all legal LSPP retries plus margin.
@@ -113,10 +111,6 @@ namespace lumen::lsp::runtime {
         {1, wire_version},
         {2, static_cast<std::uint8_t>(status)},
       }});
-    }
-
-    bool valid_text(const std::string &value, const std::size_t maximum) noexcept {
-      return !value.empty() && value.size() <= maximum && cbor::is_valid_utf8(value);
     }
 
     std::uint64_t saturating_add(const std::uint64_t value, const std::uint64_t increment) noexcept {
@@ -392,6 +386,12 @@ namespace lumen::lsp::runtime {
         lspc_header header {};  ///< Exact deferred response correlation.
         bool active {};  ///< Whether worker completion remains pending.
       } pending_text;  ///< At most one asynchronous text commit per connection.
+
+      struct PendingStart {
+        packet_slab<maximum_control_frame_bytes> request {};  ///< Exact START retained until its receipt ACK is flushed.
+        lspc_header header {};  ///< Original request correlation and generation.
+        bool active {};  ///< Whether START awaits dispatch outside the provider callback.
+      } pending_start;  ///< One bounded capture-preparation operation per connection.
 
       bool hello_complete {};  ///< Whether CLIENT_HELLO completed.
     };
@@ -1089,6 +1089,15 @@ namespace lumen::lsp::runtime {
         return false;
       }
 
+      if (message_type == ControlMessageType::start && connection.pending_start.active &&
+          parsed.header.request_id == connection.pending_start.header.request_id) {
+        if (std::ranges::equal(connection.pending_start.request.bytes(), frame)) {
+          return send_acknowledgement_only(connection);
+        }
+        transport_.close(peer);
+        return false;
+      }
+
       const auto observed = connection.inbound.observe(parsed.header.message_id);
       if (observed == receive_id_result::duplicate) {
         transport_.close(peer);
@@ -1122,7 +1131,7 @@ namespace lumen::lsp::runtime {
         case ControlMessageType::quit_application:
           return quit_application(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::start:
-          return start_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
+          return queue_start(connection, frame, parsed.header, now_microseconds);
         case ControlMessageType::attach:
           return attach_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::stop:
@@ -1167,6 +1176,24 @@ namespace lumen::lsp::runtime {
       std::scoped_lock lock(mutex_);
       for (std::size_t index = 0; index < connections_.size();) {
         auto &connection = connections_[index];
+        if (connection.pending_start.active) {
+          const auto pending = connection.pending_start;
+          connection.pending_start = {};
+          if (!start_input(
+                connection,
+                pending.request.bytes(),
+                pending.header,
+                pending.request.bytes().subspan(lspc_header_size),
+                control_monotonic_microseconds()
+              )) {
+            const auto peer = connection.peer;
+            transport_.close(peer);
+            if (const auto remaining = find(peer); remaining != connections_.size()) {
+              connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+            }
+            continue;
+          }
+        }
         if (connection.inbound_path_probe.active &&
             now_microseconds >= connection.inbound_path_probe.deadline_microseconds) {
           const auto request = connection.inbound_path_probe.request;
@@ -2969,6 +2996,7 @@ namespace lumen::lsp::runtime {
       return response && send_response(connection, request, header, ControlMessageType::auth_response, *response, false, now_microseconds);
     }
 
+    /** @brief Emit the canonical authenticated application catalog and queue its artwork. */
     bool list_applications(
       Connection &connection,
       const std::span<const std::uint8_t> request,
@@ -2989,33 +3017,19 @@ namespace lumen::lsp::runtime {
       if (!snapshot || snapshot->size() > maximum_applications) {
         return send_error(connection, request, header, ControlMessageType::applications, ControlStatus::busy, now_microseconds);
       }
-      cbor::Value::Array application_values;
+      std::vector<std::uint8_t> response;
       try {
-        application_values.reserve(snapshot->size());
-        for (const auto &application : *snapshot) {
-          if (!valid_text(application.id, maximum_application_id_bytes) ||
-              !valid_text(application.name, maximum_application_name_bytes) ||
-              (!application.image_path.empty() && !valid_text(application.image_path, maximum_application_image_bytes))) {
-            return send_error(connection, request, header, ControlMessageType::applications, ControlStatus::internal_failure, now_microseconds);
-          }
-          application_values.emplace_back(cbor::Value::Map {
-            {1, application.id},
-            {2, application.name},
-            {3, application.image_path},
-          });
+        auto encoded = encode_applications(*snapshot);
+        if (!encoded) {
+          const auto status = encoded.error() == ControlWireError::size_limit ?
+                                ControlStatus::busy : ControlStatus::internal_failure;
+          return send_error(connection, request, header, ControlMessageType::applications, status, now_microseconds);
         }
+        response = std::move(*encoded);
       } catch (...) {
         return send_error(connection, request, header, ControlMessageType::applications, ControlStatus::internal_failure, now_microseconds);
       }
-      const auto response = encode_control_value(cbor::Value {cbor::Value::Map {
-        {1, wire_version},
-        {2, static_cast<std::uint8_t>(ControlStatus::success)},
-        {3, std::move(application_values)},
-      }});
-      if (!response) {
-        return send_error(connection, request, header, ControlMessageType::applications, ControlStatus::busy, now_microseconds);
-      }
-      if (!send_response(connection, request, header, ControlMessageType::applications, *response, false, now_microseconds)) {
+      if (!send_response(connection, request, header, ControlMessageType::applications, response, false, now_microseconds)) {
         return false;
       }
       const auto artwork = applications_.artwork_snapshot();
@@ -3244,6 +3258,36 @@ namespace lumen::lsp::runtime {
                          );
     }
 
+    /**
+     * @brief Acknowledge START before dispatching slow capture preparation from tick().
+     * @param connection Authenticated association receiving the request.
+     * @param request Complete validated LSPC frame retained for idempotent response caching.
+     * @param header Parsed request correlation fields.
+     * @param now_microseconds Monotonic receipt time for immediate error responses.
+     * @return Whether the ACK or rejection was accepted by the transport.
+     */
+    bool queue_start(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (!connection.authenticated_client ||
+          !connection.authenticated_client->permissions.contains(Permission::start_attach) ||
+          !connection.authenticated_client->permissions.contains(Permission::input)) {
+        return send_error(connection, request, header, ControlMessageType::start_response, ControlStatus::permission_denied, now_microseconds);
+      }
+      if (connection.pending_start.active) {
+        return send_error(connection, request, header, ControlMessageType::start_response, ControlStatus::busy, now_microseconds);
+      }
+      if (!connection.pending_start.request.assign(request)) {
+        return false;
+      }
+      connection.pending_start.header = header;
+      connection.pending_start.active = true;
+      return send_acknowledgement_only(connection);
+    }
+
     bool start_input(
       Connection &connection,
       const std::span<const std::uint8_t> request,
@@ -3270,14 +3314,15 @@ namespace lumen::lsp::runtime {
         return send_error(connection, request, header, ControlMessageType::start_response, selected.error(), now_microseconds);
       }
       const auto response = encode_start_response(*selected);
-      if (!response || !send_response(connection, request, header, ControlMessageType::start_response, *response, false, now_microseconds)) {
+      const auto response_time = control_monotonic_microseconds();
+      if (!response || !send_response(connection, request, header, ControlMessageType::start_response, *response, false, response_time)) {
         return false;
       }
       const auto video_configuration = start_handler_.video_configuration(
         selected->session_id,
         selected->video.video_generation
       );
-      if (video_configuration == nullptr || !send_video_config(connection, *video_configuration, now_microseconds)) {
+      if (video_configuration == nullptr || !send_video_config(connection, *video_configuration, response_time)) {
         return false;
       }
       if (!send_audio_config(
@@ -3287,7 +3332,7 @@ namespace lumen::lsp::runtime {
               .stream_generation = selected->stream_generation,
               .audio = selected->audio,
             },
-            now_microseconds
+            response_time
           )) {
         return false;
       }
@@ -3298,7 +3343,7 @@ namespace lumen::lsp::runtime {
                                           .stream_generation = selected->stream_generation,
                                           .microphone = *selected->microphone,
                                         },
-                                        now_microseconds
+                                        response_time
                                       );
     }
 

@@ -743,7 +743,10 @@ namespace lumen::lsp::runtime {
     ) noexcept;
 
     /**
-     * @brief Retransmit due byte-identical responses and close failed operations.
+     * @brief Dispatch acknowledged START work, retransmit responses, and close failed operations.
+     *
+     * Call outside DTLS provider callbacks after flushing receipt ACKs queued by receive().
+     * Capture preparation can take longer than the control retransmission window.
      *
      * @param now_microseconds Current monotonic timestamp.
      */

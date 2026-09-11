@@ -96,6 +96,69 @@ The running host must not be overwritten based on the older deployment record.
   working Moonlight service; keep VDD disabled unless explicitly re-enabled.
 - [ ] Complete the scheduled corrective reviews, admin rewrite, and final gates.
 
+### Current live debugging — 2026-09-12
+
+The user resumed testing after gaming. Only the isolated scheduled task is
+restarted/deployed; installed `LumenService` remains PID 10964, with VDD disabled.
+
+- [x] Fix the **actual** catalog handler. `HostControlServer::list_applications`
+  bypassed `encode_applications` and manually emitted three fields. It now uses
+  the canonical six-field encoder. The signed macOS client authenticated and
+  printed Desktop over both IPv4 and IPv6. An initial stale-object hypothesis
+  was disproven by rebuilding; the duplicate handler was the cause.
+- [x] Cap START's receiver-advertised capacity to the active family's ceiling,
+  as required by section 12.3. Advertising 1,472 bytes on IPv6 previously caused
+  an immediate `malformed` rejection. With a 1,452-byte selected ceiling, the
+  same live request reached H.264 encoder creation and codec prewarm (249 ms).
+- [x] Finish the initial START admission path: the client's request retry window expired
+  during synchronous capture preparation. START is now retained in one bounded
+  per-connection slot, receipt-ACKed, and dispatched from the next control tick
+  after the DTLS output queue is flushed. SRTP overhead is queried only after
+  installing exact SSRC contexts, and adaptive pacing accounts audio/control
+  above the offered encoded-video ceiling. The signed client then completed
+  START, applied the input baseline, and received real 720p60 H.264 frames.
+  This does not establish sustained stability.
+- [ ] Complete visible CLI streaming. The old CLI path decoded into a headless
+  renderer. The new command-to-app handoff uses the existing stream window,
+  VideoToolbox/Metal, input capture, and CLI owner IPC. The integrated product
+  build and two focused handoff regressions pass (Umbra `7d62171`). The live
+  window reached a renderer commit and was revealed. Sustained presentation
+  and user-visible picture/input confirmation remain unqualified. The owner
+  IPC reply-order regression passes, including half-close before app exit.
+- [x] Fix the observed native final-release crash during that handoff:
+  `LSPTransport.deinit -> clsp_core_release -> Runtime` teardown emits lifecycle
+  callbacks during deletion. The 2026-09-12 02:26 crash report records a second
+  runtime destruction reaching `Runtime::Impl::stop` with an invalid pointer.
+  Umbra `38fe90a` prevents finalizing-core resurrection, defers callback-held
+  final deletion off the worker, and explicitly stops at Swift teardown. The
+  same signed command-to-window handoff subsequently completed without a crash.
+- [ ] Qualify connection stability using a consistently signed app identity.
+  The raw development executable intermittently emitted no packets on en7;
+  a signed app bundle subsequently completed authenticated catalogs over both
+  families. No permission reset, network reconfiguration, or trust change was
+  used. The test host's temporary IPv4 address override was restored to IPv6.
+  The signed diagnostic app uses existing local static legacy crypto/Opus
+  libraries; their macOS deployment-target warnings remain unresolved release
+  packaging issues. The package guard falsely classified wolfSSL's own
+  `SSL_CtxResourceFree` finalizer as a dormant libssl facade. A narrowly scoped
+  exception, verified against pinned wolfSSL source, lets that signed package
+  pass its existing resource/dependency/signature validation; this is not full
+  release qualification (Umbra `6ede894`).
+- [ ] Resolve sustained-session failures. The first admitted stream sent more
+  than 300 frames, then client receive counters plateaued at 5,047 datagrams;
+  authentication failures remained zero. NVENC reported unsupported reference
+  invalidation, and the host later tore down media without the client declaring
+  termination. Local STOP eventually returned an unconfirmed transport timeout
+  and exited. A later start ended immediately. The client also rejects valid
+  high-bit unsigned frame IDs at the signed media-token boundary; that concrete
+  conversion bug is being fixed before the next live repeat.
+- [ ] Verify audible host audio: capture/Opus initialized, but packet count was
+  zero on the silent desktop. A test tone accidentally ran after host teardown,
+  so it provides no audio evidence. Its temporary scheduled task was removed.
+
+The current remaining immediate step is a crash-free signed-client START with
+real video/audio/input. Broad qualification and frontend work remain deferred.
+
 The earlier ledger describes the September 1 development deployment. It does
 not imply LSP is enabled on the currently installed host. The accumulated
 pre-pause changes are checkpointed before further implementation; this is not

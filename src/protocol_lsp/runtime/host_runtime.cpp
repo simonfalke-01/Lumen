@@ -3201,6 +3201,7 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /** @brief Negotiate stream authority and cap offered receive capacity to the active IP family. */
     std::expected<StartResponsePayload, ControlStatus> start_input(
       const PeerEndpoint &peer,
       const TrustedClient &client,
@@ -3225,7 +3226,16 @@ namespace lumen::lsp::runtime {
 
       const auto family = peer.family == IpAddressFamily::ipv6 ? input_plane::ip_family::ipv6 : input_plane::ip_family::ipv4;
       const auto media_family = peer.family == IpAddressFamily::ipv6 ? media::ip_family::ipv6 : media::ip_family::ipv4;
-      if (!media::make_path_payload_limit(media_family, request.offered_maximum_udp_payload)) {
+      // A receive-capacity offer is an upper bound, not a request to send that
+      // size on every address family. The default 1,472-byte capacity must
+      // still negotiate the 1,452-byte Ethernet ceiling on IPv6.
+      const auto family_ceiling = media_family == media::ip_family::ipv6 ?
+                                    media::ipv6_udp_payload_ceiling : media::ipv4_udp_payload_ceiling;
+      const auto path_limit = media::make_path_payload_limit(
+        media_family,
+        std::min<std::size_t>(request.offered_maximum_udp_payload, family_ceiling)
+      );
+      if (!path_limit) {
         return std::unexpected(ControlStatus::malformed);
       }
       const auto pointer_budget = input_plane::wire_bits_per_second(family, input_plane::pointer_payload_size, request.pointer_rate);
@@ -3325,32 +3335,11 @@ namespace lumen::lsp::runtime {
           (void) proc::proc.terminate_lsp_generation(video_selection->process_generation);
         }
       };
-      const auto feedback_bits_per_second = maximum_feedback_bits_per_second(peer);
-      if (!feedback_bits_per_second ||
-          *feedback_bits_per_second > std::numeric_limits<std::uint64_t>::max() - audio_selection->bitrate) {
-        rollback_selected_process();
-        return std::unexpected(ControlStatus::internal_failure);
-      }
-      video_selection->reserved_overhead_bits_per_second =
-        static_cast<std::uint64_t>(audio_selection->bitrate) + *feedback_bits_per_second;
-      if (video_selection->reserved_overhead_bits_per_second >=
-          video_selection->aggregate_pacing_bits_per_second) {
-        rollback_selected_process();
-        return std::unexpected(ControlStatus::path_capacity_insufficient);
-      }
       video_selection->feedback_sender_ssrc = input_ssrc;
       video_selection->input_acknowledgement_ssrc = acknowledgement_ssrc;
       video_selection->audio_feedback_ssrc = audio_ssrc;
-      video_selection->path_payload_ceiling = request.offered_maximum_udp_payload;
+      video_selection->path_payload_ceiling = static_cast<std::uint16_t>(path_limit.limit.udp_payload_size);
       video_selection->network_profile = request.network_profile;
-      const auto initial_forward_rate = std::min(
-        video_selection->aggregate_pacing_bits_per_second,
-        video_selection->wire.video.selected_bits_per_second + video_selection->reserved_overhead_bits_per_second
-      );
-      if (!forward->path->reconfigure(initial_forward_rate, video_selection->wire.video.initial_udp_payload_size)) {
-        rollback_selected_process();
-        return std::unexpected(ControlStatus::path_capacity_insufficient);
-      }
       constexpr std::uint8_t input_payload_type = 96;
       std::array<SsrcAssignment, 6> assignments {
         SsrcAssignment {
@@ -3452,6 +3441,45 @@ namespace lumen::lsp::runtime {
         rollback_selected_process();
         (void) queue_association_close(peer);
         return std::unexpected(ControlStatus::internal_failure);
+      }
+      // libSRTP can report the protected trailer only after an exact outbound
+      // SSRC policy exists. Association keys alone deliberately create no
+      // wildcard stream from which to query that overhead.
+      const auto feedback_bits_per_second = maximum_feedback_bits_per_second(peer);
+      if (!feedback_bits_per_second ||
+          *feedback_bits_per_second > std::numeric_limits<std::uint64_t>::max() - audio_selection->bitrate) {
+        rollback_selected_process();
+        (void) queue_association_close(peer);
+        return std::unexpected(ControlStatus::internal_failure);
+      }
+      video_selection->reserved_overhead_bits_per_second =
+        static_cast<std::uint64_t>(audio_selection->bitrate) + *feedback_bits_per_second;
+      // An adaptive offer caps encoded video, not the entire IP-layer flow.
+      // Account audio/control above that source ceiling instead of rejecting
+      // ordinary low-bitrate video because its input ACK reserve is larger.
+      if (request.network_profile == VideoNetworkProfile::adaptive_low_latency) {
+        if (video_selection->aggregate_pacing_bits_per_second >
+            std::numeric_limits<std::uint64_t>::max() - video_selection->reserved_overhead_bits_per_second) {
+          rollback_selected_process();
+          (void) queue_association_close(peer);
+          return std::unexpected(ControlStatus::internal_failure);
+        }
+        video_selection->aggregate_pacing_bits_per_second += video_selection->reserved_overhead_bits_per_second;
+      }
+      if (video_selection->reserved_overhead_bits_per_second >=
+          video_selection->aggregate_pacing_bits_per_second) {
+        rollback_selected_process();
+        (void) queue_association_close(peer);
+        return std::unexpected(ControlStatus::path_capacity_insufficient);
+      }
+      const auto initial_forward_rate = std::min(
+        video_selection->aggregate_pacing_bits_per_second,
+        video_selection->wire.video.selected_bits_per_second + video_selection->reserved_overhead_bits_per_second
+      );
+      if (!forward->path->reconfigure(initial_forward_rate, video_selection->wire.video.initial_udp_payload_size)) {
+        rollback_selected_process();
+        (void) queue_association_close(peer);
+        return std::unexpected(ControlStatus::path_capacity_insufficient);
       }
       const auto input_rtcp_cname = association_rtcp_cname(client.client_id, connection_generation);
       if (!input_rtcp_cname) {
