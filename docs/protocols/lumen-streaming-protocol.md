@@ -608,6 +608,15 @@ corresponding configuration ACK is authenticated.
 The following deterministic-CBOR maps are frozen for wire version 1. Keys are
 consecutive integers starting at one; no omitted or additional keys are valid.
 
+- `APPLICATIONS` is the exact three-key response: wire version, status, and
+  at most 64 application entries. Each entry is the exact six-key map: stable
+  application ID, display name, artwork reference (empty when absent), running
+  boolean, resume-available boolean, and process generation. A running entry
+  has a nonzero generation; a stopped entry has generation zero and cannot be
+  resumed. A running application may be unavailable for resume, for example
+  when its process is owned by legacy streaming. Clients preserve these fields
+  when publishing their application catalog; local session memory is not a
+  substitute for the authenticated host process state.
 - `CERT_ROTATE` (six keys): wire version, host ID, connection generation,
   rotation generation, replacement SPKI SHA-256, and the old host-identity
   signature. `CERT_ROTATE_ACK` success (five keys) returns wire version,

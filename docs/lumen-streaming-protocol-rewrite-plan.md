@@ -53,6 +53,16 @@ The running host must not be overwritten based on the older deployment record.
   application-list success as historical evidence, not a current live session.
 - [ ] Resolve the first live START rejection (`malformed`) at the client/host
   codec boundary. No complete LSP stream has yet been demonstrated.
+  Reconstructing the last live offer with the current Umbra serializer yields
+  a 414-byte request that the current Lumen decoder accepts (five audio and
+  five video offers). The staged Windows control codec is source-identical.
+  This narrows the next live investigation but does not prove streaming works.
+- [x] Correct the discovered APPLICATIONS mismatch: Lumen emits six fields per
+  entry while Umbra still expected three. A vector emitted by Lumen reproduced
+  Umbra's `malformed` rejection. The client now retains authoritative
+  running/resume/generation fields and publishes running state in the product
+  catalog. The independent Lumen-encoded vector and inconsistent-state rejection
+  regressions both pass in the warnings-as-errors app/test build (2026-09-12).
 - [ ] Qualify streaming and lifecycle on Windows/macOS while preserving the
   working Moonlight service; keep VDD disabled unless explicitly re-enabled.
 - [ ] Complete the scheduled corrective reviews, admin rewrite, and final gates.
