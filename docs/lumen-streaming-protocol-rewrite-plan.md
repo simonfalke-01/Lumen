@@ -31,7 +31,7 @@ contracts.
 
 ## 0. Implementation status
 
-Last updated: 2026-09-11. This table is the durable progress ledger for the
+Last updated: 2026-09-12. This table is the durable progress ledger for the
 rewrite. A row moves to **Done** only after the named implementation and its
 smallest decisive verification both pass. Source-only scaffolding remains
 **In progress** until the real product boundary works.
@@ -63,6 +63,35 @@ The running host must not be overwritten based on the older deployment record.
   running/resume/generation fields and publishes running state in the product
   catalog. The independent Lumen-encoded vector and inconsistent-state rejection
   regressions both pass in the warnings-as-errors app/test build (2026-09-12).
+- [x] Create an isolated Windows test instance with its own executable, state,
+  credentials, and legacy ports, leaving the installed Lumen process untouched.
+  Fresh six-digit PIN pairing to that instance succeeded and persisted client
+  trust. This does not establish current application browsing or streaming.
+- [x] Fix the host's reentrant DTLS timer double-erase: remove the due timer
+  before entering provider callbacks that can also remove it. The affected
+  Windows target was rebuilt and deployed only to the isolated instance;
+  it remained alive beyond the original crash interval and completed pairing.
+  Sustained host stability is not yet qualified.
+- [x] Fix Umbra's incorrect authentication on DTLS retransmission success
+  (Umbra `9ab268a`).
+  A real silent-loopback-peer regression reproduced `dtlsFailure` after the
+  first timer, then passed after the fix: at least two ClientHello datagrams,
+  no authentication failure, and the configured two-second timeout. The
+  warnings-as-errors Swift compile and affected native/app link pass, with
+  existing Homebrew dylib deployment-target linker warnings still present.
+- [x] Preserve terminal UDP-send failures as socket errors rather than DTLS
+  policy failures. A local-client debugger injection of the observed
+  `EHOSTUNREACH` send result now produces the socket-specific error message.
+  Removed the temporary catalog payload print and the completed local PIN log.
+- [ ] Resume authenticated catalog/START diagnosis against the isolated host
+  after the user's gaming session. As of 2026-09-12 01:00 local time, its task
+  is stopped (`LastTaskResult = 0xC000013A`) and UDP 48030 has no listener.
+  Do not restart it while the user plays: startup can probe capture/encoders.
+  Installed `LumenService` remains running at PID 10964 with VDD disabled;
+  no production process, configuration, or binary was modified in this turn.
+  The user confirmed Local Network access is enabled. The latest ordinary
+  Umbra request sends successfully and times out against the stopped host;
+  the earlier intermittent `EHOSTUNREACH` cause remains unproven.
 - [ ] Qualify streaming and lifecycle on Windows/macOS while preserving the
   working Moonlight service; keep VDD disabled unless explicitly re-enabled.
 - [ ] Complete the scheduled corrective reviews, admin rewrite, and final gates.

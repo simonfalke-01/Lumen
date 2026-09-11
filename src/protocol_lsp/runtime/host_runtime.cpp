@@ -4568,18 +4568,26 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /**
+     * @brief Retire due timers before invoking reentrant DTLS provider callbacks.
+     * @param now_microseconds Monotonic time used to select and reschedule timers.
+     */
     void process_dtls_timers(const std::uint64_t now_microseconds) noexcept {
       for (std::size_t index = 0; index < dtls_timers_.size();) {
         if (now_microseconds < dtls_timers_[index].due_microseconds) {
           ++index;
           continue;
         }
-        const auto peer = dtls_timers_[index].peer;
+        // Retire the timer before entering wolfSSL. A timeout may close the
+        // association and synchronously invoke association_closed_callback(),
+        // which also removes its timer. Keeping the old index across those
+        // callbacks could erase end() or an unrelated association's timer.
+        const auto peer = std::move(dtls_timers_[index].peer);
+        dtls_timers_.erase(dtls_timers_.begin() + static_cast<std::ptrdiff_t>(index));
         begin_dtls_provider_output(peer);
         const auto result = dtls_->handle_timeout(peer);
         end_dtls_provider_output(peer);
         (void) dtls_->process_pending();
-        dtls_timers_.erase(dtls_timers_.begin() + static_cast<std::ptrdiff_t>(index));
         if (result == WolfsslDtlsOperationResult::accepted) {
           refresh_dtls_timer(peer, now_microseconds);
         }
