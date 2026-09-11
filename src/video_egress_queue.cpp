@@ -215,7 +215,7 @@ namespace video {
     recovery_callback_t recovery_callback
   ) {
     std::lock_guard lock {state_->mutex};
-    const bool valid_latency = behavior == behavior_e::latency && policy.capacity == 1 &&
+    const bool valid_latency = behavior == behavior_e::latency && policy.capacity > 0 &&
                                policy.max_queue_age > std::chrono::nanoseconds::zero();
     const bool valid_fifo = behavior == behavior_e::fifo &&
                             policy.max_queue_age == std::chrono::nanoseconds::zero();

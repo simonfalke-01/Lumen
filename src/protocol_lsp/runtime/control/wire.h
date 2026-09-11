@@ -40,8 +40,12 @@ namespace lumen::lsp::runtime {
     pair_result = 0x0015,  ///< Return the persisted trust result and host confirmation.
     auth_request = 0x0020,  ///< Authenticate an already trusted client identity.
     auth_response = 0x0021,  ///< Return authentication outcome and permission state.
+    certificate_rotate = 0x0022,  ///< Announce one old-identity-signed DTLS certificate rotation.
+    certificate_rotate_ack = 0x0023,  ///< Confirm atomic client trust persistence for a rotation.
     list_applications = 0x0100,  ///< Request configured applications.
     applications = 0x0101,  ///< Return the bounded application snapshot.
+    quit_application = 0x0102,  ///< Terminate only the application owned by this session.
+    quit_application_response = 0x0103,  ///< Return owner-qualified application termination status.
     start = 0x0200,  ///< Request input, ordered host audio, and optional reverse microphone.
     start_response = 0x0201,  ///< Return exact input, audio, and nullable microphone selection.
     attach = 0x0202,  ///< Transfer an existing session to a fresh authenticated association.
@@ -54,8 +58,14 @@ namespace lumen::lsp::runtime {
     audio_config_ack = 0x0213,  ///< Authenticate client decoder readiness for one audio generation.
     microphone_config = 0x0214,  ///< Install one exact reverse Opus microphone configuration.
     microphone_config_ack = 0x0215,  ///< Authenticate client sender readiness for one microphone generation.
+    text_input = 0x0216,  ///< Commit one UTF-8/IME payload behind an applied-edge barrier.
+    text_input_response = 0x0217,  ///< Return exact generation and barrier disposition.
+    input_rate_request = 0x0218,  ///< Offer hot-plugged device capture and packet-rate bounds.
+    input_rate_response = 0x0219,  ///< Select device rates within the active input budget.
+    stream_ended = 0x0220,  ///< Notify the client that one generation-bound stream ended.
     path_probe = 0x0300,  ///< Establish authenticated intent for one exact-size SRTCP path probe.
     path_probe_ack = 0x0301,  ///< Confirm one authenticated exact-size path probe.
+    object_chunk = 0x0400,  ///< Transfer or acknowledge one bounded contiguous object chunk.
   };
 
   /** @brief Stable control status codes from the normative LSP registry. */
@@ -166,11 +176,43 @@ namespace lumen::lsp::runtime {
     std::array<std::uint8_t, ed25519_signature_size> signature {};  ///< Host auth transcript signature.
   };
 
-  /** @brief One exact application entry in APPLICATIONS key three. */
+  /** @brief Exact six-key old-identity-signed certificate rotation request. */
+  struct CertificateRotatePayload {
+    Identifier128 host_id {};  ///< Stable host identity being rotated.
+    std::uint32_t connection_generation {};  ///< Exact authenticated connection generation.
+    std::uint32_t rotation_generation {};  ///< Next nonzero persisted rotation generation.
+    Digest256 new_spki_sha256 {};  ///< Replacement certificate SPKI digest.
+    std::array<std::uint8_t, ed25519_signature_size> host_signature {};  ///< Old identity signature.
+  };
+
+  /** @brief Exact five-key certificate rotation acknowledgement. */
+  struct CertificateRotateAckPayload {
+    ControlStatus status {ControlStatus::success};  ///< Atomic persistence disposition.
+    Identifier128 host_id {};  ///< Exact rotated host identity.
+    std::uint32_t connection_generation {};  ///< Exact association generation.
+    std::uint32_t rotation_generation {};  ///< Exact acknowledged rotation generation.
+  };
+
+  /** @brief One exact six-key application entry with authoritative process/resume state. */
   struct ControlApplication {
     std::string id;  ///< Stable configured application ID, at most 128 UTF-8 bytes.
     std::string name;  ///< Human-readable name, at most 256 UTF-8 bytes.
     std::string image_path;  ///< Optional image path, at most 512 UTF-8 bytes.
+    bool running {};  ///< Whether this is the process manager's exact active application.
+    bool resume_available {};  ///< Whether the active generation is LSP-owned and may be resumed.
+    std::uint64_t process_generation {};  ///< Exact active generation, or zero while not running.
+  };
+
+  /** @brief Exact three-key owner-qualified application quit request. */
+  struct QuitApplicationPayload {
+    Identifier128 session_id {};  ///< Active owned session identifier.
+    std::string application_id;  ///< Stable configured application identifier.
+  };
+
+  /** @brief Exact three-key application quit response. */
+  struct QuitApplicationResponsePayload {
+    ControlStatus status {ControlStatus::success};  ///< Owner-qualified termination disposition.
+    Identifier128 session_id {};  ///< Exact requested session identifier.
   };
 
   /** @brief One exact five-key Opus capability offer carried by START key eight. */
@@ -373,6 +415,7 @@ namespace lumen::lsp::runtime {
   /** @brief Exact START sixteen-key request map including video schema revision three. */
   struct StartRequestPayload {
     std::string application_id;  ///< Configured application ID selected for input ownership.
+    bool resume {};  ///< Whether START must reuse the matching running application instead of launching.
     std::uint32_t pointer_rate {};  ///< Requested pointer reports/s in 125 through 16,000.
     std::uint32_t controller_rate {};  ///< Requested controller reports/s in 125 through 2,000.
     std::uint32_t sensor_rate {};  ///< Requested sensor reports/s in 125 through 4,000.
@@ -524,6 +567,90 @@ namespace lumen::lsp::runtime {
     [[nodiscard]] bool operator==(const PathProbePayload &) const noexcept = default;
   };
 
+  /** @brief One reliable UTF-8/IME commit, inline or object-backed. */
+  struct TextInputPayload {
+    Identifier128 session_id {};  ///< Active stream-session identifier.
+    std::uint32_t input_generation {};  ///< Exact active input generation.
+    std::uint64_t preceding_edge_id {};  ///< Greatest edge that must already be applied.
+    std::uint16_t utf8_length {};  ///< Complete UTF-8 payload length, at most 16 KiB.
+    std::vector<std::uint8_t> inline_utf8;  ///< Inline UTF-8 bytes, or empty for object-backed text.
+    std::optional<Identifier128> object_id;  ///< Completed object identity for non-inline text.
+    std::optional<Digest256> sha256;  ///< Complete object commitment for non-inline text.
+  };
+
+  /** @brief Exact five-key text input response. */
+  struct TextInputResponsePayload {
+    ControlStatus status {ControlStatus::success};  ///< Injection disposition.
+    Identifier128 session_id {};  ///< Exact requested session identifier.
+    std::uint32_t input_generation {};  ///< Exact requested input generation.
+    std::uint64_t preceding_edge_id {};  ///< Exact satisfied edge barrier.
+  };
+
+  /** @brief Device class used by authenticated runtime rate renegotiation. */
+  enum class InputRateDeviceType : std::uint8_t {
+    pointer = 1,  ///< Pointer state reports.
+    controller = 2,  ///< Controller state reports.
+    sensor = 3,  ///< Controller sensor reports.
+    reconciliation = 4,  ///< Core/device reconciliation refreshes.
+  };
+
+  /** @brief Exact thirteen-key hot-plug input-rate offer or all-zero rate-tuple removal. */
+  struct InputRateRequestPayload {
+    Identifier128 session_id {};  ///< Active stream-session identifier.
+    std::uint32_t input_generation {};  ///< Exact active input generation.
+    InputRateDeviceType device_type {InputRateDeviceType::pointer};  ///< Offered device/report class.
+    std::uint16_t device_id {};  ///< Device identifier, zero only for singleton classes.
+    std::uint32_t instance_generation {};  ///< Nonzero device incarnation.
+    std::uint32_t observed_capture_rate {};  ///< Measured callback rate, or zero with every bound for removal.
+    std::uint32_t minimum_state_rate {};  ///< Minimum acceptable state rate, or zero for removal.
+    std::uint32_t maximum_state_rate {};  ///< Maximum supported state rate, or zero for removal.
+    std::uint32_t minimum_sensor_rate {};  ///< Minimum sensor rate, zero when absent or removing.
+    std::uint32_t maximum_sensor_rate {};  ///< Maximum sensor rate, zero when absent or removing.
+    std::uint16_t maximum_state_packet_bytes {};  ///< Worst-case state packet bytes, or zero for removal.
+    std::uint16_t maximum_sensor_packet_bytes {};  ///< Worst-case sensor bytes, zero when absent or removing.
+  };
+
+  /** @brief Exact fourteen-key host-selected input-rate response and aggregate schedule. */
+  struct InputRateResponsePayload {
+    ControlStatus status {ControlStatus::success};  ///< Selection disposition.
+    Identifier128 session_id {};  ///< Exact active session.
+    std::uint32_t input_generation {};  ///< Exact active input generation.
+    InputRateDeviceType device_type {InputRateDeviceType::pointer};  ///< Exact offered class.
+    std::uint16_t device_id {};  ///< Exact offered device identifier.
+    std::uint32_t instance_generation {};  ///< Exact offered device incarnation.
+    std::uint32_t state_rate {};  ///< Selected state reports per second.
+    std::uint32_t sensor_rate {};  ///< Selected sensor reports per second, or zero.
+    std::uint32_t pointer_rate {};  ///< Updated aggregate pointer reports per second.
+    std::uint32_t controller_rate {};  ///< Updated aggregate controller reports per second.
+    std::uint32_t aggregate_sensor_rate {};  ///< Updated aggregate sensor reports per second.
+    std::uint32_t reconciliation_rate {};  ///< Updated aggregate reconciliation reports per second.
+    std::uint64_t reserved_input_wire_bits_per_second {};  ///< Updated aggregate reserved input budget.
+  };
+
+  /** @brief Exact four-key generation-bound terminal stream notification. */
+  struct StreamEndedPayload {
+    Identifier128 session_id {};  ///< Session that reached a terminal state.
+    std::uint32_t stream_generation {};  ///< Exact ended stream generation.
+    std::uint8_t reason {};  ///< Stable product terminal reason.
+  };
+
+  /** @brief Exact six-key bounded contiguous object chunk. */
+  struct ObjectChunkPayload {
+    Identifier128 object_id {};  ///< Stable object identifier.
+    std::uint32_t offset {};  ///< Required contiguous byte offset.
+    std::uint32_t total_length {};  ///< Complete object size, at most 16 MiB.
+    std::vector<std::uint8_t> bytes;  ///< Nonempty chunk bytes, at most 768.
+    Digest256 sha256 {};  ///< Complete-object SHA-256 commitment.
+  };
+
+  /** @brief Exact five-key object chunk acknowledgement. */
+  struct ObjectChunkAckPayload {
+    ControlStatus status {ControlStatus::success};  ///< Contiguous assembly disposition.
+    Identifier128 object_id {};  ///< Exact object identifier.
+    std::uint32_t next_offset {};  ///< Next required contiguous offset.
+    std::uint32_t total_length {};  ///< Exact complete object size.
+  };
+
   /** @brief Decode exact CLIENT_HELLO deterministic CBOR. */
   [[nodiscard]] std::expected<ClientHelloPayload, ControlWireError> decode_client_hello(std::span<const std::uint8_t> payload);
 
@@ -554,11 +681,33 @@ namespace lumen::lsp::runtime {
   /** @brief Encode exact AUTH_RESPONSE deterministic CBOR. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_auth_response(const AuthResponsePayload &payload);
 
+  /** @brief Encode exact CERT_ROTATE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_certificate_rotate(const CertificateRotatePayload &payload);
+
+  /** @brief Encode the exact old-identity certificate rotation signature transcript. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_certificate_rotation_transcript(
+    const Identifier128 &host_id,
+    const PublicKey256 &host_identity_key,
+    const Digest256 &current_spki_sha256,
+    const Digest256 &new_spki_sha256,
+    std::uint32_t connection_generation,
+    std::uint32_t rotation_generation
+  );
+
+  /** @brief Decode exact CERT_ROTATE_ACK deterministic CBOR. */
+  [[nodiscard]] std::expected<CertificateRotateAckPayload, ControlWireError> decode_certificate_rotate_ack(std::span<const std::uint8_t> payload);
+
   /** @brief Decode exact LIST_APPLICATIONS map `{1: version}`. */
   [[nodiscard]] std::expected<void, ControlWireError> decode_list_applications(std::span<const std::uint8_t> payload);
 
   /** @brief Encode exact APPLICATIONS map `{1: version, 2: status, 3: entries}`. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_applications(std::span<const ControlApplication> applications);
+
+  /** @brief Decode exact owner-qualified QUIT_APPLICATION deterministic CBOR. */
+  [[nodiscard]] std::expected<QuitApplicationPayload, ControlWireError> decode_quit_application(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact QUIT_APPLICATION_RESPONSE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_quit_application_response(const QuitApplicationResponsePayload &payload);
 
   /** @brief Encode exact error map `{1: version, 2: status}`. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_control_error(ControlStatus status);
@@ -607,4 +756,31 @@ namespace lumen::lsp::runtime {
 
   /** @brief Decode exact PATH_PROBE or PATH_PROBE_ACK deterministic CBOR. */
   [[nodiscard]] std::expected<PathProbePayload, ControlWireError> decode_path_probe(std::span<const std::uint8_t> payload);
+
+  /** @brief Decode exact TEXT_INPUT deterministic CBOR. */
+  [[nodiscard]] std::expected<TextInputPayload, ControlWireError> decode_text_input(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact TEXT_INPUT_RESPONSE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_text_input_response(const TextInputResponsePayload &payload);
+
+  /** @brief Decode exact INPUT_RATE_REQUEST deterministic CBOR. */
+  [[nodiscard]] std::expected<InputRateRequestPayload, ControlWireError> decode_input_rate_request(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact fourteen-key INPUT_RATE_RESPONSE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_input_rate_response(const InputRateResponsePayload &payload);
+
+  /** @brief Encode exact generation-bound STREAM_ENDED deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_stream_ended(const StreamEndedPayload &payload);
+
+  /** @brief Decode one exact OBJECT_CHUNK request deterministic CBOR. */
+  [[nodiscard]] std::expected<ObjectChunkPayload, ControlWireError> decode_object_chunk(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode one exact OBJECT_CHUNK request deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_object_chunk(const ObjectChunkPayload &payload);
+
+  /** @brief Decode one exact response-flagged OBJECT_CHUNK acknowledgement payload. */
+  [[nodiscard]] std::expected<ObjectChunkAckPayload, ControlWireError> decode_object_chunk_ack(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode one exact response-flagged OBJECT_CHUNK acknowledgement payload. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_object_chunk_ack(const ObjectChunkAckPayload &payload);
 }  // namespace lumen::lsp::runtime

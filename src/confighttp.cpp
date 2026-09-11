@@ -1396,6 +1396,40 @@ namespace confighttp {
       {"latestCommitToReadyMicroseconds", snapshot->reconnect.latest_commit_to_ready_microseconds},
       {"latestTotalMicroseconds", snapshot->reconnect.latest_total_microseconds},
     };
+    const nlohmann::json media {
+      {"audioGeneration", snapshot->media.audio_generation},
+      {"videoGeneration", snapshot->media.video_generation},
+      {"microphoneGeneration", snapshot->media.microphone_generation},
+      {"audioSentPackets", snapshot->media.audio_sent_packets},
+      {"audioExpiredPackets", snapshot->media.audio_expired_packets},
+      {"audioDeliveredBytes", snapshot->media.audio_delivered_bytes},
+      {"audioLostBytes", snapshot->media.audio_lost_bytes},
+      {"audioEcnCeBytes", snapshot->media.audio_ecn_ce_bytes},
+      {"videoSentFrames", snapshot->media.video_sent_frames},
+      {"videoSentPackets", snapshot->media.video_sent_packets},
+      {"flexfecSentPackets", snapshot->media.flexfec_sent_packets},
+      {"rtxSentPackets", snapshot->media.rtx_sent_packets},
+      {"videoLostBytes", snapshot->media.video_lost_bytes},
+      {"videoEcnCeBytes", snapshot->media.video_ecn_ce_bytes},
+      {"microphoneAcceptedPackets", snapshot->media.microphone_accepted_packets},
+      {"microphoneRejectedPackets", snapshot->media.microphone_rejected_packets},
+      {"microphoneReceiverReports", snapshot->media.microphone_receiver_reports},
+      {"microphoneCongestionReports", snapshot->media.microphone_congestion_reports},
+      {"forwardSentBytes", snapshot->media.forward_sent_bytes},
+      {"inputFeedbackSentBytes", snapshot->media.input_feedback_sent_bytes},
+      {"appliedInputStateSequence", snapshot->media.applied_input_state_sequence},
+      {"appliedInputEdgeId", snapshot->media.applied_input_edge_id},
+      {"inputLatencySamples", snapshot->media.input_latency_samples},
+      {"latestInputLatencyMicroseconds", snapshot->media.latest_input_latency_microseconds},
+      {"maximumInputLatencyMicroseconds", snapshot->media.maximum_input_latency_microseconds},
+      {"ecnAvailable", snapshot->media.ecn_available},
+      {"receivedEct0Datagrams", snapshot->media.received_ect0_datagrams},
+      {"receivedEct1Datagrams", snapshot->media.received_ect1_datagrams},
+      {"receivedCeDatagrams", snapshot->media.received_ce_datagrams},
+      {"sentEct0Datagrams", snapshot->media.sent_ect0_datagrams},
+      {"ecnFallbacks", snapshot->media.ecn_fallbacks},
+      {"cachedPeerHandles", snapshot->media.cached_peer_handles},
+    };
     send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
                                                                            {"status", true},
                                                                            {"active", snapshot->active},
@@ -1403,6 +1437,7 @@ namespace confighttp {
                                                                            {"profile", lsp_profile_name(snapshot->profile)},
                                                                            {"pendingPairings", snapshot->pending_pairings},
                                                                            {"reconnect", reconnect},
+                                                                           {"media", media},
                                                                          });
   }
 
@@ -1634,6 +1669,25 @@ namespace confighttp {
     } catch (const nlohmann::json::exception &) {
       bad_request(response, request, "Invalid LSP client revocation");
     }
+  }
+
+  /** @brief Rotate the LSP DTLS certificate through authenticated client persistence and atomic swap. */
+  void rotateLspIdentity(const resp_https_t &response, const req_https_t &request) {
+    if (!authorize_lsp_administration(response, request)) {
+      return;
+    }
+    const auto result = lumen::lsp::runtime::administration_rotate_identity();
+    if (result != lumen::lsp::runtime::IdentityRotationResult::success) {
+      send_lsp_admin_error(
+        response,
+        result == lumen::lsp::runtime::IdentityRotationResult::inactive ?
+          SimpleWeb::StatusCode::client_error_conflict :
+          SimpleWeb::StatusCode::server_error_internal_server_error,
+        "LSP certificate rotation did not commit; the prior identity remains active"
+      );
+      return;
+    }
+    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
   }
 
   /**
@@ -2583,6 +2637,7 @@ namespace confighttp {
     server.resource["^/api/lsp/clients$"]["GET"] = getLspClients;
     server.resource["^/api/lsp/clients$"]["PATCH"] = updateLspClient;
     server.resource["^/api/lsp/clients$"]["DELETE"] = revokeLspClient;
+    server.resource["^/api/lsp/identity/rotate$"]["POST"] = rotateLspIdentity;
     server.resource["^/api/password$"]["POST"] = savePassword;
     server.resource["^/api/pin$"]["GET"] = getPendingPairingRequests;
     server.resource["^/api/pin$"]["POST"] = savePin;

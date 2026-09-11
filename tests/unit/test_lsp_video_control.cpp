@@ -141,10 +141,14 @@ TEST(LspVideoControlWire, DecodesExactSixteenKeyStartWithEighteenKeyVideoOffers)
     {17, cbor::Value {true}},
     {18, 16U * 1'024U * 1'024U},
   };
-  const auto encode_start = [&](const cbor::Value::Map &offer, const std::uint32_t capture_to_present) {
+  const auto encode_start = [&](
+                              const cbor::Value::Map &offer,
+                              const std::uint32_t capture_to_present,
+                              const bool resume = false
+                            ) {
     return cbor::encode(cbor::Value {cbor::Value::Map {
                           {1, 1U},
-                          {2, "1"},
+                          {2, cbor::Value::Map {{1, "1"}, {2, cbor::Value {resume}}}},
                           {3, 1'000U},
                           {4, 250U},
                           {5, 250U},
@@ -165,6 +169,7 @@ TEST(LspVideoControlWire, DecodesExactSixteenKeyStartWithEighteenKeyVideoOffers)
 
   const auto decoded = lsp::decode_start(encode_start(video_offer, 20'000));
   ASSERT_TRUE(decoded);
+  EXPECT_FALSE(decoded->resume);
   ASSERT_EQ(decoded->video_offers.size(), std::size_t {1});
   EXPECT_EQ(decoded->network_profile, lsp::VideoNetworkProfile::adaptive_low_latency);
   EXPECT_EQ(decoded->video_offers[0].codec, lsp::VideoCodec::h264);
@@ -172,6 +177,14 @@ TEST(LspVideoControlWire, DecodesExactSixteenKeyStartWithEighteenKeyVideoOffers)
   EXPECT_TRUE(decoded->video_offers[0].rtx);
   EXPECT_EQ(decoded->decoder_surfaces, 3U);
   EXPECT_EQ(decoded->maximum_capture_to_present_microseconds, 20'000U);
+  const auto resumed = lsp::decode_start(encode_start(video_offer, 20'000, true));
+  ASSERT_TRUE(resumed);
+  EXPECT_TRUE(resumed->resume);
+  auto legacy_application = cbor::decode(encode_start(video_offer, 20'000));
+  ASSERT_TRUE(legacy_application);
+  auto &legacy_map = std::get<cbor::Value::Map>(legacy_application.value->storage);
+  legacy_map[1].second = cbor::Value {std::string {"1"}};
+  EXPECT_FALSE(lsp::decode_start(cbor::encode(*legacy_application.value).bytes));
   EXPECT_TRUE(lsp::decode_start(encode_start(video_offer, lsp::video_maximum_frame_age_microseconds)));
 
   video_offer[0].second = cbor::Value {2U};

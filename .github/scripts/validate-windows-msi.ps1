@@ -49,6 +49,35 @@ $files = Read-MsiRows `
 $firewallExceptions = Read-MsiRows `
     'SELECT `Name`,`Protocol`,`Program`,`Profile`,`Component_`,`Direction` FROM `Wix4FirewallException`' 6
 
+$dynamicLspSecurityFiles = @($files | Where-Object {
+    $fileName = ($_[1] -split '\|')[-1].ToLowerInvariant()
+    $fileName -match '^(lib)?wolfssl.*\.dll$' -or
+        $fileName -match '^(lib)?srtp2.*\.dll$'
+})
+if ($dynamicLspSecurityFiles.Count -ne 0) {
+    throw 'Generated MSI contains dynamic wolfSSL or libSRTP instead of the required static providers.'
+}
+
+$packagedFileNames = @($files | ForEach-Object {
+    ($_[1] -split '\|')[-1].ToLowerInvariant()
+})
+$requiredLegalFiles = @(
+    'NOTICE',
+    'Lumen-GPL-3.0.txt',
+    'OpenSSL-Apache-2.0.txt',
+    'Opus-BSD-3-Clause.txt',
+    'moonlight-common-c-GPL-3.0.txt',
+    'ENet-MIT.txt',
+    'nanors-MIT.txt',
+    'libvirtualhid-MIT.txt',
+    'libvirtualhid-license-map.txt'
+)
+foreach ($requiredLegalFile in $requiredLegalFiles) {
+    if ($packagedFileNames -notcontains $requiredLegalFile.ToLowerInvariant()) {
+        throw "Generated MSI is missing a required distributed legal resource: $requiredLegalFile"
+    }
+}
+
 $requiredActions = @(
     'CA_LumenInstall',
     'CA_LumenInstallRollback',

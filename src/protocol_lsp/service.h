@@ -9,7 +9,10 @@
 #include "security_provider.h"
 #include "types.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <span>
 
 namespace lumen::lsp {
@@ -121,15 +124,27 @@ namespace lumen::lsp {
     void stop() noexcept;
 
     /**
+     * @brief Close receive admission and wait for every provider callback to return.
+     *
+     * The bound socket remains open so its owning runtime can join the receive
+     * worker and drain already-authorized output before closing the descriptor.
+     */
+    void stop_admission() noexcept;
+
+    /**
      * @brief Classify and dispatch one complete received UDP datagram.
      *
      * @param peer Source endpoint supplied by the socket layer.
      * @param datagram Complete UDP payload.
+     * @param received_at_microseconds Socket receive timestamp in the host monotonic domain.
+     * @param ecn IP-layer ECN observation from ancillary receive metadata.
      * @return Datagram disposition.
      */
     DatagramResult receive(
       const PeerEndpoint &peer,
-      std::span<std::uint8_t> datagram
+      std::span<std::uint8_t> datagram,
+      std::uint64_t received_at_microseconds = 0,
+      IpEcn ecn = IpEcn::unavailable
     ) noexcept;
 
     /**
@@ -151,6 +166,10 @@ namespace lumen::lsp {
     SinglePortUdpSocket &socket_;
     DtlsServerProvider *dtls_provider_ {};
     SrtpProvider *srtp_provider_ {};
-    bool active_ {};
+    std::atomic<bool> active_ {};  ///< Cross-thread listener admission gate.
+    std::mutex admission_mutex_;  ///< Serializes callback admission with shutdown draining.
+    std::condition_variable admission_condition_;  ///< Wakes shutdown after the final provider callback.
+    std::size_t in_flight_receives_ {};  ///< Provider callbacks admitted before shutdown.
+    bool socket_bound_ {};  ///< Whether this service still owns one successful bind.
   };
 }  // namespace lumen::lsp

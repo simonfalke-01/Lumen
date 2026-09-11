@@ -5,8 +5,10 @@
 #pragma once
 
 // standard includes
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 // local includes
@@ -39,11 +41,69 @@ namespace input {
 
   using lsp_platform_input_ptr = std::unique_ptr<lsp_platform_input_t, lsp_platform_input_deleter_t>;  ///< Owning opaque LSP input handle.
 
+  /** @brief Maximum relative pointer distance accepted from one authenticated LSP report. */
+  inline constexpr std::int64_t maximum_lsp_pointer_delta = 1'048'576;
+
+  /** @brief Maximum high-resolution wheel distance accepted from one authenticated LSP report. */
+  inline constexpr std::int64_t maximum_lsp_scroll_delta = 1'048'576;
+
+  /** @brief Hard loop bound for splitting one accepted LSP platform report. */
+  inline constexpr std::size_t maximum_lsp_pointer_chunks = 16;
+
+  /**
+   * @brief Validate one report's relative pointer and wheel differences before platform iteration.
+   *
+   * @param delta_x Relative horizontal difference.
+   * @param delta_y Relative vertical difference.
+   * @param vertical_scroll Vertical wheel difference.
+   * @param horizontal_scroll Horizontal wheel difference.
+   * @return True only when every value is inside its strict per-report bound.
+   */
+  [[nodiscard]] constexpr bool valid_lsp_pointer_differences(
+    const std::int64_t delta_x,
+    const std::int64_t delta_y,
+    const std::int64_t vertical_scroll,
+    const std::int64_t horizontal_scroll
+  ) noexcept {
+    const auto outside = [](const std::int64_t value, const std::int64_t limit) {
+      return value < -limit || value > limit;
+    };
+    return !outside(delta_x, maximum_lsp_pointer_delta) &&
+           !outside(delta_y, maximum_lsp_pointer_delta) &&
+           !outside(vertical_scroll, maximum_lsp_scroll_delta) &&
+           !outside(horizontal_scroll, maximum_lsp_scroll_delta);
+  }
+
   /** @brief Create a fresh neutral LSP platform-input contribution. */
   [[nodiscard]] lsp_platform_input_ptr alloc_lsp_platform_input(
     lsp_controller_feedback_callback_t feedback_callback = nullptr,
     void *feedback_context = nullptr
   );
+
+  /**
+   * @brief Disable controller feedback and join its queue worker exactly once.
+   *
+   * @param input LSP platform owner that remains valid for the duration of the call.
+   */
+  void stop_lsp_platform_input_feedback(lsp_platform_input_t &input) noexcept;
+
+#ifdef SUNSHINE_TESTS
+  namespace detail {
+    /** @brief Inject one platform feedback value into the production queue for lifetime testing. */
+    bool raise_lsp_platform_feedback_for_test(
+      lsp_platform_input_t &input,
+      const platf::gamepad_feedback_msg_t &message
+    ) noexcept;
+  }  // namespace detail
+#endif
+
+  /**
+   * @brief Map one USB keyboard-page usage to the platform virtual-key boundary.
+   *
+   * @param usage Keyboard-page usage ID from zero through 255.
+   * @return Matching virtual-key value, or zero for reserved/unrepresentable usages.
+   */
+  [[nodiscard]] std::uint16_t virtual_key_from_hid_usage(std::uint16_t usage) noexcept;
 
   /**
    * @brief Apply cumulative-pointer differences through the existing platform backend.
@@ -64,6 +124,24 @@ namespace input {
   ) noexcept;
 
   /**
+   * @brief Apply normalized absolute pointer state plus bounded cumulative wheel differences.
+   *
+   * @param input LSP held-state owner.
+   * @param absolute_x Horizontal Q0.32 coordinate.
+   * @param absolute_y Vertical Q0.32 coordinate.
+   * @param vertical_scroll Cumulative vertical-scroll difference.
+   * @param horizontal_scroll Cumulative horizontal-scroll difference.
+   * @return True after the bounded platform update was submitted.
+   */
+  bool apply_lsp_absolute_pointer(
+    lsp_platform_input_t &input,
+    std::uint32_t absolute_x,
+    std::uint32_t absolute_y,
+    std::int64_t vertical_scroll,
+    std::int64_t horizontal_scroll
+  ) noexcept;
+
+  /**
    * @brief Apply one exactly-once keyboard HID-usage transition.
    *
    * @param input LSP held-state owner.
@@ -72,6 +150,15 @@ namespace input {
    * @return True when the usage is supported and applied.
    */
   bool apply_lsp_key(lsp_platform_input_t &input, std::uint16_t hid_usage, bool release) noexcept;
+
+  /**
+   * @brief Inject one validated UTF-8/IME commit through the existing platform backend.
+   *
+   * @param input LSP authority whose keyboard contribution owns the commit.
+   * @param utf8 Nonempty validated UTF-8 bytes.
+   * @return True after the complete bounded commit was submitted.
+   */
+  bool apply_lsp_utf8_text(lsp_platform_input_t &input, std::span<const std::uint8_t> utf8) noexcept;
 
   /**
    * @brief Apply one exactly-once pointer-button transition.
@@ -140,6 +227,26 @@ namespace input {
     float z
   ) noexcept;
 
+  /**
+   * @brief Apply one generation-qualified controller battery observation.
+   *
+   * @param input LSP held-state owner.
+   * @param input_generation Active input authority generation.
+   * @param controller_id Controller identifier in the range one through sixteen.
+   * @param instance_generation Exact controller generation.
+   * @param battery_state Frozen unknown, discharging, charging, or full state.
+   * @param battery_percent Charge percentage, or 255 for unknown.
+   * @return True when the controller generation is live and the report was submitted.
+   */
+  bool apply_lsp_controller_battery(
+    lsp_platform_input_t &input,
+    std::uint32_t input_generation,
+    std::uint32_t controller_id,
+    std::uint32_t instance_generation,
+    std::uint8_t battery_state,
+    std::uint8_t battery_percent
+  ) noexcept;
+
   /** @brief Apply one controller touchpad contact event. */
   bool apply_lsp_controller_touch(
     lsp_platform_input_t &input,
@@ -153,6 +260,107 @@ namespace input {
     float pressure
   ) noexcept;
 
+  /**
+   * @brief Apply one exact pen contact lifecycle transition.
+   *
+   * @param input LSP held-state owner.
+   * @param pen_id Pen device identifier in the range one through sixteen.
+   * @param instance_generation Exact pen generation.
+   * @param event_type Begin, end, or cancel event type (`1`, `2`, or `4`).
+   * @return True when the transition is generation-consistent and retained/applied.
+   */
+  bool apply_lsp_pen_lifecycle(
+    lsp_platform_input_t &input,
+    std::uint32_t pen_id,
+    std::uint32_t instance_generation,
+    std::uint8_t event_type
+  ) noexcept;
+
+  /**
+   * @brief Apply one exact direct-touch contact lifecycle transition.
+   *
+   * @param input LSP held-state owner.
+   * @param device_id Direct-touch device identifier.
+   * @param instance_generation Exact device generation.
+   * @param contact_id Device-local contact identifier.
+   * @param event_type Begin, end, or cancel event type (`1`, `2`, or `4`).
+   * @return True when the transition is generation-consistent and retained/applied.
+   */
+  bool apply_lsp_touch_lifecycle(
+    lsp_platform_input_t &input,
+    std::uint32_t device_id,
+    std::uint32_t instance_generation,
+    std::uint32_t contact_id,
+    std::uint8_t event_type
+  ) noexcept;
+
+  /**
+   * @brief Apply one latest direct-touch contact state after its lifecycle edge.
+   *
+   * @param input LSP held-state owner.
+   * @param device_id Direct-touch device identifier.
+   * @param instance_generation Exact device generation.
+   * @param contact_id Device-local contact identifier.
+   * @param active Whether the contact remains active.
+   * @param x Horizontal Q0.32 coordinate.
+   * @param y Vertical Q0.32 coordinate.
+   * @param pressure Unsigned normalized pressure.
+   * @param major Unsigned normalized major-axis size.
+   * @param minor Unsigned normalized minor-axis size.
+   * @param orientation Signed contact orientation.
+   * @return True when the lifecycle exists and the state was submitted.
+   */
+  bool apply_lsp_touch_state(
+    lsp_platform_input_t &input,
+    std::uint32_t device_id,
+    std::uint32_t instance_generation,
+    std::uint32_t contact_id,
+    bool active,
+    std::uint32_t x,
+    std::uint32_t y,
+    std::uint16_t pressure,
+    std::uint16_t major,
+    std::uint16_t minor,
+    std::int16_t orientation
+  ) noexcept;
+
+  /**
+   * @brief Apply one latest absolute pen state after its lifecycle edge.
+   *
+   * @param input LSP held-state owner.
+   * @param pen_id Pen device identifier.
+   * @param instance_generation Exact pen generation.
+   * @param in_range Whether the tool is in digitizer range.
+   * @param contact Whether the tip is touching.
+   * @param eraser Whether the eraser tool is selected.
+   * @param buttons Frozen pen-button bitmap.
+   * @param x Horizontal Q0.32 coordinate.
+   * @param y Vertical Q0.32 coordinate.
+   * @param pressure Unsigned normalized tip pressure.
+   * @param tilt_x Signed X tilt.
+   * @param tilt_y Signed Y tilt.
+   * @param rotation Signed barrel rotation.
+   * @param distance Unsigned normalized hover distance.
+   * @param contact_id Nonzero contact identifier while in range.
+   * @return True when the lifecycle exists and the state was submitted.
+   */
+  bool apply_lsp_pen_state(
+    lsp_platform_input_t &input,
+    std::uint32_t pen_id,
+    std::uint32_t instance_generation,
+    bool in_range,
+    bool contact,
+    bool eraser,
+    std::uint16_t buttons,
+    std::uint32_t x,
+    std::uint32_t y,
+    std::uint16_t pressure,
+    std::int16_t tilt_x,
+    std::int16_t tilt_y,
+    std::int16_t rotation,
+    std::uint16_t distance,
+    std::uint16_t contact_id
+  ) noexcept;
 
   /**
    * @brief Internal input helpers exposed for focused unit testing.

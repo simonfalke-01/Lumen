@@ -603,6 +603,46 @@ product control operation is enabled. The top-level message types are reserved:
 Configuration-dependent SRTP packets MUST NOT be transmitted until the
 corresponding configuration ACK is authenticated.
 
+### 9.1 Product operation maps
+
+The following deterministic-CBOR maps are frozen for wire version 1. Keys are
+consecutive integers starting at one; no omitted or additional keys are valid.
+
+- `CERT_ROTATE` (six keys): wire version, host ID, connection generation,
+  rotation generation, replacement SPKI SHA-256, and the old host-identity
+  signature. `CERT_ROTATE_ACK` success (five keys) returns wire version,
+  status, host ID, connection generation, and rotation generation. A failure
+  uses the response/error flags and the generic two-key error map.
+- `QUIT_APPLICATION` (three keys): wire version, session ID, and stable
+  application ID. Its response has wire version, status, and session ID.
+- `TEXT_INPUT` (eight keys): wire version, session ID, input generation,
+  preceding edge ID, UTF-8 byte length, nullable inline bytes, nullable object
+  ID, and nullable SHA-256. Exactly one of inline bytes or the object reference
+  is present. Its response has five keys through the preceding edge ID.
+- `INPUT_RATE_REQUEST` (thirteen keys): wire version, session and input
+  generations, device type/ID/generation, observed capture rate, state and
+  sensor minimum/maximum rates, and state/sensor packet bounds.
+  `INPUT_RATE_RESPONSE` has fourteen keys: wire version, status, the six
+  generation/device identity fields, selected device state/sensor rates, the
+  updated aggregate pointer/controller/sensor/reconciliation rates, and the
+  aggregate reserved input wire bits per second.
+- `STREAM_ENDED` (four keys): wire version, session ID, stream generation, and
+  terminal reason. It is a reliable request-ID-zero notification.
+- An `OBJECT_CHUNK` request has six keys: wire version, object ID, contiguous
+  offset, total length, nonempty bytes, and complete-object SHA-256. A
+  response-flagged successful acknowledgement has five keys: wire version,
+  status, object ID, next contiguous offset, and total length. Failure uses the
+  generic two-key error map.
+
+Lumen exposes authenticated administration at `POST /api/lsp/identity/rotate`.
+The transaction generates a fresh certificate/private-key pair while retaining
+the stable host and application identity, sends old-identity-signed
+`CERT_ROTATE` to every authenticated client, waits for every atomic-persistence
+ACK, atomically replaces the identity file, and only then swaps the server
+context used by new associations. Existing associations retain their old
+wolfSSL contexts and traffic keys until reconnect. Any generation, client,
+persistence, or provider-swap failure keeps or restores the prior identity.
+
 ## 10. START negotiation
 
 `START` offers:
@@ -1219,6 +1259,13 @@ selects per-device rates within the existing 32 Mbps aggregate input budget or
 explicitly lowers other replaceable device rates. A rate change neither resets
 cumulative state nor advances device generation.
 
+The host retains a bounded ledger keyed by device class, device ID, instance
+generation, and state/sensor stream. Each entry freezes its worst-case packet
+size and selected rate. Every renegotiation reclaims the prior exact entry,
+selects against all simultaneous device reservations, and returns the complete
+four-class aggregate schedule plus exact reserved wire bits, never above the
+original START ceiling or 32 Mbps.
+
 When physical capture exceeds the selected network rate, the client combines
 samples without losing state: relative pointer data uses cumulative counters,
 absolute axes use the newest value, and physical edges remain individually
@@ -1366,6 +1413,38 @@ prefix:
 Kind-specific state bytes follow this prefix. The common object ID and prefix
 MUST identify the same device and, for sensor state, the same sensor.
 
+Controller device state is exactly 88 bytes. Bytes `24...27` contain battery
+state (`0` unknown, `1` discharging, `2` charging, `3` full), charge percent
+(`0...100`, or `255` only when unknown), active touchpad-contact count
+(`0...2`), and zero. Bytes `28...35` are the digital-button bitmap. Bits
+`0...19` name south, east, west, north, left/right shoulder, left/right stick,
+menu, view, guide, D-pad up/down/left/right, paddles one through four, and
+touchpad click; remaining bits are zero. Bytes `36...51` are signed Q1.15 left
+X/Y, right X/Y, D-pad X/Y, and auxiliary X/Y axes, with positive Y up. Bytes
+`52...59` are unsigned Q0.16 left, right, auxiliary-left, and auxiliary-right
+triggers. Bytes `60...87` are two packed 14-byte touchpad contacts: ID, active
+byte, normalized Q0.32 X/Y, Q0.16 pressure, and two zero bytes. Inactive
+contacts are all-zero; active IDs are nonzero and unique.
+
+Controller sensor state is exactly 36 bytes. Bytes `24...35` are signed
+right-handed X, Y, and Z in Q16.16. Gyroscope values are radians per second;
+accelerometer values are metres per second squared.
+
+Touch state is a 28-byte header followed by `0...16` packed 32-byte active
+contacts sorted by strictly increasing nonzero contact ID. Header byte 24 is
+the count and bytes `25...27` are zero. Each contact contains its ID and active
+bit, normalized Q0.32 X/Y, Q0.16 pressure, normalized Q0.16 major and minor
+surface axes, clockwise radians from +X in signed Q3.12, its nonzero physical
+ordinal, and four zero bytes. Contact ordinals do not exceed the device ordinal.
+
+Pen state is exactly 56 bytes. Byte 24 contains in-range, contact, and eraser
+bits and byte 25 is zero. Remaining fields are the 16-bit button bitmap,
+normalized Q0.32 X/Y, Q0.16 tip pressure, signed Q1.15 tangential pressure,
+signed Q3.12 X/Y tilt and clockwise barrel rotation in radians, normalized
+Q0.16 hover distance, contact ID, and six zero bytes. Contact implies in-range;
+an in-range pen has a nonzero contact ID. A neutral pen has every flag, button,
+coordinate, pressure, tilt, rotation, distance, and contact ID zero.
+
 Controller sensor state independently carries timestamped gyro or
 accelerometer vectors. Sticks, analog triggers, sensors, and touch coordinates
 may be coalesced only under their exact controller/device supersession key.
@@ -1417,6 +1496,22 @@ atomically installs it only after every authenticated part and the digest are
 valid. Normal state and edges are not applied until baseline ACK. Missing parts
 are retransmitted without changing the baseline ID or state sequence.
 
+The deterministic body begins with a 32-byte header: ASCII `LSPB`, version one,
+a neutral-state bit, 16-bit record count `1...128`, exact 32-bit total length,
+four zero bytes, the represented edge watermark, and the text/IME barrier edge
+ID. The barrier does not exceed the watermark. Each record has a 32-byte header
+containing record kind, subtype, two zero bytes, payload length, device ID,
+instance generation, per-key state sequence, and per-key physical ordinal,
+followed by its exact frozen body. Records are strictly sorted and unique by
+`(kind, subtype, device ID)`. Kinds are core, device lifecycle, pointer,
+controller, controller sensor, touch, and pen. Lifecycle bodies are four bytes:
+device class, active/removal state, and two zero bytes. Every active
+pointer/controller/touch/pen lifecycle has one complete matching
+same-generation main-state record; controller sensor records additionally
+belong to that active controller. A removal tombstone has no same-generation
+state. The core record carries the same text barrier as the body header. Every
+record has a nonzero sequence and ordinal and installs with the body watermark.
+
 The exact 48-byte baseline metadata preceding each part range is:
 
 | Offset | Size | Field |
@@ -1430,12 +1525,9 @@ The exact 48-byte baseline metadata preceding each part range is:
 | 16 | 32 | SHA-256 of the complete deterministic baseline |
 | 48 | variable | exact part bytes |
 
-The common input-header flags are zero in LSP/1. The pointer, device prefix,
-edge, and baseline-part layouts above are frozen and implemented. The portable
-codec does not yet define the device-specific state bodies following the
-24-byte prefix or the deterministic complete-baseline body. Those body schemas
-and their product integration remain in progress and are not counted as a
-completed wire primitive.
+The common input-header flags are zero in LSP/1. The pointer, core, controller,
+sensor, touch, pen, device-lifecycle, complete-baseline, edge, and baseline-part
+layouts above are frozen and implemented by the portable core.
 
 ### 15.4 Input acknowledgements
 
@@ -1640,6 +1732,11 @@ until that edge ID is contiguously applied, injects the text once, and returns
 the cached idempotent response. Later pointer, controller, or keyboard packets
 continue normally and do not wait for text completion.
 
+The wait is owned by a bounded asynchronous control worker. The receive/retry
+dispatcher records the request as pending and remains nonblocking; exact
+duplicates receive acknowledgement-only progress until the worker publishes the
+terminal cached response at the original request deadline.
+
 Inline text must fit one current path-safe LSPC payload. Larger text is uploaded
 first through the bounded `OBJECT_CHUNK` mechanism and `TEXT_INPUT` references
 its object ID, length, and SHA-256; total text remains limited to 16 KiB. The
@@ -1670,6 +1767,11 @@ streaming. Within a class, earliest deadline wins. An eligible RTX packet may
 preempt newer ordinary video when it can complete an earlier still-useful
 frame. A FlexFEC repair packet is never scheduled before every source packet in
 the group that it protects has been submitted.
+
+Established DTLS application records use a one-record completion fence per
+association. This preserves DTLS record order even when `OBJECT_CHUNK` records
+enter the bulk lane and later urgent control records use the control lane; only
+the head record is admitted to the aggregate scheduler at a time.
 
 ### 16.2 Pacing
 
@@ -1742,6 +1844,9 @@ zero 16-bit alignment word. The packet ends with the middle 32 bits of an NTP
 timestamp. One packet contains at most 16,384 metrics. Later bounded overlap
 may correct lost to received and may upgrade a duplicate reception to ECN-CE;
 it cannot regress received to lost or account the same bytes twice.
+ATO uses exact 1/1024-second units: ordinary values end at `0x1FFD`,
+`0x1FFE` reports an over-range offset, and `0x1FFF` reports an unavailable
+timestamp or arrival after the report instant.
 
 Reduced-size feedback is admitted only after a fresh regular compound RTCP
 packet beginning with SR/RR and containing the feedback sender's SDES CNAME.

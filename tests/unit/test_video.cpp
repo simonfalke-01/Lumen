@@ -96,44 +96,136 @@ TEST(VideoCaptureRecoveryTest, RequiredDirectSourceLossTerminatesInsteadOfReinit
   );
 }
 
+TEST(VideoColorspaceTest, HlgRequiresExplicitTransferProofOnAnHdrCapture) {
+  video::config_t config {};
+  config.dynamicRange = 1;
+  config.hdrTransfer = 2;
+  const auto hlg = video::colorspace_from_client_config(config, true);
+  EXPECT_EQ(hlg.colorspace, video::colorspace_e::bt2020hlg);
+  EXPECT_EQ(hlg.bit_depth, 10);
+
+  config.hdrTransfer = 1;
+  const auto pq = video::colorspace_from_client_config(config, true);
+  EXPECT_EQ(pq.colorspace, video::colorspace_e::bt2020);
+
+  const auto no_hdr_capture = video::colorspace_from_client_config(config, false);
+  EXPECT_NE(no_hdr_capture.colorspace, video::colorspace_e::bt2020hlg);
+}
+
 TEST(VideoCodecInitializationTest, ExtractsOnlyH264ParameterSets) {
   const std::vector<std::uint8_t> access_unit {
-    0, 0, 0, 1, 0x09, 0xf0,
-    0, 0, 1, 0x67, 0x64, 0x00, 0x1f,
-    0, 0, 1, 0x68, 0xee, 0x3c,
-    0, 0, 1, 0x65, 0x88, 0x84,
+    0,
+    0,
+    0,
+    1,
+    0x09,
+    0xf0,
+    0,
+    0,
+    1,
+    0x67,
+    0x64,
+    0x00,
+    0x1f,
+    0,
+    0,
+    1,
+    0x68,
+    0xee,
+    0x3c,
+    0,
+    0,
+    1,
+    0x65,
+    0x88,
+    0x84,
   };
   EXPECT_EQ(
     video::extract_codec_initialization(access_unit, 0),
     (std::vector<std::uint8_t> {
-      0, 0, 1, 0x67, 0x64, 0x00, 0x1f,
-      0, 0, 1, 0x68, 0xee, 0x3c,
+      0,
+      0,
+      1,
+      0x67,
+      0x64,
+      0x00,
+      0x1f,
+      0,
+      0,
+      1,
+      0x68,
+      0xee,
+      0x3c,
     })
   );
 }
 
 TEST(VideoCodecInitializationTest, ExtractsAllHEVCParameterSets) {
   const std::vector<std::uint8_t> access_unit {
-    0, 0, 1, 0x40, 0x01, 0xaa,
-    0, 0, 1, 0x42, 0x01, 0xbb,
-    0, 0, 1, 0x44, 0x01, 0xcc,
-    0, 0, 1, 0x26, 0x01, 0xdd,
+    0,
+    0,
+    1,
+    0x40,
+    0x01,
+    0xaa,
+    0,
+    0,
+    1,
+    0x42,
+    0x01,
+    0xbb,
+    0,
+    0,
+    1,
+    0x44,
+    0x01,
+    0xcc,
+    0,
+    0,
+    1,
+    0x26,
+    0x01,
+    0xdd,
   };
   EXPECT_EQ(
     video::extract_codec_initialization(access_unit, 1),
     (std::vector<std::uint8_t> {
-      0, 0, 1, 0x40, 0x01, 0xaa,
-      0, 0, 1, 0x42, 0x01, 0xbb,
-      0, 0, 1, 0x44, 0x01, 0xcc,
+      0,
+      0,
+      1,
+      0x40,
+      0x01,
+      0xaa,
+      0,
+      0,
+      1,
+      0x42,
+      0x01,
+      0xbb,
+      0,
+      0,
+      1,
+      0x44,
+      0x01,
+      0xcc,
     })
   );
 }
 
 TEST(VideoCodecInitializationTest, ExtractsTheAV1SequenceHeaderOBU) {
   const std::vector<std::uint8_t> access_unit {
-    0x12, 0x01, 0,
-    0x0a, 0x03, 0x20, 0x11, 0x22,
-    0x32, 0x02, 0x33, 0x44,
+    0x12,
+    0x01,
+    0,
+    0x0a,
+    0x03,
+    0x20,
+    0x11,
+    0x22,
+    0x32,
+    0x02,
+    0x33,
+    0x44,
   };
   EXPECT_EQ(
     video::extract_codec_initialization(access_unit, 2),

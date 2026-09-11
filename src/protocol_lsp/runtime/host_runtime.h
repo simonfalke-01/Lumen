@@ -9,6 +9,7 @@
 #include "control_server.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -18,6 +19,63 @@
 #include <vector>
 
 namespace lumen::lsp::runtime {
+  inline constexpr std::size_t maximum_host_feedback_work_bytes = 1'472;  ///< Confirmed LSP/1 UDP payload ceiling.
+
+  /** @brief Priority class selected by the shared feedback worker. */
+  enum class HostFeedbackWorkClass : std::uint8_t {
+    none,  ///< No feedback is queued.
+    repair,  ///< NACK/PLI/FIR always preempts congestion feedback.
+    congestion,  ///< CCFB is served only after the repair reserve drains.
+  };
+
+  /**
+   * @brief Select repair before congestion regardless of CCFB queue occupancy.
+   *
+   * @param repair_count Queued NACK/PLI/FIR work items.
+   * @param congestion_count Queued RFC 8888 CCFB work items.
+   * @return Repair when available, otherwise congestion or none.
+   */
+  [[nodiscard]] constexpr HostFeedbackWorkClass next_host_feedback_work_class(
+    const std::size_t repair_count,
+    const std::size_t congestion_count
+  ) noexcept {
+    return repair_count != 0     ? HostFeedbackWorkClass::repair :
+           congestion_count != 0 ? HostFeedbackWorkClass::congestion :
+                                   HostFeedbackWorkClass::none;
+  }
+
+  /**
+   * @brief Validate bounded CCFB work against the current association/media generations.
+   *
+   * @param packet_bytes Complete authenticated plaintext RTCP packet bytes.
+   * @param queued_connection_generation Connection generation captured at enqueue.
+   * @param queued_input_ssrc Client feedback sender SSRC captured at enqueue.
+   * @param queued_video_generation Video generation captured at enqueue.
+   * @param queued_audio_generation Audio generation captured at enqueue, or zero.
+   * @param current_connection_generation Current authoritative connection generation.
+   * @param current_input_ssrc Current authoritative feedback sender SSRC.
+   * @param current_video_generation Current active video generation.
+   * @param current_audio_generation Current active audio generation, or zero.
+   * @return True only for bounded work matching every current generation field.
+   */
+  [[nodiscard]] constexpr bool host_feedback_work_is_current(
+    const std::size_t packet_bytes,
+    const std::uint32_t queued_connection_generation,
+    const std::uint32_t queued_input_ssrc,
+    const std::uint32_t queued_video_generation,
+    const std::uint32_t queued_audio_generation,
+    const std::uint32_t current_connection_generation,
+    const std::uint32_t current_input_ssrc,
+    const std::uint32_t current_video_generation,
+    const std::uint32_t current_audio_generation
+  ) noexcept {
+    return packet_bytes >= 12U && packet_bytes <= maximum_host_feedback_work_bytes &&
+           queued_connection_generation != 0 && queued_connection_generation == current_connection_generation &&
+           queued_input_ssrc != 0 && queued_input_ssrc == current_input_ssrc &&
+           queued_video_generation != 0 && queued_video_generation == current_video_generation &&
+           queued_audio_generation == current_audio_generation;
+  }
+
   /**
    * @brief Exact active-listener DNS-SD descriptor independent of platform publication APIs.
    */
@@ -58,13 +116,70 @@ namespace lumen::lsp::runtime {
     std::uint64_t latest_total_microseconds {};  ///< Latest request-to-terminal-outcome duration.
   };
 
+  /** @brief Generation-qualified aggregate media and transport administration telemetry. */
+  struct RuntimeMediaTelemetrySnapshot {
+    std::uint32_t audio_generation {};  ///< Active host-audio generation, or zero.
+    std::uint32_t video_generation {};  ///< Active video generation, or zero.
+    std::uint32_t microphone_generation {};  ///< Active reverse-microphone generation, or zero.
+    std::uint64_t audio_sent_packets {};  ///< Final-sent host Opus RTP packets.
+    std::uint64_t audio_expired_packets {};  ///< Host audio packets dropped by deadline.
+    std::uint64_t audio_delivered_bytes {};  ///< Delivered host-audio complete IP bytes.
+    std::uint64_t audio_lost_bytes {};  ///< Lost host-audio complete IP bytes.
+    std::uint64_t audio_ecn_ce_bytes {};  ///< CE-marked host-audio complete IP bytes.
+    std::uint64_t video_sent_frames {};  ///< Fully submitted primary video frames.
+    std::uint64_t video_sent_packets {};  ///< Final-sent primary video RTP packets.
+    std::uint64_t flexfec_sent_packets {};  ///< Final-sent FlexFEC RTP packets.
+    std::uint64_t rtx_sent_packets {};  ///< Final-sent RTX RTP packets.
+    std::uint64_t video_lost_bytes {};  ///< Aggregate primary/repair loss bytes from RFC 8888.
+    std::uint64_t video_ecn_ce_bytes {};  ///< Aggregate primary/repair CE bytes from RFC 8888.
+    std::uint64_t microphone_accepted_packets {};  ///< Accepted reverse Opus RTP packets.
+    std::uint64_t microphone_rejected_packets {};  ///< Rejected reverse Opus RTP packets.
+    std::uint64_t microphone_receiver_reports {};  ///< Protected regular compound RR/CNAME packets.
+    std::uint64_t microphone_congestion_reports {};  ///< Protected reverse-media RFC 8888 packets.
+    std::uint64_t forward_sent_bytes {};  ///< Aggregate final-sent host-to-client charged bytes.
+    std::uint64_t input_feedback_sent_bytes {};  ///< Final-sent LSPI/LSPG charged bytes.
+    std::uint64_t applied_input_state_sequence {};  ///< Greatest applied input-state watermark.
+    std::uint64_t applied_input_edge_id {};  ///< Greatest contiguous applied input edge.
+    std::uint64_t input_latency_samples {};  ///< Receive-to-platform-apply samples.
+    std::uint64_t latest_input_latency_microseconds {};  ///< Latest input apply latency.
+    std::uint64_t maximum_input_latency_microseconds {};  ///< Maximum input apply latency.
+    bool ecn_available {};  ///< Whether ancillary ECN receive/send is active.
+    std::uint64_t received_ect0_datagrams {};  ///< Native socket ECT(0) observations.
+    std::uint64_t received_ect1_datagrams {};  ///< Native socket ECT(1) observations.
+    std::uint64_t received_ce_datagrams {};  ///< Native socket CE observations.
+    std::uint64_t sent_ect0_datagrams {};  ///< Native socket ECT(0) submissions.
+    std::uint64_t ecn_fallbacks {};  ///< Ancillary failures that safely disabled ECN.
+    std::size_t cached_peer_handles {};  ///< Current bounded canonical peer handles.
+    std::uint64_t srtp_soft_lifetime_events {};  ///< Per-SSRC soft lifetime first crossings.
+    std::uint64_t srtp_hard_lifetime_events {};  ///< Per-SSRC hard lifetime first crossings.
+    std::uint64_t planned_srtp_rekeys {};  ///< Soft-limit associations scheduled through fresh DTLS/ATTACH.
+    std::uint64_t hard_srtp_stops {};  ///< Hard-limit associations stopped fail closed.
+    std::uint64_t feedback_worker_rejections {};  ///< Oversize, full, stale, or invalid worker feedback drops.
+  };
+
   /** @brief Web-safe runtime status without key, PIN, SPAKE, or exporter material. */
   struct RuntimeAdministrationSnapshot {
     bool active {};  ///< Whether the real UDP listener is active.
     NetworkProfile profile {NetworkProfile::adaptive_low_latency};  ///< Configured network profile.
     std::uint16_t port {};  ///< Configured LSP port.
     std::size_t pending_pairings {};  ///< Nonexpired PIN sessions awaiting approval or completion.
+    int running_application_id {};  ///< Authoritative active configured application ID, or zero.
+    std::uint64_t running_process_generation {};  ///< Active process generation, or zero.
+    bool running_application_resumable {};  ///< Whether START resume may reuse the LSP-owned process.
     ReconnectTelemetrySnapshot reconnect {};  ///< Secret-free reconnect/rekey timings and outcomes.
+    RuntimeMediaTelemetrySnapshot media {};  ///< Generation-qualified live media/transport counters.
+  };
+
+  /** @brief Terminal result of one administrative certificate rotation transaction. */
+  enum class IdentityRotationResult : std::uint8_t {
+    success,  ///< Every active client persisted, identity persisted, and new-association context swapped.
+    inactive,  ///< Runtime or providers are unavailable.
+    generation_failed,  ///< Fresh matching certificate/key generation failed.
+    client_notification_failed,  ///< A trusted active client could not be notified.
+    client_persistence_failed,  ///< A client rejected, failed, or timed out atomic pin persistence.
+    persistence_failed,  ///< Host identity replacement could not be atomically persisted.
+    provider_swap_failed,  ///< New-association DTLS context swap failed and persistence was rolled back.
+    rollback_persistence_failed,  ///< Provider swap failed and the prior persisted identity could not be restored.
   };
 
   /**
@@ -162,6 +277,9 @@ namespace lumen::lsp::runtime {
      * @return True only after persistent removal.
      */
     virtual bool revoke_trusted_client(const Identifier128 &client_id) noexcept = 0;
+
+    /** @brief Run one complete administrative certificate rotation transaction. */
+    virtual IdentityRotationResult rotate_identity() noexcept = 0;
   };
 
   /**
@@ -205,6 +323,9 @@ namespace lumen::lsp::runtime {
 
   /** @brief Revoke one process-runtime trusted client. */
   bool administration_revoke_trusted_client(const Identifier128 &client_id);
+
+  /** @brief Rotate the process runtime's certificate through the authenticated transaction. */
+  IdentityRotationResult administration_rotate_identity();
 
   /**
    * @brief Return compile-time production-provider availability.

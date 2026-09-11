@@ -5,7 +5,10 @@
 
 // standard includes
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -18,9 +21,9 @@ extern "C" {
 #include <gtest/gtest.h>
 
 // local includes
-#include "src/input_state.h"
-#include "src/input.h"
 #include "src/config.h"
+#include "src/input.h"
+#include "src/input_state.h"
 
 namespace {
   template<class Packet>
@@ -28,6 +31,72 @@ namespace {
     const auto *begin = reinterpret_cast<const std::uint8_t *>(&packet);
     return {begin, begin + sizeof(Packet)};
   }
+
+  struct FeedbackBlocker {
+    std::mutex mutex;  ///< Synchronizes callback lifetime observations.
+    std::condition_variable changed;  ///< Wakes the test and callback.
+    std::size_t calls {};  ///< Number of callbacks that entered.
+    bool release {};  ///< Whether the in-flight callback may return.
+  };
+
+  void blocking_feedback_callback(
+    void *context,
+    const input::lsp_controller_feedback_t &
+  ) noexcept {
+    auto &blocker = *static_cast<FeedbackBlocker *>(context);
+    std::unique_lock lock(blocker.mutex);
+    ++blocker.calls;
+    blocker.changed.notify_all();
+    blocker.changed.wait(lock, [&]() {
+      return blocker.release;
+    });
+  }
+}  // namespace
+
+TEST(InputLspPointerBounds, RejectsInt64AmplificationBeforeAnyChunkLoop) {
+  EXPECT_TRUE(input::valid_lsp_pointer_differences(input::maximum_lsp_pointer_delta, -input::maximum_lsp_pointer_delta, input::maximum_lsp_scroll_delta, -input::maximum_lsp_scroll_delta));
+  EXPECT_FALSE(input::valid_lsp_pointer_differences(std::numeric_limits<std::int64_t>::max(), 0, 0, 0));
+  EXPECT_FALSE(input::valid_lsp_pointer_differences(0, std::numeric_limits<std::int64_t>::min(), 0, 0));
+}
+
+TEST(InputLspKeyboardMapping, CoversPunctuationKeypadExtendedFunctionsAndModifiers) {
+  EXPECT_EQ(input::virtual_key_from_hid_usage(4), static_cast<std::uint16_t>('A'));
+  EXPECT_EQ(input::virtual_key_from_hid_usage(45), 0xbdU);
+  EXPECT_EQ(input::virtual_key_from_hid_usage(56), 0xbfU);
+  EXPECT_EQ(input::virtual_key_from_hid_usage(84), 0x6fU);
+  EXPECT_EQ(input::virtual_key_from_hid_usage(98), 0x60U);
+  EXPECT_EQ(input::virtual_key_from_hid_usage(104), 0x7cU);
+  EXPECT_EQ(input::virtual_key_from_hid_usage(115), 0x87U);
+  EXPECT_EQ(input::virtual_key_from_hid_usage(224), 0xa2U);
+  EXPECT_EQ(input::virtual_key_from_hid_usage(231), 0x5cU);
+  EXPECT_EQ(input::virtual_key_from_hid_usage(0), 0U);
+}
+
+TEST(InputLspPlatformFeedback, ExplicitStopJoinsAnInFlightCallbackBeforeOwnerReset) {
+  using namespace std::chrono_literals;
+  FeedbackBlocker blocker;
+  auto input = input::alloc_lsp_platform_input(blocking_feedback_callback, &blocker);
+  ASSERT_TRUE(input);
+  ASSERT_TRUE(input::detail::raise_lsp_platform_feedback_for_test(*input, platf::gamepad_feedback_msg_t::make_rumble({0, 1, 1}, 1, 2)));
+  {
+    std::unique_lock lock(blocker.mutex);
+    ASSERT_TRUE(blocker.changed.wait_for(lock, 1s, [&]() {
+      return blocker.calls == 1;
+    }));
+  }
+  auto stopping = std::async(std::launch::async, [&]() {
+    input::stop_lsp_platform_input_feedback(*input);
+  });
+  EXPECT_EQ(stopping.wait_for(20ms), std::future_status::timeout);
+  {
+    std::scoped_lock lock(blocker.mutex);
+    blocker.release = true;
+  }
+  blocker.changed.notify_all();
+  EXPECT_EQ(stopping.wait_for(1s), std::future_status::ready);
+  EXPECT_FALSE(input::detail::raise_lsp_platform_feedback_for_test(*input, platf::gamepad_feedback_msg_t::make_rumble({0, 1, 1}, 3, 4)));
+  input.reset();
+  EXPECT_EQ(blocker.calls, 1U);
 }
 
 TEST(InputHeldState, ResetOneSessionDoesNotReleaseAnotherSessionsKeyOrButton) {

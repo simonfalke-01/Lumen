@@ -243,6 +243,46 @@ namespace lumen::lsp {
     bool close_association(const PeerEndpoint &peer) noexcept;
 
     /**
+     * @brief Queue an association close from an administrator or non-owner thread.
+     *
+     * The socket owner applies the request from `process_pending()`; no wolfSSL
+     * or association state is mutated by the caller.
+     *
+     * @param peer Association five-tuple.
+     * @return True when the bounded request queue accepted or already contained the peer.
+     */
+    bool request_close(const PeerEndpoint &peer) noexcept;
+
+    /**
+     * @brief Apply every queued send and close on the socket-owner thread.
+     *
+     * @return True when the caller is the owner and the queue was fully drained.
+     */
+    bool process_pending() noexcept;
+
+    /**
+     * @brief Release mutation-thread ownership after the receive worker has quiesced.
+     *
+     * @return True only for the current owner outside a provider operation.
+     */
+    bool release_owner_thread() noexcept;
+
+    /**
+     * @brief Close and notify every live association on the socket-owner thread.
+     *
+     * @return Number of associations drained exactly once.
+     */
+    std::size_t drain_all() noexcept;
+
+    /**
+     * @brief Permanently detach product callbacks after the socket owner joins.
+     *
+     * Destruction after this call clears cryptographic state silently and can
+     * never invoke dead product objects.
+     */
+    void disable_callbacks() noexcept;
+
+    /**
      * @brief Return the provider initialization result.
      *
      * @return Stable fail-closed construction status.
@@ -255,6 +295,20 @@ namespace lumen::lsp {
      * @return Digest derived from the exact DER certificate, or zero before successful initialization.
      */
     [[nodiscard]] Digest256 server_spki_sha256() const noexcept;
+
+    /**
+     * @brief Install fresh credentials for new associations while retaining live session contexts.
+     *
+     * @param certificate_der Replacement DER leaf certificate.
+     * @param private_key_der Matching replacement DER private key.
+     * @param cookie_secret Replacement stateless-cookie secret.
+     * @return True only after the new server context became current.
+     */
+    bool rotate_identity(
+      std::span<const std::uint8_t> certificate_der,
+      std::span<const std::uint8_t> private_key_der,
+      std::span<const std::uint8_t> cookie_secret
+    ) noexcept;
 
     /**
      * @brief Return the number of durable post-cookie associations.

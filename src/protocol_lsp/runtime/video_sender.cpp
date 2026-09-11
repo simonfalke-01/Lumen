@@ -71,6 +71,18 @@ namespace lumen::lsp::runtime {
     constexpr std::uint64_t retained_token_slot_mask =
       (std::uint64_t {1} << retained_token_slot_bits) - 1U;  ///< Storage-slot token bits.
 
+    /** @brief Saturatingly subtract one overlap correction from a cumulative counter. */
+    void subtract_counter(std::atomic<std::uint64_t> &counter, const std::uint64_t value) noexcept {
+      auto current = counter.load(std::memory_order_relaxed);
+      while (!counter.compare_exchange_weak(
+        current,
+        current > value ? current - value : 0,
+        std::memory_order_relaxed,
+        std::memory_order_relaxed
+      )) {
+      }
+    }
+
     /** @brief Decoded retained-AU reconstruction-token identity. */
     struct RetainedTokenIdentity {
       std::uint64_t storage_incarnation {};  ///< Nonzero AU slot reuse generation.
@@ -1193,66 +1205,8 @@ namespace lumen::lsp::runtime {
     const std::span<const std::uint8_t> packet,
     const std::uint32_t expected_sender_ssrc
   ) noexcept {
-    const auto parsed = transport::parse_rtcp_packet(packet);
-    if (!parsed || parsed.packet.size() != packet.size() || parsed.padding ||
-        parsed.packet_type != transport::rtcp_transport_feedback_type ||
-        parsed.count != transport::rtcp_congestion_feedback_format ||
-        parsed.payload.size() < 16U || expected_sender_ssrc == 0 ||
-        wire::read_be<std::uint32_t>(parsed.payload.first<4>()) != expected_sender_ssrc) {
-      return std::nullopt;
-    }
-
-    CongestionFeedbackPacketView result;
-    const auto blocks_end = parsed.payload.size() - 4U;
-    std::size_t offset = 4U;
-    std::size_t aggregate_metrics = 0;
-    while (offset < blocks_end) {
-      if (result.block_count == result.blocks.size() || blocks_end - offset < 8U) {
-        return std::nullopt;
-      }
-      const auto media_ssrc = wire::read_be<std::uint32_t>(parsed.payload.subspan(offset, 4));
-      const auto begin_sequence = wire::read_be<std::uint16_t>(parsed.payload.subspan(offset + 4U, 2));
-      const auto report_count = wire::read_be<std::uint16_t>(parsed.payload.subspan(offset + 6U, 2));
-      if (media_ssrc == 0 || report_count > 16'384U ||
-          aggregate_metrics > 16'384U - report_count) {
-        return std::nullopt;
-      }
-      for (std::size_t index = 0; index < result.block_count; ++index) {
-        if (result.blocks[index].media_ssrc == media_ssrc) {
-          return std::nullopt;
-        }
-      }
-      offset += 8U;
-      const auto metric_bytes = static_cast<std::size_t>(report_count) * 2U;
-      const auto alignment_bytes = (report_count & 1U) != 0U ? 2U : 0U;
-      if (metric_bytes + alignment_bytes > blocks_end - offset) {
-        return std::nullopt;
-      }
-      const auto metrics = parsed.payload.subspan(offset, metric_bytes);
-      for (std::size_t index = 0; index < report_count; ++index) {
-        const auto metric = wire::read_be<std::uint16_t>(metrics.subspan(index * 2U, 2));
-        if ((metric & 0x8000U) == 0 && (metric & 0x7fffU) != 0) {
-          return std::nullopt;
-        }
-      }
-      if (alignment_bytes != 0U &&
-          wire::read_be<std::uint16_t>(parsed.payload.subspan(offset + metric_bytes, 2)) != 0) {
-        return std::nullopt;
-      }
-      result.blocks[result.block_count++] = {
-        .media_ssrc = media_ssrc,
-        .begin_sequence = begin_sequence,
-        .report_count = report_count,
-        .metrics = metrics,
-      };
-      aggregate_metrics += report_count;
-      offset += metric_bytes + alignment_bytes;
-    }
-    if (offset != blocks_end || result.block_count == 0) {
-      return std::nullopt;
-    }
-    result.report_timestamp = wire::read_be<std::uint32_t>(parsed.payload.last<4>());
-    return result;
+    const auto validated = transport::validate_congestion_feedback_packet(packet, expected_sender_ssrc);
+    return validated ? std::optional {validated} : std::nullopt;
   }
 
   bool HostVideoSenderConfig::valid() const noexcept {
@@ -1328,7 +1282,7 @@ namespace lumen::lsp::runtime {
            path_payload_ceiling >= 1'200 &&
            path_payload_ceiling <= (family == media::ip_family::ipv4 ? 1'472U : 1'452U) &&
            feedback_sender_ssrc != 0 && audio_feedback_ssrc != 0 &&
-           audio_feedback_ssrc != video.primary_ssrc && capture_mail;
+           audio_feedback_ssrc != video.primary_ssrc && rtcp_cname.valid() && capture_mail;
   }
 
   class HostVideoSender::Impl {
@@ -1720,117 +1674,59 @@ namespace lumen::lsp::runtime {
       const std::uint64_t now_microseconds
     ) noexcept {
       std::scoped_lock lock(control_mutex_);
-      const auto summary = transport::parse_rtcp_datagram(packet, transport::rtcp_datagram_form::compound);
-      if (!summary || now_microseconds < last_compound_rtcp_microseconds_) {
+      const auto authority = transport::validate_compound_rtcp_authority(packet, config_.feedback_sender_ssrc);
+      if (!authority || now_microseconds < last_compound_rtcp_microseconds_ ||
+          (feedback_cname_size_ != 0 &&
+           (feedback_cname_size_ != authority.cname.size() ||
+            !std::ranges::equal(std::span<const std::uint8_t> {feedback_cname_}.first(feedback_cname_size_), authority.cname)))) {
         return false;
       }
-      bool sender_report_valid = false;
-      bool cname_valid = false;
-      std::size_t offset = 0;
-      std::size_t packet_index = 0;
-      while (offset < packet.size()) {
-        const auto parsed = transport::parse_rtcp_packet(packet.subspan(offset));
-        if (!parsed) {
-          return false;
+
+      std::uint32_t candidate_rtt = 0;
+      const auto &report_packet = authority.first_report;
+      const auto report_offset = report_packet.packet_type == transport::rtcp_sender_report_type ? 24U : 4U;
+      for (std::size_t report = 0; report < report_packet.count; ++report) {
+        const auto block = report_packet.payload.subspan(report_offset + report * 24U, 24U);
+        if (wire::read_be<std::uint32_t>(block.first<4>()) != config_.video.primary_ssrc) {
+          continue;
         }
-        if (packet_index == 0) {
-          if ((parsed.packet_type != transport::rtcp_sender_report_type &&
-               parsed.packet_type != transport::rtcp_receiver_report_type) ||
-              parsed.payload.size() < 4U ||
-              wire::read_be<std::uint32_t>(parsed.payload.first<4>()) != config_.feedback_sender_ssrc) {
-            return false;
-          }
-          const auto report_offset = parsed.packet_type == transport::rtcp_sender_report_type ? 24U : 4U;
-          if (parsed.payload.size() != report_offset + static_cast<std::size_t>(parsed.count) * 24U) {
-            return false;
-          }
-          for (std::size_t report = 0; report < parsed.count; ++report) {
-            const auto block = parsed.payload.subspan(report_offset + report * 24U, 24U);
-            if (wire::read_be<std::uint32_t>(block.first<4>()) != config_.video.primary_ssrc) {
-              continue;
-            }
-            const auto lsr = wire::read_be<std::uint32_t>(block.subspan<16, 4>());
-            const auto dlsr = wire::read_be<std::uint32_t>(block.subspan<20, 4>());
-            std::uint64_t sr_sent_microseconds = 0;
-            for (const auto &timing : sender_report_timings_) {
-              if (timing.lsr.load(std::memory_order_acquire) == lsr) {
-                sr_sent_microseconds = timing.sent_microseconds.load(std::memory_order_relaxed);
-                break;
-              }
-            }
-            if (lsr == 0 || sr_sent_microseconds == 0 || sr_sent_microseconds > now_microseconds) {
-              continue;
-            }
-            const auto receiver_delay = static_cast<std::uint64_t>(dlsr) * 1'000'000ULL / 65'536ULL;
-            const auto elapsed = now_microseconds - sr_sent_microseconds;
-            if (receiver_delay >= elapsed || elapsed - receiver_delay > 10'000'000U) {
-              continue;
-            }
-            const auto sample = static_cast<std::uint32_t>(elapsed - receiver_delay);
-            if (smoothed_rtt_microseconds_ == 0) {
-              smoothed_rtt_microseconds_ = sample;
-              rtt_variation_microseconds_ = sample / 2U;
-            } else {
-              const auto difference = smoothed_rtt_microseconds_ > sample ?
-                                        smoothed_rtt_microseconds_ - sample :
-                                        sample - smoothed_rtt_microseconds_;
-              rtt_variation_microseconds_ =
-                (rtt_variation_microseconds_ * 3U + difference) / 4U;
-              smoothed_rtt_microseconds_ =
-                (smoothed_rtt_microseconds_ * 7U + sample) / 8U;
-            }
-            repair_rtt_microseconds_.store(smoothed_rtt_microseconds_, std::memory_order_release);
-            small_path_delivery_evidence_.fetch_add(1, std::memory_order_relaxed);
-            last_small_path_delivery_microseconds_.store(now_microseconds, std::memory_order_release);
-          }
-          sender_report_valid = true;
-        }
-        if (parsed.packet_type == 202U) {
-          std::size_t chunk_offset = 0;
-          for (std::uint8_t chunk = 0; chunk < parsed.count; ++chunk) {
-            if (parsed.payload.size() - chunk_offset < 4U) {
-              return false;
-            }
-            const auto chunk_ssrc = wire::read_be<std::uint32_t>(parsed.payload.subspan(chunk_offset, 4));
-            chunk_offset += 4U;
-            bool ended = false;
-            while (chunk_offset < parsed.payload.size()) {
-              const auto item_type = parsed.payload[chunk_offset++];
-              if (item_type == 0) {
-                ended = true;
-                break;
-              }
-              if (chunk_offset >= parsed.payload.size()) {
-                return false;
-              }
-              const auto item_size = static_cast<std::size_t>(parsed.payload[chunk_offset++]);
-              if (item_size > parsed.payload.size() - chunk_offset) {
-                return false;
-              }
-              if (chunk_ssrc == config_.feedback_sender_ssrc && item_type == 1U && item_size != 0) {
-                cname_valid = true;
-              }
-              chunk_offset += item_size;
-            }
-            if (!ended) {
-              return false;
-            }
-            while ((chunk_offset & 3U) != 0U) {
-              if (chunk_offset >= parsed.payload.size() || parsed.payload[chunk_offset] != 0) {
-                return false;
-              }
-              ++chunk_offset;
-            }
-          }
-          if (chunk_offset != parsed.payload.size()) {
-            return false;
+        const auto lsr = wire::read_be<std::uint32_t>(block.subspan<16, 4>());
+        const auto dlsr = wire::read_be<std::uint32_t>(block.subspan<20, 4>());
+        std::uint64_t sr_sent_microseconds = 0;
+        for (const auto &timing : sender_report_timings_) {
+          if (timing.lsr.load(std::memory_order_acquire) == lsr) {
+            sr_sent_microseconds = timing.sent_microseconds.load(std::memory_order_relaxed);
+            break;
           }
         }
-        offset += parsed.packet.size();
-        ++packet_index;
+        if (lsr == 0 || sr_sent_microseconds == 0 || sr_sent_microseconds > now_microseconds) {
+          continue;
+        }
+        const auto receiver_delay = static_cast<std::uint64_t>(dlsr) * 1'000'000ULL / 65'536ULL;
+        const auto elapsed = now_microseconds - sr_sent_microseconds;
+        if (receiver_delay < elapsed && elapsed - receiver_delay <= 10'000'000U) {
+          candidate_rtt = static_cast<std::uint32_t>(elapsed - receiver_delay);
+        }
       }
-      if (!sender_report_valid || !cname_valid) {
-        return false;
+
+      if (feedback_cname_size_ == 0) {
+        std::copy(authority.cname.begin(), authority.cname.end(), feedback_cname_.begin());
+        feedback_cname_size_ = authority.cname.size();
+      }
+      if (candidate_rtt != 0) {
+        if (smoothed_rtt_microseconds_ == 0) {
+          smoothed_rtt_microseconds_ = candidate_rtt;
+          rtt_variation_microseconds_ = candidate_rtt / 2U;
+        } else {
+          const auto difference = smoothed_rtt_microseconds_ > candidate_rtt ?
+                                    smoothed_rtt_microseconds_ - candidate_rtt :
+                                    candidate_rtt - smoothed_rtt_microseconds_;
+          rtt_variation_microseconds_ = (rtt_variation_microseconds_ * 3U + difference) / 4U;
+          smoothed_rtt_microseconds_ = (smoothed_rtt_microseconds_ * 7U + candidate_rtt) / 8U;
+        }
+        repair_rtt_microseconds_.store(smoothed_rtt_microseconds_, std::memory_order_release);
+        small_path_delivery_evidence_.fetch_add(1, std::memory_order_relaxed);
+        last_small_path_delivery_microseconds_.store(now_microseconds, std::memory_order_release);
       }
       last_compound_rtcp_microseconds_ = now_microseconds;
       has_compound_rtcp_ = true;
@@ -1841,12 +1737,50 @@ namespace lumen::lsp::runtime {
       const std::span<const std::uint8_t> packet,
       const std::uint64_t now_microseconds
     ) noexcept {
+      const auto feedback = parse_congestion_feedback_packet(packet, config_.feedback_sender_ssrc);
+      return feedback && receive_congestion_feedback(*feedback, now_microseconds);
+    }
+
+    bool receive_congestion_feedback(
+      const CongestionFeedbackPacketView &feedback,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      return process_congestion_feedback(feedback, now_microseconds, true);
+    }
+
+    bool validate_congestion_feedback(
+      const CongestionFeedbackPacketView &feedback,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      return process_congestion_feedback(feedback, now_microseconds, false);
+    }
+
+    [[nodiscard]] std::optional<VideoCongestionFeedbackPreview> preview_congestion_feedback(
+      const CongestionFeedbackPacketView &feedback,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      return validate_congestion_feedback(feedback, now_microseconds) ?
+               std::optional<VideoCongestionFeedbackPreview> {{feedback, now_microseconds}} :
+               std::nullopt;
+    }
+
+    bool commit_congestion_feedback(const VideoCongestionFeedbackPreview &preview) noexcept {
+      return receive_congestion_feedback(preview.packet, preview.now_microseconds);
+    }
+
+    /** @brief Validate, and optionally atomically commit, all video and repair feedback blocks. */
+    bool process_congestion_feedback(
+      const CongestionFeedbackPacketView &feedback,
+      const std::uint64_t now_microseconds,
+      const bool commit
+    ) noexcept {
       std::scoped_lock lock(control_mutex_);
-      const auto reject = [this]() noexcept {
-        feedback_rejections_.fetch_add(1, std::memory_order_relaxed);
+      const auto reject = [this, commit]() noexcept {
+        if (commit) {
+          feedback_rejections_.fetch_add(1, std::memory_order_relaxed);
+        }
         return false;
       };
-      const auto feedback = parse_congestion_feedback_packet(packet, config_.feedback_sender_ssrc);
       if (!feedback || !has_compound_rtcp_ || now_microseconds < last_compound_rtcp_microseconds_ ||
           now_microseconds - last_compound_rtcp_microseconds_ > compound_rtcp_freshness_microseconds ||
           (has_feedback_receive_time_ &&
@@ -1857,7 +1791,7 @@ namespace lumen::lsp::runtime {
       }
 
       const auto content = classify_congestion_feedback_content(
-        *feedback,
+        feedback,
         config_.video.primary_ssrc,
         config_.audio_feedback_ssrc,
         config_.video.flexfec ? config_.video.flexfec->repair_ssrc : 0,
@@ -1866,11 +1800,14 @@ namespace lumen::lsp::runtime {
       if (content == CongestionFeedbackContent::invalid) {
         return reject();
       }
-      const auto report_timestamp = feedback->report_timestamp;
+      const auto report_timestamp = feedback.report_timestamp;
       if (has_feedback_timestamp_ && static_cast<std::int32_t>(report_timestamp - last_feedback_timestamp_) <= 0) {
         return reject();
       }
       if (content == CongestionFeedbackContent::audio_only) {
+        if (!commit) {
+          return true;
+        }
         last_feedback_timestamp_ = report_timestamp;
         last_feedback_receive_microseconds_ = now_microseconds;
         has_feedback_timestamp_ = true;
@@ -1884,13 +1821,14 @@ namespace lumen::lsp::runtime {
         SentPacketLedger *ledger {};  ///< Independently sequenced producer ledger.
         std::uint64_t first_serial {};  ///< First exact send incarnation in the block.
         std::uint64_t last_serial {};  ///< Last exact send incarnation in the block.
+        std::size_t locked_records {};  ///< Leading records retained through transactional commit.
         bool primary {};  ///< Whether this block drives source-loss repair and delay trend.
       };
 
       std::array<FeedbackLedgerBlock, 3> ledger_blocks {};
       std::size_t ledger_block_count = 0;
-      for (std::size_t block_index = 0; block_index < feedback->block_count; ++block_index) {
-        const auto &block = feedback->blocks[block_index];
+      for (std::size_t block_index = 0; block_index < feedback.block_count; ++block_index) {
+        const auto &block = feedback.blocks[block_index];
         SentPacketLedger *ledger = nullptr;
         bool primary = false;
         if (block.media_ssrc == config_.video.primary_ssrc) {
@@ -1915,6 +1853,19 @@ namespace lumen::lsp::runtime {
         };
       }
 
+      const auto unlock_ledger_records = [&]() noexcept {
+        for (std::size_t block_index = 0; block_index < ledger_block_count; ++block_index) {
+          auto &ledger_block = ledger_blocks[block_index];
+          for (std::size_t index = 0; index < ledger_block.locked_records; ++index) {
+            const auto sequence = static_cast<std::uint16_t>(
+              ledger_block.block->begin_sequence + index
+            );
+            ledger_block.ledger->records[sequence].access.clear(std::memory_order_release);
+          }
+          ledger_block.locked_records = 0;
+        }
+      };
+
       for (std::size_t block_index = 0; block_index < ledger_block_count; ++block_index) {
         auto &ledger_block = ledger_blocks[block_index];
         const auto &block = *ledger_block.block;
@@ -1923,12 +1874,14 @@ namespace lumen::lsp::runtime {
           const auto metric = wire::read_be<std::uint16_t>(block.metrics.subspan(index * 2U, 2));
           const auto received = (metric & 0x8000U) != 0;
           if (!received && (metric & 0x7fffU) != 0) {
+            unlock_ledger_records();
             return reject();
           }
           const auto sequence = static_cast<std::uint16_t>(block.begin_sequence + index);
           auto &record = ledger_block.ledger->records[sequence];
           while (record.access.test_and_set(std::memory_order_acquire)) {
           }
+          ++ledger_block.locked_records;
           const auto serial = record.send_serial.load(std::memory_order_acquire);
           const auto sent = record.sent_microseconds.load(std::memory_order_relaxed);
           const auto bytes = record.complete_ip_bytes.load(std::memory_order_relaxed);
@@ -1951,8 +1904,8 @@ namespace lumen::lsp::runtime {
             sent > now_microseconds || now_microseconds - sent > feedback_packet_freshness_microseconds ||
             (index != 0 && serial != ledger_block.first_serial + index) ||
             (!received && state == feedback_received);
-          record.access.clear(std::memory_order_release);
           if (invalid) {
+            unlock_ledger_records();
             return reject();
           }
           if (index == 0) {
@@ -1965,8 +1918,14 @@ namespace lumen::lsp::runtime {
             (ledger_block.last_serial > highest_sent ||
              (ledger_block.ledger->highest_feedback_serial != 0 &&
               ledger_block.last_serial + 16'384U < ledger_block.ledger->highest_feedback_serial))) {
+          unlock_ledger_records();
           return reject();
         }
+      }
+
+      if (!commit) {
+        unlock_ledger_records();
+        return true;
       }
 
       const auto current_path_generation = path_generation_.load(std::memory_order_acquire);
@@ -1990,20 +1949,17 @@ namespace lumen::lsp::runtime {
           const auto ecn = static_cast<std::uint8_t>((metric >> 13U) & 0x03U);
           const auto sequence = static_cast<std::uint16_t>(block.begin_sequence + index);
           auto &record = ledger_block.ledger->records[sequence];
-          while (record.access.test_and_set(std::memory_order_acquire)) {
-          }
           const auto expected_serial = ledger_block.first_serial + index;
           if (record.send_serial.load(std::memory_order_acquire) != expected_serial) {
-            record.access.clear(std::memory_order_release);
+            unlock_ledger_records();
             return reject();
           }
           const auto state = record.feedback_state.load(std::memory_order_relaxed);
           if (state == feedback_local_unsent) {
             if (received || record.send_serial.load(std::memory_order_acquire) != expected_serial) {
-              record.access.clear(std::memory_order_release);
+              unlock_ledger_records();
               return reject();
             }
-            record.access.clear(std::memory_order_release);
             continue;
           }
           const auto bytes = record.complete_ip_bytes.load(std::memory_order_relaxed);
@@ -2033,6 +1989,10 @@ namespace lumen::lsp::runtime {
               }
               if (state == feedback_unreported) {
                 subtract_in_flight(*ledger_block.ledger, bytes);
+              } else if (state == feedback_lost) {
+                subtract_counter(ledger_block.ledger->lost_bytes, bytes);
+                subtract_counter(feedback_lost_bytes_, bytes);
+                feedback_loss_corrections_.fetch_add(bytes, std::memory_order_relaxed);
               }
             }
             const auto prior_ecn = record.ecn_state.load(std::memory_order_relaxed);
@@ -2083,10 +2043,9 @@ namespace lumen::lsp::runtime {
             subtract_in_flight(*ledger_block.ledger, bytes);
           }
           if (record.send_serial.load(std::memory_order_acquire) != expected_serial) {
-            record.access.clear(std::memory_order_release);
+            unlock_ledger_records();
             return reject();
           }
-          record.access.clear(std::memory_order_release);
         }
         if (ledger_block.last_serial != 0) {
           ledger_block.ledger->highest_feedback_serial = std::max(
@@ -2095,6 +2054,7 @@ namespace lumen::lsp::runtime {
           );
         }
       }
+      unlock_ledger_records();
       last_feedback_timestamp_ = report_timestamp;
       last_feedback_receive_microseconds_ = now_microseconds;
       has_feedback_timestamp_ = true;
@@ -2327,6 +2287,7 @@ namespace lumen::lsp::runtime {
         .feedback_rejections = feedback_rejections_.load(std::memory_order_relaxed),
         .feedback_delivered_bytes = feedback_delivered_bytes_.load(std::memory_order_relaxed),
         .feedback_lost_bytes = feedback_lost_bytes_.load(std::memory_order_relaxed),
+        .feedback_loss_corrections = feedback_loss_corrections_.load(std::memory_order_relaxed),
         .path_probe_datagrams = path_probe_datagrams_.load(std::memory_order_relaxed),
         .path_probe_retries = path_probe_retries_.load(std::memory_order_relaxed),
         .flexfec_active = video_monotonic_microseconds() <
@@ -4047,6 +4008,15 @@ namespace lumen::lsp::runtime {
       if (!written) {
         return;
       }
+      const auto sdes_bytes = transport::write_sdes_cname(
+        config_.video.primary_ssrc,
+        config_.rtcp_cname.view(),
+        lease->storage.subspan(written.bytes_written)
+      );
+      if (sdes_bytes == 0) {
+        return;
+      }
+      const auto compound_bytes = written.bytes_written + sdes_bytes;
       const auto token = register_pending({
         .lsr = static_cast<std::uint32_t>(ntp >> 16U),
         .kind = PendingKind::sender_report,
@@ -4059,7 +4029,7 @@ namespace lumen::lsp::runtime {
             config_.peer,
             SecurePacketClass::rtcp,
             lease->storage,
-            written.bytes_written,
+            compound_bytes,
             protected_bytes
           )) {
         (void) take_pending(token, false);
@@ -4898,6 +4868,8 @@ namespace lumen::lsp::runtime {
     std::uint64_t smoothed_forward_overhead_bits_per_second_ {};  ///< Smoothed measured non-video wire rate.
     std::uint32_t last_delay_arrival_timestamp_ {};  ///< Prior receiver middle-NTP arrival timestamp.
     std::uint32_t last_feedback_timestamp_ {};  ///< Latest accepted RFC 8888 report timestamp.
+    std::array<std::uint8_t, 255> feedback_cname_ {};  ///< Stable regular-report CNAME authorizing reduced feedback.
+    std::size_t feedback_cname_size_ {};  ///< Populated stable CNAME byte count.
     std::uint32_t last_fir_sender_ssrc_ {};  ///< Feedback source of the latest accepted FIR command.
     std::uint32_t last_fir_media_ssrc_ {};  ///< Media source targeted by the latest accepted FIR command.
     std::uint32_t smoothed_rtt_microseconds_ {};  ///< Latest regular-RTCP RTT estimate when available.
@@ -4953,6 +4925,7 @@ namespace lumen::lsp::runtime {
     std::atomic<std::uint64_t> feedback_rejections_ {};  ///< Rejected malformed or hostile reports.
     std::atomic<std::uint64_t> feedback_delivered_bytes_ {};  ///< Newly accounted delivered IP bytes.
     std::atomic<std::uint64_t> feedback_lost_bytes_ {};  ///< Newly accounted lost IP bytes.
+    std::atomic<std::uint64_t> feedback_loss_corrections_ {};  ///< Loss bytes corrected by legal overlap.
     std::atomic<std::uint64_t> path_probe_datagrams_ {};  ///< Accepted exact protected LSPP submissions.
     std::atomic<std::uint64_t> path_probe_retries_ {};  ///< Fresh SRTCP-index PROBE_TIMER retries.
     std::atomic<std::uint64_t> flexfec_submitted_packets_ {};  ///< Final-sent FlexFEC RTP packet count.
@@ -4973,7 +4946,7 @@ namespace lumen::lsp::runtime {
   };
 
   HostVideoSender::HostVideoSender(HostVideoSenderConfig config, LibsrtpServerProvider &srtp) noexcept:
-      impl_ {new (std::nothrow) Impl {std::move(config), srtp}} {
+      impl_ {new(std::nothrow) Impl {std::move(config), srtp}} {
   }
 
   HostVideoSender::~HostVideoSender() = default;
@@ -5047,6 +5020,33 @@ namespace lumen::lsp::runtime {
 
   bool HostVideoSender::receive_congestion_feedback(
     const std::span<const std::uint8_t> packet,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->receive_congestion_feedback(packet, now_microseconds);
+  }
+
+  bool HostVideoSender::validate_congestion_feedback(
+    const CongestionFeedbackPacketView &packet,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->validate_congestion_feedback(packet, now_microseconds);
+  }
+
+  std::optional<VideoCongestionFeedbackPreview> HostVideoSender::preview_congestion_feedback(
+    const CongestionFeedbackPacketView &packet,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ ? impl_->preview_congestion_feedback(packet, now_microseconds) : std::nullopt;
+  }
+
+  bool HostVideoSender::commit_congestion_feedback(
+    const VideoCongestionFeedbackPreview &preview
+  ) noexcept {
+    return impl_ && impl_->commit_congestion_feedback(preview);
+  }
+
+  bool HostVideoSender::receive_congestion_feedback(
+    const CongestionFeedbackPacketView &packet,
     const std::uint64_t now_microseconds
   ) noexcept {
     return impl_ && impl_->receive_congestion_feedback(packet, now_microseconds);

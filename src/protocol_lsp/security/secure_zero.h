@@ -1,5 +1,5 @@
 /**
- * @file src/protocol_lsp/security/secure_zero.h
+ * @file SecureZero.h
  * @brief Shared non-optimizable byte clearing for LSP secret owners.
  */
 

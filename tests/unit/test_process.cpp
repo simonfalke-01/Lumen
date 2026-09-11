@@ -17,6 +17,43 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+  /** @brief Return one complete exact LSP process launch selection. */
+  proc::lsp_launch_request_t lsp_launch_request() {
+    return {
+      .width = 3'456,
+      .height = 2'160,
+      .refresh_numerator = 60'000,
+      .refresh_denominator = 1'001,
+      .pointer_rate = 8'000,
+      .controller_rate = 1'000,
+      .sensor_rate = 500,
+      .reconciliation_rate = 250,
+      .audio_channels = 6,
+      .audio_streams = 4,
+      .audio_coupled_streams = 2,
+      .audio_mapping = {0, 4, 1, 2, 3, 5, 0, 0},
+      .audio_frame_samples = 240,
+      .audio_bitrate = 384'000,
+      .audio_inband_fec = true,
+      .audio_dtx = false,
+      .video_codec = 2,
+      .video_profile = 4,
+      .video_pixel_class = 2,
+      .video_color_primaries = 9,
+      .video_transfer_function = 16,
+      .video_matrix_coefficients = 9,
+      .video_bits_per_second = 80'000'000,
+      .maximum_frame_age_microseconds = 50'000,
+      .hdr = true,
+      .video_full_range = false,
+      .flexfec = true,
+      .rtx = true,
+      .controller_output = true,
+    };
+  }
+}  // namespace
+
 class ProcessPNGTest: public BaseTest {
 protected:
   void SetUp() override {
@@ -110,6 +147,59 @@ TEST(ProcessLaunchEnvironmentTest, LegacyLaunchFallsBackToIntegerRefreshRational
   EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_NUMERATOR"].to_string(), "120");
   EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_DENOMINATOR"].to_string(), "1");
   EXPECT_EQ(env["SUNSHINE_CLIENT_FPS"].to_string(), "120");
+}
+
+TEST(ProcessLaunchEnvironmentTest, PopulatesExactLspControllerAudioAndVideoSelection) {
+  boost::process::v1::environment env {boost::this_process::environment()};
+  const auto request = lsp_launch_request();
+  ASSERT_TRUE(request.valid());
+  proc::apply_lsp_launch_environment(env, request);
+
+  EXPECT_EQ(env["LUMEN_CLIENT_PROTOCOL"].to_string(), "lsp/1");
+  EXPECT_EQ(env["LUMEN_CLIENT_CONTROLLER_RATE"].to_string(), "1000");
+  EXPECT_EQ(env["LUMEN_CLIENT_CONTROLLER_OUTPUT"].to_string(), "true");
+  EXPECT_EQ(env["LUMEN_CLIENT_AUDIO_CHANNELS"].to_string(), "6");
+  EXPECT_EQ(env["LUMEN_CLIENT_AUDIO_STREAMS"].to_string(), "4");
+  EXPECT_EQ(env["LUMEN_CLIENT_AUDIO_MAPPING"].to_string(), "0,4,1,2,3,5");
+  EXPECT_EQ(env["LUMEN_CLIENT_AUDIO_FRAME_SAMPLES"].to_string(), "240");
+  EXPECT_EQ(env["LUMEN_CLIENT_VIDEO_CODEC"].to_string(), "2");
+  EXPECT_EQ(env["LUMEN_CLIENT_VIDEO_PROFILE"].to_string(), "4");
+  EXPECT_EQ(env["LUMEN_CLIENT_VIDEO_TRANSFER_FUNCTION"].to_string(), "16");
+  EXPECT_EQ(env["LUMEN_CLIENT_VIDEO_BITRATE"].to_string(), "80000000");
+  EXPECT_EQ(env["LUMEN_CLIENT_VIDEO_FLEXFEC"].to_string(), "true");
+  EXPECT_EQ(env["LUMEN_CLIENT_VIDEO_RTX"].to_string(), "true");
+}
+
+TEST(ProcessLifecycleTest, LspStateOwnsOnlyExactIdleLaunchGeneration) {
+  boost::process::v1::environment env {boost::this_process::environment()};
+  proc::ctx_t desktop {};
+  desktop.name = "Desktop";
+  desktop.id = "881";
+  desktop.exit_timeout = std::chrono::seconds {0};
+  std::vector<proc::ctx_t> apps;
+  apps.emplace_back(std::move(desktop));
+  proc::proc_t process {std::move(env), std::move(apps)};
+
+  const auto launched = process.execute_lsp_if_idle(881, lsp_launch_request());
+  ASSERT_EQ(launched.status, 0);
+  ASSERT_NE(launched.process_generation, 0U);
+  const auto active = process.lsp_process_state();
+  EXPECT_TRUE(active.running);
+  EXPECT_TRUE(active.lsp_owned);
+  EXPECT_EQ(active.application_id, 881);
+  EXPECT_EQ(active.process_generation, launched.process_generation);
+  EXPECT_EQ(process.execute_lsp_if_idle(881, lsp_launch_request()).status, 409);
+  EXPECT_TRUE(process.terminate_lsp_generation(launched.process_generation));
+  EXPECT_FALSE(process.lsp_process_state().running);
+
+  auto legacy = std::make_shared<rtsp_stream::launch_session_t>();
+  legacy->client_cert = "certificate-a";
+  ASSERT_EQ(process.execute(881, legacy), 0);
+  const auto legacy_state = process.lsp_process_state();
+  EXPECT_TRUE(legacy_state.running);
+  EXPECT_FALSE(legacy_state.lsp_owned);
+  EXPECT_FALSE(process.terminate_lsp_generation(legacy->process_generation));
+  process.terminate();
 }
 
 TEST(ProcessLifecycleTest, CancellationRequiresAnAuthorizedLegacyCertificate) {

@@ -46,6 +46,15 @@ namespace lumen::lsp {
     fatal,  ///< Provider detected a local association failure requiring teardown.
   };
 
+  /** @brief IP-layer ECN codepoint observed on one authenticated receive datagram. */
+  enum class IpEcn : std::uint8_t {
+    not_ect = 0,  ///< Datagram was explicitly Not-ECT.
+    ect_1 = 1,  ///< Datagram carried ECT(1).
+    ect_0 = 2,  ///< Datagram carried ECT(0).
+    congestion_experienced = 3,  ///< Datagram carried ECN-CE.
+    unavailable = 0xff,  ///< Platform ancillary receive metadata was unavailable.
+  };
+
   /**
    * @brief DTLS 1.3 server provider injected by product integration.
    *
@@ -102,12 +111,16 @@ namespace lumen::lsp {
      * @param peer Source endpoint bound to the authenticated association.
      * @param packet_class RFC 5761 packet class.
      * @param datagram Mutable socket-owned SRTP or SRTCP packet unprotected in place.
+     * @param received_at_microseconds Socket receive timestamp in the host monotonic domain.
+     * @param ecn Authenticated datagram's IP-layer ECN observation.
      * @return Provider disposition.
      */
     virtual ProviderDatagramResult receive_secure_packet(
       const PeerEndpoint &peer,
       SecurePacketClass packet_class,
-      std::span<std::uint8_t> datagram
+      std::span<std::uint8_t> datagram,
+      std::uint64_t received_at_microseconds,
+      IpEcn ecn
     ) noexcept = 0;
   };
 }  // namespace lumen::lsp

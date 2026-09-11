@@ -19,7 +19,10 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_applications = 64;
     constexpr std::size_t maximum_audio_offers = 12;
     constexpr std::size_t maximum_video_offers = 8;
-    constexpr std::size_t maximum_video_codec_configuration_unit_bytes = 512;
+    constexpr std::size_t maximum_video_codec_configuration_unit_bytes = 768;
+    constexpr std::size_t maximum_inline_object_chunk_bytes = 768;
+    constexpr std::uint32_t maximum_object_bytes = 16U * 1'024U * 1'024U;
+    constexpr std::uint16_t maximum_text_input_bytes = 16U * 1'024U;
 
     template<std::size_t Size>
     cbor::Value::Bytes bytes(const std::array<std::uint8_t, Size> &value) {
@@ -43,6 +46,16 @@ namespace lumen::lsp::runtime {
     /** @brief Return a borrowed boolean only when the CBOR value has exact boolean type. */
     const bool *boolean_value(const cbor::Value &value) noexcept {
       return std::get_if<bool>(&value.storage);
+    }
+
+    /** @brief Return borrowed byte-string storage only for exact CBOR bytes. */
+    const cbor::Value::Bytes *byte_string(const cbor::Value &value) noexcept {
+      return std::get_if<cbor::Value::Bytes>(&value.storage);
+    }
+
+    /** @brief Return whether one CBOR value is exactly null. */
+    bool null_value(const cbor::Value &value) noexcept {
+      return std::holds_alternative<cbor::Null>(value.storage);
     }
 
     cbor::Limits limits() noexcept {
@@ -781,10 +794,20 @@ namespace lumen::lsp::runtime {
     for (const auto &application : applications) {
       if (application.id.empty() || application.id.size() > 128 || application.name.empty() || application.name.size() > 256 ||
           application.image_path.size() > 512 || !cbor::is_valid_utf8(application.id) ||
-          !cbor::is_valid_utf8(application.name) || !cbor::is_valid_utf8(application.image_path)) {
+          !cbor::is_valid_utf8(application.name) || !cbor::is_valid_utf8(application.image_path) ||
+          (application.running ? application.process_generation == 0 :
+                                 (application.resume_available || application.process_generation != 0)) ||
+          (application.resume_available && !application.running)) {
         return std::unexpected(ControlWireError::invalid_field);
       }
-      values.emplace_back(cbor::Value::Map {{1, application.id}, {2, application.name}, {3, application.image_path}});
+      values.emplace_back(cbor::Value::Map {
+        {1, application.id},
+        {2, application.name},
+        {3, application.image_path},
+        {4, cbor::Value {application.running}},
+        {5, cbor::Value {application.resume_available}},
+        {6, application.process_generation},
+      });
     }
     return encode({{1, wire_version}, {2, static_cast<std::uint8_t>(ControlStatus::success)}, {3, std::move(values)}});
   }
@@ -815,7 +838,13 @@ namespace lumen::lsp::runtime {
     const auto map = decode_map(payload, 16);
     StartRequestPayload result;
     const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
-    const auto *application = map ? std::get_if<std::string>(&(*map)[1].second.storage) : nullptr;
+    const auto *application_intent = map ? std::get_if<cbor::Value::Map>(&(*map)[1].second.storage) : nullptr;
+    const auto *application = application_intent && application_intent->size() == 2 ?
+                                std::get_if<std::string>(&(*application_intent)[0].second.storage) :
+                                nullptr;
+    const auto *resume = application_intent && application_intent->size() == 2 ?
+                           boolean_value((*application_intent)[1].second) :
+                           nullptr;
     const auto *pointer = map ? unsigned_value((*map)[2].second) : nullptr;
     const auto *controller = map ? unsigned_value((*map)[3].second) : nullptr;
     const auto *sensor = map ? unsigned_value((*map)[4].second) : nullptr;
@@ -831,8 +860,11 @@ namespace lumen::lsp::runtime {
     const auto *decoder_surfaces = map ? unsigned_value((*map)[13].second) : nullptr;
     const auto *render_mailbox = map ? unsigned_value((*map)[14].second) : nullptr;
     const auto *capture_to_present = map ? unsigned_value((*map)[15].second) : nullptr;
-    if (!map || version == nullptr || *version != wire_version || application == nullptr || application->empty() ||
-        application->size() > 128 || pointer == nullptr || *pointer < 125 || *pointer > 16'000 || controller == nullptr ||
+    if (!map || version == nullptr || *version != wire_version || application_intent == nullptr ||
+        application_intent->size() != 2 || (*application_intent)[0].first != 1 ||
+        (*application_intent)[1].first != 2 || application == nullptr || application->empty() ||
+        application->size() > 128 || !cbor::is_valid_utf8(*application) || resume == nullptr ||
+        pointer == nullptr || *pointer < 125 || *pointer > 16'000 || controller == nullptr ||
         *controller < 125 || *controller > 2'000 || sensor == nullptr || *sensor < 125 || *sensor > 4'000 ||
         reconciliation == nullptr || *reconciliation < 50 || *reconciliation > 1'000 || budget == nullptr ||
         *budget == 0 || *budget > 32'000'000 || offers == nullptr || offers->empty() ||
@@ -984,6 +1016,7 @@ namespace lumen::lsp::runtime {
     }
     result = {
       .application_id = *application,
+      .resume = *resume,
       .pointer_rate = static_cast<std::uint32_t>(*pointer),
       .controller_rate = static_cast<std::uint32_t>(*controller),
       .sensor_rate = static_cast<std::uint32_t>(*sensor),
@@ -1329,5 +1362,346 @@ namespace lumen::lsp::runtime {
       .probe_id = *probe_id,
       .udp_payload_size = static_cast<std::uint16_t>(*udp_payload_size),
     };
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_certificate_rotate(
+    const CertificateRotatePayload &payload
+  ) {
+    if (is_zero(payload.host_id) || payload.connection_generation == 0 ||
+        payload.rotation_generation == 0 || is_zero(payload.new_spki_sha256) ||
+        std::ranges::all_of(payload.host_signature, [](const std::uint8_t byte) {
+          return byte == 0;
+        })) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, bytes(payload.host_id)},
+      {3, payload.connection_generation},
+      {4, payload.rotation_generation},
+      {5, bytes(payload.new_spki_sha256)},
+      {6, bytes(payload.host_signature)},
+    });
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_certificate_rotation_transcript(
+    const Identifier128 &host_id,
+    const PublicKey256 &host_identity_key,
+    const Digest256 &current_spki_sha256,
+    const Digest256 &new_spki_sha256,
+    const std::uint32_t connection_generation,
+    const std::uint32_t rotation_generation
+  ) {
+    if (is_zero(host_id) || is_zero(host_identity_key) || is_zero(current_spki_sha256) ||
+        is_zero(new_spki_sha256) || current_spki_sha256 == new_spki_sha256 ||
+        connection_generation == 0 || rotation_generation == 0) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, std::string {"lumen-stream/1 certificate rotate"}},
+      {2, wire_version},
+      {3, bytes(host_id)},
+      {4, bytes(host_identity_key)},
+      {5, bytes(current_spki_sha256)},
+      {6, bytes(new_spki_sha256)},
+      {7, connection_generation},
+      {8, rotation_generation},
+    });
+  }
+
+  std::expected<CertificateRotateAckPayload, ControlWireError> decode_certificate_rotate_ack(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 5);
+    CertificateRotateAckPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *connection_generation = map ? unsigned_value((*map)[3].second) : nullptr;
+    const auto *rotation_generation = map ? unsigned_value((*map)[4].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || status == nullptr ||
+        *status > static_cast<std::uint8_t>(ControlStatus::internal_failure) ||
+        !valid_status(static_cast<ControlStatus>(*status)) ||
+        !fixed_bytes((*map)[2].second, result.host_id) || is_zero(result.host_id) ||
+        connection_generation == nullptr || *connection_generation == 0 ||
+        *connection_generation > std::numeric_limits<std::uint32_t>::max() ||
+        rotation_generation == nullptr || *rotation_generation == 0 ||
+        *rotation_generation > std::numeric_limits<std::uint32_t>::max()) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.status = static_cast<ControlStatus>(*status);
+    result.connection_generation = static_cast<std::uint32_t>(*connection_generation);
+    result.rotation_generation = static_cast<std::uint32_t>(*rotation_generation);
+    return result;
+  }
+
+  std::expected<QuitApplicationPayload, ControlWireError> decode_quit_application(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 3);
+    QuitApplicationPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *application_id = map ? std::get_if<std::string>(&(*map)[2].second.storage) : nullptr;
+    if (!map || version == nullptr || *version != wire_version ||
+        !fixed_bytes((*map)[1].second, result.session_id) || is_zero(result.session_id) ||
+        application_id == nullptr || application_id->empty() || application_id->size() > 128U ||
+        !cbor::is_valid_utf8(*application_id)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.application_id = *application_id;
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_quit_application_response(
+    const QuitApplicationResponsePayload &payload
+  ) {
+    if (!valid_status(payload.status) || is_zero(payload.session_id)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, bytes(payload.session_id)},
+    });
+  }
+
+  std::expected<TextInputPayload, ControlWireError> decode_text_input(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 8);
+    TextInputPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *input_generation = map ? unsigned_value((*map)[2].second) : nullptr;
+    const auto *preceding_edge_id = map ? unsigned_value((*map)[3].second) : nullptr;
+    const auto *utf8_length = map ? unsigned_value((*map)[4].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version ||
+        !fixed_bytes((*map)[1].second, result.session_id) || is_zero(result.session_id) ||
+        input_generation == nullptr || *input_generation == 0 ||
+        *input_generation > std::numeric_limits<std::uint32_t>::max() || preceding_edge_id == nullptr ||
+        utf8_length == nullptr || *utf8_length == 0 || *utf8_length > maximum_text_input_bytes) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.input_generation = static_cast<std::uint32_t>(*input_generation);
+    result.preceding_edge_id = *preceding_edge_id;
+    result.utf8_length = static_cast<std::uint16_t>(*utf8_length);
+    const auto *inline_utf8 = byte_string((*map)[5].second);
+    if (inline_utf8 != nullptr) {
+      const std::string_view text {reinterpret_cast<const char *>(inline_utf8->data()), inline_utf8->size()};
+      if (inline_utf8->empty() || inline_utf8->size() != result.utf8_length ||
+          inline_utf8->size() > maximum_inline_object_chunk_bytes || !cbor::is_valid_utf8(text) ||
+          !null_value((*map)[6].second) || !null_value((*map)[7].second)) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      result.inline_utf8 = *inline_utf8;
+      return result;
+    }
+    Identifier128 object_id;
+    Digest256 digest;
+    if (!null_value((*map)[5].second) || !fixed_bytes((*map)[6].second, object_id) ||
+        is_zero(object_id) || !fixed_bytes((*map)[7].second, digest) || is_zero(digest)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.object_id = object_id;
+    result.sha256 = digest;
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_text_input_response(
+    const TextInputResponsePayload &payload
+  ) {
+    if (!valid_status(payload.status) || is_zero(payload.session_id) || payload.input_generation == 0) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, bytes(payload.session_id)},
+      {4, payload.input_generation},
+      {5, payload.preceding_edge_id},
+    });
+  }
+
+  std::expected<InputRateRequestPayload, ControlWireError> decode_input_rate_request(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 13);
+    InputRateRequestPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    std::array<const std::uint64_t *, 10> values {};
+    if (map) {
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        values[index] = unsigned_value((*map)[index + 2U].second);
+      }
+    }
+    if (!map || version == nullptr || *version != wire_version ||
+        !fixed_bytes((*map)[1].second, result.session_id) || is_zero(result.session_id) ||
+        std::ranges::any_of(values, [](const auto *value) {
+          return value == nullptr;
+        })) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    const auto device_type = static_cast<InputRateDeviceType>(*values[1]);
+    const auto valid_device = device_type == InputRateDeviceType::pointer ||
+                              device_type == InputRateDeviceType::controller ||
+                              device_type == InputRateDeviceType::sensor ||
+                              device_type == InputRateDeviceType::reconciliation;
+    const auto state_minimum = device_type == InputRateDeviceType::reconciliation ? 50U : 125U;
+    const auto state_maximum = device_type == InputRateDeviceType::pointer    ? 16'000U :
+                               device_type == InputRateDeviceType::controller ? 2'000U :
+                               device_type == InputRateDeviceType::sensor     ? 4'000U :
+                                                                                1'000U;
+    const auto *maximum_sensor_packet_bytes = unsigned_value((*map)[12].second);
+    const auto removal = *values[4] == 0 && *values[5] == 0 && *values[6] == 0 &&
+                         *values[7] == 0 && *values[8] == 0 && *values[9] == 0 &&
+                         maximum_sensor_packet_bytes != nullptr && *maximum_sensor_packet_bytes == 0;
+    if (*values[0] == 0 || *values[0] > std::numeric_limits<std::uint32_t>::max() || !valid_device ||
+        *values[2] > std::numeric_limits<std::uint16_t>::max() || *values[3] == 0 ||
+        *values[3] > std::numeric_limits<std::uint32_t>::max() || maximum_sensor_packet_bytes == nullptr ||
+        (!removal &&
+         (*values[4] > 100'000U || *values[5] < state_minimum || *values[5] > *values[6] ||
+          *values[6] > state_maximum || *values[7] > *values[8] || *values[9] == 0 ||
+          *values[9] > 1'200U || *maximum_sensor_packet_bytes > 1'200U ||
+          ((*values[7] == 0 && *values[8] == 0) ? *maximum_sensor_packet_bytes != 0 :
+                                                  (*values[7] < 125U || *values[8] > 4'000U ||
+                                                   *maximum_sensor_packet_bytes == 0))))) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.input_generation = static_cast<std::uint32_t>(*values[0]);
+    result.device_type = device_type;
+    result.device_id = static_cast<std::uint16_t>(*values[2]);
+    result.instance_generation = static_cast<std::uint32_t>(*values[3]);
+    result.observed_capture_rate = static_cast<std::uint32_t>(*values[4]);
+    result.minimum_state_rate = static_cast<std::uint32_t>(*values[5]);
+    result.maximum_state_rate = static_cast<std::uint32_t>(*values[6]);
+    result.minimum_sensor_rate = static_cast<std::uint32_t>(*values[7]);
+    result.maximum_sensor_rate = static_cast<std::uint32_t>(*values[8]);
+    result.maximum_state_packet_bytes = static_cast<std::uint16_t>(*values[9]);
+    result.maximum_sensor_packet_bytes = static_cast<std::uint16_t>(*maximum_sensor_packet_bytes);
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_input_rate_response(
+    const InputRateResponsePayload &payload
+  ) {
+    if (!valid_status(payload.status) || is_zero(payload.session_id) || payload.input_generation == 0 ||
+        payload.instance_generation == 0 || payload.pointer_rate < 125U || payload.pointer_rate > 16'000U ||
+        payload.controller_rate < 125U || payload.controller_rate > 2'000U ||
+        payload.aggregate_sensor_rate < 125U || payload.aggregate_sensor_rate > 4'000U ||
+        payload.reconciliation_rate < 50U || payload.reconciliation_rate > 1'000U ||
+        payload.reserved_input_wire_bits_per_second == 0 ||
+        payload.reserved_input_wire_bits_per_second > 32'000'000U) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, bytes(payload.session_id)},
+      {4, payload.input_generation},
+      {5, static_cast<std::uint8_t>(payload.device_type)},
+      {6, payload.device_id},
+      {7, payload.instance_generation},
+      {8, payload.state_rate},
+      {9, payload.sensor_rate},
+      {10, payload.pointer_rate},
+      {11, payload.controller_rate},
+      {12, payload.aggregate_sensor_rate},
+      {13, payload.reconciliation_rate},
+      {14, payload.reserved_input_wire_bits_per_second},
+    });
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_stream_ended(
+    const StreamEndedPayload &payload
+  ) {
+    if (is_zero(payload.session_id) || payload.stream_generation == 0) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, bytes(payload.session_id)},
+      {3, payload.stream_generation},
+      {4, payload.reason},
+    });
+  }
+
+  std::expected<ObjectChunkPayload, ControlWireError> decode_object_chunk(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 6);
+    ObjectChunkPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *offset = map ? unsigned_value((*map)[2].second) : nullptr;
+    const auto *total_length = map ? unsigned_value((*map)[3].second) : nullptr;
+    const auto *chunk = map ? byte_string((*map)[4].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version ||
+        !fixed_bytes((*map)[1].second, result.object_id) || is_zero(result.object_id) ||
+        offset == nullptr || *offset > std::numeric_limits<std::uint32_t>::max() || total_length == nullptr ||
+        *total_length == 0 || *total_length > maximum_object_bytes || chunk == nullptr || chunk->empty() ||
+        chunk->size() > maximum_inline_object_chunk_bytes || *offset + chunk->size() > *total_length ||
+        !fixed_bytes((*map)[5].second, result.sha256) || is_zero(result.sha256)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.offset = static_cast<std::uint32_t>(*offset);
+    result.total_length = static_cast<std::uint32_t>(*total_length);
+    result.bytes = *chunk;
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_object_chunk(
+    const ObjectChunkPayload &payload
+  ) {
+    if (is_zero(payload.object_id) || payload.total_length == 0 ||
+        payload.total_length > maximum_object_bytes || payload.bytes.empty() ||
+        payload.bytes.size() > maximum_inline_object_chunk_bytes ||
+        static_cast<std::uint64_t>(payload.offset) + payload.bytes.size() > payload.total_length ||
+        is_zero(payload.sha256)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, bytes(payload.object_id)},
+      {3, payload.offset},
+      {4, payload.total_length},
+      {5, cbor::Value::Bytes {payload.bytes.begin(), payload.bytes.end()}},
+      {6, bytes(payload.sha256)},
+    });
+  }
+
+  std::expected<ObjectChunkAckPayload, ControlWireError> decode_object_chunk_ack(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 5);
+    ObjectChunkAckPayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *next_offset = map ? unsigned_value((*map)[3].second) : nullptr;
+    const auto *total_length = map ? unsigned_value((*map)[4].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || status == nullptr ||
+        *status > static_cast<std::uint8_t>(ControlStatus::internal_failure) ||
+        !valid_status(static_cast<ControlStatus>(*status)) ||
+        !fixed_bytes((*map)[2].second, result.object_id) || is_zero(result.object_id) ||
+        next_offset == nullptr || total_length == nullptr || *total_length == 0 ||
+        *total_length > maximum_object_bytes || *next_offset > *total_length) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.status = static_cast<ControlStatus>(*status);
+    result.next_offset = static_cast<std::uint32_t>(*next_offset);
+    result.total_length = static_cast<std::uint32_t>(*total_length);
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_object_chunk_ack(
+    const ObjectChunkAckPayload &payload
+  ) {
+    if (!valid_status(payload.status) || is_zero(payload.object_id) || payload.total_length == 0 ||
+        payload.total_length > maximum_object_bytes || payload.next_offset > payload.total_length) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, bytes(payload.object_id)},
+      {4, payload.next_offset},
+      {5, payload.total_length},
+    });
   }
 }  // namespace lumen::lsp::runtime

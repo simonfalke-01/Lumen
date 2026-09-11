@@ -6,6 +6,7 @@
 #include "wolfssl_dtls_server.h"
 
 #include "secure_zero.h"
+#include "wolfssl_process.h"
 
 // clang-format off
 #include <wolfssl/options.h>
@@ -27,12 +28,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -256,28 +259,6 @@ namespace lumen::lsp {
       return actual != nullptr && std::string_view {actual} == expected;
     }
 
-    /**
-     * @brief Initialize wolfSSL once for the process without provider-local cleanup races.
-     *
-     * wolfSSL global cleanup is intentionally left to process termination.
-     * Multiple DTLS providers and libSRTP's wolfCrypt backend can coexist, so
-     * one provider must never tear global state down while another still uses
-     * it.
-     *
-     * @return True when process-scoped initialization succeeded.
-     */
-    [[nodiscard]] bool initialize_wolfssl_process() noexcept {
-      static std::once_flag initialization_once;
-      static bool initialized = false;
-      try {
-        std::call_once(initialization_once, []() noexcept {
-          initialized = wolfSSL_Init() == WOLFSSL_SUCCESS;
-        });
-      } catch (...) {
-        return false;
-      }
-      return initialized;
-    }
   }  // namespace
 
   class WolfsslDtlsServerProvider::Impl {
@@ -317,6 +298,20 @@ namespace lumen::lsp {
     using Context = std::unique_ptr<WOLFSSL_CTX, ContextDeleter>;  ///< Owning wolfSSL server context.
     using Session = std::unique_ptr<WOLFSSL, SessionDeleter>;  ///< Owning wolfSSL association.
 
+    /** @brief Allocation-free canonical five-tuple used by cross-thread queues. */
+    struct FixedPeerIdentity {
+      IpAddressFamily family {IpAddressFamily::ipv4};  ///< Declared address family.
+      std::array<std::uint8_t, 16> local_address {};  ///< IPv4 leading four bytes or full IPv6 bytes.
+      std::uint16_t local_port {};  ///< Local application port.
+      std::uint32_t local_scope_id {};  ///< Local IPv6 scope identifier, zero otherwise.
+      std::uint32_t interface_index {};  ///< Receiving interface used for same-source replies.
+      std::array<std::uint8_t, 16> remote_address {};  ///< IPv4 leading four bytes or full IPv6 bytes.
+      std::uint16_t remote_port {};  ///< Remote source port.
+      std::uint32_t remote_scope_id {};  ///< Remote IPv6 scope identifier, zero otherwise.
+
+      bool operator==(const FixedPeerIdentity &) const = default;
+    };
+
     /**
      * @brief Per-call complete-datagram wolfSSL I/O adapter.
      */
@@ -334,8 +329,80 @@ namespace lumen::lsp {
      */
     struct Association {
       PeerEndpoint peer;  ///< Bound LSP five-tuple.
+      FixedPeerIdentity identity {};  ///< Allocation-free exact lookup identity.
       Session session;  ///< Stateful wolfSSL DTLS association.
+      std::uint32_t context_generation {};  ///< Exact server context that created this session.
       bool established {};  ///< Whether exact policy validation and exporter installation completed.
+      bool pending_close {};  ///< Deferred close applied only after the outermost wolfSSL call unwinds.
+    };
+
+    /** @brief Retired server context retained only while its associations remain live. */
+    struct RetiredContext {
+      std::uint32_t generation {};  ///< Context incarnation named by live associations.
+      Context context;  ///< Old credential context.
+    };
+
+    /** @brief Bounded copied application record awaiting socket-owner protection. */
+    struct PendingSend {
+      FixedPeerIdentity peer {};  ///< Destination association without string allocation.
+      std::array<std::uint8_t, maximum_dtls_application_record> plaintext {};  ///< Copied record bytes.
+      std::size_t size {};  ///< Active leading record bytes.
+    };
+
+    /** @brief Restore the prior wolfSSL I/O contexts at lexical-scope exit. */
+    class ScopedIoContext {
+    public:
+      /** @brief Attach one per-call I/O adapter while preserving prior contexts. */
+      ScopedIoContext(WOLFSSL *session, IoContext &context) noexcept:
+          session_ {session},
+          previous_read_ {wolfSSL_GetIOReadCtx(session)},
+          previous_write_ {wolfSSL_GetIOWriteCtx(session)} {
+        wolfSSL_SetIOReadCtx(session_, &context);
+        wolfSSL_SetIOWriteCtx(session_, &context);
+      }
+
+      ScopedIoContext(const ScopedIoContext &) = delete;
+      ScopedIoContext &operator=(const ScopedIoContext &) = delete;
+
+      /** @brief Restore both prior contexts before association mutation. */
+      ~ScopedIoContext() {
+        wolfSSL_SetIOReadCtx(session_, previous_read_);
+        wolfSSL_SetIOWriteCtx(session_, previous_write_);
+      }
+
+    private:
+      WOLFSSL *session_ {};  ///< Temporarily attached association.
+      void *previous_read_ {};  ///< Prior read context.
+      void *previous_write_ {};  ///< Prior write context.
+    };
+
+    /** @brief Track one outer or direct socket-owner provider operation. */
+    class OperationScope {
+    public:
+      /** @brief Enter only when the current thread owns association mutation. */
+      explicit OperationScope(Impl &owner) noexcept:
+          owner_ {owner},
+          active_ {owner_.enter_operation()} {
+      }
+
+      OperationScope(const OperationScope &) = delete;
+      OperationScope &operator=(const OperationScope &) = delete;
+
+      /** @brief Unwind and drain deferred operations at depth zero. */
+      ~OperationScope() {
+        if (active_) {
+          owner_.leave_operation();
+        }
+      }
+
+      /** @brief Return whether owner-thread entry succeeded. */
+      [[nodiscard]] bool active() const noexcept {
+        return active_;
+      }
+
+    private:
+      Impl &owner_;  ///< Provider implementation owner.
+      bool active_ {};  ///< Successful owner-thread entry.
     };
 
     /**
@@ -350,13 +417,48 @@ namespace lumen::lsp {
      * @brief Clear secrets before member storage is released.
      */
     ~Impl() {
-      for (const auto &association : associations_) {
-        notify_closed(association.peer);
-      }
+      disable_callbacks();
       associations_.clear();
       context_.reset();
       secure_zero(private_key_der_);
       secure_zero(cookie_secret_);
+    }
+
+    /** @brief Build one exact-policy server context from a matching DER credential pair. */
+    static Context make_server_context(
+      const std::span<const std::uint8_t> certificate_der,
+      const std::span<const std::uint8_t> private_key_der
+    ) noexcept {
+      Context context {wolfSSL_CTX_new(wolfDTLSv1_3_server_method())};
+      if (!context || wolfSSL_CTX_set_cipher_list(context.get(), wolfssl_cipher_name.data()) != WOLFSSL_SUCCESS) {
+        return {};
+      }
+      (void) wolfSSL_CTX_set_session_cache_mode(context.get(), WOLFSSL_SESS_CACHE_OFF);
+      int group = WOLFSSL_ECC_X25519;
+      if (wolfSSL_CTX_set_groups(context.get(), &group, 1) != WOLFSSL_SUCCESS ||
+          wolfSSL_CTX_set_tlsext_use_srtp(context.get(), required_srtp_profile.data()) != 0 ||
+          wolfSSL_CTX_no_ticket_TLSv13(context.get()) != 0 ||
+          certificate_der.size() > std::numeric_limits<long>::max() ||
+          private_key_der.size() > std::numeric_limits<long>::max() ||
+          wolfSSL_CTX_use_certificate_buffer(
+            context.get(),
+            certificate_der.data(),
+            static_cast<long>(certificate_der.size()),
+            WOLFSSL_FILETYPE_ASN1
+          ) != WOLFSSL_SUCCESS ||
+          wolfSSL_CTX_use_PrivateKey_buffer(
+            context.get(),
+            private_key_der.data(),
+            static_cast<long>(private_key_der.size()),
+            WOLFSSL_FILETYPE_ASN1
+          ) != WOLFSSL_SUCCESS ||
+          wolfSSL_CTX_check_private_key(context.get()) != WOLFSSL_SUCCESS) {
+        return {};
+      }
+      wolfSSL_CTX_set_verify(context.get(), WOLFSSL_VERIFY_NONE, nullptr);
+      wolfSSL_CTX_SetIORecv(context.get(), receive_callback);
+      wolfSSL_CTX_SetIOSend(context.get(), send_callback);
+      return context;
     }
 
     /**
@@ -379,11 +481,13 @@ namespace lumen::lsp {
         private_key_der_.assign(config.private_key_der.begin(), config.private_key_der.end());
         cookie_secret_.assign(config.cookie_secret.begin(), config.cookie_secret.end());
         associations_.reserve(config.maximum_associations);
+        retired_contexts_.reserve(8);
       } catch (...) {
         return WolfsslDtlsInitializationStatus::invalid_configuration;
       }
       maximum_associations_ = config.maximum_associations;
       callbacks_ = config.callbacks;
+      callbacks_enabled_ = true;
 
       const auto spki = derive_spki_sha256(certificate_der_);
       if (!spki) {
@@ -397,38 +501,10 @@ namespace lumen::lsp {
       if (!initialize_wolfssl_process()) {
         return WolfsslDtlsInitializationStatus::wolfssl_initialization_failed;
       }
-      context_.reset(wolfSSL_CTX_new(wolfDTLSv1_3_server_method()));
-      if (!context_ || wolfSSL_CTX_set_cipher_list(context_.get(), wolfssl_cipher_name.data()) != WOLFSSL_SUCCESS) {
+      context_ = make_server_context(certificate_der_, private_key_der_);
+      if (!context_) {
         return WolfsslDtlsInitializationStatus::wolfssl_initialization_failed;
       }
-      (void) wolfSSL_CTX_set_session_cache_mode(context_.get(), WOLFSSL_SESS_CACHE_OFF);
-
-      int group = WOLFSSL_ECC_X25519;
-      if (wolfSSL_CTX_set_groups(context_.get(), &group, 1) != WOLFSSL_SUCCESS ||
-          wolfSSL_CTX_set_tlsext_use_srtp(context_.get(), required_srtp_profile.data()) != 0 ||
-          wolfSSL_CTX_no_ticket_TLSv13(context_.get()) != 0 ||
-          certificate_der_.size() > std::numeric_limits<long>::max() ||
-          private_key_der_.size() > std::numeric_limits<long>::max() ||
-          wolfSSL_CTX_use_certificate_buffer(
-            context_.get(),
-            certificate_der_.data(),
-            static_cast<long>(certificate_der_.size()),
-            WOLFSSL_FILETYPE_ASN1
-          ) != WOLFSSL_SUCCESS ||
-          wolfSSL_CTX_use_PrivateKey_buffer(
-            context_.get(),
-            private_key_der_.data(),
-            static_cast<long>(private_key_der_.size()),
-            WOLFSSL_FILETYPE_ASN1
-          ) != WOLFSSL_SUCCESS ||
-          wolfSSL_CTX_check_private_key(context_.get()) != WOLFSSL_SUCCESS) {
-        context_.reset();
-        return WolfsslDtlsInitializationStatus::wolfssl_initialization_failed;
-      }
-
-      wolfSSL_CTX_set_verify(context_.get(), WOLFSSL_VERIFY_NONE, nullptr);
-      wolfSSL_CTX_SetIORecv(context_.get(), receive_callback);
-      wolfSSL_CTX_SetIOSend(context_.get(), send_callback);
       return WolfsslDtlsInitializationStatus::ready;
     }
 
@@ -456,11 +532,20 @@ namespace lumen::lsp {
       const PeerEndpoint &peer,
       const std::span<const std::uint8_t> datagram
     ) noexcept {
+      OperationScope operation {*this};
+      if (!operation.active()) {
+        return ProviderDatagramResult::fatal;
+      }
       if (!context_ || !peer.valid() || datagram.empty() || datagram.size() > std::numeric_limits<int>::max()) {
         return ProviderDatagramResult::dropped;
       }
 
-      if (const auto index = find_association(peer); index != associations_.size()) {
+      const auto fixed_peer = fixed_peer_identity(peer);
+      if (!fixed_peer) {
+        return ProviderDatagramResult::dropped;
+      }
+
+      if (const auto index = find_association(*fixed_peer); index != associations_.size()) {
         return receive_known(index, datagram);
       }
       if (datagram.front() != 22U || associations_.size() >= maximum_associations_) {
@@ -476,9 +561,11 @@ namespace lumen::lsp {
         .peer = &peer,
         .input = datagram,
       };
-      attach_io(session.get(), io);
-      const auto accept_result = wolfSSL_accept(session.get());
-      detach_io(session.get());
+      int accept_result = WOLFSSL_FAILURE;
+      {
+        ScopedIoContext io_scope {session.get(), io};
+        accept_result = wolfSSL_accept(session.get());
+      }
       if (io.output_failed) {
         return ProviderDatagramResult::fatal;
       }
@@ -491,19 +578,22 @@ namespace lumen::lsp {
       try {
         associations_.push_back(Association {
           .peer = peer,
+          .identity = *fixed_peer,
           .session = std::move(session),
+          .context_generation = current_context_generation_,
         });
+        association_count_snapshot_.store(associations_.size(), std::memory_order_release);
       } catch (...) {
         return ProviderDatagramResult::fatal;
       }
       const auto index = associations_.size() - 1;
       if (accept_result == WOLFSSL_SUCCESS) {
         if (!complete_association(index)) {
-          erase_association(index);
+          associations_[index].pending_close = true;
           return ProviderDatagramResult::dropped;
         }
       } else if (!acceptable_wolfssl_result(associations_[index].session.get(), accept_result)) {
-        erase_association(index);
+        associations_[index].pending_close = true;
         return ProviderDatagramResult::dropped;
       }
       return ProviderDatagramResult::accepted;
@@ -520,43 +610,23 @@ namespace lumen::lsp {
       const PeerEndpoint &peer,
       const std::span<const std::uint8_t> plaintext
     ) noexcept {
-      const auto index = find_association(peer);
-      if (index == associations_.size()) {
-        return WolfsslDtlsOperationResult::not_found;
-      }
-      auto &association = associations_[index];
-      if (!association.established) {
-        return WolfsslDtlsOperationResult::not_established;
-      }
       if (plaintext.empty() || plaintext.size() > maximum_dtls_application_record ||
-          plaintext.size() > std::numeric_limits<int>::max()) {
+          plaintext.size() > std::numeric_limits<int>::max() || !peer.valid()) {
         return WolfsslDtlsOperationResult::rejected;
       }
-
-      IoContext io {
-        .callbacks = &callbacks_,
-        .peer = &association.peer,
-      };
-      attach_io(association.session.get(), io);
-      const auto written = wolfSSL_write(
-        association.session.get(),
-        plaintext.data(),
-        static_cast<int>(plaintext.size())
-      );
-      detach_io(association.session.get());
-      if (written == static_cast<int>(plaintext.size()) && !io.output_failed) {
-        return WolfsslDtlsOperationResult::accepted;
-      }
-      if (io.output_failed) {
-        erase_association(index);
-        return WolfsslDtlsOperationResult::fatal;
-      }
-      const auto error = wolfSSL_get_error(association.session.get(), written);
-      if (error == WOLFSSL_ERROR_WANT_READ || error == WOLFSSL_ERROR_WANT_WRITE) {
+      const auto fixed_peer = fixed_peer_identity(peer);
+      if (!fixed_peer) {
         return WolfsslDtlsOperationResult::rejected;
       }
-      erase_association(index);
-      return WolfsslDtlsOperationResult::fatal;
+      if (!is_owner_thread() || operation_depth_ != 0) {
+        return queue_send(*fixed_peer, plaintext) ?
+                 WolfsslDtlsOperationResult::accepted :
+                 WolfsslDtlsOperationResult::rejected;
+      }
+      OperationScope operation {*this};
+      return operation.active() ?
+               perform_send(*fixed_peer, plaintext) :
+               WolfsslDtlsOperationResult::rejected;
     }
 
     /**
@@ -566,7 +636,15 @@ namespace lumen::lsp {
      * @return Exact operation disposition.
      */
     WolfsslDtlsOperationResult handle_timeout(const PeerEndpoint &peer) noexcept {
-      const auto index = find_association(peer);
+      OperationScope operation {*this};
+      if (!operation.active()) {
+        return WolfsslDtlsOperationResult::rejected;
+      }
+      const auto fixed_peer = fixed_peer_identity(peer);
+      if (!fixed_peer) {
+        return WolfsslDtlsOperationResult::rejected;
+      }
+      const auto index = find_association(*fixed_peer);
       if (index == associations_.size()) {
         return WolfsslDtlsOperationResult::not_found;
       }
@@ -575,13 +653,15 @@ namespace lumen::lsp {
         .callbacks = &callbacks_,
         .peer = &association.peer,
       };
-      attach_io(association.session.get(), io);
-      const auto result = wolfSSL_dtls_got_timeout(association.session.get());
-      detach_io(association.session.get());
+      int result = WOLFSSL_FAILURE;
+      {
+        ScopedIoContext io_scope {association.session.get(), io};
+        result = wolfSSL_dtls_got_timeout(association.session.get());
+      }
       if (result == WOLFSSL_SUCCESS && !io.output_failed) {
         return WolfsslDtlsOperationResult::accepted;
       }
-      erase_association(index);
+      association.pending_close = true;
       return WolfsslDtlsOperationResult::fatal;
     }
 
@@ -592,7 +672,14 @@ namespace lumen::lsp {
      * @return Positive seconds, or zero when absent or unavailable.
      */
     [[nodiscard]] std::uint32_t timeout_seconds(const PeerEndpoint &peer) const noexcept {
-      const auto index = find_association(peer);
+      if (!is_owner_thread()) {
+        return 0;
+      }
+      const auto fixed_peer = fixed_peer_identity(peer);
+      if (!fixed_peer) {
+        return 0;
+      }
+      const auto index = find_association(*fixed_peer);
       if (index == associations_.size()) {
         return 0;
       }
@@ -607,12 +694,97 @@ namespace lumen::lsp {
      * @return True when removed.
      */
     bool close_association(const PeerEndpoint &peer) noexcept {
-      const auto index = find_association(peer);
+      if (!is_owner_thread()) {
+        return request_close(peer);
+      }
+      const auto fixed_peer = fixed_peer_identity(peer);
+      if (!fixed_peer) {
+        return false;
+      }
+      const auto index = find_association(*fixed_peer);
       if (index == associations_.size()) {
         return false;
       }
-      erase_association(index);
+      associations_[index].pending_close = true;
+      if (operation_depth_ == 0) {
+        flush_pending_closes();
+      }
       return true;
+    }
+
+    /** @brief Queue a close without mutating association state. */
+    bool request_close(const PeerEndpoint &peer) noexcept {
+      const auto fixed_peer = fixed_peer_identity(peer);
+      if (!fixed_peer) {
+        return false;
+      }
+      std::scoped_lock lock(pending_mutex_);
+      for (std::size_t index = 0; index < pending_close_count_; ++index) {
+        if (pending_closes_[(pending_close_head_ + index) % pending_closes_.size()] == *fixed_peer) {
+          return true;
+        }
+      }
+      if (pending_close_count_ == pending_closes_.size()) {
+        return false;
+      }
+      pending_closes_[pending_close_tail_] = *fixed_peer;
+      pending_close_tail_ = (pending_close_tail_ + 1) % pending_closes_.size();
+      ++pending_close_count_;
+      return true;
+    }
+
+    /** @brief Drain copied sends and close requests on the owner thread. */
+    bool process_pending() noexcept {
+      if (!is_owner_thread()) {
+        OperationScope bind_owner {*this};
+        return bind_owner.active();
+      }
+      if (operation_depth_ != 0 || draining_pending_) {
+        return false;
+      }
+      process_pending_owner();
+      return true;
+    }
+
+    /** @brief Permit a joined receive worker to hand final provider draining to shutdown. */
+    bool release_owner_thread() noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      if (owner_thread_ != std::this_thread::get_id() || operation_depth_ != 0 || draining_pending_) {
+        return false;
+      }
+      owner_thread_ = {};
+      return true;
+    }
+
+    /** @brief Close and notify every association exactly once on the owner thread. */
+    std::size_t drain_all() noexcept {
+      if (!is_owner_thread() || operation_depth_ != 0) {
+        return 0;
+      }
+      process_pending_owner();
+      const auto drained = associations_.size();
+      while (!associations_.empty()) {
+        erase_association(associations_.size() - 1);
+      }
+      clear_pending_queues();
+      return drained;
+    }
+
+    /** @brief Permanently clear non-owning callbacks after owner shutdown. */
+    void disable_callbacks() noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      callbacks_ = {};
+      callbacks_enabled_ = false;
+      for (auto &pending : pending_sends_) {
+        secure_zero(pending.plaintext);
+        pending = {};
+      }
+      pending_send_count_ = 0;
+      pending_send_head_ = 0;
+      pending_send_tail_ = 0;
+      pending_close_count_ = 0;
+      pending_close_head_ = 0;
+      pending_close_tail_ = 0;
     }
 
     /**
@@ -624,16 +796,273 @@ namespace lumen::lsp {
       return server_spki_sha256_;
     }
 
+    bool rotate_identity(
+      const std::span<const std::uint8_t> certificate_der,
+      const std::span<const std::uint8_t> private_key_der,
+      const std::span<const std::uint8_t> cookie_secret
+    ) noexcept {
+      OperationScope operation {*this};
+      if (!operation.active()) {
+        return false;
+      }
+      reclaim_retired_contexts();
+      if (certificate_der.empty() || private_key_der.empty() ||
+          cookie_secret.size() != cookie_secret_size || !contains_nonzero(cookie_secret) ||
+          retired_contexts_.size() >= 8U ||
+          current_context_generation_ == std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+      }
+      const auto spki = derive_spki_sha256(certificate_der);
+      if (!spki || *spki == server_spki_sha256_ ||
+          !callbacks_.server_certificate(callbacks_.context, certificate_der, *spki)) {
+        return false;
+      }
+      auto replacement = make_server_context(certificate_der, private_key_der);
+      if (!replacement) {
+        return false;
+      }
+      std::vector<std::uint8_t> certificate_copy;
+      std::vector<std::uint8_t> private_key_copy;
+      std::vector<std::uint8_t> cookie_copy;
+      try {
+        certificate_copy.assign(certificate_der.begin(), certificate_der.end());
+        private_key_copy.assign(private_key_der.begin(), private_key_der.end());
+        cookie_copy.assign(cookie_secret.begin(), cookie_secret.end());
+        retired_contexts_.push_back({current_context_generation_, std::move(context_)});
+      } catch (...) {
+        if (!context_ && !retired_contexts_.empty()) {
+          context_ = std::move(retired_contexts_.back().context);
+          retired_contexts_.pop_back();
+        }
+        secure_zero(private_key_copy);
+        secure_zero(cookie_copy);
+        return false;
+      }
+      certificate_der_.swap(certificate_copy);
+      secure_zero(private_key_der_);
+      private_key_der_.swap(private_key_copy);
+      secure_zero(cookie_secret_);
+      cookie_secret_.swap(cookie_copy);
+      secure_zero(private_key_copy);
+      secure_zero(cookie_copy);
+      context_ = std::move(replacement);
+      ++current_context_generation_;
+      server_spki_sha256_ = *spki;
+      reclaim_retired_contexts();
+      return true;
+    }
+
     /**
      * @brief Return retained durable association count.
      *
      * @return Association count.
      */
     [[nodiscard]] std::size_t association_count() const noexcept {
-      return associations_.size();
+      return association_count_snapshot_.load(std::memory_order_acquire);
     }
 
   private:
+    /**
+     * @brief Parse one endpoint into allocation-free canonical queue identity.
+     *
+     * @param peer Valid numeric endpoint supplied by the socket owner.
+     * @return Fixed five-tuple identity, or no value when either numeric address is invalid.
+     */
+    [[nodiscard]] static std::optional<FixedPeerIdentity> fixed_peer_identity(
+      const PeerEndpoint &peer
+    ) noexcept {
+      if (!peer.valid()) {
+        return std::nullopt;
+      }
+      FixedPeerIdentity identity {
+        .family = peer.family,
+        .local_port = peer.local_port,
+        .interface_index = peer.interface_index,
+        .remote_port = peer.remote_port,
+      };
+      const auto address_family = peer.family == IpAddressFamily::ipv4 ? AF_INET : AF_INET6;
+      const auto address_size = peer.family == IpAddressFamily::ipv4 ? 4U : 16U;
+      if (peer.canonical_local.valid) {
+        std::copy_n(peer.canonical_local.address.begin(), address_size, identity.local_address.begin());
+        identity.local_scope_id = peer.family == IpAddressFamily::ipv6 ? peer.canonical_local.scope_id : 0;
+      } else if (inet_pton(address_family, peer.local_address.c_str(), identity.local_address.data()) != 1) {
+        return std::nullopt;
+      }
+      if (peer.canonical_remote.valid) {
+        std::copy_n(peer.canonical_remote.address.begin(), address_size, identity.remote_address.begin());
+        identity.remote_scope_id = peer.family == IpAddressFamily::ipv6 ? peer.canonical_remote.scope_id : 0;
+      } else if (inet_pton(address_family, peer.remote_address.c_str(), identity.remote_address.data()) != 1) {
+        return std::nullopt;
+      }
+      return identity;
+    }
+
+    /** @brief Return whether the current thread owns all association mutation. */
+    [[nodiscard]] bool is_owner_thread() const noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      return owner_thread_ != std::thread::id {} && owner_thread_ == std::this_thread::get_id();
+    }
+
+    /** @brief Bind or re-enter the socket-owner mutation scope. */
+    bool enter_operation() noexcept {
+      {
+        std::scoped_lock lock(pending_mutex_);
+        if (owner_thread_ == std::thread::id {}) {
+          owner_thread_ = std::this_thread::get_id();
+        }
+        if (owner_thread_ != std::this_thread::get_id() || !callbacks_enabled_) {
+          return false;
+        }
+      }
+      ++operation_depth_;
+      return true;
+    }
+
+    /** @brief Leave one owner scope and apply deferred work only at depth zero. */
+    void leave_operation() noexcept {
+      if (operation_depth_ == 0) {
+        return;
+      }
+      --operation_depth_;
+      if (operation_depth_ == 0 && !draining_pending_) {
+        process_pending_owner();
+      }
+    }
+
+    /** @brief Copy one deferred application record into the bounded concurrent queue. */
+    bool queue_send(const FixedPeerIdentity &peer, const std::span<const std::uint8_t> plaintext) noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      if (!callbacks_enabled_ || pending_send_count_ == pending_sends_.size()) {
+        return false;
+      }
+      auto &pending = pending_sends_[pending_send_tail_];
+      pending.peer = peer;
+      std::copy(plaintext.begin(), plaintext.end(), pending.plaintext.begin());
+      pending.size = plaintext.size();
+      pending_send_tail_ = (pending_send_tail_ + 1) % pending_sends_.size();
+      ++pending_send_count_;
+      return true;
+    }
+
+    /** @brief Protect one record directly while already executing on the owner. */
+    WolfsslDtlsOperationResult perform_send(
+      const FixedPeerIdentity &peer,
+      const std::span<const std::uint8_t> plaintext
+    ) noexcept {
+      const auto index = find_association(peer);
+      if (index == associations_.size()) {
+        return WolfsslDtlsOperationResult::not_found;
+      }
+      auto &association = associations_[index];
+      if (!association.established || association.pending_close) {
+        return WolfsslDtlsOperationResult::not_established;
+      }
+      IoContext io {
+        .callbacks = &callbacks_,
+        .peer = &association.peer,
+      };
+      int written = WOLFSSL_FAILURE;
+      {
+        ScopedIoContext io_scope {association.session.get(), io};
+        written = wolfSSL_write(
+          association.session.get(),
+          plaintext.data(),
+          static_cast<int>(plaintext.size())
+        );
+      }
+      if (written == static_cast<int>(plaintext.size()) && !io.output_failed) {
+        return WolfsslDtlsOperationResult::accepted;
+      }
+      if (io.output_failed) {
+        association.pending_close = true;
+        return WolfsslDtlsOperationResult::fatal;
+      }
+      const auto error = wolfSSL_get_error(association.session.get(), written);
+      if (error == WOLFSSL_ERROR_WANT_READ || error == WOLFSSL_ERROR_WANT_WRITE) {
+        return WolfsslDtlsOperationResult::rejected;
+      }
+      association.pending_close = true;
+      return WolfsslDtlsOperationResult::fatal;
+    }
+
+    /** @brief Apply all association-local close flags after no wolfSSL frame is active. */
+    void flush_pending_closes() noexcept {
+      for (std::size_t index = associations_.size(); index > 0; --index) {
+        if (associations_[index - 1].pending_close) {
+          erase_association(index - 1);
+        }
+      }
+    }
+
+    /** @brief Apply every copied send before queued closes on the owner thread. */
+    void process_pending_owner() noexcept {
+      if (draining_pending_ || operation_depth_ != 0) {
+        return;
+      }
+      draining_pending_ = true;
+      for (;;) {
+        PendingSend pending_send;
+        FixedPeerIdentity pending_close;
+        bool have_send = false;
+        bool have_close = false;
+        {
+          std::scoped_lock lock(pending_mutex_);
+          if (pending_send_count_ != 0) {
+            auto &source = pending_sends_[pending_send_head_];
+            pending_send = std::move(source);
+            secure_zero(source.plaintext);
+            source = {};
+            pending_send_head_ = (pending_send_head_ + 1) % pending_sends_.size();
+            --pending_send_count_;
+            have_send = true;
+          } else if (pending_close_count_ != 0) {
+            pending_close = std::move(pending_closes_[pending_close_head_]);
+            pending_closes_[pending_close_head_] = {};
+            pending_close_head_ = (pending_close_head_ + 1) % pending_closes_.size();
+            --pending_close_count_;
+            have_close = true;
+          }
+        }
+        if (have_send) {
+          ++operation_depth_;
+          (void) perform_send(
+            pending_send.peer,
+            std::span<const std::uint8_t> {pending_send.plaintext.data(), pending_send.size}
+          );
+          --operation_depth_;
+          secure_zero(pending_send.plaintext);
+          flush_pending_closes();
+          continue;
+        }
+        if (have_close) {
+          const auto index = find_association(pending_close);
+          if (index != associations_.size()) {
+            associations_[index].pending_close = true;
+          }
+          flush_pending_closes();
+          continue;
+        }
+        break;
+      }
+      flush_pending_closes();
+      draining_pending_ = false;
+    }
+
+    /** @brief Clear queued plaintext and peer requests without callbacks. */
+    void clear_pending_queues() noexcept {
+      std::scoped_lock lock(pending_mutex_);
+      for (auto &pending : pending_sends_) {
+        secure_zero(pending.plaintext);
+        pending = {};
+      }
+      pending_send_head_ = 0;
+      pending_send_tail_ = 0;
+      pending_send_count_ = 0;
+      pending_close_head_ = 0;
+      pending_close_tail_ = 0;
+      pending_close_count_ = 0;
+    }
+
     /**
      * @brief Serve one complete datagram to wolfSSL exactly once.
      *
@@ -672,7 +1101,8 @@ namespace lumen::lsp {
     static int send_callback(WOLFSSL *session, char *buffer, int size, void *opaque) noexcept {
       (void) session;
       auto *io = static_cast<IoContext *>(opaque);
-      if (io == nullptr || io->callbacks == nullptr || io->peer == nullptr || buffer == nullptr || size <= 0) {
+      if (io == nullptr || io->callbacks == nullptr || io->callbacks->send_datagram == nullptr ||
+          io->peer == nullptr || buffer == nullptr || size <= 0) {
         return WOLFSSL_CBIO_ERR_GENERAL;
       }
       const auto datagram = std::span<const std::uint8_t> {
@@ -726,27 +1156,6 @@ namespace lumen::lsp {
     }
 
     /**
-     * @brief Attach one stack I/O context for a synchronous wolfSSL call.
-     *
-     * @param session wolfSSL association.
-     * @param io Live per-call I/O context.
-     */
-    static void attach_io(WOLFSSL *session, IoContext &io) noexcept {
-      wolfSSL_SetIOReadCtx(session, &io);
-      wolfSSL_SetIOWriteCtx(session, &io);
-    }
-
-    /**
-     * @brief Remove stack I/O pointers after a synchronous wolfSSL call.
-     *
-     * @param session wolfSSL association.
-     */
-    static void detach_io(WOLFSSL *session) noexcept {
-      wolfSSL_SetIOReadCtx(session, nullptr);
-      wolfSSL_SetIOWriteCtx(session, nullptr);
-    }
-
-    /**
      * @brief Return whether a wolfSSL operation is a successful nonblocking wait.
      *
      * @param session wolfSSL association.
@@ -778,28 +1187,28 @@ namespace lumen::lsp {
         .peer = &association.peer,
         .input = datagram,
       };
-      attach_io(association.session.get(), io);
-
       ProviderDatagramResult result = ProviderDatagramResult::accepted;
-      if (!association.established) {
-        const auto accepted = wolfSSL_accept(association.session.get());
-        if (accepted == WOLFSSL_SUCCESS) {
-          if (!complete_association(index)) {
+      {
+        ScopedIoContext io_scope {association.session.get(), io};
+        if (!association.established) {
+          const auto accepted = wolfSSL_accept(association.session.get());
+          if (accepted == WOLFSSL_SUCCESS) {
+            if (!complete_association(index)) {
+              result = ProviderDatagramResult::dropped;
+            }
+          } else if (!acceptable_wolfssl_result(association.session.get(), accepted)) {
             result = ProviderDatagramResult::dropped;
           }
-        } else if (!acceptable_wolfssl_result(association.session.get(), accepted)) {
-          result = ProviderDatagramResult::dropped;
+        } else {
+          result = read_application_records(association);
         }
-      } else {
-        result = read_application_records(association);
       }
-      detach_io(association.session.get());
 
       if (io.output_failed) {
         result = ProviderDatagramResult::fatal;
       }
       if (result != ProviderDatagramResult::accepted) {
-        erase_association(index);
+        association.pending_close = true;
       }
       return result;
     }
@@ -866,7 +1275,8 @@ namespace lumen::lsp {
       };
       secure_zero(exporter);
       secure_zero(pairing_exporter);
-      const auto admitted = callbacks_.association_ready(callbacks_.context, association.peer, security);
+      const auto admitted = callbacks_enabled_ && callbacks_.association_ready != nullptr &&
+                            callbacks_.association_ready(callbacks_.context, association.peer, security);
       secure_zero(security.srtp.client_write_key);
       secure_zero(security.srtp.server_write_key);
       secure_zero(security.srtp.client_write_salt);
@@ -894,7 +1304,8 @@ namespace lumen::lsp {
           static_cast<int>(plaintext.size())
         );
         if (size > 0) {
-          if (!callbacks_.application_data(
+          if (!callbacks_enabled_ || callbacks_.application_data == nullptr ||
+              !callbacks_.application_data(
                 callbacks_.context,
                 association.peer,
                 std::span<const std::uint8_t> {plaintext.data(), static_cast<std::size_t>(size)}
@@ -923,9 +1334,9 @@ namespace lumen::lsp {
      * @param peer Five-tuple to find.
      * @return Index, or `associations_.size()` when absent.
      */
-    [[nodiscard]] std::size_t find_association(const PeerEndpoint &peer) const noexcept {
+    [[nodiscard]] std::size_t find_association(const FixedPeerIdentity &peer) const noexcept {
       const auto iterator = std::find_if(associations_.begin(), associations_.end(), [&peer](const Association &candidate) {
-        return candidate.peer == peer;
+        return candidate.identity == peer;
       });
       return static_cast<std::size_t>(std::distance(associations_.begin(), iterator));
     }
@@ -936,8 +1347,27 @@ namespace lumen::lsp {
      * @param index Valid association index.
      */
     void erase_association(const std::size_t index) noexcept {
+      ++operation_depth_;
       notify_closed(associations_[index].peer);
+      --operation_depth_;
       associations_.erase(associations_.begin() + static_cast<std::ptrdiff_t>(index));
+      association_count_snapshot_.store(associations_.size(), std::memory_order_release);
+      reclaim_retired_contexts();
+    }
+
+    /** @brief Destroy retired contexts after their final association closes. */
+    void reclaim_retired_contexts() noexcept {
+      for (std::size_t index = 0; index < retired_contexts_.size();) {
+        const auto generation = retired_contexts_[index].generation;
+        const auto referenced = std::ranges::any_of(associations_, [generation](const Association &association) {
+          return association.context_generation == generation;
+        });
+        if (referenced) {
+          ++index;
+        } else {
+          retired_contexts_.erase(retired_contexts_.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+      }
     }
 
     /**
@@ -946,12 +1376,13 @@ namespace lumen::lsp {
      * @param peer Association five-tuple.
      */
     void notify_closed(const PeerEndpoint &peer) const noexcept {
-      if (callbacks_.association_closed != nullptr) {
+      if (callbacks_enabled_ && callbacks_.association_closed != nullptr) {
         callbacks_.association_closed(callbacks_.context, peer);
       }
     }
 
     Context context_;  ///< Exact DTLS 1.3 wolfSSL server context.
+    std::vector<RetiredContext> retired_contexts_;  ///< Old contexts retained for live pre-rotation sessions.
     std::vector<std::uint8_t> certificate_der_;  ///< Canonical DER leaf certificate.
     std::vector<std::uint8_t> private_key_der_;  ///< Secret DER private key.
     std::vector<std::uint8_t> cookie_secret_;  ///< Shared address-bound HRR HMAC secret.
@@ -959,6 +1390,21 @@ namespace lumen::lsp {
     WolfsslDtlsServerCallbacks callbacks_;  ///< Product/socket callbacks.
     std::vector<Association> associations_;  ///< Durable post-cookie associations.
     std::size_t maximum_associations_ {};  ///< Durable association bound.
+    std::uint32_t current_context_generation_ {1};  ///< Active new-association credential incarnation.
+    std::array<PendingSend, 64> pending_sends_ {};  ///< Bounded copied application records.
+    std::array<FixedPeerIdentity, 64> pending_closes_ {};  ///< Bounded administrator/callback close requests.
+    mutable std::mutex pending_mutex_;  ///< Synchronizes only cross-thread queue and owner identity state.
+    std::thread::id owner_thread_ {};  ///< Sole association and WOLFSSL mutation thread.
+    std::size_t pending_send_head_ {};  ///< Next copied send to drain.
+    std::size_t pending_send_tail_ {};  ///< Next copied send insertion slot.
+    std::size_t pending_send_count_ {};  ///< Live copied send count.
+    std::size_t pending_close_head_ {};  ///< Next close request to drain.
+    std::size_t pending_close_tail_ {};  ///< Next close insertion slot.
+    std::size_t pending_close_count_ {};  ///< Live close request count.
+    std::size_t operation_depth_ {};  ///< Owner-thread wolfSSL/callback nesting depth.
+    bool draining_pending_ {};  ///< Prevent recursive pending-queue drains.
+    bool callbacks_enabled_ {};  ///< Product callback lifetime gate.
+    std::atomic<std::size_t> association_count_snapshot_ {};  ///< Cross-thread administration snapshot.
   };
 
   WolfsslDtlsServerProvider::WolfsslDtlsServerProvider(const WolfsslDtlsServerConfig &config) noexcept:
@@ -1011,12 +1457,42 @@ namespace lumen::lsp {
     return impl_ && impl_->close_association(peer);
   }
 
+  bool WolfsslDtlsServerProvider::request_close(const PeerEndpoint &peer) noexcept {
+    return impl_ && impl_->request_close(peer);
+  }
+
+  bool WolfsslDtlsServerProvider::process_pending() noexcept {
+    return impl_ && impl_->process_pending();
+  }
+
+  bool WolfsslDtlsServerProvider::release_owner_thread() noexcept {
+    return impl_ && impl_->release_owner_thread();
+  }
+
+  std::size_t WolfsslDtlsServerProvider::drain_all() noexcept {
+    return impl_ ? impl_->drain_all() : 0;
+  }
+
+  void WolfsslDtlsServerProvider::disable_callbacks() noexcept {
+    if (impl_) {
+      impl_->disable_callbacks();
+    }
+  }
+
   WolfsslDtlsInitializationStatus WolfsslDtlsServerProvider::initialization_status() const noexcept {
     return status_;
   }
 
   Digest256 WolfsslDtlsServerProvider::server_spki_sha256() const noexcept {
     return impl_ ? impl_->server_spki_sha256() : Digest256 {};
+  }
+
+  bool WolfsslDtlsServerProvider::rotate_identity(
+    const std::span<const std::uint8_t> certificate_der,
+    const std::span<const std::uint8_t> private_key_der,
+    const std::span<const std::uint8_t> cookie_secret
+  ) noexcept {
+    return impl_ && impl_->rotate_identity(certificate_der, private_key_der, cookie_secret);
   }
 
   std::size_t WolfsslDtlsServerProvider::association_count() const noexcept {

@@ -1,5 +1,5 @@
 /**
- * @file src/protocol_lsp/input_plane/state.h
+ * @file src/lsp/input_plane/state.h
  * @brief Bounded allocation-free LSP/1 input authority and delivery state machines.
  */
 
@@ -23,7 +23,7 @@ namespace lumen::lsp::input_plane {
     packet_kind kind = packet_kind::core_state;  ///< Replaceable packet kind.
     device_type device = device_type::keyboard;  ///< Device class.
     std::uint32_t device_id = 0;  ///< Device identifier, zero only for core state.
-    std::uint32_t instance_generation = 0;  ///< Device instance generation, zero only for core state.
+    std::uint32_t instance_generation = 0;  ///< Nonzero device or keyboard reconciliation generation.
     sensor_type sensor = sensor_type::gyroscope;  ///< Sensor stream when `kind` is sensor state.
 
     /** @brief Compare every supersession-key component. */
@@ -68,8 +68,15 @@ namespace lumen::lsp::input_plane {
           return supersession_key_result::success;
         }
       case packet_kind::core_state:
-        output.device = device_type::keyboard;
-        return supersession_key_result::success;
+        {
+          const auto core = parse_core_state_payload(packet.payload);
+          if (!core) {
+            return supersession_key_result::malformed;
+          }
+          output.device = device_type::keyboard;
+          output.instance_generation = core.value.keyboard_instance_generation;
+          return supersession_key_result::success;
+        }
       case packet_kind::device_state:
         {
           const auto prefix = parse_device_prefix(packet.payload);
@@ -107,7 +114,327 @@ namespace lumen::lsp::input_plane {
     malformed,  ///< Packet cannot form a replaceable supersession key.
     payload_too_large,  ///< Packet payload exceeds the fixed slot size.
     full,  ///< No free supersession-key slot remains.
+    baseline_conflict,  ///< Atomic baseline metadata conflicts with an existing installed key.
+    inactive_lifecycle,  ///< Non-core state has no exact active same-generation device lifecycle.
   };
+
+  /** @brief Result of atomically installing one parsed complete baseline. */
+  enum class baseline_install_result : std::uint8_t {
+    installed,  ///< Every record was seeded atomically.
+    invalid,  ///< Baseline or record mapping is malformed.
+    capacity_exhausted,  ///< Complete record set exceeds fixed latest-state/history capacity.
+    conflict,  ///< Duplicate exact key or incompatible active/removal generation exists.
+  };
+
+  /** @brief Per-supersession-key sequence and physical-ordinal admission result. */
+  enum class latest_sequence_result : std::uint8_t {
+    advanced,  ///< New sequence, ordinal, and watermark became latest.
+    stale,  ///< Sequence, strict non-core ordinal, or edge watermark did not advance safely.
+    invalid,  ///< Sequence or physical ordinal is zero.
+    full,  ///< No fixed key-history slot is available.
+  };
+
+  /** @brief Borrowed per-key latest-sequence snapshot. */
+  struct latest_sequence_snapshot {
+    supersession_key key {};  ///< Exact independently replaceable key.
+    std::uint64_t state_sequence = 0;  ///< Greatest admitted state sequence.
+    std::uint64_t physical_ordinal = 0;  ///< Greatest admitted physical ordinal.
+    std::uint64_t edge_watermark = 0;  ///< Greatest dependent-edge watermark.
+    bool found = false;  ///< Whether the key exists.
+  };
+
+  /**
+   * @brief Fixed history table preventing applied state from becoming admissible again after drain.
+   *
+   * @tparam Capacity Maximum exact supersession keys retained for one authority generation.
+   */
+  template<std::size_t Capacity = 64>
+  class latest_sequence_table {
+  public:
+    static_assert(Capacity > 0, "latest-sequence capacity must be nonzero");
+
+    /**
+     * @brief Admit one per-key sequence and physical ordinal.
+     *
+     * Only core reconciliation may retain an equal physical ordinal. Every other exact key requires a
+     * strictly newer physical sample, and no key may lower its dependent-edge watermark.
+     *
+     * @param key Exact supersession key.
+     * @param state_sequence Nonzero logical sequence.
+     * @param physical_ordinal Nonzero newest represented physical sample.
+     * @param edge_watermark Greatest edge observed before sampling state.
+     * @return Admission result.
+     */
+    constexpr latest_sequence_result observe(
+      const supersession_key &key,
+      const std::uint64_t state_sequence,
+      const std::uint64_t physical_ordinal,
+      const std::uint64_t edge_watermark
+    ) noexcept {
+      if (state_sequence == 0 || physical_ordinal == 0) {
+        return latest_sequence_result::invalid;
+      }
+      entry_type *free_entry = nullptr;
+      for (auto &entry : entries_) {
+        if (entry.occupied && entry.key == key) {
+          const auto permits_equal_ordinal = key.kind == packet_kind::core_state;
+          if (state_sequence <= entry.state_sequence || edge_watermark < entry.edge_watermark ||
+              physical_ordinal < entry.physical_ordinal ||
+              (!permits_equal_ordinal && physical_ordinal == entry.physical_ordinal)) {
+            return latest_sequence_result::stale;
+          }
+          entry.state_sequence = state_sequence;
+          entry.physical_ordinal = physical_ordinal;
+          entry.edge_watermark = edge_watermark;
+          return latest_sequence_result::advanced;
+        }
+        if (!entry.occupied && free_entry == nullptr) {
+          free_entry = &entry;
+        }
+      }
+      if (free_entry == nullptr) {
+        return latest_sequence_result::full;
+      }
+      *free_entry = {
+        .key = key,
+        .state_sequence = state_sequence,
+        .physical_ordinal = physical_ordinal,
+        .edge_watermark = edge_watermark,
+        .occupied = true,
+      };
+      return latest_sequence_result::advanced;
+    }
+
+    /**
+     * @brief Return the retained sequence state for one exact key.
+     *
+     * @param key Exact supersession key.
+     * @return Found snapshot or an empty result.
+     */
+    [[nodiscard]] constexpr latest_sequence_snapshot lookup(const supersession_key &key) const noexcept {
+      for (const auto &entry : entries_) {
+        if (entry.occupied && entry.key == key) {
+          return {
+            .key = entry.key,
+            .state_sequence = entry.state_sequence,
+            .physical_ordinal = entry.physical_ordinal,
+            .edge_watermark = entry.edge_watermark,
+            .found = true,
+          };
+        }
+      }
+      return {};
+    }
+
+    /** @brief Clear every retained key on input-authority replacement. */
+    constexpr void clear() noexcept {
+      for (auto &entry : entries_) {
+        entry = {};
+      }
+    }
+
+    /**
+     * @brief Retire history for one exact key after a generation-bound removal is installed.
+     *
+     * @param key Exact retired key.
+     * @return `true` when a retained entry was reclaimed.
+     */
+    constexpr bool retire(const supersession_key &key) noexcept {
+      for (auto &entry : entries_) {
+        if (entry.occupied && entry.key == key) {
+          entry = {};
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /**
+     * @brief Reclaim all exact stream keys for one removed device generation.
+     *
+     * @param device Device class.
+     * @param device_id Stable device identifier.
+     * @param instance_generation Removed instance generation.
+     * @return Number of reclaimed state/sensor keys.
+     */
+    constexpr std::size_t retire_device(
+      const device_type device,
+      const std::uint32_t device_id,
+      const std::uint32_t instance_generation
+    ) noexcept {
+      std::size_t retired = 0;
+      for (auto &entry : entries_) {
+        if (entry.occupied && entry.key.device == device && entry.key.device_id == device_id &&
+            entry.key.instance_generation == instance_generation) {
+          entry = {};
+          ++retired;
+        }
+      }
+      return retired;
+    }
+
+  private:
+    /** @brief One exact-key history slot. */
+    struct entry_type {
+      supersession_key key {};  ///< Exact independently replaceable key.
+      std::uint64_t state_sequence = 0;  ///< Greatest logical sequence.
+      std::uint64_t physical_ordinal = 0;  ///< Greatest physical ordinal.
+      std::uint64_t edge_watermark = 0;  ///< Greatest dependent-edge watermark.
+      bool occupied = false;  ///< Whether this history slot is live.
+    };
+
+    std::array<entry_type, Capacity> entries_ {};  ///< Fixed exact-key history.
+  };
+
+  /** @brief Device lifecycle generation admission result. */
+  enum class lifecycle_generation_result : std::uint8_t {
+    advanced,  ///< New arrival/removal generation or state was retained.
+    duplicate,  ///< Exact generation and presence were already retained.
+    stale,  ///< Generation moved backward or reused with conflicting presence.
+    invalid,  ///< Device class, identifier, or generation is invalid.
+    full,  ///< No device-identity tombstone slot remains.
+  };
+
+  /**
+   * @brief Fixed per-device lifecycle/tombstone table that does not grow per hot-plug generation.
+   *
+   * Each `(device type, device ID)` owns one slot. A newer arrival replaces its removal tombstone in
+   * place, while a removal preserves the greatest generation so late state cannot resurrect it.
+   *
+   * @tparam Capacity Maximum stable device identities retained in one input authority.
+   */
+  template<std::size_t Capacity = 32>
+  class device_lifecycle_table {
+  public:
+    static_assert(Capacity > 0, "device-lifecycle capacity must be nonzero");
+
+    /**
+     * @brief Observe one generation-bound arrival or removal.
+     *
+     * @param device Device class.
+     * @param device_id Nonzero stable device identifier.
+     * @param instance_generation Nonzero monotonically increasing hot-plug generation.
+     * @param presence Active or removed lifecycle state.
+     * @return Lifecycle admission result.
+     */
+    constexpr lifecycle_generation_result observe(
+      const device_type device,
+      const std::uint32_t device_id,
+      const std::uint32_t instance_generation,
+      const device_presence presence
+    ) noexcept {
+      if (!valid_device_type(device) || device_id == 0 || instance_generation == 0 ||
+          (presence != device_presence::active && presence != device_presence::removed)) {
+        return lifecycle_generation_result::invalid;
+      }
+      entry_type *free_entry = nullptr;
+      for (auto &entry : entries_) {
+        if (entry.occupied && entry.device == device && entry.device_id == device_id) {
+          if (instance_generation < entry.instance_generation ||
+              (instance_generation == entry.instance_generation && entry.presence == device_presence::removed &&
+               presence == device_presence::active)) {
+            return lifecycle_generation_result::stale;
+          }
+          if (instance_generation == entry.instance_generation && presence == entry.presence) {
+            return lifecycle_generation_result::duplicate;
+          }
+          entry.instance_generation = instance_generation;
+          entry.presence = presence;
+          return lifecycle_generation_result::advanced;
+        }
+        if (!entry.occupied && free_entry == nullptr) {
+          free_entry = &entry;
+        }
+      }
+      if (free_entry == nullptr) {
+        return lifecycle_generation_result::full;
+      }
+      *free_entry = {
+        .device = device,
+        .presence = presence,
+        .device_id = device_id,
+        .instance_generation = instance_generation,
+        .occupied = true,
+      };
+      return lifecycle_generation_result::advanced;
+    }
+
+    /** @brief Return whether one exact generation is currently active. */
+    [[nodiscard]] constexpr bool active(
+      const device_type device,
+      const std::uint32_t device_id,
+      const std::uint32_t instance_generation
+    ) const noexcept {
+      for (const auto &entry : entries_) {
+        if (entry.occupied && entry.device == device && entry.device_id == device_id) {
+          return entry.instance_generation == instance_generation && entry.presence == device_presence::active;
+        }
+      }
+      return false;
+    }
+
+    /** @brief Clear all lifecycle identities on input-authority replacement. */
+    constexpr void clear() noexcept {
+      for (auto &entry : entries_) {
+        entry = {};
+      }
+    }
+
+  private:
+    /** @brief One stable device identity and greatest hot-plug generation. */
+    struct entry_type {
+      device_type device = device_type::keyboard;  ///< Stable device class.
+      device_presence presence = device_presence::removed;  ///< Current active/tombstone state.
+      std::uint32_t device_id = 0;  ///< Stable device identifier.
+      std::uint32_t instance_generation = 0;  ///< Greatest observed generation.
+      bool occupied = false;  ///< Whether the identity slot is retained.
+    };
+
+    std::array<entry_type, Capacity> entries_ {};  ///< Fixed stable-identity tombstone table.
+  };
+
+  /**
+   * @brief Derive the newest physical ordinal from one validated replaceable packet.
+   *
+   * @param packet Parsed replaceable packet.
+   * @param physical_ordinal Destination.
+   * @return `true` when the exact frozen kind body yielded a nonzero ordinal.
+   */
+  [[nodiscard]] constexpr bool state_physical_ordinal(
+    const parsed_packet &packet,
+    std::uint64_t &physical_ordinal
+  ) noexcept {
+    switch (packet.header.kind) {
+      case packet_kind::pointer_motion:
+        {
+          const auto value = parse_pointer_payload(packet.payload);
+          physical_ordinal = value ? value.value.physical_ordinal : 0;
+          return static_cast<bool>(value);
+        }
+      case packet_kind::core_state:
+        {
+          const auto value = parse_core_state_payload(packet.payload);
+          physical_ordinal = value ? value.value.physical_ordinal : 0;
+          return static_cast<bool>(value);
+        }
+      case packet_kind::device_state:
+        {
+          const auto value = parse_device_prefix(packet.payload);
+          physical_ordinal = value ? value.value.physical_ordinal : 0;
+          return static_cast<bool>(value);
+        }
+      case packet_kind::sensor_state:
+        {
+          const auto value = parse_device_prefix(packet.payload, true);
+          physical_ordinal = value ? value.value.physical_ordinal : 0;
+          return static_cast<bool>(value);
+        }
+      case packet_kind::edge_batch:
+      case packet_kind::baseline_part:
+        return false;
+    }
+    return false;
+  }
 
   /**
    * @brief Fixed table retaining only the newest payload for each exact supersession key.
@@ -135,24 +462,47 @@ namespace lumen::lsp::input_plane {
       if (packet.payload.size() > MaxPayload) {
         return latest_state_result::payload_too_large;
       }
+      std::uint64_t physical_ordinal = 0;
+      if (!state_physical_ordinal(packet, physical_ordinal)) {
+        return latest_state_result::malformed;
+      }
+      if (key.kind != packet_kind::core_state &&
+          !lifecycles_.active(key.device, key.device_id, key.instance_generation)) {
+        return latest_state_result::inactive_lifecycle;
+      }
       slot *free_slot = nullptr;
+      slot *matching_slot = nullptr;
       for (auto &candidate : slots_) {
         if (candidate.occupied && candidate.key == key) {
-          if (packet.header.state_sequence <= candidate.header.state_sequence ||
-              packet.header.edge_watermark < candidate.header.edge_watermark) {
-            return latest_state_result::stale;
-          }
-          store(candidate, packet, key);
-          return latest_state_result::stored;
+          matching_slot = &candidate;
+          break;
         }
         if (!candidate.occupied && free_slot == nullptr) {
           free_slot = &candidate;
         }
       }
-      if (free_slot == nullptr) {
+      if (matching_slot != nullptr && packet.header.edge_watermark < matching_slot->header.edge_watermark) {
+        return latest_state_result::stale;
+      }
+      if (matching_slot == nullptr && free_slot == nullptr) {
         return latest_state_result::full;
       }
-      store(*free_slot, packet, key);
+      const auto sequence_result = sequences_.observe(
+        key,
+        packet.header.state_sequence,
+        physical_ordinal,
+        packet.header.edge_watermark
+      );
+      if (sequence_result == latest_sequence_result::stale) {
+        return latest_state_result::stale;
+      }
+      if (sequence_result == latest_sequence_result::full) {
+        return latest_state_result::full;
+      }
+      if (sequence_result != latest_sequence_result::advanced) {
+        return latest_state_result::malformed;
+      }
+      store(matching_slot != nullptr ? *matching_slot : *free_slot, packet, key);
       return latest_state_result::stored;
     }
 
@@ -202,6 +552,165 @@ namespace lumen::lsp::input_plane {
       for (auto &entry : slots_) {
         entry.occupied = false;
       }
+      sequences_.clear();
+      lifecycles_.clear();
+    }
+
+    /**
+     * @brief Return retained latest sequence/ordinal history for one exact key.
+     *
+     * @param key Supersession key.
+     * @return Found snapshot or an empty result.
+     */
+    [[nodiscard]] constexpr latest_sequence_snapshot latest_sequence(const supersession_key &key) const noexcept {
+      return sequences_.lookup(key);
+    }
+
+    /**
+     * @brief Reclaim pending and historical state for one exact retired key.
+     *
+     * @param key Key whose generation has a committed removal tombstone.
+     * @return `true` when pending or history state was reclaimed.
+     */
+    constexpr bool retire(const supersession_key &key) noexcept {
+      auto reclaimed = sequences_.retire(key);
+      for (auto &entry : slots_) {
+        if (entry.occupied && entry.key == key) {
+          entry = {};
+          reclaimed = true;
+        }
+      }
+      return reclaimed;
+    }
+
+    /**
+     * @brief Install a generation-bound device arrival or removal and reclaim removed stream keys.
+     *
+     * @param device Device class.
+     * @param device_id Stable device identifier.
+     * @param instance_generation Monotonic hot-plug generation.
+     * @param presence Active arrival or removed tombstone.
+     * @return Lifecycle admission result.
+     */
+    constexpr lifecycle_generation_result observe_lifecycle(
+      const device_type device,
+      const std::uint32_t device_id,
+      const std::uint32_t instance_generation,
+      const device_presence presence
+    ) noexcept {
+      const auto result = lifecycles_.observe(device, device_id, instance_generation, presence);
+      if ((result == lifecycle_generation_result::advanced || result == lifecycle_generation_result::duplicate) &&
+          presence == device_presence::removed) {
+        sequences_.retire_device(device, device_id, instance_generation);
+        for (auto &entry : slots_) {
+          if (entry.occupied && entry.key.device == device && entry.key.device_id == device_id &&
+              entry.key.instance_generation == instance_generation) {
+            entry = {};
+          }
+        }
+      }
+      return result;
+    }
+
+    /**
+     * @brief Atomically seed exact per-key sequence history from a committed baseline.
+     *
+     * Pending replaceable packets are cleared only after the complete baseline fits and has unique keys.
+     *
+     * @param baseline Parsed complete baseline.
+     * @param input_generation Nonzero authority generation owning it.
+     * @return Atomic installation result.
+     */
+    constexpr baseline_install_result install_baseline(
+      const parsed_input_baseline &baseline,
+      const std::uint32_t input_generation
+    ) noexcept {
+      if (!baseline || input_generation == 0) {
+        return baseline_install_result::invalid;
+      }
+      latest_sequence_table<Capacity> candidate_sequences;
+      device_lifecycle_table<Capacity> candidate_lifecycles;
+      for (std::size_t index = 0; index < baseline.record_count; ++index) {
+        const auto record = baseline.record(index);
+        if (record.payload.empty()) {
+          return baseline_install_result::invalid;
+        }
+        if (record.header.kind == baseline_record_kind::device_lifecycle) {
+          device_lifecycle_payload lifecycle;
+          if (parse_device_lifecycle_payload(record.payload, lifecycle) != wire_error::none) {
+            return baseline_install_result::invalid;
+          }
+          const auto lifecycle_result = candidate_lifecycles.observe(
+            lifecycle.device,
+            record.header.device_id,
+            record.header.instance_generation,
+            lifecycle.presence
+          );
+          if (lifecycle_result == lifecycle_generation_result::full) {
+            return baseline_install_result::capacity_exhausted;
+          }
+          if (lifecycle_result != lifecycle_generation_result::advanced) {
+            return baseline_install_result::conflict;
+          }
+          continue;
+        }
+        supersession_key key {
+          .input_generation = input_generation,
+          .instance_generation = record.header.instance_generation,
+        };
+        switch (record.header.kind) {
+          case baseline_record_kind::core:
+            key.kind = packet_kind::core_state;
+            key.device = device_type::keyboard;
+            break;
+          case baseline_record_kind::pointer:
+            key.kind = packet_kind::pointer_motion;
+            key.device = device_type::pointer;
+            key.device_id = record.header.device_id;
+            break;
+          case baseline_record_kind::controller:
+            key.kind = packet_kind::device_state;
+            key.device = device_type::controller;
+            key.device_id = record.header.device_id;
+            break;
+          case baseline_record_kind::controller_sensor:
+            key.kind = packet_kind::sensor_state;
+            key.device = device_type::controller;
+            key.device_id = record.header.device_id;
+            key.sensor = static_cast<sensor_type>(record.header.subtype);
+            break;
+          case baseline_record_kind::touch:
+            key.kind = packet_kind::device_state;
+            key.device = device_type::touch;
+            key.device_id = record.header.device_id;
+            break;
+          case baseline_record_kind::pen:
+            key.kind = packet_kind::device_state;
+            key.device = device_type::pen;
+            key.device_id = record.header.device_id;
+            break;
+          case baseline_record_kind::device_lifecycle:
+            return baseline_install_result::invalid;
+        }
+        const auto sequence_result = candidate_sequences.observe(
+          key,
+          record.header.state_sequence,
+          record.header.physical_ordinal,
+          baseline.edge_watermark
+        );
+        if (sequence_result == latest_sequence_result::full) {
+          return baseline_install_result::capacity_exhausted;
+        }
+        if (sequence_result != latest_sequence_result::advanced) {
+          return baseline_install_result::conflict;
+        }
+      }
+      for (auto &entry : slots_) {
+        entry = {};
+      }
+      sequences_ = candidate_sequences;
+      lifecycles_ = candidate_lifecycles;
+      return baseline_install_result::installed;
     }
 
   private:
@@ -230,6 +739,8 @@ namespace lumen::lsp::input_plane {
     }
 
     std::array<slot, Capacity> slots_ {};  ///< Fixed supersession-key table.
+    latest_sequence_table<Capacity> sequences_ {};  ///< Applied-and-pending per-key sequence history.
+    device_lifecycle_table<Capacity> lifecycles_ {};  ///< Stable device-generation arrival/removal tombstones.
   };
 
   /** @brief Input baseline part admission result. */
@@ -241,6 +752,7 @@ namespace lumen::lsp::input_plane {
     overlap,  ///< New part overlaps an existing part.
     incomplete,  ///< Commit was requested before exact coverage existed.
     digest_mismatch,  ///< Caller-supplied digest verifier rejected assembled bytes.
+    invalid_body,  ///< Digest-authenticated bytes are not one exact deterministic complete baseline.
     committed,  ///< Complete digest-verified baseline became atomically visible.
   };
 
@@ -282,16 +794,26 @@ namespace lumen::lsp::input_plane {
         return baseline_result::invalid;
       }
       if (committed_) {
-        return header.object_id == baseline_id_ && header.input_generation == input_generation_ ? baseline_result::duplicate :
-                                                                                                  baseline_result::conflict;
+        if (header.object_id != baseline_id_ || header.input_generation != input_generation_ ||
+            header.edge_watermark != edge_watermark_ || part.part_count != part_count_ ||
+            part.total_length != total_length_ || part.digest != digest_) {
+          return baseline_result::conflict;
+        }
+        const auto &retained = parts_[part.part_index];
+        return retained.received && retained.offset == part.part_offset && retained.length == part.part_length &&
+                   std::equal(part.bytes.begin(), part.bytes.end(), storage_.begin() + retained.offset) ?
+                 baseline_result::duplicate :
+                 baseline_result::conflict;
       }
       if (baseline_id_ == 0) {
         input_generation_ = header.input_generation;
         baseline_id_ = header.object_id;
+        edge_watermark_ = header.edge_watermark;
         part_count_ = part.part_count;
         total_length_ = part.total_length;
         digest_ = part.digest;
       } else if (header.input_generation != input_generation_ || header.object_id != baseline_id_ ||
+                 header.edge_watermark != edge_watermark_ ||
                  part.part_count != part_count_ || part.total_length != total_length_ || part.digest != digest_) {
         return baseline_result::conflict;
       }
@@ -344,6 +866,10 @@ namespace lumen::lsp::input_plane {
       if (!verifier.verify(bytes, digest_)) {
         return baseline_result::digest_mismatch;
       }
+      const auto baseline = parse_input_baseline(bytes);
+      if (!baseline || baseline.edge_watermark != edge_watermark_) {
+        return baseline_result::invalid_body;
+      }
       committed_ = true;
       return baseline_result::committed;
     }
@@ -366,6 +892,16 @@ namespace lumen::lsp::input_plane {
       return committed_ ? std::span<const std::uint8_t>(storage_).first(total_length_) : std::span<const std::uint8_t> {};
     }
 
+    /**
+     * @brief Return the parsed committed deterministic baseline.
+     *
+     * @return Parsed borrowed baseline, or an invalid result before commit.
+     */
+    [[nodiscard]] constexpr parsed_input_baseline committed_baseline() const noexcept {
+      return committed_ ? parse_input_baseline(std::span<const std::uint8_t>(storage_).first(total_length_)) :
+                          parsed_input_baseline {.error = wire_error::invalid_baseline_body};
+    }
+
     /** @brief Return the committed or pending random baseline identifier. */
     [[nodiscard]] constexpr std::uint64_t baseline_id() const noexcept {
       return baseline_id_;
@@ -383,6 +919,7 @@ namespace lumen::lsp::input_plane {
       }
       input_generation_ = 0;
       baseline_id_ = 0;
+      edge_watermark_ = 0;
       part_count_ = 0;
       received_parts_ = 0;
       total_length_ = 0;
@@ -404,6 +941,7 @@ namespace lumen::lsp::input_plane {
     std::array<std::uint8_t, 32> digest_ {};  ///< Advertised complete SHA-256 digest.
     std::uint32_t input_generation_ = 0;  ///< Authority generation owning this baseline.
     std::uint64_t baseline_id_ = 0;  ///< Random baseline identifier.
+    std::uint64_t edge_watermark_ = 0;  ///< Exact edge watermark shared by all parts and the body.
     std::uint8_t part_count_ = 0;  ///< Declared complete part count.
     std::uint8_t received_parts_ = 0;  ///< Unique retained part count.
     std::uint32_t total_length_ = 0;  ///< Declared complete byte length.
@@ -969,12 +1507,14 @@ namespace lumen::lsp::input_plane {
      * @param input_generation Nonzero input authority generation.
      * @param pointer_id Pointer object ID in the range 1 through 4.
      * @param baseline Pointer baseline with nonzero instance generation and ordinal.
+     * @param baseline_edge_watermark Greatest dependent edge represented by the baseline.
      * @return `true` when the baseline is valid.
      */
     constexpr bool reset(
       const std::uint32_t input_generation,
       const std::uint32_t pointer_id,
-      const pointer_payload &baseline
+      const pointer_payload &baseline,
+      const std::uint64_t baseline_edge_watermark = 0
     ) noexcept {
       if (input_generation == 0 || pointer_id == 0 || pointer_id > 4 || baseline.instance_generation == 0) {
         return false;
@@ -986,6 +1526,38 @@ namespace lumen::lsp::input_plane {
       pending_header_ = {};
       pending_valid_ = false;
       last_state_sequence_ = 1;
+      last_edge_watermark_ = baseline_edge_watermark;
+      return true;
+    }
+
+    /**
+     * @brief Seed pointer state and its exact per-key sequence from one committed baseline record.
+     *
+     * @param input_generation Nonzero authority generation.
+     * @param baseline Parsed committed baseline.
+     * @param record_index Pointer record index.
+     * @return `true` when the record is one valid pointer key and reset succeeds atomically.
+     */
+    constexpr bool install_baseline_record(
+      const std::uint32_t input_generation,
+      const parsed_input_baseline &baseline,
+      const std::size_t record_index
+    ) noexcept {
+      if (!baseline) {
+        return false;
+      }
+      const auto record = baseline.record(record_index);
+      if (record.header.kind != baseline_record_kind::pointer) {
+        return false;
+      }
+      const auto pointer = parse_pointer_payload(record.payload);
+      if (!pointer || pointer.value.physical_ordinal != record.header.physical_ordinal) {
+        return false;
+      }
+      if (!reset(input_generation, record.header.device_id, pointer.value, baseline.edge_watermark)) {
+        return false;
+      }
+      last_state_sequence_ = record.header.state_sequence;
       return true;
     }
 
@@ -1011,8 +1583,10 @@ namespace lumen::lsp::input_plane {
           pointer.value.instance_generation != applied_.instance_generation) {
         return pointer_receive_result::stale_generation;
       }
-      if (packet.header.state_sequence <= last_state_sequence_ || pointer.value.physical_ordinal <= applied_.physical_ordinal ||
+      if (packet.header.state_sequence <= last_state_sequence_ || packet.header.edge_watermark < last_edge_watermark_ ||
+          pointer.value.physical_ordinal <= applied_.physical_ordinal ||
           (pending_valid_ && (packet.header.state_sequence <= pending_header_.state_sequence ||
+                              packet.header.edge_watermark < pending_header_.edge_watermark ||
                               pointer.value.physical_ordinal <= pending_.physical_ordinal))) {
         return pointer_receive_result::stale;
       }
@@ -1066,6 +1640,7 @@ namespace lumen::lsp::input_plane {
       }
       applied_ = pending_;
       last_state_sequence_ = pending_header_.state_sequence;
+      last_edge_watermark_ = pending_header_.edge_watermark;
       pending_valid_ = false;
       return pointer_receive_result::applied;
     }
@@ -1103,7 +1678,169 @@ namespace lumen::lsp::input_plane {
     std::uint32_t input_generation_ = 0;  ///< Active authority generation.
     std::uint32_t pointer_id_ = 0;  ///< Active pointer object ID.
     std::uint64_t last_state_sequence_ = 0;  ///< Greatest applied state sequence.
+    std::uint64_t last_edge_watermark_ = 0;  ///< Greatest applied dependent-edge watermark.
     bool pending_valid_ = false;  ///< Whether pending state is populated.
+  };
+
+  /** @brief Pen replaceable-state receive/admission result. */
+  enum class pen_receive_result : std::uint8_t {
+    retained,  ///< Newest pen state was retained.
+    applied,  ///< Retained pen state was submitted to the platform.
+    stale,  ///< State sequence or physical ordinal did not advance.
+    stale_generation,  ///< Input, device, or instance generation is stale.
+    waiting_for_edges,  ///< State awaits its dependent edge watermark.
+    apply_failed,  ///< Platform callback rejected the ready state.
+    malformed,  ///< Packet is not one exact frozen pen device-state payload.
+  };
+
+  /** @brief Allocation-free latest absolute pen receiver with edge-watermark ordering. */
+  class pen_receiver {
+  public:
+    /**
+     * @brief Install one pen state from a committed authority baseline.
+     *
+     * @param input_generation Nonzero input authority generation.
+     * @param device_id Nonzero pen device identifier.
+     * @param baseline Frozen pen baseline state.
+     * @param baseline_state_sequence Nonzero per-key baseline sequence.
+     * @param baseline_edge_watermark Greatest dependent edge represented by the baseline.
+     * @return `true` when every generation and identifier is consistent.
+     */
+    constexpr bool reset(
+      const std::uint32_t input_generation,
+      const std::uint32_t device_id,
+      const pen_state_payload &baseline,
+      const std::uint64_t baseline_state_sequence = 1,
+      const std::uint64_t baseline_edge_watermark = 0
+    ) noexcept {
+      std::array<std::uint8_t, pen_state_payload_size> encoded {};
+      if (input_generation == 0 || device_id == 0 || baseline_state_sequence == 0 ||
+          baseline.prefix.device != device_type::pen || baseline.prefix.device_id != device_id ||
+          baseline.prefix.instance_generation == 0 || baseline.prefix.physical_ordinal == 0 ||
+          serialize_pen_state_payload(baseline, encoded) != wire_error::none) {
+        return false;
+      }
+      input_generation_ = input_generation;
+      device_id_ = device_id;
+      applied_ = baseline;
+      pending_ = {};
+      pending_header_ = {};
+      last_state_sequence_ = baseline_state_sequence;
+      last_edge_watermark_ = baseline_edge_watermark;
+      pending_valid_ = false;
+      return true;
+    }
+
+    /**
+     * @brief Seed exact pen model state from one committed baseline record.
+     *
+     * @param input_generation Nonzero authority generation.
+     * @param baseline Parsed committed baseline.
+     * @param record_index Pen record index.
+     * @return `true` when full model validation and reset succeed atomically.
+     */
+    constexpr bool install_baseline_record(
+      const std::uint32_t input_generation,
+      const parsed_input_baseline &baseline,
+      const std::size_t record_index
+    ) noexcept {
+      if (!baseline) {
+        return false;
+      }
+      const auto record = baseline.record(record_index);
+      if (record.header.kind != baseline_record_kind::pen) {
+        return false;
+      }
+      const auto pen = parse_pen_state_payload(record.payload);
+      return pen && pen.value.prefix.physical_ordinal == record.header.physical_ordinal &&
+             reset(
+               input_generation,
+               record.header.device_id,
+               pen.value,
+               record.header.state_sequence,
+               baseline.edge_watermark
+             );
+    }
+
+    /**
+     * @brief Retain the newest validated pen packet without allocation.
+     *
+     * @param packet Parsed device-state packet.
+     * @param applied_edge_watermark Current exactly-once edge watermark.
+     * @return Admission readiness result.
+     */
+    constexpr pen_receive_result admit(
+      const parsed_packet &packet,
+      const std::uint64_t applied_edge_watermark
+    ) noexcept {
+      if (!packet || packet.header.kind != packet_kind::device_state) {
+        return pen_receive_result::malformed;
+      }
+      device_type type {};
+      std::uint32_t device_id = 0;
+      const auto pen = parse_pen_state_payload(packet.payload);
+      if (!pen || !decode_device_object_id(packet.header.object_id, type, device_id) || type != device_type::pen ||
+          device_id != device_id_) {
+        return pen_receive_result::malformed;
+      }
+      if (packet.header.input_generation != input_generation_ ||
+          pen.value.prefix.instance_generation != applied_.prefix.instance_generation) {
+        return pen_receive_result::stale_generation;
+      }
+      if (packet.header.state_sequence <= last_state_sequence_ || packet.header.edge_watermark < last_edge_watermark_ ||
+          pen.value.prefix.physical_ordinal <= applied_.prefix.physical_ordinal ||
+          (pending_valid_ && (packet.header.state_sequence <= pending_header_.state_sequence ||
+                              packet.header.edge_watermark < pending_header_.edge_watermark ||
+                              pen.value.prefix.physical_ordinal <= pending_.prefix.physical_ordinal))) {
+        return pen_receive_result::stale;
+      }
+      pending_ = pen.value;
+      pending_header_ = packet.header;
+      pending_valid_ = true;
+      return packet.header.edge_watermark <= applied_edge_watermark ? pen_receive_result::retained :
+                                                                      pen_receive_result::waiting_for_edges;
+    }
+
+    /**
+     * @brief Apply the newest pen state after all dependent edges are ready.
+     *
+     * @tparam Apply Callable accepting `const pen_state_payload &` and returning `bool`.
+     * @param applied_edge_watermark Current exactly-once edge watermark.
+     * @param apply Platform pen callback.
+     * @return Application result.
+     */
+    template<class Apply>
+    constexpr pen_receive_result apply_ready(
+      const std::uint64_t applied_edge_watermark,
+      Apply &&apply
+    ) noexcept(noexcept(std::invoke(apply, std::declval<const pen_state_payload &>()))) {
+      if (!pending_valid_ || pending_header_.edge_watermark > applied_edge_watermark) {
+        return pen_receive_result::waiting_for_edges;
+      }
+      if (!std::invoke(apply, std::as_const(pending_))) {
+        return pen_receive_result::apply_failed;
+      }
+      applied_ = pending_;
+      last_state_sequence_ = pending_header_.state_sequence;
+      last_edge_watermark_ = pending_header_.edge_watermark;
+      pending_valid_ = false;
+      return pen_receive_result::applied;
+    }
+
+    /** @brief Return the newest successfully applied frozen pen state. */
+    [[nodiscard]] constexpr const pen_state_payload &applied_state() const noexcept {
+      return applied_;
+    }
+
+  private:
+    pen_state_payload applied_ {};  ///< Last platform-applied pen state.
+    pen_state_payload pending_ {};  ///< Newest retained replaceable pen state.
+    common_header pending_header_ {};  ///< Header binding pending state to dependent edges.
+    std::uint32_t input_generation_ = 0;  ///< Active input authority generation.
+    std::uint32_t device_id_ = 0;  ///< Active pen device identifier.
+    std::uint64_t last_state_sequence_ = 0;  ///< Greatest applied pen state sequence.
+    std::uint64_t last_edge_watermark_ = 0;  ///< Greatest applied dependent-edge watermark.
+    bool pending_valid_ = false;  ///< Whether a newer pen state is retained.
   };
 
   /** @brief Text barrier admission result. */

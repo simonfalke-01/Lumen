@@ -12,6 +12,8 @@
 #endif
 
 #if LUMEN_LSP_WOLFSSL_AVAILABLE
+  #include "../security/wolfssl_process.h"
+
   #include <wolfssl/options.h>
   #include <wolfssl/wolfcrypt/asn_public.h>
   #include <wolfssl/wolfcrypt/ed25519.h>
@@ -99,6 +101,22 @@ namespace lumen::lsp::runtime {
         error
       );
       return !error;
+    }
+
+    bool replace_file_atomic(
+      const std::filesystem::path &pending,
+      const std::filesystem::path &destination
+    ) noexcept {
+#ifdef _WIN32
+      if (std::filesystem::exists(destination)) {
+        return ReplaceFileW(destination.c_str(), pending.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != 0;
+      }
+      return MoveFileExW(pending.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+#else
+      std::error_code error;
+      std::filesystem::rename(pending, destination, error);
+      return !error;
+#endif
     }
 
     std::expected<std::vector<std::uint8_t>, IdentityError> read_identity_file(
@@ -214,6 +232,38 @@ namespace lumen::lsp::runtime {
            contains_nonzero(application_private_key) && !is_zero(cookie_secret) &&
            !certificate_der.empty() && certificate_der.size() <= maximum_der_bytes &&
            !private_key_der.empty() && private_key_der.size() <= maximum_der_bytes;
+  }
+
+  HostIdentity::HostIdentity(HostIdentity &&other) noexcept:
+      host_id {other.host_id},
+      application_public_key {other.application_public_key},
+      application_private_key {other.application_private_key},
+      cookie_secret {other.cookie_secret},
+      certificate_der {std::move(other.certificate_der)},
+      private_key_der {std::move(other.private_key_der)} {
+    clear_identity_secrets(other);
+    other.host_id = {};
+    other.application_public_key = {};
+  }
+
+  HostIdentity &HostIdentity::operator=(HostIdentity &&other) noexcept {
+    if (this != &other) {
+      clear_identity_secrets(*this);
+      host_id = other.host_id;
+      application_public_key = other.application_public_key;
+      application_private_key = other.application_private_key;
+      cookie_secret = other.cookie_secret;
+      certificate_der = std::move(other.certificate_der);
+      private_key_der = std::move(other.private_key_der);
+      clear_identity_secrets(other);
+      other.host_id = {};
+      other.application_public_key = {};
+    }
+    return *this;
+  }
+
+  HostIdentity::~HostIdentity() {
+    clear_identity_secrets(*this);
   }
 
   std::expected<std::vector<std::uint8_t>, IdentityError> encode_identity(
@@ -361,14 +411,15 @@ namespace lumen::lsp::runtime {
       random.get()
     );
     const auto certificate_size = body_size > 0 ? wc_SignCert_ex(
-                                                  certificate.bodySz,
-                                                  certificate.sigType,
-                                                  certificate_buffer.data(),
-                                                  static_cast<word32>(certificate_buffer.size()),
-                                                  ED25519_TYPE,
-                                                  dtls_key.get(),
-                                                  random.get()
-                                                ) : body_size;
+                                                    certificate.bodySz,
+                                                    certificate.sigType,
+                                                    certificate_buffer.data(),
+                                                    static_cast<word32>(certificate_buffer.size()),
+                                                    ED25519_TYPE,
+                                                    dtls_key.get(),
+                                                    random.get()
+                                                  ) :
+                                                  body_size;
     if (certificate_size <= 0) {
       clear_identity_secrets(identity);
       return std::unexpected(IdentityError::certificate_generation_failed);
@@ -397,9 +448,69 @@ namespace lumen::lsp::runtime {
 #endif
   }
 
+  std::expected<HostIdentity, IdentityError> generate_rotated_identity(
+    const HostIdentity &current
+  ) noexcept {
+    if (!current.valid()) {
+      return std::unexpected(IdentityError::invalid_identity);
+    }
+    auto generated = generate_identity();
+    if (!generated) {
+      return std::unexpected(generated.error());
+    }
+    generated->host_id = current.host_id;
+    generated->application_public_key = current.application_public_key;
+    generated->application_private_key = current.application_private_key;
+    generated->cookie_secret = current.cookie_secret;
+    return generated;
+  }
+
+  std::expected<void, IdentityError> persist_identity_atomic(
+    const std::filesystem::path &path,
+    const HostIdentity &identity
+  ) noexcept {
+    auto encoded = encode_identity(identity);
+    if (!encoded) {
+      return std::unexpected(encoded.error());
+    }
+    try {
+      std::error_code error;
+      std::filesystem::create_directories(path.parent_path(), error);
+      if (error) {
+        clear_secret(*encoded);
+        return std::unexpected(IdentityError::io_failed);
+      }
+      auto pending = path;
+      pending += ".rotation.pending";
+      std::filesystem::remove(pending, error);
+      error.clear();
+      if (!write_identity_file(pending, *encoded)) {
+        clear_secret(*encoded);
+        std::filesystem::remove(pending, error);
+        return std::unexpected(IdentityError::io_failed);
+      }
+      const auto replaced = replace_file_atomic(pending, path);
+      clear_secret(*encoded);
+      if (!replaced) {
+        std::filesystem::remove(pending, error);
+        return std::unexpected(IdentityError::io_failed);
+      }
+      return {};
+    } catch (...) {
+      clear_secret(*encoded);
+      return std::unexpected(IdentityError::io_failed);
+    }
+  }
+
   std::expected<HostIdentity, IdentityError> load_or_create_identity(
     const std::filesystem::path &path
   ) noexcept {
+#if LUMEN_LSP_WOLFSSL_AVAILABLE
+    if (!initialize_wolfssl_process()) {
+      return std::unexpected(IdentityError::random_failed);
+    }
+#endif
+
     try {
       std::error_code error;
       if (std::filesystem::exists(path, error)) {

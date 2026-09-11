@@ -35,3 +35,95 @@ feature-report, queueing, and force-feedback behavior was adapted into Lumen's
 existing driver with written permission from LizardByte. Lumen does not compile
 or distribute libvirtualhid's Windows driver, broker, entitlement service,
 installer, or generated driver-package artifacts.
+
+Distributed license files
+-------------------------
+
+Binary packages place the complete redistributable license texts for Lumen,
+OpenSSL, Opus, moonlight-common-c, ENet, nanors, and the portable
+libvirtualhid components beside this notice under `share/licenses/Lumen`.
+The wolfSSL commercial agreement and all confidential licensing material are
+intentionally excluded; the non-secret wolfSSL provenance and downstream
+licensing requirements appear below. The complete libSRTP and added
+wolfCrypt-backend notices also appear below.
+
+wolfSSL 5.9.2
+-------------
+
+Lumen's LSP security provider is built from the public wolfSSL 5.9.2 stable
+source release:
+https://github.com/wolfSSL/wolfssl/tree/ac01707f552c611fbd135cc723b2682b3e7f80f2
+
+Lumen release builds use wolfSSL and wolfCrypt under a separately held
+commercial license. The commercial agreement, account information,
+credentials, and other confidential license material are not part of the
+source tree or binary package.
+
+wolfSSL 5.9.2 is otherwise offered under the GNU General Public License,
+version 3, subject to the exceptions in wolfSSL's upstream LICENSING file, or
+under a commercial license from wolfSSL Inc. A downstream builder or
+distributor that incorporates wolfSSL must independently obtain the required
+commercial rights or comply with the applicable wolfSSL GPL terms. Lumen's
+GPL-3.0 license does not grant wolfSSL commercial rights.
+
+libSRTP 2.8.0
+-------------
+
+Copyright (c) 2001-2017 Cisco Systems, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of Cisco Systems, Inc. nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+libSRTP wolfCrypt backend
+-------------------------
+
+The AES-GCM and AES-ICM wolfCrypt backend added to libSRTP carries this
+additional notice:
+
+Copyright (c) 2026 LizardByte project contributors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.

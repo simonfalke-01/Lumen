@@ -32,6 +32,28 @@ namespace lumen::lsp::runtime {
   using PairingDtlsExporter = std::array<std::uint8_t, pairing_dtls_exporter_size>;
 
   /**
+   * @brief Select the nonzero semantic generation used to cache one control response.
+   *
+   * CLIENT_HELLO is the sole request whose wire generation is zero. Its response is scoped to the
+   * host-assigned association generation so duplicate first requests remain idempotent without
+   * weakening the response cache's nonzero-generation invariant.
+   *
+   * @param message_type Request control-message type.
+   * @param wire_generation Generation carried by the request header.
+   * @param association_generation Nonzero generation assigned to the DTLS association.
+   * @return Association generation for CLIENT_HELLO; otherwise the wire generation.
+   */
+  [[nodiscard]] constexpr std::uint32_t response_cache_generation(
+    const std::uint16_t message_type,
+    const std::uint32_t wire_generation,
+    const std::uint32_t association_generation
+  ) noexcept {
+    return message_type == static_cast<std::uint16_t>(ControlMessageType::client_hello) ?
+             association_generation :
+             wire_generation;
+  }
+
+  /**
    * @brief Persisted LSP trusted-client record.
    */
   struct TrustedClient {
@@ -89,6 +111,16 @@ namespace lumen::lsp::runtime {
       const TrustedClient &client,
       TrustedClient &effective
     ) noexcept = 0;
+
+    /** @brief Atomically update an existing client's permissions/enabled state and advance revocation. */
+    virtual bool update_existing(
+      const Identifier128 &client_id,
+      PermissionSet permissions,
+      bool enabled
+    ) noexcept = 0;
+
+    /** @brief Atomically remove one existing client record. */
+    virtual bool revoke_existing(const Identifier128 &client_id) noexcept = 0;
   };
 
   /**
@@ -96,6 +128,13 @@ namespace lumen::lsp::runtime {
    */
   class ControlApplicationProvider {
   public:
+    /** @brief One bounded artwork object referenced by an APPLICATIONS image-path field. */
+    struct ArtworkObject {
+      Identifier128 object_id {};  ///< Object identity encoded in the application reference.
+      Digest256 sha256 {};  ///< Complete artwork commitment.
+      std::vector<std::uint8_t> bytes;  ///< Complete artwork bytes, at most 16 MiB.
+    };
+
     virtual ~ControlApplicationProvider() = default;
 
     /**
@@ -104,6 +143,11 @@ namespace lumen::lsp::runtime {
      * @return Complete current snapshot, or no value on a product-state failure.
      */
     [[nodiscard]] virtual std::optional<std::vector<ControlApplication>> snapshot() noexcept = 0;
+
+    /** @brief Return artwork objects frozen by the most recent successful snapshot. */
+    [[nodiscard]] virtual std::optional<std::vector<ArtworkObject>> artwork_snapshot() noexcept {
+      return std::vector<ArtworkObject> {};
+    }
   };
 
   /** @brief Product authority boundary for START, ATTACH, input, video, audio, and microphone. */
@@ -139,6 +183,31 @@ namespace lumen::lsp::runtime {
       const TrustedClient &client,
       std::uint32_t connection_generation,
       const StopRequestPayload &request
+    ) noexcept = 0;
+
+    /** @brief Terminate only the application owned by the authenticated session. */
+    virtual ControlStatus quit_application(
+      const TrustedClient &client,
+      std::uint32_t connection_generation,
+      const QuitApplicationPayload &request
+    ) noexcept = 0;
+
+    /** @brief Inject one validated UTF-8 commit after its input edge barrier. */
+    virtual ControlStatus text_input(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      std::uint32_t connection_generation,
+      const TextInputPayload &request,
+      std::span<const std::uint8_t> utf8,
+      std::uint64_t deadline_microseconds
+    ) noexcept = 0;
+
+    /** @brief Select hot-plugged device rates within the current input budget. */
+    [[nodiscard]] virtual std::expected<InputRateResponsePayload, ControlStatus> input_rate(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      std::uint32_t connection_generation,
+      const InputRateRequestPayload &request
     ) noexcept = 0;
 
     /**
@@ -447,6 +516,14 @@ namespace lumen::lsp::runtime {
     PairingAdministrationState state {PairingAdministrationState::awaiting_pin};  ///< Coarse current state.
   };
 
+  /** @brief Terminal state of one host-originated certificate rotation transaction. */
+  enum class CertificateRotationState : std::uint8_t {
+    absent,  ///< No matching authenticated connection/rotation exists.
+    pending,  ///< Client persistence acknowledgement remains outstanding.
+    succeeded,  ///< Client atomically persisted the replacement pin.
+    failed,  ///< Client rejected or failed persistence.
+  };
+
   /** @brief Result of one PIN-session POLL rate admission. */
   enum class PairingPollResult : std::uint8_t {
     accepted,  ///< Poll is legal and advances exponential backoff.
@@ -606,6 +683,14 @@ namespace lumen::lsp::runtime {
     ~HostControlServer();
 
     /**
+     * @brief Close control admission, join asynchronous workers, and terminally answer queued text requests.
+     *
+     * The transport and its DTLS/forward-path owners must remain alive until
+     * this call returns and its queued terminal records have been drained.
+     */
+    void shutdown() noexcept;
+
+    /**
      * @brief Admit a newly authenticated DTLS association and assign a generation.
      *
      * @param peer Exact association five-tuple.
@@ -630,6 +715,16 @@ namespace lumen::lsp::runtime {
      * @param client_id Stable client identifier changed or revoked by administration.
      */
     void disconnect_client(const Identifier128 &client_id) noexcept;
+
+    /** @brief Serialize pairing cancellation, persistent permission update, and association disconnect. */
+    bool update_trusted_client(
+      const Identifier128 &client_id,
+      PermissionSet permissions,
+      bool enabled
+    ) noexcept;
+
+    /** @brief Serialize pairing cancellation, persistent revocation, and association disconnect. */
+    bool revoke_trusted_client(const Identifier128 &client_id) noexcept;
 
     /**
      * @brief Process one authenticated DTLS application record.
@@ -693,6 +788,54 @@ namespace lumen::lsp::runtime {
       const PeerEndpoint &peer,
       const PathProbePayload &probe
     ) noexcept;
+
+    /**
+     * @brief Reliably notify one authenticated peer that its exact stream generation ended.
+     *
+     * @param peer Exact authenticated association.
+     * @param ended Generation-bound terminal event.
+     * @param now_microseconds Monotonic first-send time.
+     * @return True when retained and first-transmitted.
+     */
+    bool send_stream_ended(
+      const PeerEndpoint &peer,
+      const StreamEndedPayload &ended,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /**
+     * @brief Sign and reliably announce one replacement DTLS certificate SPKI.
+     *
+     * @param peer Exact authenticated association.
+     * @param new_spki_sha256 Replacement certificate SPKI digest.
+     * @param rotation_generation Next persisted nonzero rotation generation.
+     * @param now_microseconds Monotonic first-send time.
+     * @return True when retained and first-transmitted under the old host identity.
+     */
+    bool start_certificate_rotation(
+      const PeerEndpoint &peer,
+      const Digest256 &new_spki_sha256,
+      std::uint32_t rotation_generation,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /** @brief Snapshot authenticated association peers for an administrative rotation transaction. */
+    [[nodiscard]] std::optional<std::vector<PeerEndpoint>> authenticated_peers() const noexcept;
+
+    /** @brief Atomically cancel PIN work, suspend new pairing, and snapshot authenticated peers. */
+    [[nodiscard]] std::optional<std::vector<PeerEndpoint>> begin_certificate_rotation() noexcept;
+
+    /** @brief Re-enable PIN pairing after one rotation transaction terminates. */
+    void end_certificate_rotation() noexcept;
+
+    /** @brief Read one peer's exact certificate rotation transaction state. */
+    [[nodiscard]] CertificateRotationState certificate_rotation_state(
+      const PeerEndpoint &peer,
+      std::uint32_t rotation_generation
+    ) const noexcept;
+
+    /** @brief Publish the successfully activated SPKI as the base for future signed rotations. */
+    void commit_certificate_rotation(const Digest256 &new_spki_sha256) noexcept;
 
     /** @brief Return the path-safe current control RTO used as a probe interval. */
     [[nodiscard]] std::uint64_t path_probe_interval(const PeerEndpoint &peer) const noexcept;

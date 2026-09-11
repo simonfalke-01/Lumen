@@ -244,22 +244,13 @@ namespace lumen::lsp::runtime {
     std::uint64_t now_microseconds
   ) noexcept;
 
-  /** @brief Maximum active forward-media SSRC blocks admitted in one RFC 8888 packet. */
-  inline constexpr std::size_t maximum_congestion_feedback_blocks = 8;
+  using CongestionFeedbackBlockView = transport::congestion_feedback_block_view;  ///< Shared immutable RFC 8888 block view.
+  using CongestionFeedbackPacketView = transport::congestion_feedback_packet_view;  ///< Shared immutable RFC 8888 packet view.
 
-  /** @brief One validated RFC 8888 per-SSRC report block backed by the input packet. */
-  struct CongestionFeedbackBlockView {
-    std::uint32_t media_ssrc {};  ///< Active forward-media SSRC.
-    std::uint16_t begin_sequence {};  ///< First sequence in the Errata 8166 half-open range.
-    std::uint16_t report_count {};  ///< Exact number of following 16-bit metrics.
-    std::span<const std::uint8_t> metrics {};  ///< Exact metrics excluding any odd-count zero pad.
-  };
-
-  /** @brief Bounded validated RFC 8888 feedback packet backed by caller-owned bytes. */
-  struct CongestionFeedbackPacketView {
-    std::array<CongestionFeedbackBlockView, maximum_congestion_feedback_blocks> blocks {};  ///< Ordered SSRC blocks.
-    std::size_t block_count {};  ///< Populated leading block views.
-    std::uint32_t report_timestamp {};  ///< Final middle-32-bit NTP report timestamp.
+  /** @brief Immutable no-mutation video CCFB preview backed by authenticated RTCP bytes. */
+  struct VideoCongestionFeedbackPreview {
+    CongestionFeedbackPacketView packet {};  ///< Validated borrowed packet view.
+    std::uint64_t now_microseconds {};  ///< Exact receive time used by validation and commit.
   };
 
   /** @brief Product admission result for negotiated primary/repair/audio RFC 8888 blocks. */
@@ -390,6 +381,7 @@ namespace lumen::lsp::runtime {
     std::uint16_t path_payload_ceiling {1'200};  ///< Negotiated family/operator DPLPMTUD ceiling.
     std::uint32_t feedback_sender_ssrc {};  ///< Negotiated client input SSRC used by RTCP feedback.
     std::uint32_t audio_feedback_ssrc {};  ///< Active host-audio SSRC admitted but not accounted by this video owner.
+    RtcpCname rtcp_cname {};  ///< Stable host-unique association CNAME for every host RTCP source.
     VideoNetworkProfile network_profile {VideoNetworkProfile::adaptive_low_latency};  ///< Negotiated controller profile.
     media::ip_family family {media::ip_family::ipv4};  ///< Address family for complete wire accounting.
     safe::mail_t capture_mail;  ///< Local capture recovery and shutdown mailbox.
@@ -440,6 +432,7 @@ namespace lumen::lsp::runtime {
     std::uint64_t feedback_rejections {};  ///< Malformed, stale, or hostile RFC 8888 reports.
     std::uint64_t feedback_delivered_bytes {};  ///< Newly accounted complete IP-layer delivered bytes.
     std::uint64_t feedback_lost_bytes {};  ///< Newly accounted complete IP-layer lost bytes.
+    std::uint64_t feedback_loss_corrections {};  ///< Lost bytes later corrected to authenticated delivery.
     std::uint64_t path_probe_datagrams {};  ///< Freshly protected SRTCP LSPP transmissions.
     std::uint64_t path_probe_retries {};  ///< PROBE_TIMER retries with a new SRTCP index.
     bool flexfec_active {};  ///< Whether measured loss currently activates frame-local parity.
@@ -534,6 +527,27 @@ namespace lumen::lsp::runtime {
 
     /** @brief Parse authenticated RFC 8888 CCFB and update independent forward congestion state. */
     bool receive_congestion_feedback(std::span<const std::uint8_t> packet, std::uint64_t now_microseconds) noexcept;
+
+    /** @brief Consume one shared, structurally admitted immutable RFC 8888 view. */
+    bool receive_congestion_feedback(
+      const CongestionFeedbackPacketView &packet,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /** @brief Validate all negotiated video/repair ledger blocks without mutating feedback state. */
+    bool validate_congestion_feedback(
+      const CongestionFeedbackPacketView &packet,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /** @brief Build an explicit no-mutation video/repair feedback preview. */
+    [[nodiscard]] std::optional<VideoCongestionFeedbackPreview> preview_congestion_feedback(
+      const CongestionFeedbackPacketView &packet,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /** @brief Revalidate and commit one exact prior video/repair feedback preview. */
+    bool commit_congestion_feedback(const VideoCongestionFeedbackPreview &preview) noexcept;
 
     /**
      * @brief Apply authenticated Generic NACK, PLI, or FIR video feedback.

@@ -597,7 +597,17 @@ namespace platf::dxgi {
 
     adapter_t::pointer adapter_p;
     for (int tries = 0; tries < 2; ++tries) {
-      for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+      for (int x = 0;; ++x) {
+        const auto adapter_status = factory->EnumAdapters1(x, &adapter_p);
+        if (adapter_status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(adapter_status) || !adapter_p) {
+          BOOST_LOG(error) << "Failed to enumerate DXGI adapter "sv << x << " [0x"sv
+                           << util::hex(adapter_status).to_string_view() << ']';
+          break;
+        }
+
         dxgi::adapter_t adapter_tmp {adapter_p};
 
         DXGI_ADAPTER_DESC1 adapter_desc;
@@ -608,7 +618,17 @@ namespace platf::dxgi {
         }
 
         dxgi::output_t::pointer output_p;
-        for (int y = 0; adapter_tmp->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+        for (int y = 0;; ++y) {
+          const auto output_status = adapter_tmp->EnumOutputs(y, &output_p);
+          if (output_status == DXGI_ERROR_NOT_FOUND) {
+            break;
+          }
+          if (FAILED(output_status) || !output_p) {
+            BOOST_LOG(error) << "Failed to enumerate DXGI output "sv << y << " [0x"sv
+                             << util::hex(output_status).to_string_view() << ']';
+            break;
+          }
+
           dxgi::output_t output_tmp {output_p};
 
           DXGI_OUTPUT_DESC desc;

@@ -72,10 +72,18 @@ namespace lumen::lsp::runtime {
     /** @brief Observe a transition into or out of kernel backpressure. */
     using BackpressureChanged = void (*)(void *context, bool blocked) noexcept;
 
+    /** @brief Observe an authenticated path-payload generation change. */
+    using PathChanged = void (*)(
+      void *context,
+      const PeerEndpoint &peer,
+      std::uint16_t path_payload_bytes
+    ) noexcept;
+
     void *context {};  ///< Opaque product runtime context.
     SendDatagram send_datagram {};  ///< Required final socket submission callback.
     Completed completed {};  ///< Optional asynchronous terminal callback.
     BackpressureChanged backpressure_changed {};  ///< Optional video-admission callback.
+    PathChanged path_changed {};  ///< Optional ECN/path-property invalidation callback.
   };
 
   /** @brief Optional O(1) producer-specific terminal callback stored with one slot. */

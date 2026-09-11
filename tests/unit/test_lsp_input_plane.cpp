@@ -302,13 +302,45 @@ TEST(LspInputEdges, AppliesLossAndReorderExactlyOnceWithExplicitAckWindow) {
 }
 
 TEST(LspInputBaseline, CommitsAtomicallyOnlyAfterAllPartsAndDigestVerification) {
-  constexpr std::array<std::uint8_t, 8> complete {1, 2, 3, 4, 5, 6, 7, 8};
+  std::array<std::uint8_t, input::core_state_payload_size> core_bytes {};
+  ASSERT_EQ(
+    input::serialize_core_state_payload(
+      {
+        .neutral = true,
+        .keyboard_instance_generation = 1,
+        .physical_ordinal = 1,
+      },
+      core_bytes
+    ),
+    input::wire_error::none
+  );
+  const std::array<input::input_baseline_record_view, 1> records {{
+    {
+      .header = {
+        .kind = input::baseline_record_kind::core,
+        .payload_length = core_bytes.size(),
+        .instance_generation = 1,
+        .state_sequence = 1,
+        .physical_ordinal = 1,
+      },
+      .payload = core_bytes,
+    },
+  }};
+  std::array<std::uint8_t, 256> baseline_storage {};
+  const auto encoded = input::serialize_input_baseline(
+    {.neutral = true, .records = records},
+    baseline_storage
+  );
+  ASSERT_TRUE(encoded);
+  const auto complete = std::span<const std::uint8_t>(baseline_storage).first(encoded.bytes_written);
+  ASSERT_EQ(complete.size() % 2U, 0U);
+  const auto split = complete.size() / 2U;
   std::array<std::uint8_t, 32> digest {};
   digest[0] = 42;
   const input::common_header header {
     .input_generation = 7,
     .kind = input::packet_kind::baseline_part,
-    .payload_length = 52,
+    .payload_length = static_cast<std::uint16_t>(input::baseline_part_header_size + split),
     .state_sequence = 1,
     .object_id = 99,
   };
@@ -316,20 +348,20 @@ TEST(LspInputBaseline, CommitsAtomicallyOnlyAfterAllPartsAndDigestVerification) 
   const input::baseline_part tail {
     .part_index = 1,
     .part_count = 2,
-    .total_length = complete.size(),
-    .part_offset = 4,
-    .part_length = 4,
+    .total_length = static_cast<std::uint32_t>(complete.size()),
+    .part_offset = static_cast<std::uint32_t>(split),
+    .part_length = static_cast<std::uint32_t>(complete.size() - split),
     .digest = digest,
-    .bytes = std::span(complete).subspan(4),
+    .bytes = complete.subspan(split),
   };
   const input::baseline_part head {
     .part_index = 0,
     .part_count = 2,
-    .total_length = complete.size(),
+    .total_length = static_cast<std::uint32_t>(complete.size()),
     .part_offset = 0,
-    .part_length = 4,
+    .part_length = static_cast<std::uint32_t>(split),
     .digest = digest,
-    .bytes = std::span(complete).first(4),
+    .bytes = complete.first(split),
   };
   EXPECT_EQ(receiver.add(header, tail), input::baseline_result::accepted);
   EXPECT_TRUE(receiver.committed_bytes().empty());
@@ -351,14 +383,19 @@ TEST(LspInputBaseline, CommitsAtomicallyOnlyAfterAllPartsAndDigestVerification) 
 }
 
 TEST(LspInputSupersession, KeepsExactControllerAndSensorKeysAndHonorsWatermarks) {
-  std::array<std::uint8_t, 25> controller_payload {};
-  controller_payload[0] = static_cast<std::uint8_t>(input::device_type::controller);
-  lumen::lsp::wire::write_be<std::uint16_t>(std::span(controller_payload).subspan(2, 2), 1);
-  lumen::lsp::wire::write_be<std::uint32_t>(std::span(controller_payload).subspan(4, 4), 2);
-  lumen::lsp::wire::write_be<std::uint32_t>(std::span(controller_payload).subspan(8, 4), 5);
-  lumen::lsp::wire::write_be<std::uint16_t>(std::span(controller_payload).subspan(12, 2), controller_payload.size());
-  lumen::lsp::wire::write_be<std::uint64_t>(std::span(controller_payload).subspan(16, 8), 9);
-  controller_payload[24] = 77;
+  std::array<std::uint8_t, input::controller_state_payload_size> controller_payload {};
+  const input::controller_state_payload controller {
+    .prefix = {
+      .device = input::device_type::controller,
+      .represented_reports = 1,
+      .device_id = 2,
+      .instance_generation = 5,
+      .record_length = input::controller_state_payload_size,
+      .physical_ordinal = 9,
+    },
+    .triggers = {77, 0, 0, 0},
+  };
+  ASSERT_EQ(input::serialize_controller_state_payload(controller, controller_payload), input::wire_error::none);
 
   std::array<std::uint8_t, input::common_header_size + controller_payload.size()> packet {};
   ASSERT_EQ(
@@ -375,7 +412,11 @@ TEST(LspInputSupersession, KeepsExactControllerAndSensorKeysAndHonorsWatermarks)
     ),
     input::wire_error::none
   );
-  input::latest_state_table<4, 64> latest;
+  input::latest_state_table<4, input::controller_state_payload_size> latest;
+  ASSERT_EQ(
+    latest.observe_lifecycle(input::device_type::controller, 2, 5, input::device_presence::active),
+    input::lifecycle_generation_result::advanced
+  );
   EXPECT_EQ(latest.put(input::parse_packet(packet, 7)), input::latest_state_result::stored);
   EXPECT_EQ(
     latest.drain_ready(2, [](const input::common_header &, const input::supersession_key &, std::span<const std::uint8_t>) {
@@ -388,11 +429,61 @@ TEST(LspInputSupersession, KeepsExactControllerAndSensorKeysAndHonorsWatermarks)
       EXPECT_EQ(key.device, input::device_type::controller);
       EXPECT_EQ(key.device_id, 2U);
       EXPECT_EQ(key.instance_generation, 5U);
-      EXPECT_EQ(bytes.back(), 77);
+      EXPECT_EQ(input::parse_controller_state_payload(bytes).value.triggers[0], 77);
       return true;
     }),
     std::size_t {1}
   );
+}
+
+TEST(LspInputSupersession, CoalescesSyntheticOneEightAndSixteenKilohertzStateWithoutFifoGrowth) {
+  constexpr std::array<std::uint32_t, 3> report_rates {1'000, 8'000, 16'000};
+  for (const auto reports : report_rates) {
+    input::latest_state_table<96, input::pointer_payload_size> latest;
+    ASSERT_EQ(
+      latest.observe_lifecycle(input::device_type::pointer, 1, 3, input::device_presence::active),
+      input::lifecycle_generation_result::advanced
+    );
+    for (std::uint32_t index = 1; index <= reports; ++index) {
+      const input::pointer_payload pointer {
+        .instance_generation = 3,
+        .mode = input::pointer_flag::relative,
+        .represented_reports = 1,
+        .physical_ordinal = index,
+        .cumulative_x = index,
+      };
+      const auto bytes = pointer_packet(pointer, std::uint64_t {index} + 1U, 7);
+      ASSERT_EQ(latest.put(input::parse_packet(bytes, 7)), input::latest_state_result::stored);
+    }
+
+    const input::pointer_payload stale {
+      .instance_generation = 3,
+      .mode = input::pointer_flag::relative,
+      .represented_reports = 1,
+      .physical_ordinal = reports - 1U,
+      .cumulative_x = reports - 1U,
+    };
+    const auto stale_bytes = pointer_packet(stale, reports, 7);
+    EXPECT_EQ(latest.put(input::parse_packet(stale_bytes, 7)), input::latest_state_result::stale);
+    EXPECT_EQ(
+      latest.drain_ready(6, [](const input::common_header &, const input::supersession_key &, std::span<const std::uint8_t>) {
+        return true;
+      }),
+      std::size_t {0}
+    );
+    std::uint64_t applied_sequence = 0;
+    std::uint64_t applied_ordinal = 0;
+    EXPECT_EQ(
+      latest.drain_ready(7, [&](const input::common_header &header, const input::supersession_key &, const std::span<const std::uint8_t> payload) {
+        applied_sequence = header.state_sequence;
+        applied_ordinal = input::parse_pointer_payload(payload).value.physical_ordinal;
+        return true;
+      }),
+      std::size_t {1}
+    );
+    EXPECT_EQ(applied_sequence, std::uint64_t {reports} + 1U);
+    EXPECT_EQ(applied_ordinal, reports);
+  }
 }
 
 TEST(LspInputRates, UsesExactThirtyTwoMegabitBudgetAndNeverDependsOnVideoFps) {

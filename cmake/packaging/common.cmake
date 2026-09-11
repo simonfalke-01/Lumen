@@ -19,10 +19,45 @@ set(CPACK_PACKAGE_FILE_NAME
         "${CPACK_PACKAGE_NAME}-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_STRIP_FILES YES)
 
+file(SHA256 "${CMAKE_SOURCE_DIR}/OPENSSL_LICENSE.txt" LUMEN_OPENSSL_LICENSE_SHA256)
+if(NOT LUMEN_OPENSSL_LICENSE_SHA256 STREQUAL
+   "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a")
+    message(FATAL_ERROR "OPENSSL_LICENSE.txt does not match the reviewed OpenSSL Apache-2.0 text")
+endif()
+file(SHA256 "${CMAKE_SOURCE_DIR}/OPUS_LICENSE.txt" LUMEN_OPUS_LICENSE_SHA256)
+if(NOT LUMEN_OPUS_LICENSE_SHA256 STREQUAL
+   "01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551")
+    message(FATAL_ERROR "OPUS_LICENSE.txt does not match the reviewed Opus BSD/patent notice")
+endif()
+
 # Retain the exact MIT notice for the portable libvirtualhid core. The
 # separately licensed upstream Windows driver and broker are not distributed.
 install(FILES "${CMAKE_SOURCE_DIR}/NOTICE"
         DESTINATION "share/licenses/Lumen"
+        COMPONENT application)
+install(FILES "${CMAKE_SOURCE_DIR}/LICENSE"
+        DESTINATION "share/licenses/Lumen"
+        RENAME "Lumen-GPL-3.0.txt"
+        COMPONENT application)
+install(FILES "${CMAKE_SOURCE_DIR}/OPENSSL_LICENSE.txt"
+        DESTINATION "share/licenses/Lumen"
+        RENAME "OpenSSL-Apache-2.0.txt"
+        COMPONENT application)
+install(FILES "${CMAKE_SOURCE_DIR}/OPUS_LICENSE.txt"
+        DESTINATION "share/licenses/Lumen"
+        RENAME "Opus-BSD-3-Clause.txt"
+        COMPONENT application)
+install(FILES "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/LICENSE.txt"
+        DESTINATION "share/licenses/Lumen"
+        RENAME "moonlight-common-c-GPL-3.0.txt"
+        COMPONENT application)
+install(FILES "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet/LICENSE"
+        DESTINATION "share/licenses/Lumen"
+        RENAME "ENet-MIT.txt"
+        COMPONENT application)
+install(FILES "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/nanors/LICENSE"
+        DESTINATION "share/licenses/Lumen"
+        RENAME "nanors-MIT.txt"
         COMPONENT application)
 install(FILES "${CMAKE_SOURCE_DIR}/third-party/libvirtualhid/LICENSES/MIT.md"
         DESTINATION "share/licenses/Lumen"

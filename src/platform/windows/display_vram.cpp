@@ -796,6 +796,7 @@ namespace platf::dxgi {
       std::uint32_t output_transfer {};  ///< Zero SDR, one PQ, or two HLG.
       std::uint32_t lut_size {};
     };
+
     static_assert(sizeof(vdd_color_shader_params_t) == 64);
 
     struct vdd_gpu_color_transform_t {
@@ -1001,7 +1002,7 @@ namespace platf::dxgi {
           device_ctx->OMSetRenderTargets(1, &out_Y_or_YUV_rtv, nullptr);
           device_ctx->VSSetShader(convert_Y_or_YUV_vs.get(), nullptr, 0);
           device_ctx->PSSetShader(
-            vdd_color_transform_active ? convert_Y_or_YUV_vdd_ps.get() :
+            vdd_color_transform_active                   ? convert_Y_or_YUV_vdd_ps.get() :
             img.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? convert_Y_or_YUV_fp16_ps.get() :
                                                            convert_Y_or_YUV_ps.get(),
             nullptr,
@@ -1018,7 +1019,7 @@ namespace platf::dxgi {
             device_ctx->OMSetRenderTargets(1, &out_UV_rtv, nullptr);
             device_ctx->VSSetShader(convert_UV_vs.get(), nullptr, 0);
             device_ctx->PSSetShader(
-              vdd_color_transform_active ? convert_UV_vdd_ps.get() :
+              vdd_color_transform_active                   ? convert_UV_vdd_ps.get() :
               img.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? convert_UV_fp16_ps.get() :
                                                              convert_UV_ps.get(),
               nullptr,
@@ -1085,9 +1086,9 @@ namespace platf::dxgi {
       if (fused) {
         context_lock = std::unique_lock(*shared_context_mutex);
       }
-      vdd_output_transfer = colorspace.colorspace == ::video::colorspace_e::bt2020 ? 1U :
+      vdd_output_transfer = colorspace.colorspace == ::video::colorspace_e::bt2020    ? 1U :
                             colorspace.colorspace == ::video::colorspace_e::bt2020hlg ? 2U :
-                                                                                       0U;
+                                                                                        0U;
       auto color_vectors = ::video::color_vectors_from_colorspace(colorspace, true);
 
       if (format == DXGI_FORMAT_AYUV || format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_Y410) {
@@ -1940,6 +1941,11 @@ namespace platf::dxgi {
       return target_ && target_->invalidate_ref_frames(first_frame, last_frame);
     }
 
+    /** @copydoc nvenc::nvenc_encoder::reconfigure_bitrate() */
+    bool reconfigure_bitrate(const std::uint32_t bits_per_second) override {
+      return target_ && target_->reconfigure_bitrate(bits_per_second);
+    }
+
   private:
     nvenc::nvenc_encoder *target_ = nullptr;  ///< Non-owning concrete encoder forwarded by this proxy.
     void *context_ = nullptr;  ///< Opaque encode-device owner passed to the callback.
@@ -2152,10 +2158,7 @@ namespace platf::dxgi {
         return false;
       }
 
-      base->set_telemetry_session(fused_d3d11::telemetry().begin_frame_session(
-        telemetry_profile(client_config),
-        telemetry_client(client_config)
-      ));
+      base->set_telemetry_session(fused_d3d11::telemetry().begin_frame_session(telemetry_profile(client_config), telemetry_client(client_config)));
 
       if (!nvenc_d3d->create_encoder(
             config::video.nv,
@@ -2992,8 +2995,8 @@ namespace platf::dxgi {
     if (resources_.width != static_cast<std::uint32_t>(config.width) ||
         resources_.height != static_cast<std::uint32_t>(config.height) ||
         resources_.dynamic_range != (config.dynamicRange ?
-                                      virtual_display::dynamic_range_e::hdr10 :
-                                      virtual_display::dynamic_range_e::sdr)) {
+                                       virtual_display::dynamic_range_e::hdr10 :
+                                       virtual_display::dynamic_range_e::sdr)) {
       source_->stop();
       return -1;
     }
@@ -3169,9 +3172,9 @@ namespace platf::dxgi {
       d3d_img->resource_bound = true;
     }
     d3d_img->frame_timestamp = std::chrono::steady_clock::now() - qpc_time_difference(
-      qpc_counter(),
-      acquired.lease->descriptor().capture_qpc
-    );
+                                                                    qpc_counter(),
+                                                                    acquired.lease->descriptor().capture_qpc
+                                                                  );
     d3d_img->color_transform = acquired.lease->color_transform();
     d3d_img->color_metadata = acquired.lease->descriptor().color_metadata;
     d3d_img->encode_source_lifetime = std::move(acquired.lease);

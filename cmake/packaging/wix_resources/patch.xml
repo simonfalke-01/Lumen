@@ -49,7 +49,7 @@
                           IgnoreFailure="no"/>
     <fw:FirewallException Id="LumenUdpFirewallException"
                           Name="Lumen UDP"
-                          Description="Allow inbound UDP traffic to Lumen."
+                          Description="Allow inbound UDP traffic on configured streaming ports, restricted to Lumen.exe."
                           Protocol="udp"
                           Profile="all"
                           Scope="any"

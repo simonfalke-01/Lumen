@@ -136,6 +136,7 @@ namespace lumen::lsp::transport {
     invalid_length,  ///< Declared RTCP length exceeds or fails to consume the datagram.
     invalid_padding,  ///< Padding length is zero, oversized, or used before the final packet.
     invalid_compound_start,  ///< Compound RTCP does not begin with SR or RR.
+    invalid_payload,  ///< Packet payload violates the selected RTCP authority or feedback grammar.
     too_many_packets,  ///< Packet count cannot be represented by the bounded summary.
   };
 
@@ -175,6 +176,18 @@ namespace lumen::lsp::transport {
     }
   };
 
+  /** @brief Fully validated regular compound RTCP authority prerequisite. */
+  struct compound_rtcp_authority_view {
+    rtcp_packet_view first_report {};  ///< First exact SR/RR packet from the feedback sender.
+    std::span<const std::uint8_t> cname {};  ///< Sole complete nonempty SDES CNAME for that sender.
+    rtcp_parse_error error {rtcp_parse_error::none};  ///< Structural or authority validation failure.
+
+    /** @brief Return whether both the first report and unique CNAME are valid. */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return error == rtcp_parse_error::none && !first_report.packet.empty() && !cname.empty();
+    }
+  };
+
   /** @brief RFC 3550 sender information for one active RTP source. */
   struct sender_report {
     std::uint32_t sender_ssrc = 0;  ///< SSRC of the RTP source described by this report.
@@ -206,6 +219,37 @@ namespace lumen::lsp::transport {
       return error == sender_report_error::none;
     }
   };
+
+  /**
+   * @brief Serialize one RTCP SDES packet containing one stable CNAME chunk.
+   *
+   * @param sender_ssrc Nonzero SSRC owning the CNAME.
+   * @param cname Nonempty CNAME bytes, at most 255.
+   * @param destination Caller-owned packet storage.
+   * @return Complete aligned packet bytes, or zero on invalid input/bounds.
+   */
+  [[nodiscard]] constexpr std::size_t write_sdes_cname(
+    const std::uint32_t sender_ssrc,
+    const std::span<const std::uint8_t> cname,
+    const std::span<std::uint8_t> destination
+  ) noexcept {
+    if (sender_ssrc == 0 || cname.empty() || cname.size() > 255U) {
+      return 0;
+    }
+    const auto unaligned = 4U + 4U + 2U + cname.size() + 1U;
+    const auto required = (unaligned + 3U) & ~std::size_t {3U};
+    if (destination.size() < required) {
+      return 0;
+    }
+    auto packet = destination.first(required);
+    std::fill(packet.begin(), packet.end(), 0);
+    detail::write_rtcp_header(packet, 1, 202U);
+    detail::write_u32(packet.subspan(4, 4), sender_ssrc);
+    packet[8] = 1U;
+    packet[9] = static_cast<std::uint8_t>(cname.size());
+    std::copy(cname.begin(), cname.end(), packet.begin() + 10);
+    return required;
+  }
 
   /**
    * @brief Serialize one report-block-free RFC 3550 sender report.
@@ -314,6 +358,93 @@ namespace lumen::lsp::transport {
       return {.packet_count = count, .bytes_consumed = offset, .error = rtcp_parse_error::invalid_length};
     }
     return {.packet_count = count, .bytes_consumed = offset};
+  }
+
+  /**
+   * @brief Validate the complete regular RTCP prerequisite for reduced-size feedback.
+   *
+   * The first packet must be an exact SR/RR from `expected_sender_ssrc` and the
+   * complete compound datagram must carry exactly one nonempty SDES CNAME for
+   * that sender. No caller state is mutated by this validation pass.
+   *
+   * @param datagram Complete plaintext compound RTCP datagram.
+   * @param expected_sender_ssrc Negotiated feedback sender SSRC.
+   * @return Borrowed first-report and CNAME views, or a fail-closed error.
+   */
+  [[nodiscard]] constexpr compound_rtcp_authority_view validate_compound_rtcp_authority(
+    const std::span<const std::uint8_t> datagram,
+    const std::uint32_t expected_sender_ssrc
+  ) noexcept {
+    const auto summary = parse_rtcp_datagram(datagram, rtcp_datagram_form::compound);
+    if (!summary || expected_sender_ssrc == 0) {
+      return {.error = summary.error == rtcp_parse_error::none ? rtcp_parse_error::invalid_payload : summary.error};
+    }
+    const auto first = parse_rtcp_packet(datagram);
+    if (!first || (first.packet_type != rtcp_sender_report_type && first.packet_type != rtcp_receiver_report_type) ||
+        first.payload.size() < 4U || detail::read_u32(first.payload.first<4>()) != expected_sender_ssrc) {
+      return {.error = rtcp_parse_error::invalid_payload};
+    }
+    const auto report_offset = first.packet_type == rtcp_sender_report_type ? 24U : 4U;
+    if (first.payload.size() != report_offset + static_cast<std::size_t>(first.count) * 24U) {
+      return {.error = rtcp_parse_error::invalid_payload};
+    }
+
+    std::span<const std::uint8_t> cname;
+    std::size_t offset = 0;
+    while (offset < datagram.size()) {
+      const auto packet = parse_rtcp_packet(datagram.subspan(offset));
+      if (!packet) {
+        return {.error = packet.error};
+      }
+      if (packet.packet_type == 202U) {
+        std::size_t chunk_offset = 0;
+        for (std::uint8_t chunk = 0; chunk < packet.count; ++chunk) {
+          if (packet.payload.size() - chunk_offset < 4U) {
+            return {.error = rtcp_parse_error::invalid_payload};
+          }
+          const auto chunk_ssrc = detail::read_u32(packet.payload.subspan(chunk_offset, 4));
+          chunk_offset += 4U;
+          bool ended = false;
+          while (chunk_offset < packet.payload.size()) {
+            const auto item_type = packet.payload[chunk_offset++];
+            if (item_type == 0) {
+              ended = true;
+              break;
+            }
+            if (chunk_offset >= packet.payload.size()) {
+              return {.error = rtcp_parse_error::invalid_payload};
+            }
+            const auto item_size = static_cast<std::size_t>(packet.payload[chunk_offset++]);
+            if (item_size > packet.payload.size() - chunk_offset) {
+              return {.error = rtcp_parse_error::invalid_payload};
+            }
+            if (chunk_ssrc == expected_sender_ssrc && item_type == 1U) {
+              if (item_size == 0 || !cname.empty()) {
+                return {.error = rtcp_parse_error::invalid_payload};
+              }
+              cname = packet.payload.subspan(chunk_offset, item_size);
+            }
+            chunk_offset += item_size;
+          }
+          if (!ended) {
+            return {.error = rtcp_parse_error::invalid_payload};
+          }
+          while ((chunk_offset & 3U) != 0U) {
+            if (chunk_offset >= packet.payload.size() || packet.payload[chunk_offset] != 0) {
+              return {.error = rtcp_parse_error::invalid_payload};
+            }
+            ++chunk_offset;
+          }
+        }
+        if (chunk_offset != packet.payload.size()) {
+          return {.error = rtcp_parse_error::invalid_payload};
+        }
+      }
+      offset += packet.packet.size();
+    }
+    return cname.empty() ?
+             compound_rtcp_authority_view {.error = rtcp_parse_error::invalid_payload} :
+             compound_rtcp_authority_view {.first_report = first, .cname = cname};
   }
 
   /** @brief One RFC 4585 Generic NACK PID/BLP loss description. */
@@ -745,11 +876,133 @@ namespace lumen::lsp::transport {
 
   /** @brief ECN state carried by one RFC 8888 received-packet report. */
   enum class ecn_mark : std::uint8_t {
-    not_ect,  ///< Packet was not ECN capable.
-    ect0,  ///< Packet carried ECT(0).
-    ect1,  ///< Packet carried ECT(1).
-    congestion_experienced,  ///< Packet carried ECN-CE.
+    not_ect = 0,  ///< Packet was not ECN capable.
+    ect1 = 1,  ///< Packet carried ECT(1), IP ECN codepoint `01`.
+    ect0 = 2,  ///< Packet carried ECT(0), IP ECN codepoint `10`.
+    congestion_experienced = 3,  ///< Packet carried ECN-CE.
   };
+
+  /** @brief Largest ordinary RFC 8888 arrival-time offset. */
+  inline constexpr std::uint16_t congestion_ato_maximum = 0x1ffdU;
+  /** @brief RFC 8888 arrival-time offset meaning older than the representable interval. */
+  inline constexpr std::uint16_t congestion_ato_over_range = 0x1ffeU;
+  /** @brief RFC 8888 arrival-time offset meaning no usable arrival timestamp. */
+  inline constexpr std::uint16_t congestion_ato_unavailable = 0x1fffU;
+
+  /**
+   * @brief Encode a monotonic receive-to-report delay into RFC 8888 ATO units.
+   *
+   * @param arrival_microseconds Authenticated packet arrival, or zero when unavailable.
+   * @param report_microseconds Monotonic instant represented by the report timestamp.
+   * @return Ordinary 1/1024-second ATO, over-range, or unavailable sentinel.
+   */
+  [[nodiscard]] constexpr std::uint16_t encode_congestion_ato(
+    const std::uint64_t arrival_microseconds,
+    const std::uint64_t report_microseconds
+  ) noexcept {
+    if (arrival_microseconds == 0 || report_microseconds < arrival_microseconds) {
+      return congestion_ato_unavailable;
+    }
+    const auto delay = report_microseconds - arrival_microseconds;
+    const auto maximum_delay = static_cast<std::uint64_t>(congestion_ato_maximum) * 1'000'000ULL / 1'024ULL;
+    if (delay > maximum_delay) {
+      return congestion_ato_over_range;
+    }
+    return static_cast<std::uint16_t>(delay * 1'024ULL / 1'000'000ULL);
+  }
+
+  /** @brief Maximum distinct SSRC report blocks admitted from one RFC 8888 packet. */
+  inline constexpr std::size_t maximum_congestion_feedback_blocks = 8;
+
+  /** @brief One structurally validated RFC 8888 SSRC block backed by the input packet. */
+  struct congestion_feedback_block_view {
+    std::uint32_t media_ssrc = 0;  ///< Nonzero reported media SSRC.
+    std::uint16_t begin_sequence = 0;  ///< First sequence in the Errata 8166 half-open range.
+    std::uint16_t report_count = 0;  ///< Exact number of following metrics.
+    std::span<const std::uint8_t> metrics {};  ///< Exact metrics without odd-count alignment padding.
+  };
+
+  /** @brief Complete structurally validated RFC 8888 feedback backed by caller-owned bytes. */
+  struct congestion_feedback_packet_view {
+    std::array<congestion_feedback_block_view, maximum_congestion_feedback_blocks> blocks {};  ///< Unique blocks.
+    std::size_t block_count = 0;  ///< Populated leading block count.
+    std::uint32_t report_timestamp = 0;  ///< Final middle-32-bit NTP report timestamp.
+    rtcp_parse_error error {rtcp_parse_error::none};  ///< Structural validation result.
+
+    /** @brief Return whether the complete standalone feedback packet is valid. */
+    [[nodiscard]] constexpr explicit operator bool() const noexcept {
+      return error == rtcp_parse_error::none && block_count != 0;
+    }
+  };
+
+  /**
+   * @brief Validate one complete standalone or compound-member RFC 8888 packet.
+   *
+   * @param packet Exact RTCP feedback packet, not an enclosing compound datagram.
+   * @param expected_sender_ssrc Negotiated RTCP feedback sender SSRC.
+   * @return Immutable bounded block/timestamp views or a fail-closed error.
+   */
+  [[nodiscard]] constexpr congestion_feedback_packet_view validate_congestion_feedback_packet(
+    const std::span<const std::uint8_t> packet,
+    const std::uint32_t expected_sender_ssrc
+  ) noexcept {
+    const auto parsed = parse_rtcp_packet(packet);
+    if (!parsed || parsed.packet.size() != packet.size() || parsed.padding || expected_sender_ssrc == 0 ||
+        parsed.packet_type != rtcp_transport_feedback_type || parsed.count != rtcp_congestion_feedback_format ||
+        parsed.payload.size() < 16U || detail::read_u32(parsed.payload.first<4>()) != expected_sender_ssrc) {
+      return {.error = rtcp_parse_error::invalid_payload};
+    }
+
+    congestion_feedback_packet_view result;
+    const auto blocks_end = parsed.payload.size() - 4U;
+    std::size_t offset = 4U;
+    std::size_t aggregate_metrics = 0;
+    while (offset < blocks_end) {
+      if (result.block_count == result.blocks.size() || blocks_end - offset < 8U) {
+        return {.error = rtcp_parse_error::invalid_payload};
+      }
+      const auto media_ssrc = detail::read_u32(parsed.payload.subspan(offset, 4));
+      const auto begin_sequence = detail::read_u16(parsed.payload.subspan(offset + 4U, 2));
+      const auto report_count = detail::read_u16(parsed.payload.subspan(offset + 6U, 2));
+      if (media_ssrc == 0 || report_count > 16'384U || aggregate_metrics > 16'384U - report_count) {
+        return {.error = rtcp_parse_error::invalid_payload};
+      }
+      for (std::size_t index = 0; index < result.block_count; ++index) {
+        if (result.blocks[index].media_ssrc == media_ssrc) {
+          return {.error = rtcp_parse_error::invalid_payload};
+        }
+      }
+      offset += 8U;
+      const auto metric_bytes = static_cast<std::size_t>(report_count) * 2U;
+      const auto alignment_bytes = (report_count & 1U) != 0U ? 2U : 0U;
+      if (metric_bytes + alignment_bytes > blocks_end - offset) {
+        return {.error = rtcp_parse_error::invalid_payload};
+      }
+      const auto metrics = parsed.payload.subspan(offset, metric_bytes);
+      for (std::size_t index = 0; index < report_count; ++index) {
+        const auto metric = detail::read_u16(metrics.subspan(index * 2U, 2));
+        if ((metric & 0x8000U) == 0 && (metric & 0x7fffU) != 0) {
+          return {.error = rtcp_parse_error::invalid_payload};
+        }
+      }
+      if (alignment_bytes != 0U && detail::read_u16(parsed.payload.subspan(offset + metric_bytes, 2)) != 0) {
+        return {.error = rtcp_parse_error::invalid_payload};
+      }
+      result.blocks[result.block_count++] = {
+        .media_ssrc = media_ssrc,
+        .begin_sequence = begin_sequence,
+        .report_count = report_count,
+        .metrics = metrics,
+      };
+      aggregate_metrics += report_count;
+      offset += metric_bytes + alignment_bytes;
+    }
+    if (offset != blocks_end || result.block_count == 0) {
+      return {.error = rtcp_parse_error::invalid_payload};
+    }
+    result.report_timestamp = detail::read_u32(parsed.payload.last<4>());
+    return result;
+  }
 
   /** @brief One bounded RFC 8888 packet-reception observation. */
   struct congestion_packet_report {
@@ -911,6 +1164,304 @@ namespace lumen::lsp::transport {
     std::uint64_t last_report_microseconds_ = 0;  ///< Most recent committed report time.
     std::uint64_t latest_arrival_microseconds_ = 0;  ///< Latest retained arrival time.
     bool initialized_ = false;  ///< Whether `reset()` established the interval origin.
+  };
+
+  /** @brief One sequence position in a reorder-tolerant RFC 8888 receive window. */
+  struct congestion_reception_slot {
+    std::uint64_t arrival_microseconds = 0;  ///< First authenticated arrival, or zero for a gap.
+    ecn_mark ecn = ecn_mark::not_ect;  ///< First mark, upgraded to CE on any duplicate CE copy.
+    bool received = false;  ///< Whether at least one authenticated copy arrived.
+  };
+
+  /** @brief Borrowed contiguous sequence range for one RFC 8888 block. */
+  struct reordering_congestion_report_batch {
+    std::span<const congestion_reception_slot> first {};  ///< First ring segment.
+    std::span<const congestion_reception_slot> second {};  ///< Wrapped ring segment.
+    std::uint32_t media_ssrc = 0;  ///< Sole media SSRC represented by the block.
+    std::uint32_t begin_extended_sequence = 0;  ///< First extended sequence, including gaps.
+    std::uint64_t interval_begin_microseconds = 0;  ///< Prior committed report time.
+    std::uint64_t interval_end_microseconds = 0;  ///< Proposed final-send time.
+    bool correction = false;  ///< Whether this is one late overlap correction rather than the main prefix.
+
+    /** @brief Return the exact half-open report count including missing packets. */
+    [[nodiscard]] constexpr std::size_t size() const noexcept {
+      return first.size() + second.size();
+    }
+  };
+
+  /** @brief Admission result for reorder-tolerant authenticated reception. */
+  enum class reordering_congestion_report_result : std::uint8_t {
+    accepted,  ///< New sequence position was retained.
+    duplicate,  ///< Existing reception was retained or upgraded to CE.
+    stale,  ///< Sequence precedes the current uncommitted range.
+    invalid,  ///< SSRC, size, or arrival time is invalid.
+    full,  ///< Sequence would exceed bounded range capacity.
+  };
+
+  /**
+   * @brief Bounded gap-preserving, reorder-tolerant RFC 8888 receive window.
+   *
+   * @tparam Capacity Maximum contiguous sequence positions retained, including gaps.
+   */
+  template<std::size_t Capacity = 512>
+  class reordering_congestion_feedback_window {
+  public:
+    static_assert(Capacity >= congestion_feedback_packet_cadence);
+
+    /** @brief Reset one SSRC and feedback interval, discarding uncommitted state. */
+    constexpr void reset(const std::uint32_t media_ssrc, const std::uint64_t now_microseconds) noexcept {
+      slots_ = {};
+      head_ = 0;
+      size_ = 0;
+      media_ssrc_ = media_ssrc;
+      begin_extended_sequence_ = 0;
+      last_report_microseconds_ = now_microseconds;
+      has_sequence_ = false;
+      history_ = {};
+      history_head_ = 0;
+      history_size_ = 0;
+      corrections_ = {};
+      correction_head_ = 0;
+      correction_size_ = 0;
+    }
+
+    /** @brief Retain authenticated reception before any downstream playout admission. */
+    constexpr reordering_congestion_report_result record(
+      const congestion_packet_report &report
+    ) noexcept {
+      if (report.media_ssrc == 0 || report.media_ssrc != media_ssrc_ || report.received_bytes == 0 ||
+          report.arrival_microseconds == 0) {
+        return reordering_congestion_report_result::invalid;
+      }
+      if (!has_sequence_) {
+        begin_extended_sequence_ = report.extended_sequence_number;
+        has_sequence_ = true;
+        size_ = 1;
+      }
+      if (report.extended_sequence_number < begin_extended_sequence_) {
+        auto *history = find_history(report.extended_sequence_number);
+        if (history == nullptr) {
+          return reordering_congestion_report_result::stale;
+        }
+        const auto was_received = history->slot.received;
+        const auto prior_ecn = history->slot.ecn;
+        if (was_received) {
+          history->slot.arrival_microseconds = std::min(
+            history->slot.arrival_microseconds,
+            report.arrival_microseconds
+          );
+          if (report.ecn == ecn_mark::congestion_experienced) {
+            history->slot.ecn = ecn_mark::congestion_experienced;
+          }
+        } else {
+          history->slot = {
+            .arrival_microseconds = report.arrival_microseconds,
+            .ecn = report.ecn,
+            .received = true,
+          };
+        }
+        if (!was_received ||
+            (prior_ecn != ecn_mark::congestion_experienced &&
+             history->slot.ecn == ecn_mark::congestion_experienced)) {
+          queue_correction(report.extended_sequence_number, history->slot);
+        }
+        return was_received ?
+                 reordering_congestion_report_result::duplicate :
+                 reordering_congestion_report_result::accepted;
+      }
+      const auto offset = static_cast<std::uint64_t>(report.extended_sequence_number) - begin_extended_sequence_;
+      if (offset >= Capacity) {
+        return reordering_congestion_report_result::full;
+      }
+      if (offset >= size_) {
+        size_ = static_cast<std::size_t>(offset) + 1U;
+      }
+      auto &slot = slots_[(head_ + static_cast<std::size_t>(offset)) % Capacity];
+      if (slot.received) {
+        if (report.ecn == ecn_mark::congestion_experienced) {
+          slot.ecn = ecn_mark::congestion_experienced;
+        }
+        slot.arrival_microseconds = std::min(slot.arrival_microseconds, report.arrival_microseconds);
+        return reordering_congestion_report_result::duplicate;
+      }
+      slot = {
+        .arrival_microseconds = report.arrival_microseconds,
+        .ecn = report.ecn,
+        .received = true,
+      };
+      return reordering_congestion_report_result::accepted;
+    }
+
+    /** @brief Return whether the two-millisecond/128-position cadence is due. */
+    [[nodiscard]] constexpr bool report_due(const std::uint64_t now_microseconds) const noexcept {
+      if (!has_sequence_ || now_microseconds < last_report_microseconds_) {
+        return false;
+      }
+      const auto elapsed = now_microseconds - last_report_microseconds_;
+      if (elapsed < congestion_feedback_floor_microseconds) {
+        return false;
+      }
+      return correction_size_ != 0 ||
+             (size_ != 0 &&
+              (size_ >= congestion_feedback_packet_cadence ||
+               elapsed >= congestion_feedback_interval_microseconds));
+    }
+
+    /** @brief Borrow the current exact sequence prefix without consuming it. */
+    [[nodiscard]] constexpr reordering_congestion_report_batch pending_report(
+      const std::uint64_t now_microseconds
+    ) const noexcept {
+      if (!report_due(now_microseconds)) {
+        return {};
+      }
+      if (correction_size_ != 0) {
+        const auto &correction = corrections_[correction_head_];
+        return {
+          .first = std::span<const congestion_reception_slot> {&correction.slot, 1},
+          .media_ssrc = media_ssrc_,
+          .begin_extended_sequence = correction.extended_sequence,
+          .interval_begin_microseconds = last_report_microseconds_,
+          .interval_end_microseconds = now_microseconds,
+          .correction = true,
+        };
+      }
+      const auto first_size = std::min(size_, Capacity - head_);
+      return {
+        .first = std::span<const congestion_reception_slot> {slots_}.subspan(head_, first_size),
+        .second = std::span<const congestion_reception_slot> {slots_}.first(size_ - first_size),
+        .media_ssrc = media_ssrc_,
+        .begin_extended_sequence = begin_extended_sequence_,
+        .interval_begin_microseconds = last_report_microseconds_,
+        .interval_end_microseconds = now_microseconds,
+      };
+    }
+
+    /** @brief Consume only the borrowed prefix after successful final socket submission. */
+    constexpr bool commit_report(
+      const std::uint32_t begin_extended_sequence,
+      const std::size_t count,
+      const std::uint64_t sent_microseconds
+    ) noexcept {
+      if (count == 0 || sent_microseconds < last_report_microseconds_) {
+        return false;
+      }
+      if (correction_size_ != 0 && count == 1 &&
+          corrections_[correction_head_].extended_sequence == begin_extended_sequence) {
+        corrections_[correction_head_] = {};
+        correction_head_ = (correction_head_ + 1U) % corrections_.size();
+        --correction_size_;
+        last_report_microseconds_ = sent_microseconds;
+        return true;
+      }
+      if (begin_extended_sequence != begin_extended_sequence_ || count > size_) {
+        return false;
+      }
+      for (std::size_t index = 0; index < count; ++index) {
+        const auto extended_sequence = begin_extended_sequence_ + static_cast<std::uint32_t>(index);
+        retain_history(extended_sequence, slots_[(head_ + index) % Capacity]);
+        slots_[(head_ + index) % Capacity] = {};
+      }
+      head_ = (head_ + count) % Capacity;
+      size_ -= count;
+      begin_extended_sequence_ += static_cast<std::uint32_t>(count);
+      last_report_microseconds_ = sent_microseconds;
+      return true;
+    }
+
+    /** @brief Compatibility commit for callers that borrowed the current leading report. */
+    constexpr bool commit_report(const std::size_t count, const std::uint64_t sent_microseconds) noexcept {
+      const auto begin = correction_size_ != 0 ?
+                           corrections_[correction_head_].extended_sequence :
+                           begin_extended_sequence_;
+      return commit_report(begin, count, sent_microseconds);
+    }
+
+    /** @brief Return current report positions including gaps. */
+    [[nodiscard]] constexpr std::size_t size() const noexcept {
+      return size_;
+    }
+
+  private:
+    /** @brief One recently committed sequence retained for bounded overlap correction. */
+    struct committed_reception {
+      congestion_reception_slot slot {};  ///< Last reportable reception state.
+      std::uint32_t extended_sequence = 0;  ///< Exact committed sequence identity.
+      bool occupied = false;  ///< Whether this entry is live.
+    };
+
+    /** @brief One pending one-sequence overlap correction. */
+    struct correction_reception {
+      congestion_reception_slot slot {};  ///< Corrected received/CE state.
+      std::uint32_t extended_sequence = 0;  ///< Exact sequence reported by overlap.
+      bool occupied = false;  ///< Whether this queue entry is live.
+    };
+
+    static constexpr std::size_t overlap_capacity = std::min<std::size_t>(Capacity, 64U);
+
+    [[nodiscard]] constexpr committed_reception *find_history(const std::uint32_t sequence) noexcept {
+      for (std::size_t index = 0; index < history_size_; ++index) {
+        auto &entry = history_[(history_head_ + index) % history_.size()];
+        if (entry.occupied && entry.extended_sequence == sequence) {
+          return &entry;
+        }
+      }
+      return nullptr;
+    }
+
+    constexpr void retain_history(
+      const std::uint32_t sequence,
+      const congestion_reception_slot slot
+    ) noexcept {
+      const auto index = history_size_ < history_.size() ?
+                           (history_head_ + history_size_++) % history_.size() :
+                           history_head_;
+      if (history_size_ == history_.size() && index == history_head_) {
+        history_head_ = (history_head_ + 1U) % history_.size();
+      }
+      history_[index] = {
+        .slot = slot,
+        .extended_sequence = sequence,
+        .occupied = true,
+      };
+    }
+
+    constexpr void queue_correction(
+      const std::uint32_t sequence,
+      const congestion_reception_slot slot
+    ) noexcept {
+      for (std::size_t index = 0; index < correction_size_; ++index) {
+        auto &entry = corrections_[(correction_head_ + index) % corrections_.size()];
+        if (entry.occupied && entry.extended_sequence == sequence) {
+          entry.slot = slot;
+          return;
+        }
+      }
+      const auto index = correction_size_ < corrections_.size() ?
+                           (correction_head_ + correction_size_++) % corrections_.size() :
+                           correction_head_;
+      if (correction_size_ == corrections_.size() && index == correction_head_) {
+        correction_head_ = (correction_head_ + 1U) % corrections_.size();
+      }
+      corrections_[index] = {
+        .slot = slot,
+        .extended_sequence = sequence,
+        .occupied = true,
+      };
+    }
+
+    std::array<congestion_reception_slot, Capacity> slots_ {};  ///< Bounded ring of receptions and gaps.
+    std::array<committed_reception, overlap_capacity> history_ {};  ///< Recently committed overlap state.
+    std::array<correction_reception, overlap_capacity> corrections_ {};  ///< Pending overlap corrections.
+    std::size_t head_ = 0;  ///< First uncommitted sequence position.
+    std::size_t size_ = 0;  ///< Current contiguous range length including gaps.
+    std::size_t history_head_ = 0;  ///< Oldest committed overlap entry.
+    std::size_t history_size_ = 0;  ///< Live committed overlap entries.
+    std::size_t correction_head_ = 0;  ///< Oldest pending correction.
+    std::size_t correction_size_ = 0;  ///< Live pending corrections.
+    std::uint32_t media_ssrc_ = 0;  ///< Sole authenticated RTP source.
+    std::uint32_t begin_extended_sequence_ = 0;  ///< Extended sequence at `head_`.
+    std::uint64_t last_report_microseconds_ = 0;  ///< Last final-sent feedback time.
+    bool has_sequence_ = false;  ///< Whether a report range has an origin.
   };
 
   /** @brief Decoder state carried by protected RTCP APP `LSPV`. */

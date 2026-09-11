@@ -25,6 +25,9 @@ namespace lumen::lsp::runtime {
 
     constexpr std::size_t maximum_control_connections = 64;
     constexpr std::size_t maximum_pending_pairings = 4;
+    constexpr std::size_t maximum_incoming_objects = 16;
+    constexpr std::size_t maximum_buffered_object_bytes = 32U * 1'024U * 1'024U;
+    constexpr std::size_t maximum_object_chunk_bytes = 768;
     constexpr std::uint64_t pairing_ttl_seconds = 120;
     constexpr std::uint64_t pairing_retry_cooldown_seconds = 2;
     constexpr std::uint8_t maximum_pairing_challenges = 3;
@@ -34,6 +37,14 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_application_image_bytes = 512;
     constexpr std::uint64_t response_deadline_microseconds = 1'000'000;
     constexpr std::uint64_t path_probe_semantic_deadline_microseconds = 60'000'000;  ///< Covers all legal LSPP retries plus margin.
+
+    /** @brief Return local monotonic microseconds for asynchronous terminal responses. */
+    std::uint64_t control_monotonic_microseconds() noexcept {
+      return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch()
+      )
+                                          .count());
+    }
 
     template<std::size_t Size>
     cbor::Value::Bytes bytes(const std::array<std::uint8_t, Size> &value) {
@@ -259,7 +270,7 @@ namespace lumen::lsp::runtime {
       selective_ack_window inbound;  ///< Received message-ID/ACK state.
       outbound_control_window<maximum_control_frame_bytes> outbound;  ///< Byte-identical retry storage.
       response_cache<maximum_control_frame_bytes, maximum_control_frame_bytes> responses;  ///< Idempotent terminal responses.
-      control_rto rto {true};  ///< Local-path initial RTO.
+      control_rto rto {control_path_profile::local};  ///< Local-path initial RTO.
       std::uint64_t next_message_id {1};  ///< Next outbound logical message ID.
 
       struct PendingVideoConfig {
@@ -338,6 +349,50 @@ namespace lumen::lsp::runtime {
       std::size_t next_path_probe_ack_slot {};  ///< Next ACK cache replacement slot.
       std::array<std::uint64_t, 4> cancelled_path_probe_request_ids {};  ///< Retired requests whose late ACK is harmless.
       std::size_t next_cancelled_path_probe_slot {};  ///< Next cancelled-request replacement slot.
+
+      struct IncomingObject {
+        Identifier128 object_id {};  ///< Stable object identifier.
+        std::uint32_t total_length {};  ///< Complete bounded byte length.
+        Digest256 sha256 {};  ///< Complete-object commitment.
+        std::vector<std::uint8_t> bytes;  ///< Contiguous accepted prefix.
+        bool complete {};  ///< Whether SHA-256 validated the complete bytes.
+      };
+
+      std::vector<IncomingObject> incoming_objects;  ///< At most sixteen active or completed inbound objects.
+      std::size_t buffered_object_bytes {};  ///< Complete retained bytes across this connection.
+
+      std::vector<ControlApplicationProvider::ArtworkObject> outgoing_objects;  ///< Frozen artwork transfer queue.
+      std::size_t outgoing_object_index {};  ///< Current artwork object index.
+      std::uint32_t outgoing_object_offset {};  ///< Next contiguous byte offset.
+      std::uint64_t outgoing_object_request_id {};  ///< Exact current chunk response correlation.
+      std::uint64_t outgoing_object_message_id {};  ///< Exact current reliable request message.
+      bool outgoing_object_pending {};  ///< Whether one OBJECT_CHUNK response remains pending.
+
+      struct AcceptedObjectAck {
+        std::uint64_t request_id {};  ///< OBJECT_CHUNK request answered by this frame.
+        std::array<std::uint8_t, maximum_control_frame_bytes> frame {};  ///< Byte-identical accepted response.
+        std::size_t size {};  ///< Populated leading bytes.
+      };
+
+      std::array<AcceptedObjectAck, 4> accepted_object_acks {};  ///< Bounded late-duplicate cache.
+      std::size_t next_object_ack_slot {};  ///< Next accepted object ACK replacement slot.
+
+      CertificateRotatePayload pending_certificate_rotation {};  ///< Exact old-identity-signed request.
+      std::uint64_t certificate_rotation_request_id {};  ///< Exact ACK correlation identifier.
+      std::uint64_t certificate_rotation_message_id {};  ///< Exact reliable request message identifier.
+      bool certificate_rotation_pending {};  ///< Whether client atomic persistence remains unacknowledged.
+      std::uint32_t completed_certificate_rotation_generation {};  ///< Latest terminal rotation generation.
+      bool completed_certificate_rotation_succeeded {};  ///< Whether the latest terminal ACK succeeded.
+      std::array<std::uint8_t, maximum_control_frame_bytes> accepted_certificate_rotation_ack {};  ///< Latest accepted ACK.
+      std::size_t accepted_certificate_rotation_ack_size {};  ///< Populated leading ACK bytes.
+      std::uint64_t accepted_certificate_rotation_request_id {};  ///< Latest accepted request correlation.
+
+      struct PendingText {
+        packet_slab<maximum_control_frame_bytes> request {};  ///< Byte-identical request for terminal caching.
+        lspc_header header {};  ///< Exact deferred response correlation.
+        bool active {};  ///< Whether worker completion remains pending.
+      } pending_text;  ///< At most one asynchronous text commit per connection.
+
       bool hello_complete {};  ///< Whether CLIENT_HELLO completed.
     };
 
@@ -359,6 +414,8 @@ namespace lumen::lsp::runtime {
       std::array<std::uint8_t, pairing_spake_point_size> point_b {};  ///< Host SPAKE point after approval.
       PermissionSet requested_permissions {};  ///< Original BEGIN permission request bound into AAD.
       PermissionSet effective_permissions {};  ///< Fixed host/request intersection.
+      std::uint32_t frozen_revocation_generation {};  ///< Existing-trust generation frozen at BEGIN, or zero for new trust.
+      bool recovering_existing_trust {};  ///< Whether identical enabled trust existed at BEGIN.
       std::uint64_t expires_at_utc_seconds {};  ///< Absolute 120-second expiry.
       std::uint64_t cooldown_until_utc_seconds {};  ///< Earliest next PIN challenge.
       PairingPollLimiter poll_limiter {};  ///< Allocation-free floor, backoff, abuse count, and cooldown.
@@ -424,6 +481,8 @@ namespace lumen::lsp::runtime {
         point_b = other.point_b;
         requested_permissions = other.requested_permissions;
         effective_permissions = other.effective_permissions;
+        frozen_revocation_generation = other.frozen_revocation_generation;
+        recovering_existing_trust = other.recovering_existing_trust;
         expires_at_utc_seconds = other.expires_at_utc_seconds;
         cooldown_until_utc_seconds = other.cooldown_until_utc_seconds;
         poll_limiter = other.poll_limiter;
@@ -498,6 +557,19 @@ namespace lumen::lsp::runtime {
       bool active {};  ///< Whether the fixed cache slot is populated.
     };
 
+    /** @brief One asynchronous edge-barrier text operation owned by the control worker. */
+    struct TextWork {
+      PeerEndpoint peer {};  ///< Exact authenticated association.
+      TrustedClient client {};  ///< Frozen authenticated owner.
+      std::uint32_t connection_generation {};  ///< Exact authority generation.
+      TextInputPayload request {};  ///< Exact semantic text request.
+      std::vector<std::uint8_t> utf8;  ///< Complete inline or assembled UTF-8 bytes.
+      std::uint64_t deadline_microseconds {};  ///< Request-origin absolute terminal deadline.
+      std::uint64_t request_id {};  ///< Exact deferred response correlation.
+      std::uint64_t message_id {};  ///< Exact authenticated inbound message incarnation.
+      Digest256 request_digest {};  ///< Complete canonical request digest.
+    };
+
     Impl(
       const HostIdentity &identity,
       const Digest256 spki_sha256,
@@ -526,8 +598,12 @@ namespace lumen::lsp::runtime {
           connections_.reserve(maximum_connections_);
           pairings_.reserve(maximum_pending_pairings);
           pairing_work_.reserve(maximum_pending_pairings);
+          text_work_.reserve(maximum_connections_);
           pairing_worker_ = std::jthread {[this](const std::stop_token stop_token) {
             pairing_worker(stop_token);
+          }};
+          text_worker_ = std::jthread {[this](const std::stop_token stop_token) {
+            text_worker(stop_token);
           }};
           ready_ = true;
         }
@@ -537,11 +613,7 @@ namespace lumen::lsp::runtime {
     }
 
     ~Impl() {
-      pairing_worker_.request_stop();
-      pairing_condition_.notify_all();
-      if (pairing_worker_.joinable()) {
-        pairing_worker_.join();
-      }
+      shutdown();
       std::scoped_lock lock(mutex_);
       for (auto &pairing : pairings_) {
         clear_pairing(pairing);
@@ -554,6 +626,71 @@ namespace lumen::lsp::runtime {
       }
       pairings_.clear();
       pairing_work_.clear();
+    }
+
+    /** @brief Stop asynchronous control work while product callbacks and transport output remain valid. */
+    void shutdown() noexcept {
+      {
+        std::unique_lock lock(mutex_);
+        if (shutdown_started_) {
+          shutdown_condition_.wait(lock, [this]() {
+            return shutdown_complete_;
+          });
+          return;
+        }
+        shutdown_started_ = true;
+        ready_ = false;
+        pairing_worker_.request_stop();
+        text_worker_.request_stop();
+        pairing_condition_.notify_all();
+        text_condition_.notify_all();
+      }
+      if (pairing_worker_.joinable() && pairing_worker_.get_id() != std::this_thread::get_id()) {
+        pairing_worker_.join();
+      }
+      if (text_worker_.joinable() && text_worker_.get_id() != std::this_thread::get_id()) {
+        text_worker_.join();
+      }
+
+      std::scoped_lock lock(mutex_);
+      const auto now = control_monotonic_microseconds();
+      for (auto &connection : connections_) {
+        if (connection.pending_text.active) {
+          const auto frame = parse_lspc(connection.pending_text.request.bytes());
+          if (frame) {
+            const auto request = decode_text_input(frame.payload);
+            if (request) {
+              const auto response = encode_text_input_response({
+                .status = ControlStatus::internal_failure,
+                .session_id = request->session_id,
+                .input_generation = request->input_generation,
+                .preceding_edge_id = request->preceding_edge_id,
+              });
+              if (response) {
+                (void) send_response(
+                  connection,
+                  connection.pending_text.request.bytes(),
+                  connection.pending_text.header,
+                  ControlMessageType::text_input_response,
+                  *response,
+                  true,
+                  now
+                );
+              }
+            }
+          }
+          connection.pending_text = {};
+        }
+        connection.outgoing_objects.clear();
+        connection.outgoing_object_index = 0;
+        connection.outgoing_object_offset = 0;
+        connection.outgoing_object_request_id = 0;
+        connection.outgoing_object_message_id = 0;
+        connection.outgoing_object_pending = false;
+      }
+      text_work_.clear();
+      shutdown_complete_ = true;
+      shutdown_condition_.notify_all();
     }
 
     /** @brief Clear retained PIN/SPAKE/exporter material before releasing a pending session. */
@@ -637,6 +774,81 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /** @brief Execute edge-barrier text work without blocking control receive/retry dispatch. */
+    void text_worker(const std::stop_token stop_token) noexcept {
+      while (!stop_token.stop_requested()) {
+        TextWork work;
+        {
+          std::unique_lock lock(mutex_);
+          text_condition_.wait(lock, stop_token, [&]() {
+            return !text_work_.empty();
+          });
+          if (stop_token.stop_requested()) {
+            return;
+          }
+          work = std::move(text_work_.front());
+          text_work_.erase(text_work_.begin());
+        }
+        auto status = start_handler_.text_input(
+          work.peer,
+          work.client,
+          work.connection_generation,
+          work.request,
+          work.utf8,
+          work.deadline_microseconds
+        );
+        std::scoped_lock lock(mutex_);
+        const auto index = find(work.peer);
+        if (index == connections_.size()) {
+          continue;
+        }
+        auto &connection = connections_[index];
+        Digest256 pending_digest {};
+        if (!connection.pending_text.active || connection.generation != work.connection_generation ||
+            connection.pending_text.header.request_id != work.request_id ||
+            connection.pending_text.header.message_id != work.message_id ||
+            !crypto_.sha256(connection.pending_text.request.bytes(), pending_digest) ||
+            pending_digest != work.request_digest) {
+          continue;
+        }
+        const auto now = control_monotonic_microseconds();
+        if (now >= work.deadline_microseconds) {
+          status = ControlStatus::timeout;
+        }
+        if (status == ControlStatus::success && work.request.object_id) {
+          const auto object = std::ranges::find(
+            connection.incoming_objects,
+            *work.request.object_id,
+            &Connection::IncomingObject::object_id
+          );
+          if (object != connection.incoming_objects.end()) {
+            connection.buffered_object_bytes -= object->total_length;
+            connection.incoming_objects.erase(object);
+          }
+        }
+        const auto response = encode_text_input_response({
+          .status = status,
+          .session_id = work.request.session_id,
+          .input_generation = work.request.input_generation,
+          .preceding_edge_id = work.request.preceding_edge_id,
+        });
+        const auto request = connection.pending_text.request;
+        const auto header = connection.pending_text.header;
+        connection.pending_text = {};
+        if (!response || !send_response(
+                           connection,
+                           request.bytes(),
+                           header,
+                           ControlMessageType::text_input_response,
+                           *response,
+                           status != ControlStatus::success,
+                           now
+                         )) {
+          transport_.close(work.peer);
+        }
+      }
+    }
+
     std::uint32_t association_ready(
       const PeerEndpoint &peer,
       const PairingDtlsExporter &exporter
@@ -688,8 +900,25 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    void disconnect_client(const Identifier128 &client_id) noexcept {
-      std::scoped_lock lock(mutex_);
+    /** @brief Cancel pending/completed pairing state for one client under the control lock. */
+    void cancel_client_pairings(const Identifier128 &client_id) noexcept {
+      for (std::size_t index = 0; index < pairings_.size();) {
+        if (pairings_[index].client_id != client_id) {
+          ++index;
+          continue;
+        }
+        clear_pairing(pairings_[index]);
+        pairings_.erase(pairings_.begin() + static_cast<std::ptrdiff_t>(index));
+      }
+      for (auto &completed : completed_pairings_) {
+        if (completed.active && completed.client_id == client_id) {
+          clear_completed_pairing(completed);
+        }
+      }
+    }
+
+    /** @brief Request close of every authenticated association for one client under the control lock. */
+    void request_client_disconnects(const Identifier128 &client_id) noexcept {
       std::array<PeerEndpoint, maximum_control_connections> peers {};
       std::size_t count = 0;
       for (const auto &connection : connections_) {
@@ -699,10 +928,36 @@ namespace lumen::lsp::runtime {
       }
       for (std::size_t index = 0; index < count; ++index) {
         transport_.close(peers[index]);
-        if (const auto remaining = find(peers[index]); remaining != connections_.size()) {
-          connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
-        }
       }
+    }
+
+    void disconnect_client(const Identifier128 &client_id) noexcept {
+      std::scoped_lock lock(mutex_);
+      request_client_disconnects(client_id);
+    }
+
+    bool update_trusted_client(
+      const Identifier128 &client_id,
+      const PermissionSet permissions,
+      const bool enabled
+    ) noexcept {
+      std::scoped_lock lock(mutex_);
+      cancel_client_pairings(client_id);
+      if (!trust_store_.update_existing(client_id, permissions, enabled)) {
+        return false;
+      }
+      request_client_disconnects(client_id);
+      return true;
+    }
+
+    bool revoke_trusted_client(const Identifier128 &client_id) noexcept {
+      std::scoped_lock lock(mutex_);
+      cancel_client_pairings(client_id);
+      if (!trust_store_.revoke_existing(client_id)) {
+        return false;
+      }
+      request_client_disconnects(client_id);
+      return true;
     }
 
     bool receive(
@@ -712,6 +967,9 @@ namespace lumen::lsp::runtime {
       const std::uint64_t now_utc_seconds
     ) noexcept {
       std::scoped_lock lock(mutex_);
+      if (!ready_) {
+        return false;
+      }
       const auto index = find(peer);
       if (index == connections_.size()) {
         return false;
@@ -729,7 +987,12 @@ namespace lumen::lsp::runtime {
                                         parsed.header.acknowledgement_bitmap,
                                         connection.outbound_path_probe.message_id
                                       );
-      connection.outbound.acknowledge(parsed.header.acknowledgement_base, parsed.header.acknowledgement_bitmap);
+      (void) connection.outbound.acknowledge(
+        parsed.header.acknowledgement_base,
+        parsed.header.acknowledgement_bitmap,
+        now_microseconds,
+        connection.rto
+      );
       if (release_path_probe) {
         if (!start_handler_.path_probe_intent_acknowledged(
               connection.peer,
@@ -753,6 +1016,9 @@ namespace lumen::lsp::runtime {
       }
       const auto message_type = static_cast<ControlMessageType>(parsed.header.message_type);
       if (has_flag(parsed.header.flags, lspc_flag::response)) {
+        if (message_type == ControlMessageType::certificate_rotate_ack) {
+          return certificate_rotation_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        }
         if (message_type == ControlMessageType::video_config_ack) {
           return video_config_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
         }
@@ -765,6 +1031,9 @@ namespace lumen::lsp::runtime {
         if (message_type == ControlMessageType::path_probe_ack) {
           return path_probe_ack(connection, frame, parsed.header, parsed.payload, now_microseconds);
         }
+        if (message_type == ControlMessageType::object_chunk) {
+          return object_chunk_acknowledgement(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        }
         transport_.close(peer);
         return false;
       }
@@ -773,7 +1042,26 @@ namespace lumen::lsp::runtime {
         return false;
       }
 
-      const auto cached = connection.responses.lookup(parsed.header.request_id, frame);
+      response_semantic_identity semantic_identity {
+        .message_type = parsed.header.message_type,
+        .schema_version = wire_version,
+        .generation = response_cache_generation(
+          parsed.header.message_type,
+          parsed.header.connection_generation,
+          connection.generation
+        ),
+      };
+      wire::write_be<std::uint64_t>(std::span<std::uint8_t> {semantic_identity.semantic_id}.last<8>(), parsed.header.request_id);
+      if (!crypto_.sha256(frame, semantic_identity.request_digest)) {
+        transport_.close(peer);
+        return false;
+      }
+      const auto cached = connection.responses.lookup(
+        parsed.header.request_id,
+        semantic_identity,
+        frame,
+        now_microseconds
+      );
       if (cached.result == response_cache_result::hit) {
         return transport_.send(peer, cached.response);
       }
@@ -786,6 +1074,15 @@ namespace lumen::lsp::runtime {
           parsed.header.request_id == connection.inbound_path_probe.header.request_id) {
         if (connection.inbound_path_probe.request.bytes().size() == frame.size() &&
             std::ranges::equal(connection.inbound_path_probe.request.bytes(), frame)) {
+          return send_acknowledgement_only(connection);
+        }
+        transport_.close(peer);
+        return false;
+      }
+      if (message_type == ControlMessageType::text_input && connection.pending_text.active &&
+          parsed.header.request_id == connection.pending_text.header.request_id) {
+        if (connection.pending_text.request.bytes().size() == frame.size() &&
+            std::ranges::equal(connection.pending_text.request.bytes(), frame)) {
           return send_acknowledgement_only(connection);
         }
         transport_.close(peer);
@@ -822,20 +1119,34 @@ namespace lumen::lsp::runtime {
           return authenticate(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::list_applications:
           return list_applications(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::quit_application:
+          return quit_application(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::start:
           return start_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::attach:
           return attach_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::stop:
           return stop_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::text_input:
+          return text_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::input_rate_request:
+          return input_rate(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::path_probe:
           return receive_path_probe(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::object_chunk:
+          return object_chunk(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::certificate_rotate:
+        case ControlMessageType::certificate_rotate_ack:
+        case ControlMessageType::quit_application_response:
         case ControlMessageType::video_config:
         case ControlMessageType::video_config_ack:
         case ControlMessageType::audio_config:
         case ControlMessageType::audio_config_ack:
         case ControlMessageType::microphone_config:
         case ControlMessageType::microphone_config_ack:
+        case ControlMessageType::text_input_response:
+        case ControlMessageType::input_rate_response:
+        case ControlMessageType::stream_ended:
         case ControlMessageType::path_probe_ack:
         case ControlMessageType::client_hello:
         case ControlMessageType::server_hello:
@@ -924,6 +1235,89 @@ namespace lumen::lsp::runtime {
       return connections_.size();
     }
 
+    [[nodiscard]] std::optional<std::vector<PeerEndpoint>> authenticated_peers() const noexcept {
+      std::scoped_lock lock(mutex_);
+      std::vector<PeerEndpoint> result;
+      try {
+        result.reserve(connections_.size());
+        for (const auto &connection : connections_) {
+          if (connection.authenticated_client) {
+            result.push_back(connection.peer);
+          }
+        }
+      } catch (...) {
+        return std::nullopt;
+      }
+      return result;
+    }
+
+    [[nodiscard]] std::optional<std::vector<PeerEndpoint>> begin_certificate_rotation() noexcept {
+      std::scoped_lock lock(mutex_);
+      if (pairing_suspended_) {
+        return std::nullopt;
+      }
+      pairing_suspended_ = true;
+      for (auto &pairing : pairings_) {
+        clear_pairing(pairing);
+      }
+      pairings_.clear();
+      for (auto &work : pairing_work_) {
+        work.clear();
+      }
+      pairing_work_.clear();
+      for (auto &completed : completed_pairings_) {
+        clear_completed_pairing(completed);
+      }
+      std::vector<PeerEndpoint> result;
+      try {
+        result.reserve(connections_.size());
+        for (const auto &connection : connections_) {
+          if (connection.authenticated_client) {
+            result.push_back(connection.peer);
+          }
+        }
+      } catch (...) {
+        pairing_suspended_ = false;
+        return std::nullopt;
+      }
+      return result;
+    }
+
+    void end_certificate_rotation() noexcept {
+      std::scoped_lock lock(mutex_);
+      pairing_suspended_ = false;
+    }
+
+    [[nodiscard]] CertificateRotationState certificate_rotation_state(
+      const PeerEndpoint &peer,
+      const std::uint32_t rotation_generation
+    ) const noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (index == connections_.size()) {
+        return CertificateRotationState::absent;
+      }
+      const auto &connection = connections_[index];
+      if (connection.certificate_rotation_pending &&
+          connection.pending_certificate_rotation.rotation_generation == rotation_generation) {
+        return CertificateRotationState::pending;
+      }
+      if (connection.completed_certificate_rotation_generation != rotation_generation) {
+        return CertificateRotationState::absent;
+      }
+      return connection.completed_certificate_rotation_succeeded ?
+               CertificateRotationState::succeeded :
+               CertificateRotationState::failed;
+    }
+
+    void commit_certificate_rotation(const Digest256 &new_spki_sha256) noexcept {
+      if (is_zero(new_spki_sha256)) {
+        return;
+      }
+      std::scoped_lock lock(mutex_);
+      spki_sha256_ = new_spki_sha256;
+    }
+
     [[nodiscard]] std::vector<PendingPairingSummary> pending_pairings(const std::uint64_t now_utc_seconds) noexcept {
       std::scoped_lock lock(mutex_);
       retire_expired_pairings(now_utc_seconds);
@@ -965,6 +1359,9 @@ namespace lumen::lsp::runtime {
         return 0;
       }
       std::scoped_lock lock(mutex_);
+      if (pairing_suspended_) {
+        return 0;
+      }
       retire_expired_pairings(now_utc_seconds);
       const auto pairing = std::ranges::find(pairings_, pairing_session_id, &PendingPairing::session_id);
       if (pairing == pairings_.end()) {
@@ -1078,12 +1475,184 @@ namespace lumen::lsp::runtime {
       if (!pending.active || pending.probe != probe) {
         return false;
       }
-      connections_[index].outbound.acknowledge(pending.message_id, 0);
+      (void) connections_[index].outbound.acknowledge(pending.message_id, 0, 0, connections_[index].rto);
       connections_[index].cancelled_path_probe_request_ids[connections_[index].next_cancelled_path_probe_slot] = pending.request_id;
       connections_[index].next_cancelled_path_probe_slot =
         (connections_[index].next_cancelled_path_probe_slot + 1U) % connections_[index].cancelled_path_probe_request_ids.size();
       pending = {};
       return true;
+    }
+
+    bool send_stream_ended(
+      const PeerEndpoint &peer,
+      const StreamEndedPayload &ended,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (index == connections_.size() || !connections_[index].authenticated_client ||
+          connections_[index].next_message_id == 0) {
+        return false;
+      }
+      auto &connection = connections_[index];
+      const auto payload = encode_stream_ended(ended);
+      if (!payload) {
+        return false;
+      }
+      std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
+      const lspc_header header {
+        .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
+        .message_type = static_cast<std::uint16_t>(ControlMessageType::stream_ended),
+        .connection_generation = connection.generation,
+        .payload_length = static_cast<std::uint32_t>(payload->size()),
+        .message_id = connection.next_message_id,
+        .request_id = 0,
+        .acknowledgement_base = connection.inbound.base(),
+        .acknowledgement_bitmap = connection.inbound.bitmap(),
+      };
+      const auto serialized = serialize_lspc(header, *payload, storage);
+      if (!serialized) {
+        return false;
+      }
+      const auto frame = std::span<const std::uint8_t> {storage}.first(serialized.bytes_written);
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(connection.next_message_id, frame, deadline) != outbound_store_result::stored) {
+        return false;
+      }
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(peer, frame)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
+    }
+
+    bool start_certificate_rotation(
+      const PeerEndpoint &peer,
+      const Digest256 &new_spki_sha256,
+      const std::uint32_t rotation_generation,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (index == connections_.size() || !connections_[index].authenticated_client ||
+          connections_[index].certificate_rotation_pending || connections_[index].next_message_id == 0) {
+        return false;
+      }
+      auto &connection = connections_[index];
+      const auto transcript = encode_certificate_rotation_transcript(
+        identity_.host_id,
+        identity_.application_public_key,
+        spki_sha256_,
+        new_spki_sha256,
+        connection.generation,
+        rotation_generation
+      );
+      CertificateRotatePayload rotation {
+        .host_id = identity_.host_id,
+        .connection_generation = connection.generation,
+        .rotation_generation = rotation_generation,
+        .new_spki_sha256 = new_spki_sha256,
+      };
+      if (!transcript || !crypto_.sign(*transcript, rotation.host_signature)) {
+        return false;
+      }
+      const auto payload = encode_certificate_rotate(rotation);
+      std::array<std::uint8_t, 8> request_bytes {};
+      if (!payload || !crypto_.random(request_bytes)) {
+        return false;
+      }
+      auto request_id = wire::read_be<std::uint64_t>(request_bytes);
+      if (request_id == 0) {
+        request_id = 1;
+      }
+      std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
+      const lspc_header header {
+        .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
+        .message_type = static_cast<std::uint16_t>(ControlMessageType::certificate_rotate),
+        .connection_generation = connection.generation,
+        .payload_length = static_cast<std::uint32_t>(payload->size()),
+        .message_id = connection.next_message_id,
+        .request_id = request_id,
+        .acknowledgement_base = connection.inbound.base(),
+        .acknowledgement_bitmap = connection.inbound.bitmap(),
+      };
+      const auto serialized = serialize_lspc(header, *payload, storage);
+      if (!serialized) {
+        return false;
+      }
+      const auto frame = std::span<const std::uint8_t> {storage}.first(serialized.bytes_written);
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(connection.next_message_id, frame, deadline) != outbound_store_result::stored) {
+        return false;
+      }
+      connection.pending_certificate_rotation = rotation;
+      connection.certificate_rotation_request_id = request_id;
+      connection.certificate_rotation_message_id = connection.next_message_id;
+      connection.certificate_rotation_pending = true;
+      connection.completed_certificate_rotation_generation = 0;
+      connection.completed_certificate_rotation_succeeded = false;
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(peer, frame)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
+    }
+
+    /** @brief Validate exact client persistence acknowledgement for one signed rotation. */
+    bool certificate_rotation_ack(
+      Connection &connection,
+      const std::span<const std::uint8_t> frame,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      const auto observed = connection.inbound.observe(header.message_id);
+      if (observed != receive_id_result::accepted) {
+        return connection.accepted_certificate_rotation_ack_size == frame.size() &&
+               connection.accepted_certificate_rotation_request_id == header.request_id &&
+               std::ranges::equal(
+                 std::span<const std::uint8_t> {connection.accepted_certificate_rotation_ack}.first(frame.size()),
+                 frame
+               ) &&
+               send_acknowledgement_only(connection);
+      }
+      if (!connection.certificate_rotation_pending ||
+          header.request_id != connection.certificate_rotation_request_id) {
+        return false;
+      }
+      ControlStatus status = ControlStatus::success;
+      if (has_flag(header.flags, lspc_flag::error_response)) {
+        const auto error = decode_control_error(payload);
+        if (!error || *error == ControlStatus::success) {
+          return false;
+        }
+        status = *error;
+      } else {
+        const auto acknowledgement = decode_certificate_rotate_ack(payload);
+        if (!acknowledgement || acknowledgement->status != ControlStatus::success ||
+            acknowledgement->host_id != connection.pending_certificate_rotation.host_id ||
+            acknowledgement->connection_generation != connection.pending_certificate_rotation.connection_generation ||
+            acknowledgement->rotation_generation != connection.pending_certificate_rotation.rotation_generation) {
+          return false;
+        }
+      }
+      (void) status;
+      (void) connection.outbound.acknowledge(
+        connection.certificate_rotation_message_id,
+        0,
+        now_microseconds,
+        connection.rto
+      );
+      connection.accepted_certificate_rotation_request_id = header.request_id;
+      connection.accepted_certificate_rotation_ack_size = frame.size();
+      std::copy(frame.begin(), frame.end(), connection.accepted_certificate_rotation_ack.begin());
+      connection.certificate_rotation_pending = false;
+      connection.completed_certificate_rotation_generation = connection.pending_certificate_rotation.rotation_generation;
+      connection.completed_certificate_rotation_succeeded = status == ControlStatus::success;
+      connection.pending_certificate_rotation = {};
+      return send_acknowledgement_only(connection);
     }
 
   private:
@@ -1122,14 +1691,22 @@ namespace lumen::lsp::runtime {
           return ControlMessageType::pair_result;
         case ControlMessageType::auth_request:
           return ControlMessageType::auth_response;
+        case ControlMessageType::certificate_rotate:
+          return ControlMessageType::certificate_rotate_ack;
         case ControlMessageType::list_applications:
           return ControlMessageType::applications;
+        case ControlMessageType::quit_application:
+          return ControlMessageType::quit_application_response;
         case ControlMessageType::start:
           return ControlMessageType::start_response;
         case ControlMessageType::attach:
           return ControlMessageType::attach_response;
         case ControlMessageType::stop:
           return ControlMessageType::stop_response;
+        case ControlMessageType::text_input:
+          return ControlMessageType::text_input_response;
+        case ControlMessageType::input_rate_request:
+          return ControlMessageType::input_rate_response;
         case ControlMessageType::video_config:
           return ControlMessageType::video_config_ack;
         case ControlMessageType::audio_config:
@@ -1139,9 +1716,16 @@ namespace lumen::lsp::runtime {
           return ControlMessageType::microphone_config_ack;
         case ControlMessageType::path_probe:
           return ControlMessageType::path_probe_ack;
+        case ControlMessageType::object_chunk:
+          return ControlMessageType::object_chunk;
+        case ControlMessageType::certificate_rotate_ack:
+        case ControlMessageType::quit_application_response:
         case ControlMessageType::microphone_config_ack:
         case ControlMessageType::video_config_ack:
         case ControlMessageType::path_probe_ack:
+        case ControlMessageType::text_input_response:
+        case ControlMessageType::input_rate_response:
+        case ControlMessageType::stream_ended:
         case ControlMessageType::server_hello:
         case ControlMessageType::pair_pending:
         case ControlMessageType::pair_challenge:
@@ -1205,23 +1789,49 @@ namespace lumen::lsp::runtime {
         return false;
       }
       const auto response = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
-      const auto cache_result = connection.responses.insert(request_header.request_id, request, response);
+      response_cache_metadata metadata {
+        .identity = {
+          .message_type = request_header.message_type,
+          .schema_version = wire_version,
+          .generation = response_cache_generation(
+            request_header.message_type,
+            request_header.connection_generation,
+            connection.generation
+          ),
+        },
+        .retention_deadline_microseconds = saturating_add(now_microseconds, response_deadline_microseconds),
+      };
+      wire::write_be<std::uint64_t>(std::span<std::uint8_t> {metadata.identity.semantic_id}.last<8>(), request_header.request_id);
+      if (!crypto_.sha256(request, metadata.identity.request_digest)) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      const auto cache_result = connection.responses.insert(
+        request_header.request_id,
+        metadata,
+        request,
+        response,
+        now_microseconds
+      );
       if (cache_result != response_cache_result::stored && cache_result != response_cache_result::hit) {
         transport_.close(connection.peer);
         return false;
       }
-      if (connection.outbound.store(
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(
             connection.next_message_id,
             response,
-            now_microseconds,
-            saturating_add(now_microseconds, response_deadline_microseconds),
-            connection.rto
+            deadline
           ) != outbound_store_result::stored) {
         transport_.close(connection.peer);
         return false;
       }
-      ++connection.next_message_id;
-      return transport_.send(connection.peer, response);
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(connection.peer, response)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
     }
 
     /** @brief Send one untracked ACK-only LSPC frame for an accepted client response. */
@@ -1246,6 +1856,142 @@ namespace lumen::lsp::runtime {
       }
       ++connection.next_message_id;
       return transport_.send(connection.peer, storage);
+    }
+
+    /** @brief Retain and send the next contiguous outgoing artwork chunk. */
+    bool send_next_object_chunk(Connection &connection, const std::uint64_t now_microseconds) noexcept {
+      try {
+        if (connection.outgoing_object_pending) {
+          return true;
+        }
+        while (connection.outgoing_object_index < connection.outgoing_objects.size() &&
+               connection.outgoing_object_offset >= connection.outgoing_objects[connection.outgoing_object_index].bytes.size()) {
+          ++connection.outgoing_object_index;
+          connection.outgoing_object_offset = 0;
+        }
+        if (connection.outgoing_object_index >= connection.outgoing_objects.size()) {
+          connection.outgoing_objects.clear();
+          connection.outgoing_object_index = 0;
+          return true;
+        }
+        auto &object = connection.outgoing_objects[connection.outgoing_object_index];
+        const auto remaining = object.bytes.size() - connection.outgoing_object_offset;
+        const auto chunk_bytes = std::min(remaining, maximum_object_chunk_bytes);
+        ObjectChunkPayload chunk {
+          .object_id = object.object_id,
+          .offset = connection.outgoing_object_offset,
+          .total_length = static_cast<std::uint32_t>(object.bytes.size()),
+          .bytes = std::vector<std::uint8_t> {
+            object.bytes.begin() + static_cast<std::ptrdiff_t>(connection.outgoing_object_offset),
+            object.bytes.begin() + static_cast<std::ptrdiff_t>(connection.outgoing_object_offset + chunk_bytes),
+          },
+          .sha256 = object.sha256,
+        };
+        const auto payload = encode_object_chunk(chunk);
+        std::array<std::uint8_t, 8> request_bytes {};
+        if (!payload || connection.next_message_id == 0 || !crypto_.random(request_bytes)) {
+          return false;
+        }
+        auto request_id = wire::read_be<std::uint64_t>(request_bytes);
+        if (request_id == 0) {
+          request_id = 1;
+        }
+        std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
+        const lspc_header header {
+          .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
+          .message_type = static_cast<std::uint16_t>(ControlMessageType::object_chunk),
+          .connection_generation = connection.generation,
+          .payload_length = static_cast<std::uint32_t>(payload->size()),
+          .message_id = connection.next_message_id,
+          .request_id = request_id,
+          .acknowledgement_base = connection.inbound.base(),
+          .acknowledgement_bitmap = connection.inbound.bitmap(),
+        };
+        const auto serialized = serialize_lspc(header, *payload, storage);
+        if (!serialized) {
+          return false;
+        }
+        const auto frame = std::span<const std::uint8_t> {storage}.first(serialized.bytes_written);
+        const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+        if (connection.outbound.reserve(connection.next_message_id, frame, deadline) != outbound_store_result::stored) {
+          return false;
+        }
+        connection.outgoing_object_request_id = request_id;
+        connection.outgoing_object_message_id = connection.next_message_id;
+        connection.outgoing_object_pending = true;
+        const auto message_id = connection.next_message_id++;
+        if (!transport_.send(connection.peer, frame)) {
+          return false;
+        }
+        return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+               outbound_submission_result::submitted;
+      } catch (...) {
+        return false;
+      }
+    }
+
+    /** @brief Validate one exact response-flagged artwork prefix acknowledgement. */
+    bool object_chunk_acknowledgement(
+      Connection &connection,
+      const std::span<const std::uint8_t> frame,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      const auto accepted_duplicate = std::ranges::find_if(connection.accepted_object_acks, [&](const Connection::AcceptedObjectAck &accepted) {
+        return accepted.size == frame.size() && accepted.request_id == header.request_id &&
+               std::ranges::equal(std::span<const std::uint8_t> {accepted.frame}.first(accepted.size), frame);
+      });
+      const auto observed = connection.inbound.observe(header.message_id);
+      if (observed != receive_id_result::accepted) {
+        return accepted_duplicate != connection.accepted_object_acks.end() && send_acknowledgement_only(connection);
+      }
+      if (!connection.authenticated_client || !connection.outgoing_object_pending ||
+          header.request_id != connection.outgoing_object_request_id ||
+          connection.outgoing_object_index >= connection.outgoing_objects.size()) {
+        return false;
+      }
+      if (has_flag(header.flags, lspc_flag::error_response)) {
+        const auto error = decode_control_error(payload);
+        if (!error || *error == ControlStatus::success) {
+          return false;
+        }
+        (void) connection.outbound.acknowledge(
+          connection.outgoing_object_message_id,
+          0,
+          now_microseconds,
+          connection.rto
+        );
+        connection.outgoing_objects.clear();
+        connection.outgoing_object_pending = false;
+        return send_acknowledgement_only(connection);
+      }
+      const auto acknowledgement = decode_object_chunk_ack(payload);
+      const auto &object = connection.outgoing_objects[connection.outgoing_object_index];
+      if (!acknowledgement || acknowledgement->status != ControlStatus::success ||
+          acknowledgement->object_id != object.object_id ||
+          acknowledgement->total_length != object.bytes.size() ||
+          acknowledgement->next_offset <= connection.outgoing_object_offset ||
+          acknowledgement->next_offset > object.bytes.size()) {
+        return false;
+      }
+      (void) connection.outbound.acknowledge(
+        connection.outgoing_object_message_id,
+        0,
+        now_microseconds,
+        connection.rto
+      );
+      auto &accepted = connection.accepted_object_acks[connection.next_object_ack_slot];
+      accepted.request_id = header.request_id;
+      accepted.size = frame.size();
+      std::copy(frame.begin(), frame.end(), accepted.frame.begin());
+      connection.next_object_ack_slot = (connection.next_object_ack_slot + 1U) % connection.accepted_object_acks.size();
+      connection.outgoing_object_offset = acknowledgement->next_offset;
+      connection.outgoing_object_pending = false;
+      if (!send_acknowledgement_only(connection)) {
+        return false;
+      }
+      return send_next_object_chunk(connection, now_microseconds);
     }
 
     /** @brief Reliably send one server-originated VIDEO_CONFIG after START or ATTACH response. */
@@ -1289,12 +2035,11 @@ namespace lumen::lsp::runtime {
         return false;
       }
       const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
-      if (connection.outbound.store(
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(
             connection.next_message_id,
             frame,
-            now_microseconds,
-            saturating_add(now_microseconds, response_deadline_microseconds),
-            connection.rto
+            deadline
           ) != outbound_store_result::stored) {
         return false;
       }
@@ -1305,8 +2050,12 @@ namespace lumen::lsp::runtime {
         .message_id = connection.next_message_id,
         .active = true,
       };
-      ++connection.next_message_id;
-      return transport_.send(connection.peer, frame);
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(connection.peer, frame)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
     }
 
     /** @brief Validate and commit one idempotent VIDEO_CONFIG_ACK response. */
@@ -1350,7 +2099,12 @@ namespace lumen::lsp::runtime {
         transport_.close(connection.peer);
         return false;
       }
-      connection.outbound.acknowledge(connection.pending_video.message_id, 0);
+      (void) connection.outbound.acknowledge(
+        connection.pending_video.message_id,
+        0,
+        now_microseconds,
+        connection.rto
+      );
       connection.pending_video.active = false;
       auto &accepted = connection.accepted_video_acks[connection.next_video_ack_slot];
       accepted.request_id = header.request_id;
@@ -1404,12 +2158,11 @@ namespace lumen::lsp::runtime {
         return false;
       }
       const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
-      if (connection.outbound.store(
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(
             connection.next_message_id,
             frame,
-            now_microseconds,
-            saturating_add(now_microseconds, response_deadline_microseconds),
-            connection.rto
+            deadline
           ) != outbound_store_result::stored) {
         return false;
       }
@@ -1421,8 +2174,12 @@ namespace lumen::lsp::runtime {
         .datagram_sent = false,
         .active = true,
       };
-      ++connection.next_message_id;
-      return transport_.send(peer, frame);
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(peer, frame)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
     }
 
     /** @brief Retain one peer intent until its exact protected LSPP arrives. */
@@ -1547,7 +2304,12 @@ namespace lumen::lsp::runtime {
           return false;
         }
       }
-      connection.outbound.acknowledge(connection.outbound_path_probe.message_id, 0);
+      (void) connection.outbound.acknowledge(
+        connection.outbound_path_probe.message_id,
+        0,
+        now_microseconds,
+        connection.rto
+      );
       connection.outbound_path_probe = {};
       auto &accepted = connection.accepted_path_probe_acks[connection.next_path_probe_ack_slot];
       accepted.request_id = header.request_id;
@@ -1608,12 +2370,11 @@ namespace lumen::lsp::runtime {
         return false;
       }
       const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
-      if (connection.outbound.store(
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(
             connection.next_message_id,
             frame,
-            now_microseconds,
-            saturating_add(now_microseconds, response_deadline_microseconds),
-            connection.rto
+            deadline
           ) != outbound_store_result::stored) {
         return false;
       }
@@ -1623,8 +2384,12 @@ namespace lumen::lsp::runtime {
         .message_id = connection.next_message_id,
         .active = true,
       };
-      ++connection.next_message_id;
-      return transport_.send(connection.peer, frame);
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(connection.peer, frame)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
     }
 
     /**
@@ -1677,7 +2442,12 @@ namespace lumen::lsp::runtime {
         transport_.close(connection.peer);
         return false;
       }
-      connection.outbound.acknowledge(connection.pending_audio.message_id, 0);
+      (void) connection.outbound.acknowledge(
+        connection.pending_audio.message_id,
+        0,
+        now_microseconds,
+        connection.rto
+      );
       connection.pending_audio.active = false;
       auto &accepted = connection.accepted_audio_acks[connection.next_audio_ack_slot];
       accepted.request_id = header.request_id;
@@ -1735,12 +2505,11 @@ namespace lumen::lsp::runtime {
         return false;
       }
       const auto frame = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
-      if (connection.outbound.store(
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(
             connection.next_message_id,
             frame,
-            now_microseconds,
-            saturating_add(now_microseconds, response_deadline_microseconds),
-            connection.rto
+            deadline
           ) != outbound_store_result::stored) {
         return false;
       }
@@ -1750,8 +2519,12 @@ namespace lumen::lsp::runtime {
         .message_id = connection.next_message_id,
         .active = true,
       };
-      ++connection.next_message_id;
-      return transport_.send(connection.peer, frame);
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(connection.peer, frame)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
     }
 
     /** @brief Validate and commit one idempotent MICROPHONE_CONFIG_ACK response. */
@@ -1795,7 +2568,12 @@ namespace lumen::lsp::runtime {
         transport_.close(connection.peer);
         return false;
       }
-      connection.outbound.acknowledge(connection.pending_microphone.message_id, 0);
+      (void) connection.outbound.acknowledge(
+        connection.pending_microphone.message_id,
+        0,
+        now_microseconds,
+        connection.rto
+      );
       connection.pending_microphone.active = false;
       auto &accepted = connection.accepted_microphone_acks[connection.next_microphone_ack_slot];
       accepted.request_id = header.request_id;
@@ -1839,6 +2617,9 @@ namespace lumen::lsp::runtime {
       const std::uint64_t now_microseconds,
       const std::uint64_t now_utc_seconds
     ) noexcept {
+      if (pairing_suspended_) {
+        return send_error(connection, request, header, ControlMessageType::pair_pending, ControlStatus::busy, now_microseconds);
+      }
       if (connection.authenticated_client) {
         return send_error(connection, request, header, ControlMessageType::pair_pending, ControlStatus::stale_generation, now_microseconds);
       }
@@ -1897,6 +2678,8 @@ namespace lumen::lsp::runtime {
         pairing.point_a = begin->point_a;
         pairing.requested_permissions = begin->requested_permissions;
         pairing.effective_permissions = *effective_permissions;
+        pairing.frozen_revocation_generation = existing ? existing->revocation_generation : 0;
+        pairing.recovering_existing_trust = existing.has_value();
         pairing.expires_at_utc_seconds = saturating_add(now_utc_seconds, pairing_ttl_seconds);
         if (!crypto_.random(pairing.session_id) || is_zero(pairing.session_id) ||
             !crypto_.sha256(pairing.client_identity_key, pairing.identity_key_fingerprint)) {
@@ -2028,6 +2811,19 @@ namespace lumen::lsp::runtime {
           pairing->connection_generation != connection.generation ||
           pairing->state != PairingAdministrationState::challenge_ready || !pairing->spake ||
           pairing->approval_generation != finish->approval_generation) {
+        return send_error(connection, request, header, ControlMessageType::pair_result, ControlStatus::authentication_failed, now_microseconds);
+      }
+      const auto current_trust = trust_store_.find(pairing->client_id);
+      const auto trust_snapshot_matches = pairing->recovering_existing_trust ?
+                                            current_trust && current_trust->enabled &&
+                                              current_trust->identity_key == pairing->client_identity_key &&
+                                              current_trust->permissions == pairing->effective_permissions &&
+                                              current_trust->revocation_generation == pairing->frozen_revocation_generation :
+                                            !current_trust;
+      if (!trust_snapshot_matches) {
+        const auto pairing_index = static_cast<std::size_t>(std::distance(pairings_.begin(), pairing));
+        clear_pairing(pairings_[pairing_index]);
+        pairings_.erase(pairings_.begin() + static_cast<std::ptrdiff_t>(pairing_index));
         return send_error(connection, request, header, ControlMessageType::pair_result, ControlStatus::authentication_failed, now_microseconds);
       }
       std::array<std::uint8_t, pairing_confirmation_size> confirmation_b {};
@@ -2219,7 +3015,233 @@ namespace lumen::lsp::runtime {
       if (!response) {
         return send_error(connection, request, header, ControlMessageType::applications, ControlStatus::busy, now_microseconds);
       }
-      return send_response(connection, request, header, ControlMessageType::applications, *response, false, now_microseconds);
+      if (!send_response(connection, request, header, ControlMessageType::applications, *response, false, now_microseconds)) {
+        return false;
+      }
+      const auto artwork = applications_.artwork_snapshot();
+      if (!artwork) {
+        return false;
+      }
+      try {
+        connection.outgoing_objects = *artwork;
+      } catch (...) {
+        return false;
+      }
+      connection.outgoing_object_index = 0;
+      connection.outgoing_object_offset = 0;
+      connection.outgoing_object_pending = false;
+      return send_next_object_chunk(connection, now_microseconds);
+    }
+
+    /** @brief Validate and execute one session-owned application quit request. */
+    bool quit_application(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (!connection.authenticated_client ||
+          !connection.authenticated_client->permissions.contains(Permission::quit_application)) {
+        return send_error(
+          connection,
+          request,
+          header,
+          ControlMessageType::quit_application_response,
+          ControlStatus::permission_denied,
+          now_microseconds
+        );
+      }
+      const auto decoded = decode_quit_application(payload);
+      if (!decoded) {
+        return send_error(connection, request, header, ControlMessageType::quit_application_response, ControlStatus::malformed, now_microseconds);
+      }
+      const auto status = start_handler_.quit_application(
+        *connection.authenticated_client,
+        connection.generation,
+        *decoded
+      );
+      const auto response = encode_quit_application_response({
+        .status = status,
+        .session_id = decoded->session_id,
+      });
+      return response && send_response(
+                           connection,
+                           request,
+                           header,
+                           ControlMessageType::quit_application_response,
+                           *response,
+                           status != ControlStatus::success,
+                           now_microseconds
+                         );
+    }
+
+    /** @brief Resolve inline/object UTF-8 and execute one edge-barrier-bound text commit. */
+    bool text_input(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (!connection.authenticated_client ||
+          !connection.authenticated_client->permissions.contains(Permission::input)) {
+        return send_error(connection, request, header, ControlMessageType::text_input_response, ControlStatus::permission_denied, now_microseconds);
+      }
+      const auto decoded = decode_text_input(payload);
+      if (!decoded) {
+        return send_error(connection, request, header, ControlMessageType::text_input_response, ControlStatus::malformed, now_microseconds);
+      }
+      if (connection.pending_text.active || text_work_.size() >= maximum_connections_) {
+        return send_error(connection, request, header, ControlMessageType::text_input_response, ControlStatus::busy, now_microseconds);
+      }
+      std::span<const std::uint8_t> utf8 = decoded->inline_utf8;
+      if (decoded->object_id) {
+        const auto found = std::ranges::find(connection.incoming_objects, *decoded->object_id, &Connection::IncomingObject::object_id);
+        if (found == connection.incoming_objects.end() || !found->complete || !decoded->sha256 ||
+            found->sha256 != *decoded->sha256 || found->bytes.size() != decoded->utf8_length) {
+          return send_error(connection, request, header, ControlMessageType::text_input_response, ControlStatus::stale_generation, now_microseconds);
+        }
+        utf8 = found->bytes;
+      }
+      try {
+        Digest256 request_digest {};
+        if (!crypto_.sha256(request, request_digest)) {
+          return send_error(connection, request, header, ControlMessageType::text_input_response, ControlStatus::internal_failure, now_microseconds);
+        }
+        TextWork work {
+          .peer = connection.peer,
+          .client = *connection.authenticated_client,
+          .connection_generation = connection.generation,
+          .request = *decoded,
+          .utf8 = std::vector<std::uint8_t> {utf8.begin(), utf8.end()},
+          .deadline_microseconds = saturating_add(now_microseconds, response_deadline_microseconds),
+          .request_id = header.request_id,
+          .message_id = header.message_id,
+          .request_digest = request_digest,
+        };
+        connection.pending_text.request.assign(request);
+        connection.pending_text.header = header;
+        connection.pending_text.active = true;
+        text_work_.push_back(std::move(work));
+      } catch (...) {
+        connection.pending_text = {};
+        return send_error(connection, request, header, ControlMessageType::text_input_response, ControlStatus::busy, now_microseconds);
+      }
+      text_condition_.notify_one();
+      return true;
+    }
+
+    /** @brief Validate and execute one generation-scoped device rate offer. */
+    bool input_rate(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (!connection.authenticated_client ||
+          !connection.authenticated_client->permissions.contains(Permission::input)) {
+        return send_error(connection, request, header, ControlMessageType::input_rate_response, ControlStatus::permission_denied, now_microseconds);
+      }
+      const auto decoded = decode_input_rate_request(payload);
+      if (!decoded) {
+        return send_error(connection, request, header, ControlMessageType::input_rate_response, ControlStatus::malformed, now_microseconds);
+      }
+      const auto selected = start_handler_.input_rate(
+        connection.peer,
+        *connection.authenticated_client,
+        connection.generation,
+        *decoded
+      );
+      if (!selected) {
+        return send_error(connection, request, header, ControlMessageType::input_rate_response, selected.error(), now_microseconds);
+      }
+      const auto response = encode_input_rate_response(*selected);
+      return response && send_response(connection, request, header, ControlMessageType::input_rate_response, *response, false, now_microseconds);
+    }
+
+    /** @brief Append one authenticated contiguous object chunk and cache its terminal prefix. */
+    bool object_chunk(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (!connection.authenticated_client ||
+          !connection.authenticated_client->permissions.contains(Permission::input)) {
+        return send_error(connection, request, header, ControlMessageType::object_chunk, ControlStatus::permission_denied, now_microseconds);
+      }
+      const auto decoded = decode_object_chunk(payload);
+      if (!decoded) {
+        return send_error(connection, request, header, ControlMessageType::object_chunk, ControlStatus::malformed, now_microseconds);
+      }
+      auto found = std::ranges::find(connection.incoming_objects, decoded->object_id, &Connection::IncomingObject::object_id);
+      ControlStatus status = ControlStatus::success;
+      std::uint32_t next_offset = decoded->offset;
+      if (found == connection.incoming_objects.end()) {
+        if (decoded->offset != 0 || connection.incoming_objects.size() >= maximum_incoming_objects ||
+            decoded->total_length > maximum_buffered_object_bytes - connection.buffered_object_bytes) {
+          status = decoded->offset == 0 ? ControlStatus::busy : ControlStatus::stale_generation;
+        } else {
+          try {
+            Connection::IncomingObject object {
+              .object_id = decoded->object_id,
+              .total_length = decoded->total_length,
+              .sha256 = decoded->sha256,
+            };
+            object.bytes.reserve(decoded->total_length);
+            connection.incoming_objects.push_back(std::move(object));
+            connection.buffered_object_bytes += decoded->total_length;
+            found = std::prev(connection.incoming_objects.end());
+          } catch (...) {
+            status = ControlStatus::busy;
+          }
+        }
+      }
+      if (status == ControlStatus::success && found != connection.incoming_objects.end()) {
+        if (found->complete) {
+          next_offset = found->total_length;
+        } else if (found->total_length != decoded->total_length || found->sha256 != decoded->sha256 ||
+                   found->bytes.size() != decoded->offset) {
+          status = ControlStatus::stale_generation;
+          connection.buffered_object_bytes -= found->total_length;
+          connection.incoming_objects.erase(found);
+        } else {
+          try {
+            found->bytes.insert(found->bytes.end(), decoded->bytes.begin(), decoded->bytes.end());
+            next_offset = static_cast<std::uint32_t>(found->bytes.size());
+          } catch (...) {
+            status = ControlStatus::busy;
+          }
+          if (status == ControlStatus::success && next_offset == found->total_length) {
+            Digest256 digest;
+            if (!crypto_.sha256(found->bytes, digest) || digest != found->sha256) {
+              status = ControlStatus::authentication_failed;
+              connection.buffered_object_bytes -= found->total_length;
+              connection.incoming_objects.erase(found);
+            } else {
+              found->complete = true;
+            }
+          }
+        }
+      }
+      const auto response = encode_object_chunk_ack({
+        .status = status,
+        .object_id = decoded->object_id,
+        .next_offset = next_offset,
+        .total_length = decoded->total_length,
+      });
+      return response && send_response(
+                           connection,
+                           request,
+                           header,
+                           ControlMessageType::object_chunk,
+                           *response,
+                           status != ControlStatus::success,
+                           now_microseconds
+                         );
     }
 
     bool start_input(
@@ -2382,14 +3404,21 @@ namespace lumen::lsp::runtime {
     std::vector<Connection> connections_;  ///< Bounded authenticated-DTLS association state.
     std::vector<PendingPairing> pairings_;  ///< At most four pending association/source-bound PIN sessions.
     std::vector<PairingWork> pairing_work_;  ///< At most four async scrypt/SPAKE work items.
+    std::vector<TextWork> text_work_;  ///< At most one queued text operation per connection.
     std::array<CompletedPairing, 4> completed_pairings_ {};  ///< Lost-result replay independent of request-ID caching.
     std::size_t next_completed_pairing_slot_ {};  ///< Next fixed replay-cache slot.
     std::size_t maximum_connections_ {};  ///< Configured association bound.
     std::uint32_t next_generation_ {1};  ///< Next nonzero connection generation.
     bool ready_ {};  ///< Constructor validation and allocation status.
+    bool pairing_suspended_ {};  ///< Administrative certificate rotation excludes PIN pairing.
+    bool shutdown_started_ {};  ///< Whether asynchronous admission has permanently closed.
+    bool shutdown_complete_ {};  ///< Whether workers and queued terminal responses are fully drained.
     mutable std::recursive_mutex mutex_;  ///< Synchronizes socket callbacks and low-rate administration.
+    std::condition_variable_any shutdown_condition_;  ///< Wakes concurrent shutdown callers after full join.
     std::condition_variable_any pairing_condition_;  ///< Dedicated worker wakeup without socket/HTTP blocking.
+    std::condition_variable_any text_condition_;  ///< Edge-barrier text worker wakeup.
     std::jthread pairing_worker_;  ///< Sole synchronous scrypt/SPAKE execution owner.
+    std::jthread text_worker_;  ///< Sole asynchronous text barrier/platform injection owner.
   };
 
   HostControlServer::HostControlServer(
@@ -2420,6 +3449,12 @@ namespace lumen::lsp::runtime {
 
   HostControlServer::~HostControlServer() = default;
 
+  void HostControlServer::shutdown() noexcept {
+    if (impl_) {
+      impl_->shutdown();
+    }
+  }
+
   std::uint32_t HostControlServer::association_ready(
     const PeerEndpoint &peer,
     const PairingDtlsExporter &exporter
@@ -2437,6 +3472,18 @@ namespace lumen::lsp::runtime {
     if (impl_) {
       impl_->disconnect_client(client_id);
     }
+  }
+
+  bool HostControlServer::update_trusted_client(
+    const Identifier128 &client_id,
+    const PermissionSet permissions,
+    const bool enabled
+  ) noexcept {
+    return impl_ && impl_->update_trusted_client(client_id, permissions, enabled);
+  }
+
+  bool HostControlServer::revoke_trusted_client(const Identifier128 &client_id) noexcept {
+    return impl_ && impl_->revoke_trusted_client(client_id);
   }
 
   bool HostControlServer::receive(
@@ -2475,6 +3522,57 @@ namespace lumen::lsp::runtime {
     const PathProbePayload &probe
   ) noexcept {
     return impl_ && impl_->cancel_path_probe(peer, probe);
+  }
+
+  bool HostControlServer::send_stream_ended(
+    const PeerEndpoint &peer,
+    const StreamEndedPayload &ended,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->send_stream_ended(peer, ended, now_microseconds);
+  }
+
+  bool HostControlServer::start_certificate_rotation(
+    const PeerEndpoint &peer,
+    const Digest256 &new_spki_sha256,
+    const std::uint32_t rotation_generation,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->start_certificate_rotation(
+                      peer,
+                      new_spki_sha256,
+                      rotation_generation,
+                      now_microseconds
+                    );
+  }
+
+  std::optional<std::vector<PeerEndpoint>> HostControlServer::authenticated_peers() const noexcept {
+    return impl_ ? impl_->authenticated_peers() : std::nullopt;
+  }
+
+  std::optional<std::vector<PeerEndpoint>> HostControlServer::begin_certificate_rotation() noexcept {
+    return impl_ ? impl_->begin_certificate_rotation() : std::nullopt;
+  }
+
+  void HostControlServer::end_certificate_rotation() noexcept {
+    if (impl_) {
+      impl_->end_certificate_rotation();
+    }
+  }
+
+  CertificateRotationState HostControlServer::certificate_rotation_state(
+    const PeerEndpoint &peer,
+    const std::uint32_t rotation_generation
+  ) const noexcept {
+    return impl_ ?
+             impl_->certificate_rotation_state(peer, rotation_generation) :
+             CertificateRotationState::absent;
+  }
+
+  void HostControlServer::commit_certificate_rotation(const Digest256 &new_spki_sha256) noexcept {
+    if (impl_) {
+      impl_->commit_certificate_rotation(new_spki_sha256);
+    }
   }
 
   std::uint64_t HostControlServer::path_probe_interval(const PeerEndpoint &peer) const noexcept {

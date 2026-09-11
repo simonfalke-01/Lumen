@@ -13,6 +13,8 @@
 #endif
 
 // standard includes
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -66,6 +68,65 @@ namespace proc {
     std::string_view app_name,
     const rtsp_stream::launch_session_t &launch_session
   );
+
+  /** @brief Exact selected LSP media/input values supplied to a fresh application launch. */
+  struct lsp_launch_request_t {
+    int width {};  ///< Selected encoded width.
+    int height {};  ///< Selected encoded height.
+    std::uint32_t refresh_numerator {};  ///< Exact selected refresh numerator.
+    std::uint32_t refresh_denominator {};  ///< Exact selected refresh denominator.
+    std::uint32_t pointer_rate {};  ///< Selected pointer reports per second.
+    std::uint32_t controller_rate {};  ///< Selected controller reports per second.
+    std::uint32_t sensor_rate {};  ///< Selected aggregate sensor reports per second.
+    std::uint32_t reconciliation_rate {};  ///< Selected reconciliation reports per second.
+    std::uint8_t audio_channels {};  ///< Selected Opus channel count.
+    std::uint8_t audio_streams {};  ///< Selected Opus stream count.
+    std::uint8_t audio_coupled_streams {};  ///< Selected coupled Opus stream count.
+    std::array<std::uint8_t, 8> audio_mapping {};  ///< Selected mapping-family-one channel map.
+    std::uint16_t audio_frame_samples {};  ///< Selected Opus frame samples at 48 kHz.
+    std::uint32_t audio_bitrate {};  ///< Selected Opus bits per second.
+    bool audio_inband_fec {};  ///< Selected Opus in-band FEC state.
+    bool audio_dtx {};  ///< Selected Opus DTX state.
+    std::uint8_t video_codec {};  ///< Selected LSP video codec registry value.
+    std::uint8_t video_profile {};  ///< Selected LSP video profile registry value.
+    std::uint8_t video_pixel_class {};  ///< Selected LSP decoded pixel class.
+    std::uint8_t video_color_primaries {};  ///< Selected H.273 color primaries.
+    std::uint8_t video_transfer_function {};  ///< Selected H.273 transfer characteristic.
+    std::uint8_t video_matrix_coefficients {};  ///< Selected H.273 matrix coefficients.
+    std::uint64_t video_bits_per_second {};  ///< Selected encoded video rate.
+    std::uint32_t maximum_frame_age_microseconds {};  ///< Authenticated video frame-age budget.
+    bool hdr {};  ///< Whether the selected video tuple carries HDR.
+    bool video_full_range {};  ///< Whether selected decoded luma/chroma use full range.
+    bool flexfec {};  ///< Whether FlexFEC repair is selected.
+    bool rtx {};  ///< Whether RTX repair is selected.
+    bool controller_output {};  ///< Whether authenticated controller output is enabled.
+
+    /**
+     * @brief Validate complete selected launch fields before process mutation.
+     *
+     * @return True only when every input, audio, and video field is usable.
+     */
+    [[nodiscard]] bool valid() const noexcept;
+  };
+
+  /**
+   * @brief Populate exact LSP-only application environment variables.
+   *
+   * @param env Child-process environment updated in place.
+   * @param request Valid exact LSP input/audio/video selection.
+   */
+  void apply_lsp_launch_environment(
+    boost::process::v1::environment &env,
+    const lsp_launch_request_t &request
+  );
+
+  /** @brief Authoritative current application process and LSP ownership snapshot. */
+  struct lsp_process_state_t {
+    int application_id {};  ///< Running configured application ID, or zero.
+    std::uint64_t process_generation {};  ///< Current running process generation, or zero.
+    bool running {};  ///< Whether the process manager currently reports an active application.
+    bool lsp_owned {};  ///< Whether fresh LSP launch semantics own this process generation.
+  };
 
   /**
    * pre_cmds -- guaranteed to be executed unless any of the commands fail.
@@ -139,7 +200,7 @@ namespace proc {
      */
     int execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session);
 
-    /** @brief Result of an input-only LSP application launch. */
+    /** @brief Result of one exact selected LSP application launch. */
     struct lsp_launch_result_t {
       int status {};  ///< Zero on success, 409 while another process is active, or launch error.
       std::uint64_t process_generation {};  ///< Generation owned by the accepted LSP session.
@@ -149,9 +210,20 @@ namespace proc {
      * @brief Launch one configured application only while the process slot is idle.
      *
      * @param app_id Configured numeric application ID.
+     * @param request Exact selected LSP launch environment.
      * @return Launch status and generation-qualified ownership token.
      */
-    [[nodiscard]] lsp_launch_result_t execute_lsp_if_idle(int app_id);
+    [[nodiscard]] lsp_launch_result_t execute_lsp_if_idle(
+      int app_id,
+      const lsp_launch_request_t &request
+    );
+
+    /**
+     * @brief Snapshot whether the running application is owned and resumable by LSP.
+     *
+     * @return Atomic running application, generation, and ownership state.
+     */
+    [[nodiscard]] lsp_process_state_t lsp_process_state();
 
     /**
      * @brief Terminate an LSP-owned application only when its generation is current.
@@ -263,6 +335,20 @@ namespace proc {
     void terminate();
 
   private:
+    /**
+     * @brief Shared legacy/LSP launch implementation with optional exact LSP environment.
+     *
+     * @param app_id Configured numeric application ID.
+     * @param launch_session Common legacy-compatible launch fields.
+     * @param lsp_request Exact LSP selection, or null for a legacy launch.
+     * @return Zero on success or the exact launch error.
+     */
+    int execute_impl(
+      int app_id,
+      std::shared_ptr<rtsp_stream::launch_session_t> launch_session,
+      const lsp_launch_request_t *lsp_request
+    );
+
     int _app_id;
 
     boost::process::v1::environment _env;
@@ -274,6 +360,7 @@ namespace proc {
     struct lifecycle_state_t {
       std::uint64_t generation {};  ///< Monotonic application process generation.
       bool legacy_attachable {};  ///< Whether the current running process permits legacy session attachment.
+      bool lsp_owned {};  ///< Whether the current generation was launched by the exact LSP path.
       std::unordered_set<std::string> cancel_client_certificates;  ///< Verified legacy cancel owners for this generation.
     };
 

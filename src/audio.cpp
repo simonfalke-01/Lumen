@@ -36,6 +36,7 @@ namespace audio {
   };
 
   using sample_queue_t = std::shared_ptr<safe::queue_t<captured_frame_t>>;
+  using pcm_slab_queue_t = std::shared_ptr<safe::queue_t<std::vector<float>>>;
 
   static int start_audio_control(audio_ctx_t &ctx);
   static void stop_audio_control(audio_ctx_t &);
@@ -118,6 +119,7 @@ namespace audio {
    */
   void encodeThread(
     sample_queue_t samples,
+    pcm_slab_queue_t free_pcm_slabs,
     config_t config,
     packet_destination_t destination,
     const std::shared_ptr<std::atomic_bool> &encoding
@@ -166,7 +168,35 @@ namespace audio {
 
     auto frame_size = config.frameSamples != 0 ? config.frameSamples : config.packetDuration * stream.sampleRate / 1000;
     auto encode_and_publish = [&](std::span<const float> pcm, const std::uint64_t sample_position, const bool discontinuity) {
-      buffer_t packet {1400};
+      const auto locked_destination = destination.lock();
+      if (!locked_destination) {
+        return std::optional {AudioPacketDestination::enqueue_result_e::closed};
+      }
+      if (const auto lease = locked_destination->acquire_packet_storage()) {
+        const int bytes = opus_multistream_encode_float(
+          opus.get(),
+          pcm.data(),
+          frame_size,
+          lease->storage.data(),
+          static_cast<opus_int32>(lease->storage.size())
+        );
+        if (bytes < 0) {
+          locked_destination->cancel_packet_storage(*lease);
+          BOOST_LOG(error) << "Couldn't encode audio: "sv << opus_strerror(bytes);
+          return std::optional<AudioPacketDestination::enqueue_result_e> {};
+        }
+        return std::optional {locked_destination->commit_packet_storage(
+          *lease,
+          static_cast<std::size_t>(bytes),
+          sample_position,
+          discontinuity
+        )};
+      }
+      if (locked_destination->requires_fixed_packet_storage()) {
+        return std::optional {AudioPacketDestination::enqueue_result_e::backpressure};
+      }
+
+      buffer_t packet {AudioPacketDestination::maximum_encoded_packet_bytes};
       const int bytes = opus_multistream_encode_float(
         opus.get(),
         pcm.data(),
@@ -179,10 +209,6 @@ namespace audio {
         return std::optional<AudioPacketDestination::enqueue_result_e> {};
       }
       packet.fake_resize(bytes);
-      const auto locked_destination = destination.lock();
-      if (!locked_destination) {
-        return std::optional {AudioPacketDestination::enqueue_result_e::closed};
-      }
       return std::optional {locked_destination->enqueue(packet_t {
         .payload = std::move(packet),
         .sample_position = sample_position,
@@ -190,35 +216,43 @@ namespace audio {
       })};
     };
     std::vector<float> silence(static_cast<std::size_t>(frame_size * stream.channelCount), 0.0f);
+    bool publication_discontinuity_pending = false;
     while (auto sample = samples->pop()) {
+      auto recycle_pcm = util::fail_guard([&]() {
+        if (free_pcm_slabs && !sample->samples.empty()) {
+          (void) free_pcm_slabs->raise(std::move(sample->samples));
+        }
+      });
       const auto first_gap_position = sample->sample_position -
                                       static_cast<std::uint64_t>(sample->gap_frames) * frame_size;
       for (std::uint32_t gap = 0; gap < sample->gap_frames; ++gap) {
         const auto result = encode_and_publish(
           silence,
           first_gap_position + static_cast<std::uint64_t>(gap) * frame_size,
-          gap == 0
+          gap == 0 || publication_discontinuity_pending
         );
         if (!result || *result == AudioPacketDestination::enqueue_result_e::closed) {
           return;
         }
         if (*result == AudioPacketDestination::enqueue_result_e::backpressure) {
-          BOOST_LOG(error) << "Audio destination backpressure while preserving a capture gap"sv;
-          return;
+          publication_discontinuity_pending = true;
+          break;
         }
+        publication_discontinuity_pending = false;
       }
       const auto result = encode_and_publish(
         sample->samples,
         sample->sample_position,
-        sample->discontinuity && sample->gap_frames == 0
+        (sample->discontinuity && sample->gap_frames == 0) || publication_discontinuity_pending
       );
       if (!result || *result == AudioPacketDestination::enqueue_result_e::closed) {
         return;
       }
       if (*result == AudioPacketDestination::enqueue_result_e::backpressure) {
-        BOOST_LOG(error) << "Audio destination backpressure"sv;
-        return;
+        publication_discontinuity_pending = true;
+        continue;
       }
+      publication_discontinuity_pending = false;
     }
   }
 
@@ -310,33 +344,50 @@ namespace audio {
                                         legacy_queue_frames :
                                         std::clamp(config.captureQueueFrames, 1U, legacy_queue_frames);
     auto samples = std::make_shared<sample_queue_t::element_type>(maximum_queue_frames);
+    auto free_pcm_slabs = std::make_shared<pcm_slab_queue_t::element_type>(maximum_queue_frames + 1U);
+    const auto samples_per_frame = static_cast<std::size_t>(frame_size * stream.channelCount);
+    try {
+      for (std::uint32_t index = 0; index < maximum_queue_frames + 1U; ++index) {
+        std::vector<float> slab(samples_per_frame);
+        if (!free_pcm_slabs->raise(std::move(slab))) {
+          return;
+        }
+      }
+    } catch (...) {
+      return;
+    }
     auto encoding = std::make_shared<std::atomic_bool>(true);
-    std::jthread thread {encodeThread, samples, config, std::move(destination), encoding};
+    std::jthread thread {encodeThread, samples, free_pcm_slabs, config, std::move(destination), encoding};
     bool wait_for_shutdown_after_cleanup = true;
 
     auto fg = util::fail_guard([&]() {
       samples->stop();
       thread.join();
+      free_pcm_slabs->stop();
 
       if (wait_for_shutdown_after_cleanup) {
         shutdown_event->view();
       }
     });
 
-    int samples_per_frame = frame_size * stream.channelCount;
-
     std::uint64_t next_sample_position {};
     std::uint32_t pending_gap_frames {};
     bool pending_discontinuity {};
     while (!shutdown_event->peek() && encoding->load(std::memory_order_acquire)) {
-      std::vector<float> sample_buffer;
-      sample_buffer.resize(samples_per_frame);
+      auto sample_buffer = free_pcm_slabs->pop(std::chrono::milliseconds {0});
+      if (!sample_buffer) {
+        if (pending_gap_frames != UINT32_MAX) {
+          ++pending_gap_frames;
+        }
+        continue;
+      }
 
-      auto status = mic->sample(sample_buffer);
+      auto status = mic->sample(*sample_buffer);
       switch (status) {
         case platf::capture_e::ok:
           break;
         case platf::capture_e::timeout:
+          (void) free_pcm_slabs->raise(std::move(*sample_buffer));
           continue;
         case platf::capture_e::reinit:
           BOOST_LOG(info) << "Reinitializing audio capture"sv;
@@ -348,13 +399,14 @@ namespace audio {
               BOOST_LOG(warning) << "Couldn't re-initialize audio input"sv;
             }
           } while (!mic && !shutdown_event->view(5s));
+          (void) free_pcm_slabs->raise(std::move(*sample_buffer));
           continue;
         default:
           return;
       }
 
       captured_frame_t captured {
-        .samples = std::move(sample_buffer),
+        .samples = std::move(*sample_buffer),
         .sample_position = next_sample_position,
         .gap_frames = pending_gap_frames,
         .discontinuity = pending_discontinuity,
@@ -363,6 +415,7 @@ namespace audio {
         pending_gap_frames = 0;
         pending_discontinuity = false;
       } else if (pending_gap_frames != UINT32_MAX) {
+        (void) free_pcm_slabs->raise(std::move(captured.samples));
         ++pending_gap_frames;
       }
       next_sample_position += static_cast<std::uint64_t>(frame_size);

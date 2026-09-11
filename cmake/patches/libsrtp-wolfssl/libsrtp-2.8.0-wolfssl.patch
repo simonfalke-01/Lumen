@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 01f007f..a4cbd7e 100644
+index 01f007f..be083b4 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -84,16 +84,17 @@ set(ERR_REPORTING_FILE "" CACHE FILEPATH "Use file for logging")
@@ -53,7 +53,7 @@ index 01f007f..a4cbd7e 100644
 +    message(FATAL_ERROR "crypto conflict: select exactly one external crypto engine.")
 +  endif()
 +  if(NOT TARGET wolfssl::wolfssl)
-+    find_package(wolfssl 5.9.2 CONFIG REQUIRED)
++    find_package(wolfssl CONFIG REQUIRED)
 +  endif()
 +  set(WOLFSSL ${ENABLE_WOLFSSL} CACHE BOOL INTERNAL)
 +  set(GCM ${ENABLE_WOLFSSL} CACHE BOOL INTERNAL)
@@ -62,7 +62,7 @@ index 01f007f..a4cbd7e 100644
  set(CONFIG_FILE_DIR ${CMAKE_CURRENT_BINARY_DIR})
  include_directories(${CONFIG_FILE_DIR})
  
-@@ -159,6 +169,11 @@ elseif(ENABLE_NSS)
+@@ -159,6 +171,11 @@ elseif(ENABLE_NSS)
      crypto/cipher/aes_icm_nss.c
      crypto/cipher/aes_gcm_nss.c
    )
@@ -74,7 +74,7 @@ index 01f007f..a4cbd7e 100644
  else()
    list(APPEND CIPHERS_SOURCES_C
      crypto/cipher/aes.c
-@@ -185,6 +200,11 @@ elseif(ENABLE_NSS)
+@@ -185,6 +202,11 @@ elseif(ENABLE_NSS)
    list(APPEND HASHES_SOURCES_C
      crypto/hash/hmac_nss.c
    )
@@ -86,7 +86,7 @@ index 01f007f..a4cbd7e 100644
  else()
    list(APPEND HASHES_SOURCES_C
      crypto/hash/hmac.c
-@@ -292,6 +312,11 @@ elseif(ENABLE_MBEDTLS)
+@@ -292,6 +314,11 @@ elseif(ENABLE_MBEDTLS)
  elseif(ENABLE_NSS)
    target_include_directories(srtp2 PRIVATE ${NSS_INCLUDE_DIRS})
    target_link_libraries(srtp2 ${NSS_LIBRARIES})
@@ -252,3 +252,40 @@ index 28250d1..b414a08 100644
  extern srtp_debug_module_t srtp_mod_aes_gcm;
  #endif
  
+diff --git a/crypto/kernel/alloc.c b/crypto/kernel/alloc.c
+index 3ebc315..f894a3b 100644
+--- a/crypto/kernel/alloc.c
++++ b/crypto/kernel/alloc.c
+@@ -82,4 +82,4 @@ void *srtp_crypto_alloc(size_t size)
+     } else {
+-        debug_print(srtp_mod_alloc, "allocation failed (asked for %zu bytes)\n",
+-                    size);
++        debug_print(srtp_mod_alloc, "allocation failed (asked for %llu bytes)\n",
++                    (unsigned long long)size);
+     }
+diff --git a/srtp/srtp.c b/srtp/srtp.c
+index 66bbde8..b6e8e5f 100644
+--- a/srtp/srtp.c
++++ b/srtp/srtp.c
+@@ -665,5 +665,6 @@ static srtp_err_status_t srtp_stream_clone(
+     const srtp_session_keys_t *template_session_keys = NULL;
+-
+-    debug_print(mod_srtp, "cloning stream (SSRC: 0x%08x)", ntohl(ssrc));
+-
++
++    debug_print(mod_srtp, "cloning stream (SSRC: 0x%08x)",
++                (unsigned int)ntohl(ssrc));
++
+     /* allocate srtp stream and set str_ptr */
+@@ -2784,4 +2785,4 @@ srtp_err_status_t srtp_unprotect_mki(srtp_ctx_t *ctx,
+             debug_print(mod_srtp, "using provisional stream (SSRC: 0x%08x)",
+-                        ntohl(hdr->ssrc));
+-
++                        (unsigned int)ntohl(hdr->ssrc));
++
+ /*
+@@ -4549,3 +4550,3 @@ srtp_err_status_t srtp_unprotect_rtcp_mki(srtp_t ctx,
+                         "srtcp using provisional stream (SSRC: 0x%08x)",
+-                        ntohl(hdr->ssrc));
++                        (unsigned int)ntohl(hdr->ssrc));
+         } else {

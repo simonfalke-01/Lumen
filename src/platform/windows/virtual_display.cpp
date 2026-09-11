@@ -6,6 +6,11 @@
 
 #include "virtual_display_driver/LumenModeValidationPolicy.h"
 
+#ifdef _WIN32
+  #include <initguid.h>
+  #include <Windows.h>
+#endif
+
 #ifndef _WIN32
   #include "virtual_display_driver/LumenVirtualDisplayProtocol.h"
 #endif
@@ -19,17 +24,14 @@
 #include <utility>
 
 #ifdef _WIN32
-  #include <Windows.h>
-  #include <initguid.h>
+  #include "src/video.h"
+  #include "virtual_display_driver/LumenVirtualDisplayGuids.h"
+  #include "virtual_display_driver/LumenVirtualDisplayProtocol.h"
+
   #include <cfgmgr32.h>
   #include <devpkey.h>
-  #include <SetupAPI.h>
-
-  #include "virtual_display_driver/LumenVirtualDisplayProtocol.h"
-  #include "virtual_display_driver/LumenVirtualDisplayGuids.h"
-  #include "src/video.h"
-
   #include <memory>
+  #include <SetupAPI.h>
 #endif
 
 namespace platf::virtual_display {
@@ -828,7 +830,7 @@ namespace platf::virtual_display {
       const auto exact_color_mode =
         (converted.dynamic_range == dynamic_range_e::sdr && converted.bits_per_channel == 8) ||
         (converted.dynamic_range == dynamic_range_e::hdr10 && converted.bits_per_channel == 10);
-      if (!mode::valid_shape(
+      if (!lumen::vdd::mode::valid_shape(
             converted.width,
             converted.height,
             converted.refresh.numerator,

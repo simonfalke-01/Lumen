@@ -2664,14 +2664,17 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
-    // Interactive video must never accumulate a quality-mode FIFO. At 120 Hz,
-    // the former 32-frame queue could be hundreds of milliseconds old before
-    // overflow recovery ran. Retain only the current frame and recover within
-    // one refresh when the network sender falls behind.
+    // Interactive video must never accumulate a quality-mode FIFO. Retain a
+    // small jitter cushion so ordinary 20-30 ms sender scheduling stalls do
+    // not drop a reference chain and force an expensive recovery frame. The
+    // age ceiling remains independent of frame rate and prevents the former
+    // 32-frame queue from accumulating hundreds of milliseconds of latency.
     const auto egress_behavior = video::egress_queue_t::behavior_e::latency;
+    constexpr auto maximum_egress_age = 33ms;
+    const auto frame_interval = video::capture_frame_interval(session->config.monitor);
     const video::egress_queue_t::registration_policy_t egress_policy {
-      1U,
-      video::capture_frame_interval(session->config.monitor),
+      4U,
+      std::min(frame_interval * 4, std::chrono::duration_cast<std::chrono::nanoseconds>(maximum_egress_age)),
     };
     const auto registered = ref->video_egress.register_session(
       session,

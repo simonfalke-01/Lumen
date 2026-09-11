@@ -5,6 +5,7 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <array>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -47,6 +48,43 @@
 namespace proc {
   using namespace std::literals;
   namespace pt = boost::property_tree;
+
+  namespace {
+    constexpr std::array lsp_environment_names {
+      "LUMEN_CLIENT_PROTOCOL",
+      "LUMEN_CLIENT_POINTER_RATE",
+      "LUMEN_CLIENT_CONTROLLER_RATE",
+      "LUMEN_CLIENT_SENSOR_RATE",
+      "LUMEN_CLIENT_RECONCILIATION_RATE",
+      "LUMEN_CLIENT_CONTROLLER_OUTPUT",
+      "LUMEN_CLIENT_AUDIO_CHANNELS",
+      "LUMEN_CLIENT_AUDIO_STREAMS",
+      "LUMEN_CLIENT_AUDIO_COUPLED_STREAMS",
+      "LUMEN_CLIENT_AUDIO_MAPPING",
+      "LUMEN_CLIENT_AUDIO_FRAME_SAMPLES",
+      "LUMEN_CLIENT_AUDIO_BITRATE",
+      "LUMEN_CLIENT_AUDIO_INBAND_FEC",
+      "LUMEN_CLIENT_AUDIO_DTX",
+      "LUMEN_CLIENT_VIDEO_CODEC",
+      "LUMEN_CLIENT_VIDEO_PROFILE",
+      "LUMEN_CLIENT_VIDEO_PIXEL_CLASS",
+      "LUMEN_CLIENT_VIDEO_COLOR_PRIMARIES",
+      "LUMEN_CLIENT_VIDEO_TRANSFER_FUNCTION",
+      "LUMEN_CLIENT_VIDEO_MATRIX_COEFFICIENTS",
+      "LUMEN_CLIENT_VIDEO_FULL_RANGE",
+      "LUMEN_CLIENT_VIDEO_BITRATE",
+      "LUMEN_CLIENT_VIDEO_MAXIMUM_FRAME_AGE_US",
+      "LUMEN_CLIENT_VIDEO_FLEXFEC",
+      "LUMEN_CLIENT_VIDEO_RTX",
+    };
+
+    /** @brief Remove prior LSP-only values before every application launch. */
+    void clear_lsp_launch_environment(boost::process::v1::environment &env) {
+      for (const auto *name : lsp_environment_names) {
+        env.erase(name);
+      }
+    }
+  }  // namespace
 
   proc_t proc;  ///< Global process registry used to track and terminate child processes.
 
@@ -128,6 +166,58 @@ namespace proc {
     }
     env["LUMEN_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session.surround_params;
     env["SUNSHINE_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session.surround_params;
+  }
+
+  bool lsp_launch_request_t::valid() const noexcept {
+    const auto audio_channels_valid = audio_channels == 2 || audio_channels == 6 || audio_channels == 8;
+    return width > 0 && height > 0 && refresh_numerator != 0 && refresh_denominator != 0 &&
+           refresh_numerator / refresh_denominator <= static_cast<std::uint32_t>(std::numeric_limits<int>::max()) &&
+           pointer_rate >= 125 && pointer_rate <= 16'000 && controller_rate >= 125 && controller_rate <= 2'000 &&
+           sensor_rate >= 125 && sensor_rate <= 4'000 && reconciliation_rate >= 50 && reconciliation_rate <= 1'000 &&
+           audio_channels_valid && audio_streams != 0 && audio_streams <= audio_channels &&
+           audio_coupled_streams <= audio_streams && audio_frame_samples != 0 && audio_bitrate != 0 &&
+           video_codec != 0 && video_profile != 0 && video_pixel_class != 0 &&
+           video_color_primaries != 0 && video_transfer_function != 0 && video_matrix_coefficients != 0 &&
+           video_bits_per_second != 0 &&
+           maximum_frame_age_microseconds != 0;
+  }
+
+  void apply_lsp_launch_environment(
+    boost::process::v1::environment &env,
+    const lsp_launch_request_t &request
+  ) {
+    env["LUMEN_CLIENT_PROTOCOL"] = "lsp/1";
+    env["LUMEN_CLIENT_POINTER_RATE"] = std::to_string(request.pointer_rate);
+    env["LUMEN_CLIENT_CONTROLLER_RATE"] = std::to_string(request.controller_rate);
+    env["LUMEN_CLIENT_SENSOR_RATE"] = std::to_string(request.sensor_rate);
+    env["LUMEN_CLIENT_RECONCILIATION_RATE"] = std::to_string(request.reconciliation_rate);
+    env["LUMEN_CLIENT_CONTROLLER_OUTPUT"] = request.controller_output ? "true" : "false";
+    env["LUMEN_CLIENT_AUDIO_CHANNELS"] = std::to_string(request.audio_channels);
+    env["LUMEN_CLIENT_AUDIO_STREAMS"] = std::to_string(request.audio_streams);
+    env["LUMEN_CLIENT_AUDIO_COUPLED_STREAMS"] = std::to_string(request.audio_coupled_streams);
+    std::string audio_mapping;
+    for (std::size_t index = 0; index < request.audio_channels; ++index) {
+      if (!audio_mapping.empty()) {
+        audio_mapping.push_back(',');
+      }
+      audio_mapping += std::to_string(request.audio_mapping[index]);
+    }
+    env["LUMEN_CLIENT_AUDIO_MAPPING"] = audio_mapping;
+    env["LUMEN_CLIENT_AUDIO_FRAME_SAMPLES"] = std::to_string(request.audio_frame_samples);
+    env["LUMEN_CLIENT_AUDIO_BITRATE"] = std::to_string(request.audio_bitrate);
+    env["LUMEN_CLIENT_AUDIO_INBAND_FEC"] = request.audio_inband_fec ? "true" : "false";
+    env["LUMEN_CLIENT_AUDIO_DTX"] = request.audio_dtx ? "true" : "false";
+    env["LUMEN_CLIENT_VIDEO_CODEC"] = std::to_string(request.video_codec);
+    env["LUMEN_CLIENT_VIDEO_PROFILE"] = std::to_string(request.video_profile);
+    env["LUMEN_CLIENT_VIDEO_PIXEL_CLASS"] = std::to_string(request.video_pixel_class);
+    env["LUMEN_CLIENT_VIDEO_COLOR_PRIMARIES"] = std::to_string(request.video_color_primaries);
+    env["LUMEN_CLIENT_VIDEO_TRANSFER_FUNCTION"] = std::to_string(request.video_transfer_function);
+    env["LUMEN_CLIENT_VIDEO_MATRIX_COEFFICIENTS"] = std::to_string(request.video_matrix_coefficients);
+    env["LUMEN_CLIENT_VIDEO_FULL_RANGE"] = request.video_full_range ? "true" : "false";
+    env["LUMEN_CLIENT_VIDEO_BITRATE"] = std::to_string(request.video_bits_per_second);
+    env["LUMEN_CLIENT_VIDEO_MAXIMUM_FRAME_AGE_US"] = std::to_string(request.maximum_frame_age_microseconds);
+    env["LUMEN_CLIENT_VIDEO_FLEXFEC"] = request.flexfec ? "true" : "false";
+    env["LUMEN_CLIENT_VIDEO_RTX"] = request.rtx ? "true" : "false";
   }
 
   void terminate_process_group(boost::process::v1::child &proc, boost::process::v1::group &group, std::chrono::seconds exit_timeout) {
@@ -217,11 +307,20 @@ namespace proc {
   }
 
   int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    return execute_impl(app_id, std::move(launch_session), nullptr);
+  }
+
+  int proc_t::execute_impl(
+    const int app_id,
+    std::shared_ptr<rtsp_stream::launch_session_t> launch_session,
+    const lsp_launch_request_t *lsp_request
+  ) {
     auto lifecycle = _lifecycle->lock();
     // Ensure starting from a clean slate
     terminate();
     const auto process_generation = ++(*_lifecycle)->generation;
     (*_lifecycle)->legacy_attachable = false;
+    (*_lifecycle)->lsp_owned = false;
     launch_session->process_generation = process_generation;
 
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
@@ -240,7 +339,11 @@ namespace proc {
     _app_prep_it = _app_prep_begin;
 
     // LUMEN_* carries exact modern values while SUNSHINE_* retains the legacy shape.
+    clear_lsp_launch_environment(_env);
     apply_launch_environment(_env, _app_id, _app.name, *launch_session);
+    if (lsp_request != nullptr) {
+      apply_lsp_launch_environment(_env, *lsp_request);
+    }
 
     if (!_app.output.empty() && _app.output != "null"sv) {
 #ifdef _WIN32
@@ -335,26 +438,54 @@ namespace proc {
     return 0;
   }
 
-  proc_t::lsp_launch_result_t proc_t::execute_lsp_if_idle(const int app_id) {
+  proc_t::lsp_launch_result_t proc_t::execute_lsp_if_idle(
+    const int app_id,
+    const lsp_launch_request_t &request
+  ) {
     auto lifecycle = _lifecycle->lock();
     if (running() > 0) {
       return {.status = 409};
     }
+    if (!request.valid()) {
+      return {.status = -1};
+    }
     auto launch = std::make_shared<rtsp_stream::launch_session_t>();
     launch->appid = app_id;
     launch->unique_id = "lsp";
-    launch->refresh_denominator = 1;
-    launch->surround_info = 2;
-    const auto status = execute(app_id, launch);
+    launch->width = request.width;
+    launch->height = request.height;
+    launch->fps = static_cast<int>(std::max<std::uint32_t>(1, request.refresh_numerator / request.refresh_denominator));
+    launch->refresh_numerator = request.refresh_numerator;
+    launch->refresh_denominator = request.refresh_denominator;
+    launch->surround_info = request.audio_channels;
+    launch->continuous_audio = !request.audio_dtx;
+    launch->enable_hdr = request.hdr;
+    launch->enable_sops = request.flexfec || request.rtx;
+    const auto status = execute_impl(app_id, launch, &request);
+    if (status == 0) {
+      (*_lifecycle)->lsp_owned = true;
+    }
     return {
       .status = status,
       .process_generation = status == 0 ? launch->process_generation : 0,
     };
   }
 
+  lsp_process_state_t proc_t::lsp_process_state() {
+    auto lifecycle = _lifecycle->lock();
+    const auto application_id = running();
+    return {
+      .application_id = application_id,
+      .process_generation = application_id > 0 ? (*_lifecycle)->generation : 0,
+      .running = application_id > 0,
+      .lsp_owned = application_id > 0 && (*_lifecycle)->lsp_owned,
+    };
+  }
+
   bool proc_t::terminate_lsp_generation(const std::uint64_t process_generation) {
     auto lifecycle = _lifecycle->lock();
-    if (process_generation == 0 || process_generation != (*_lifecycle)->generation || (*_lifecycle)->legacy_attachable) {
+    if (process_generation == 0 || process_generation != (*_lifecycle)->generation ||
+        !(*_lifecycle)->lsp_owned) {
       return false;
     }
     if (running() > 0) {
@@ -471,6 +602,7 @@ namespace proc {
     std::error_code ec;
     placebo = false;
     (*_lifecycle)->legacy_attachable = false;
+    (*_lifecycle)->lsp_owned = false;
     (*_lifecycle)->cancel_client_certificates.clear();
     terminate_process_group(_process, _process_group, _app.exit_timeout);
     _process = boost::process::v1::child();

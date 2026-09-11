@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -23,6 +24,24 @@ namespace lumen::lsp {
   using PublicKey256 = std::array<std::uint8_t, 32>;  ///< Ed25519 public key bytes.
   using Digest256 = std::array<std::uint8_t, 32>;  ///< SHA-256 digest bytes.
   using Secret256 = std::array<std::uint8_t, 32>;  ///< Fixed-width nonce, confirmation, digest, or attach secret.
+
+  /** @brief Bounded stable RTCP SDES CNAME supplied once per authenticated association. */
+  struct RtcpCname {
+    std::array<std::uint8_t, 64> bytes {};  ///< Host-unique opaque CNAME bytes.
+    std::uint8_t size {};  ///< Populated leading bytes, one through 64.
+
+    /** @brief Return whether one nonempty bounded CNAME is present. */
+    [[nodiscard]] constexpr bool valid() const noexcept {
+      return size != 0 && size <= bytes.size();
+    }
+
+    /** @brief Return the populated immutable CNAME bytes. */
+    [[nodiscard]] constexpr std::span<const std::uint8_t> view() const noexcept {
+      return valid() ? std::span<const std::uint8_t> {bytes}.first(size) : std::span<const std::uint8_t> {};
+    }
+
+    bool operator==(const RtcpCname &) const = default;
+  };
 
   /**
    * @brief Return whether every byte in a fixed-width protocol value is zero.
@@ -152,6 +171,15 @@ namespace lumen::lsp {
     ipv6,  ///< IPv6 UDP socket.
   };
 
+  /** @brief Canonical binary remote address cached by the native socket per association. */
+  struct CanonicalPeerAddress {
+    std::array<std::uint8_t, 16> address {};  ///< IPv4 bytes in the leading four positions or full IPv6 bytes.
+    std::uint32_t scope_id {};  ///< IPv6 scope identifier, zero for IPv4/global IPv6.
+    bool valid {};  ///< Whether binary family/address bytes are authoritative.
+
+    bool operator==(const CanonicalPeerAddress &) const = default;
+  };
+
   /**
    * @brief Host-visible LSP configuration values.
    */
@@ -181,8 +209,11 @@ namespace lumen::lsp {
     IpAddressFamily family {IpAddressFamily::ipv4};  ///< IP protocol family.
     std::string local_address;  ///< Numeric local address that received the datagram.
     std::uint16_t local_port {};  ///< Local LSP application port.
+    CanonicalPeerAddress canonical_local;  ///< Exact received local destination address and IPv6 scope.
+    std::uint32_t interface_index {};  ///< Receiving interface used for same-source replies, zero when unavailable.
     std::string remote_address;  ///< Numeric remote source address.
     std::uint16_t remote_port {};  ///< Nonzero remote UDP source port.
+    CanonicalPeerAddress canonical_remote;  ///< Cached binary address avoiding steady-state text parsing.
 
     /**
      * @brief Validate the endpoint before passing it to a security provider.
@@ -191,7 +222,8 @@ namespace lumen::lsp {
      */
     [[nodiscard]] bool valid() const noexcept;
 
-    bool operator==(const PeerEndpoint &) const = default;
+    /** @brief Compare semantic five-tuple fields while ignoring the derived binary cache. */
+    bool operator==(const PeerEndpoint &other) const noexcept;
   };
 
   /**

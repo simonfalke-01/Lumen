@@ -11,6 +11,7 @@ extern "C" {
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cmath>
@@ -19,14 +20,15 @@ extern "C" {
 #include <mutex>
 #include <new>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
-  // clang-format off: avrt.h depends on the Windows base types.
+// clang-format off: avrt.h depends on the Windows base types.
   #include <windows.h>
   #include <avrt.h>
-  // clang-format on
+// clang-format on
 #endif
 
 // lib includes
@@ -238,13 +240,33 @@ namespace input {
       bool active {};  ///< Whether this slot is live.
     };
 
+    struct pen_t {
+      std::uint32_t instance_generation {};  ///< Exact live pen generation.
+      platf::pen_input_t state {};  ///< Latest submitted pen state used for lifecycle completion.
+      bool active {};  ///< Whether a begin edge owns this pen.
+      bool submitted {};  ///< Whether coordinates were submitted to the platform.
+      bool contact {};  ///< Whether the last submitted state held the pen tip down.
+    };
+
+    struct touch_t {
+      std::uint32_t device_id {};  ///< Owning direct-touch device.
+      std::uint32_t instance_generation {};  ///< Exact device generation.
+      std::uint32_t contact_id {};  ///< Device-local contact identifier.
+      platf::touch_input_t state {};  ///< Latest submitted contact state for lifecycle completion.
+      bool occupied {};  ///< Whether this bounded contact slot is live.
+      bool submitted {};  ///< Whether a down/move event reached the platform.
+    };
+
     std::bitset<256> keyboard_usages;  ///< Pressed USB keyboard-page usages.
     std::bitset<6> pointer_buttons;  ///< Pressed pointer buttons one through five.
     std::array<controller_t, 16> controllers;  ///< LSP controller slots.
+    std::array<pen_t, 16> pens;  ///< Generation-qualified direct pen contacts.
+    std::array<touch_t, 256> touches;  ///< Bounded direct-touch devices and contacts.
+    std::unique_ptr<platf::client_input_t> client_context;  ///< Per-client touch/pen platform context.
     safe::mail_t feedback_mail;  ///< Private controller-feedback mailbox.
     platf::feedback_queue_t feedback_queue;  ///< Platform callback queue.
-    lsp_controller_feedback_callback_t feedback_callback {};  ///< Runtime LSPG callback.
-    void *feedback_context {};  ///< Runtime callback context.
+    std::atomic<lsp_controller_feedback_callback_t> feedback_callback {};  ///< Runtime LSPG callback lifetime gate.
+    std::atomic<void *> feedback_context {};  ///< Runtime callback context lifetime gate.
     std::jthread feedback_worker;  ///< Feedback queue drain owner.
   };
 
@@ -252,7 +274,7 @@ namespace input {
    * @brief Map a USB keyboard-page usage to the existing platform virtual-key boundary.
    *
    * @param usage USB HID usage.
-   * @return Virtual-key code, or zero when this first input slice does not support the usage.
+   * @return Virtual-key code, or zero for reserved or unrepresentable usages.
    */
   std::uint16_t virtual_key_from_hid_usage(const std::uint16_t usage) noexcept {
     if (usage >= 4 && usage <= 29) {
@@ -267,6 +289,12 @@ namespace input {
     if (usage >= 58 && usage <= 69) {
       return static_cast<std::uint16_t>(0x70 + usage - 58);
     }
+    if (usage >= 89 && usage <= 97) {
+      return static_cast<std::uint16_t>(0x61 + usage - 89);
+    }
+    if (usage >= 104 && usage <= 115) {
+      return static_cast<std::uint16_t>(0x7c + usage - 104);
+    }
     switch (usage) {
       case 40:
         return 0x0d;
@@ -278,6 +306,30 @@ namespace input {
         return 0x09;
       case 44:
         return 0x20;
+      case 45:
+        return 0xbd;
+      case 46:
+        return 0xbb;
+      case 47:
+        return 0xdb;
+      case 48:
+        return 0xdd;
+      case 49:
+        return 0xdc;
+      case 50:
+        return 0xe2;
+      case 51:
+        return 0xba;
+      case 52:
+        return 0xde;
+      case 53:
+        return 0xc0;
+      case 54:
+        return 0xbc;
+      case 55:
+        return 0xbe;
+      case 56:
+        return 0xbf;
       case 57:
         return 0x14;
       case 70:
@@ -308,6 +360,88 @@ namespace input {
         return 0x26;
       case 83:
         return 0x90;
+      case 84:
+        return 0x6f;
+      case 85:
+        return 0x6a;
+      case 86:
+        return 0x6d;
+      case 87:
+        return 0x6b;
+      case 88:
+        return 0x0d;
+      case 98:
+        return 0x60;
+      case 99:
+        return 0x6e;
+      case 100:
+        return 0xe2;
+      case 101:
+        return 0x5d;
+      case 102:
+        return 0x5f;
+      case 103:
+        return 0xbb;
+      case 116:
+        return 0x2b;
+      case 117:
+        return 0x2f;
+      case 118:
+        return 0x5d;
+      case 119:
+        return 0x29;
+      case 120:
+        return 0xb2;
+      case 127:
+        return 0xad;
+      case 128:
+        return 0xaf;
+      case 129:
+        return 0xae;
+      case 130:
+        return 0x14;
+      case 131:
+        return 0x90;
+      case 132:
+        return 0x91;
+      case 133:
+        return 0x6c;
+      case 134:
+        return 0xbb;
+      case 135:
+        return 0xe2;
+      case 136:
+        return 0x15;
+      case 137:
+        return 0xdc;
+      case 138:
+        return 0x1c;
+      case 139:
+        return 0x1d;
+      case 140:
+        return 0x6c;
+      case 144:
+        return 0x15;
+      case 145:
+        return 0x19;
+      case 154:
+        return 0xf6;
+      case 155:
+        return 0x03;
+      case 156:
+        return 0x0c;
+      case 157:
+        return 0x21;
+      case 158:
+        return 0x0d;
+      case 159:
+        return 0x6c;
+      case 162:
+        return 0x0c;
+      case 163:
+        return 0xf7;
+      case 164:
+        return 0xf8;
       case 224:
         return VKEY_LCONTROL;
       case 225:
@@ -331,17 +465,32 @@ namespace input {
 
   void lsp_platform_input_deleter_t::operator()(lsp_platform_input_t *input) const noexcept {
     if (input != nullptr) {
+      stop_lsp_platform_input_feedback(*input);
       neutralize_lsp_platform_input(*input);
-      if (input->feedback_queue) {
-        input->feedback_queue->stop();
-      }
-      input->feedback_worker.request_stop();
-      if (input->feedback_worker.joinable()) {
-        input->feedback_worker.join();
-      }
     }
     delete input;
   }
+
+  void stop_lsp_platform_input_feedback(lsp_platform_input_t &input) noexcept {
+    input.feedback_callback.store(nullptr, std::memory_order_release);
+    if (input.feedback_queue) {
+      input.feedback_queue->stop();
+    }
+    input.feedback_worker.request_stop();
+    if (input.feedback_worker.joinable() && input.feedback_worker.get_id() != std::this_thread::get_id()) {
+      input.feedback_worker.join();
+    }
+    input.feedback_context.store(nullptr, std::memory_order_release);
+  }
+
+#ifdef SUNSHINE_TESTS
+  bool detail::raise_lsp_platform_feedback_for_test(
+    lsp_platform_input_t &input,
+    const platf::gamepad_feedback_msg_t &message
+  ) noexcept {
+    return input.feedback_queue && input.feedback_queue->raise(message);
+  }
+#endif
 
   lsp_platform_input_ptr alloc_lsp_platform_input(
     const lsp_controller_feedback_callback_t feedback_callback,
@@ -351,8 +500,9 @@ namespace input {
     if (!input) {
       return {};
     }
-    input->feedback_callback = feedback_callback;
-    input->feedback_context = feedback_context;
+    input->feedback_callback.store(feedback_callback, std::memory_order_release);
+    input->feedback_context.store(feedback_context, std::memory_order_release);
+    input->client_context = platf::allocate_client_input_context(platf_input);
     input->feedback_mail = std::make_shared<safe::mail_raw_t>();
     input->feedback_queue = input->feedback_mail->queue<platf::gamepad_feedback_msg_t>("lsp-controller-feedback");
     if (feedback_callback != nullptr) {
@@ -361,8 +511,9 @@ namespace input {
         input->feedback_worker = std::jthread {[raw](const std::stop_token stop_token) {
           while (!stop_token.stop_requested()) {
             const auto message = raw->feedback_queue->pop(10ms);
-            if (message && raw->feedback_callback != nullptr) {
-              raw->feedback_callback(raw->feedback_context, {*message});
+            const auto callback = raw->feedback_callback.load(std::memory_order_acquire);
+            if (message && callback != nullptr) {
+              callback(raw->feedback_context.load(std::memory_order_acquire), {*message});
             }
           }
         }};
@@ -380,27 +531,70 @@ namespace input {
     std::int64_t vertical_scroll,
     std::int64_t horizontal_scroll
   ) noexcept {
-    (void)input;
+    (void) input;
+    if (!valid_lsp_pointer_differences(delta_x, delta_y, vertical_scroll, horizontal_scroll)) {
+      return false;
+    }
     std::lock_guard lock(platform_input_mutex);
     constexpr auto minimum = static_cast<std::int64_t>(std::numeric_limits<int>::min());
     constexpr auto maximum = static_cast<std::int64_t>(std::numeric_limits<int>::max());
+    std::size_t chunks = 0;
     while (delta_x != 0 || delta_y != 0) {
+      if (chunks++ == maximum_lsp_pointer_chunks) {
+        return false;
+      }
       const auto x = static_cast<int>(std::clamp(delta_x, minimum, maximum));
       const auto y = static_cast<int>(std::clamp(delta_y, minimum, maximum));
       platf::move_mouse(platf_input, x, y);
       delta_x -= x;
       delta_y -= y;
     }
+    chunks = 0;
     while (vertical_scroll != 0) {
+      if (chunks++ == maximum_lsp_pointer_chunks) {
+        return false;
+      }
       const auto distance = static_cast<int>(std::clamp(vertical_scroll, minimum, maximum));
       platf::scroll(platf_input, distance);
       vertical_scroll -= distance;
     }
+    chunks = 0;
     while (horizontal_scroll != 0) {
+      if (chunks++ == maximum_lsp_pointer_chunks) {
+        return false;
+      }
       const auto distance = static_cast<int>(std::clamp(horizontal_scroll, minimum, maximum));
       platf::hscroll(platf_input, distance);
       horizontal_scroll -= distance;
     }
+    return true;
+  }
+
+  bool apply_lsp_absolute_pointer(
+    lsp_platform_input_t &input,
+    const std::uint32_t absolute_x,
+    const std::uint32_t absolute_y,
+    const std::int64_t vertical_scroll,
+    const std::int64_t horizontal_scroll
+  ) noexcept {
+    (void) input;
+    if (!valid_lsp_pointer_differences(0, 0, vertical_scroll, horizontal_scroll)) {
+      return false;
+    }
+    constexpr float coordinate_maximum = 65'535.0f;
+    constexpr auto normalized_port = platf::touch_port_t {0, 0, 65'535, 65'535, 65'535, 65'535};
+    const auto x = static_cast<float>(absolute_x) /
+                   static_cast<float>(std::numeric_limits<std::uint32_t>::max()) * coordinate_maximum;
+    const auto y = static_cast<float>(absolute_y) /
+                   static_cast<float>(std::numeric_limits<std::uint32_t>::max()) * coordinate_maximum;
+    std::lock_guard lock(platform_input_mutex);
+    if (vertical_scroll != 0) {
+      platf::scroll(platf_input, static_cast<int>(vertical_scroll));
+    }
+    if (horizontal_scroll != 0) {
+      platf::hscroll(platf_input, static_cast<int>(horizontal_scroll));
+    }
+    platf::abs_mouse(platf_input, normalized_port, x, y);
     return true;
   }
 
@@ -410,7 +604,7 @@ namespace input {
     }
     const auto key = virtual_key_from_hid_usage(hid_usage);
     if (key == 0) {
-      return false;
+      return release;
     }
     std::lock_guard lock(platform_input_mutex);
     if (input.keyboard_usages[hid_usage] == !release) {
@@ -418,6 +612,23 @@ namespace input {
     }
     input.keyboard_usages[hid_usage] = !release;
     update_platform_keyboard_locked(key, release, 0);
+    return true;
+  }
+
+  bool apply_lsp_utf8_text(
+    lsp_platform_input_t &input,
+    const std::span<const std::uint8_t> utf8
+  ) noexcept {
+    (void) input;
+    if (utf8.empty() || utf8.size() > 16U * 1'024U || utf8.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+    std::scoped_lock lock(platform_input_mutex);
+    platf::unicode(
+      platf_input,
+      reinterpret_cast<char *>(const_cast<std::uint8_t *>(utf8.data())),
+      static_cast<int>(utf8.size())
+    );
     return true;
   }
 
@@ -466,6 +677,21 @@ namespace input {
       platf::free_gamepad(platf_input, controller.reservation.id);
       gamepad_slots.release(controller.reservation);
       controller = {};
+    }
+    constexpr auto normalized_port = platf::touch_port_t {0, 0, 65'535, 65'535, 65'535, 65'535};
+    for (auto &touch : input.touches) {
+      if (input.client_context && touch.occupied && touch.submitted) {
+        touch.state.eventType = 4;
+        platf::touch_update(input.client_context.get(), normalized_port, touch.state);
+      }
+      touch = {};
+    }
+    for (auto &pen : input.pens) {
+      if (input.client_context && pen.active && pen.submitted) {
+        pen.state.eventType = 4;
+        platf::pen_update(input.client_context.get(), normalized_port, pen.state);
+      }
+      pen = {};
     }
   }
 
@@ -596,12 +822,37 @@ namespace input {
       return false;
     }
     platf::gamepad_motion(platf_input, {
-      .id = {controller.reservation.id, static_cast<std::uint8_t>(controller_id - 1), input_generation, instance_generation},
-      .motionType = sensor_type,
-      .x = x,
-      .y = y,
-      .z = z,
-    });
+                                         .id = {controller.reservation.id, static_cast<std::uint8_t>(controller_id - 1), input_generation, instance_generation},
+                                         .motionType = sensor_type,
+                                         .x = x,
+                                         .y = y,
+                                         .z = z,
+                                       });
+    return true;
+  }
+
+  bool apply_lsp_controller_battery(
+    lsp_platform_input_t &input,
+    const std::uint32_t input_generation,
+    const std::uint32_t controller_id,
+    const std::uint32_t instance_generation,
+    const std::uint8_t battery_state,
+    const std::uint8_t battery_percent
+  ) noexcept {
+    if (input_generation == 0 || controller_id == 0 || controller_id > input.controllers.size() ||
+        battery_state > 3U || !((battery_state == 0 && battery_percent == 255U) || (battery_state != 0 && battery_percent <= 100U))) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    const auto &controller = input.controllers[controller_id - 1U];
+    if (!controller.active || controller.instance_generation != instance_generation) {
+      return false;
+    }
+    platf::gamepad_battery(platf_input, {
+                                          .id = {controller.reservation.id, static_cast<std::uint8_t>(controller_id - 1U), input_generation, instance_generation},
+                                          .state = battery_state,
+                                          .percentage = battery_percent,
+                                        });
     return true;
   }
 
@@ -625,13 +876,211 @@ namespace input {
       return false;
     }
     platf::gamepad_touch(platf_input, {
-      .id = {controller.reservation.id, static_cast<std::uint8_t>(controller_id - 1), input_generation, instance_generation},
-      .eventType = event_type,
+                                        .id = {controller.reservation.id, static_cast<std::uint8_t>(controller_id - 1), input_generation, instance_generation},
+                                        .eventType = event_type,
+                                        .pointerId = contact_id,
+                                        .x = x,
+                                        .y = y,
+                                        .pressure = pressure,
+                                      });
+    return true;
+  }
+
+  bool apply_lsp_pen_lifecycle(
+    lsp_platform_input_t &input,
+    const std::uint32_t pen_id,
+    const std::uint32_t instance_generation,
+    const std::uint8_t event_type
+  ) noexcept {
+    if (pen_id == 0 || pen_id > input.pens.size() || instance_generation == 0 ||
+        (event_type != 1U && event_type != 2U && event_type != 4U) || !input.client_context) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    auto &pen = input.pens[pen_id - 1U];
+    if (event_type == 1U) {
+      if (pen.active) {
+        return pen.instance_generation == instance_generation;
+      }
+      pen.instance_generation = instance_generation;
+      pen.active = true;
+      return true;
+    }
+    if (!pen.active || pen.instance_generation != instance_generation) {
+      return false;
+    }
+    if (pen.submitted) {
+      constexpr auto normalized_port = platf::touch_port_t {0, 0, 65'535, 65'535, 65'535, 65'535};
+      pen.state.eventType = event_type;
+      platf::pen_update(input.client_context.get(), normalized_port, pen.state);
+    }
+    pen.submitted = false;
+    pen.contact = false;
+    return true;
+  }
+
+  bool apply_lsp_touch_lifecycle(
+    lsp_platform_input_t &input,
+    const std::uint32_t device_id,
+    const std::uint32_t instance_generation,
+    const std::uint32_t contact_id,
+    const std::uint8_t event_type
+  ) noexcept {
+    if (device_id == 0 || device_id > 16U || instance_generation == 0 || contact_id == 0 || contact_id > 16U ||
+        (event_type != 1U && event_type != 2U && event_type != 4U) || !input.client_context) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    auto *entry = static_cast<lsp_platform_input_t::touch_t *>(nullptr);
+    auto *empty = static_cast<lsp_platform_input_t::touch_t *>(nullptr);
+    for (auto &candidate : input.touches) {
+      if (candidate.occupied && candidate.device_id == device_id &&
+          candidate.instance_generation == instance_generation && candidate.contact_id == contact_id) {
+        entry = &candidate;
+        break;
+      }
+      if (!candidate.occupied && empty == nullptr) {
+        empty = &candidate;
+      }
+    }
+    if (event_type == 1U) {
+      if (entry != nullptr) {
+        return true;
+      }
+      if (empty == nullptr) {
+        return false;
+      }
+      *empty = {
+        .device_id = device_id,
+        .instance_generation = instance_generation,
+        .contact_id = contact_id,
+        .occupied = true,
+      };
+      return true;
+    }
+    if (entry == nullptr) {
+      return false;
+    }
+    if (entry->submitted) {
+      constexpr auto normalized_port = platf::touch_port_t {0, 0, 65'535, 65'535, 65'535, 65'535};
+      entry->state.eventType = event_type;
+      platf::touch_update(input.client_context.get(), normalized_port, entry->state);
+    }
+    *entry = {};
+    return true;
+  }
+
+  bool apply_lsp_touch_state(
+    lsp_platform_input_t &input,
+    const std::uint32_t device_id,
+    const std::uint32_t instance_generation,
+    const std::uint32_t contact_id,
+    const bool active,
+    const std::uint32_t x,
+    const std::uint32_t y,
+    const std::uint16_t pressure,
+    const std::uint16_t major,
+    const std::uint16_t minor,
+    const std::int16_t orientation
+  ) noexcept {
+    if (device_id == 0 || device_id > 16U || instance_generation == 0 || contact_id == 0 || contact_id > 16U ||
+        !input.client_context) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    auto *entry = static_cast<lsp_platform_input_t::touch_t *>(nullptr);
+    for (auto &candidate : input.touches) {
+      if (candidate.occupied && candidate.device_id == device_id &&
+          candidate.instance_generation == instance_generation && candidate.contact_id == contact_id) {
+        entry = &candidate;
+        break;
+      }
+    }
+    if (entry == nullptr || !active) {
+      return entry != nullptr && !active;
+    }
+    constexpr float coordinate_maximum = 65'535.0f;
+    constexpr auto normalized_port = platf::touch_port_t {0, 0, 65'535, 65'535, 65'535, 65'535};
+    constexpr float radians_to_degrees = 57.29577951308232f;
+    auto rotation = static_cast<int>(std::lround(static_cast<float>(orientation) / 4'096.0f * radians_to_degrees));
+    rotation %= 360;
+    if (rotation < 0) {
+      rotation += 360;
+    }
+    entry->state = {
+      .eventType = static_cast<std::uint8_t>(entry->submitted ? 3U : 1U),
+      .rotation = static_cast<std::uint16_t>(rotation),
       .pointerId = contact_id,
-      .x = x,
-      .y = y,
-      .pressure = pressure,
-    });
+      .x = static_cast<float>(x) / static_cast<float>(std::numeric_limits<std::uint32_t>::max()) * coordinate_maximum,
+      .y = static_cast<float>(y) / static_cast<float>(std::numeric_limits<std::uint32_t>::max()) * coordinate_maximum,
+      .pressureOrDistance = static_cast<float>(pressure) / std::numeric_limits<std::uint16_t>::max(),
+      .contactAreaMajor = static_cast<float>(major) / std::numeric_limits<std::uint16_t>::max() * coordinate_maximum,
+      .contactAreaMinor = static_cast<float>(minor) / std::numeric_limits<std::uint16_t>::max() * coordinate_maximum,
+    };
+    platf::touch_update(input.client_context.get(), normalized_port, entry->state);
+    entry->submitted = true;
+    return true;
+  }
+
+  bool apply_lsp_pen_state(
+    lsp_platform_input_t &input,
+    const std::uint32_t pen_id,
+    const std::uint32_t instance_generation,
+    const bool in_range,
+    const bool contact,
+    const bool eraser,
+    const std::uint16_t buttons,
+    const std::uint32_t x,
+    const std::uint32_t y,
+    const std::uint16_t pressure,
+    const std::int16_t tilt_x,
+    const std::int16_t tilt_y,
+    const std::int16_t rotation,
+    const std::uint16_t distance,
+    const std::uint16_t contact_id
+  ) noexcept {
+    if (pen_id == 0 || pen_id > input.pens.size() || instance_generation == 0 || buttons > 0xffU ||
+        (in_range && contact_id == 0) || (!in_range && (contact || buttons != 0 || pressure != 0)) ||
+        !input.client_context) {
+      return false;
+    }
+    std::lock_guard lock(platform_input_mutex);
+    auto &pen = input.pens[pen_id - 1U];
+    if (!pen.active || pen.instance_generation != instance_generation) {
+      return false;
+    }
+    constexpr float coordinate_maximum = 65'535.0f;
+    constexpr float radians_to_degrees = 57.29577951308232f;
+    constexpr auto normalized_port = platf::touch_port_t {0, 0, 65'535, 65'535, 65'535, 65'535};
+    auto rotation_degrees = static_cast<int>(std::lround(static_cast<float>(rotation) / 4'096.0f * radians_to_degrees));
+    rotation_degrees %= 360;
+    if (rotation_degrees < 0) {
+      rotation_degrees += 360;
+    }
+    const auto tilt_radians = std::hypot(static_cast<float>(tilt_x), static_cast<float>(tilt_y)) / 4'096.0f;
+    const auto tilt_degrees = std::clamp<int>(
+      static_cast<int>(std::lround(tilt_radians * radians_to_degrees)),
+      0,
+      90
+    );
+    const auto event_type = !in_range ? LI_TOUCH_EVENT_HOVER_LEAVE :
+                            contact   ? (pen.contact ? LI_TOUCH_EVENT_MOVE : LI_TOUCH_EVENT_DOWN) :
+                                        LI_TOUCH_EVENT_HOVER;
+    pen.state = {
+      .eventType = static_cast<std::uint8_t>(event_type),
+      .toolType = static_cast<std::uint8_t>(eraser ? LI_TOOL_TYPE_ERASER : LI_TOOL_TYPE_PEN),
+      .penButtons = static_cast<std::uint8_t>(buttons),
+      .tilt = static_cast<std::uint8_t>(tilt_degrees),
+      .rotation = static_cast<std::uint16_t>(rotation_degrees),
+      .x = static_cast<float>(x) / static_cast<float>(std::numeric_limits<std::uint32_t>::max()) * coordinate_maximum,
+      .y = static_cast<float>(y) / static_cast<float>(std::numeric_limits<std::uint32_t>::max()) * coordinate_maximum,
+      .pressureOrDistance = contact ?
+                              static_cast<float>(pressure) / std::numeric_limits<std::uint16_t>::max() :
+                              static_cast<float>(distance) / std::numeric_limits<std::uint16_t>::max(),
+    };
+    platf::pen_update(input.client_context.get(), normalized_port, pen.state);
+    pen.submitted = in_range;
+    pen.contact = contact;
     return true;
   }
 

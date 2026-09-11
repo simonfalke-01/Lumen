@@ -21,6 +21,13 @@ namespace lumen::lsp::runtime {
    * @brief Complete fresh LSP host identity, independent of legacy credentials.
    */
   struct HostIdentity {
+    HostIdentity() noexcept = default;
+    HostIdentity(const HostIdentity &) = delete;
+    HostIdentity &operator=(const HostIdentity &) = delete;
+    HostIdentity(HostIdentity &&other) noexcept;
+    HostIdentity &operator=(HostIdentity &&other) noexcept;
+    ~HostIdentity();
+
     Identifier128 host_id {};  ///< Stable random LSP host identifier.
     PublicKey256 application_public_key {};  ///< Ed25519 application identity public key.
     std::array<std::uint8_t, ed25519_private_key_size> application_private_key {};  ///< Ed25519 application identity private key.
@@ -75,6 +82,17 @@ namespace lumen::lsp::runtime {
    * @return Fresh identity or an exact provider/crypto failure.
    */
   [[nodiscard]] std::expected<HostIdentity, IdentityError> generate_identity() noexcept;
+
+  /** @brief Generate fresh DTLS credentials while retaining the stable application identity. */
+  [[nodiscard]] std::expected<HostIdentity, IdentityError> generate_rotated_identity(
+    const HostIdentity &current
+  ) noexcept;
+
+  /** @brief Atomically replace one persisted identity with a validated complete candidate. */
+  [[nodiscard]] std::expected<void, IdentityError> persist_identity_atomic(
+    const std::filesystem::path &path,
+    const HostIdentity &identity
+  ) noexcept;
 
   /**
    * @brief Load the existing LSP identity or generate and atomically persist it.

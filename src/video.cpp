@@ -198,6 +198,7 @@ namespace video {
       append(config.encoderCscMode);
       append(config.videoFormat);
       append(config.dynamicRange);
+      append(config.hdrTransfer);
       append(config.chromaSamplingType);
       append(config.enableIntraRefresh);
       append_codec_cache_string(fingerprint, config.output_name);
@@ -1658,6 +1659,16 @@ namespace video {
     return display->get_hdr_metadata(metadata) ? std::optional {metadata} : std::nullopt;
   }
 
+  bool active_hdr_capture_available(const config_t &config) noexcept {
+    const auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    if (!chosen_encoder || !chosen_encoder->platform_formats) {
+      return false;
+    }
+    const auto output_name = display_device::map_output_name(config.output_name);
+    const auto display = platf::display(chosen_encoder->platform_formats->dev_type, output_name, config);
+    return display && display->is_hdr();
+  }
+
   bool active_encoder_is_nvenc() {
     const auto probe_lock = std::lock_guard(encoder_probe_mutex);
     return chosen_encoder != nullptr && chosen_encoder->name == "nvenc"sv;
@@ -1674,11 +1685,14 @@ namespace video {
     const auto supported = codec[encoder_t::PASSED];
     const auto hardware = supported && chosen_encoder != &software;
     const auto native_nvenc = hardware && chosen_encoder->name == "nvenc"sv;
+    const auto hlg = hardware && video_format != 0 &&
+                     (codec[encoder_t::DYNAMIC_RANGE] || codec[encoder_t::DYNAMIC_RANGE_YUV444]);
     return {
       .supported = supported,
       .hardware = hardware,
       .verified_low_delay = hardware,
       .reference_invalidation = native_nvenc && last_encoder_probe_supported_ref_frames_invalidation,
+      .hlg = hlg,
     };
   }
 

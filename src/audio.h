@@ -10,8 +10,10 @@
 #include "utility.h"
 
 #include <bitset>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 
 namespace audio {
   /**
@@ -127,6 +129,20 @@ namespace audio {
    */
   class AudioPacketDestination {
   public:
+    /** @brief Maximum fixed Opus output bytes offered to a zero-allocation destination. */
+    inline static constexpr std::size_t maximum_encoded_packet_bytes = 1'400;
+
+    /** @brief Destination-owned writable Opus slab lease. */
+    struct packet_write_lease_t {
+      std::span<std::uint8_t> storage;  ///< Writable setup-allocated codec output storage.
+      std::uint64_t token {};  ///< Nonzero destination-specific slot incarnation.
+
+      /** @brief Return whether storage and token name one live reservation. */
+      [[nodiscard]] explicit operator bool() const noexcept {
+        return !storage.empty() && token != 0;
+      }
+    };
+
     /**
      * @brief Result of offering one packet to the protocol-owned destination.
      */
@@ -137,6 +153,53 @@ namespace audio {
     };
 
     virtual ~AudioPacketDestination() = default;
+
+    /** @brief Return whether this destination requires fixed-slab transfer with no heap fallback. */
+    [[nodiscard]] virtual bool requires_fixed_packet_storage() const noexcept {
+      return false;
+    }
+
+    /**
+     * @brief Reserve destination-owned codec output storage without allocation.
+     *
+     * Legacy destinations may return no value and receive the ordinary move-owned packet fallback.
+     *
+     * @return Writable fixed slab lease, or no value when unsupported or backpressured.
+     */
+    [[nodiscard]] virtual std::optional<packet_write_lease_t> acquire_packet_storage() noexcept {
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Commit bytes written into a destination-owned packet lease.
+     *
+     * @param lease Exact live lease returned by `acquire_packet_storage()`.
+     * @param payload_bytes Populated leading Opus bytes.
+     * @param sample_position Exact 48 kHz first-sample position.
+     * @param discontinuity Whether the decoder timeline must reset before this packet.
+     * @return Exact destination admission result.
+     */
+    [[nodiscard]] virtual enqueue_result_e commit_packet_storage(
+      const packet_write_lease_t &lease,
+      std::size_t payload_bytes,
+      std::uint64_t sample_position,
+      bool discontinuity
+    ) noexcept {
+      (void) lease;
+      (void) payload_bytes;
+      (void) sample_position;
+      (void) discontinuity;
+      return enqueue_result_e::backpressure;
+    }
+
+    /**
+     * @brief Release an uncommitted destination-owned packet lease.
+     *
+     * @param lease Exact live lease returned by `acquire_packet_storage()`.
+     */
+    virtual void cancel_packet_storage(const packet_write_lease_t &lease) noexcept {
+      (void) lease;
+    }
 
     /**
      * @brief Offer one encoded packet without blocking the encoder thread.

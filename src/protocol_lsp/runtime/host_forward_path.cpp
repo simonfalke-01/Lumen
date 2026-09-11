@@ -33,6 +33,7 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t shared_slot_begin = video_slot_begin + video_slot_count;
     constexpr std::uint64_t retry_delay_microseconds = 50;
     constexpr std::uint64_t microbatch_microseconds = 100;
+    constexpr std::uint64_t starvation_promotion_microseconds = 2'000;
     constexpr std::uint8_t maximum_microbatch_datagrams = 8;
 
     enum class SlotState : std::uint8_t {
@@ -50,6 +51,7 @@ namespace lumen::lsp::runtime {
       std::uint64_t deadline_microseconds {};
       std::uint64_t retry_at_microseconds {};
       std::uint64_t enqueue_ordinal {};
+      std::uint64_t enqueued_microseconds {};
       std::size_t protected_bytes {};
       std::uint16_t charged_bytes {};
       HostForwardCompletionTarget target {};
@@ -82,6 +84,21 @@ namespace lumen::lsp::runtime {
 
     [[nodiscard]] constexpr std::uint8_t lane_priority(const HostForwardLane lane) noexcept {
       return static_cast<std::uint8_t>(lane);
+    }
+
+    [[nodiscard]] constexpr std::uint8_t effective_lane_priority(
+      const Slot &slot,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      const auto priority = lane_priority(slot.lane);
+      if (priority == 0 || slot.enqueued_microseconds == 0 || now_microseconds < slot.enqueued_microseconds) {
+        return priority;
+      }
+      const auto promotions = std::min<std::uint64_t>(
+        priority,
+        (now_microseconds - slot.enqueued_microseconds) / starvation_promotion_microseconds
+      );
+      return static_cast<std::uint8_t>(priority - promotions);
     }
 
     [[nodiscard]] constexpr bool uses_control_reserve(const HostForwardLane lane) noexcept {
@@ -282,6 +299,7 @@ namespace lumen::lsp::runtime {
       if (slot.enqueue_ordinal == 0) {
         slot.enqueue_ordinal = next_enqueue_ordinal_++;
       }
+      slot.enqueued_microseconds = now;
       slot.state = SlotState::queued;
       --active_leases_;
       accepted_datagrams_.fetch_add(1, std::memory_order_relaxed);
@@ -341,6 +359,7 @@ namespace lumen::lsp::runtime {
         return false;
       }
       current_pacing_bits_per_second_.store(pacing_bits_per_second, std::memory_order_release);
+      const auto prior_path_payload = current_path_payload_bytes_.load(std::memory_order_acquire);
       current_path_payload_bytes_.store(path_payload_bytes, std::memory_order_release);
       const auto now = monotonic_microseconds();
       for (auto &slot : slots_) {
@@ -361,6 +380,9 @@ namespace lumen::lsp::runtime {
       }
       for (std::size_t index = 0; index < completion_count; ++index) {
         publish_completion(completions[index]);
+      }
+      if (path_payload_bytes != prior_path_payload && config_.callbacks.path_changed != nullptr) {
+        config_.callbacks.path_changed(config_.callbacks.context, config_.peer, path_payload_bytes);
       }
       return true;
     }
@@ -529,6 +551,7 @@ namespace lumen::lsp::runtime {
     }
 
     [[nodiscard]] std::optional<std::size_t> next_queued_slot() const noexcept {
+      const auto now = monotonic_microseconds();
       std::optional<std::size_t> selected;
       for (std::size_t index = 0; index < slots_.size(); ++index) {
         const auto &slot = slots_[index];
@@ -540,10 +563,12 @@ namespace lumen::lsp::runtime {
           continue;
         }
         const auto &current = slots_[*selected];
+        const auto current_priority = effective_lane_priority(current, now);
+        const auto candidate_priority = effective_lane_priority(slot, now);
         const auto current_deadline = current.deadline_microseconds == 0 ? std::numeric_limits<std::uint64_t>::max() : current.deadline_microseconds;
         const auto candidate_deadline = slot.deadline_microseconds == 0 ? std::numeric_limits<std::uint64_t>::max() : slot.deadline_microseconds;
-        if (lane_priority(slot.lane) < lane_priority(current.lane) ||
-            (slot.lane == current.lane &&
+        if (candidate_priority < current_priority ||
+            (candidate_priority == current_priority &&
              (candidate_deadline < current_deadline ||
               (candidate_deadline == current_deadline && slot.enqueue_ordinal < current.enqueue_ordinal)))) {
           selected = index;
@@ -726,13 +751,16 @@ namespace lumen::lsp::runtime {
         }
 
         auto selected = retry_slot();
-        const auto retrying = selected.has_value();
+        auto retrying = selected.has_value();
+        const auto queued = next_queued_slot();
+        if (!selected ||
+            (queued && lane_priority(slots_[*queued].lane) < lane_priority(slots_[*selected].lane))) {
+          selected = queued;
+          retrying = false;
+        }
         if (retrying && slots_[*selected].retry_at_microseconds > now) {
           precise_wait(lock, slots_[*selected].retry_at_microseconds - now);
           continue;
-        }
-        if (!selected) {
-          selected = next_queued_slot();
         }
         if (!selected) {
           condition_.wait(lock, [this, &stop_token]() {
@@ -742,16 +770,16 @@ namespace lumen::lsp::runtime {
         }
 
         auto &slot = slots_[*selected];
+        if (batch_window_started_microseconds_ == 0 || now < batch_window_started_microseconds_ ||
+            now - batch_window_started_microseconds_ >= microbatch_microseconds) {
+          batch_window_started_microseconds_ = now;
+          batch_datagrams_ = 0;
+        }
+        if (batch_datagrams_ >= maximum_microbatch_datagrams) {
+          precise_wait(lock, microbatch_microseconds - (now - batch_window_started_microseconds_));
+          continue;
+        }
         if (!retrying) {
-          if (batch_window_started_microseconds_ == 0 || now < batch_window_started_microseconds_ ||
-              now - batch_window_started_microseconds_ >= microbatch_microseconds) {
-            batch_window_started_microseconds_ = now;
-            batch_datagrams_ = 0;
-          }
-          if (batch_datagrams_ >= maximum_microbatch_datagrams) {
-            precise_wait(lock, microbatch_microseconds - (now - batch_window_started_microseconds_));
-            continue;
-          }
           const std::array<std::uint16_t, 1> charge {slot.charged_bytes};
           const auto grant = pacer_.grant(charge, false, now);
           if (grant.datagrams != 1) {
@@ -768,8 +796,8 @@ namespace lumen::lsp::runtime {
             precise_wait(lock, wait);
             continue;
           }
-          ++batch_datagrams_;
         }
+        ++batch_datagrams_;
 
         slot.state = SlotState::sending;
         const auto datagram = std::span<const std::uint8_t> {slot.bytes}.first(slot.protected_bytes);
@@ -857,7 +885,7 @@ namespace lumen::lsp::runtime {
   };
 
   HostForwardPath::HostForwardPath(HostForwardPathConfig config) noexcept:
-      impl_ {new (std::nothrow) Impl {std::move(config)}} {
+      impl_ {new(std::nothrow) Impl {std::move(config)}} {
   }
 
   HostForwardPath::~HostForwardPath() = default;

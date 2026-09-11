@@ -4,6 +4,7 @@
  */
 #include "../tests_common.h"
 
+#include <array>
 #include <condition_variable>
 #include <future>
 #include <mutex>
@@ -48,6 +49,155 @@ namespace {
     std::condition_variable packet_available_;
     std::vector<packet_t> packets_;
     bool closed_ {};
+  };
+
+  class fixed_slab_destination_t final: public AudioPacketDestination {
+  public:
+    bool requires_fixed_packet_storage() const noexcept override {
+      return true;
+    }
+
+    std::optional<packet_write_lease_t> acquire_packet_storage() noexcept override {
+      std::scoped_lock lock(mutex_);
+      if (closed_ || reserved_) {
+        return std::nullopt;
+      }
+      reserved_ = true;
+      ++acquired_;
+      return packet_write_lease_t {.storage = storage_, .token = 1};
+    }
+
+    enqueue_result_e commit_packet_storage(
+      const packet_write_lease_t &lease,
+      const std::size_t payload_bytes,
+      const std::uint64_t,
+      const bool
+    ) noexcept override {
+      std::scoped_lock lock(mutex_);
+      if (!reserved_ || lease.token != 1 || payload_bytes == 0 || payload_bytes > storage_.size()) {
+        return enqueue_result_e::backpressure;
+      }
+      reserved_ = false;
+      ++committed_;
+      available_.notify_all();
+      return enqueue_result_e::enqueued;
+    }
+
+    void cancel_packet_storage(const packet_write_lease_t &) noexcept override {
+      std::scoped_lock lock(mutex_);
+      reserved_ = false;
+      available_.notify_all();
+    }
+
+    enqueue_result_e enqueue(packet_t) override {
+      ++fallback_enqueues_;
+      return enqueue_result_e::backpressure;
+    }
+
+    void close() noexcept override {
+      std::scoped_lock lock(mutex_);
+      closed_ = true;
+      available_.notify_all();
+    }
+
+    bool wait_for_commit(const std::chrono::milliseconds timeout) {
+      std::unique_lock lock(mutex_);
+      return available_.wait_for(lock, timeout, [this] {
+        return committed_ != 0 || closed_;
+      }) && committed_ != 0;
+    }
+
+    std::size_t acquired() const noexcept {
+      return acquired_.load(std::memory_order_acquire);
+    }
+
+    std::size_t committed() const noexcept {
+      return committed_.load(std::memory_order_acquire);
+    }
+
+    std::size_t fallback_enqueues() const noexcept {
+      return fallback_enqueues_.load(std::memory_order_acquire);
+    }
+
+  private:
+    std::array<std::uint8_t, maximum_encoded_packet_bytes> storage_ {};
+    mutable std::mutex mutex_;
+    std::condition_variable available_;
+    std::atomic_size_t acquired_ {};
+    std::atomic_size_t committed_ {};
+    std::atomic_size_t fallback_enqueues_ {};
+    bool reserved_ {};
+    bool closed_ {};
+  };
+
+  class transient_fixed_slab_destination_t final: public AudioPacketDestination {
+  public:
+    bool requires_fixed_packet_storage() const noexcept override {
+      return true;
+    }
+
+    std::optional<packet_write_lease_t> acquire_packet_storage() noexcept override {
+      const auto attempt = attempts_.fetch_add(1, std::memory_order_acq_rel);
+      if (attempt < 2) {
+        return std::nullopt;
+      }
+      return packet_write_lease_t {.storage = storage_, .token = 1};
+    }
+
+    enqueue_result_e commit_packet_storage(
+      const packet_write_lease_t &,
+      const std::size_t payload_bytes,
+      const std::uint64_t,
+      const bool discontinuity
+    ) noexcept override {
+      if (payload_bytes == 0 || payload_bytes > storage_.size()) {
+        return enqueue_result_e::backpressure;
+      }
+      discontinuity_.store(discontinuity, std::memory_order_release);
+      committed_.store(true, std::memory_order_release);
+      available_.notify_all();
+      return enqueue_result_e::enqueued;
+    }
+
+    void cancel_packet_storage(const packet_write_lease_t &) noexcept override {
+    }
+
+    enqueue_result_e enqueue(packet_t) override {
+      fallback_enqueues_.fetch_add(1, std::memory_order_relaxed);
+      return enqueue_result_e::backpressure;
+    }
+
+    void close() noexcept override {
+      available_.notify_all();
+    }
+
+    bool wait_for_commit(const std::chrono::milliseconds timeout) {
+      std::unique_lock lock(mutex_);
+      return available_.wait_for(lock, timeout, [this] {
+        return committed_.load(std::memory_order_acquire);
+      });
+    }
+
+    std::size_t attempts() const noexcept {
+      return attempts_.load(std::memory_order_acquire);
+    }
+
+    bool discontinuity() const noexcept {
+      return discontinuity_.load(std::memory_order_acquire);
+    }
+
+    std::size_t fallback_enqueues() const noexcept {
+      return fallback_enqueues_.load(std::memory_order_acquire);
+    }
+
+  private:
+    std::array<std::uint8_t, maximum_encoded_packet_bytes> storage_ {};
+    std::mutex mutex_;
+    std::condition_variable available_;
+    std::atomic_size_t attempts_ {};
+    std::atomic_size_t fallback_enqueues_ {};
+    std::atomic_bool committed_ {};
+    std::atomic_bool discontinuity_ {};
   };
 
   struct blocking_destination_state_t {
@@ -189,6 +339,37 @@ TEST_P(AudioTest, TestEncode) {
 
 struct AudioPacketDestinationTest: PlatformTestSuite {};
 
+TEST_F(AudioPacketDestinationTest, HostStyleFixedSlabAvoidsFallbackPacketAllocation) {
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  const auto destination = std::make_shared<fixed_slab_destination_t>();
+  std::atomic_bool committed {};
+  std::jthread timer([&] {
+    committed.store(destination->wait_for_commit(5s), std::memory_order_release);
+    stop_capture(mail);
+  });
+  audio::capture(mail, destination_test_config(), destination);
+  timer.join();
+
+  EXPECT_TRUE(committed.load(std::memory_order_acquire));
+  EXPECT_GT(destination->acquired(), 0U);
+  EXPECT_GT(destination->committed(), 0U);
+  EXPECT_EQ(destination->fallback_enqueues(), 0U);
+}
+
+TEST_F(AudioPacketDestinationTest, FixedSlabPressureMarksTheNextPublishedPacketDiscontinuous) {
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  const auto destination = std::make_shared<transient_fixed_slab_destination_t>();
+  std::jthread capture([mail, destination] {
+    audio::capture(mail, destination_test_config(), destination);
+  });
+  ASSERT_TRUE(destination->wait_for_commit(5s));
+  stop_capture(mail);
+  capture.join();
+  EXPECT_GE(destination->attempts(), 3U);
+  EXPECT_TRUE(destination->discontinuity());
+  EXPECT_EQ(destination->fallback_enqueues(), 0U);
+}
+
 // AUD-U01: the encoder owns only a weak typed destination reference while an enqueue is active.
 TEST_F(AudioPacketDestinationTest, DestinationCanBeDestroyedWhileEncodeIsInFlight) {
   auto mail = std::make_shared<safe::mail_raw_t>();
@@ -217,28 +398,29 @@ TEST_F(AudioPacketDestinationTest, DestinationCanBeDestroyedWhileEncodeIsInFligh
   capture.join();
 }
 
-// AUD-U02: exact full/closed results terminate publication instead of spinning or dropping silently.
-TEST_F(AudioPacketDestinationTest, BackpressureAndClosedResultsStopFurtherPublication) {
-  for (const auto result : {
-         AudioPacketDestination::enqueue_result_e::backpressure,
-         AudioPacketDestination::enqueue_result_e::closed,
-       }) {
-    auto mail = std::make_shared<safe::mail_raw_t>();
-    auto destination = std::make_shared<rejecting_destination_t>(result);
-    auto called = destination->called_future();
-    std::jthread capture([mail, destination] {
-      audio::capture(mail, destination_test_config(), destination);
-    });
+// AUD-U02: transient destination pressure drops bounded packets but does not terminate capture.
+TEST_F(AudioPacketDestinationTest, BackpressureContinuesPublicationWhileClosedStopsIt) {
+  auto pressured_mail = std::make_shared<safe::mail_raw_t>();
+  auto pressured = std::make_shared<rejecting_destination_t>(AudioPacketDestination::enqueue_result_e::backpressure);
+  auto first_pressure = pressured->called_future();
+  std::jthread pressured_capture([pressured_mail, pressured] {
+    audio::capture(pressured_mail, destination_test_config(), pressured);
+  });
+  ASSERT_EQ(first_pressure.wait_for(2s), std::future_status::ready);
+  std::this_thread::sleep_for(30ms);
+  stop_capture(pressured_mail);
+  pressured_capture.join();
+  EXPECT_GT(pressured->calls(), 1U);
 
-    if (called.wait_for(2s) != std::future_status::ready) {
-      stop_capture(mail);
-      capture.join();
-      FAIL() << "Audio encoder never observed the scripted destination result";
-      return;
-    }
-    std::this_thread::sleep_for(30ms);
-    stop_capture(mail);
-    capture.join();
-    EXPECT_EQ(destination->calls(), 1U);
-  }
+  auto closed_mail = std::make_shared<safe::mail_raw_t>();
+  auto closed = std::make_shared<rejecting_destination_t>(AudioPacketDestination::enqueue_result_e::closed);
+  auto first_closed = closed->called_future();
+  std::jthread closed_capture([closed_mail, closed] {
+    audio::capture(closed_mail, destination_test_config(), closed);
+  });
+  ASSERT_EQ(first_closed.wait_for(2s), std::future_status::ready);
+  std::this_thread::sleep_for(30ms);
+  stop_capture(closed_mail);
+  closed_capture.join();
+  EXPECT_EQ(closed->calls(), 1U);
 }

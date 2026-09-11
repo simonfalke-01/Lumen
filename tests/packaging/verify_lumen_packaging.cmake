@@ -55,6 +55,33 @@ assert_file_contains_literal(
     "cmake/packaging/common.cmake"
     [=[${CPACK_PACKAGE_NAME}-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}]=]
     "Artifact names must retain the full release or prerelease version")
+foreach(required_legal_resource IN ITEMS
+        "Lumen-GPL-3.0.txt"
+        "OpenSSL-Apache-2.0.txt"
+        "Opus-BSD-3-Clause.txt"
+        "moonlight-common-c-GPL-3.0.txt"
+        "ENet-MIT.txt"
+        "nanors-MIT.txt"
+        "libvirtualhid-MIT.txt"
+        "libvirtualhid-license-map.txt")
+    assert_file_contains_literal(
+        "cmake/packaging/common.cmake"
+        "${required_legal_resource}"
+        "CPack must install ${required_legal_resource}")
+    assert_file_contains_literal(
+        ".github/scripts/validate-windows-msi.ps1"
+        "${required_legal_resource}"
+        "Compiled MSI validation must require ${required_legal_resource}")
+endforeach()
+foreach(required_notice_text IN ITEMS
+        "wolfSSL 5.9.2"
+        "Copyright (c) 2001-2017 Cisco Systems, Inc."
+        "Copyright (c) 2026 LizardByte project contributors.")
+    assert_file_contains_literal(
+        "NOTICE"
+        "${required_notice_text}"
+        "The packaged NOTICE must retain ${required_notice_text}")
+endforeach()
 assert_file_contains_literal(
     "cmake/prep/build_version.cmake"
     [=[set(RC_VERSION_BUILD "${PROJECT_VERSION_PATCH}")]=]

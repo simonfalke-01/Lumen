@@ -1,5 +1,5 @@
 /**
- * @file src/protocol_lsp/core/control.h
+ * @file src/lsp/core/control.h
  * @brief LSPC version-1 framing, selective acknowledgement, and bounded reliability primitives.
  */
 
@@ -8,6 +8,7 @@
 #include "packet.h"
 #include "wire.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -324,16 +325,23 @@ namespace lumen::lsp {
     std::uint64_t received_before_ = 0;  ///< Receipt bits preceding `largest_`.
   };
 
+  /** @brief Explicit initial retransmission profile for the authenticated control path. */
+  enum class control_path_profile : std::uint8_t {
+    local,  ///< Directly connected or local path with a 20 ms initial RTO.
+    nonlocal,  ///< Nonlocal path with a 100 ms initial RTO.
+  };
+
   /** @brief Smoothed RTT and bounded LSPC retransmission-timeout estimator. */
   class control_rto {
   public:
     /**
      * @brief Construct an estimator with the path-appropriate initial timeout.
      *
-     * @param local_path Selects 20 ms for local paths or 100 ms otherwise.
+     * @param profile Explicit local or nonlocal initial timeout profile.
      */
-    constexpr explicit control_rto(const bool local_path) noexcept:
-        rto_microseconds_(local_path ? 20'000U : 100'000U) {
+    constexpr explicit control_rto(const control_path_profile profile) noexcept:
+        profile_(profile),
+        rto_microseconds_(profile == control_path_profile::local ? 20'000U : 100'000U) {
     }
 
     /**
@@ -369,6 +377,26 @@ namespace lumen::lsp {
       return rto_microseconds_;
     }
 
+    /** @brief Return the explicit initial path profile. */
+    [[nodiscard]] constexpr control_path_profile profile() const noexcept {
+      return profile_;
+    }
+
+    /** @brief Return whether an authenticated non-retransmitted ACK initialized the estimator. */
+    [[nodiscard]] constexpr bool sampled() const noexcept {
+      return sampled_;
+    }
+
+    /** @brief Return the current smoothed RTT in microseconds, or zero before initialization. */
+    [[nodiscard]] constexpr std::uint64_t smoothed_microseconds() const noexcept {
+      return smoothed_microseconds_;
+    }
+
+    /** @brief Return the current smoothed RTT variation in microseconds, or zero before initialization. */
+    [[nodiscard]] constexpr std::uint64_t variation_microseconds() const noexcept {
+      return variation_microseconds_;
+    }
+
     /**
      * @brief Return an exponentially backed-off timeout for a transmission attempt.
      *
@@ -384,6 +412,7 @@ namespace lumen::lsp {
     }
 
   private:
+    control_path_profile profile_ = control_path_profile::nonlocal;  ///< Explicit initial path classification.
     std::uint64_t smoothed_microseconds_ = 0;  ///< Smoothed RTT.
     std::uint64_t variation_microseconds_ = 0;  ///< Smoothed RTT variation.
     std::uint64_t rto_microseconds_ = 0;  ///< Current base RTO.
@@ -392,12 +421,20 @@ namespace lumen::lsp {
 
   /** @brief Failure while adding a retained outbound LSPC frame. */
   enum class outbound_store_result : std::uint8_t {
-    stored,  ///< Frame was retained.
+    stored,  ///< Frame was reserved before its first socket submission.
     invalid_id,  ///< Message identifier is zero.
     duplicate_id,  ///< Identifier is already retained.
     frame_too_large,  ///< Byte-identical frame exceeds configured storage.
     window_full,  ///< All 64 or fewer configured slots are occupied.
-    invalid_deadline,  ///< Deadline is not later than initial transmission time.
+    invalid_deadline,  ///< Absolute deadline is zero.
+  };
+
+  /** @brief Result of binding a reserved frame to its actual first socket submission. */
+  enum class outbound_submission_result : std::uint8_t {
+    submitted,  ///< Actual first-send time and retry deadline were recorded.
+    not_found,  ///< Message identifier names no reserved live frame.
+    already_submitted,  ///< The retained frame already has a first submission.
+    invalid_time,  ///< Socket-submission time is zero or at/after the operation deadline.
   };
 
   /**
@@ -409,10 +446,27 @@ namespace lumen::lsp {
   struct outbound_control_frame {
     std::uint64_t message_id = 0;  ///< Retained logical-frame identifier.
     packet_slab<MaxFrameBytes> frame {};  ///< Byte-identical encoded frame.
+    std::uint64_t first_sent_microseconds = 0;  ///< Authenticated first socket-submission time.
+    std::uint64_t last_sent_microseconds = 0;  ///< Most recent socket-submission time.
     std::uint64_t deadline_microseconds = 0;  ///< Absolute operation deadline.
     std::uint64_t next_retry_microseconds = 0;  ///< Absolute next retry time.
     std::uint8_t transmissions = 0;  ///< Completed transmission count.
+    bool karn_eligible = false;  ///< Whether an ACK may yield an unambiguous first-send RTT sample.
     bool occupied = false;  ///< Whether this slot contains a live frame.
+  };
+
+  /** @brief Typed authenticated selective-ACK processing status. */
+  enum class outbound_ack_status : std::uint8_t {
+    accepted,  ///< At least one retained frame was retired.
+    no_match,  ///< ACK fields named no live retained frame.
+  };
+
+  /** @brief Result of retiring frames and optionally applying one Karn-safe RTT sample. */
+  struct outbound_ack_result {
+    outbound_ack_status status = outbound_ack_status::no_match;  ///< ACK processing status.
+    std::size_t removed = 0;  ///< Number of newly retired frames.
+    std::uint64_t rtt_sample_microseconds = 0;  ///< Applied RTT sample, or zero when Karn suppressed sampling.
+    bool rto_updated = false;  ///< Whether the supplied estimator consumed the sample.
   };
 
   /**
@@ -427,26 +481,22 @@ namespace lumen::lsp {
     static_assert(Capacity > 0 && Capacity <= 64, "LSPC outbound capacity must be 1 through 64");
 
     /**
-     * @brief Retain a first-transmission frame for selective acknowledgement and retry.
+     * @brief Reserve a byte-identical frame before its first socket submission.
      *
      * @param message_id Nonzero logical-frame identifier.
      * @param frame Complete encoded frame.
-     * @param now_microseconds First transmission time.
      * @param deadline_microseconds Absolute operation deadline.
-     * @param rto Retry-time estimator.
      * @return Storage result.
      */
-    constexpr outbound_store_result store(
+    constexpr outbound_store_result reserve(
       const std::uint64_t message_id,
       const std::span<const std::uint8_t> frame,
-      const std::uint64_t now_microseconds,
-      const std::uint64_t deadline_microseconds,
-      const control_rto &rto
+      const std::uint64_t deadline_microseconds
     ) noexcept {
       if (message_id == 0) {
         return outbound_store_result::invalid_id;
       }
-      if (deadline_microseconds <= now_microseconds) {
+      if (deadline_microseconds == 0) {
         return outbound_store_result::invalid_deadline;
       }
       if (frame.size() > MaxFrameBytes) {
@@ -466,31 +516,76 @@ namespace lumen::lsp {
       }
       free_slot->message_id = message_id;
       free_slot->frame.assign(frame);
+      free_slot->first_sent_microseconds = 0;
+      free_slot->last_sent_microseconds = 0;
       free_slot->deadline_microseconds = deadline_microseconds;
-      const auto initial_delay = rto.timeout_for_attempt(1);
-      free_slot->next_retry_microseconds = now_microseconds > std::numeric_limits<std::uint64_t>::max() - initial_delay ?
-                                             std::numeric_limits<std::uint64_t>::max() :
-                                             now_microseconds + initial_delay;
-      free_slot->transmissions = 1;
+      free_slot->next_retry_microseconds = 0;
+      free_slot->transmissions = 0;
+      free_slot->karn_eligible = false;
       free_slot->occupied = true;
       ++size_;
       return outbound_store_result::stored;
     }
 
     /**
+     * @brief Record the actual first socket submission of one reserved frame.
+     *
+     * Karn eligibility begins only here, never when queue space is reserved.
+     *
+     * @param message_id Reserved message identifier.
+     * @param submitted_at_microseconds Actual monotonic socket-submission time.
+     * @param rto Retry-time estimator used to schedule the first retry.
+     * @return Typed submission result.
+     */
+    constexpr outbound_submission_result mark_initial_submitted(
+      const std::uint64_t message_id,
+      const std::uint64_t submitted_at_microseconds,
+      const control_rto &rto
+    ) noexcept {
+      for (auto &slot : slots_) {
+        if (!slot.occupied || slot.message_id != message_id) {
+          continue;
+        }
+        if (slot.transmissions != 0) {
+          return outbound_submission_result::already_submitted;
+        }
+        if (submitted_at_microseconds == 0 || submitted_at_microseconds >= slot.deadline_microseconds) {
+          return outbound_submission_result::invalid_time;
+        }
+        slot.first_sent_microseconds = submitted_at_microseconds;
+        slot.last_sent_microseconds = submitted_at_microseconds;
+        slot.transmissions = 1;
+        slot.karn_eligible = true;
+        const auto initial_delay = rto.timeout_for_attempt(1);
+        slot.next_retry_microseconds = submitted_at_microseconds > std::numeric_limits<std::uint64_t>::max() - initial_delay ?
+                                         std::numeric_limits<std::uint64_t>::max() :
+                                         submitted_at_microseconds + initial_delay;
+        return outbound_submission_result::submitted;
+      }
+      return outbound_submission_result::not_found;
+    }
+
+    /**
      * @brief Remove every retained frame explicitly covered by a peer ACK field.
+     *
+     * Karn's algorithm permits one RTT sample only from a frame that was never retransmitted. When one
+     * ACK retires several eligible frames, the most recently first-sent frame supplies the single sample.
      *
      * @param acknowledgement_base ACK base, explicitly acknowledged when nonzero.
      * @param acknowledgement_bitmap Receipt bits for the preceding 64 identifiers.
-     * @return Number of frames removed.
+     * @param authenticated_ack_time_microseconds Local monotonic receive time after ACK authentication.
+     * @param rto Estimator updated by at most one unambiguous sample.
+     * @return Removal count and RTT update result.
      */
-    constexpr std::size_t acknowledge(
+    constexpr outbound_ack_result acknowledge(
       const std::uint64_t acknowledgement_base,
-      const std::uint64_t acknowledgement_bitmap
+      const std::uint64_t acknowledgement_bitmap,
+      const std::uint64_t authenticated_ack_time_microseconds,
+      control_rto &rto
     ) noexcept {
-      std::size_t removed = 0;
+      outbound_control_frame<MaxFrameBytes> *sample_source = nullptr;
       for (auto &slot : slots_) {
-        if (!slot.occupied) {
+        if (!slot.occupied || slot.transmissions == 0) {
           continue;
         }
         auto acknowledged = acknowledgement_base != 0 && slot.message_id == acknowledgement_base;
@@ -499,13 +594,36 @@ namespace lumen::lsp {
           acknowledged = distance <= 64U && (acknowledgement_bitmap & (std::uint64_t {1} << (distance - 1U))) != 0;
         }
         if (acknowledged) {
-          slot.occupied = false;
-          slot.frame.clear();
-          --size_;
-          ++removed;
+          if (authenticated_ack_time_microseconds != 0 && slot.karn_eligible &&
+              authenticated_ack_time_microseconds > slot.first_sent_microseconds &&
+              (sample_source == nullptr || slot.first_sent_microseconds > sample_source->first_sent_microseconds)) {
+            sample_source = &slot;
+          }
         }
       }
-      return removed;
+      outbound_ack_result result;
+      if (sample_source != nullptr) {
+        result.rtt_sample_microseconds = authenticated_ack_time_microseconds - sample_source->first_sent_microseconds;
+        rto.update(result.rtt_sample_microseconds);
+        result.rto_updated = true;
+      }
+      for (auto &slot : slots_) {
+        if (!slot.occupied || slot.transmissions == 0) {
+          continue;
+        }
+        auto acknowledged = acknowledgement_base != 0 && slot.message_id == acknowledgement_base;
+        if (!acknowledged && acknowledgement_base > slot.message_id) {
+          const auto distance = acknowledgement_base - slot.message_id;
+          acknowledged = distance <= 64U && (acknowledgement_bitmap & (std::uint64_t {1} << (distance - 1U))) != 0;
+        }
+        if (acknowledged) {
+          slot = {};
+          --size_;
+          ++result.removed;
+        }
+      }
+      result.status = result.removed == 0 ? outbound_ack_status::no_match : outbound_ack_status::accepted;
+      return result;
     }
 
     /**
@@ -520,7 +638,8 @@ namespace lumen::lsp {
     [[nodiscard]] constexpr outbound_control_frame<MaxFrameBytes> *due(const std::uint64_t now_microseconds) noexcept {
       outbound_control_frame<MaxFrameBytes> *selected = nullptr;
       for (auto &slot : slots_) {
-        if (!slot.occupied || slot.transmissions >= 5U || now_microseconds >= slot.deadline_microseconds || now_microseconds < slot.next_retry_microseconds) {
+        if (!slot.occupied || slot.transmissions == 0 || slot.transmissions >= 5U ||
+            now_microseconds >= slot.deadline_microseconds || now_microseconds < slot.next_retry_microseconds) {
           continue;
         }
         if (selected == nullptr || slot.next_retry_microseconds < selected->next_retry_microseconds) {
@@ -542,10 +661,12 @@ namespace lumen::lsp {
       const std::uint64_t now_microseconds,
       const control_rto &rto
     ) noexcept {
-      if (!retained.occupied || retained.transmissions >= 5U) {
+      if (!retained.occupied || retained.transmissions == 0 || retained.transmissions >= 5U) {
         return;
       }
       ++retained.transmissions;
+      retained.last_sent_microseconds = now_microseconds;
+      retained.karn_eligible = false;
       const auto delay = rto.timeout_for_attempt(retained.transmissions);
       retained.next_retry_microseconds = now_microseconds > std::numeric_limits<std::uint64_t>::max() - delay ?
                                            std::numeric_limits<std::uint64_t>::max() :
@@ -588,21 +709,43 @@ namespace lumen::lsp {
     stored,  ///< New request and response were cached.
     conflicting_request,  ///< Reused request identifier carries different request bytes.
     invalid_request_id,  ///< Request identifier zero is forbidden.
+    invalid_semantic_identity,  ///< Semantic message type, schema, or generation is zero.
+    invalid_retention_deadline,  ///< Retention deadline is not later than the current time.
     object_too_large,  ///< Request or response exceeds its configured fixed storage.
+    capacity_exhausted,  ///< Every slot contains an unexpired response and caller must apply backpressure.
+  };
+
+  /** @brief Exact semantic operation identity retained beside an idempotent response. */
+  struct response_semantic_identity {
+    std::uint16_t message_type = 0;  ///< Nonzero request message type.
+    std::uint16_t schema_version = 0;  ///< Nonzero deterministic request schema version.
+    std::uint32_t generation = 0;  ///< Nonzero configuration, transaction, or authority generation.
+    std::array<std::uint8_t, 16> semantic_id {};  ///< Canonical 128-bit transaction/configuration identity.
+    std::array<std::uint8_t, 32> request_digest {};  ///< SHA-256 of the complete canonical semantic request.
+
+    /** @brief Compare every semantic identity field. */
+    [[nodiscard]] bool operator==(const response_semantic_identity &) const noexcept = default;
+  };
+
+  /** @brief Retention metadata supplied for one terminal-response cache insertion. */
+  struct response_cache_metadata {
+    response_semantic_identity identity {};  ///< Exact semantic operation identity.
+    std::uint64_t retention_deadline_microseconds = 0;  ///< Absolute monotonic retention deadline.
   };
 
   /**
    * @brief Borrowed cached-response lookup result.
    *
-   * The response view remains valid until the next cache insertion or clear.
+   * The response view remains valid until the next mutable cache operation.
    */
   struct cached_response_view {
     response_cache_result result = response_cache_result::miss;  ///< Lookup status.
     std::span<const std::uint8_t> response {};  ///< Cached response on a hit.
+    response_cache_metadata metadata {};  ///< Retained semantic and deadline metadata on a hit.
   };
 
   /**
-   * @brief Bounded idempotent request/response cache with exact byte comparison.
+   * @brief Bounded terminal idempotent request/response cache with exact byte comparison.
    *
    * @tparam MaxRequestBytes Maximum retained request bytes.
    * @tparam MaxResponseBytes Maximum retained response bytes.
@@ -617,65 +760,113 @@ namespace lumen::lsp {
      * @brief Look up an idempotent response by request identifier and exact request bytes.
      *
      * @param request_id Nonzero request identifier.
-     * @param request Complete semantic request bytes.
+     * @param identity Exact semantic identity of the request.
+     * @param request Complete deterministic semantic request bytes.
+     * @param now_microseconds Current monotonic time used to expire old entries.
      * @return Hit, miss, conflict, or invalid-input result.
      */
     [[nodiscard]] constexpr cached_response_view lookup(
       const std::uint64_t request_id,
-      const std::span<const std::uint8_t> request
-    ) const noexcept {
+      const response_semantic_identity &identity,
+      const std::span<const std::uint8_t> request,
+      const std::uint64_t now_microseconds
+    ) noexcept {
       if (request_id == 0) {
         return {.result = response_cache_result::invalid_request_id};
       }
-      for (const auto &entry : entries_) {
+      if (!valid(identity)) {
+        return {.result = response_cache_result::invalid_semantic_identity};
+      }
+      for (auto &entry : entries_) {
+        if (entry.occupied && entry.metadata.retention_deadline_microseconds <= now_microseconds) {
+          release(entry);
+        }
         if (!entry.occupied || entry.request_id != request_id) {
           continue;
         }
-        if (!equal(entry.request.bytes(), request)) {
+        if (entry.metadata.identity != identity || !equal(entry.request.bytes(), request)) {
           return {.result = response_cache_result::conflicting_request};
         }
-        return {.result = response_cache_result::hit, .response = entry.response.bytes()};
+        return {
+          .result = response_cache_result::hit,
+          .response = entry.response.bytes(),
+          .metadata = entry.metadata,
+        };
       }
       return {.result = response_cache_result::miss};
     }
 
     /**
-     * @brief Insert an idempotent response, evicting the oldest entry at capacity.
+     * @brief Insert an idempotent response without evicting any unexpired entry.
      *
      * An existing byte-identical request is left untouched and reported as a hit. Reuse of an
      * identifier with different bytes is always a conflict and never replaces the prior entry.
      *
      * @param request_id Nonzero request identifier.
-     * @param request Complete semantic request bytes.
+     * @param metadata Exact 128-bit identity, request digest, and retention deadline.
+     * @param request Complete deterministic semantic request bytes.
      * @param response Complete byte-identical response bytes.
+     * @param now_microseconds Current monotonic time.
      * @return Cache result.
      */
     constexpr response_cache_result insert(
       const std::uint64_t request_id,
+      const response_cache_metadata &metadata,
       const std::span<const std::uint8_t> request,
-      const std::span<const std::uint8_t> response
+      const std::span<const std::uint8_t> response,
+      const std::uint64_t now_microseconds
     ) noexcept {
       if (request_id == 0) {
         return response_cache_result::invalid_request_id;
       }
+      if (!valid(metadata.identity)) {
+        return response_cache_result::invalid_semantic_identity;
+      }
+      if (metadata.retention_deadline_microseconds <= now_microseconds) {
+        return response_cache_result::invalid_retention_deadline;
+      }
       if (request.size() > MaxRequestBytes || response.size() > MaxResponseBytes) {
         return response_cache_result::object_too_large;
       }
-      const auto prior = lookup(request_id, request);
+      const auto prior = lookup(request_id, metadata.identity, request, now_microseconds);
       if (prior.result == response_cache_result::hit || prior.result == response_cache_result::conflicting_request) {
         return prior.result;
       }
 
-      auto &entry = entries_[next_];
-      entry.request_id = request_id;
-      entry.request.assign(request);
-      entry.response.assign(response);
-      entry.occupied = true;
-      next_ = (next_ + 1U) % Capacity;
-      if (size_ < Capacity) {
-        ++size_;
+      entry_type *free_entry = nullptr;
+      for (auto &entry : entries_) {
+        if (!entry.occupied) {
+          free_entry = &entry;
+          break;
+        }
       }
+      if (free_entry == nullptr) {
+        return response_cache_result::capacity_exhausted;
+      }
+      free_entry->request_id = request_id;
+      free_entry->metadata = metadata;
+      free_entry->request.assign(request);
+      free_entry->response.assign(response);
+      free_entry->occupied = true;
+      ++size_;
       return response_cache_result::stored;
+    }
+
+    /**
+     * @brief Release every entry whose retention deadline has elapsed.
+     *
+     * @param now_microseconds Current monotonic time.
+     * @return Number of released entries.
+     */
+    constexpr std::size_t expire(const std::uint64_t now_microseconds) noexcept {
+      std::size_t expired = 0;
+      for (auto &entry : entries_) {
+        if (entry.occupied && entry.metadata.retention_deadline_microseconds <= now_microseconds) {
+          release(entry);
+          ++expired;
+        }
+      }
+      return expired;
     }
 
     /**
@@ -690,18 +881,15 @@ namespace lumen::lsp {
     /** @brief Discard every cached request and response. */
     constexpr void clear() noexcept {
       for (auto &entry : entries_) {
-        entry.occupied = false;
-        entry.request.clear();
-        entry.response.clear();
+        release(entry);
       }
-      next_ = 0;
-      size_ = 0;
     }
 
   private:
     /** @brief One fixed request/response cache entry. */
     struct entry_type {
       std::uint64_t request_id = 0;  ///< Request identifier.
+      response_cache_metadata metadata {};  ///< Semantic identity, digest, and retention deadline.
       packet_slab<MaxRequestBytes> request {};  ///< Exact request bytes.
       packet_slab<MaxResponseBytes> response {};  ///< Exact response bytes.
       bool occupied = false;  ///< Whether the entry is live.
@@ -729,8 +917,27 @@ namespace lumen::lsp {
       return true;
     }
 
+    /** @brief Return whether a semantic identity is usable as a cache discriminator. */
+    [[nodiscard]] static constexpr bool valid(const response_semantic_identity &identity) noexcept {
+      return identity.message_type != 0 && identity.schema_version != 0 && identity.generation != 0 &&
+             std::any_of(identity.semantic_id.begin(), identity.semantic_id.end(), [](const auto byte) {
+               return byte != 0;
+             }) &&
+             std::any_of(identity.request_digest.begin(), identity.request_digest.end(), [](const auto byte) {
+               return byte != 0;
+             });
+    }
+
+    /** @brief Release one entry and update the occupied count exactly once. */
+    constexpr void release(entry_type &entry) noexcept {
+      if (!entry.occupied) {
+        return;
+      }
+      entry = {};
+      --size_;
+    }
+
     std::array<entry_type, Capacity> entries_ {};  ///< Fixed cache entries.
-    std::size_t next_ = 0;  ///< Oldest entry and next eviction target.
     std::size_t size_ = 0;  ///< Occupied entry count.
   };
 }  // namespace lumen::lsp

@@ -186,3 +186,38 @@ TEST(LspPinPairingPoll, EnforcesFloorBackoffEarlyAbuseAndCooldown) {
   EXPECT_EQ(limiter.admit(2'000'004), lsp::PairingPollResult::accepted);
   EXPECT_EQ(limiter.interval_microseconds, 80'000U);
 }
+
+TEST(LspClientHelloResponseCache, ScopesZeroWireGenerationToAssignedAssociationAndReplaysDuplicate) {
+  constexpr std::uint32_t association_generation = 7;
+  constexpr auto client_hello_type = static_cast<std::uint16_t>(lsp::ControlMessageType::client_hello);
+  EXPECT_EQ(lsp::response_cache_generation(client_hello_type, 0, association_generation), association_generation);
+  EXPECT_EQ(
+    lsp::response_cache_generation(
+      static_cast<std::uint16_t>(lsp::ControlMessageType::pair_begin),
+      association_generation,
+      9
+    ),
+    association_generation
+  );
+
+  lumen::lsp::response_cache<128, 128> cache;
+  lumen::lsp::response_cache_metadata metadata {
+    .identity = {
+      .message_type = client_hello_type,
+      .schema_version = lumen::lsp::wire_version,
+      .generation = lsp::response_cache_generation(client_hello_type, 0, association_generation),
+      .semantic_id = filled<16>(1),
+      .request_digest = filled<32>(2),
+    },
+    .retention_deadline_microseconds = 2'000'000,
+  };
+  const std::array<std::uint8_t, 3> request {1, 2, 3};
+  const std::array<std::uint8_t, 2> response {4, 5};
+  EXPECT_EQ(
+    cache.insert(11, metadata, request, response, 1'000'000),
+    lumen::lsp::response_cache_result::stored
+  );
+  const auto duplicate = cache.lookup(11, metadata.identity, request, 1'000'001);
+  ASSERT_EQ(duplicate.result, lumen::lsp::response_cache_result::hit);
+  EXPECT_TRUE(std::ranges::equal(duplicate.response, response));
+}

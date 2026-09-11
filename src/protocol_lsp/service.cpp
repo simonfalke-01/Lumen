@@ -37,7 +37,7 @@ namespace lumen::lsp {
   }
 
   ServiceStartResult HostService::start() noexcept {
-    if (active_) {
+    if (active_.load(std::memory_order_acquire)) {
       return ServiceStartResult::already_started;
     }
     if (!config_.valid()) {
@@ -61,51 +61,87 @@ namespace lumen::lsp {
     if (!socket_.bind(config_.port)) {
       return ServiceStartResult::socket_bind_failed;
     }
-    active_ = true;
+    {
+      std::scoped_lock lock(admission_mutex_);
+      socket_bound_ = true;
+      active_.store(true, std::memory_order_release);
+    }
     return ServiceStartResult::started;
   }
 
   void HostService::stop() noexcept {
-    if (!active_) {
-      return;
+    stop_admission();
+    {
+      std::scoped_lock lock(admission_mutex_);
+      if (!socket_bound_) {
+        return;
+      }
+      socket_bound_ = false;
     }
-    active_ = false;
     socket_.close();
+  }
+
+  void HostService::stop_admission() noexcept {
+    std::unique_lock lock(admission_mutex_);
+    active_.store(false, std::memory_order_release);
+    admission_condition_.wait(lock, [this]() {
+      return in_flight_receives_ == 0;
+    });
   }
 
   DatagramResult HostService::receive(
     const PeerEndpoint &peer,
-    const std::span<std::uint8_t> datagram
+    const std::span<std::uint8_t> datagram,
+    const std::uint64_t received_at_microseconds,
+    const IpEcn ecn
   ) noexcept {
-    if (!active_) {
-      return DatagramResult::inactive;
+    {
+      std::scoped_lock lock(admission_mutex_);
+      if (!active_.load(std::memory_order_acquire)) {
+        return DatagramResult::inactive;
+      }
+      ++in_flight_receives_;
     }
+    auto result = DatagramResult::invalid_drop;
     if (!peer.valid() || peer.local_port != config_.port) {
-      return DatagramResult::malformed_peer;
-    }
-
-    switch (classify_packet(datagram)) {
-      case PacketClass::stun:
-      case PacketClass::zrtp:
-      case PacketClass::turn_channel:
-        return DatagramResult::reserved_drop;
-      case PacketClass::invalid:
-        return DatagramResult::invalid_drop;
-      case PacketClass::dtls:
-        return provider_result(dtls_provider_->receive_dtls(peer, datagram));
-      case PacketClass::rtp_or_rtcp: {
-        const auto packet_class = classify_secure_packet(datagram);
-        if (packet_class == SecurePacketClass::invalid) {
-          return DatagramResult::invalid_drop;
-        }
-        return provider_result(srtp_provider_->receive_secure_packet(peer, packet_class, datagram));
+      result = DatagramResult::malformed_peer;
+    } else {
+      switch (classify_packet(datagram)) {
+        case PacketClass::stun:
+        case PacketClass::zrtp:
+        case PacketClass::turn_channel:
+          result = DatagramResult::reserved_drop;
+          break;
+        case PacketClass::invalid:
+          result = DatagramResult::invalid_drop;
+          break;
+        case PacketClass::dtls:
+          result = provider_result(dtls_provider_->receive_dtls(peer, datagram));
+          break;
+        case PacketClass::rtp_or_rtcp:
+          {
+            const auto packet_class = classify_secure_packet(datagram);
+            result = packet_class == SecurePacketClass::invalid ?
+                       DatagramResult::invalid_drop :
+                       provider_result(
+                         srtp_provider_->receive_secure_packet(peer, packet_class, datagram, received_at_microseconds, ecn)
+                       );
+            break;
+          }
       }
     }
-    return DatagramResult::invalid_drop;
+    {
+      std::scoped_lock lock(admission_mutex_);
+      --in_flight_receives_;
+      if (in_flight_receives_ == 0) {
+        admission_condition_.notify_all();
+      }
+    }
+    return result;
   }
 
   bool HostService::active() const noexcept {
-    return active_;
+    return active_.load(std::memory_order_acquire);
   }
 
   const HostConfig &HostService::config() const noexcept {

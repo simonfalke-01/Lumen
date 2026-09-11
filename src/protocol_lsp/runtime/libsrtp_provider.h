@@ -7,6 +7,7 @@
 
 #include "../security/wolfssl_dtls_server.h"
 #include "../security_provider.h"
+#include "../ssrc_registry.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,12 @@
 #include <span>
 
 namespace lumen::lsp::runtime {
+  /** @brief Proactive per-SSRC SRTP packet-lifetime threshold event. */
+  enum class SrtpLifetimeEvent : std::uint8_t {
+    soft_limit,  ///< Rekey should begin while the association remains usable.
+    hard_limit,  ///< No further packet should be accepted for this stream.
+  };
+
   /**
    * @brief Non-owning authenticated SRTP/SRTCP delivery callbacks invoked without the provider mutex.
    */
@@ -27,6 +34,8 @@ namespace lumen::lsp::runtime {
      * @param packet_class RTP or RTCP classification.
      * @param plaintext Complete in-place-decrypted packet.
      * @param protected_bytes Complete authenticated UDP payload size before unprotection.
+     * @param received_at_microseconds Original socket receive timestamp.
+     * @param ecn Authenticated datagram's observed IP-layer ECN field.
      * @return True only when the bounded lane owner accepted the packet.
      */
     using PlaintextPacket = bool (*)(
@@ -34,11 +43,31 @@ namespace lumen::lsp::runtime {
       const PeerEndpoint &peer,
       SecurePacketClass packet_class,
       std::span<const std::uint8_t> plaintext,
-      std::size_t protected_bytes
+      std::size_t protected_bytes,
+      std::uint64_t received_at_microseconds,
+      IpEcn ecn
+    ) noexcept;
+
+    /** @brief Observe one first-crossing stream lifetime event outside crypto locks. */
+    using LifetimeEvent = void (*)(
+      void *context,
+      const PeerEndpoint &peer,
+      std::uint32_t ssrc,
+      MediaDirection direction,
+      SrtpLifetimeEvent event
     ) noexcept;
 
     void *context {};  ///< Opaque callback value.
     PlaintextPacket plaintext_packet {};  ///< Required authenticated receive callback.
+    LifetimeEvent lifetime_event {};  ///< Optional proactive rekey/hard-stop signal.
+  };
+
+  /** @brief Low-rate provider lifetime and hot-cache observations. */
+  struct LibsrtpProviderSnapshot {
+    std::uint64_t protected_packets {};  ///< Successfully protected RTP/SRTCP packets.
+    std::uint64_t unprotected_packets {};  ///< Successfully authenticated/decrypted RTP/SRTCP packets.
+    std::uint64_t soft_lifetime_events {};  ///< First soft-limit events emitted.
+    std::uint64_t hard_lifetime_events {};  ///< First hard-limit events emitted.
   };
 
   /**
@@ -70,7 +99,9 @@ namespace lumen::lsp::runtime {
     ProviderDatagramResult receive_secure_packet(
       const PeerEndpoint &peer,
       SecurePacketClass packet_class,
-      std::span<std::uint8_t> datagram
+      std::span<std::uint8_t> datagram,
+      std::uint64_t received_at_microseconds,
+      IpEcn ecn
     ) noexcept override;
 
     /**
@@ -83,6 +114,22 @@ namespace lumen::lsp::runtime {
     bool install_association(
       const PeerEndpoint &peer,
       const DtlsSrtpKeyMaterial &key_material
+    ) noexcept;
+
+    /**
+     * @brief Install one exact authenticated SSRC before it becomes visible.
+     *
+     * @param peer Exact association five-tuple.
+     * @param direction Negotiated packet direction.
+     * @param ssrc Nonzero exact SSRC; wildcard policies are never created.
+     * @param encrypted_extension_ids RFC 6904 extension IDs for this stream only.
+     * @return True after the exact replay-protected stream is active.
+     */
+    bool install_stream(
+      const PeerEndpoint &peer,
+      MediaDirection direction,
+      std::uint32_t ssrc,
+      std::span<const int> encrypted_extension_ids = {}
     ) noexcept;
 
     /**
@@ -123,6 +170,9 @@ namespace lumen::lsp::runtime {
      * @return Current association count.
      */
     [[nodiscard]] std::size_t association_count() const noexcept;
+
+    /** @brief Return low-rate provider packet-lifetime and cache observations. */
+    [[nodiscard]] LibsrtpProviderSnapshot snapshot() const noexcept;
 
   private:
     class Impl;

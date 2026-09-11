@@ -125,25 +125,40 @@ TEST(LspControlCore, SelectiveAckWindowRetainsOnlyObservedIdentifiers) {
 }
 
 TEST(LspControlCore, OutboundWindowAndResponseCacheRemainBoundedAndExact) {
-  lumen::lsp::control_rto rto(true);
+  lumen::lsp::control_rto rto(lumen::lsp::control_path_profile::local);
   lumen::lsp::outbound_control_window<8, 2> outbound;
   constexpr std::array<std::uint8_t, 2> frame_one {1, 2};
   constexpr std::array<std::uint8_t, 2> frame_two {3, 4};
-  EXPECT_EQ(outbound.store(1, frame_one, 1'000, 100'000, rto), lumen::lsp::outbound_store_result::stored);
-  EXPECT_EQ(outbound.store(2, frame_two, 1'000, 100'000, rto), lumen::lsp::outbound_store_result::stored);
-  EXPECT_EQ(outbound.store(3, frame_two, 1'000, 100'000, rto), lumen::lsp::outbound_store_result::window_full);
-  EXPECT_EQ(outbound.acknowledge(2, 0b1), std::size_t {2});
+  EXPECT_EQ(outbound.reserve(1, frame_one, 100'000), lumen::lsp::outbound_store_result::stored);
+  EXPECT_EQ(outbound.reserve(2, frame_two, 100'000), lumen::lsp::outbound_store_result::stored);
+  EXPECT_EQ(outbound.reserve(3, frame_two, 100'000), lumen::lsp::outbound_store_result::window_full);
+  EXPECT_EQ(outbound.mark_initial_submitted(1, 1'000, rto), lumen::lsp::outbound_submission_result::submitted);
+  EXPECT_EQ(outbound.mark_initial_submitted(2, 2'000, rto), lumen::lsp::outbound_submission_result::submitted);
+  EXPECT_EQ(outbound.acknowledge(2, 0b1, 3'000, rto).removed, std::size_t {2});
   EXPECT_EQ(outbound.size(), std::size_t {0});
 
   lumen::lsp::response_cache<4, 4, 2> cache;
   constexpr std::array<std::uint8_t, 2> request {7, 8};
   constexpr std::array<std::uint8_t, 1> response {9};
-  EXPECT_EQ(cache.insert(11, request, response), lumen::lsp::response_cache_result::stored);
-  const auto hit = cache.lookup(11, request);
+  lumen::lsp::response_cache_metadata metadata {
+    .identity = {
+      .message_type = 1,
+      .schema_version = 1,
+      .generation = 1,
+      .semantic_id = {1},
+      .request_digest = {1},
+    },
+    .retention_deadline_microseconds = 100'000,
+  };
+  EXPECT_EQ(cache.insert(11, metadata, request, response, 1'000), lumen::lsp::response_cache_result::stored);
+  const auto hit = cache.lookup(11, metadata.identity, request, 2'000);
   EXPECT_EQ(hit.result, lumen::lsp::response_cache_result::hit);
   EXPECT_TRUE(std::ranges::equal(hit.response, response));
   constexpr std::array<std::uint8_t, 2> conflict {7, 9};
-  EXPECT_EQ(cache.lookup(11, conflict).result, lumen::lsp::response_cache_result::conflicting_request);
+  EXPECT_EQ(
+    cache.lookup(11, metadata.identity, conflict, 2'000).result,
+    lumen::lsp::response_cache_result::conflicting_request
+  );
 }
 
 TEST(LspRtpCore, WritesAndParsesAStandardFixedHeaderWithCsrcs) {
@@ -294,13 +309,14 @@ TEST(LspTransportCore, PacerReconfigureNeverGrantsFreshStartupCredit) {
   EXPECT_EQ(pacer.grant(packet, false, 1'000).datagrams, 1U);
   EXPECT_EQ(pacer.grant(packet, false, 1'000).datagrams, 0U);
   ASSERT_TRUE(pacer.reconfigure({
-    .pacing_bits_per_second = 16'000'000,
-    .input_reserve_bits_per_second = 0,
-    .path_datagram_bytes = 1'428,
-    .quantum_microseconds = 100,
-    .submission_horizon_microseconds = 200,
-    .max_datagrams_per_batch = 8,
-  }, 1'000));
+                                  .pacing_bits_per_second = 16'000'000,
+                                  .input_reserve_bits_per_second = 0,
+                                  .path_datagram_bytes = 1'428,
+                                  .quantum_microseconds = 100,
+                                  .submission_horizon_microseconds = 200,
+                                  .max_datagrams_per_batch = 8,
+                                },
+                                1'000));
   EXPECT_EQ(pacer.grant(packet, false, 1'000).datagrams, 0U);
 }
 
