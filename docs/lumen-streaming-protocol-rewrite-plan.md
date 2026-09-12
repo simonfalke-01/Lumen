@@ -435,6 +435,14 @@ the objective. The installed host is still not a test target.
   The runtime pin check caught and corrected a leftover Swift digest constant.
 - [ ] Complete real picture/audio/input/controller confirmation, sustained
   game-streaming checks, and release packaging on the named hardware.
+- [ ] Recheck Dock activation and focused input with the user. The real
+  `Umbra-2026-09-12-170709.ips` crash identifies `matching()` in
+  `AppleInputCapture.mm:1165`: IOHID C-string key macros were passed directly to
+  a CFType dictionary, which crashed while sending `hash` to string bytes.
+  Umbra `c06ddd3` wraps both keys in `CFSTR`; the affected product build and
+  signing pass. The corrected LSP stream is reopened for the user's Dock/input
+  test. The crashed session was cleared by restarting only the isolated test
+  task; installed Lumen PID 10964 was not restarted or replaced.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
