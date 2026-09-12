@@ -443,6 +443,15 @@ the objective. The installed host is still not a test target.
   signing pass. The corrected LSP stream is reopened for the user's Dock/input
   test. The crashed session was cleared by restarting only the isolated test
   task; installed Lumen PID 10964 was not restarted or replaced.
+  The follow-up `Umbra-2026-09-12-180903.ips` identified a separate
+  `__IOHIDManagerExtRelease` abort: failed device opening released a
+  dispatch-backed manager before activation/cancellation. Umbra `1c343fa`
+  defers dispatch queue assignment until fallible preparation has succeeded,
+  preserving the native capture path and permitting safe AppKit fallback.
+  The affected app build/signing and a real-HID failed-start/retry regression
+  pass (one test, 0.123 s). The signed LSP stream reopened at 18:15 after
+  clearing the crashed association on only the isolated test task; installed
+  PID 10964 is unchanged. User focus/input confirmation remains pending.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
