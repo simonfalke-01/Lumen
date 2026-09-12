@@ -538,8 +538,9 @@ the objective. The installed host is still not a test target.
   owner present, the idle GUI was relaunched to clear its stale association.
   `/Applications/Umbra.app` PID 7739 then refreshed authenticated trust and
   Bonjour last-seen state at 21:16:54, with no GUI connection error recorded.
-  This identifies Little Snitch filtering as the removed connectivity block;
-  the earlier macOS-toggle/reset diagnosis was incorrect. No firewall rule
+  GUI connectivity returned after Little Snitch was disabled and the expired
+  test host was restored; these combined changes do not independently isolate
+  the entire filtering/permission cause. No firewall rule
   was changed by the agent. Only the user disabled Little Snitch. A narrowly
   scoped Umbra allow rule is still preferable to leaving the firewall disabled.
 - [ ] Fix idle catalog-session reuse after host expiry: the previous running
@@ -562,6 +563,15 @@ the objective. The installed host is still not a test target.
   post-disconnect admission drops, so those totals do not establish active
   stream encoder saturation or network loss. No performance-fix claim is made
   until fresh live timing and user observation confirm the corrected path.
+  The installed `b3184aa` GUI again reports native UDP failure and macOS
+  `Local network prohibited` after its binary update, so the new stream test
+  has not started. Little Snitch's log records filtering disabled at 21:12:30
+  and no subsequent enable event in the inspected interval. An ad-hoc raw
+  SwiftPM executable sharing the installed binary's Mach-O UUID was archived
+  as non-executable `/tmp/umbra-install-backup.5bRJQr/unsigned-current-build.saved`;
+  re-registering/reopening the unchanged installed bundle did not fix the
+  denial. That duplicate-UUID hypothesis is not established. No privacy-store
+  modification, permission bypass, or Windows service restart was performed.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
