@@ -12,13 +12,16 @@
 #include "../input_plane/rate.h"
 #include "../input_plane/state.h"
 #include "../transport/rtcp.h"
+#include "host_congestion_feedback.h"
 #include "udp_socket.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -30,6 +33,34 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_input_rtp_bytes = 1'200;
     constexpr std::size_t maximum_latest_state_keys = input_plane::maximum_input_baseline_records;
     constexpr std::uint64_t edge_application_deadline_microseconds = 100'000;
+
+    /** @brief Return the current middle 32 bits of the wall-clock NTP timestamp. */
+    std::uint32_t current_middle_ntp() noexcept {
+      constexpr std::uint64_t ntp_unix_epoch_seconds = 2'208'988'800ULL;
+      const auto elapsed = std::chrono::system_clock::now().time_since_epoch();
+      const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed);
+      const auto fraction = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed - seconds);
+      const auto ntp_seconds = static_cast<std::uint64_t>(seconds.count()) + ntp_unix_epoch_seconds;
+      const auto ntp_fraction = static_cast<std::uint64_t>(fraction.count()) * (std::uint64_t {1} << 32U) /
+                                1'000'000'000ULL;
+      return static_cast<std::uint32_t>((ntp_seconds << 16U) | (ntp_fraction >> 16U));
+    }
+
+    /** @brief Map one authenticated socket ECN observation into RFC 8888's two-bit field. */
+    transport::ecn_mark feedback_ecn(const IpEcn ecn) noexcept {
+      switch (ecn) {
+        case IpEcn::ect_0:
+          return transport::ecn_mark::ect0;
+        case IpEcn::ect_1:
+          return transport::ecn_mark::ect1;
+        case IpEcn::congestion_experienced:
+          return transport::ecn_mark::congestion_experienced;
+        case IpEcn::not_ect:
+        case IpEcn::unavailable:
+          return transport::ecn_mark::not_ect;
+      }
+      return transport::ecn_mark::not_ect;
+    }
 
     bool difference(const std::int64_t current, const std::int64_t previous, std::int64_t &output) noexcept {
       if ((previous > 0 && current < std::numeric_limits<std::int64_t>::min() + previous) ||
@@ -63,6 +94,40 @@ namespace lumen::lsp::runtime {
     return sdes_size == 0 ? 0 : 8U + sdes_size;
   }
 
+  std::size_t write_input_feedback_compound_report(
+    const std::span<std::uint8_t> destination,
+    const std::uint32_t acknowledgement_ssrc,
+    const InputReceiverReportState &report,
+    const RtcpCname &cname
+  ) noexcept {
+    if (destination.size() < 32U || acknowledgement_ssrc == 0 || report.media_ssrc == 0 ||
+        acknowledgement_ssrc == report.media_ssrc || !cname.valid()) {
+      return 0;
+    }
+    auto receiver_report = destination.first<32>();
+    std::ranges::fill(receiver_report, 0);
+    receiver_report[0] = 0x81U;
+    receiver_report[1] = transport::rtcp_receiver_report_type;
+    wire::write_be<std::uint16_t>(receiver_report.subspan<2, 2>(), 7U);
+    wire::write_be<std::uint32_t>(receiver_report.subspan<4, 4>(), acknowledgement_ssrc);
+    wire::write_be<std::uint32_t>(receiver_report.subspan<8, 4>(), report.media_ssrc);
+    receiver_report[12] = report.fraction_lost;
+    const auto cumulative_lost = static_cast<std::uint32_t>(report.cumulative_lost) & 0x00ff'ffffU;
+    receiver_report[13] = static_cast<std::uint8_t>(cumulative_lost >> 16U);
+    receiver_report[14] = static_cast<std::uint8_t>(cumulative_lost >> 8U);
+    receiver_report[15] = static_cast<std::uint8_t>(cumulative_lost);
+    wire::write_be<std::uint32_t>(receiver_report.subspan<16, 4>(), report.extended_highest_sequence);
+    wire::write_be<std::uint32_t>(receiver_report.subspan<20, 4>(), report.interarrival_jitter);
+    wire::write_be<std::uint32_t>(receiver_report.subspan<24, 4>(), report.last_sender_report);
+    wire::write_be<std::uint32_t>(receiver_report.subspan<28, 4>(), report.delay_since_sender_report);
+    const auto sdes_size = transport::write_sdes_cname(
+      acknowledgement_ssrc,
+      cname.view(),
+      destination.subspan(receiver_report.size())
+    );
+    return sdes_size == 0 ? 0 : receiver_report.size() + sdes_size;
+  }
+
   void InputFeedbackCompoundGate::reset(
     const std::uint32_t connection_generation,
     const std::uint32_t input_generation
@@ -70,9 +135,13 @@ namespace lumen::lsp::runtime {
     const auto value = connection_generation == 0 || input_generation == 0 ?
                          0 :
                          (static_cast<std::uint64_t>(connection_generation) << 32U) | input_generation;
+    reset_authority(value);
+  }
+
+  void InputFeedbackCompoundGate::reset_authority(const std::uint64_t token) noexcept {
     sent_.store(false, std::memory_order_release);
     in_flight_token_.store(0, std::memory_order_release);
-    authority_token_.store(value, std::memory_order_release);
+    authority_token_.store(token, std::memory_order_release);
   }
 
   std::uint64_t InputFeedbackCompoundGate::token() const noexcept {
@@ -82,6 +151,19 @@ namespace lumen::lsp::runtime {
   bool InputFeedbackCompoundGate::begin_submission(const std::uint64_t token) noexcept {
     if (token == 0 || token != authority_token_.load(std::memory_order_acquire) ||
         sent_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    auto expected = std::uint64_t {0};
+    return in_flight_token_.compare_exchange_strong(
+      expected,
+      token,
+      std::memory_order_acq_rel,
+      std::memory_order_acquire
+    );
+  }
+
+  bool InputFeedbackCompoundGate::begin_refresh_submission(const std::uint64_t token) noexcept {
+    if (!reduced_size_allowed(token)) {
       return false;
     }
     auto expected = std::uint64_t {0};
@@ -189,6 +271,12 @@ namespace lumen::lsp::runtime {
         std::scoped_lock lock(mutex_);
         ready_ = false;
         shutting_down_ = true;
+        feedback_authority_epoch_ = 0;
+        pending_feedback_ = {};
+        pending_compound_authority_epoch_ = 0;
+        pending_receiver_expected_ = 0;
+        pending_receiver_received_ = 0;
+        compound_gate_.reset(0, 0);
       }
       worker_.request_stop();
       condition_.notify_all();
@@ -243,7 +331,36 @@ namespace lumen::lsp::runtime {
       ack_pending_since_ = 0;
       ack_pending_records_ = 0;
       ack_urgent_ = false;
-      compound_gate_.reset(mapping.connection_generation, mapping.input_generation);
+      feedback_authority_epoch_ = next_feedback_authority_epoch_++;
+      if (next_feedback_authority_epoch_ == 0) {
+        next_feedback_authority_epoch_ = 1;
+      }
+      compound_gate_.reset_authority(feedback_authority_epoch_);
+      last_compound_report_microseconds_ = 0;
+      feedback_window_.reset(mapping.input_ssrc, monotonic_microseconds());
+      feedback_highest_sequence_ = 0;
+      feedback_base_sequence_ = 0;
+      unique_received_packets_ = 0;
+      receiver_expected_prior_ = 0;
+      receiver_received_prior_ = 0;
+      prior_feedback_transit_ = 0;
+      feedback_interarrival_jitter_ = 0;
+      has_feedback_transit_ = false;
+      feedback_sequence_initialized_ = false;
+      pending_feedback_ = {};
+      pending_compound_authority_epoch_ = 0;
+      pending_receiver_expected_ = 0;
+      pending_receiver_received_ = 0;
+      sender_cname_ = {};
+      sender_cname_size_ = 0;
+      last_sender_report_ = 0;
+      last_sender_report_received_microseconds_ = 0;
+      authenticated_rtp_packets_ = 0;
+      reportable_rtp_packets_ = 0;
+      feedback_storage_drops_ = 0;
+      receiver_reports_ = 0;
+      sender_reports_ = 0;
+      congestion_reports_ = 0;
       baseline_acknowledged_id_ = 0;
       text_barrier_edge_id_ = 0;
       baseline_receive_time_ = 0;
@@ -265,7 +382,9 @@ namespace lumen::lsp::runtime {
     bool receive(
       const PeerEndpoint &peer,
       const std::span<const std::uint8_t> packet,
-      std::uint64_t received_at_microseconds
+      const std::size_t protected_bytes,
+      std::uint64_t received_at_microseconds,
+      const IpEcn ecn
     ) noexcept {
       const auto rtp = parse_rtp_fixed_header(packet);
       if (!rtp || rtp.header.padding || rtp.header.extension || rtp.header.csrc_count != 0) {
@@ -299,6 +418,17 @@ namespace lumen::lsp::runtime {
         condition_.notify_one();
         return true;
       }
+
+      ++authenticated_rtp_packets_;
+      record_congestion_feedback_locked(
+        *mapping_,
+        rtp.header.sequence_number,
+        rtp.header.timestamp,
+        packet.size(),
+        protected_bytes,
+        received_at_microseconds,
+        ecn
+      );
 
       switch (parsed.header.kind) {
         case input_plane::packet_kind::baseline_part:
@@ -503,9 +633,24 @@ namespace lumen::lsp::runtime {
       };
     }
 
-    /** @brief Read exact final-sent complete IP/UDP bytes for LSPI and LSPG. */
+    /** @brief Read exact final-sent complete IP/UDP bytes for all host input feedback. */
     [[nodiscard]] std::uint64_t sent_feedback_wire_bytes() const noexcept {
       return sent_feedback_wire_bytes_.load(std::memory_order_relaxed);
+    }
+
+    /** @brief Snapshot authenticated input and host feedback state under the owner lock. */
+    [[nodiscard]] InputFeedbackSnapshot feedback_snapshot() const noexcept {
+      std::scoped_lock lock(mutex_);
+      return {
+        .authenticated_rtp_packets = authenticated_rtp_packets_,
+        .reportable_rtp_packets = reportable_rtp_packets_,
+        .feedback_storage_drops = feedback_storage_drops_,
+        .receiver_reports = receiver_reports_,
+        .sender_reports = sender_reports_,
+        .congestion_reports = congestion_reports_,
+        .sent_wire_bytes = sent_feedback_wire_bytes_.load(std::memory_order_relaxed),
+        .pending_report_positions = feedback_window_.size(),
+      };
     }
 
     /** @brief Read receive-to-platform-apply latency observations. */
@@ -517,36 +662,207 @@ namespace lumen::lsp::runtime {
       };
     }
 
-    bool receive_rtcp(const PeerEndpoint &peer, const std::span<const std::uint8_t> packet) noexcept {
+    bool receive_rtcp(
+      const PeerEndpoint &peer,
+      const std::span<const std::uint8_t> packet,
+      std::uint64_t received_at_microseconds
+    ) noexcept {
       std::scoped_lock lock(mutex_);
-      if (!mapping_ || peer != mapping_->peer || packet.size() < 8 || (packet[0] >> 6U) != 2 || packet[1] != 204 ||
-          wire::read_be<std::uint32_t>(packet.subspan(4, 4)) != mapping_->input_ssrc ||
-          (std::size_t {wire::read_be<std::uint16_t>(packet.subspan(2, 2))} + 1U) * 4U != packet.size()) {
+      if (shutting_down_ || !mapping_ || peer != mapping_->peer || packet.size() < 8) {
         return true;
       }
-      if (packet.size() < 8 + input_plane::lspg_header_size) {
+      if ((packet[0] >> 6U) == 2U && packet[1] == 204U) {
+        if (wire::read_be<std::uint32_t>(packet.subspan(4, 4)) != mapping_->input_ssrc ||
+            (std::size_t {wire::read_be<std::uint16_t>(packet.subspan(2, 2))} + 1U) * 4U != packet.size() ||
+            packet.size() < 8U + input_plane::lspg_header_size) {
+          return true;
+        }
+        const auto lspg_size = input_plane::lspg_header_size + wire::read_be<std::uint16_t>(packet.subspan(14, 2));
+        if (lspg_size > packet.size() - 8U) {
+          return true;
+        }
+        const auto parsed = input_plane::parse_lspg(packet.subspan(8, lspg_size));
+        if (!parsed || parsed.subtype != input_plane::lspg_subtype::acknowledgement) {
+          return true;
+        }
+        input_plane::controller_command_ack acknowledgement;
+        return input_plane::decode_controller_ack(parsed, acknowledgement) == input_plane::lspg_error::none &&
+               controller_output_.acknowledge(acknowledgement) != input_plane::controller_output_result::stale_generation;
+      }
+
+      const auto authority = transport::validate_compound_rtcp_authority(packet, mapping_->input_ssrc);
+      if (!authority || authority.first_report.packet_type != transport::rtcp_sender_report_type ||
+          authority.first_report.payload.size() < 24U || authority.cname.size() > sender_cname_.size()) {
         return true;
       }
-      const auto lspg_size = input_plane::lspg_header_size + wire::read_be<std::uint16_t>(packet.subspan(14, 2));
-      if (lspg_size > packet.size() - 8) {
+      if (sender_cname_size_ != 0 &&
+          (sender_cname_size_ != authority.cname.size() ||
+           !std::ranges::equal(
+             std::span<const std::uint8_t> {sender_cname_}.first(sender_cname_size_),
+             authority.cname
+           ))) {
         return true;
       }
-      const auto parsed = input_plane::parse_lspg(packet.subspan(8, lspg_size));
-      if (!parsed || parsed.subtype != input_plane::lspg_subtype::acknowledgement) {
-        return true;
+      if (sender_cname_size_ == 0) {
+        std::copy(authority.cname.begin(), authority.cname.end(), sender_cname_.begin());
+        sender_cname_size_ = authority.cname.size();
       }
-      input_plane::controller_command_ack acknowledgement;
-      return input_plane::decode_controller_ack(parsed, acknowledgement) == input_plane::lspg_error::none &&
-             controller_output_.acknowledge(acknowledgement) != input_plane::controller_output_result::stale_generation;
+      if (received_at_microseconds == 0) {
+        received_at_microseconds = monotonic_microseconds();
+      }
+      const auto seconds = wire::read_be<std::uint32_t>(authority.first_report.payload.subspan<4, 4>());
+      const auto fraction = wire::read_be<std::uint32_t>(authority.first_report.payload.subspan<8, 4>());
+      last_sender_report_ = static_cast<std::uint32_t>((seconds << 16U) | (fraction >> 16U));
+      last_sender_report_received_microseconds_ = received_at_microseconds;
+      ++sender_reports_;
+      return true;
     }
 
   private:
-    /** @brief Bind regular-compound completion to one exact connection/input generation pair. */
-    [[nodiscard]] static constexpr std::uint64_t mapping_token(
-      const InputSessionMapping &mapping
+    /** @brief Sole borrowed RFC 8888 prefix awaiting aggregate final-send completion. */
+    struct PendingFeedback {
+      std::uint64_t token {};  ///< Unique aggregate completion identity.
+      std::uint64_t authority_epoch {};  ///< Exact input mapping incarnation that borrowed the prefix.
+      std::uint32_t begin_extended_sequence {};  ///< Borrowed prefix origin, including gaps.
+      std::size_t report_count {};  ///< Exact borrowed sequence-position count.
+      bool prefix_modified {};  ///< Reorder or CE update requires regeneration instead of prefix commit.
+      bool active {};  ///< Whether aggregate terminal completion remains pending.
+    };
+
+    /** @brief Expand one RTP sequence around the greatest authenticated input sequence. */
+    [[nodiscard]] std::uint64_t expand_feedback_sequence(const std::uint16_t sequence) noexcept {
+      if (!feedback_sequence_initialized_) {
+        feedback_sequence_initialized_ = true;
+        feedback_highest_sequence_ = sequence;
+        return feedback_highest_sequence_;
+      }
+      const auto cycle = feedback_highest_sequence_ & ~std::uint64_t {0xffffU};
+      auto candidate = cycle | sequence;
+      if (candidate + 0x8000U < feedback_highest_sequence_) {
+        candidate += 0x1'0000U;
+      } else if (candidate > feedback_highest_sequence_ + 0x8000U && candidate >= 0x1'0000U) {
+        candidate -= 0x1'0000U;
+      }
+      feedback_highest_sequence_ = std::max(feedback_highest_sequence_, candidate);
+      return candidate;
+    }
+
+    /** @brief Retain one admitted authenticated input packet for bounded RFC 8888 reporting. */
+    void record_congestion_feedback_locked(
+      const InputSessionMapping &mapping,
+      const std::uint16_t sequence,
+      const std::uint32_t rtp_timestamp,
+      const std::size_t plaintext_bytes,
+      const std::size_t protected_bytes,
+      const std::uint64_t received_at_microseconds,
+      const IpEcn ecn
     ) noexcept {
-      return (static_cast<std::uint64_t>(mapping.connection_generation) << 32U) |
-             mapping.input_generation;
+      const auto network_overhead = mapping.peer.family == IpAddressFamily::ipv6 ? 48U : 28U;
+      if (protected_bytes < plaintext_bytes ||
+          protected_bytes > std::numeric_limits<std::uint16_t>::max() - network_overhead ||
+          received_at_microseconds == 0) {
+        ++feedback_storage_drops_;
+        return;
+      }
+      const auto expanded_sequence = expand_feedback_sequence(sequence);
+      if (expanded_sequence > std::numeric_limits<std::uint32_t>::max()) {
+        ++feedback_storage_drops_;
+        return;
+      }
+      if (pending_feedback_.active &&
+          expanded_sequence >= pending_feedback_.begin_extended_sequence &&
+          expanded_sequence - pending_feedback_.begin_extended_sequence < pending_feedback_.report_count) {
+        pending_feedback_.prefix_modified = true;
+      }
+      const auto result = feedback_window_.record({
+        .media_ssrc = mapping.input_ssrc,
+        .extended_sequence_number = static_cast<std::uint32_t>(expanded_sequence),
+        .arrival_microseconds = received_at_microseconds,
+        .received_bytes = static_cast<std::uint16_t>(protected_bytes + network_overhead),
+        .ecn = feedback_ecn(ecn),
+      });
+      if (result == transport::reordering_congestion_report_result::accepted ||
+          result == transport::reordering_congestion_report_result::duplicate) {
+        ++reportable_rtp_packets_;
+      } else {
+        ++feedback_storage_drops_;
+      }
+      const auto unique = result == transport::reordering_congestion_report_result::accepted ||
+                          result == transport::reordering_congestion_report_result::full ||
+                          (result == transport::reordering_congestion_report_result::stale &&
+                           unique_received_packets_ != 0 && expanded_sequence >= feedback_base_sequence_);
+      if (!unique) {
+        return;
+      }
+      if (unique_received_packets_ == 0) {
+        feedback_base_sequence_ = expanded_sequence;
+      }
+      ++unique_received_packets_;
+      const auto transit = static_cast<std::int32_t>(
+        static_cast<std::uint32_t>(received_at_microseconds) - rtp_timestamp
+      );
+      if (has_feedback_transit_) {
+        const auto delta = static_cast<std::uint32_t>(std::abs(
+          static_cast<std::int64_t>(transit) - prior_feedback_transit_
+        ));
+        const auto next_jitter = static_cast<std::int64_t>(feedback_interarrival_jitter_) +
+                                 (static_cast<std::int64_t>(delta) - feedback_interarrival_jitter_) / 16;
+        feedback_interarrival_jitter_ = static_cast<std::uint32_t>(std::max<std::int64_t>(0, next_jitter));
+      }
+      prior_feedback_transit_ = transit;
+      has_feedback_transit_ = true;
+    }
+
+    /** @brief Borrow, serialize, protect once, and enqueue one due input RFC 8888 prefix. */
+    void maybe_send_congestion_feedback_locked(
+      const InputSessionMapping &mapping,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (shutting_down_ || !mapping_ || *mapping_ != mapping || pending_feedback_.active ||
+          !ensure_regular_compound(mapping)) {
+        return;
+      }
+      const auto batch = feedback_window_.pending_report(now_microseconds);
+      if (batch.size() == 0 || next_feedback_completion_token_ == 0) {
+        return;
+      }
+      auto lease = mapping.forward_path->acquire(HostForwardLane::congestion_feedback);
+      if (!lease) {
+        return;
+      }
+      const auto total = write_host_congestion_report(
+        lease->storage,
+        mapping.acknowledgement_ssrc,
+        batch,
+        current_middle_ntp()
+      );
+      if (total == 0) {
+        return;
+      }
+      std::size_t protected_bytes = 0;
+      if (!srtp_.protect_in_place(mapping.peer, SecurePacketClass::rtcp, lease->storage, total, protected_bytes)) {
+        return;
+      }
+      const auto deadline = now_microseconds > std::numeric_limits<std::uint64_t>::max() - 20'000U ?
+                              std::numeric_limits<std::uint64_t>::max() :
+                              now_microseconds + 20'000U;
+      const auto token = next_feedback_completion_token_++;
+      pending_feedback_ = {
+        .token = token,
+        .authority_epoch = feedback_authority_epoch_,
+        .begin_extended_sequence = batch.begin_extended_sequence,
+        .report_count = batch.size(),
+        .active = true,
+      };
+      if (mapping.forward_path->commit(
+            *lease,
+            protected_bytes,
+            deadline,
+            token,
+            {.context = this, .completed = congestion_feedback_completion_callback}
+          ) != HostForwardSubmitResult::accepted) {
+        pending_feedback_ = {};
+      }
     }
 
     /** @brief Clear the current mapping while the owner mutex is already held. */
@@ -568,6 +884,26 @@ namespace lumen::lsp::runtime {
       ack_pending_records_ = 0;
       ack_urgent_ = false;
       compound_gate_.reset(0, 0);
+      last_compound_report_microseconds_ = 0;
+      feedback_window_.reset(0, monotonic_microseconds());
+      feedback_highest_sequence_ = 0;
+      feedback_base_sequence_ = 0;
+      unique_received_packets_ = 0;
+      receiver_expected_prior_ = 0;
+      receiver_received_prior_ = 0;
+      prior_feedback_transit_ = 0;
+      feedback_interarrival_jitter_ = 0;
+      has_feedback_transit_ = false;
+      feedback_sequence_initialized_ = false;
+      pending_feedback_ = {};
+      pending_compound_authority_epoch_ = 0;
+      pending_receiver_expected_ = 0;
+      pending_receiver_received_ = 0;
+      sender_cname_ = {};
+      sender_cname_size_ = 0;
+      last_sender_report_ = 0;
+      last_sender_report_received_microseconds_ = 0;
+      feedback_authority_epoch_ = 0;
       baseline_acknowledged_id_ = 0;
       text_barrier_edge_id_ = 0;
       baseline_receive_time_ = 0;
@@ -1167,10 +1503,11 @@ namespace lumen::lsp::runtime {
             drain_latest_states_locked(*mapping_);
             enforce_edge_deadlines_locked(*mapping_, monotonic_microseconds());
           }
+          const auto now = monotonic_microseconds();
           if (mapping_) {
-            (void) ensure_regular_compound(*mapping_);
+            maybe_send_congestion_feedback_locked(*mapping_, now);
           }
-          acknowledged = flush_pending_ack(monotonic_microseconds());
+          acknowledged = flush_pending_ack(now);
         }
         notify_baseline_acknowledged(acknowledged);
         if (baseline_candidate) {
@@ -1701,39 +2038,78 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    /** @brief Protect and submit the regular RR/CNAME prerequisite exactly once per mapping. */
+    /** @brief Establish and periodically refresh the regular RR/CNAME prerequisite. */
     [[nodiscard]] bool ensure_regular_compound(const InputSessionMapping &mapping) noexcept {
-      const auto token = mapping_token(mapping);
+      const auto token = feedback_authority_epoch_;
       if (!mapping_ || *mapping_ != mapping || token == 0 || !mapping.rtcp_cname.valid() ||
           compound_gate_.token() != token) {
         return false;
       }
-      if (compound_gate_.reduced_size_allowed(token)) {
+      const auto now = monotonic_microseconds();
+      const auto authorized = compound_gate_.reduced_size_allowed(token);
+      if (authorized && last_compound_report_microseconds_ != 0 &&
+          now >= last_compound_report_microseconds_ &&
+          now - last_compound_report_microseconds_ < 1'000'000U) {
         return true;
       }
       if (compound_gate_.submission_pending()) {
-        return false;
+        return authorized;
       }
-      auto lease = mapping.forward_path->acquire(HostForwardLane::input_feedback);
-      if (!lease || lease->storage.size() < 12U) {
-        return false;
+      auto lease = mapping.forward_path->acquire(HostForwardLane::periodic);
+      if (!lease || lease->storage.size() < 32U) {
+        return authorized;
       }
+      const auto expected = feedback_sequence_initialized_ && unique_received_packets_ != 0 ?
+                              feedback_highest_sequence_ - feedback_base_sequence_ + 1U :
+                              0U;
+      const auto received = unique_received_packets_;
+      const auto cumulative_lost_raw = static_cast<std::int64_t>(expected) - static_cast<std::int64_t>(received);
+      const auto cumulative_lost = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+        cumulative_lost_raw,
+        -0x80'0000LL,
+        0x7f'ffffLL
+      ));
+      const auto expected_interval = expected >= receiver_expected_prior_ ? expected - receiver_expected_prior_ : 0U;
+      const auto received_interval = received >= receiver_received_prior_ ? received - receiver_received_prior_ : 0U;
+      const auto lost_interval = expected_interval > received_interval ? expected_interval - received_interval : 0U;
+      const auto fraction_lost = expected_interval == 0 ?
+                                   0U :
+                                   std::min<std::uint64_t>(255U, lost_interval * 256U / expected_interval);
+      const auto sr_delay_microseconds = last_sender_report_received_microseconds_ == 0 ||
+                                             now < last_sender_report_received_microseconds_ ?
+                                           0U :
+                                           now - last_sender_report_received_microseconds_;
+      const auto delay_since_sender_report = std::min<std::uint64_t>(
+        std::numeric_limits<std::uint32_t>::max(),
+        sr_delay_microseconds * 65'536ULL / 1'000'000ULL
+      );
       const auto total = write_input_feedback_compound_report(
         lease->storage,
         mapping.acknowledgement_ssrc,
+        {
+          .media_ssrc = mapping.input_ssrc,
+          .extended_highest_sequence = static_cast<std::uint32_t>(feedback_highest_sequence_),
+          .interarrival_jitter = feedback_interarrival_jitter_,
+          .last_sender_report = last_sender_report_,
+          .delay_since_sender_report = static_cast<std::uint32_t>(delay_since_sender_report),
+          .cumulative_lost = cumulative_lost,
+          .fraction_lost = static_cast<std::uint8_t>(fraction_lost),
+        },
         mapping.rtcp_cname
       );
       if (total == 0) {
-        return false;
+        return authorized;
       }
       std::size_t protected_bytes = 0;
       if (!srtp_.protect_in_place(mapping.peer, SecurePacketClass::rtcp, lease->storage, total, protected_bytes)) {
-        return false;
+        return authorized;
       }
-      if (!compound_gate_.begin_submission(token)) {
-        return false;
+      if (!(authorized ? compound_gate_.begin_refresh_submission(token) : compound_gate_.begin_submission(token))) {
+        return authorized;
       }
-      const auto now = monotonic_microseconds();
+      pending_compound_authority_epoch_ = feedback_authority_epoch_;
+      pending_receiver_expected_ = expected;
+      pending_receiver_received_ = received;
       const auto deadline = now > std::numeric_limits<std::uint64_t>::max() - 20'000U ?
                               std::numeric_limits<std::uint64_t>::max() :
                               now + 20'000U;
@@ -1744,10 +2120,13 @@ namespace lumen::lsp::runtime {
             token,
             completion_target()
           ) != HostForwardSubmitResult::accepted) {
+        pending_compound_authority_epoch_ = 0;
+        pending_receiver_expected_ = 0;
+        pending_receiver_received_ = 0;
         compound_gate_.cancel_submission(token);
-        return false;
+        return authorized;
       }
-      return compound_gate_.reduced_size_allowed(token);
+      return authorized;
     }
 
     /** @brief Serialize, protect once, and commit one current LSPI acknowledgement. */
@@ -1822,7 +2201,7 @@ namespace lumen::lsp::runtime {
       static_cast<Impl *>(context)->handle_feedback(feedback.message);
     }
 
-    /** @brief Count final-sent host input-feedback wire bytes without entering owner synchronization. */
+    /** @brief Complete LSPI/LSPG or regular-compound output without producer-global lookup. */
     static void forward_completion_callback(
       void *context,
       const std::uint64_t token,
@@ -1833,15 +2212,81 @@ namespace lumen::lsp::runtime {
       const std::uint16_t charged_bytes
     ) noexcept {
       (void) lane;
-      (void) completed_at_microseconds;
       (void) protected_bytes;
       auto *self = static_cast<Impl *>(context);
       if (self != nullptr && completion == HostForwardCompletion::sent) {
         self->sent_feedback_wire_bytes_.fetch_add(charged_bytes, std::memory_order_relaxed);
       }
       if (self != nullptr && token != 0) {
+        {
+          std::scoped_lock lock(self->mutex_);
+          if (!self->shutting_down_ && self->mapping_ && self->feedback_authority_epoch_ == token &&
+              self->pending_compound_authority_epoch_ == token) {
+            if (completion == HostForwardCompletion::sent) {
+              self->receiver_expected_prior_ = self->pending_receiver_expected_;
+              self->receiver_received_prior_ = self->pending_receiver_received_;
+              self->last_compound_report_microseconds_ = completed_at_microseconds;
+              ++self->receiver_reports_;
+            }
+            self->pending_compound_authority_epoch_ = 0;
+            self->pending_receiver_expected_ = 0;
+            self->pending_receiver_received_ = 0;
+          } else if (self->pending_compound_authority_epoch_ == token) {
+            self->pending_compound_authority_epoch_ = 0;
+            self->pending_receiver_expected_ = 0;
+            self->pending_receiver_received_ = 0;
+          }
+        }
         self->compound_gate_.complete(token, completion == HostForwardCompletion::sent);
         self->condition_.notify_all();
+      }
+    }
+
+    /** @brief Commit only the exact borrowed RFC 8888 prefix after final socket success. */
+    void complete_congestion_feedback(
+      const std::uint64_t token,
+      const HostForwardCompletion completion,
+      const std::uint64_t completed_at_microseconds,
+      const std::uint16_t charged_bytes
+    ) noexcept {
+      if (completion == HostForwardCompletion::sent) {
+        sent_feedback_wire_bytes_.fetch_add(charged_bytes, std::memory_order_relaxed);
+      }
+      std::scoped_lock lock(mutex_);
+      if (!pending_feedback_.active || pending_feedback_.token != token) {
+        return;
+      }
+      const auto pending = pending_feedback_;
+      pending_feedback_ = {};
+      if (completion == HostForwardCompletion::sent) {
+        if (mapping_ && pending.authority_epoch == feedback_authority_epoch_) {
+          ++congestion_reports_;
+          if (!pending.prefix_modified) {
+            (void) feedback_window_.commit_report(
+              pending.begin_extended_sequence,
+              pending.report_count,
+              completed_at_microseconds
+            );
+          }
+          maybe_send_congestion_feedback_locked(*mapping_, completed_at_microseconds);
+        }
+      }
+      condition_.notify_all();
+    }
+
+    /** @brief Adapt aggregate terminal completion to the input-owned RFC 8888 transaction. */
+    static void congestion_feedback_completion_callback(
+      void *context,
+      const std::uint64_t token,
+      const HostForwardLane,
+      const HostForwardCompletion completion,
+      const std::uint64_t completed_at_microseconds,
+      const std::size_t,
+      const std::uint16_t charged_bytes
+    ) noexcept {
+      auto *self = static_cast<Impl *>(context);
+      if (self != nullptr) {
+        self->complete_congestion_feedback(token, completion, completed_at_microseconds, charged_bytes);
       }
     }
 
@@ -2065,12 +2510,40 @@ namespace lumen::lsp::runtime {
     bool latest_apply_succeeded_ {};  ///< Result of the current worker-owned latest-state dispatch.
     std::jthread worker_;  ///< Dedicated ordered platform apply owner.
     InputFeedbackCompoundGate compound_gate_;  ///< Completion-fenced RR/CNAME prerequisite.
-    std::atomic<std::uint64_t> sent_feedback_wire_bytes_ {};  ///< Complete final-sent IP/UDP bytes for LSPI and LSPG.
+    transport::reordering_congestion_feedback_window<512> feedback_window_;  ///< Input RTP gaps, reorder, and ECN state.
+    PendingFeedback pending_feedback_;  ///< Sole borrowed CCFB prefix awaiting final-send completion.
+    std::uint64_t feedback_highest_sequence_ {};  ///< Greatest expanded authenticated input RTP sequence.
+    std::uint64_t feedback_base_sequence_ {};  ///< First unique input sequence used by RR loss accounting.
+    std::uint64_t unique_received_packets_ {};  ///< Unique authenticated input sequences used by RR accounting.
+    std::uint64_t receiver_expected_prior_ {};  ///< Expected total committed by the last final-sent RR.
+    std::uint64_t receiver_received_prior_ {};  ///< Received total committed by the last final-sent RR.
+    std::uint64_t feedback_authority_epoch_ {};  ///< Exact current input mapping incarnation.
+    std::uint64_t next_feedback_authority_epoch_ {1};  ///< Monotonic mapping-incarnation source.
+    std::uint64_t next_feedback_completion_token_ {1};  ///< Monotonic aggregate CCFB completion identity.
+    std::uint64_t last_compound_report_microseconds_ {};  ///< Latest final-sent input RR/CNAME instant.
+    std::uint64_t pending_compound_authority_epoch_ {};  ///< Mapping incarnation owning the in-flight RR snapshot.
+    std::uint64_t pending_receiver_expected_ {};  ///< RR expected total committed only after final send.
+    std::uint64_t pending_receiver_received_ {};  ///< RR received total committed only after final send.
+    std::array<std::uint8_t, 255> sender_cname_ {};  ///< Stable authenticated client input-source CNAME.
+    std::size_t sender_cname_size_ {};  ///< Populated stable client CNAME bytes.
+    std::uint64_t last_sender_report_received_microseconds_ {};  ///< Monotonic receive time of latest input SR.
+    std::int64_t prior_feedback_transit_ {};  ///< Prior one-megahertz arrival-minus-RTP transit sample.
+    std::uint32_t feedback_interarrival_jitter_ {};  ///< Smoothed RFC 3550 input jitter in microsecond units.
+    std::uint32_t last_sender_report_ {};  ///< Middle NTP bits of the latest valid client input SR.
+    std::uint64_t authenticated_rtp_packets_ {};  ///< Exact input bodies offered to feedback admission.
+    std::uint64_t reportable_rtp_packets_ {};  ///< Accepted or duplicate input RTP sequence observations.
+    std::uint64_t feedback_storage_drops_ {};  ///< Metadata/range observations omitted from bounded feedback.
+    std::uint64_t receiver_reports_ {};  ///< Final-sent regular RR/CNAME packets for this mapping.
+    std::uint64_t sender_reports_ {};  ///< Authenticated regular client input SR/CNAME packets.
+    std::uint64_t congestion_reports_ {};  ///< Final-sent reduced CCFB packets for this mapping.
+    std::atomic<std::uint64_t> sent_feedback_wire_bytes_ {};  ///< Complete final-sent IP/UDP bytes for input RTCP.
     std::atomic<std::uint64_t> apply_latency_samples_ {};  ///< Receive-to-apply sample count.
     std::atomic<std::uint64_t> latest_apply_latency_microseconds_ {};  ///< Latest receive-to-apply duration.
     std::atomic<std::uint64_t> maximum_apply_latency_microseconds_ {};  ///< Maximum receive-to-apply duration.
     bool ready_ {};  ///< Callback/platform/worker readiness.
     bool shutting_down_ {};  ///< Permanent producer-admission closure.
+    bool feedback_sequence_initialized_ {};  ///< Whether feedback sequence expansion has an origin.
+    bool has_feedback_transit_ {};  ///< Whether jitter differencing has a prior input transit sample.
   };
 
   InputOwner::InputOwner(
@@ -2101,11 +2574,25 @@ namespace lumen::lsp::runtime {
     const std::span<const std::uint8_t> packet,
     const std::uint64_t received_at_microseconds
   ) noexcept {
-    return impl_ && impl_->receive(peer, packet, received_at_microseconds);
+    return receive(peer, packet, 0, received_at_microseconds, IpEcn::unavailable);
   }
 
-  bool InputOwner::receive_rtcp(const PeerEndpoint &peer, const std::span<const std::uint8_t> packet) noexcept {
-    return impl_ && impl_->receive_rtcp(peer, packet);
+  bool InputOwner::receive(
+    const PeerEndpoint &peer,
+    const std::span<const std::uint8_t> packet,
+    const std::size_t protected_bytes,
+    const std::uint64_t received_at_microseconds,
+    const IpEcn ecn
+  ) noexcept {
+    return impl_ && impl_->receive(peer, packet, protected_bytes, received_at_microseconds, ecn);
+  }
+
+  bool InputOwner::receive_rtcp(
+    const PeerEndpoint &peer,
+    const std::span<const std::uint8_t> packet,
+    const std::uint64_t received_at_microseconds
+  ) noexcept {
+    return impl_ && impl_->receive_rtcp(peer, packet, received_at_microseconds);
   }
 
   void InputOwner::begin_shutdown() noexcept {
@@ -2150,6 +2637,10 @@ namespace lumen::lsp::runtime {
   /** @copydoc InputOwner::sent_feedback_wire_bytes */
   std::uint64_t InputOwner::sent_feedback_wire_bytes() const noexcept {
     return impl_ ? impl_->sent_feedback_wire_bytes() : 0;
+  }
+
+  InputFeedbackSnapshot InputOwner::feedback_snapshot() const noexcept {
+    return impl_ ? impl_->feedback_snapshot() : InputFeedbackSnapshot {};
   }
 
   InputLatencySnapshot InputOwner::latency_snapshot() const noexcept {

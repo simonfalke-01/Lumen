@@ -29,6 +29,7 @@ namespace {
     std::condition_variable condition;
     std::vector<std::vector<std::uint8_t>> submissions;
     std::vector<std::pair<std::uint64_t, runtime::HostForwardLane>> completions;
+    std::vector<std::tuple<std::uint64_t, runtime::HostForwardLane, std::uint64_t>> timed_completions;
     std::vector<std::pair<std::uint64_t, runtime::HostForwardCompletion>> terminal;
     std::vector<bool> pressure;
     bool would_block_once {};
@@ -54,7 +55,7 @@ namespace {
       const std::uint64_t token,
       const runtime::HostForwardLane lane,
       const runtime::HostForwardCompletion completion,
-      const std::uint64_t,
+      const std::uint64_t completed_at_microseconds,
       const std::size_t,
       const std::uint16_t
     ) noexcept {
@@ -64,6 +65,7 @@ namespace {
         self.terminal.emplace_back(token, completion);
         if (completion == runtime::HostForwardCompletion::sent) {
           self.completions.emplace_back(token, lane);
+          self.timed_completions.emplace_back(token, lane, completed_at_microseconds);
         }
       }
       self.condition.notify_all();
@@ -167,6 +169,51 @@ TEST(LspHostForwardPath, AudioPreemptsQueuedVideoAndChargesCompleteIpBytes) {
   EXPECT_EQ(snapshot.sent_charged_bytes, 2U * (32U + 28U));
 }
 
+TEST(LspHostForwardPath, SharedCongestionFloorPreservesUrgentInputPreemption) {
+  FakeForwardSocket socket;
+  auto path = make_path(socket);
+  ASSERT_TRUE(path.ready());
+
+  fill_and_commit(path, runtime::HostForwardLane::congestion_feedback, 0xc1, 1);
+  fill_and_commit(path, runtime::HostForwardLane::congestion_feedback, 0xc2, 2);
+  fill_and_commit(path, runtime::HostForwardLane::video, 0x44, 3);
+  fill_and_commit(path, runtime::HostForwardLane::input_feedback, 0x11, 4);
+  ASSERT_TRUE(path.start());
+  ASSERT_TRUE(socket.wait_for_completions(4));
+  path.close();
+  path.join();
+
+  ASSERT_EQ(socket.completions.size(), 4U);
+  EXPECT_EQ(socket.completions[0].first, 4U);
+  ASSERT_EQ(socket.timed_completions.size(), 4U);
+  const auto first_feedback = std::ranges::find_if(socket.timed_completions, [](const auto &completion) {
+    return std::get<0>(completion) == 1U;
+  });
+  const auto second_feedback = std::ranges::find_if(socket.timed_completions, [](const auto &completion) {
+    return std::get<0>(completion) == 2U;
+  });
+  ASSERT_NE(first_feedback, socket.timed_completions.end());
+  ASSERT_NE(second_feedback, socket.timed_completions.end());
+  EXPECT_GE(
+    std::get<2>(*second_feedback) - std::get<2>(*first_feedback),
+    500U
+  );
+}
+
+TEST(LspHostForwardPath, LateQueuedCongestionFeedbackDoesNotRequireOtherTrafficToWake) {
+  FakeForwardSocket socket;
+  auto path = make_path(socket);
+  ASSERT_TRUE(path.start());
+  fill_and_commit(path, runtime::HostForwardLane::congestion_feedback, 0xc1, 1);
+  ASSERT_TRUE(socket.wait_for_completions(1));
+  fill_and_commit(path, runtime::HostForwardLane::congestion_feedback, 0xc2, 2);
+  ASSERT_TRUE(socket.wait_for_completions(2));
+  path.close();
+  path.join();
+  ASSERT_EQ(socket.timed_completions.size(), 2U);
+  EXPECT_GE(std::get<2>(socket.timed_completions[1]) - std::get<2>(socket.timed_completions[0]), 500U);
+}
+
 TEST(LspHostForwardPath, WouldBlockRetriesIdenticalProtectedBytesWithoutRecharging) {
   FakeForwardSocket socket;
   socket.would_block_once = true;
@@ -227,7 +274,7 @@ TEST(LspHostForwardPath, PmtuDecreaseRetiresQueuedOversizeMediaButRetainsProbeCe
   path.join();
 }
 
-TEST(LspHostForwardPath, BulkCannotConsumeVideoOrRecoveryReservations) {
+TEST(LspHostForwardPath, BulkCannotConsumeVideoRecoveryOrCongestionFeedbackReservations) {
   FakeForwardSocket socket;
   auto path = make_path(socket);
   std::array<std::optional<runtime::HostForwardLease>, 4> bulk;
@@ -239,6 +286,7 @@ TEST(LspHostForwardPath, BulkCannotConsumeVideoOrRecoveryReservations) {
   EXPECT_TRUE(path.acquire(runtime::HostForwardLane::video).has_value());
   EXPECT_TRUE(path.acquire(runtime::HostForwardLane::recovery).has_value());
   EXPECT_TRUE(path.acquire(runtime::HostForwardLane::path_probe).has_value());
+  EXPECT_TRUE(path.acquire(runtime::HostForwardLane::congestion_feedback).has_value());
 }
 
 TEST(LspHostForwardPath, WrongOwnerCannotDisarmOrCommitAnotherPathsLease) {

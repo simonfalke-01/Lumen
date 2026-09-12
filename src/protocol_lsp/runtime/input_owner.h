@@ -11,6 +11,7 @@
 #include "libsrtp_provider.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -30,9 +31,16 @@ namespace lumen::lsp::runtime {
     void reset(std::uint32_t connection_generation, std::uint32_t input_generation) noexcept;
 
     /**
+     * @brief Reset authority to one caller-issued nonrepeating mapping incarnation.
+     *
+     * @param token Nonzero incarnation token, or zero to clear authority.
+     */
+    void reset_authority(std::uint64_t token) noexcept;
+
+    /**
      * @brief Return the exact current generation token.
      *
-     * @return Nonzero connection/input token, or zero while inactive.
+     * @return Nonzero authority token, or zero while inactive.
      */
     [[nodiscard]] std::uint64_t token() const noexcept;
 
@@ -43,6 +51,14 @@ namespace lumen::lsp::runtime {
      * @return True only when no compound is sent or already in flight.
      */
     bool begin_submission(std::uint64_t token) noexcept;
+
+    /**
+     * @brief Reserve a periodic regular-compound refresh without revoking prior authority.
+     *
+     * @param token Exact active mapping token.
+     * @return True only when reduced-size authority exists and no compound is in flight.
+     */
+    bool begin_refresh_submission(std::uint64_t token) noexcept;
 
     /**
      * @brief Roll back a submission that could not enter aggregate output.
@@ -94,11 +110,50 @@ namespace lumen::lsp::runtime {
     const RtcpCname &cname
   ) noexcept;
 
+  /** @brief Exact RFC 3550 receiver-report state for the client input RTP source. */
+  struct InputReceiverReportState {
+    std::uint32_t media_ssrc {};  ///< Negotiated client input source SSRC.
+    std::uint32_t extended_highest_sequence {};  ///< Greatest authenticated extended RTP sequence.
+    std::uint32_t interarrival_jitter {};  ///< RFC 3550 jitter in one-megahertz input timestamp units.
+    std::uint32_t last_sender_report {};  ///< Middle NTP bits of the latest valid client input SR.
+    std::uint32_t delay_since_sender_report {};  ///< Delay since SR in 1/65536-second units.
+    std::int32_t cumulative_lost {};  ///< Signed cumulative loss clamped to the RTCP 24-bit field.
+    std::uint8_t fraction_lost {};  ///< Interval loss fraction in 1/256 units.
+  };
+
+  /**
+   * @brief Write one input-source RR block plus stable SDES CNAME.
+   *
+   * @param destination Caller-owned plaintext RTCP storage.
+   * @param acknowledgement_ssrc Host input-feedback sender SSRC.
+   * @param report Exact current client input-source reception state.
+   * @param cname Stable association CNAME shared with other host RTCP sources.
+   * @return Complete compound bytes, or zero for invalid fields or insufficient storage.
+   */
+  [[nodiscard]] std::size_t write_input_feedback_compound_report(
+    std::span<std::uint8_t> destination,
+    std::uint32_t acknowledgement_ssrc,
+    const InputReceiverReportState &report,
+    const RtcpCname &cname
+  ) noexcept;
+
   /** @brief Low-rate input receive-to-platform-apply latency observations. */
   struct InputLatencySnapshot {
     std::uint64_t samples {};  ///< Applied baseline/state/edge observations.
     std::uint64_t latest_microseconds {};  ///< Latest receive-to-apply duration.
     std::uint64_t maximum_microseconds {};  ///< Maximum receive-to-apply duration.
+  };
+
+  /** @brief Bounded host observations for reverse input congestion feedback. */
+  struct InputFeedbackSnapshot {
+    std::uint64_t authenticated_rtp_packets {};  ///< Exact admitted input RTP bodies offered to feedback state.
+    std::uint64_t reportable_rtp_packets {};  ///< New or duplicate sequence observations retained by RFC 8888 state.
+    std::uint64_t feedback_storage_drops {};  ///< Valid input packets omitted only because metadata/window bounds rejected them.
+    std::uint64_t receiver_reports {};  ///< Final-sent regular RR/CNAME packets.
+    std::uint64_t sender_reports {};  ///< Authenticated regular client input SR/CNAME packets.
+    std::uint64_t congestion_reports {};  ///< Final-sent reduced RFC 8888 feedback packets.
+    std::uint64_t sent_wire_bytes {};  ///< Complete final-sent IP/UDP bytes for all host input feedback.
+    std::size_t pending_report_positions {};  ///< Current bounded sequence positions, including inferred gaps.
   };
 
   /** @brief Authenticated input-only session mapping installed by START_RESPONSE. */
@@ -208,6 +263,9 @@ namespace lumen::lsp::runtime {
      * @param packet Complete decrypted RTP packet.
      * @param received_at_microseconds Socket receive timestamp, or zero to sample the host clock now.
      * @return True when accepted into the bounded ordered owner; unknown mappings are silent drops.
+     *
+     * This compatibility overload does not invent unavailable protected-byte or ECN metadata,
+     * so its packet is applied normally but omitted from RFC 8888 reception accounting.
      */
     bool receive(
       const PeerEndpoint &peer,
@@ -215,8 +273,37 @@ namespace lumen::lsp::runtime {
       std::uint64_t received_at_microseconds = 0
     ) noexcept;
 
-    /** @brief Process one authenticated negotiated SRTCP LSPG acknowledgement. */
-    bool receive_rtcp(const PeerEndpoint &peer, std::span<const std::uint8_t> packet) noexcept;
+    /**
+     * @brief Validate and enqueue authenticated input while retaining exact socket metadata for RFC 8888.
+     *
+     * @param peer Exact receive five-tuple.
+     * @param packet Complete decrypted RTP packet.
+     * @param protected_bytes Authenticated UDP payload size before SRTP unprotection.
+     * @param received_at_microseconds Original monotonic socket receive time, or zero to sample now.
+     * @param ecn Authenticated IP-layer ECN observation.
+     * @return True when accepted or safely dropped for the active input mapping.
+     */
+    bool receive(
+      const PeerEndpoint &peer,
+      std::span<const std::uint8_t> packet,
+      std::size_t protected_bytes,
+      std::uint64_t received_at_microseconds,
+      IpEcn ecn
+    ) noexcept;
+
+    /**
+     * @brief Process one authenticated input SR/CNAME compound or negotiated SRTCP LSPG acknowledgement.
+     *
+     * @param peer Exact receive five-tuple.
+     * @param packet Complete decrypted RTCP datagram.
+     * @param received_at_microseconds Original monotonic socket receive time, or zero to sample now.
+     * @return True for accepted or safely ignored RTCP input traffic.
+     */
+    bool receive_rtcp(
+      const PeerEndpoint &peer,
+      std::span<const std::uint8_t> packet,
+      std::uint64_t received_at_microseconds = 0
+    ) noexcept;
 
     /**
      * @brief Permanently close producer admission and request the apply worker to stop.
@@ -272,9 +359,12 @@ namespace lumen::lsp::runtime {
     /**
      * @brief Return measured final-sent complete IP/UDP bytes for host input feedback.
      *
-     * @return Combined LSPI and LSPG charged bytes for the active owner lifetime.
+     * @return Combined RR, CCFB, LSPI, and LSPG charged bytes for the active owner lifetime.
      */
     [[nodiscard]] std::uint64_t sent_feedback_wire_bytes() const noexcept;
+
+    /** @brief Return current authenticated input and RFC 8888 feedback observations. */
+    [[nodiscard]] InputFeedbackSnapshot feedback_snapshot() const noexcept;
 
     /** @brief Return current receive-to-platform-apply latency observations. */
     [[nodiscard]] InputLatencySnapshot latency_snapshot() const noexcept;

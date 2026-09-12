@@ -813,6 +813,9 @@ namespace lumen::lsp::runtime {
         repair_worker_ = std::jthread {[this](const std::stop_token stop_token) {
           run_repair_worker(stop_token);
         }};
+        retirement_worker_ = std::jthread {[this](const std::stop_token stop_token) {
+          run_retirement_worker(stop_token);
+        }};
         worker_ = std::jthread {[this](const std::stop_token stop_token) {
           run(stop_token);
         }};
@@ -822,6 +825,11 @@ namespace lumen::lsp::runtime {
         repair_condition_.notify_all();
         if (repair_worker_.joinable()) {
           repair_worker_.join();
+        }
+        retirement_worker_.request_stop();
+        retirement_condition_.notify_all();
+        if (retirement_worker_.joinable()) {
+          retirement_worker_.join();
         }
         service_->stop();
         return ServiceStartResult::socket_bind_failed;
@@ -859,6 +867,11 @@ namespace lumen::lsp::runtime {
 
       if (input_owner_) {
         input_owner_->begin_shutdown();
+      }
+      retirement_worker_.request_stop();
+      retirement_condition_.notify_all();
+      if (retirement_worker_.joinable()) {
+        retirement_worker_.join();
       }
       std::unique_ptr<ActiveAudioRuntime> audio;
       std::unique_ptr<ActiveVideoRuntime> video;
@@ -977,6 +990,15 @@ namespace lumen::lsp::runtime {
           const auto snapshot = video_runtime_->sender->snapshot();
           media.video_generation = video_runtime_->generation;
           media.video_sent_frames = snapshot.submitted_frames;
+          media.video_admitted_frames = snapshot.admitted_frames;
+          media.video_dropped_frames = snapshot.dropped_frames;
+          media.video_pressure_events = snapshot.pressure_events;
+          media.video_decoder_credit = snapshot.decoder_credit;
+          media.video_pacing_bits_per_second = snapshot.pacing_bits_per_second;
+          media.video_encoder_bits_per_second = snapshot.encoder_bits_per_second;
+          media.video_feedback_reports = snapshot.feedback_reports;
+          media.video_feedback_rejections = snapshot.feedback_rejections;
+          media.video_repair_feedback_packets = snapshot.repair_feedback_packets;
           media.video_sent_packets = snapshot.submitted_packets;
           media.flexfec_sent_packets = snapshot.flexfec_submitted_packets;
           media.rtx_sent_packets = snapshot.rtx_submitted_packets;
@@ -993,6 +1015,13 @@ namespace lumen::lsp::runtime {
           media.microphone_rejected_packets = snapshot.rejected_rtp_packets;
           media.microphone_receiver_reports = snapshot.receiver_reports;
           media.microphone_congestion_reports = snapshot.congestion_reports;
+          media.microphone_decoded_frames = snapshot.playout.decoded_frames;
+          media.microphone_fec_frames = snapshot.playout.fec_frames;
+          media.microphone_plc_frames = snapshot.playout.plc_frames;
+          media.microphone_silence_frames = snapshot.playout.silence_frames;
+          media.microphone_decode_errors = snapshot.playout.decode_errors;
+          media.microphone_sink_errors = snapshot.playout.sink_errors;
+          media.microphone_playout_active = snapshot.active;
           active_peer = microphone_runtime_->peer();
         }
       }
@@ -1002,7 +1031,13 @@ namespace lumen::lsp::runtime {
         }
       }
       if (input_owner_) {
-        media.input_feedback_sent_bytes = input_owner_->sent_feedback_wire_bytes();
+        const auto feedback = input_owner_->feedback_snapshot();
+        media.input_feedback_sent_bytes = feedback.sent_wire_bytes;
+        media.input_authenticated_packets = feedback.authenticated_rtp_packets;
+        media.input_congestion_reports = feedback.congestion_reports;
+        media.input_receiver_reports = feedback.receiver_reports;
+        media.input_feedback_storage_drops = feedback.feedback_storage_drops;
+        media.input_pending_feedback_positions = feedback.pending_report_positions;
         const auto [state_sequence, edge_id] = input_owner_->applied_watermark();
         media.applied_input_state_sequence = state_sequence;
         media.applied_input_edge_id = edge_id;
@@ -1188,10 +1223,12 @@ namespace lumen::lsp::runtime {
     struct ActiveAudioRuntime {
       PeerEndpoint peer {};  ///< Association authorized to receive this generation.
       std::uint32_t generation {};  ///< Exact active audio generation.
+      std::uint32_t connection_generation {};  ///< Forward-path generation owning the original SRTP namespace.
       safe::mail_t mail;  ///< Local shutdown mailbox consumed by `audio::capture`.
       std::shared_ptr<HostAudioSender> sender;  ///< Typed encoded-packet destination and SRTP worker.
       std::jthread capture_thread;  ///< Host loopback capture owner.
-      bool remove_srtp_on_retirement {};  ///< Whether association loss deferred SRTP removal until after join.
+      bool retirement_claimed {};  ///< Background worker borrowed this queued owner under the session lock.
+      std::atomic<bool> retirement_complete {};  ///< Release-published after the worker's last owner access.
     };
 
     /** @brief Prepared VIDEO_CONFIG plus host-only hardware capture and pacing selection. */
@@ -1229,11 +1266,13 @@ namespace lumen::lsp::runtime {
     struct ActiveVideoRuntime {
       PeerEndpoint peer {};  ///< Association authorized to receive this generation.
       std::uint32_t generation {};  ///< Exact active video generation.
+      std::uint32_t connection_generation {};  ///< Forward-path generation owning the original SRTP namespace.
       safe::mail_t mail;  ///< Local capture shutdown and recovery mailbox.
       std::shared_ptr<HostVideoSender> sender;  ///< Capacity-one RTP/SRTP sender owner.
       std::jthread capture_thread;  ///< Existing capture/VDD/hardware encoder owner.
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease;  ///< Active exact VDD generation owner.
-      bool remove_srtp_on_retirement {};  ///< Whether association loss deferred SRTP removal until join.
+      bool retirement_claimed {};  ///< Background worker borrowed this queued owner under the session lock.
+      std::atomic<bool> retirement_complete {};  ///< Release-published after the worker's last owner access.
     };
 
     /** @brief One committed ATTACH waiting for every replacement authority boundary. */
@@ -1687,6 +1726,37 @@ namespace lumen::lsp::runtime {
         }
       }
       return {};
+    }
+
+    /** @brief Keep a closed five-tuple unavailable until its old media and SRTP namespace retire. */
+    [[nodiscard]] bool closed_peer_pending_retirement(const PeerEndpoint &peer) const noexcept {
+      std::scoped_lock lock(forward_path_mutex_);
+      return std::ranges::find(authenticated_peers_, peer) == authenticated_peers_.end() &&
+             std::ranges::any_of(forward_paths_, [&peer](const auto &owner) {
+               return owner && owner->peer == peer;
+             });
+    }
+
+    /** @brief Return whether a queued media owner still fences cleanup of this association. */
+    [[nodiscard]] bool pending_media_retirement(const PeerEndpoint &peer) const noexcept {
+      std::scoped_lock lock(session_mutex_);
+      const auto matches = [&peer](const auto &owner) {
+        return owner && owner->peer == peer;
+      };
+      return std::ranges::any_of(pending_audio_retirements_, matches) ||
+             std::ranges::any_of(pending_video_retirements_, matches);
+    }
+
+    /** @brief Retire closed keys only after every producer for the exact connection generation joined. */
+    void retire_closed_peer_if_quiescent(const PeerEndpoint &peer, const std::uint32_t generation) noexcept {
+      if (!srtp_ || pending_media_retirement(peer) || !closed_peer_pending_retirement(peer)) {
+        return;
+      }
+      const auto forward = find_forward_path(peer);
+      if (forward && forward->generation == generation) {
+        retire_forward_path(peer);
+        srtp_->remove_association(peer);
+      }
     }
 
     /** @brief Enter one synchronous DTLS provider call that may emit pre-authentication output. */
@@ -2269,7 +2339,9 @@ namespace lumen::lsp::runtime {
           rollback_process();
           continue;
         }
-        selected.capture.enableIntraRefresh = capability.reference_invalidation ? 1 : 0;
+        // Reference invalidation and cyclic intra-refresh are independent
+        // encoder features. RFI support must not implicitly enable an
+        // overlapping intra-refresh wave that can reject invalidation.
         auto initialization = video::codec_initialization(selected.capture);
         if (!initialization) {
           rollback_process();
@@ -2387,25 +2459,29 @@ namespace lumen::lsp::runtime {
     }
 
     /**
-     * @brief Stop and join one detached audio runtime without holding session authority locks.
+     * @brief Join detached audio threads without destroying their retained owner.
      *
-     * @param runtime Audio runtime ownership to release.
+     * @param runtime Retained audio owner whose workers must become quiescent.
      */
+    static void join_audio_runtime(ActiveAudioRuntime &runtime) noexcept {
+      if (runtime.sender) {
+        runtime.sender->close();
+      }
+      if (runtime.mail) {
+        runtime.mail->event<bool>(mail::shutdown)->raise(true);
+      }
+      if (runtime.capture_thread.joinable()) {
+        runtime.capture_thread.join();
+      }
+      if (runtime.sender) {
+        runtime.sender->join();
+      }
+    }
+
+    /** @brief Join and destroy an audio owner after its background borrow has ended. */
     static void stop_audio_runtime(std::unique_ptr<ActiveAudioRuntime> runtime) noexcept {
-      if (!runtime) {
-        return;
-      }
-      if (runtime->sender) {
-        runtime->sender->close();
-      }
-      if (runtime->mail) {
-        runtime->mail->event<bool>(mail::shutdown)->raise(true);
-      }
-      if (runtime->capture_thread.joinable()) {
-        runtime->capture_thread.join();
-      }
-      if (runtime->sender) {
-        runtime->sender->join();
+      if (runtime) {
+        join_audio_runtime(*runtime);
       }
     }
 
@@ -2437,51 +2513,97 @@ namespace lumen::lsp::runtime {
       for (auto &pending : pending_audio_retirements_) {
         if (!pending) {
           pending = std::move(runtime);
+          retirement_condition_.notify_one();
           return;
         }
       }
       std::terminate();
     }
 
-    /** @brief Join every quiescent audio runtime outside DTLS/control callbacks and session locks. */
+    /** @brief Join queued media without blocking the socket owner; retained arrays own every borrowed pointer. */
+    void run_retirement_worker(const std::stop_token stop_token) noexcept {
+      while (!stop_token.stop_requested()) {
+        ActiveAudioRuntime *audio = nullptr;
+        ActiveVideoRuntime *video = nullptr;
+        {
+          std::unique_lock lock(session_mutex_);
+          const auto unclaimed = [](const auto &candidate) {
+            return candidate && !candidate->retirement_claimed;
+          };
+          retirement_condition_.wait(lock, [&]() {
+            return stop_token.stop_requested() ||
+                   std::ranges::any_of(pending_audio_retirements_, unclaimed) ||
+                   std::ranges::any_of(pending_video_retirements_, unclaimed);
+          });
+          if (stop_token.stop_requested()) {
+            return;
+          }
+          const auto pending_audio = std::ranges::find_if(pending_audio_retirements_, unclaimed);
+          if (pending_audio != pending_audio_retirements_.end()) {
+            audio = pending_audio->get();
+            audio->retirement_claimed = true;
+          } else {
+            const auto pending_video = std::ranges::find_if(pending_video_retirements_, unclaimed);
+            if (pending_video != pending_video_retirements_.end()) {
+              video = pending_video->get();
+              video->retirement_claimed = true;
+            }
+          }
+        }
+        if (audio) {
+          join_audio_runtime(*audio);
+          audio->retirement_complete.store(true, std::memory_order_release);
+        } else if (video) {
+          join_video_runtime(*video);
+          video->retirement_complete.store(true, std::memory_order_release);
+        }
+        // The release store is the last access: the socket owner may destroy
+        // that runtime immediately after acquiring its completed flag.
+      }
+    }
+
+    /** @brief Finalize completed audio joins on the socket owner; shutdown drains remaining work synchronously. */
     void process_pending_audio_retirements() noexcept {
       while (true) {
         std::unique_ptr<ActiveAudioRuntime> runtime;
         {
           std::scoped_lock lock(session_mutex_);
-          const auto pending = std::ranges::find_if(pending_audio_retirements_, [](const auto &candidate) {
-            return static_cast<bool>(candidate);
+          const auto synchronous = !retirement_worker_.joinable();
+          const auto pending = std::ranges::find_if(pending_audio_retirements_, [synchronous](const auto &candidate) {
+            return candidate && (synchronous || candidate->retirement_complete.load(std::memory_order_acquire));
           });
           if (pending == pending_audio_retirements_.end()) {
             return;
           }
           runtime = std::move(*pending);
         }
-        const auto remove_srtp = runtime->remove_srtp_on_retirement;
+        const auto connection_generation = runtime->connection_generation;
         const auto peer = runtime->peer;
         stop_audio_runtime(std::move(runtime));
-        if (remove_srtp && srtp_ && !is_retiring_attach_peer(peer)) {
-          retire_forward_path(peer);
-          srtp_->remove_association(peer);
-        }
+        retire_closed_peer_if_quiescent(peer, connection_generation);
       }
     }
 
-    /** @brief Stop and join one detached LSP video runtime outside authority locks. */
+    /** @brief Join detached video threads without releasing socket-owner provider/display state. */
+    static void join_video_runtime(ActiveVideoRuntime &runtime) noexcept {
+      if (runtime.mail) {
+        runtime.mail->event<bool>(mail::shutdown)->raise(true);
+      }
+      if (runtime.capture_thread.joinable()) {
+        runtime.capture_thread.join();
+      }
+      if (runtime.sender) {
+        runtime.sender->close();
+        runtime.sender->join();
+      }
+    }
+
+    /** @brief Destroy a joined video owner and release its display lease on the socket owner. */
     static void stop_video_runtime(std::unique_ptr<ActiveVideoRuntime> runtime) noexcept {
       if (!runtime) {
         return;
       }
-      if (runtime->mail) {
-        runtime->mail->event<bool>(mail::shutdown)->raise(true);
-      }
-      if (runtime->capture_thread.joinable()) {
-        runtime->capture_thread.join();
-      }
-      if (runtime->sender) {
-        runtime->sender->close();
-        runtime->sender->join();
-      }
+      join_video_runtime(*runtime);
   #ifdef _WIN32
       if (runtime->display_lease) {
         (void) runtime->display_lease->release();
@@ -2510,13 +2632,14 @@ namespace lumen::lsp::runtime {
       for (auto &pending : pending_video_retirements_) {
         if (!pending) {
           pending = std::move(runtime);
+          retirement_condition_.notify_one();
           return;
         }
       }
       std::terminate();
     }
 
-    /** @brief Join every quiescent video owner outside packet/control callbacks. */
+    /** @brief Finalize completed video joins and activate successor capture on the socket owner. */
     void process_pending_video_retirements() noexcept {
       while (true) {
         std::unique_ptr<ActiveVideoRuntime> runtime;
@@ -2524,10 +2647,16 @@ namespace lumen::lsp::runtime {
         PeerEndpoint failed_replacement_peer;
         {
           std::scoped_lock lock(session_mutex_);
-          const auto pending = std::ranges::find_if(pending_video_retirements_, [](const auto &candidate) {
-            return static_cast<bool>(candidate);
+          const auto synchronous = !retirement_worker_.joinable();
+          const auto pending = std::ranges::find_if(pending_video_retirements_, [synchronous](const auto &candidate) {
+            return candidate && (synchronous || candidate->retirement_complete.load(std::memory_order_acquire));
           });
           if (pending == pending_video_retirements_.end()) {
+            if (std::ranges::any_of(pending_video_retirements_, [](const auto &candidate) {
+                  return static_cast<bool>(candidate);
+                })) {
+              return;  // Old capture/VDD ownership must finish before the successor starts.
+            }
             if (video_start_pending_ && video_runtime_ && active_video_configuration_) {
               video_start_pending_ = false;
               if (!start_video_capture(*video_runtime_, *active_video_configuration_)) {
@@ -2552,13 +2681,10 @@ namespace lumen::lsp::runtime {
             return;
           }
         }
-        const auto remove_srtp = runtime->remove_srtp_on_retirement;
+        const auto connection_generation = runtime->connection_generation;
         const auto peer = runtime->peer;
         stop_video_runtime(std::move(runtime));
-        if (remove_srtp && srtp_ && !is_retiring_attach_peer(peer)) {
-          retire_forward_path(peer);
-          srtp_->remove_association(peer);
-        }
+        retire_closed_peer_if_quiescent(peer, connection_generation);
         if (replacement_activation_failed) {
           fail_required_video_session(failed_replacement_peer);
           return;
@@ -2643,7 +2769,7 @@ namespace lumen::lsp::runtime {
                                   ) :
                                   std::nullopt;
         if (!srtp_ || !forward || !forward->path || !input_mapping || input_mapping->peer != peer ||
-            !rtcp_cname) {
+            input_mapping->connection_generation != forward->generation || !rtcp_cname) {
           return nullptr;
         }
         auto sink = platf::win_audio::make_virtual_microphone();
@@ -2710,6 +2836,7 @@ namespace lumen::lsp::runtime {
       }
       runtime->peer = peer;
       runtime->generation = selection.audio_generation;
+      runtime->connection_generation = forward->generation;
       runtime->mail = std::shared_ptr<safe::mail_raw_t> {new (std::nothrow) safe::mail_raw_t};
       const auto input_mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
       const auto rtcp_cname = input_mapping ?
@@ -2718,7 +2845,8 @@ namespace lumen::lsp::runtime {
                                   input_mapping->connection_generation
                                 ) :
                                 std::nullopt;
-      if (!input_mapping || input_mapping->peer != peer || !rtcp_cname) {
+      if (!input_mapping || input_mapping->peer != peer ||
+          input_mapping->connection_generation != forward->generation || !rtcp_cname) {
         return nullptr;
       }
       runtime->sender = std::shared_ptr<HostAudioSender> {new (std::nothrow) HostAudioSender(
@@ -2808,6 +2936,7 @@ namespace lumen::lsp::runtime {
       }
       runtime->peer = peer;
       runtime->generation = selection.wire.video.video_generation;
+      runtime->connection_generation = forward->generation;
       runtime->display_lease = std::move(display_lease);
       runtime->mail = std::shared_ptr<safe::mail_raw_t> {new (std::nothrow) safe::mail_raw_t};
       const auto family = peer.family == IpAddressFamily::ipv6 ? media::ip_family::ipv6 : media::ip_family::ipv4;
@@ -2818,7 +2947,8 @@ namespace lumen::lsp::runtime {
                                   input_mapping->connection_generation
                                 ) :
                                 std::nullopt;
-      if (!input_mapping || input_mapping->peer != peer || !rtcp_cname) {
+      if (!input_mapping || input_mapping->peer != peer ||
+          input_mapping->connection_generation != forward->generation || !rtcp_cname) {
         return nullptr;
       }
       runtime->sender = std::shared_ptr<HostVideoSender> {new (std::nothrow) HostVideoSender(
@@ -3230,7 +3360,8 @@ namespace lumen::lsp::runtime {
       // size on every address family. The default 1,472-byte capacity must
       // still negotiate the 1,452-byte Ethernet ceiling on IPv6.
       const auto family_ceiling = media_family == media::ip_family::ipv6 ?
-                                    media::ipv6_udp_payload_ceiling : media::ipv4_udp_payload_ceiling;
+                                    media::ipv6_udp_payload_ceiling :
+                                    media::ipv4_udp_payload_ceiling;
       const auto path_limit = media::make_path_payload_limit(
         media_family,
         std::min<std::size_t>(request.offered_maximum_udp_payload, family_ceiling)
@@ -4063,10 +4194,6 @@ namespace lumen::lsp::runtime {
         }
         const auto replacing_active_video = static_cast<bool>(video_runtime_);
         prior_video = std::move(video_runtime_);
-        if (prior_video) {
-          const auto audio_owns_old_srtp = audio_runtime_ && audio_runtime_->peer == prior_video->peer;
-          prior_video->remove_srtp_on_retirement = !audio_owns_old_srtp;
-        }
         video_runtime_ = std::move(replacement);
         if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
             attach_readiness_.connection_generation == connection_generation &&
@@ -4174,6 +4301,12 @@ namespace lumen::lsp::runtime {
           return acknowledgement.status == ControlStatus::success;
         }
         if (acknowledgement.status == ControlStatus::success) {
+          // ATTACH has already committed successor authority. End the old
+          // sink's writes before claiming the replacement microphone writer;
+          // its outstanding feedback still retires through the deferred owner.
+          if (microphone_runtime_) {
+            microphone_runtime_->stop();
+          }
           auto replacement = create_microphone_runtime(peer, active_microphone_configuration_->microphone);
           if (!replacement) {
             if (active_microphone_required_) {
@@ -4499,6 +4632,9 @@ namespace lumen::lsp::runtime {
       while (!stop_token.stop_requested() && active_) {
         (void) socket_.wait_readable(runtime_poll_milliseconds);
         const auto result = socket_.receive_batch(runtime_receive_batch, [this](const ReceivedDatagram &datagram) {
+          if (closed_peer_pending_retirement(datagram.peer)) {
+            return;
+          }
           const auto packet_class = classify_packet(datagram.payload);
           if (packet_class == PacketClass::dtls) {
             refresh_dtls_timer(datagram.peer, datagram.received_at_microseconds);
@@ -4702,8 +4838,13 @@ namespace lumen::lsp::runtime {
         }
       }
       for (std::size_t index = 0; index < count; ++index) {
-        if (!dtls_ || !dtls_->request_close(peers[index])) {
+        // This drain runs on the DTLS owner outside provider callbacks. Close
+        // directly so a full provider request queue cannot discard authority teardown.
+        if (!dtls_ || !dtls_->close_association(peers[index])) {
           const auto &peer = peers[index];
+          if (pending_media_retirement(peer)) {
+            continue;  // Completed joins will retire this exact generation on the socket owner.
+          }
           retire_forward_path(peer);
           if (srtp_) {
             srtp_->remove_association(peer);
@@ -5166,21 +5307,10 @@ namespace lumen::lsp::runtime {
           microphone = std::move(runtime.microphone_runtime_);
         }
       }
-      const auto audio_uses_closed_peer = audio && audio->peer == peer;
-      const auto video_uses_closed_peer = video && video->peer == peer;
-      if (video_uses_closed_peer) {
-        video->remove_srtp_on_retirement = true;
-        if (audio_uses_closed_peer) {
-          audio->remove_srtp_on_retirement = false;
-        }
-      } else if (audio_uses_closed_peer) {
-        audio->remove_srtp_on_retirement = true;
-      }
-      const auto deferred_srtp_removal = audio_uses_closed_peer || video_uses_closed_peer;
       runtime.queue_audio_retirement(std::move(audio));
       runtime.queue_video_retirement(std::move(video));
       runtime.queue_microphone_retirement(std::move(microphone));
-      if (!deferred_srtp_removal && runtime.srtp_) {
+      if (!runtime.pending_media_retirement(peer) && runtime.srtp_) {
         runtime.retire_forward_path(peer);
         runtime.srtp_->remove_association(peer);
       }
@@ -5286,6 +5416,7 @@ namespace lumen::lsp::runtime {
             if (!runtime.accept_compound_rtcp_authority(*mapping, plaintext, now)) {
               return false;
             }
+            const auto input_accepted = runtime.input_owner_->receive_rtcp(peer, plaintext, received_at_microseconds);
             const auto microphone_accepted = runtime.microphone_runtime_ &&
                                              runtime.microphone_runtime_->receive_rtcp(peer, plaintext);
             const auto video_accepted = sender.receive_compound_rtcp(plaintext, now);
@@ -5321,7 +5452,7 @@ namespace lumen::lsp::runtime {
                 offset += parsed.packet.size();
               }
             }
-            return video_accepted || microphone_accepted;
+            return input_accepted && (video_accepted || microphone_accepted);
           }
           if (plaintext[1] == transport::rtcp_transport_feedback_type &&
               (plaintext[0] & 0x1fU) == transport::rtcp_congestion_feedback_format) {
@@ -5349,7 +5480,7 @@ namespace lumen::lsp::runtime {
             return true;
           }
         }
-        const auto input_accepted = runtime.input_owner_->receive_rtcp(peer, plaintext);
+        const auto input_accepted = runtime.input_owner_->receive_rtcp(peer, plaintext, received_at_microseconds);
         const auto microphone_accepted = !runtime.microphone_runtime_ ||
                                          runtime.microphone_runtime_->receive_rtcp(peer, plaintext);
         return input_accepted && microphone_accepted;
@@ -5366,7 +5497,7 @@ namespace lumen::lsp::runtime {
         return true;
       }
       if (assignment->lane == MediaLane::input) {
-        return runtime.input_owner_->receive(peer, plaintext, received_at_microseconds);
+        return runtime.input_owner_->receive(peer, plaintext, protected_bytes, received_at_microseconds, ecn);
       }
       if (assignment->lane == MediaLane::microphone && runtime.microphone_runtime_ &&
           runtime.microphone_runtime_->generation() == assignment->generation) {
@@ -5523,6 +5654,8 @@ namespace lumen::lsp::runtime {
     std::array<std::unique_ptr<ActiveVideoRuntime>, 64> pending_video_retirements_ {};  ///< Video owners awaiting callback-safe capture/sender joins.
     std::array<std::unique_ptr<LspMicrophoneReceiver>, 64> pending_microphone_retirements_ {};  ///< Microphone owners awaiting callback-safe destruction.
     std::jthread repair_worker_;  ///< Dedicated NACK/PLI/FIR consumer outside session authority.
+    std::condition_variable_any retirement_condition_;  ///< Wakes background joins for queued retained media.
+    std::jthread retirement_worker_;  ///< Joins stopped media while socket/control processing continues.
     std::jthread worker_;  ///< Socket receive/control timer owner.
     std::atomic<bool> active_ {};  ///< Listener/worker availability.
     std::atomic<bool> stopping_ {};  ///< Idempotent full teardown ownership.

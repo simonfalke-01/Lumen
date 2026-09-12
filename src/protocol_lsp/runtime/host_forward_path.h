@@ -25,11 +25,12 @@ namespace lumen::lsp::runtime {
     urgent_control = 0,  ///< DTLS authority, stop, and teardown control.
     input_feedback = 1,  ///< LSPI/LSPG acknowledgements and controller output.
     audio = 2,  ///< Host Opus RTP and timing reports.
-    path_probe = 3,  ///< Exact-size authenticated LSPP DPLPMTUD probe.
-    recovery = 4,  ///< Deadline-eligible FEC, RTX, and recovery control.
-    video = 5,  ///< Primary video RTP.
-    periodic = 6,  ///< Periodic reports and telemetry.
-    bulk = 7,  ///< Object chunks with no streaming reserve.
+    congestion_feedback = 3,  ///< Connection-wide floor-controlled RFC 8888 feedback.
+    path_probe = 4,  ///< Exact-size authenticated LSPP DPLPMTUD probe.
+    recovery = 5,  ///< Deadline-eligible FEC, RTX, and recovery control.
+    video = 6,  ///< Primary video RTP.
+    periodic = 7,  ///< Periodic reports and telemetry.
+    bulk = 8,  ///< Object chunks with no streaming reserve.
   };
 
   /** @brief Result of reserving or committing one bounded forward-path slot. */

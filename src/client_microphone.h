@@ -289,6 +289,16 @@ namespace client_microphone {
     receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, bool inband_fec = true);
 
     /**
+     * @brief Construct a receiver with a protocol-selected bounded startup delay.
+     * @param decoder Decoder used for ordinary, FEC, and PLC frames.
+     * @param sink Platform endpoint that receives decoded PCM.
+     * @param inband_fec Whether next-packet FEC is negotiated.
+     * @param initial_delay Startup preroll from zero through the legacy jitter window.
+     * @throws std::invalid_argument If the decoder or delay is invalid.
+     */
+    receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, bool inband_fec, std::chrono::milliseconds initial_delay);
+
+    /**
      * @brief Stop the active generation and destroy the receiver.
      */
     ~receiver_t();
@@ -381,7 +391,7 @@ namespace client_microphone {
    *
    * Packet arrival only updates the bounded jitter buffer. A private worker waits
    * for the receiver's exact next deadline and calls `poll()` independently, so
-   * arrival bursts cannot force immediate `now + JITTER_WINDOW` playout. `stop()`
+   * arrival bursts cannot restart or bypass the selected startup preroll. `stop()`
    * ends the current generation while keeping the worker reusable for reconnect;
    * `shutdown()` joins the worker and permanently closes the wrapper.
    */
@@ -395,6 +405,16 @@ namespace client_microphone {
      * @param inband_fec Whether next-packet FEC is negotiated; defaults to legacy enabled behavior.
      */
     clocked_receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, bool inband_fec = true);
+
+    /**
+     * @brief Construct the clocked wrapper with protocol-selected startup preroll.
+     * @param decoder Opus decoder ownership.
+     * @param sink Platform injection sink.
+     * @param inband_fec Whether next-packet FEC is negotiated.
+     * @param initial_delay Startup preroll from zero through the legacy jitter window.
+     * @throws std::invalid_argument If the decoder or delay is invalid.
+     */
+    clocked_receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, bool inband_fec, std::chrono::milliseconds initial_delay);
     ~clocked_receiver_t();
 
     clocked_receiver_t(const clocked_receiver_t &) = delete;

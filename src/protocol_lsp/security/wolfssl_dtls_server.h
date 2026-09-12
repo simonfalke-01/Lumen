@@ -216,7 +216,7 @@ namespace lumen::lsp {
     ) noexcept;
 
     /**
-     * @brief Process one expired wolfSSL DTLS retransmission timer.
+     * @brief Process one expired handshake timer; established associations are unchanged.
      *
      * The socket owner calls this only after the duration returned by
      * `timeout_seconds()` has expired for the same association.
@@ -227,10 +227,10 @@ namespace lumen::lsp {
     WolfsslDtlsOperationResult handle_timeout(const PeerEndpoint &peer) noexcept;
 
     /**
-     * @brief Return wolfSSL's current retransmission timeout.
+     * @brief Return wolfSSL's current handshake retransmission timeout.
      *
      * @param peer Association five-tuple.
-     * @return Positive whole seconds, or zero when no association exists.
+     * @return Positive whole seconds, or zero after establishment or when absent.
      */
     [[nodiscard]] std::uint32_t timeout_seconds(const PeerEndpoint &peer) const noexcept;
 

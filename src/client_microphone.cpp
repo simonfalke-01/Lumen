@@ -182,17 +182,21 @@ namespace client_microphone {
     bool played {};  ///< Whether the first playout deadline has passed.
     bool inactivity_flushed {};  ///< Whether the current no-packet interval was already flushed.
     bool inband_fec {true};  ///< Whether a following Opus packet may repair one missing frame.
+    std::chrono::milliseconds initial_delay;  ///< Protocol-selected startup preroll; legacy remains 60 ms.
 
     /**
      * @brief Construct internal state around injected dependencies.
      *
      * @param decoder Decoder owned by the receiver.
      * @param sink Platform sink borrowed by the receiver.
+     * @param inband_fec Whether next-packet FEC is negotiated.
+     * @param initial_delay Bounded protocol-selected startup delay.
      */
-    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec):
+    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec, const std::chrono::milliseconds initial_delay):
         decoder(std::move(decoder)),
         sink(sink),
-        inband_fec(inband_fec) {
+        inband_fec(inband_fec),
+        initial_delay(initial_delay) {
       packets.reserve(MAX_QUEUED_PACKETS);
     }
 
@@ -278,12 +282,24 @@ namespace client_microphone {
     }
   };
 
-  receiver_t::receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec) {
+  receiver_t::receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec):
+      receiver_t(std::move(decoder), sink, inband_fec, JITTER_WINDOW) {
+  }
+
+  receiver_t::receiver_t(
+    std::unique_ptr<decoder_t> decoder,
+    sink_t &sink,
+    const bool inband_fec,
+    const std::chrono::milliseconds initial_delay
+  ) {
     if (!decoder) {
       throw std::invalid_argument("Client microphone receiver requires a decoder");
     }
+    if (initial_delay < std::chrono::milliseconds::zero() || initial_delay > JITTER_WINDOW) {
+      throw std::invalid_argument("Client microphone startup delay is outside its bounded jitter window");
+    }
 
-    impl_ = std::make_unique<impl_t>(std::move(decoder), sink, inband_fec);
+    impl_ = std::make_unique<impl_t>(std::move(decoder), sink, inband_fec, initial_delay);
   }
 
   receiver_t::~receiver_t() {
@@ -360,7 +376,7 @@ namespace client_microphone {
     if (!impl_->scheduled) {
       impl_->expected_sequence = packet.sequence;
       impl_->expected_timestamp = packet.timestamp;
-      impl_->next_playout = now + JITTER_WINDOW;
+      impl_->next_playout = now + impl_->initial_delay;
       impl_->last_packet = now;
       impl_->scheduled = true;
     } else {
@@ -505,8 +521,8 @@ namespace client_microphone {
     bool shut_down {};  ///< Whether `shutdown_worker()` permanently closed this wrapper.
     std::jthread worker;  ///< Independent monotonic playout worker; declared last to start after state initialization.
 
-    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec):
-        receiver(std::move(decoder), sink, inband_fec) {
+    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec, const std::chrono::milliseconds initial_delay):
+        receiver(std::move(decoder), sink, inband_fec, initial_delay) {
     }
 
     ~impl_t() {
@@ -570,7 +586,16 @@ namespace client_microphone {
     sink_t &sink,
     const bool inband_fec
   ):
-      impl_(std::make_unique<impl_t>(std::move(decoder), sink, inband_fec)) {
+      clocked_receiver_t(std::move(decoder), sink, inband_fec, JITTER_WINDOW) {
+  }
+
+  clocked_receiver_t::clocked_receiver_t(
+    std::unique_ptr<decoder_t> decoder,
+    sink_t &sink,
+    const bool inband_fec,
+    const std::chrono::milliseconds initial_delay
+  ):
+      impl_(std::make_unique<impl_t>(std::move(decoder), sink, inband_fec, initial_delay)) {
   }
 
   clocked_receiver_t::~clocked_receiver_t() = default;

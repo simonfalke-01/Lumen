@@ -2,6 +2,18 @@
 
 Status: implementation active on branch `feature/lsp-rewrite`.
 
+### Current delivery scope — user update, 2026-09-12
+
+Deliver fully working Lumen and Umbra builds for actual game streaming using
+LSP end to end. The user has cancelled the Svelte/SvelteKit administration
+rewrite: preserve the existing administration interface, and do not treat a
+frontend redesign as a remaining deliverable. Legacy Moonlight compatibility
+remains independent and must not be used to claim the native LSP path works.
+Finish real input, audio/microphone, video, pacing/repair and reconnect wiring;
+verify them together on the Windows host and macOS client, then package and
+hand off the usable builds. Keep supported-hardware limits explicit.
+This newer scope supersedes frontend requirements in the original goal prompt.
+
 This plan replaces the retired experimental QUIC implementation with the
 clean-room [Lumen Streaming Protocol](protocols/lumen-streaming-protocol.md).
 The user has authorized implementation. Execution began by deleting the retired
@@ -51,8 +63,8 @@ The running host must not be overwritten based on the older deployment record.
   `657833c8fa0cc96f75e248696716d51226ae55f3` in both products.
 - [x] Record the prior live discovery, DTLS, PIN pairing, and authenticated
   application-list success as historical evidence, not a current live session.
-- [ ] Resolve the first live START rejection (`malformed`) at the client/host
-  codec boundary. No complete LSP stream has yet been demonstrated.
+- [x] Resolve the first live START rejection (`malformed`) at the client/host
+  boundary; see the verified September 12 admission fixes below.
   Reconstructing the last live offer with the current Umbra serializer yields
   a 414-byte request that the current Lumen decoder accepts (five audio and
   five video offers). The staged Windows control codec is source-identical.
@@ -83,8 +95,8 @@ The running host must not be overwritten based on the older deployment record.
   policy failures. A local-client debugger injection of the observed
   `EHOSTUNREACH` send result now produces the socket-specific error message.
   Removed the temporary catalog payload print and the completed local PIN log.
-- [ ] Resume authenticated catalog/START diagnosis against the isolated host
-  after the user's gaming session. As of 2026-09-12 01:00 local time, its task
+- [x] Resume authenticated catalog/START diagnosis against the isolated host
+  after the user's gaming session. At 2026-09-12 01:00 local time, its task
   is stopped (`LastTaskResult = 0xC000013A`) and UDP 48030 has no listener.
   Do not restart it while the user plays: startup can probe capture/encoders.
   Installed `LumenService` remains running at PID 10964 with VDD disabled;
@@ -94,7 +106,7 @@ The running host must not be overwritten based on the older deployment record.
   the earlier intermittent `EHOSTUNREACH` cause remains unproven.
 - [ ] Qualify streaming and lifecycle on Windows/macOS while preserving the
   working Moonlight service; keep VDD disabled unless explicitly re-enabled.
-- [ ] Complete the scheduled corrective reviews, admin rewrite, and final gates.
+- [ ] Complete streaming-readiness fixes, qualification, packaging, and final gates.
 
 ### Current live debugging — 2026-09-12
 
@@ -144,20 +156,298 @@ restarted/deployed; installed `LumenService` remains PID 10964, with VDD disable
   exception, verified against pinned wolfSSL source, lets that signed package
   pass its existing resource/dependency/signature validation; this is not full
   release qualification (Umbra `6ede894`).
-- [ ] Resolve sustained-session failures. The first admitted stream sent more
+- [x] Fix the identified repeated termination causes. The first admitted stream sent more
   than 300 frames, then client receive counters plateaued at 5,047 datagrams;
   authentication failures remained zero. NVENC reported unsupported reference
   invalidation, and the host later tore down media without the client declaring
   termination. Local STOP eventually returned an unconfirmed transport timeout
   and exited. A later start ended immediately. The client also rejects valid
   high-bit unsigned frame IDs at the signed media-token boundary; that concrete
-  conversion bug is being fixed before the next live repeat.
-- [ ] Verify audible host audio: capture/Opus initialized, but packet count was
-  zero on the silent desktop. A test tone accidentally ran after host teardown,
-  so it provides no audio evidence. Its temporary scheduled task was removed.
+  conversion bug is now fixed using a lossless bit-pattern bridge, with the
+  full-width boundary regression passing and a real negative media-token frame
+  reaching the renderer. LSP no longer implicitly enables cyclic intra-refresh
+  from the independent RFI capability; subsequent runs report no NVENC RFI
+  rejection. The repeatable approximately 135-second shutdown was a separate
+  host bug: established DTLS associations continued exhausting handshake timer
+  backoff. Established associations now expose no handshake timer and ignore a
+  stale timer callback. The existing product DTLS integration test passes after
+  ten such callbacks and a subsequent real application-record exchange (8 ms).
+- [x] Run a 720p60-configured H.264 session beyond the prior timeout: the
+  2026-09-12 03:07 run remained active beyond four minutes, sent over 5,700 video
+  frames, and delivered a late test tone as 118 Opus/SRTP packets with no reported
+  audio loss/expiry or authentication failures. These are static-desktop results,
+  not proof of 60 unique frames/s or the higher-refresh performance targets.
+  Normal CLI STOP and app exit both returned success, and a fresh START worked.
+- [x] Recover from an actual silent peer: the isolated host process was suspended
+  for four seconds and resumed automatically, without touching installed Lumen.
+  Umbra's new three-report-interval authenticated-activity watchdog triggered
+  fresh-DTLS ATTACH. The host reports one committed/completed reconnect, zero
+  failures, new audio/video generation 2, and resumed video; commit-to-ready took
+  77.7 ms (excluding outage detection and DTLS). The temporary firewall trial
+  did not establish a confirmed interruption and is not counted as evidence.
+- [ ] Obtain human confirmation of picture, mouse/keyboard, and audible playback.
+  The user prohibited Computer Use; no UI automation was used. Host input
+  baseline application is verified, but physical input and optical latency are
+  not. Audio packet delivery is confirmed, not independently heard by the agent.
 
-The current remaining immediate step is a crash-free signed-client START with
-real video/audio/input. Broad qualification and frontend work remain deferred.
+The immediate baseline now starts, renders through the native media boundary,
+delivers audio, stops, restarts, and recovers from peer silence. Full codec/input/
+performance qualification remain unfinished. The later admin rewrite was cancelled by the user.
+
+Handoff: normal STOP also succeeded after the forced-outage reconnect, and the
+isolated test task was stopped to release host resources. The installed service
+was never restarted or replaced (PID 10964). The latest frame-ID, watchdog,
+NVENC-setting, and established-DTLS-timer fixes are built and live-verified but
+their final commits await 1Password SSH-signing authorization. Failed/pending
+signing attempts were cancelled; preserve the staged/dirty changes and retry
+signed commits after the user unlocks 1Password. Earlier checkpoints are Lumen
+`1c172777` and Umbra `38fe90a`, `7d62171`, `6ede894`.
+
+### Live continuation — September 12, from 03:15
+
+Only the isolated Windows instance is used. Installed Lumen remains PID 10964;
+its last observed Moonlight disconnect is 01:54:24, and VDD remains disabled.
+
+- [x] Expose real bounded-window media timings through the existing CLI owner
+  IPC, and host frame/pressure/feedback counters through authenticated status.
+  The focused same-user IPC regression passes. Sample counts are not lifetime
+  frame totals; render enqueue and Metal commit are not physical presentation.
+- [x] Correct Darwin receive timestamps and media clock comparisons. Kernel
+  `SCM_TIMESTAMP_MONOTONIC` values are raw Mach ticks, scaled by the cached
+  timebase; native expiry and Swift media timing use `CLOCK_UPTIME_RAW`.
+  The observed M4 timebase is 125/3, and mixing sleep-inclusive monotonic time
+  with uptime previously introduced approximately 111.74 seconds of skew.
+  The existing silent-peer regression passes with the corrected clock domain.
+- [x] Remove Windows short-wait timer quantization from the LSP forward pacer.
+  A requested 100 microseconds actually woke at p50 567.4 / p99 688.4
+  microseconds. Active waits now release the scheduler lock and use a bounded
+  at-most-50-microsecond CPU pause; empty queues still block normally.
+  The isolated Windows build succeeds, and HEVC subsequently completes admitted
+  frames without the prior hundreds/thousands of pressure drops. Legacy pacing
+  is unchanged; sustained full-rate CPU/latency qualification remains pending.
+- [x] Keep the shared renderer active when an LSP predecessor decoder retires.
+  Decoder-only cleanup drains callbacks without flushing the successor's
+  renderer; normal final stop flushes once. The focused renderer-preservation
+  test passes, and real HEVC Metal commits resume after ATTACH.
+- [x] Fix receive-ceiling publication when protected LSPP arrives before its
+  control-intent callback. Both authenticated match orders now publish the
+  proved receive size before acknowledgement. Previously the host advanced to
+  1,452-byte packets while Umbra still discarded packets over 1,200, causing
+  authenticated-peer silence and an unsolicited startup reconnect.
+  The subsequent HEVC 1080p120-configured run remains generation 1, receives
+  59,776 datagrams with zero authentication failures and no additional ATTACH
+  attempts, and stops normally. An intermediate host snapshot records 1,354
+  sent frames, two pressure drops, zero reported video loss, and no rejected
+  congestion feedback. Recent receive-to-Metal-enqueue p99 is 1,566 microseconds;
+  enqueue-to-commit p99 is 3,855 microseconds, so the final latency target is
+  not claimed. Static desktop delivery does not prove 120 unique frames/s.
+- [x] Move AppKit fallback samples from Swift into Objective-C++ and rebuild
+  the signed client. Keyboard/modifier/button/scroll handling, coalescing
+  restoration, and GameController capture now feed the native owner directly.
+  The coarse Swift lifecycle binds input to the exact stream window and stops
+  on application deactivation, key-window loss, or window close; the native
+  AppKit monitor also rejects events from other windows. Physical focus-loss,
+  modifier, pointer, and controller behavior remains unconfirmed.
+- [x] Exercise AV1 720p60-configured decoding/Metal delivery on Apple M4 Max
+  against RTX 4060 Laptop NVENC. Thousands of static-desktop frames and a test
+  tone are delivered with zero authentication failures. This is functional
+  codec evidence, not FEC/RTX, unique-frame-rate, or sustained-load qualification.
+- [x] Fix required-microphone startup disconnects. First resolve the independent
+  test configuration requirements: temporarily grant the microphone bit on the
+  sole isolated test pairing and enable its `client_microphone` setting. The
+  installed service and its audio settings remain unchanged. The live failure
+  then reproduces every three seconds: a bare client microphone RTCP SR lacks
+  the compound SDES CNAME and makes Lumen close that association before encoder
+  creation. Appending SDES with the same established association CNAME fixes
+  the exact retry: generation 1 remains active with 489 microphone packets
+  accepted, zero rejected, 449 congestion reports, ten receiver reports, and
+  307 video frames. The host-side diagnosis independently confirms the chain.
+  This proves the authenticated reverse path, not audible application capture.
+- [x] Replace opaque numeric `LSPControlStatus` errors with concise descriptions
+  of all eleven stable status values, including a client-permission remedy.
+  The existing session test's focused localized-status regression passes;
+  the updated signed client also builds. No automatic retry or fallback added.
+- [x] Verify clocked microphone decode/platform-sink health through real
+  administration snapshots. The affected Windows build and private deployment
+  pass; artifact SHA-256 is
+  `C197B60B5562D026D8B3C3F8D713915360136F796774DFC25D14E11AAF94B0B0`.
+  A fresh required-microphone run records 817 accepted packets, 813 ordinary
+  decoded PCM frames, active playout, and zero decode errors, sink errors,
+  concealment, or silence frames. It simultaneously sends 517 HEVC frames with
+  zero admission drops/pressure and zero reconnects. This proves delivery to
+  the Windows virtual sink's write boundary, not another application's capture
+  or audible playback. Normal STOP succeeds.
+- [x] Implement and live-prove clean native microphone reverse-feedback consumption: the prior run's
+  746 client dropped datagrams correlate with 747 host microphone CCFB reports.
+  The client previously dispatched SR and APP only, rejecting RR/CCFB. It now
+  validates compound RR/CNAME, correlates real SR/RR RTT and bounded successful
+  sends, applies overlap/CE-safe CCFB accounting to the Photon controller, and
+  adjusts native microphone/reverse credit without consuming the input reserve.
+  IPv4/IPv6 complete-IP accounting and compound video/audio SR timing are wired.
+  Integration caught and corrected an invalid comparison of stream generation
+  with independent connection generation. The warnings-as-errors client build
+  passes; the signed live retry reports one client drop while the host emits
+  751 CCFB packets, with 822 microphone packets accepted, 817 decoded frames,
+  zero decode/sink/PLC errors, active HEVC, and no spontaneous reconnect.
+  Impairment adaptation, missing-feedback lifetime, and input-only CCFB remain
+  unqualified/unfinished; clean receipt is not a congestion qualification claim.
+- [x] Fix required-microphone reconnect writer transfer and first-attempt recovery.
+  The initial real four-second
+  isolated-host suspension resumes the Windows process, but ATTACH fails its
+  required microphone activation: generation 1 still owns the platform writer
+  when generation 2 attempts to claim it. The bounded fix stops old PCM writes
+  and releases that exact writer before replacement construction, keeping old
+  feedback callbacks and worker storage alive for deferred retirement. This is
+  built in Windows artifact
+  `2174474C8713E4A17ED3A698AF8D891EECA128DA5D106C6396226E3B765FE34C`.
+  The outage retry advances microphone generations with decoded PCM and no
+  sink errors, proving writer transfer, but still fails overall: synchronous
+  old-device stop/new-device start delays the microphone control response ACK
+  and causes rapid control-timeout reconnects. Defer that bounded activation
+  until after its validated receipt ACK is flushed, then repeat the same outage.
+  A focused predecessor-stop/deferred-destruction ownership regression is added
+  to the existing host foundation tests. Its affected objects compile and the
+  single filtered test passes in 4 ms. The older cached coverage files emit
+  merge warnings; no coverage percentage is claimed or extra coverage run made.
+  The control ACK deferral is now built/deployed in artifact
+  `80CA5FF92200712DF12E5A2A209682646D1F4557D7F9DBAC803A83919E703668`:
+  exact validated receipt is cached/ACKed before one original-deadline-bounded
+  microphone activation runs from the next tick. Repeating the outage with the
+  prior client stops the tight control-timeout loop and restores real video and
+  microphone PCM, but takes two ATTACH attempts (one failed readiness, one
+  successful). This does not establish one-attempt or latency-qualified recovery.
+  The combined-client retry also recovers through two attempts: the successful
+  generation 3 records 1,320 accepted microphone packets, 1,317 decoded frames,
+  zero decode/sink/PLC errors, and 839 sent HEVC frames. Client counters reach
+  46,365 received datagrams, one drop, zero authentication failures, and live
+  decode/Metal commits before successful STOP. The first post-outage attempt
+  still failed at that checkpoint; the background-join fix in the 05:00
+  continuation below subsequently proves single-attempt recovery.
+  The proposed large control-test fixture was removed; do not recreate that
+  harness. This control fix's verification is the exact live scenario, not a
+  claimed unit regression.
+- [x] Preserve provider-disabled Umbra builds after the feedback change. The
+  active-socket overhead helper is platform-guarded and the direct native
+  syntax check with `CLSP_CORE_HAS_RUNTIME=0` passes. No default IPv4 wire
+  behavior is invented for an unavailable runtime.
+- [x] Restore the temporary isolated test microphone grant/configuration when
+  the runs end: the test client's microphone bit returns from mask 95 to 87
+  through the authenticated API; the exact original private configuration is
+  restored from its backup with a current-file hash guard. The test task is
+  stopped and installed Lumen remains PID 10964. No installed service restart,
+  VDD change, driver installation, or system audio-setting change was made.
+
+At the end of this continuation the isolated task is stopped with its original
+private configuration and permission mask restored. The original private
+configuration backup remains `lumen.conf.before-microphone`. For future
+microphone runs, explicitly re-enable only the isolated setting/grant; neither
+the installed host nor its working Moonlight configuration is a test target.
+- [ ] Confirm physical picture/audio/input and complete sustained codec/mode,
+  congestion/repair, input/controller, and hardware qualification before the
+  streaming-readiness fixes and packaging. The admin rewrite is no longer in scope.
+
+The current signed development client passes its affected Swift build with
+warnings-as-errors. Temporary legacy static libraries still produce known
+deployment-target linker warnings; release packaging remains unqualified.
+Stable source changes remain staged/dirty because 1Password Git signing is
+unavailable. Signing has not been disabled or bypassed. Photon is unchanged at
+`657833c8fa0cc96f75e248696716d51226ae55f3` / digest `72b3a260…679db`;
+these native Apple runtime changes are outside its source-identical core.
+
+### Reconnect continuation — September 12, from 05:00
+
+The preceding goal turn made implementation and live-verification progress;
+the LSP streaming, qualification, packaging, and relevant final gates remain
+the objective. The installed host is still not a test target.
+
+- [x] Identify the remaining first-attempt timeout from the real exchange:
+  client `MICROPHONE_CONFIG_ACK` (`0x0215`) reaches its final retry at 77,384
+  microseconds with a 5,000-microsecond base RTO. Host lifecycle timing records
+  audio retirement at 183,325 microseconds and video retirement at 144,048
+  microseconds on the UDP receive thread. Deferring microphone activation alone
+  cannot prevent earlier media teardown from delaying reception of that ACK.
+- [x] Move blocking audio/video joins to a dedicated owned worker while queued
+  runtime objects remain retained. Only acquire-observed completion permits
+  socket-owner destruction, generation-checked path/key cleanup, or replacement
+  capture activation. Closed five-tuples stay unavailable until the old
+  namespace retires; shutdown joins this worker before freeing its borrowed
+  owners. The affected Windows build passes. A bounded source-level lifetime
+  check additionally confirmed the closed-tuple ingress fence and caught the
+  need to defer DTLS-close cleanup for already-queued owners. Cleanup is now
+  centralized after every producer joins, and the close drain uses the direct
+  owner-thread provider API rather than a potentially full request queue.
+  The isolated Windows artifact
+  `079C66A8626A0ADE674AAD5838E01B2F9AB9E6AB8F4619C6EC4D3A1748B04256`
+  passes the exact four-second host-suspension retry: one ATTACH attempt,
+  one commit/completion, zero failures, new audio/video/microphone generation 2,
+  614 sent HEVC frames, and 968 decoded microphone frames with no decode/sink,
+  PLC, or packet-rejection errors in that recovered generation. The host
+  commit-to-ready barrier takes 58,922 microseconds, excluding outage detection
+  and DTLS; this is not first-packet or physical-presentation latency.
+  Four video pressure events remain visible, so full performance qualification
+  is not claimed. Temporary retry/retirement instrumentation is removed.
+- [x] Fix intermittent first-start microphone playout rejection. One
+  pre-outage generation records 157 rejected packets, 127 FEC frames, and 30 PLC
+  frames despite zero decode/sink errors; the recovered generation is clean.
+  A first-rejection diagnostic in the exact live retry identifies
+  `too_far_ahead`, with no late/timestamp-invalid packets. LSP inherited the
+  legacy receiver's 60-ms preroll despite its one-packet requirement; that delay
+  consumes headroom in the six-packet receive window before burst arrivals.
+  New bounded constructor overloads let LSP select 20 ms while preserving the
+  original legacy constructors, signatures, and 60-ms default. The Windows
+  affected target builds; the same required-microphone START records 1,167
+  accepted packets, 1,165 decoded frames, and zero rejected/FEC/PLC/silence,
+  decode-error, or sink-error frames, with active HEVC and no reconnect.
+  Three focused tests pass for legacy timing, explicit-delay bounds, and
+  one-packet burst headroom (7 ms); no broad suite was run. The temporary
+  rejection diagnostic is removed and the affected host target rebuilt.
+- [x] Correct the independently confirmed fifth-send retry boundary in canonical
+  Photon: a fifth transmission remains ACK-eligible until its next-retry time
+  or the earlier operation deadline, and a sixth transmission is never sent.
+  The existing `PhotonControlStateTests` target and filtered
+  `Photon.ControlState` test pass. Only `src/lsp/core/control.h` and the existing
+  `tests/control_state_test.cpp` change in Photon.
+- [x] Make the signed Photon checkpoint, regenerate its digest, and advance the
+  normal Lumen/Umbra pins and mirrors. After the user confirmed 1Password was
+  unlocked, signing succeeded: Photon `6a504910dfeb0489eb33af02e4bd3659e8c11e24`
+  carries an SSH signature and is pushed to `origin/main`. Both normal sync
+  utilities verify digest `d565644e8c3a00d6c474d6c118b8b8eccd3140d35eda54dbb0bba7c42f1ca7f0`.
+  Umbra's affected product build succeeds against that canonical checkout.
+  The old signing block is cleared; Windows deployment of the integrated
+  input-feedback build is still pending.
+
+### Current LSP game-streaming integration
+
+- [x] Cancel the Svelte/SvelteKit admin rewrite per the latest user request.
+  Keep the current admin panel. Delivery is working LSP Lumen/Umbra builds;
+  legacy Moonlight success is not evidence for the LSP acceptance gate.
+- [ ] Finish input-only/mixed input+microphone RFC 8888 integration. The host
+  observation window, shared CCFB send lane/floor, native input sent/tombstone
+  ledger, aggregate reverse controller, and client input SR are implemented.
+  Parent dispatch now passes actual protected bytes, receive time and ECN.
+  Host SR receipt/RR LSR-DLSR echo and live counters are connected. Both product
+  builds succeed; focused feedback pacing/wire tests pass (4 ms). The first
+  signed input-only LSP run receives the baseline, sends one input CCFB plus
+  periodic RR, has no feedback-storage drops, and continues HEVC with zero
+  client authentication failures or packet drops. Physical input activity and
+  mixed input/microphone qualification are still pending; baseline receipt
+  does not prove mouse/keyboard application or high-rate control behavior.
+  The runtime pin check caught and corrected a leftover Swift digest constant.
+- [ ] Complete real picture/audio/input/controller confirmation, sustained
+  game-streaming checks, and release packaging on the named hardware.
+
+After the successful retry, normal STOP succeeds, the test pairing returns to
+mask 87, the original private microphone configuration is restored with its
+hash guard, and the isolated scheduled task is stopped. Installed Lumen remains
+PID 10964. Temporary control-retry and retirement timing diagnostics have been
+removed from source; the signed diagnostic bundle will be refreshed by its affected
+  product build. The final client rebuild is currently stopped by the correct
+  Photon source-drift check while its new retry fix remains uncommitted. An
+  attempted `PHOTON_REPOSITORY` override to a clean pinned worktree did not
+  change SwiftPM's prebuild checkout selection. Checks were not disabled;
+  the signed bundle still contains the temporary final-retry diagnostic until
+  the Photon checkpoint/sync permits its normal rebuild. The source diagnostic
+  is removed. No broad suite or repeated outage run is needed for this result.
 
 The earlier ledger describes the September 1 development deployment. It does
 not imply LSP is enabled on the currently installed host. The accumulated

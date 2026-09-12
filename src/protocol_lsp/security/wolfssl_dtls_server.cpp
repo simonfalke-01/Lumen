@@ -649,6 +649,9 @@ namespace lumen::lsp {
         return WolfsslDtlsOperationResult::not_found;
       }
       auto &association = associations_[index];
+      if (association.established) {
+        return WolfsslDtlsOperationResult::accepted;
+      }
       IoContext io {
         .callbacks = &callbacks_,
         .peer = &association.peer,
@@ -666,10 +669,10 @@ namespace lumen::lsp {
     }
 
     /**
-     * @brief Return the current timeout in whole seconds.
+     * @brief Return the handshake retransmission timeout in whole seconds.
      *
      * @param peer Association five-tuple.
-     * @return Positive seconds, or zero when absent or unavailable.
+     * @return Positive seconds while handshaking, or zero once established/absent.
      */
     [[nodiscard]] std::uint32_t timeout_seconds(const PeerEndpoint &peer) const noexcept {
       if (!is_owner_thread()) {
@@ -680,7 +683,7 @@ namespace lumen::lsp {
         return 0;
       }
       const auto index = find_association(*fixed_peer);
-      if (index == associations_.size()) {
+      if (index == associations_.size() || associations_[index].established) {
         return 0;
       }
       const auto timeout = wolfSSL_dtls_get_current_timeout(associations_[index].session.get());

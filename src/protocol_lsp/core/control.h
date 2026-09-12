@@ -674,14 +674,16 @@ namespace lumen::lsp {
     }
 
     /**
-     * @brief Return whether any retained operation exhausted attempts or its deadline.
+     * @brief Return whether any retained operation exhausted its final attempt or deadline.
      *
      * @param now_microseconds Current monotonic time.
      * @return `true` when a live operation must fail.
      */
     [[nodiscard]] constexpr bool has_failed(const std::uint64_t now_microseconds) const noexcept {
       for (const auto &slot : slots_) {
-        if (slot.occupied && (slot.transmissions >= 5U || now_microseconds >= slot.deadline_microseconds)) {
+        if (slot.occupied &&
+            (now_microseconds >= slot.deadline_microseconds ||
+             (slot.transmissions >= 5U && now_microseconds >= slot.next_retry_microseconds))) {
           return true;
         }
       }

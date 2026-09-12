@@ -166,10 +166,10 @@ namespace lumen::lsp::runtime {
      */
     bool receive_rtcp(const PeerEndpoint &peer, std::span<const std::uint8_t> packet) noexcept;
 
-    /** @brief End playout immediately while retaining joinable receiver ownership. */
+    /** @brief End platform writes and release writer authority, retaining callback and joinable worker storage. */
     void stop() noexcept;
 
-    /** @brief Permanently join playout and release the generation-qualified writer. */
+    /** @brief Stop authority, drain feedback completions, and permanently join playout. */
     void shutdown() noexcept;
 
     /** @brief Return current parser and playout observations. */

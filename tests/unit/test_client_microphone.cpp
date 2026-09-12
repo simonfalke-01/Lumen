@@ -376,6 +376,7 @@ TEST(ClientMicrophoneWriter, ArbitratesStableLegacyOwners) {
   client_microphone::release_writer(second);
   EXPECT_FALSE(client_microphone::claim_writer(client_microphone::writer_owner_t::legacy(0)));
 }
+
 TEST(ClientMicrophoneReceiver, RejectsNullDecoder) {
   fake_sink_t sink;
   EXPECT_THROW(client_microphone::receiver_t(nullptr, sink), std::invalid_argument);
@@ -413,6 +414,50 @@ TEST_F(client_microphone_test, EnforcesLifecycleGenerationAndPayloadBounds) {
 
   EXPECT_EQ(receiver_->statistics().wrong_generation_packets, 1U);
   EXPECT_EQ(receiver_->statistics().invalid_payload_packets, 3U);
+}
+
+TEST_F(client_microphone_test, ExplicitOnePacketPrerollPreservesLegacyDefaultAndBurstHeadroom) {
+  fake_sink_t low_delay_sink;
+  client_microphone::receiver_t low_delay {
+    std::make_unique<fake_decoder_t>(),
+    low_delay_sink,
+    true,
+    client_microphone::FRAME_DURATION
+  };
+  ASSERT_TRUE(low_delay.reset(8, START));
+  ASSERT_TRUE(receiver_->reset(7, START));
+  for (std::uint64_t sequence = 0; sequence < 4; ++sequence) {
+    const auto timestamp = static_cast<std::uint32_t>(sequence * client_microphone::SAMPLES_PER_FRAME);
+    ASSERT_EQ(low_delay.submit(opus_packet(8, sequence, timestamp, 1), START), submit_result_e::accepted);
+    ASSERT_EQ(receiver_->submit(opus_packet(7, sequence, timestamp, 1), START), submit_result_e::accepted);
+  }
+  EXPECT_EQ(low_delay.poll(START + 19ms), 0U);
+  EXPECT_EQ(low_delay.poll(START + 20ms), 1U);
+  EXPECT_EQ(receiver_->poll(START + 20ms), 0U);
+  EXPECT_EQ(receiver_->poll(START + 59ms), 0U);
+  EXPECT_EQ(receiver_->poll(START + 60ms), 1U);
+  EXPECT_EQ(low_delay.poll(START + 40ms), 1U);
+  EXPECT_EQ(low_delay.poll(START + 60ms), 1U);
+
+  // A four-frame capture burst must fit without the legacy startup delay
+  // consuming the queue headroom needed before the next playout tick.
+  for (std::uint64_t sequence = 4; sequence < 8; ++sequence) {
+    ASSERT_EQ(low_delay.submit(opus_packet(8, sequence, static_cast<std::uint32_t>(sequence * client_microphone::SAMPLES_PER_FRAME), 1), START + 80ms), submit_result_e::accepted);
+  }
+  for (int elapsed = 80; elapsed <= 160; elapsed += 20) {
+    EXPECT_EQ(low_delay.poll(START + std::chrono::milliseconds {elapsed}), 1U);
+  }
+  EXPECT_EQ(low_delay_sink.frames.size(), 8U);
+  EXPECT_EQ(low_delay.statistics().out_of_window_packets, 0U);
+  EXPECT_EQ(low_delay.statistics().fec_frames, 0U);
+  EXPECT_EQ(low_delay.statistics().plc_frames, 0U);
+}
+
+TEST_F(client_microphone_test, ExplicitPrerollRejectsOutOfBoundsInBothWrappers) {
+  EXPECT_THROW((client_microphone::receiver_t {std::make_unique<fake_decoder_t>(), sink_, true, -1ms}), std::invalid_argument);
+  EXPECT_THROW((client_microphone::receiver_t {std::make_unique<fake_decoder_t>(), sink_, true, 61ms}), std::invalid_argument);
+  EXPECT_THROW((client_microphone::clocked_receiver_t {std::make_unique<fake_decoder_t>(), sink_, true, 61ms}), std::invalid_argument);
+  EXPECT_THROW((client_microphone::receiver_t {nullptr, sink_, true, 20ms}), std::invalid_argument);
 }
 
 TEST_F(client_microphone_test, ReordersWithinWindowAndRejectsDuplicateLateAndDistantPackets) {

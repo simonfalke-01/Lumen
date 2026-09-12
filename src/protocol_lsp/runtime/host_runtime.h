@@ -127,6 +127,15 @@ namespace lumen::lsp::runtime {
     std::uint64_t audio_lost_bytes {};  ///< Lost host-audio complete IP bytes.
     std::uint64_t audio_ecn_ce_bytes {};  ///< CE-marked host-audio complete IP bytes.
     std::uint64_t video_sent_frames {};  ///< Fully submitted primary video frames.
+    std::uint64_t video_admitted_frames {};  ///< Complete video access units admitted by the sender.
+    std::uint64_t video_dropped_frames {};  ///< Whole video frames rejected before transmission.
+    std::uint64_t video_pressure_events {};  ///< Queue, admission, pacer, or socket pressure observations.
+    std::uint8_t video_decoder_credit {};  ///< Latest authenticated client decoder credit.
+    std::uint64_t video_pacing_bits_per_second {};  ///< Current complete-IP aggregate pacing target.
+    std::uint64_t video_encoder_bits_per_second {};  ///< Current encoded-video bitrate target.
+    std::uint64_t video_feedback_reports {};  ///< Accepted authenticated congestion feedback reports.
+    std::uint64_t video_feedback_rejections {};  ///< Rejected malformed/stale congestion reports.
+    std::uint64_t video_repair_feedback_packets {};  ///< Accepted NACK/PLI/FIR reports.
     std::uint64_t video_sent_packets {};  ///< Final-sent primary video RTP packets.
     std::uint64_t flexfec_sent_packets {};  ///< Final-sent FlexFEC RTP packets.
     std::uint64_t rtx_sent_packets {};  ///< Final-sent RTX RTP packets.
@@ -136,8 +145,20 @@ namespace lumen::lsp::runtime {
     std::uint64_t microphone_rejected_packets {};  ///< Rejected reverse Opus RTP packets.
     std::uint64_t microphone_receiver_reports {};  ///< Protected regular compound RR/CNAME packets.
     std::uint64_t microphone_congestion_reports {};  ///< Protected reverse-media RFC 8888 packets.
+    std::uint64_t microphone_decoded_frames {};  ///< Ordinary Opus frames decoded for platform delivery.
+    std::uint64_t microphone_fec_frames {};  ///< Missing Opus frames recovered with in-band FEC.
+    std::uint64_t microphone_plc_frames {};  ///< Missing/invalid Opus frames replaced with concealment.
+    std::uint64_t microphone_silence_frames {};  ///< Silence or queue-underrun PCM frames generated.
+    std::uint64_t microphone_decode_errors {};  ///< Decoder calls failing to produce one complete PCM frame.
+    std::uint64_t microphone_sink_errors {};  ///< PCM frames rejected by the platform sink.
+    bool microphone_playout_active {};  ///< Whether the generation's clocked PCM receiver is active.
     std::uint64_t forward_sent_bytes {};  ///< Aggregate final-sent host-to-client charged bytes.
-    std::uint64_t input_feedback_sent_bytes {};  ///< Final-sent LSPI/LSPG charged bytes.
+    std::uint64_t input_feedback_sent_bytes {};  ///< Final-sent LSPI/LSPG and input RR/CCFB charged bytes.
+    std::uint64_t input_authenticated_packets {};  ///< Valid input RTP observations offered to feedback tracking.
+    std::uint64_t input_congestion_reports {};  ///< Final-sent input RFC 8888 reports.
+    std::uint64_t input_receiver_reports {};  ///< Final-sent regular input RR/CNAME packets.
+    std::uint64_t input_feedback_storage_drops {};  ///< Input observations omitted by bounded feedback storage.
+    std::size_t input_pending_feedback_positions {};  ///< Input sequence positions awaiting a completed report.
     std::uint64_t applied_input_state_sequence {};  ///< Greatest applied input-state watermark.
     std::uint64_t applied_input_edge_id {};  ///< Greatest contiguous applied input edge.
     std::uint64_t input_latency_samples {};  ///< Receive-to-platform-apply samples.

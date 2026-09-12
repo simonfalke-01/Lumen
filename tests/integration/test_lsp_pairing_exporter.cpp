@@ -224,6 +224,16 @@ TEST(LspPairingExporter, ProductServerMatchesExplicitEmptyContextPeer) {
   );
   EXPECT_EQ(client_pairing_exporter, harness.server_pairing_exporter);
 
+  // A completed association must never consume handshake retransmission
+  // attempts. Previously these stale timer callbacks closed live streams
+  // after the exponential handshake backoff exhausted its maximum.
+  EXPECT_EQ(server.timeout_seconds(peer), 0U);
+  for (std::size_t attempt = 0; attempt < 10; ++attempt) {
+    EXPECT_EQ(server.handle_timeout(peer), lsp::WolfsslDtlsOperationResult::accepted);
+  }
+  EXPECT_EQ(server.association_count(), 1U);
+  EXPECT_EQ(harness.closed_calls, 0U);
+
   constexpr std::array<std::uint8_t, 5> nested_reply {'r', 'e', 'p', 'l', 'y'};
   std::copy(nested_reply.begin(), nested_reply.end(), harness.reply.begin());
   harness.reply_size = nested_reply.size();

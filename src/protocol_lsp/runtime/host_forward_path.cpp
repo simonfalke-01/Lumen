@@ -6,6 +6,7 @@
 #include "host_forward_path.h"
 
 #include "../../platform/common.h"
+#include "../transport/rtcp.h"
 #include "udp_socket.h"
 
 #include <algorithm>
@@ -19,21 +20,30 @@
 #include <thread>
 #include <utility>
 
+#if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+  #include <immintrin.h>
+#endif
+
 namespace lumen::lsp::runtime {
   namespace {
     constexpr std::size_t control_slot_count = 64;
     constexpr std::size_t audio_slot_count = 8;
+    constexpr std::size_t congestion_feedback_slot_count = 2;
     constexpr std::size_t common_slot_count = 24;
     constexpr std::size_t recovery_slot_count = 8;
     constexpr std::size_t video_slot_count = 12;
-    constexpr std::size_t total_slot_count = control_slot_count + audio_slot_count + common_slot_count;
-    constexpr std::size_t common_slot_begin = control_slot_count + audio_slot_count;
+    constexpr std::size_t total_slot_count =
+      control_slot_count + audio_slot_count + congestion_feedback_slot_count + common_slot_count;
+    constexpr std::size_t congestion_feedback_slot_begin = control_slot_count + audio_slot_count;
+    constexpr std::size_t common_slot_begin = congestion_feedback_slot_begin + congestion_feedback_slot_count;
     constexpr std::size_t recovery_slot_begin = common_slot_begin;
     constexpr std::size_t video_slot_begin = recovery_slot_begin + recovery_slot_count;
     constexpr std::size_t shared_slot_begin = video_slot_begin + video_slot_count;
     constexpr std::uint64_t retry_delay_microseconds = 50;
     constexpr std::uint64_t microbatch_microseconds = 100;
     constexpr std::uint64_t starvation_promotion_microseconds = 2'000;
+    constexpr std::uint64_t congestion_feedback_floor_microseconds =
+      transport::congestion_feedback_floor_microseconds;
     constexpr std::uint8_t maximum_microbatch_datagrams = 8;
 
     enum class SlotState : std::uint8_t {
@@ -94,8 +104,11 @@ namespace lumen::lsp::runtime {
       if (priority == 0 || slot.enqueued_microseconds == 0 || now_microseconds < slot.enqueued_microseconds) {
         return priority;
       }
+      const auto minimum_priority = slot.lane == HostForwardLane::congestion_feedback ?
+                                      lane_priority(HostForwardLane::audio) :
+                                      std::uint8_t {0};
       const auto promotions = std::min<std::uint64_t>(
-        priority,
+        priority - minimum_priority,
         (now_microseconds - slot.enqueued_microseconds) / starvation_promotion_microseconds
       );
       return static_cast<std::uint8_t>(priority - promotions);
@@ -520,6 +533,12 @@ namespace lumen::lsp::runtime {
           return reserved;
         }
       }
+      if (lane == HostForwardLane::congestion_feedback) {
+        if (const auto reserved = find_free_in_range(congestion_feedback_slot_begin, common_slot_begin)) {
+          return reserved;
+        }
+        return find_free_in_range(shared_slot_begin, total_slot_count);
+      }
       if (lane == HostForwardLane::recovery) {
         if (const auto reserved = find_free_in_range(recovery_slot_begin, video_slot_begin)) {
           return reserved;
@@ -541,21 +560,41 @@ namespace lumen::lsp::runtime {
       return find_free_in_range(shared_slot_begin, total_slot_count);
     }
 
-    [[nodiscard]] std::optional<std::size_t> retry_slot() const noexcept {
+    /** @brief Return whether a slot may pass the connection-wide RFC 8888 send floor. */
+    [[nodiscard]] bool congestion_feedback_eligible(
+      const Slot &slot,
+      const std::uint64_t now
+    ) const noexcept {
+      return slot.lane != HostForwardLane::congestion_feedback ||
+             last_congestion_feedback_sent_microseconds_ == 0 ||
+             (now >= last_congestion_feedback_sent_microseconds_ &&
+              now - last_congestion_feedback_sent_microseconds_ >= congestion_feedback_floor_microseconds);
+    }
+
+    /** @brief Select the first retry slot eligible for an actual send attempt. */
+    [[nodiscard]] std::optional<std::size_t> retry_slot(
+      const std::uint64_t now,
+      const bool apply_congestion_feedback_floor = true
+    ) const noexcept {
       for (std::size_t index = 0; index < slots_.size(); ++index) {
-        if (slots_[index].state == SlotState::retry) {
+        if (slots_[index].state == SlotState::retry &&
+            (!apply_congestion_feedback_floor || congestion_feedback_eligible(slots_[index], now))) {
           return index;
         }
       }
       return std::nullopt;
     }
 
-    [[nodiscard]] std::optional<std::size_t> next_queued_slot() const noexcept {
-      const auto now = monotonic_microseconds();
+    /** @brief Select the highest-priority queued slot currently eligible for submission. */
+    [[nodiscard]] std::optional<std::size_t> next_queued_slot(
+      const std::uint64_t now,
+      const bool apply_congestion_feedback_floor = true
+    ) const noexcept {
       std::optional<std::size_t> selected;
       for (std::size_t index = 0; index < slots_.size(); ++index) {
         const auto &slot = slots_[index];
-        if (slot.state != SlotState::queued) {
+        if (slot.state != SlotState::queued ||
+            (apply_congestion_feedback_floor && !congestion_feedback_eligible(slot, now))) {
           continue;
         }
         if (!selected) {
@@ -575,6 +614,28 @@ namespace lumen::lsp::runtime {
         }
       }
       return selected;
+    }
+
+    /** @brief Return the next connection-wide RFC 8888 eligibility instant, if one is cooling down. */
+    [[nodiscard]] std::optional<std::uint64_t> next_congestion_feedback_eligibility(
+      const std::uint64_t now
+    ) const noexcept {
+      if (last_congestion_feedback_sent_microseconds_ == 0 ||
+          now < last_congestion_feedback_sent_microseconds_) {
+        return std::nullopt;
+      }
+      const auto eligible_at = last_congestion_feedback_sent_microseconds_ >
+                                   std::numeric_limits<std::uint64_t>::max() - congestion_feedback_floor_microseconds ?
+                                 std::numeric_limits<std::uint64_t>::max() :
+                                 last_congestion_feedback_sent_microseconds_ + congestion_feedback_floor_microseconds;
+      if (now >= eligible_at) {
+        return std::nullopt;
+      }
+      const auto waiting = std::ranges::any_of(slots_, [](const Slot &slot) {
+        return (slot.state == SlotState::queued || slot.state == SlotState::retry) &&
+               slot.lane == HostForwardLane::congestion_feedback;
+      });
+      return waiting ? std::optional<std::uint64_t> {eligible_at} : std::nullopt;
     }
 
     [[nodiscard]] bool has_owned_slot() const noexcept {
@@ -698,13 +759,35 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /**
+     * @brief Wait one bounded pacing interval without Windows timer wakeup quantization.
+     * @param lock Scheduler lock released so urgent work can be enqueued during the wait.
+     * @param microseconds Earned-credit wait, capped at the short retry interval.
+     */
     void precise_wait(std::unique_lock<std::mutex> &lock, const std::uint64_t microseconds) noexcept {
       if (microseconds == 0) {
         return;
       }
       const auto bounded = std::min<std::uint64_t>(microseconds, retry_delay_microseconds);
       lock.unlock();
+#ifdef _WIN32
+      // High-resolution waitable timers still wake roughly half a millisecond
+      // late on supported Windows hosts. These <=50us intervals must not enter
+      // that scheduler path; idle queues use the condition variable in run().
+      const auto started = monotonic_microseconds();
+      const auto deadline = started > std::numeric_limits<std::uint64_t>::max() - bounded ?
+                              std::numeric_limits<std::uint64_t>::max() :
+                              started + bounded;
+      while (!closed_.load(std::memory_order_relaxed) && monotonic_microseconds() < deadline) {
+  #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+        _mm_pause();
+  #else
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+  #endif
+      }
+#else
       high_precision_timer_->sleep_for(std::chrono::microseconds {bounded});
+#endif
       lock.lock();
     }
 
@@ -731,14 +814,15 @@ namespace lumen::lsp::runtime {
           if (!has_owned_slot()) {
             break;
           }
-          auto cancelled = next_queued_slot();
+          auto cancelled = next_queued_slot(now, false);
           if (!cancelled) {
-            cancelled = retry_slot();
+            cancelled = retry_slot(now, false);
           }
           if (!cancelled) {
             condition_.wait(lock, [this, &stop_token]() {
-              return stop_token.stop_requested() || active_leases_ == 0 || next_queued_slot().has_value() ||
-                     retry_slot().has_value();
+              const auto instant = monotonic_microseconds();
+              return stop_token.stop_requested() || active_leases_ == 0 ||
+                     next_queued_slot(instant, false).has_value() || retry_slot(instant, false).has_value();
             });
             continue;
           }
@@ -750,9 +834,9 @@ namespace lumen::lsp::runtime {
           continue;
         }
 
-        auto selected = retry_slot();
+        auto selected = retry_slot(now);
         auto retrying = selected.has_value();
-        const auto queued = next_queued_slot();
+        const auto queued = next_queued_slot(now);
         if (!selected ||
             (queued && lane_priority(slots_[*queued].lane) < lane_priority(slots_[*selected].lane))) {
           selected = queued;
@@ -763,9 +847,17 @@ namespace lumen::lsp::runtime {
           continue;
         }
         if (!selected) {
-          condition_.wait(lock, [this, &stop_token]() {
-            return stop_token.stop_requested() || closed_.load(std::memory_order_relaxed) || retry_slot().has_value() || next_queued_slot().has_value();
-          });
+          if (const auto eligible_at = next_congestion_feedback_eligibility(now)) {
+            precise_wait(lock, *eligible_at - now);
+          } else {
+            condition_.wait(lock, [this, &stop_token]() {
+              const auto instant = monotonic_microseconds();
+              // New cooling feedback must wake this idle wait so the outer
+              // loop can arm its deadline even if no other traffic arrives.
+              return stop_token.stop_requested() || closed_.load(std::memory_order_relaxed) ||
+                     retry_slot(instant, false).has_value() || next_queued_slot(instant, false).has_value();
+            });
+          }
           continue;
         }
 
@@ -822,6 +914,9 @@ namespace lumen::lsp::runtime {
         switch (send_result) {
           case UdpSendResult::sent:
             completion_result = HostForwardCompletion::sent;
+            if (slot.lane == HostForwardLane::congestion_feedback) {
+              last_congestion_feedback_sent_microseconds_ = completed_at;
+            }
             sent_datagrams_.fetch_add(1, std::memory_order_relaxed);
             sent_protected_bytes_.fetch_add(slot.protected_bytes, std::memory_order_relaxed);
             sent_charged_bytes_.fetch_add(slot.charged_bytes, std::memory_order_relaxed);
@@ -862,6 +957,7 @@ namespace lumen::lsp::runtime {
     std::uint64_t next_ticket_ {1};
     std::uint64_t next_enqueue_ordinal_ {1};
     std::uint64_t batch_window_started_microseconds_ {};
+    std::uint64_t last_congestion_feedback_sent_microseconds_ {};  ///< Latest final-sent RFC 8888 datagram.
     std::size_t active_leases_ {};
     std::uint8_t batch_datagrams_ {};
     std::atomic<std::uint64_t> accepted_datagrams_ {};
@@ -885,7 +981,7 @@ namespace lumen::lsp::runtime {
   };
 
   HostForwardPath::HostForwardPath(HostForwardPathConfig config) noexcept:
-      impl_ {new(std::nothrow) Impl {std::move(config)}} {
+      impl_ {new (std::nothrow) Impl {std::move(config)}} {
   }
 
   HostForwardPath::~HostForwardPath() = default;

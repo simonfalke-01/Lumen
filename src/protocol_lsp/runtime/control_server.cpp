@@ -304,6 +304,7 @@ namespace lumen::lsp::runtime {
         MicrophoneConfigPayload payload {};  ///< Exact configuration awaiting client installation.
         std::uint64_t request_id {};  ///< Random request identifier echoed by MICROPHONE_CONFIG_ACK.
         std::uint64_t message_id {};  ///< Reliable outbound message identifier.
+        std::uint64_t deadline_microseconds {};  ///< Original absolute configuration-response deadline.
         bool active {};  ///< Whether a matching acknowledgement remains pending.
       } pending_microphone;  ///< At most one pending microphone configuration per connection.
 
@@ -315,6 +316,12 @@ namespace lumen::lsp::runtime {
 
       std::array<AcceptedMicrophoneAck, 4> accepted_microphone_acks {};  ///< Bounded ACK cache across rekeys.
       std::size_t next_microphone_ack_slot {};  ///< Ring slot replaced by the next accepted microphone ACK.
+
+      struct PendingMicrophoneActivation {
+        MicrophoneConfigAckPayload acknowledgement {};  ///< Validated acknowledgement awaiting semantic activation.
+        std::uint64_t deadline_microseconds {};  ///< Original absolute configuration-response deadline.
+        bool active {};  ///< Whether `tick()` still owes the one semantic callback.
+      } pending_microphone_activation;  ///< Receipt-ACKed microphone activation dispatched outside provider callbacks.
 
       struct PendingOutboundPathProbe {
         PathProbePayload probe {};  ///< Exact intent and protected candidate size.
@@ -1176,6 +1183,24 @@ namespace lumen::lsp::runtime {
       std::scoped_lock lock(mutex_);
       for (std::size_t index = 0; index < connections_.size();) {
         auto &connection = connections_[index];
+        if (connection.pending_microphone_activation.active) {
+          const auto pending = connection.pending_microphone_activation;
+          connection.pending_microphone_activation = {};
+          if (!connection.authenticated_client || now_microseconds >= pending.deadline_microseconds ||
+              !start_handler_.microphone_config_acknowledged(
+                connection.peer,
+                *connection.authenticated_client,
+                connection.generation,
+                pending.acknowledgement
+              )) {
+            const auto peer = connection.peer;
+            transport_.close(peer);
+            if (const auto remaining = find(peer); remaining != connections_.size()) {
+              connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+            }
+            continue;
+          }
+        }
         if (connection.pending_start.active) {
           const auto pending = connection.pending_start;
           connection.pending_start = {};
@@ -2490,6 +2515,11 @@ namespace lumen::lsp::runtime {
       const MicrophoneConfigPayload &configuration,
       const std::uint64_t now_microseconds
     ) noexcept {
+      if (connection.pending_microphone_activation.active) {
+        return connection.pending_microphone_activation.acknowledgement.session_id == configuration.session_id &&
+               connection.pending_microphone_activation.acknowledgement.microphone_generation ==
+                 configuration.microphone.microphone_generation;
+      }
       if (connection.pending_microphone.active) {
         return connection.pending_microphone.payload.session_id == configuration.session_id &&
                connection.pending_microphone.payload.microphone.microphone_generation ==
@@ -2544,6 +2574,7 @@ namespace lumen::lsp::runtime {
         .payload = configuration,
         .request_id = request_id,
         .message_id = connection.next_message_id,
+        .deadline_microseconds = deadline,
         .active = true,
       };
       const auto message_id = connection.next_message_id++;
@@ -2562,7 +2593,6 @@ namespace lumen::lsp::runtime {
       const std::span<const std::uint8_t> payload,
       const std::uint64_t now_microseconds
     ) noexcept {
-      (void) now_microseconds;
       const auto accepted_duplicate = std::ranges::find_if(connection.accepted_microphone_acks, [&](const Connection::AcceptedMicrophoneAck &accepted) {
         return accepted.size == frame.size() && accepted.request_id == header.request_id &&
                std::ranges::equal(std::span<const std::uint8_t> {accepted.frame}.first(accepted.size), frame);
@@ -2586,12 +2616,7 @@ namespace lumen::lsp::runtime {
       if (!acknowledgement || acknowledgement->session_id != connection.pending_microphone.payload.session_id ||
           acknowledgement->microphone_generation != connection.pending_microphone.payload.microphone.microphone_generation ||
           has_flag(header.flags, lspc_flag::error_response) != (acknowledgement->status != ControlStatus::success) ||
-          !start_handler_.microphone_config_acknowledged(
-            connection.peer,
-            *connection.authenticated_client,
-            connection.generation,
-            *acknowledgement
-          )) {
+          connection.pending_microphone_activation.active) {
         transport_.close(connection.peer);
         return false;
       }
@@ -2607,6 +2632,11 @@ namespace lumen::lsp::runtime {
       std::ranges::copy(frame, accepted.frame.begin());
       accepted.size = frame.size();
       connection.next_microphone_ack_slot = (connection.next_microphone_ack_slot + 1U) % connection.accepted_microphone_acks.size();
+      connection.pending_microphone_activation = {
+        .acknowledgement = *acknowledgement,
+        .deadline_microseconds = connection.pending_microphone.deadline_microseconds,
+        .active = true,
+      };
       return send_acknowledgement_only(connection);
     }
 

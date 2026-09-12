@@ -457,6 +457,12 @@ both acknowledged and capture/sender activated. A newer forward-recovery
 ATTACH may supersede an incomplete successor without overwriting older
 retiring peers.
 
+Blocking capture and encoder joins must not stall the UDP receive/control
+owner during handoff. Retained media owners are released only after their
+workers are quiescent. Path and SRTP cleanup remains connection-generation
+qualified; a closed five-tuple cannot establish replacement keys while its old
+producers are still retiring.
+
 Fresh authentication is re-evaluated at every ATTACH. Loss of optional
 microphone permission omits the replacement microphone generation and retires
 the old receiver; loss of required microphone permission rejects before
@@ -1222,6 +1228,9 @@ after end-to-end device and CPU validation.
 - Audio never blocks video or input queues.
 
 SRTCP sender reports relate the 48 kHz RTP timeline to the sender clock.
+Each microphone sender report is a regular compound SR/SDES packet identifying
+the microphone SSRC with the same association CNAME used by the other local
+sources. A bare SR does not establish compound RTCP authority.
 
 ## 15. Input protocol
 
@@ -2049,6 +2058,13 @@ Each endpoint records monotonic timestamps at:
 
 Distributions report count, p50, p95, p99, maximum, drops, active generations,
 and clock domain. Cross-machine one-way results include offset uncertainty.
+
+On macOS, native receive/expiry timestamps and coarse media timing use the
+awake-only `CLOCK_UPTIME_RAW` domain. Darwin `SCM_TIMESTAMP_MONOTONIC` carries
+raw `mach_absolute_time` ticks, not nanoseconds; convert them using the runtime
+`mach_timebase_info` ratio before comparing them with uptime microseconds.
+IOHID timestamps require the same tick conversion. Sleep-inclusive
+`CLOCK_MONOTONIC` values must not be compared directly with these timestamps.
 
 Input telemetry additionally reports, per device and instance generation:
 

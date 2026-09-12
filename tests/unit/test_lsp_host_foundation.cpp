@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <future>
 #include <gtest/gtest.h>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -637,6 +638,101 @@ TEST(LspMicrophoneFeedbackWire, WritesRegularCompoundAndReducedCongestionReports
   EXPECT_EQ(parsed->report_timestamp, 0x12345678U);
 }
 
+TEST(LspMicrophoneOwnership, StoppedPredecessorReleasesWriterBeforeDeferredDestruction) {
+  /** @brief Observe exclusive platform ownership without creating an audio device. */
+  class Sink final: public client_microphone::sink_t {
+  public:
+    /** @brief Share the test's platform-generation observation. */
+    explicit Sink(std::atomic<std::uint64_t> &active):
+        active_(active) {
+    }
+
+    /** @brief Reject simultaneous platform writers. */
+    bool begin(std::uint64_t generation, std::uint32_t, std::uint8_t) override {
+      auto empty = std::uint64_t {0};
+      return active_.compare_exchange_strong(empty, generation);
+    }
+
+    /** @brief Accept writes only from the active generation. */
+    bool write(std::uint64_t generation, std::span<const std::int16_t>) override {
+      return active_.load() == generation;
+    }
+
+    /** @brief Retire only this sink's generation. */
+    void end(std::uint64_t generation) override {
+      (void) active_.compare_exchange_strong(generation, 0);
+    }
+
+  private:
+    std::atomic<std::uint64_t> &active_;  ///< Platform owner visible across receiver workers.
+  };
+
+  const lsp::PeerEndpoint peer {
+    .family = lsp::IpAddressFamily::ipv4,
+    .local_address = "127.0.0.1",
+    .local_port = 48'030,
+    .remote_address = "127.0.0.1",
+    .remote_port = 49'001,
+  };
+  auto forward = std::make_shared<lsp::runtime::HostForwardPath>(lsp::runtime::HostForwardPathConfig {
+    .peer = peer,
+    .generation = 7,
+    .pacing_bits_per_second = 1'000'000,
+    .path_payload_bytes = 1'200,
+    .callbacks = {
+      .send_datagram = [](void *, const lsp::PeerEndpoint &, std::span<const std::uint8_t>) noexcept {
+        return lsp::runtime::UdpSendResult::sent;
+      },
+    },
+  });
+  ASSERT_TRUE(forward->ready());
+  lsp::runtime::LibsrtpServerProvider srtp {{}};
+  std::atomic<std::uint64_t> active_generation {0};
+  const auto create_receiver = [&](std::uint32_t generation) {
+    return lsp::runtime::LspMicrophoneReceiver::create(
+      {
+        .peer = peer,
+        .generation = generation,
+        .ssrc = generation + 100,
+        .payload_type = 112,
+        .forward_path = forward,
+        .forward_path_generation = 7,
+        .feedback_ssrc = 77,
+        .rtcp_cname = {.bytes = {'m', 'i', 'c'}, .size = 3},
+      },
+      std::make_unique<Sink>(active_generation),
+      srtp
+    );
+  };
+  auto predecessor = create_receiver(1);
+  ASSERT_TRUE(predecessor);
+  EXPECT_EQ(active_generation.load(), 1U);
+  EXPECT_FALSE(create_receiver(2));
+
+  predecessor->stop();
+  EXPECT_EQ(active_generation.load(), 0U);
+  auto successor = create_receiver(2);
+  ASSERT_TRUE(successor);
+  EXPECT_EQ(active_generation.load(), 2U);
+
+  // Deferred predecessor destruction must neither end nor release its successor.
+  predecessor.reset();
+  EXPECT_EQ(active_generation.load(), 2U);
+  const auto legacy_owner = client_microphone::writer_owner_t::legacy(9);
+  const auto incorrectly_claimed = client_microphone::claim_writer(legacy_owner);
+  EXPECT_FALSE(incorrectly_claimed);
+  if (incorrectly_claimed) {
+    client_microphone::release_writer(legacy_owner);
+  }
+  successor->stop();
+  EXPECT_EQ(active_generation.load(), 0U);
+  const auto claimed_after_stop = client_microphone::claim_writer(legacy_owner);
+  EXPECT_TRUE(claimed_after_stop);
+  if (claimed_after_stop) {
+    client_microphone::release_writer(legacy_owner);
+  }
+}
+
 TEST(LspInputFeedbackWire, WritesAcknowledgementRegularCompoundWithoutMicrophoneAuthority) {
   lsp::RtcpCname cname;
   constexpr std::array<std::uint8_t, 12> cname_bytes {'l', 's', 'p', '-', 'i', 'n', 'p', 'u', 't', '-', 'a', 'c'};
@@ -651,7 +747,42 @@ TEST(LspInputFeedbackWire, WritesAcknowledgementRegularCompoundWithoutMicrophone
   );
   ASSERT_TRUE(authority);
   EXPECT_EQ(authority.first_report.packet_type, lsp::transport::rtcp_receiver_report_type);
+  EXPECT_EQ(authority.first_report.count, 0U);
   EXPECT_TRUE(std::ranges::equal(authority.cname, cname.view()));
+
+  std::array<std::uint8_t, 128> reported {};
+  const auto reported_size = lsp::runtime::write_input_feedback_compound_report(
+    reported,
+    91,
+    {
+      .media_ssrc = 92,
+      .extended_highest_sequence = 0x1234'5678U,
+      .interarrival_jitter = 37,
+      .last_sender_report = 0x89ab'cdefU,
+      .delay_since_sender_report = 0x1020'3040U,
+      .cumulative_lost = -2,
+      .fraction_lost = 17,
+    },
+    cname
+  );
+  ASSERT_NE(reported_size, 0U);
+  const auto reported_authority = lsp::transport::validate_compound_rtcp_authority(
+    std::span<const std::uint8_t> {reported}.first(reported_size),
+    91
+  );
+  ASSERT_TRUE(reported_authority);
+  ASSERT_EQ(reported_authority.first_report.count, 1U);
+  const auto payload = reported_authority.first_report.payload;
+  ASSERT_EQ(payload.size(), 28U);
+  EXPECT_EQ(lsp::wire::read_be<std::uint32_t>(payload.subspan<4, 4>()), 92U);
+  EXPECT_EQ(payload[8], 17U);
+  EXPECT_EQ(payload[9], 0xffU);
+  EXPECT_EQ(payload[10], 0xffU);
+  EXPECT_EQ(payload[11], 0xfeU);
+  EXPECT_EQ(lsp::wire::read_be<std::uint32_t>(payload.subspan<12, 4>()), 0x1234'5678U);
+  EXPECT_EQ(lsp::wire::read_be<std::uint32_t>(payload.subspan<16, 4>()), 37U);
+  EXPECT_EQ(lsp::wire::read_be<std::uint32_t>(payload.subspan<20, 4>()), 0x89ab'cdefU);
+  EXPECT_EQ(lsp::wire::read_be<std::uint32_t>(payload.subspan<24, 4>()), 0x1020'3040U);
 }
 
 TEST(LspInputFeedbackWire, DefersReducedFeedbackThroughWouldBlockUntilCompoundIsSent) {
@@ -670,6 +801,10 @@ TEST(LspInputFeedbackWire, DefersReducedFeedbackThroughWouldBlockUntilCompoundIs
   gate.complete(token, true);
   EXPECT_FALSE(gate.submission_pending());
   EXPECT_TRUE(gate.reduced_size_allowed(token));
+  ASSERT_TRUE(gate.begin_refresh_submission(token));
+  EXPECT_TRUE(gate.reduced_size_allowed(token));
+  gate.complete(token, true);
+  EXPECT_FALSE(gate.submission_pending());
 
   EXPECT_FALSE(gate.begin_submission(token + 1U));
   gate.reset(8, 12);
