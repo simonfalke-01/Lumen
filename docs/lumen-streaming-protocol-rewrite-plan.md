@@ -572,6 +572,16 @@ the objective. The installed host is still not a test target.
   re-registering/reopening the unchanged installed bundle did not fix the
   denial. That duplicate-UUID hypothesis is not established. No privacy-store
   modification, permission bypass, or Windows service restart was performed.
+  At 22:35, native UDP setup-stage diagnostics were added without changing the
+  connection policy or ABI. The updated app was installed at the same canonical
+  path and opened through LaunchServices, not launched under the shell's
+  network exemption. GUI PID 78045 logged its initial connection failure at
+  22:35:34, then updated authenticated trust at 22:35:37 on the next automatic
+  check. No later failure appeared during the follow-up observation. No Mac
+  reboot, host restart, permission edit, or firewall change was used for this
+  recovery. The original denial's precise cause remains unproven; do not claim
+  that diagnostic logging itself fixed network policy. The client is left open
+  for the user's real streaming/input/latency retry.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
