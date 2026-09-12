@@ -531,6 +531,21 @@ the objective. The installed host is still not a test target.
   automatic recovery regression passes in 3.46 seconds and the installed app
   is updated. GUI reachability remains unverified; this timer is not a claim
   that the connection-denial cause has been fixed.
+- [x] Repeat the real GUI connection after the user disabled Little Snitch.
+  The isolated Windows task had meanwhile stopped at its `PT2H` execution
+  limit. A guarded helper started only that stopped task and changed its
+  limit to `PT0S`; installed Lumen PID 10964 remained unchanged. With no stream
+  owner present, the idle GUI was relaunched to clear its stale association.
+  `/Applications/Umbra.app` PID 7739 then refreshed authenticated trust and
+  Bonjour last-seen state at 21:16:54, with no GUI connection error recorded.
+  This identifies Little Snitch filtering as the removed connectivity block;
+  the earlier macOS-toggle/reset diagnosis was incorrect. No firewall rule
+  was changed by the agent. Only the user disabled Little Snitch. A narrowly
+  scoped Umbra allow rule is still preferable to leaving the firewall disabled.
+- [ ] Fix idle catalog-session reuse after host expiry: the previous running
+  GUI retained a stale authenticated session and repeatedly returned
+  `notAuthenticated` after the test host stopped, until the idle GUI restarted.
+  Do not interrupt the newly working client while the user tests streaming.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
