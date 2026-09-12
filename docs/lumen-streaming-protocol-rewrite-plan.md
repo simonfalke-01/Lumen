@@ -488,6 +488,36 @@ the objective. The installed host is still not a test target.
   Bonjour itself finds the advertised current host immediately. Local Network
   settings have been opened for the user to enable Umbra. No permission store
   was modified or bypassed; no Windows service was restarted.
+  **Correction after the user's screenshots:** all Umbra toggles were already
+  enabled. Read-only inspection confirms `DenyMulticast=false` for both the
+  stable app identifier and the temporary bundle rule. Asking the user to
+  enable it again was not a valid diagnosis.
+- [x] Consolidate development launches onto `/Applications/Umbra.app`, signed
+  by the same Apple Development identity/requirement as the previous installed
+  app. Previous installed/temporary bundles and two remaining old development
+  bundles are recoverable under `/tmp/umbra-install-backup.5bRJQr`. Sixteen
+  stale LaunchServices registrations are removed; a fresh dump lists only the
+  canonical `/Applications/Umbra.app` for this bundle identifier. The private
+  network-permissions store was not edited. Historical Local Network rows are
+  **not** claimed removed; Apple documents no supported per-program reset.
+- [x] Block raw build executable launches before creating network services,
+  preserving help/version and explicit local recovery. This prevents future
+  raw-build networking from adding per-executable privacy identities. The
+  focused bootstrap regression and affected app build pass.
+- [x] Check saved host reachability through authenticated LSP APPLICATIONS,
+  independently of Bonjour endpoint resolution, and publish each host result.
+  No START or ATTACH is sent. The focused regression covers Offline, Ready
+  without Bonjour, retained Ready across refresh, and failed-probe Offline.
+- [ ] Resolve the GUI-process permission denial. A read-only APPLICATIONS
+  request from the shell returns Desktop immediately, but the identical signed
+  app opened by LaunchServices fails its real native UDP check and stays
+  Offline. This disproves the earlier resolver-only conclusion: Apple's
+  TN3179 documents the Terminal/child-process exemption, so shell success is
+  not GUI permission evidence. Do not use a shell launch as a bypass. A normal
+  Mac restart is the next bounded state-refresh diagnostic, not a guaranteed
+  fix, and requires user approval because it closes local applications. No
+  further signing, app relocation, toggle cycles, or permission-store surgery
+  should substitute for this diagnostic.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
