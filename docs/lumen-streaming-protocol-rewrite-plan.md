@@ -469,6 +469,25 @@ the objective. The installed host is still not a test target.
   launching it. The disconnect/reconnect cause remains unconfirmed; this is
   not a live stability claim. No host restart or stream launch occurred during
   this local fix/verification step.
+- [x] Remove the obsolete September 1 local LSP test pairing
+  `12C056C1-813A-1BCF-C32D-19C8DB42A660`, which shared the current host's
+  display name/address. Both original LSP host/trust files are backed up in
+  `/tmp/umbra-obsolete-pairing.XzxT8a`. Exact comparison confirms current host
+  `324363D1-4353-BA2D-7154-8B6FBC75F273` and its trust are unchanged. Legacy
+  state and all client identities are untouched.
+- [x] Repair LSP host-browser status: saved-but-unconfirmed hosts display
+  Offline instead of an indefinitely idle Checking state; discovery-confirmed
+  Ready survives persisted-state refresh; manual refresh retries known Bonjour
+  services; LSP uses Bonjour TXT metadata directly. Legacy discovery's browser
+  descriptor is unchanged. The app build and two focused readiness/snapshot
+  regressions pass; the signed app was relaunched without a stream.
+- [ ] Complete the live Ready check after resolving macOS Local Network
+  permission. At 19:02:42, Network.framework logs for the running signed Umbra
+  PID 98662 explicitly reject both IPv4 and IPv6 host endpoints with
+  `Local network prohibited`; the LSP resolver times out at three seconds.
+  Bonjour itself finds the advertised current host immediately. Local Network
+  settings have been opened for the user to enable Umbra. No permission store
+  was modified or bypassed; no Windows service was restarted.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
