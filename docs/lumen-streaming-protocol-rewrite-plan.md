@@ -518,6 +518,19 @@ the objective. The installed host is still not a test target.
   fix, and requires user approval because it closes local applications. No
   further signing, app relocation, toggle cycles, or permission-store surgery
   should substitute for this diagnostic.
+  **Further investigation:** Little Snitch 6.4.1 has an active network filter;
+  the VPN services inspected are disconnected. The remaining denial must not
+  be attributed conclusively to macOS before inspecting Umbra's filter rules.
+  The supported Little Snitch rule export requires root, and the noninteractive
+  attempt reports that a password is required. No filter was disabled, no
+  rules were changed, and no administrator credentials were obtained.
+- [x] Umbra `562aee6` adds automatic idle-host status retries at the existing
+  legacy monitor's three-second cadence, with one in-flight check, unchanged
+  UI/error suppression, and no probes during owned streaming/reconnect. The
+  user's 100 ms example was not treated as a timing requirement. The focused
+  automatic recovery regression passes in 3.46 seconds and the installed app
+  is updated. GUI reachability remains unverified; this timer is not a claim
+  that the connection-denial cause has been fixed.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
