@@ -546,6 +546,22 @@ the objective. The installed host is still not a test target.
   GUI retained a stale authenticated session and repeatedly returned
   `notAuthenticated` after the test host stopped, until the idle GUI restarted.
   Do not interrupt the newly working client while the user tests streaming.
+- [x] Umbra `b3184aa` fixes two faults found in the user's first GUI stream:
+  AppKit fallback focus transitions were labelled RESOURCE_EXHAUSTED, and a
+  synchronous video-consumer report re-entered the native C ABI callback and
+  terminated the stream. Focus-triggered starts now coalesce after the AppKit
+  transition and revalidate exact window ownership; genuine queue-allocation
+  failure remains distinct from unavailable focus. Retained complete frames
+  are delivered on a serial frame-level queue, bounded by the native retained
+  frame pool (decoder surfaces + 2), with handler-generation fencing. No
+  per-packet Swift queue was introduced. Both focused regressions pass, the
+  affected app builds, and the signed installed app is reopened for the user.
+- [ ] Recheck physical input, latency, stutter, and picture quality in a new
+  live stream. The prior GUI stream rendered at 21:17:42 and closed at
+  21:18:15 with `reentrantCallback`. Later host counters include continued
+  post-disconnect admission drops, so those totals do not establish active
+  stream encoder saturation or network loss. No performance-fix claim is made
+  until fresh live timing and user observation confirm the corrected path.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
