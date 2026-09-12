@@ -452,6 +452,23 @@ the objective. The installed host is still not a test target.
   pass (one test, 0.123 s). The signed LSP stream reopened at 18:15 after
   clearing the crashed association on only the isolated test task; installed
   PID 10964 is unchanged. User focus/input confirmation remains pending.
+- [ ] Resolve the reported disconnect/reconnect failure without interrupting an
+  active user stream. The GUI stream log records fullscreen video at 18:37:11;
+  an agent-launched second instance sent START at 18:37:27, received `busy`, and
+  the first stream dismissed at 18:37:33. The agent should not have launched
+  the second instance while the user was testing. The host rejects nonowner
+  START and fences association teardown by peer; these timestamps alone do
+  not establish the terminal failure's cause. The GUI termination reason was
+  not persisted in the support log. Umbra `4e7fb8f` now registers GUI streams
+  with the owner endpoint, reserves ownership before START, rejects duplicate
+  cross-process ownership with a private lifetime file lock, and persists
+  terminal LSP errors. Failed startup finishes window cleanup before releasing
+  ownership; delayed old listener tasks cannot unlink or reuse successor
+  descriptors. Four focused IPC tests pass and the affected app builds with
+  Swift warnings-as-errors. The signed test bundle is refreshed without
+  launching it. The disconnect/reconnect cause remains unconfirmed; this is
+  not a live stability claim. No host restart or stream launch occurred during
+  this local fix/verification step.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
