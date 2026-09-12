@@ -582,6 +582,19 @@ the objective. The installed host is still not a test target.
   recovery. The original denial's precise cause remains unproven; do not claim
   that diagnostic logging itself fixed network policy. The client is left open
   for the user's real streaming/input/latency retry.
+- [x] Repair the September 13 saved-endpoint failure without restarting the
+  running GUI or host. Native diagnostics show IPv6 `connect()` failing with
+  errno 65. `en7` no longer exists and its saved link-local route is absent;
+  `192.168.1.236` is reachable through `en0`. Only the current host's saved
+  address/interface hint was corrected to that explicitly supplied IPv4 host
+  and `en0`. The original host file is backed up in
+  `/tmp/umbra-endpoint-repair.A6qP4A`; comparison verifies every other host
+  field is unchanged, and file permissions remain 0600. Existing GUI PID 53212
+  then authenticated at 00:06:14 and holds IPv4 UDP
+  `192.168.1.70:61572 -> 192.168.1.236:48030`. This failure is a stale scoped
+  address after an interface change, not evidence that another reboot or
+  permission toggle is needed. No stream start, trust reset, or service restart
+  was performed.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
