@@ -151,7 +151,7 @@ namespace platf::win_input {
 
     /**
      * @brief Synchronize the calling thread with the current input desktop.
-     * @return Current input desktop handle.
+     * @return Bound input desktop, or `nullptr` when synchronization fails.
      */
     virtual HDESK sync_thread_desktop() = 0;
 
@@ -199,7 +199,6 @@ namespace platf::win_input {
 
     std::shared_ptr<win32_api_t> api_;  ///< Win32 call surface.
     mutable std::mutex mutex_;  ///< Serializes state and calls to `SendInput`.
-    HDESK last_input_desktop_ {nullptr};  ///< Last observed input desktop.
     std::unordered_map<std::uint16_t, std::uint8_t> held_keys_;  ///< Held keys and their packet flags.
     std::uint8_t held_buttons_ {0};  ///< Held mouse-button bitmap.
   };

@@ -986,8 +986,16 @@ namespace platf {
 
   void enable_mouse_keys();
 
-  // Allow OS-specific actions to be taken to prepare for streaming
+  /**
+   * @brief Acquire platform performance settings for streaming.
+   * @note Windows shares the settings and system-sleep inhibitor across legacy and LSP owners.
+   */
   void streaming_will_start();
+
+  /**
+   * @brief Release one streaming platform owner after its workers stop.
+   * @note Windows restores settings only after the final matching owner releases them.
+   */
   void streaming_will_stop();
 
   void restart();

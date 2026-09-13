@@ -582,6 +582,7 @@ namespace video {
     std::uint64_t reference_invalidation_generation = 0;  ///< Exact accepted LSP invalidation generation, or zero.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
     std::optional<std::chrono::steady_clock::time_point> encoder_submit_timestamp;  ///< Actual encoder submission time.
+    std::optional<std::chrono::steady_clock::time_point> encoder_complete_timestamp;  ///< Encoded output availability time.
     std::uint64_t applied_input_state_sequence {};  ///< Input state watermark sampled at capture submission.
     std::uint64_t applied_input_edge_id {};  ///< Input edge watermark sampled at capture submission.
   };

@@ -25,7 +25,7 @@ namespace platf {
   /**
    * @brief Synchronize thread desktop.
    *
-   * @return true when the thread desktop was synchronized successfully.
+   * @return Bound input desktop, or `nullptr` when opening or binding fails.
    */
   HDESK syncThreadDesktop();
 

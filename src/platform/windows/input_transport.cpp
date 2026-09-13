@@ -122,17 +122,15 @@ namespace platf::win_input {
       return {};
     }
 
-    const auto status = api_->last_error();
-    const auto desktop = api_->sync_thread_desktop();
-    if (last_input_desktop_ != desktop) {
-      last_input_desktop_ = desktop;
-      sent = api_->send_input(1, &input, sizeof(INPUT));
-      if (sent == 1) {
-        return {};
-      }
+    if (api_->sync_thread_desktop() == nullptr) {
+      return {completion_t::rejected, api_->last_error()};
+    }
+    sent = api_->send_input(1, &input, sizeof(INPUT));
+    if (sent == 1) {
+      return {};
     }
 
-    return {completion_t::rejected, status};
+    return {completion_t::rejected, api_->last_error()};
   }
 
   result_t send_input_transport_t::move_mouse(std::int32_t delta_x, std::int32_t delta_y) {

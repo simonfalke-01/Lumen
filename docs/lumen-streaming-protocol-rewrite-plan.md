@@ -686,6 +686,87 @@ LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorize
 - [ ] Repeat sustained gameplay, physical input, picture-quality and latency
   verification; short Desktop streams are not production qualification.
 
+### September 13 input, readable statistics, and stutter follow-up
+
+- [x] The unchanged installed GUI PID 26591 authenticated again at 15:24:38
+  through its automatic retry. No app/host restart or further deployment by the
+  agent caused that recovery; the exact reason the earlier local rejection
+  cleared is unproven. The user subsequently started a real fullscreen LSP stream.
+- [x] Isolate the reported keyboard/mouse failure past the client: the host
+  receives authenticated input and logs repeated `SendInput` rejection.
+  The isolated host runs elevated in console session 1; a same-context probe
+  sees `WinSta0/Default`. That probe also rejected a zero-motion input, so the
+  desktop retry defect below must not be claimed as the entire proven cause.
+- [x] Implement per-calling-thread Windows input recovery: remove the shared
+  recycled-desktop-handle retry gate, retry once after successful binding,
+  and retain the final error rather than reporting an earlier zero error.
+  Existing focused transport regressions were updated; Windows execution of
+  these changes remains pending.
+- [x] Build the revised client overlay: solid 12-point monospace, no glyph
+  outline or background box, a text shadow, and clearer nonoverlapping labels.
+  The native rendered snapshot was inspected; focused overlay, ABI, and
+  telemetry checks passed. The revised client is signed and installed at the
+  canonical `/Applications/Umbra.app`, then reopened idle after the failed
+  session had already ended. Live host-encode accuracy still requires the
+  matching Windows deployment. The previous executable is recoverable as
+  `/tmp/lsp-start-repro.FEPfa6/Umbra-before-readable-encoder.saved`.
+- [x] Implement actual host encoding duration end-to-end in software:
+  timestamp encoded-output availability at NVENC/FFmpeg completion, retain
+  sender-time anchoring separately, parse authenticated repeated timing, and
+  show completion minus submission as `Host encode`. The private client C ABI
+  advances to version 3; LSP wire remains version 1 and Photon is unchanged.
+- [x] Add coarse host frame-drop reasons to the existing admin statistics:
+  decoder saturation, deadline misses, invalid reference, and forward capacity.
+  The prior stream had roughly two percent host admission drops while client
+  packet drops and host-reported network loss remained very low/zero. The
+  precise cause of those historical frame drops is not yet attributable.
+- [x] Wire LSP capture lifetime to the existing Windows streaming platform
+  hooks (DWM MMCSS, timer resolution, process priority, WLAN streaming mode).
+  Share these settings by first/last lease across legacy and LSP; restore only
+  after final capture teardown. Add a process-owned system-sleep request while
+  streaming, without changing the user's power plan. Local Lumen build and
+  Windows power-API compile check passed; Windows live behavior is unverified.
+- [ ] Finish Windows build and deploy both products, then retry real input and
+  stutter scenarios. The initial Windows build connection stopped producing
+  output after 17/39 objects. Around 16:12 the live stream lost connectivity;
+  subsequent SSH/ARP on both en7 and en0 and the known IPv6 endpoint fail.
+  A targeted Wake-on-LAN request was sent; it did not restore connectivity in
+  the observed interval. No host restart or deployment was performed. Neither
+  sleep nor build resource pressure is established as the cause. The next
+  build helper uses two jobs; check for an existing build before restarting it.
+  The local router remains reachable. Later targeted IPv4/IPv6 retries still
+  fail, so the host outage is not resolved by the client installation.
+- [ ] Remove the completed temporary `Lumen-LSP-input-context-20260913` task
+  when the host is reachable again. It performed desktop/token inspection and
+  one zero-motion input probe; it did not change service, display, or power settings.
+- [ ] Full pixel-to-pixel latency remains unmeasured. Host game-present timing,
+  bounded cross-machine clock calibration, and actual client scanout are not
+  available from the current telemetry. Do not add overlapping percentiles or
+  label Metal command commit as a physical end-to-end measurement.
+- [ ] Commit these follow-up changes once signing is available. Both signed
+  commit attempts returned `1Password: agent returned an error`; changes remain
+  staged and preserved. No unsigned substitute commit was made.
+
+### Host restored, missing LSP startup corrected
+
+- [x] After the user brought Windows back, verify that only the installed
+  legacy service (PID 12356) was running; the isolated LSP task was stopped and
+  UDP 48030 had no listener. This was a real startup-wiring defect, independent
+  of the GUI connection problem, and explains why legacy Moonlight alone could
+  connect immediately after the host returned.
+- [x] Start only the isolated LSP task and add its exact-user logon trigger,
+  StartWhenAvailable, and bounded failure restarts. The listener returned at
+  16:57:01 as PID 4356. Installed service PID 12356 remained unchanged. No media
+  stream was started by this operation and no new host executable was deployed.
+- [x] Verify a read-only authenticated LSP catalog request returns Desktop.
+  This terminal-launched request is diagnostic only: it is not GUI permission
+  evidence or a fallback transport. It did not START or ATTACH a stream.
+- [ ] Restore GUI connectivity. Existing GUI PID 19130 kept retrying but native
+  sends failed with errno 65/32. One idle-GUI restart using the unchanged signed
+  binary produced PID 26726 and the same errors; it did not resolve the issue.
+  The 17:01:51 trust-file update belongs to the terminal diagnostic, not a GUI
+  recovery. Do not mark this host Ready based only on the terminal or Moonlight.
+
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
 hash guard, and the isolated scheduled task is stopped. Installed Lumen remains

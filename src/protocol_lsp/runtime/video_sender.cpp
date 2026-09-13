@@ -1384,6 +1384,7 @@ namespace lumen::lsp::runtime {
         {.capacity = 1, .max_queue_age = std::max(frame_interval, 1ns)},
         [this](const video::egress_queue_t::recovery_request_t &request) {
           pressure_events_.fetch_add(1, std::memory_order_relaxed);
+          forward_capacity_drops_.fetch_add(request.dropped_frames, std::memory_order_relaxed);
           if (config_.reference_invalidation) {
             if (!request_reference_invalidation(
                   request.first_frame,
@@ -2257,6 +2258,10 @@ namespace lumen::lsp::runtime {
         .submitted_frames = submitted_frames_.load(std::memory_order_relaxed),
         .submitted_packets = submitted_packets_.load(std::memory_order_relaxed),
         .dropped_frames = dropped_frames_.load(std::memory_order_relaxed),
+        .decoder_saturated_drops = decoder_saturated_drops_.load(std::memory_order_relaxed),
+        .deadline_miss_drops = deadline_miss_drops_.load(std::memory_order_relaxed),
+        .invalid_reference_drops = invalid_reference_drops_.load(std::memory_order_relaxed),
+        .forward_capacity_drops = forward_capacity_drops_.load(std::memory_order_relaxed),
         .submitted_wire_bytes = submitted_wire_bytes_.load(std::memory_order_relaxed),
         .flexfec_submitted_packets = flexfec_submitted_packets_.load(std::memory_order_relaxed),
         .flexfec_submitted_wire_bytes = flexfec_submitted_wire_bytes_.load(std::memory_order_relaxed),
@@ -4258,10 +4263,44 @@ namespace lumen::lsp::runtime {
       return true;
     }
 
-    /** @brief Drop an encoded frame before submission and invalidate its future reference use. */
-    [[nodiscard]] bool drop_pre_submit_frame(video::packet_raw_t &packet) noexcept {
+    /** @brief Coarse mutually exclusive reason for rejecting one whole frame before submission. */
+    enum class FrameAdmissionDropReason : std::uint8_t {
+      other,  ///< Failure is outside the production admission categories.
+      decoder_saturated,  ///< Authenticated client hardware-decoder credit is zero.
+      deadline_miss,  ///< The deadline elapsed or complete serialization cannot finish in time.
+      invalid_reference,  ///< Dependency or recovery state rejects this encoded frame.
+      forward_capacity,  ///< Aggregate forward-path capacity or backpressure rejects the frame.
+    };
+
+    /**
+     * @brief Drop an encoded frame before submission and invalidate its future reference use.
+     *
+     * @param packet Unsent encoded frame whose dependency is invalidated.
+     * @param reason Coarse admission reason recorded exactly once for this frame.
+     * @return True after dependency invalidation was queued; false after fail-closed teardown.
+     */
+    [[nodiscard]] bool drop_pre_submit_frame(
+      video::packet_raw_t &packet,
+      const FrameAdmissionDropReason reason = FrameAdmissionDropReason::other
+    ) noexcept {
       dropped_frames_.fetch_add(1, std::memory_order_relaxed);
       pressure_events_.fetch_add(1, std::memory_order_relaxed);
+      switch (reason) {
+        case FrameAdmissionDropReason::decoder_saturated:
+          decoder_saturated_drops_.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case FrameAdmissionDropReason::deadline_miss:
+          deadline_miss_drops_.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case FrameAdmissionDropReason::invalid_reference:
+          invalid_reference_drops_.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case FrameAdmissionDropReason::forward_capacity:
+          forward_capacity_drops_.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case FrameAdmissionDropReason::other:
+          break;
+      }
       return invalidate_uncommitted_frame_dependency(packet);
     }
 
@@ -4397,6 +4436,7 @@ namespace lumen::lsp::runtime {
       const auto complete_time = std::chrono::steady_clock::now();
       const auto capture_time = packet.frame_timestamp.value_or(complete_time);
       const auto submit_time = packet.encoder_submit_timestamp.value_or(capture_time);
+      const auto encoder_complete_time = packet.encoder_complete_timestamp.value_or(complete_time);
       const auto capture_us_count = std::chrono::duration_cast<std::chrono::microseconds>(capture_time.time_since_epoch()).count();
       if (capture_us_count < 0 || next_frame_id_ == 0) {
         return false;
@@ -4424,7 +4464,7 @@ namespace lumen::lsp::runtime {
             recovery_boundary.request_independent_frame,
             independent
           )) {
-        return drop_pre_submit_frame(packet);
+        return drop_pre_submit_frame(packet, FrameAdmissionDropReason::invalid_reference);
       }
       const auto extension_storage = make_extensions(
         independent,
@@ -4434,7 +4474,7 @@ namespace lumen::lsp::runtime {
         packet.applied_input_state_sequence,
         packet.applied_input_edge_id,
         saturated_microseconds(submit_time - capture_time),
-        saturated_microseconds(complete_time - capture_time)
+        saturated_microseconds(encoder_complete_time - capture_time)
       );
       if (!extension_storage) {
         return false;
@@ -4487,7 +4527,12 @@ namespace lumen::lsp::runtime {
         .maximum_capture_to_client_us = config_.maximum_capture_to_present_microseconds,
       });
       if (!wait_for_reference_terminal(independent, deadline)) {
-        return drop_pre_submit_frame(packet);
+        const auto reason = closed_.load(std::memory_order_acquire) ?
+                              FrameAdmissionDropReason::other :
+                            video_monotonic_microseconds() >= deadline ?
+                              FrameAdmissionDropReason::deadline_miss :
+                              FrameAdmissionDropReason::invalid_reference;
+        return drop_pre_submit_frame(packet, reason);
       }
       const auto now_us = video_monotonic_microseconds();
       const auto credit = decoder_credit_.load(std::memory_order_acquire);
@@ -4528,11 +4573,28 @@ namespace lumen::lsp::runtime {
         .reference_path_valid = independent || reference_path_valid_.load(std::memory_order_acquire),
       });
       if (!admission) {
-        return drop_pre_submit_frame(packet);
+        auto reason = FrameAdmissionDropReason::other;
+        switch (admission.status) {
+          case media::frame_admission_status::decoder_saturated:
+            reason = FrameAdmissionDropReason::decoder_saturated;
+            break;
+          case media::frame_admission_status::expired:
+          case media::frame_admission_status::misses_deadline:
+            reason = FrameAdmissionDropReason::deadline_miss;
+            break;
+          case media::frame_admission_status::invalid_reference_path:
+            reason = FrameAdmissionDropReason::invalid_reference;
+            break;
+          case media::frame_admission_status::admitted:
+          case media::frame_admission_status::invalid_size:
+          case media::frame_admission_status::invalid_pacing_rate:
+            break;
+        }
+        return drop_pre_submit_frame(packet, reason);
       }
       if (forward_backpressured_.load(std::memory_order_acquire) ||
           !config_.forward_path->video_admission_open()) {
-        return drop_pre_submit_frame(packet);
+        return drop_pre_submit_frame(packet, FrameAdmissionDropReason::forward_capacity);
       }
 
       std::uint64_t complete_wire_bytes = 0;
@@ -4560,12 +4622,12 @@ namespace lumen::lsp::runtime {
                                       std::numeric_limits<std::uint64_t>::max() :
                                       (wire_bits * 1'000'000U + pacing_rate - 1U) / pacing_rate;
       if (now_us >= deadline || serialization_us > deadline - now_us) {
-        return drop_pre_submit_frame(packet);
+        return drop_pre_submit_frame(packet, FrameAdmissionDropReason::deadline_miss);
       }
 
       const auto dependency_generation = reserve_dependency_generation(independent);
       if (!dependency_generation) {
-        return drop_pre_submit_frame(packet);
+        return drop_pre_submit_frame(packet, FrameAdmissionDropReason::invalid_reference);
       }
       admitted_frames_.fetch_add(1, std::memory_order_relaxed);
       {
@@ -4591,7 +4653,10 @@ namespace lumen::lsp::runtime {
       );
       if (frame_ticket == 0) {
         abort_retained_frame(retained_frame_index, retained_frame.incarnation);
-        return drop_pre_submit_frame(packet);
+        const auto reason = closed_.load(std::memory_order_acquire) ?
+                              FrameAdmissionDropReason::other :
+                              FrameAdmissionDropReason::forward_capacity;
+        return drop_pre_submit_frame(packet, reason);
       }
       const auto reservation = reserve_recovery_frame(
         frame_ticket,
@@ -4919,6 +4984,10 @@ namespace lumen::lsp::runtime {
     std::atomic<std::uint64_t> submitted_frames_ {};  ///< Fully submitted frame count.
     std::atomic<std::uint64_t> submitted_packets_ {};  ///< Protected RTP packet count.
     std::atomic<std::uint64_t> dropped_frames_ {};  ///< Whole pre-send frame drop count.
+    std::atomic<std::uint64_t> decoder_saturated_drops_ {};  ///< Zero-credit frame rejections.
+    std::atomic<std::uint64_t> deadline_miss_drops_ {};  ///< Deadline and serialization frame rejections.
+    std::atomic<std::uint64_t> invalid_reference_drops_ {};  ///< Dependency and recovery frame rejections.
+    std::atomic<std::uint64_t> forward_capacity_drops_ {};  ///< Queue and aggregate-path capacity rejections.
     std::atomic<std::uint64_t> submitted_wire_bytes_ {};  ///< Complete charged wire bytes.
     std::atomic<std::uint64_t> pressure_events_ {};  ///< Bounded pressure observation count.
     std::atomic<std::uint64_t> feedback_reports_ {};  ///< Accepted authenticated RFC 8888 reports.

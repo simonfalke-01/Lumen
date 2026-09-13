@@ -2141,6 +2141,7 @@ namespace video {
       } else if (ret < 0) {
         return ret;
       }
+      const auto encoder_complete_timestamp = std::chrono::steady_clock::now();
 
       if (av_packet->flags & AV_PKT_FLAG_KEY) {
         BOOST_LOG(debug) << "Frame "sv << frame_nr << ": IDR Keyframe (AV_FRAME_FLAG_KEY)"sv;
@@ -2178,6 +2179,7 @@ namespace video {
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
         packet->encoder_submit_timestamp = encoder_submit_timestamp;
+        packet->encoder_complete_timestamp = encoder_complete_timestamp;
       }
 
       packet->replacements = &session.replacements;
@@ -2214,6 +2216,7 @@ namespace video {
   ) {
     const auto encoder_submit_timestamp = std::chrono::steady_clock::now();
     auto encoded_frame = session.encode_frame(frame_nr);
+    const auto encoder_complete_timestamp = std::chrono::steady_clock::now();
     if (encoded_frame.data.empty()) {
       BOOST_LOG(error) << "NvENC returned empty packet";
       return -1;
@@ -2234,6 +2237,7 @@ namespace video {
     packet->reference_invalidation_generation = encoded_frame.reference_invalidation_generation;
     packet->frame_timestamp = frame_timestamp;
     packet->encoder_submit_timestamp = encoder_submit_timestamp;
+    packet->encoder_complete_timestamp = encoder_complete_timestamp;
     packet->applied_input_state_sequence = input_watermark.first;
     packet->applied_input_edge_id = input_watermark.second;
     if (egress.push(channel_data, std::move(packet)) == egress_queue_t::enqueue_e::recovery_callback_failed) {

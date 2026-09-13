@@ -347,33 +347,59 @@ TEST_F(send_input_transport_test, RejectsInvalidUnicodeInput) {
   EXPECT_TRUE(api->submitted.empty());
 }
 
-TEST_F(send_input_transport_test, RetriesAfterInputDesktopChanges) {
+TEST_F(send_input_transport_test, RetriesAfterInputDesktopSynchronization) {
   api->send_results = {0, 1};
-  api->desktop = reinterpret_cast<HDESK>(static_cast<std::uintptr_t>(2));
 
   const auto result = transport->move_mouse(5, -7);
 
   ASSERT_TRUE(result);
   ASSERT_EQ(api->submitted.size(), 2);
   EXPECT_EQ(api->sync_calls, 1);
-  EXPECT_EQ(api->last_error_calls, 1);
+  EXPECT_EQ(api->last_error_calls, 0);
   EXPECT_EQ(api->submitted[0].mi.dx, api->submitted[1].mi.dx);
   EXPECT_EQ(api->submitted[0].mi.dy, api->submitted[1].mi.dy);
   EXPECT_EQ(api->submitted[0].mi.dwFlags, api->submitted[1].mi.dwFlags);
 }
 
-TEST_F(send_input_transport_test, DoesNotRetryAgainOnUnchangedInputDesktop) {
-  api->send_results = {0, 1, 0};
-  api->desktop = reinterpret_cast<HDESK>(static_cast<std::uintptr_t>(3));
+TEST_F(send_input_transport_test, RetriesEveryFailureAfterInputDesktopSynchronization) {
+  api->send_results = {0, 1, 0, 1};
   ASSERT_TRUE(transport->move_mouse(1, 2));
+
+  const auto result = transport->move_mouse(3, 4);
+
+  EXPECT_TRUE(result);
+  EXPECT_EQ(api->submitted.size(), 4);
+  EXPECT_EQ(api->sync_calls, 2);
+  EXPECT_EQ(api->last_error_calls, 0);
+}
+
+TEST_F(send_input_transport_test, DoesNotRetryWhenInputDesktopSynchronizationFails) {
+  api->send_results = {0};
+  api->desktop = nullptr;
+  api->error = ERROR_ACCESS_DENIED;
 
   const auto result = transport->move_mouse(3, 4);
 
   EXPECT_FALSE(result);
   EXPECT_EQ(result.completion, platf::win_input::completion_t::rejected);
   EXPECT_EQ(result.status, ERROR_ACCESS_DENIED);
-  EXPECT_EQ(api->submitted.size(), 3);
-  EXPECT_EQ(api->sync_calls, 2);
+  EXPECT_EQ(api->submitted.size(), 1);
+  EXPECT_EQ(api->sync_calls, 1);
+  EXPECT_EQ(api->last_error_calls, 1);
+}
+
+TEST_F(send_input_transport_test, ReportsFinalSendInputErrorAfterRetry) {
+  api->send_results = {0, 0};
+  api->error = ERROR_PRIVILEGE_NOT_HELD;
+
+  const auto result = transport->move_mouse(3, 4);
+
+  EXPECT_FALSE(result);
+  EXPECT_EQ(result.completion, platf::win_input::completion_t::rejected);
+  EXPECT_EQ(result.status, ERROR_PRIVILEGE_NOT_HELD);
+  EXPECT_EQ(api->submitted.size(), 2);
+  EXPECT_EQ(api->sync_calls, 1);
+  EXPECT_EQ(api->last_error_calls, 1);
 }
 
 TEST_F(send_input_transport_test, NeutralizeReleasesHeldKey) {

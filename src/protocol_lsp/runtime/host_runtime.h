@@ -129,6 +129,10 @@ namespace lumen::lsp::runtime {
     std::uint64_t video_sent_frames {};  ///< Fully submitted primary video frames.
     std::uint64_t video_admitted_frames {};  ///< Complete video access units admitted by the sender.
     std::uint64_t video_dropped_frames {};  ///< Whole video frames rejected before transmission.
+    std::uint64_t video_decoder_saturated_drops {};  ///< Video frames rejected because decoder credit was zero.
+    std::uint64_t video_deadline_miss_drops {};  ///< Video frames rejected by deadline or serialization bounds.
+    std::uint64_t video_invalid_reference_drops {};  ///< Video frames rejected by dependency or recovery state.
+    std::uint64_t video_forward_capacity_drops {};  ///< Video frames rejected by queue/path capacity or backpressure.
     std::uint64_t video_pressure_events {};  ///< Queue, admission, pacer, or socket pressure observations.
     std::uint8_t video_decoder_credit {};  ///< Latest authenticated client decoder credit.
     std::uint64_t video_pacing_bits_per_second {};  ///< Current complete-IP aggregate pacing target.

@@ -48,6 +48,7 @@
   #include "../../config.h"
   #include "../../globals.h"
   #include "../../httpcommon.h"
+  #include "../../platform/common.h"
   #include "../../process.h"
 
   #include <wolfssl/options.h>
@@ -995,6 +996,10 @@ namespace lumen::lsp::runtime {
           media.video_sent_frames = snapshot.submitted_frames;
           media.video_admitted_frames = snapshot.admitted_frames;
           media.video_dropped_frames = snapshot.dropped_frames;
+          media.video_decoder_saturated_drops = snapshot.decoder_saturated_drops;
+          media.video_deadline_miss_drops = snapshot.deadline_miss_drops;
+          media.video_invalid_reference_drops = snapshot.invalid_reference_drops;
+          media.video_forward_capacity_drops = snapshot.forward_capacity_drops;
           media.video_pressure_events = snapshot.pressure_events;
           media.video_decoder_credit = snapshot.decoder_credit;
           media.video_pacing_bits_per_second = snapshot.pacing_bits_per_second;
@@ -1274,6 +1279,9 @@ namespace lumen::lsp::runtime {
       std::shared_ptr<HostVideoSender> sender;  ///< Capacity-one RTP/SRTP sender owner.
       std::jthread capture_thread;  ///< Existing capture/VDD/hardware encoder owner.
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease;  ///< Active exact VDD generation owner.
+  #ifdef _WIN32
+      bool platform_streaming_lease {};  ///< Whether this capture owns one Windows streaming-performance lease.
+  #endif
       bool retirement_claimed {};  ///< Background worker borrowed this queued owner under the session lock.
       std::atomic<bool> retirement_complete {};  ///< Release-published after the worker's last owner access.
     };
@@ -2618,6 +2626,18 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /** @brief Release this video's Windows streaming-performance state exactly once. */
+    static void release_video_platform_streaming_lease(ActiveVideoRuntime &runtime) noexcept {
+  #ifdef _WIN32
+      if (runtime.platform_streaming_lease) {
+        runtime.platform_streaming_lease = false;
+        platf::streaming_will_stop();
+      }
+  #else
+      (void) runtime;
+  #endif
+    }
+
     /** @brief Destroy a joined video owner and release its display lease on the socket owner. */
     static void stop_video_runtime(std::unique_ptr<ActiveVideoRuntime> runtime) noexcept {
       if (!runtime) {
@@ -2630,6 +2650,7 @@ namespace lumen::lsp::runtime {
         runtime->display_lease.reset();
       }
   #endif
+      release_video_platform_streaming_lease(*runtime);
     }
 
     /** @brief Make one video capture/sender runtime quiescent without joining in a callback. */
@@ -3020,6 +3041,10 @@ namespace lumen::lsp::runtime {
       }
       runtime.mail->event<bool>(mail::idr)->raise(true);
       try {
+  #ifdef _WIN32
+        runtime.platform_streaming_lease = true;
+        platf::streaming_will_start();
+  #endif
         const auto mail = runtime.mail;
         const auto sender = runtime.sender;
         auto capture_config = selection.capture;
@@ -3028,6 +3053,7 @@ namespace lumen::lsp::runtime {
           sender->close();
         });
       } catch (...) {
+        release_video_platform_streaming_lease(runtime);
         return false;
       }
       return true;

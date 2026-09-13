@@ -402,6 +402,10 @@ namespace lumen::lsp::runtime {
     std::uint64_t submitted_frames {};  ///< Frames whose complete primary RTP packet set was submitted.
     std::uint64_t submitted_packets {};  ///< Primary-video RTP packets accepted by the kernel.
     std::uint64_t dropped_frames {};  ///< Whole frames dropped before first-packet submission.
+    std::uint64_t decoder_saturated_drops {};  ///< Frames rejected because authenticated decoder credit was zero.
+    std::uint64_t deadline_miss_drops {};  ///< Frames rejected by an elapsed deadline or serialization estimate.
+    std::uint64_t invalid_reference_drops {};  ///< Frames rejected by stale dependency or recovery state.
+    std::uint64_t forward_capacity_drops {};  ///< Frames rejected by bounded forward-path capacity or backpressure.
     std::uint64_t submitted_wire_bytes {};  ///< Complete primary-video IP/UDP/SRTP bytes charged.
     std::uint64_t flexfec_submitted_packets {};  ///< Repair RTP packets accepted by the kernel.
     std::uint64_t flexfec_submitted_wire_bytes {};  ///< Complete IP/UDP/SRTP FlexFEC bytes charged.

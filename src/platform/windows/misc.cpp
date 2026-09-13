@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iterator>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -96,6 +97,9 @@ extern "C" {
 namespace {
 
   std::atomic<bool> used_nt_set_timer_resolution = false;
+  std::mutex streaming_lease_mutex;  ///< Serializes process-wide streaming platform-state ownership.
+  std::uint32_t streaming_lease_count {};  ///< Active legacy and LSP owners of streaming platform state.
+  HANDLE streaming_power_request {};  ///< Process-owned system-sleep inhibitor held by the first streaming lease.
 
   bool nt_set_timer_resolution_max() {
     ULONG maximum;
@@ -218,6 +222,7 @@ namespace platf {
 
   /**
    * @brief Synchronize thread desktop.
+   * @return Bound input desktop, or `nullptr` when opening or binding fails.
    */
   HDESK syncThreadDesktop() {
     auto hDesk = OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, FALSE, GENERIC_ALL);
@@ -225,12 +230,16 @@ namespace platf {
       auto err = GetLastError();
       BOOST_LOG(error) << "Failed to Open Input Desktop [0x"sv << util::hex(err).to_string_view() << ']';
 
+      SetLastError(err);
       return nullptr;
     }
 
     if (!SetThreadDesktop(hDesk)) {
       auto err = GetLastError();
       BOOST_LOG(error) << "Failed to sync desktop to thread [0x"sv << util::hex(err).to_string_view() << ']';
+      CloseDesktop(hDesk);
+      SetLastError(err);
+      return nullptr;
     }
 
     CloseDesktop(hDesk);
@@ -1139,6 +1148,11 @@ namespace platf {
   }
 
   void streaming_will_start() {
+    std::scoped_lock lock(streaming_lease_mutex);
+    if (streaming_lease_count++ != 0) {
+      return;
+    }
+
     static std::once_flag load_wlanapi_once_flag;
     std::call_once(load_wlanapi_once_flag, []() {
       // wlanapi.dll is not installed by default on Windows Server, so we load it dynamically
@@ -1167,6 +1181,24 @@ namespace platf {
         return;
       }
     });
+
+    wchar_t streaming_reason[] = L"Lumen game streaming";
+    REASON_CONTEXT power_reason {
+      .Version = POWER_REQUEST_CONTEXT_VERSION,
+      .Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+      .Reason = {
+        .SimpleReasonString = streaming_reason,
+      },
+    };
+    const auto power_request = PowerCreateRequest(&power_reason);
+    if (power_request == INVALID_HANDLE_VALUE) {
+      BOOST_LOG(warning) << "Unable to create the Windows streaming power request: "sv << GetLastError();
+    } else if (!PowerSetRequest(power_request, PowerRequestSystemRequired)) {
+      BOOST_LOG(warning) << "Unable to prevent system sleep while streaming: "sv << GetLastError();
+      CloseHandle(power_request);
+    } else {
+      streaming_power_request = power_request;
+    }
 
     // Enable MMCSS scheduling for DWM
     DwmEnableMMCSS(true);
@@ -1256,6 +1288,15 @@ namespace platf {
   }
 
   void streaming_will_stop() {
+    std::scoped_lock lock(streaming_lease_mutex);
+    if (streaming_lease_count == 0) {
+      BOOST_LOG(warning) << "Ignored an unmatched Windows streaming platform-state release"sv;
+      return;
+    }
+    if (--streaming_lease_count != 0) {
+      return;
+    }
+
     // Demote ourselves back to normal priority class
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
@@ -1285,6 +1326,15 @@ namespace platf {
         auto winerr = GetLastError();
         BOOST_LOG(warning) << "Unable to restore original state of Mouse Keys: "sv << winerr;
       }
+    }
+
+    // Closing the process-owned handle clears the request even if the explicit clear fails.
+    if (streaming_power_request != nullptr) {
+      if (!PowerClearRequest(streaming_power_request, PowerRequestSystemRequired)) {
+        BOOST_LOG(warning) << "Unable to clear the Windows streaming power request: "sv << GetLastError();
+      }
+      CloseHandle(streaming_power_request);
+      streaming_power_request = nullptr;
     }
   }
 
