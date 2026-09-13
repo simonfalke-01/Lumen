@@ -668,9 +668,17 @@ LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorize
 - [ ] Resolve the current post-update GUI network denial. Regular installed
   GUI PID 26591 remains unable to authenticate; macOS reports `Local network
   prohibited`. No successful authentication occurred after 14:48:12. The
-  Little Snitch extension is active, but that alone does not establish whether
-  filtering is enabled or causing the denial. Its supported preference read
-  requires root. No new permission toggle, filter bypass, private-state edit,
+  user explicitly reconfirmed that Little Snitch filtering is disabled; do not
+  ask again or treat an active extension as evidence that filtering is enabled.
+  Read-only OS inspection maps installed build UUID
+  `B40F49B7-F0C7-3BF6-9920-A12CFD8C552C` to `app.umbra.Umbra`; the corresponding
+  saved consent rule has `DenyAll=false`, `DenyMulticast=false`, and
+  `MulticastPreferenceSet=true`. The installed Apple Development designated
+  requirement remains compatible with the existing app identity, and no raw
+  SwiftPM executable is present. The live GUI nevertheless receives repeated
+  pre-authentication send failures. Apple documents no additional supported
+  per-update installation step or per-app permission reset that resolves this
+  discrepancy. No new permission toggle, filter bypass, private-state edit,
   or Mac reboot was performed. Do not mistake earlier short-stream success
   for current reachability.
 - [ ] Deliberately terminate one exact test client and immediately relaunch to
