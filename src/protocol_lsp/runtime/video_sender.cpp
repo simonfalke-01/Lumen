@@ -6,6 +6,7 @@
 #include "video_sender.h"
 
 #include "../../globals.h"
+#include "../../logging.h"
 #include "../core/transport.h"
 #include "../core/wire.h"
 #include "../media/av1.h"
@@ -4272,6 +4273,109 @@ namespace lumen::lsp::runtime {
       forward_capacity,  ///< Aggregate forward-path capacity or backpressure rejects the frame.
     };
 
+    /** @brief Exact sender stage at which a frame exhausted its capture-relative deadline. */
+    enum class FrameDeadlineMissStage : std::uint8_t {
+      reference_wait,  ///< The preceding reference frame did not become terminal in time.
+      coarse_admission_expired,  ///< Capture-relative deadline elapsed before size admission.
+      coarse_serialization,  ///< Codec plus selected-repair bytes exceeded remaining pacing time.
+      exact_serialization,  ///< Complete IP/UDP/SRTP bytes exceeded remaining pacing time.
+      packet_submission,  ///< Packet construction reached the deadline after admission.
+    };
+
+    /** @brief Return a stable secret-free label for one deadline diagnostic stage. */
+    [[nodiscard]] static constexpr const char *deadline_stage_name(
+      const FrameDeadlineMissStage stage
+    ) noexcept {
+      switch (stage) {
+        case FrameDeadlineMissStage::reference_wait:
+          return "reference-wait";
+        case FrameDeadlineMissStage::coarse_admission_expired:
+          return "coarse-expired";
+        case FrameDeadlineMissStage::coarse_serialization:
+          return "coarse-serialization";
+        case FrameDeadlineMissStage::exact_serialization:
+          return "exact-wire-serialization";
+        case FrameDeadlineMissStage::packet_submission:
+          return "packet-submission";
+      }
+      return "unknown";
+    }
+
+    /**
+     * @brief Rate-limit one exact capture-relative deadline diagnostic.
+     *
+     * @param stage Admission or submission stage that exhausted the deadline.
+     * @param packet Encoded frame carrying host capture and encoder timestamps.
+     * @param queue_age Time retained by the bounded encoder-egress queue.
+     * @param capture_microseconds Monotonic capture timestamp used by admission.
+     * @param now_microseconds Monotonic deadline observation time.
+     * @param deadline_microseconds Absolute negotiated frame deadline.
+     * @param source_bytes Encoded access-unit bytes before RTP framing.
+     * @param complete_wire_bytes Exact complete IP-layer bytes when already known.
+     * @param selected_repair_bytes Selected repair bytes included by admission.
+     * @param packet_count Planned primary RTP packet count.
+     * @param serialization_microseconds Serialization estimate for this stage.
+     * @param pacing_bits_per_second Aggregate pacing rate used by admission.
+     */
+    void log_deadline_miss(
+      const FrameDeadlineMissStage stage,
+      video::packet_raw_t &packet,
+      const std::chrono::nanoseconds queue_age,
+      const std::uint64_t capture_microseconds,
+      const std::uint64_t now_microseconds,
+      const std::uint64_t deadline_microseconds,
+      const std::size_t source_bytes,
+      const std::uint64_t complete_wire_bytes,
+      const std::size_t selected_repair_bytes,
+      const std::size_t packet_count,
+      const std::uint64_t serialization_microseconds,
+      const std::uint64_t pacing_bits_per_second
+    ) noexcept {
+      constexpr std::uint64_t diagnostic_interval_microseconds = 1'000'000;
+      if (last_deadline_diagnostic_microseconds_ != 0 &&
+          now_microseconds >= last_deadline_diagnostic_microseconds_ &&
+          now_microseconds - last_deadline_diagnostic_microseconds_ < diagnostic_interval_microseconds) {
+        ++suppressed_deadline_diagnostics_;
+        return;
+      }
+      const auto frame_age = now_microseconds >= capture_microseconds ?
+                               now_microseconds - capture_microseconds :
+                               0;
+      const auto remaining = deadline_microseconds > now_microseconds ?
+                               deadline_microseconds - now_microseconds :
+                               0;
+      const auto capture_to_submit = packet.frame_timestamp && packet.encoder_submit_timestamp &&
+                                             *packet.encoder_submit_timestamp >= *packet.frame_timestamp ?
+                                       saturated_microseconds(
+                                         *packet.encoder_submit_timestamp - *packet.frame_timestamp
+                                       ) :
+                                       0;
+      const auto encoder_duration = packet.encoder_submit_timestamp && packet.encoder_complete_timestamp &&
+                                            *packet.encoder_complete_timestamp >= *packet.encoder_submit_timestamp ?
+                                      saturated_microseconds(
+                                        *packet.encoder_complete_timestamp - *packet.encoder_submit_timestamp
+                                      ) :
+                                      0;
+      BOOST_LOG(warning) << "LSP video deadline miss: stage=" << deadline_stage_name(stage)
+                         << " frame=" << packet.frame_index()
+                         << " age_us=" << frame_age
+                         << " budget_us=" << config_.maximum_capture_to_present_microseconds
+                         << " remaining_us=" << remaining
+                         << " capture_to_submit_us=" << capture_to_submit
+                         << " encode_us=" << encoder_duration
+                         << " egress_queue_us="
+                         << std::chrono::duration_cast<std::chrono::microseconds>(queue_age).count()
+                         << " source_bytes=" << source_bytes
+                         << " wire_bytes=" << complete_wire_bytes
+                         << " repair_bytes=" << selected_repair_bytes
+                         << " packets=" << packet_count
+                         << " serialization_us=" << serialization_microseconds
+                         << " pacing_bps=" << pacing_bits_per_second
+                         << " suppressed=" << suppressed_deadline_diagnostics_;
+      last_deadline_diagnostic_microseconds_ = now_microseconds;
+      suppressed_deadline_diagnostics_ = 0;
+    }
+
     /**
      * @brief Drop an encoded frame before submission and invalidate its future reference use.
      *
@@ -4300,6 +4404,15 @@ namespace lumen::lsp::runtime {
           break;
         case FrameAdmissionDropReason::other:
           break;
+      }
+      if (reason == FrameAdmissionDropReason::invalid_reference) {
+        std::scoped_lock lock(dependency_state_mutex_);
+        if (invalidation_pending_locked()) {
+          // NVENC expands the active invalidation through its last encoded frame on the
+          // encoder thread. Any unmarked dependent already queued behind that request is
+          // therefore covered; issuing another request here chases the encoder forever.
+          return true;
+        }
       }
       return invalidate_uncommitted_frame_dependency(packet);
     }
@@ -4359,7 +4472,7 @@ namespace lumen::lsp::runtime {
         if (closed_.load(std::memory_order_acquire)) {
           break;
         }
-        if (!process_frame(*dequeued->packet)) {
+        if (!process_frame(*dequeued->packet, dequeued->queue_age)) {
           failed_.store(true, std::memory_order_release);
           config_.capture_mail->event<bool>(mail::shutdown)->raise(true);
           break;
@@ -4367,8 +4480,17 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    /** @brief Materialize, admit, packetize, pace, protect, and submit one complete access unit. */
-    [[nodiscard]] bool process_frame(video::packet_raw_t &packet) noexcept {
+    /**
+     * @brief Materialize, admit, packetize, pace, protect, and submit one complete access unit.
+     *
+     * @param packet Encoded access unit transferred from the capture/encoder pipeline.
+     * @param queue_age Time retained by the bounded encoder-egress queue.
+     * @return True after bounded processing; false on terminal sender failure.
+     */
+    [[nodiscard]] bool process_frame(
+      video::packet_raw_t &packet,
+      const std::chrono::nanoseconds queue_age
+    ) noexcept {
       if (!consume_invalidation_results()) {
         return false;
       }
@@ -4527,11 +4649,28 @@ namespace lumen::lsp::runtime {
         .maximum_capture_to_client_us = config_.maximum_capture_to_present_microseconds,
       });
       if (!wait_for_reference_terminal(independent, deadline)) {
+        const auto deadline_observation = video_monotonic_microseconds();
         const auto reason = closed_.load(std::memory_order_acquire) ?
                               FrameAdmissionDropReason::other :
-                            video_monotonic_microseconds() >= deadline ?
+                            deadline_observation >= deadline ?
                               FrameAdmissionDropReason::deadline_miss :
                               FrameAdmissionDropReason::invalid_reference;
+        if (reason == FrameAdmissionDropReason::deadline_miss) {
+          log_deadline_miss(
+            FrameDeadlineMissStage::reference_wait,
+            packet,
+            queue_age,
+            capture_us,
+            deadline_observation,
+            deadline,
+            access_unit_bytes,
+            0,
+            0,
+            plan_count,
+            0,
+            pacing_rate
+          );
+        }
         return drop_pre_submit_frame(packet, reason);
       }
       const auto now_us = video_monotonic_microseconds();
@@ -4574,12 +4713,17 @@ namespace lumen::lsp::runtime {
       });
       if (!admission) {
         auto reason = FrameAdmissionDropReason::other;
+        std::optional<FrameDeadlineMissStage> deadline_stage;
         switch (admission.status) {
           case media::frame_admission_status::decoder_saturated:
             reason = FrameAdmissionDropReason::decoder_saturated;
             break;
           case media::frame_admission_status::expired:
+            deadline_stage = FrameDeadlineMissStage::coarse_admission_expired;
+            reason = FrameAdmissionDropReason::deadline_miss;
+            break;
           case media::frame_admission_status::misses_deadline:
+            deadline_stage = FrameDeadlineMissStage::coarse_serialization;
             reason = FrameAdmissionDropReason::deadline_miss;
             break;
           case media::frame_admission_status::invalid_reference_path:
@@ -4589,6 +4733,22 @@ namespace lumen::lsp::runtime {
           case media::frame_admission_status::invalid_size:
           case media::frame_admission_status::invalid_pacing_rate:
             break;
+        }
+        if (deadline_stage) {
+          log_deadline_miss(
+            *deadline_stage,
+            packet,
+            queue_age,
+            capture_us,
+            now_us,
+            deadline,
+            access_unit_bytes,
+            0,
+            selected_repair_bytes,
+            plan_count,
+            admission.estimated_serialization_us,
+            pacing_rate
+          );
         }
         return drop_pre_submit_frame(packet, reason);
       }
@@ -4622,6 +4782,20 @@ namespace lumen::lsp::runtime {
                                       std::numeric_limits<std::uint64_t>::max() :
                                       (wire_bits * 1'000'000U + pacing_rate - 1U) / pacing_rate;
       if (now_us >= deadline || serialization_us > deadline - now_us) {
+        log_deadline_miss(
+          FrameDeadlineMissStage::exact_serialization,
+          packet,
+          queue_age,
+          capture_us,
+          now_us,
+          deadline,
+          access_unit_bytes,
+          complete_wire_bytes,
+          selected_repair_bytes,
+          plan_count,
+          serialization_us,
+          pacing_rate
+        );
         return drop_pre_submit_frame(packet, FrameAdmissionDropReason::deadline_miss);
       }
 
@@ -4680,6 +4854,21 @@ namespace lumen::lsp::runtime {
           return false;
         }
         if (now >= deadline) {
+          deadline_miss_drops_.fetch_add(1, std::memory_order_relaxed);
+          log_deadline_miss(
+            FrameDeadlineMissStage::packet_submission,
+            packet,
+            queue_age,
+            capture_us,
+            now,
+            deadline,
+            access_unit_bytes,
+            complete_wire_bytes,
+            selected_repair_bytes,
+            plan_count,
+            serialization_us,
+            pacing_rate
+          );
           finish_pending_frame(frame_ticket, false);
           return retire_consumed_sequences(packet_index);
         }
@@ -4987,6 +5176,8 @@ namespace lumen::lsp::runtime {
     std::atomic<std::uint64_t> decoder_saturated_drops_ {};  ///< Zero-credit frame rejections.
     std::atomic<std::uint64_t> deadline_miss_drops_ {};  ///< Deadline and serialization frame rejections.
     std::atomic<std::uint64_t> invalid_reference_drops_ {};  ///< Dependency and recovery frame rejections.
+    std::uint64_t last_deadline_diagnostic_microseconds_ {};  ///< Sender-thread rate-limit timestamp.
+    std::uint64_t suppressed_deadline_diagnostics_ {};  ///< Deadline logs suppressed since the last publication.
     std::atomic<std::uint64_t> forward_capacity_drops_ {};  ///< Queue and aggregate-path capacity rejections.
     std::atomic<std::uint64_t> submitted_wire_bytes_ {};  ///< Complete charged wire bytes.
     std::atomic<std::uint64_t> pressure_events_ {};  ///< Bounded pressure observation count.

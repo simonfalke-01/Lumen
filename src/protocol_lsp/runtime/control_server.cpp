@@ -272,6 +272,7 @@ namespace lumen::lsp::runtime {
         std::uint32_t video_generation {};  ///< Exact configured video generation.
         std::uint64_t request_id {};  ///< Random request identifier echoed by VIDEO_CONFIG_ACK.
         std::uint64_t message_id {};  ///< Reliable outbound message identifier.
+        std::uint64_t deadline_microseconds {};  ///< Original absolute configuration-response deadline.
         bool active {};  ///< Whether a matching acknowledgement remains pending.
       } pending_video;  ///< At most one pending video configuration per connection.
 
@@ -284,10 +285,18 @@ namespace lumen::lsp::runtime {
       std::array<AcceptedVideoAck, 4> accepted_video_acks {};  ///< Bounded recent ACK cache across rekeys.
       std::size_t next_video_ack_slot {};  ///< Ring slot replaced by the next accepted video ACK.
 
+      struct PendingVideoActivation {
+        VideoConfigAckPayload acknowledgement {};  ///< Validated acknowledgement awaiting semantic activation.
+        packet_slab<maximum_control_frame_bytes> frame {};  ///< Exact accepted response retained across dispatch.
+        std::uint64_t deadline_microseconds {};  ///< Original absolute configuration-response deadline.
+        bool active {};  ///< Whether `tick()` still owes the semantic callback.
+      } pending_video_activation;  ///< Receipt-ACKed video activation dispatched outside provider callbacks.
+
       struct PendingAudioConfig {
         AudioConfigPayload payload {};  ///< Exact configuration awaiting client installation.
         std::uint64_t request_id {};  ///< Random request identifier echoed by AUDIO_CONFIG_ACK.
         std::uint64_t message_id {};  ///< Reliable outbound message identifier.
+        std::uint64_t deadline_microseconds {};  ///< Original absolute configuration-response deadline.
         bool active {};  ///< Whether a matching acknowledgement remains pending.
       } pending_audio;  ///< At most one pending audio configuration per connection.
 
@@ -299,6 +308,13 @@ namespace lumen::lsp::runtime {
 
       std::array<AcceptedAudioAck, 4> accepted_audio_acks {};  ///< Bounded recent ACK cache across same-association updates.
       std::size_t next_audio_ack_slot {};  ///< Ring slot replaced by the next accepted ACK.
+
+      struct PendingAudioActivation {
+        AudioConfigAckPayload acknowledgement {};  ///< Validated acknowledgement awaiting semantic activation.
+        packet_slab<maximum_control_frame_bytes> frame {};  ///< Exact accepted response retained across dispatch.
+        std::uint64_t deadline_microseconds {};  ///< Original absolute configuration-response deadline.
+        bool active {};  ///< Whether `tick()` still owes the semantic callback.
+      } pending_audio_activation;  ///< Receipt-ACKed audio activation dispatched outside provider callbacks.
 
       struct PendingMicrophoneConfig {
         MicrophoneConfigPayload payload {};  ///< Exact configuration awaiting client installation.
@@ -1179,11 +1195,80 @@ namespace lumen::lsp::runtime {
       return send_error(connection, frame, parsed.header, message_type, ControlStatus::unsupported, now_microseconds);
     }
 
+    /** @brief Dispatch receipt-ACKed media activation and START work outside DTLS callbacks. */
     void tick(const std::uint64_t now_microseconds) noexcept {
       std::scoped_lock lock(mutex_);
       for (std::size_t index = 0; index < connections_.size();) {
         auto &connection = connections_[index];
-        if (connection.pending_microphone_activation.active) {
+        const auto configuration_receipts_ready =
+          (!connection.pending_video.active || connection.pending_video_activation.active) &&
+          (!connection.pending_audio.active || connection.pending_audio_activation.active) &&
+          !connection.pending_microphone.active;
+        if (configuration_receipts_ready && connection.pending_video_activation.active) {
+          const auto pending = connection.pending_video_activation;
+          connection.pending_video_activation = {};
+          if (!connection.authenticated_client || !connection.pending_video.active ||
+              now_microseconds >= pending.deadline_microseconds ||
+              !start_handler_.video_config_acknowledged(
+                connection.peer,
+                *connection.authenticated_client,
+                connection.generation,
+                pending.acknowledgement
+              )) {
+            const auto peer = connection.peer;
+            transport_.close(peer);
+            if (const auto remaining = find(peer); remaining != connections_.size()) {
+              connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+            }
+            continue;
+          }
+          (void) connection.outbound.acknowledge(
+            connection.pending_video.message_id,
+            0,
+            now_microseconds,
+            connection.rto
+          );
+          connection.pending_video.active = false;
+          auto &accepted = connection.accepted_video_acks[connection.next_video_ack_slot];
+          accepted.request_id = connection.pending_video.request_id;
+          std::ranges::copy(pending.frame.bytes(), accepted.frame.begin());
+          accepted.size = pending.frame.bytes().size();
+          connection.next_video_ack_slot =
+            (connection.next_video_ack_slot + 1U) % connection.accepted_video_acks.size();
+        }
+        if (configuration_receipts_ready && connection.pending_audio_activation.active) {
+          const auto pending = connection.pending_audio_activation;
+          connection.pending_audio_activation = {};
+          if (!connection.authenticated_client || !connection.pending_audio.active ||
+              now_microseconds >= pending.deadline_microseconds ||
+              !start_handler_.audio_config_acknowledged(
+                connection.peer,
+                *connection.authenticated_client,
+                connection.generation,
+                pending.acknowledgement
+              )) {
+            const auto peer = connection.peer;
+            transport_.close(peer);
+            if (const auto remaining = find(peer); remaining != connections_.size()) {
+              connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+            }
+            continue;
+          }
+          (void) connection.outbound.acknowledge(
+            connection.pending_audio.message_id,
+            0,
+            now_microseconds,
+            connection.rto
+          );
+          connection.pending_audio.active = false;
+          auto &accepted = connection.accepted_audio_acks[connection.next_audio_ack_slot];
+          accepted.request_id = connection.pending_audio.request_id;
+          std::ranges::copy(pending.frame.bytes(), accepted.frame.begin());
+          accepted.size = pending.frame.bytes().size();
+          connection.next_audio_ack_slot =
+            (connection.next_audio_ack_slot + 1U) % connection.accepted_audio_acks.size();
+        }
+        if (configuration_receipts_ready && connection.pending_microphone_activation.active) {
           const auto pending = connection.pending_microphone_activation;
           connection.pending_microphone_activation = {};
           if (!connection.authenticated_client || now_microseconds >= pending.deadline_microseconds ||
@@ -2100,6 +2185,7 @@ namespace lumen::lsp::runtime {
         .video_generation = configuration.video.video_generation,
         .request_id = request_id,
         .message_id = connection.next_message_id,
+        .deadline_microseconds = deadline,
         .active = true,
       };
       const auto message_id = connection.next_message_id++;
@@ -2110,7 +2196,7 @@ namespace lumen::lsp::runtime {
              outbound_submission_result::submitted;
     }
 
-    /** @brief Validate and commit one idempotent VIDEO_CONFIG_ACK response. */
+    /** @brief Validate, receipt-ack, and defer one idempotent VIDEO_CONFIG_ACK response. */
     bool video_config_ack(
       Connection &connection,
       const std::span<const std::uint8_t> frame,
@@ -2123,9 +2209,13 @@ namespace lumen::lsp::runtime {
         return accepted.size == frame.size() && accepted.request_id == header.request_id &&
                std::ranges::equal(std::span<const std::uint8_t> {accepted.frame}.first(accepted.size), frame);
       });
+      const auto pending_duplicate = connection.pending_video_activation.active &&
+                                     connection.pending_video.request_id == header.request_id &&
+                                     connection.pending_video_activation.frame.bytes().size() == frame.size() &&
+                                     std::ranges::equal(connection.pending_video_activation.frame.bytes(), frame);
       const auto observed = connection.inbound.observe(header.message_id);
       if (observed != receive_id_result::accepted) {
-        if (accepted_duplicate != connection.accepted_video_acks.end()) {
+        if (accepted_duplicate != connection.accepted_video_acks.end() || pending_duplicate) {
           return send_acknowledgement_only(connection);
         }
         transport_.close(connection.peer);
@@ -2142,27 +2232,19 @@ namespace lumen::lsp::runtime {
       if (!acknowledgement || acknowledgement->session_id != connection.pending_video.session_id ||
           acknowledgement->video_generation != connection.pending_video.video_generation ||
           has_flag(header.flags, lspc_flag::error_response) != (acknowledgement->status != ControlStatus::success) ||
-          !start_handler_.video_config_acknowledged(
-            connection.peer,
-            *connection.authenticated_client,
-            connection.generation,
-            *acknowledgement
-          )) {
+          connection.pending_video_activation.active) {
         transport_.close(connection.peer);
         return false;
       }
-      (void) connection.outbound.acknowledge(
-        connection.pending_video.message_id,
-        0,
-        now_microseconds,
-        connection.rto
-      );
-      connection.pending_video.active = false;
-      auto &accepted = connection.accepted_video_acks[connection.next_video_ack_slot];
-      accepted.request_id = header.request_id;
-      std::ranges::copy(frame, accepted.frame.begin());
-      accepted.size = frame.size();
-      connection.next_video_ack_slot = (connection.next_video_ack_slot + 1U) % connection.accepted_video_acks.size();
+      auto &pending = connection.pending_video_activation;
+      pending = {};
+      if (!pending.frame.assign(frame)) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      pending.acknowledgement = *acknowledgement;
+      pending.deadline_microseconds = connection.pending_video.deadline_microseconds;
+      pending.active = true;
       return send_acknowledgement_only(connection);
     }
 
@@ -2434,6 +2516,7 @@ namespace lumen::lsp::runtime {
         .payload = configuration,
         .request_id = request_id,
         .message_id = connection.next_message_id,
+        .deadline_microseconds = deadline,
         .active = true,
       };
       const auto message_id = connection.next_message_id++;
@@ -2445,7 +2528,7 @@ namespace lumen::lsp::runtime {
     }
 
     /**
-     * @brief Validate and commit one idempotent AUDIO_CONFIG_ACK response.
+     * @brief Validate, receipt-ack, and defer one idempotent AUDIO_CONFIG_ACK response.
      *
      * @param connection Authenticated connection state.
      * @param frame Complete byte-identical LSPC frame.
@@ -2466,9 +2549,13 @@ namespace lumen::lsp::runtime {
         return accepted.size == frame.size() && accepted.request_id == header.request_id &&
                std::ranges::equal(std::span<const std::uint8_t> {accepted.frame}.first(accepted.size), frame);
       });
+      const auto pending_duplicate = connection.pending_audio_activation.active &&
+                                     connection.pending_audio.request_id == header.request_id &&
+                                     connection.pending_audio_activation.frame.bytes().size() == frame.size() &&
+                                     std::ranges::equal(connection.pending_audio_activation.frame.bytes(), frame);
       const auto observed = connection.inbound.observe(header.message_id);
       if (observed != receive_id_result::accepted) {
-        if (accepted_duplicate != connection.accepted_audio_acks.end()) {
+        if (accepted_duplicate != connection.accepted_audio_acks.end() || pending_duplicate) {
           return send_acknowledgement_only(connection);
         }
         transport_.close(connection.peer);
@@ -2485,27 +2572,19 @@ namespace lumen::lsp::runtime {
       if (!acknowledgement || acknowledgement->session_id != connection.pending_audio.payload.session_id ||
           acknowledgement->audio_generation != connection.pending_audio.payload.audio.audio_generation ||
           has_flag(header.flags, lspc_flag::error_response) == (acknowledgement->status == ControlStatus::success) ||
-          !start_handler_.audio_config_acknowledged(
-            connection.peer,
-            *connection.authenticated_client,
-            connection.generation,
-            *acknowledgement
-          )) {
+          connection.pending_audio_activation.active) {
         transport_.close(connection.peer);
         return false;
       }
-      (void) connection.outbound.acknowledge(
-        connection.pending_audio.message_id,
-        0,
-        now_microseconds,
-        connection.rto
-      );
-      connection.pending_audio.active = false;
-      auto &accepted = connection.accepted_audio_acks[connection.next_audio_ack_slot];
-      accepted.request_id = header.request_id;
-      std::ranges::copy(frame, accepted.frame.begin());
-      accepted.size = frame.size();
-      connection.next_audio_ack_slot = (connection.next_audio_ack_slot + 1U) % connection.accepted_audio_acks.size();
+      auto &pending = connection.pending_audio_activation;
+      pending = {};
+      if (!pending.frame.assign(frame)) {
+        transport_.close(connection.peer);
+        return false;
+      }
+      pending.acknowledgement = *acknowledgement;
+      pending.deadline_microseconds = connection.pending_audio.deadline_microseconds;
+      pending.active = true;
       return send_acknowledgement_only(connection);
     }
 

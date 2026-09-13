@@ -3,8 +3,11 @@
  * @brief Handles launching Lumen.exe into user sessions as SYSTEM.
  */
 #define WIN32_LEAN_AND_MEAN
+#include <algorithm>
+#include <cstddef>
 #include <format>
 #include <string>
+#include <string_view>
 #include <Windows.h>
 #include <WtsApi32.h>
 
@@ -21,8 +24,56 @@ SERVICE_STATUS service_status;
 HANDLE stop_event;
 HANDLE session_change_event;
 
-constexpr auto SERVICE_NAME = "LumenService";  ///< Stable Windows service name for Lumen.
+constexpr auto DEFAULT_SERVICE_NAME = L"LumenService";  ///< Stable Windows service name for normal Lumen installations.
+constexpr auto DEFAULT_LOG_FILE_NAME = L"lumen.log";  ///< Stable service log filename for normal Lumen installations.
+constexpr std::size_t MAX_SERVICE_LOG_NAME_LENGTH = 64;  ///< Maximum normalized alternate service name stored in its log filename.
 constexpr auto LUMEN_EXECUTABLE = L"Lumen.exe";  ///< Executable name published by current packages.
+
+/**
+ * @brief Check whether a service-name character is safe in a Windows filename.
+ *
+ * @param character The service-name character to inspect.
+ * @return `true` when the character is an ASCII letter, digit, hyphen, or underscore.
+ */
+bool IsSafeServiceLogCharacter(wchar_t character) {
+  return (character >= L'a' && character <= L'z') ||
+         (character >= L'A' && character <= L'Z') ||
+         (character >= L'0' && character <= L'9') ||
+         character == L'-' ||
+         character == L'_';
+}
+
+/**
+ * @brief Build the service wrapper's log filename.
+ *
+ * The installed `LumenService` retains the historical `lumen.log` filename.
+ * Alternate SCM services receive a bounded filename derived from their actual
+ * service name so they cannot truncate or share the installed service's log.
+ * Characters that are unsafe or ambiguous in Windows filenames are replaced.
+ *
+ * @param service_name Actual service name supplied by the Service Control Manager.
+ * @return The filename to create inside the system temporary directory.
+ */
+std::wstring BuildServiceLogFileName(std::wstring_view service_name) {
+  if (service_name == DEFAULT_SERVICE_NAME) {
+    return DEFAULT_LOG_FILE_NAME;
+  }
+
+  std::wstring normalized_name;
+  normalized_name.reserve(std::min(service_name.size(), MAX_SERVICE_LOG_NAME_LENGTH));
+  for (const auto character : service_name) {
+    if (normalized_name.size() == MAX_SERVICE_LOG_NAME_LENGTH) {
+      break;
+    }
+    normalized_name.push_back(IsSafeServiceLogCharacter(character) ? character : L'_');
+  }
+
+  if (normalized_name.empty()) {
+    normalized_name = L"service";
+  }
+
+  return std::format(L"lumen-{}.log", normalized_name);
+}
 
 /**
  * @brief Resolve the Lumen host executable without crossing product identity.
@@ -133,12 +184,22 @@ HANDLE DuplicateTokenForSession(DWORD console_session_id) {
   return new_token;
 }
 
-HANDLE OpenLogFileHandle() {
+/**
+ * @brief Open the inheritable service output log for the active SCM service.
+ *
+ * @param service_name Actual service name supplied by the Service Control Manager.
+ * @return An inheritable log handle, or `INVALID_HANDLE_VALUE` on failure.
+ */
+HANDLE OpenLogFileHandle(std::wstring_view service_name) {
   WCHAR log_file_name[MAX_PATH];
 
-  // Create lumen.log in the Temp folder (usually %SYSTEMROOT%\Temp)
-  GetTempPathW(_countof(log_file_name), log_file_name);
-  wcscat_s(log_file_name, L"lumen.log");
+  // Create the service-specific log in the Temp folder (usually %SYSTEMROOT%\Temp).
+  const auto temp_path_length = GetTempPathW(_countof(log_file_name), log_file_name);
+  const auto service_log_file_name = BuildServiceLogFileName(service_name);
+  if (temp_path_length == 0 || temp_path_length >= _countof(log_file_name) || wcscat_s(log_file_name, service_log_file_name.c_str()) != 0) {
+    SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    return INVALID_HANDLE_VALUE;
+  }
 
   // Preserve previous service output before opening the current log.
   logging::rotate_log_file(log_file_name);
@@ -146,7 +207,7 @@ HANDLE OpenLogFileHandle() {
   // The file handle must be inheritable for our child process to use it
   SECURITY_ATTRIBUTES security_attributes = {sizeof(security_attributes), nullptr, TRUE};
 
-  // Create the current lumen.log
+  // Create the current service-specific log.
   return CreateFileW(log_file_name, GENERIC_WRITE, FILE_SHARE_READ, &security_attributes, CREATE_ALWAYS, 0, nullptr);
 }
 
@@ -186,8 +247,15 @@ bool RunTerminationHelper(HANDLE console_token, DWORD pid) {
   return exit_code == 0;
 }
 
-VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
-  service_status_handle = RegisterServiceCtrlHandlerEx(SERVICE_NAME, HandlerEx, nullptr);
+/**
+ * @brief Run the Lumen service wrapper under the SCM-provided service identity.
+ *
+ * @param argc Number of service arguments supplied by the Service Control Manager.
+ * @param argv Service name followed by any registered service arguments.
+ */
+VOID WINAPI ServiceMain(DWORD argc, LPWSTR *argv) {
+  const std::wstring service_name = argc > 0 && argv != nullptr && argv[0] != nullptr && argv[0][0] != L'\0' ? argv[0] : DEFAULT_SERVICE_NAME;
+  service_status_handle = RegisterServiceCtrlHandlerExW(service_name.c_str(), HandlerEx, nullptr);
   if (service_status_handle == nullptr) {
     // Nothing we can really do here but terminate ourselves
     ExitProcess(GetLastError());
@@ -224,7 +292,7 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     return;
   }
 
-  auto log_file_handle = OpenLogFileHandle();
+  auto log_file_handle = OpenLogFileHandle(service_name);
   if (log_file_handle == INVALID_HANDLE_VALUE) {
     // Tell SCM we failed to start
     service_status.dwWin32ExitCode = GetLastError();
@@ -366,8 +434,8 @@ int DoGracefulTermination(DWORD pid) {
 }
 
 int main(int argc, char *argv[]) {
-  static const SERVICE_TABLE_ENTRY service_table[] = {
-    {(LPSTR) SERVICE_NAME, ServiceMain},
+  static const SERVICE_TABLE_ENTRYW service_table[] = {
+    {const_cast<LPWSTR>(DEFAULT_SERVICE_NAME), ServiceMain},
     {nullptr, nullptr}
   };
 
@@ -390,5 +458,5 @@ int main(int argc, char *argv[]) {
   SetCurrentDirectoryW(module_path);
 
   // Trigger our ServiceMain()
-  return StartServiceCtrlDispatcher(service_table);
+  return StartServiceCtrlDispatcherW(service_table);
 }

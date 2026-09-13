@@ -43,7 +43,7 @@ contracts.
 
 ## 0. Implementation status
 
-Last updated: 2026-09-12. This table is the durable progress ledger for the
+Last updated: 2026-09-13. This table is the durable progress ledger for the
 rewrite. A row moves to **Done** only after the named implementation and its
 smallest decisive verification both pass. Source-only scaffolding remains
 **In progress** until the real product boundary works.
@@ -688,6 +688,59 @@ LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorize
 
 ### September 13 input, readable statistics, and stutter follow-up
 
+Latest live correction (19:31, supersedes earlier input-cause hypotheses below):
+
+- [x] Confirm the installed Lumen Virtual HID driver is healthy. LSP startup
+  rejected its exclusive claim with ERROR_BUSY (170); the idle legacy service
+  already owned it. LSP therefore used SendInput, not Virtual HID. Desktop
+  binding and SYSTEM launch changes did not resolve that ownership conflict.
+- [x] Release the idle legacy owner's claim, restart LSP, and confirm its real
+  startup log selects `Lumen Virtual HID`, then restore the legacy listener.
+  Both services run; Counter-Strike PID 24052 is preserved. This is a temporary
+  ownership-order correction, not a permanent multi-service lifecycle fix.
+- [ ] Acquire Virtual HID only for active input sessions, release on the last
+  legacy/LSP session, and retry acquisition for a later session. Recheck actual
+  keyboard and relative-mouse input; working left clicks alone are insufficient.
+- [x] Install the numeric Bonjour endpoint fix through the canonical signed Mac
+  app. The resolved host remains 192.168.1.236 and real LSP video starts.
+- [ ] Fix the remaining stutter/artifacts: the live sample has 7,652 admitted
+  frames, 33 deadline drops and 159 invalid-reference drops, with zero reported
+  video network loss, decoder-saturation drops, or forward-capacity drops.
+  Client offers a fixed two-frame capture budget (16,666 us at 120 Hz); establish
+  the exact deadline subcase before changing this policy.
+- [x] Capture the exact deadline trigger in the live Windows sender: encoding
+  alone spikes to 16.7–24.7 ms, while other misses combine 8.8–15.7 ms encoding
+  with 5–8 ms paced serialization. Encoder-egress queue age is only 13–31 us.
+  The fixed 16,666 us adaptive ceiling rejects these frames and starts recovery.
+- [ ] Deploy the adaptive 50 ms admission ceiling (no added playback delay),
+  and suppress redundant pending reference invalidations, then recheck the
+  user's 0.1–1 s low-FPS/artifact bursts. Mac product build passes; Windows
+  video/control build is running. No resolution/FPS/bitrate reduction is used.
+- [x] Build the Windows video recovery/control update successfully. It defers
+  media activation until all configuration receipts are ACKed, and avoids
+  re-invalidating dependent frames already covered by an outstanding NVENC
+  invalidation. Live deployment and before/after counters are the next check.
+- [x] Deploy video/control host SHA256
+  `5113668E3F69A5EEAC5CB9745B04FA89F9B8659ABD78E50529B7AE08A2451BDA`
+  and the signed adaptive-budget client. The first two client launches failed
+  their initial BSD UDP write with EPIPE before the host received any packet.
+  A complete-bundle replacement plus increasing first-write startup grace from
+  20 to 200 ms restored the actual LaunchServices-launched stream at 19:52.
+  This combined change does not isolate the exact socket-policy cause or prove
+  universal permission/relaunch recovery; no permission records were reset.
+- [x] Observe the first updated live sample: 3,480 sent frames, zero host frame
+  drops/deadline misses/invalid-reference drops, and zero reconnect attempts.
+  Client receive-to-decoder-submit p99 181 us, decoder p99 1,584 us, and Metal
+  enqueue-to-commit p99 151 us. Retain physical gameplay confirmation as pending;
+  these counters are not proof that every perceptible stutter is gone.
+- [ ] Finish/deploy active-session-only Virtual HID ownership. The source and
+  focused regressions are written/formatted, but the Windows rebuild is paused
+  to remove compiler contention from the user's gameplay check. Current live
+  host still uses the verified service-order ownership correction.
+- [ ] Fix unacknowledged control responses 0x0211/0x0213 observed in the real
+  media association; the current client recovered with ATTACH but this still
+  causes an avoidable interruption.
+
 - [x] The unchanged installed GUI PID 26591 authenticated again at 15:24:38
   through its automatic retry. No app/host restart or further deployment by the
   agent caused that recovery; the exact reason the earlier local rejection
@@ -766,6 +819,39 @@ LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorize
   binary produced PID 26726 and the same errors; it did not resolve the issue.
   The 17:01:51 trust-file update belongs to the terminal diagnostic, not a GUI
   recovery. Do not mark this host Ready based only on the terminal or Moonlight.
+
+### GUI recovery verified; Windows input/media deployment resumed
+
+- [x] Complete the authorized network-helper restart without changing permission
+  records or restarting the Mac. It did not resolve the GUI failure by itself;
+  the prior macOS-only causal explanation was not established.
+- [x] Correct client first-send ordering: keep a bounded startup grace after
+  UDP connection setup before sending ClientHello, and bound first-datagram
+  retries. The live error preceded the helper's allowed result; this is a
+  client connection-handling fix, not a permission bypass or alternate transport.
+- [x] Separate short background readiness probes from full browsing recovery.
+  Cached APPLICATIONS and fresh DTLS setup use one-second limits, with no
+  repeated network-failure authentication inside a probe. Existing trusted-pin
+  rotation fallback remains available on a pin mismatch. Exact-session and
+  trust comparisons protect concurrent stream ownership and newer trust.
+- [x] Verify the final installed build through GUI-only cold starts at
+  17:52:58 and 17:55:34. Then stop and restore only the idle LSP listener:
+  the same GUI PID 68529 authenticated again at 17:56:17, without being reopened.
+  Its UDP peer port changed, confirming a new association. No terminal catalog
+  request was used to create these trust-file updates. Installed legacy Lumen
+  remained PID 12356 throughout the listener-return checks.
+- [x] Fix the isolated launcher's orphan behavior using the production service's
+  kill-on-job-close supervision pattern. Old isolated PIDs 4356 and 23504 were
+  resolved and stopped; no legacy process or pairing data was removed. The
+  following stop/start check succeeded through the scheduled task alone.
+- [x] Sign and commit the accumulated source milestones: Lumen `a7f11479`,
+  Umbra `1b46f29`. These commits do not claim Windows live qualification complete.
+- [ ] Finish the resumed two-job, below-normal-priority Windows build and deploy
+  only the isolated host. Deployment now refuses an active LSP media session and
+  restores normal task priority for the host. The installed legacy service is
+  independently active; a Moonlight connection was recorded at 18:07:21.
+- [ ] Run actual keyboard/mouse and stutter verification with the updated host.
+  Do not start a competing video stream while the user is gaming in Moonlight.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
