@@ -690,6 +690,11 @@ LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorize
 
 Latest live correction (19:31, supersedes earlier input-cause hypotheses below):
 
+- [x] User confirms the stuttering is fixed in the updated live LSP session.
+  This closes the reported recurring low-FPS/heavy-artifact burst for the
+  current configuration. Leave the running session unchanged; keyboard/mouse
+  confirmation and durable cross-service Virtual HID ownership remain pending.
+
 - [x] Confirm the installed Lumen Virtual HID driver is healthy. LSP startup
   rejected its exclusive claim with ERROR_BUSY (170); the idle legacy service
   already owned it. LSP therefore used SendInput, not Virtual HID. Desktop
@@ -712,10 +717,10 @@ Latest live correction (19:31, supersedes earlier input-cause hypotheses below):
   alone spikes to 16.7–24.7 ms, while other misses combine 8.8–15.7 ms encoding
   with 5–8 ms paced serialization. Encoder-egress queue age is only 13–31 us.
   The fixed 16,666 us adaptive ceiling rejects these frames and starts recovery.
-- [ ] Deploy the adaptive 50 ms admission ceiling (no added playback delay),
-  and suppress redundant pending reference invalidations, then recheck the
-  user's 0.1–1 s low-FPS/artifact bursts. Mac product build passes; Windows
-  video/control build is running. No resolution/FPS/bitrate reduction is used.
+- [x] Deploy the adaptive 50 ms admission ceiling (no added playback delay)
+  and suppress redundant pending reference invalidations. Both product builds
+  pass and are installed; the user confirms the 0.1–1 s low-FPS/artifact bursts
+  are fixed. No resolution/FPS/bitrate reduction is used.
 - [x] Build the Windows video recovery/control update successfully. It defers
   media activation until all configuration receipts are ACKed, and avoids
   re-invalidating dependent frames already covered by an outstanding NVENC
