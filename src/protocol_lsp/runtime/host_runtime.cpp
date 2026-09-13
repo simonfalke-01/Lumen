@@ -116,6 +116,7 @@ namespace lumen::lsp::runtime {
   namespace {
     constexpr std::size_t runtime_receive_batch = 64;
     constexpr std::uint32_t runtime_poll_milliseconds = 2;
+    constexpr std::uint64_t authenticated_receive_inactivity_microseconds = 3U * 1'000'000U;  ///< Three missed authenticated report intervals.
     constexpr std::uint64_t attach_grace_microseconds = 10U * 1'000'000U;
     constexpr std::uint64_t attach_readiness_deadline_microseconds = 3U * 1'000'000U;
     constexpr std::uint64_t compound_rtcp_freshness_microseconds = 5U * 1'000'000U;
@@ -886,6 +887,8 @@ namespace lumen::lsp::runtime {
           (void) proc::proc.terminate_lsp_generation(active_process_generation_);
           active_process_generation_ = 0;
         }
+        active_association_peer_ = {};
+        active_association_generation_ = 0;
         audio = std::move(audio_runtime_);
         video = std::move(video_runtime_);
         microphone = std::move(microphone_runtime_);
@@ -1329,10 +1332,25 @@ namespace lumen::lsp::runtime {
       std::atomic<std::uint8_t> lifetime_event {};  ///< Zero, soft, or hard pending lifecycle action.
       std::atomic<bool> planned_lifetime_latched {};  ///< One planned rekey per association.
       std::atomic<bool> hard_lifetime_latched {};  ///< Permanent fail-closed association protection fence.
+      std::atomic<std::uint64_t> last_authenticated_receive_microseconds {};  ///< Latest validated DTLS/SRTP ingress.
       std::mutex dtls_mutex;  ///< Serializes DTLS records through one completion-ordered path fence.
       std::condition_variable dtls_condition;  ///< Wakes the record producer after terminal submission.
       HostForwardCompletion dtls_completion {HostForwardCompletion::fatal};  ///< Latest fenced record disposition.
       bool dtls_in_flight {};  ///< Whether one record owns the ordering fence.
+
+      /**
+       * @brief Advance authenticated receive activity without regressing its monotonic timestamp.
+       *
+       * @note Called only by the socket owner, or before the generation is published.
+       *
+       * @param received_at_microseconds Validated packet receive time.
+       */
+      void record_authenticated_receive(const std::uint64_t received_at_microseconds) noexcept {
+        const auto previous = last_authenticated_receive_microseconds.load(std::memory_order_relaxed);
+        if (received_at_microseconds > previous) {
+          last_authenticated_receive_microseconds.store(received_at_microseconds, std::memory_order_relaxed);
+        }
+      }
 
       /** @brief Close and join the callback source before generation storage is destroyed. */
       ~ForwardPathGeneration() {
@@ -1823,6 +1841,7 @@ namespace lumen::lsp::runtime {
       owner->runtime = this;
       owner->peer = peer;
       owner->generation = generation;
+      owner->record_authenticated_receive(monotonic_microseconds());
       {
         std::scoped_lock lock(forward_path_mutex_);
         const auto free = std::ranges::find(forward_paths_, nullptr);
@@ -2098,10 +2117,9 @@ namespace lumen::lsp::runtime {
         return std::unexpected(ControlStatus::malformed);
       }
       const auto process_state = proc::proc.lsp_process_state();
-      if ((request.resume &&
-           (!process_state.running || !process_state.lsp_owned ||
-            process_state.application_id != numeric_application_id || process_state.process_generation == 0)) ||
-          (!request.resume && process_state.running)) {
+      if (process_state.running &&
+          (!process_state.lsp_owned || process_state.application_id != numeric_application_id ||
+           process_state.process_generation == 0)) {
         return std::unexpected(ControlStatus::busy);
       }
       const auto competition_capacity = static_cast<std::uint64_t>(config_.host.competition_capacity_mbps) * 1'000'000ULL;
@@ -2266,13 +2284,15 @@ namespace lumen::lsp::runtime {
   #endif
         std::uint64_t process_generation = 0;
         bool process_started_by_request = false;
-        if (request.resume) {
-          const auto resumed = proc::proc.lsp_process_state();
-          if (!resumed.running || !resumed.lsp_owned || resumed.application_id != numeric_application_id ||
-              resumed.process_generation == 0) {
+        // The authenticated host process snapshot is authoritative. A client's
+        // resume bit can be stale between APPLICATIONS and this START.
+        const auto selected_process = proc::proc.lsp_process_state();
+        if (selected_process.running) {
+          if (!selected_process.lsp_owned || selected_process.application_id != numeric_application_id ||
+              selected_process.process_generation == 0) {
             return std::unexpected(ControlStatus::busy);
           }
-          process_generation = resumed.process_generation;
+          process_generation = selected_process.process_generation;
         } else {
           const proc::lsp_launch_request_t launch_request {
             .width = static_cast<int>(offer.width),
@@ -3283,6 +3303,8 @@ namespace lumen::lsp::runtime {
           active_process_generation_ = 0;
         }
         active_client_.reset();
+        active_association_peer_ = {};
+        active_association_generation_ = 0;
         active_application_id_.clear();
         active_audio_configuration_.reset();
         active_video_configuration_.reset();
@@ -3656,6 +3678,11 @@ namespace lumen::lsp::runtime {
       }
       retain_preflighted_session_ssrcs(assigned_ssrc_span);
       active_client_ = authority_client;
+      active_association_peer_ = peer;
+      active_association_generation_ = connection_generation;
+      // Cold encoder preparation can outlast an idle interval. Arm the stream
+      // lease at authenticated START commit, not at the earlier request receipt.
+      forward->record_authenticated_receive(monotonic_microseconds());
       active_process_generation_ = video_selection->process_generation;
       active_application_id_ = request.application_id;
       active_rates_ = {
@@ -4074,6 +4101,9 @@ namespace lumen::lsp::runtime {
       retain_preflighted_session_ssrcs(assigned_ssrc_span);
       const auto snapshot = authority_.snapshot();
       active_client_ = authority_client;
+      active_association_peer_ = peer;
+      active_association_generation_ = snapshot.generations.connection;
+      forward->record_authenticated_receive(monotonic_microseconds());
       ssrc_registry_ = std::move(*registry);
       active_audio_configuration_ = AudioConfigPayload {
         .session_id = snapshot.session_id,
@@ -4452,6 +4482,8 @@ namespace lumen::lsp::runtime {
                           proc::proc.terminate_lsp_generation(active_process_generation_);
         active_process_generation_ = 0;
         active_client_.reset();
+        active_association_peer_ = {};
+        active_association_generation_ = 0;
         active_application_id_.clear();
         active_audio_configuration_.reset();
         active_video_configuration_.reset();
@@ -4691,6 +4723,7 @@ namespace lumen::lsp::runtime {
         process_pending_video_retirements();
         process_pending_microphone_retirements();
         process_failed_forward_paths();
+        process_authenticated_receive_inactivity(now);
         process_pending_association_closes();
         process_audio_failure();
         process_video_failure();
@@ -4703,6 +4736,37 @@ namespace lumen::lsp::runtime {
         (void) dtls_->release_owner_thread();
       }
       active_ = false;
+    }
+
+    /**
+     * @brief Close only the authoritative generation after three missed authenticated report intervals.
+     *
+     * @param now_microseconds Current socket-owner monotonic time.
+     */
+    void process_authenticated_receive_inactivity(const std::uint64_t now_microseconds) noexcept {
+      std::optional<PeerEndpoint> expired_peer;
+      {
+        std::scoped_lock lock(session_mutex_);
+        const auto snapshot = authority_.snapshot();
+        if (snapshot.state != SessionState::streaming || !active_association_peer_.valid() ||
+            active_association_generation_ == 0 ||
+            snapshot.generations.connection != active_association_generation_) {
+          return;
+        }
+        const auto owner = find_forward_path(active_association_peer_);
+        if (!owner || owner->generation != active_association_generation_) {
+          return;
+        }
+        const auto last_receive = owner->last_authenticated_receive_microseconds.load(std::memory_order_relaxed);
+        if (last_receive == 0 || now_microseconds < last_receive ||
+            now_microseconds - last_receive < authenticated_receive_inactivity_microseconds) {
+          return;
+        }
+        expired_peer = active_association_peer_;
+      }
+      if (expired_peer) {
+        (void) queue_association_close(*expired_peer);
+      }
     }
 
     void refresh_dtls_timer(const PeerEndpoint &peer, const std::uint64_t now_microseconds) noexcept {
@@ -4961,6 +5025,8 @@ namespace lumen::lsp::runtime {
             active_process_generation_ = 0;
           }
           active_client_.reset();
+          active_association_peer_ = {};
+          active_association_generation_ = 0;
           active_application_id_.clear();
           active_audio_configuration_.reset();
           active_video_configuration_.reset();
@@ -5009,6 +5075,8 @@ namespace lumen::lsp::runtime {
         session_start_available_.store(true, std::memory_order_release);
         active_process_generation_ = 0;
         active_client_.reset();
+        active_association_peer_ = {};
+        active_association_generation_ = 0;
         active_application_id_.clear();
         active_audio_configuration_.reset();
         active_video_configuration_.reset();
@@ -5164,10 +5232,14 @@ namespace lumen::lsp::runtime {
       const std::span<const std::uint8_t> plaintext
     ) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
+      const auto received_at_microseconds = monotonic_microseconds();
+      if (const auto forward = runtime.find_forward_path(peer)) {
+        forward->record_authenticated_receive(received_at_microseconds);
+      }
       return runtime.control_ && runtime.control_->receive(
                                    peer,
                                    plaintext,
-                                   monotonic_microseconds(),
+                                   received_at_microseconds,
                                    utc_seconds()
                                  );
     }
@@ -5275,6 +5347,10 @@ namespace lumen::lsp::runtime {
 
     static void association_closed_callback(void *context, const PeerEndpoint &peer) noexcept {
       auto &runtime = *static_cast<ProductHostRuntime *>(context);
+      const auto closed_generation = [&]() noexcept {
+        const auto forward = runtime.find_forward_path(peer);
+        return forward ? forward->generation : 0U;
+      }();
       runtime.forget_authenticated_peer(peer);
       std::unique_ptr<ActiveAudioRuntime> audio;
       std::unique_ptr<ActiveVideoRuntime> video;
@@ -5284,18 +5360,21 @@ namespace lumen::lsp::runtime {
         if (runtime.pending_inbound_path_probe_.active && runtime.pending_inbound_path_probe_.peer == peer) {
           runtime.pending_inbound_path_probe_ = {};
         }
-        if (runtime.input_owner_) {
-          const auto mapping = runtime.input_owner_->mapping();
-          if (mapping && mapping->peer == peer) {
-            (void) runtime.authority_.transport_lost(mapping->connection_generation);
-            runtime.session_start_available_.store(false, std::memory_order_release);
-            runtime.detached_deadline_microseconds_ = monotonic_microseconds() + attach_grace_microseconds;
-            runtime.ssrc_registry_.reset();
-            runtime.active_client_.reset();
-            runtime.record_reconnect_failed();
-            runtime.queue_all_retiring_attach_peers();
-            runtime.video_start_pending_ = false;
-          }
+        const auto snapshot = runtime.authority_.snapshot();
+        if (snapshot.state == SessionState::streaming && runtime.active_association_peer_ == peer &&
+            runtime.active_association_generation_ != 0 &&
+            runtime.active_association_generation_ == closed_generation &&
+            runtime.active_association_generation_ == snapshot.generations.connection &&
+            runtime.authority_.transport_lost(runtime.active_association_generation_) == AuthorityResult::accepted) {
+          runtime.active_association_peer_ = {};
+          runtime.active_association_generation_ = 0;
+          runtime.session_start_available_.store(false, std::memory_order_release);
+          runtime.detached_deadline_microseconds_ = monotonic_microseconds() + attach_grace_microseconds;
+          runtime.ssrc_registry_.reset();
+          runtime.active_client_.reset();
+          runtime.record_reconnect_failed();
+          runtime.queue_all_retiring_attach_peers();
+          runtime.video_start_pending_ = false;
         }
         if (runtime.audio_runtime_ && runtime.audio_runtime_->peer == peer) {
           audio = std::move(runtime.audio_runtime_);
@@ -5339,6 +5418,11 @@ namespace lumen::lsp::runtime {
       const auto forward = runtime.find_forward_path(peer);
       if (forward && forward->hard_lifetime_latched.load(std::memory_order_acquire)) {
         return false;
+      }
+      if (forward) {
+        forward->record_authenticated_receive(
+          received_at_microseconds != 0 ? received_at_microseconds : monotonic_microseconds()
+        );
       }
       if (packet_class == SecurePacketClass::rtcp && plaintext.size() >= 12U &&
           std::ranges::equal(transport::lspv_app_name, plaintext.subspan<8, 4>())) {
@@ -5580,6 +5664,8 @@ namespace lumen::lsp::runtime {
     std::unique_ptr<HostService> service_;  ///< RFC 7983 dispatcher and socket activation guard.
     SessionAuthority authority_;  ///< START/baseline/disconnect input authority state.
     std::optional<AuthenticatedClient> active_client_;  ///< Current input session owner.
+    PeerEndpoint active_association_peer_ {};  ///< Exact DTLS/SRTP five-tuple owning stream authority.
+    std::uint32_t active_association_generation_ {};  ///< Exact connection generation owning the active five-tuple.
     std::string active_application_id_;  ///< Stable application ID owned by the active session.
     std::optional<SsrcRegistry> ssrc_registry_;  ///< Authenticated input SSRC mapping.
     std::optional<AudioConfigPayload> active_audio_configuration_;  ///< Selected or rekeyed audio tuple awaiting/holding ACK.

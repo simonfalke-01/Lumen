@@ -596,6 +596,88 @@ the objective. The installed host is still not a test target.
   permission toggle is needed. No stream start, trust reset, or service restart
   was performed.
 
+### Desktop-click recovery — deployed, live stability still being checked
+
+On September 13 the user ended the gaming restriction and authorized Windows
+builds, deployment, and live testing. The installed legacy service and its
+configuration remain preserved; all host runtime changes below use the isolated
+LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorized.
+
+- [x] Implement host-side authenticated receive inactivity detection (three
+  report intervals) fenced to the exact owning peer/connection generation.
+  Reuse neutralization, the existing ten-second ATTACH grace, and deferred
+  retirement. Closing an association no longer depends on an input mapping
+  that might already have been neutralized. An orphan cannot own streaming
+  authority indefinitely. The initial local LSP-enabled translation-unit
+  compilation and formatting checks passed. Final source also arms the lease
+  at authenticated START/ATTACH commit so cold encoder preparation cannot
+  consume the first receive interval. Windows/UCRT64 build and isolated
+  deployment passed; executable SHA256 is
+  `66F4DA4BB9F59B14C0EABE17D51523B02BC4AB1D3EDA4181ADE975CB7177694E`.
+  After the failing 14:09 stream ended at 14:10:22, host capture stopped at
+  14:10:25 without restarting Lumen.
+- [x] Implement host START selection from actual current process state,
+  accepting stale launch/resume hints for the same LSP-owned application while
+  preserving unrelated applications and legacy-owned processes.
+- [x] Implement client retirement/re-authentication of failed browse-only
+  sessions, protecting pending/active input and the shared renderer. Desktop
+  startup refreshes the catalog through a bounded recovery window, derives
+  launch/resume from the host, and retries START only after definite `busy`
+  rejection. Ambiguous START timeouts are not replayed as new launches.
+- [x] Implement same-app active-stream window reuse; clicking Desktop again
+  focuses the existing window or waits for its current close operation rather
+  than creating a competing stream. Pending first-frame presentation stays
+  hidden until the renderer publishes normally.
+- [x] Four focused client recovery-policy tests and the first-renderer-commit
+  window regression pass. Affected client/host builds pass and are installed.
+  Real LaunchServices streams accepted stale `--resume` requests against a
+  stopped Desktop at 14:03, 14:09, and 14:48 without a host restart.
+- [x] Isolated scheduled task now uses a guarded hidden launcher and no task
+  execution limit. Closing an incidental console cannot terminate this test
+  listener. Installed legacy Lumen PID 10964 is unchanged.
+- [x] Persist Bonjour SRV hostname rather than a transient scoped IPv6 address.
+  Current discovery saves `simon.local.` and resolves it on connection.
+- [x] Fix native decode-credit comparison and Swift decode/Metal commit ordering.
+  The old code rejected legitimate retained-frame reservations and allowed a
+  Metal commit to race ahead of decode reporting. Native credits remain
+  ledger-owned; callbacks are fenced to the active video generation.
+  The installed fix streamed from 14:48:13 to normal STOP at 14:50:15, past the
+  previous 25-second failure, with no `invalidConfiguration` termination.
+  The last live snapshot had 95,915 received datagrams, two drops, zero
+  authentication failures, and real audio decode/enqueue samples.
+- [x] Defer GUI-routed CLI stream resolution until application initialization
+  completes. Retry one failed initial browse authentication after one second,
+  only with no installed association/input owner. First DTLS send at 14:48:11
+  failed with errno 65 (`EHOSTUNREACH`); bounded retry accepted START at
+  14:48:12 and renderer commit at 14:48:13. This establishes recovery for that
+  live failure, not the cause of every historical permission/route denial.
+- [x] Implement and render-check the compact performance overlay. The old grid
+  displayed only legacy measurements despite live LSP telemetry. Source now
+  shows LSP timing/packet rows in 10-point monospace without a background box,
+  and forwards actual decoder statistics while reading the real renderer.
+  Eleven focused presenter/overlay/bootstrap checks pass. The existing native
+  snapshot test renders the text-only view, including increased contrast and
+  narrow containment. Installed app includes the changes; post-update live
+  values remain blocked by the renewed connection failure below.
+- [x] Try the next resolved address when the real initial ClientHello reports
+  a route error after successful UDP `connect()`. Each candidate uses a fresh
+  DTLS association and the unchanged expected SPKI. No authentication error
+  permits fallback. Live 15:04 logs demonstrate IPv6 fallback to IPv4; both
+  paths currently fail before authentication (errno 65, then 32).
+  `SO_NOSIGPIPE` now preserves the GUI's ability to report a rejected send.
+- [ ] Resolve the current post-update GUI network denial. Regular installed
+  GUI PID 26591 remains unable to authenticate; macOS reports `Local network
+  prohibited`. No successful authentication occurred after 14:48:12. The
+  Little Snitch extension is active, but that alone does not establish whether
+  filtering is enabled or causing the denial. Its supported preference read
+  requires root. No new permission toggle, filter bypass, private-state edit,
+  or Mac reboot was performed. Do not mistake earlier short-stream success
+  for current reachability.
+- [ ] Deliberately terminate one exact test client and immediately relaunch to
+  verify orphan recovery. Prior client exits were not intentional crash tests.
+- [ ] Repeat sustained gameplay, physical input, picture-quality and latency
+  verification; short Desktop streams are not production qualification.
+
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
 hash guard, and the isolated scheduled task is stopped. Installed Lumen remains
