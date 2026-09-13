@@ -690,6 +690,65 @@ LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorize
 
 Latest live correction (19:31, supersedes earlier input-cause hypotheses below):
 
+- [ ] New AWDL requirement supersedes the per-stream administrator prompt:
+  authorize once during setup, then use a narrowly restricted authenticated
+  privileged helper without stream/reconnect/stop elevation. The bundled
+  SMAppService/XPC replacement is in progress; preserve signing continuity.
+- [x] Build, sign, install, and reopen the once-approval AWDL replacement.
+  A bundled SMAppService daemon exposes only status/acquire/release for awdl0,
+  authenticates every XPC message by audit-token-derived code identity and
+  signing team, and restores through connection invalidation/recovery state.
+  No stream path invokes registration, osascript, or administrator elevation.
+  App/helper builds, 3 lifecycle regressions, and 9 package checks pass.
+- [ ] Complete the user-controlled one-time `AWDL helper → Set Up…` approval
+  in Advanced settings and live-prove disable/restore over repeated streams.
+  The installed implementation must not claim privileged operation before
+  macOS reports that helper approval is enabled.
+- [x] Diagnose the later generic media-negotiation failure: the client was set
+  to Competition LAN with a 1,000 Mbps ceiling while the host remained Adaptive.
+  The exact host profile comparison rejects that mismatch before media startup.
+  Restore the client's previously working Adaptive profile and reopen Umbra;
+  retain its other settings and the host configuration. This is not a codec fix.
+- [ ] Live-verify the pending microphone receiver correction. The earlier
+  microphone-enabled session decoded only six packets and rejected 1,380 while
+  producing silence. Source now honors authenticated RTP discontinuity markers,
+  but initial backlog/timeline recovery and real host microphone audio remain
+  unverified. Do not label microphone forwarding fully functional yet.
+
+- [ ] User-requested client updates while live testing remains undisturbed:
+  replace routine streaming warning dialogs with nonmodal state, remove
+  reconnect-success dialogs and rate-retry popup spam, add a real persisted
+  microphone device selector, and add an explicit AWDL-during-streaming option
+  with truthful interface state and restoration. Warning routing is edited and
+  parses; device/AWDL integration is in progress. No client/host restart is
+  authorized by this checkpoint while the user tests the existing session.
+- [x] After the user's explicit restart authorization, install/reopen the
+  client with persisted microphone selection and nonblocking warning routing.
+  Selected CoreAudio UID is applied before AudioQueue start and propagated to
+  legacy/LSP capture, including reconnect. Two targeted warning/terminal-error
+  regressions pass. No Windows/game restart was used for these UI updates.
+- [x] Install the Advanced AWDL option and actual read-only interface state.
+  It is opt-in (default off), requests administrator consent at stream start,
+  and uses a scoped per-session watchdog for disable/restoration after stop or
+  app exit. Four focused lifecycle/race regressions and the product build pass.
+- [ ] Live-test the privileged AWDL change after the user enables the option
+  and approves the macOS prompt. No successful interface-change claim is made
+  from the unit tests or checkbox state alone.
+
+- [x] Correct Umbra's missing microphone signing capability: the hardened-runtime
+  app had no entitlements. Add `com.apple.security.device.audio-input` to the
+  canonical signing plist and every package-signing path; reject packages that
+  omit it. The two focused packaging regressions pass and the installed signed
+  app contains the entitlement. Its live startup now passes the Mac microphone
+  authorization/capture-availability checks.
+- [x] Enable microphone permission only for the existing Umbra client (mask 87
+  to 95, revocation generation 8), and opt in to `client_microphone` only in
+  the isolated LSP host configuration. Preserve the legacy host configuration.
+  Existing VB-Audio CABLE input/output endpoints are installed and healthy.
+- [ ] Verify microphone RTP reception, Opus decode, virtual-cable injection,
+  and host application recording; successful macOS consent alone is not proof
+  of end-to-end microphone audio.
+
 - [x] User confirms the stuttering is fixed in the updated live LSP session.
   This closes the reported recurring low-FPS/heavy-artifact burst for the
   current configuration. Leave the running session unchanged; keyboard/mouse
