@@ -156,6 +156,47 @@ namespace lumen::lsp::runtime {
     std::size_t pending_report_positions {};  ///< Current bounded sequence positions, including inferred gaps.
   };
 
+  /** @brief Constant-work result for one selected device's input-rate budget clamp. */
+  struct InputRateBudgetClampResult {
+    std::uint64_t wire_bits {};  ///< Projected aggregate wire rate after both reductions.
+    std::uint32_t state_rate {};  ///< Selected state reports per second.
+    std::uint32_t sensor_rate {};  ///< Selected sensor reports per second.
+  };
+
+  /**
+   * @brief Clamp one device's sensor-then-state rates to an aggregate input wire budget.
+   *
+   * The selection uses closed-form ceiling division, so work is independent of
+   * the offered report rates. A zero-cost stream is still lowered to its minimum
+   * when the aggregate is over budget, matching the prior ordered selection. The
+   * aggregate must include the selected state and sensor rates multiplied by
+   * their corresponding per-report costs.
+   *
+   * @param aggregate_wire_bits Current aggregate input wire rate.
+   * @param budget_wire_bits Maximum permitted aggregate input wire rate.
+   * @param state_wire_bits_per_report Exact complete-IP cost of one state report.
+   * @param sensor_wire_bits_per_report Exact complete-IP cost of one sensor report.
+   * @param sensor_fallback_wire_bits_per_report Additional aggregate sensor-fallback cost below saturation.
+   * @param sensor_fallback_saturation_rate Selected sensor rate at which the aggregate fallback leaves saturation.
+   * @param state_rate Offered state reports per second.
+   * @param minimum_state_rate Minimum acceptable state reports per second.
+   * @param sensor_rate Offered sensor reports per second.
+   * @param minimum_sensor_rate Minimum acceptable sensor reports per second.
+   * @return Selected rates and projected aggregate wire rate after sensor-first reduction.
+   */
+  [[nodiscard]] InputRateBudgetClampResult clamp_input_rate_budget(
+    std::uint64_t aggregate_wire_bits,
+    std::uint64_t budget_wire_bits,
+    std::uint64_t state_wire_bits_per_report,
+    std::uint64_t sensor_wire_bits_per_report,
+    std::uint64_t sensor_fallback_wire_bits_per_report,
+    std::uint32_t sensor_fallback_saturation_rate,
+    std::uint32_t state_rate,
+    std::uint32_t minimum_state_rate,
+    std::uint32_t sensor_rate,
+    std::uint32_t minimum_sensor_rate
+  ) noexcept;
+
   /** @brief Authenticated input-only session mapping installed by START_RESPONSE. */
   struct InputSessionMapping {
     PeerEndpoint peer;  ///< Exact authoritative DTLS/SRTP five-tuple.

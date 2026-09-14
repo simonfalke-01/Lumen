@@ -743,7 +743,7 @@ namespace lumen::lsp::runtime {
     ) noexcept;
 
     /**
-     * @brief Dispatch receipt-ACKed media/START work, retransmit responses, and close failed operations.
+     * @brief Dispatch receipt-ACKed media/START/input-rate work, retransmit responses, and close failed operations.
      *
      * Call outside DTLS provider callbacks after flushing receipt ACKs queued by receive().
      * Capture preparation can take longer than the control retransmission window.

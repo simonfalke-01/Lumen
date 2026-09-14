@@ -44,7 +44,7 @@ namespace platf::win_input {
    * @brief Runtime backend selected for stateful keyboard and mouse input.
    */
   enum class backend_t {
-    probing,  ///< The Virtual HID driver is being probed.
+    probing,  ///< Virtual HID is available but no input session currently owns it.
     send_input,  ///< Win32 `SendInput` compatibility backend.
     virtual_hid,  ///< Lumen Virtual HID driver backend.
     fail_closed  ///< No further stateful input is permitted.
@@ -62,6 +62,12 @@ namespace platf::win_input {
      * @return Current backend state.
      */
     [[nodiscard]] virtual backend_t backend() const noexcept = 0;
+
+    /**
+     * @brief Acquire resources needed by the first active input session.
+     * @return Operation result.
+     */
+    virtual result_t start_session() = 0;
 
     /**
      * @brief Inject relative mouse movement.
@@ -121,7 +127,7 @@ namespace platf::win_input {
     virtual result_t unicode(const char *utf8, int size) = 0;
 
     /**
-     * @brief Complete a higher-level input reset after its pressed maps clear.
+     * @brief Complete the final active-session reset and release session resources.
      * @return Operation result.
      */
     virtual result_t reset_session() = 0;
@@ -179,6 +185,7 @@ namespace platf::win_input {
     ~send_input_transport_t() override;
 
     backend_t backend() const noexcept override;
+    result_t start_session() override;
     result_t move_mouse(std::int32_t delta_x, std::int32_t delta_y) override;
     result_t absolute_mouse(float x, float y, std::int32_t source_width, std::int32_t source_height) override;
     result_t mouse_button(int button, bool release) override;

@@ -259,6 +259,7 @@ namespace input {
 
     std::bitset<256> keyboard_usages;  ///< Pressed USB keyboard-page usages.
     std::bitset<6> pointer_buttons;  ///< Pressed pointer buttons one through five.
+    detail::input_session_reset_gate_t::session_id_t session_registration {};  ///< Shared transport lease.
     std::array<controller_t, 16> controllers;  ///< LSP controller slots.
     std::array<pen_t, 16> pens;  ///< Generation-qualified direct pen contacts.
     std::array<touch_t, 256> touches;  ///< Bounded direct-touch devices and contacts.
@@ -467,6 +468,7 @@ namespace input {
     if (input != nullptr) {
       stop_lsp_platform_input_feedback(*input);
       neutralize_lsp_platform_input(*input);
+      stop_lsp_platform_input_session(*input);
     }
     delete input;
   }
@@ -522,6 +524,27 @@ namespace input {
       }
     }
     return input;
+  }
+
+  void start_lsp_platform_input_session(lsp_platform_input_t &input) noexcept {
+    if (input.session_registration != 0) {
+      return;
+    }
+    input.session_registration = input_session_gate.register_session([]() {
+#ifdef _WIN32
+      platf::start_input_session(platf_input);
+#endif
+    });
+  }
+
+  void stop_lsp_platform_input_session(lsp_platform_input_t &input) noexcept {
+    const auto registration = input.session_registration;
+    input.session_registration = 0;
+    input_session_gate.unregister_session(registration, []() {
+#ifdef _WIN32
+      platf::reset_input_session(platf_input);
+#endif
+    });
   }
 
   bool apply_lsp_pointer(
@@ -3236,7 +3259,11 @@ namespace input {
       mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
     );
     auto *const raw_input = input.get();
-    input->session_registration = input_session_gate.register_session();
+    input->session_registration = input_session_gate.register_session([]() {
+#ifdef _WIN32
+      platf::start_input_session(platf_input);
+#endif
+    });
     input->dispatcher = std::make_unique<input_t::dispatcher_t>(
       [raw_input](std::vector<std::uint8_t> &&entry) {
         passthrough_next_message(raw_input, std::move(entry));

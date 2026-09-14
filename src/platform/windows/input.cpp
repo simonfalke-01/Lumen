@@ -783,6 +783,14 @@ namespace platf {
     }
   }
 
+  void start_input_session(input_t &input) {
+    auto *raw = (input_raw_t *) input.get();
+    const auto result = raw->keyboard_mouse->start_session();
+    if (!result) {
+      BOOST_LOG(error) << "Couldn't start keyboard and mouse input session: "sv << result.status;
+    }
+  }
+
   void reset_input_session(input_t &input) {
     auto *raw = (input_raw_t *) input.get();
     const auto result = raw->keyboard_mouse->reset_session();

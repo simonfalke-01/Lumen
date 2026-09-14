@@ -17,6 +17,7 @@
 
 // standard includes
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -29,6 +30,9 @@
 namespace platf::win_input {
   namespace {
     using namespace std::literals;
+
+    constexpr auto exclusive_claim_retry_budget = std::chrono::milliseconds {20};  ///< Cross-process STOP-to-START handoff budget.
+    constexpr std::uint32_t maximum_exclusive_claim_attempts = 20;  ///< Bound driver calls inside the handoff budget.
 
     /** @brief Production synchronous IOCTL channel. */
     class system_virtual_hid_channel_t final: public virtual_hid_channel_t {
@@ -538,12 +542,7 @@ namespace platf::win_input {
     }
   }
 
-  bool virtual_hid_transport_t::initialize() {
-    std::lock_guard lock(mutex_);
-    if (backend_.load() != backend_t::probing) {
-      return backend_.load() == backend_t::virtual_hid;
-    }
-
+  bool virtual_hid_transport_t::open_and_validate_driver() {
     auto result = channel_->open();
     if (!result) {
       set_failure("interface discovery/open", result.status);
@@ -559,8 +558,32 @@ namespace platf::win_input {
       backend_.store(backend_t::send_input);
       return false;
     }
+    return true;
+  }
 
-    result = channel_->claim();
+  bool virtual_hid_transport_t::preflight() {
+    std::lock_guard lock(mutex_);
+    if (backend_.load() != backend_t::probing) {
+      return backend_.load() == backend_t::virtual_hid;
+    }
+    if (!open_and_validate_driver()) {
+      return false;
+    }
+    channel_->close();
+    return true;
+  }
+
+  bool virtual_hid_transport_t::initialize() {
+    std::lock_guard lock(mutex_);
+    if (backend_.load() != backend_t::probing) {
+      return backend_.load() == backend_t::virtual_hid;
+    }
+
+    if (!open_and_validate_driver()) {
+      return false;
+    }
+
+    const auto result = channel_->claim();
     if (!result) {
       set_failure("exclusive claim", result.status);
       channel_->close();
@@ -592,6 +615,36 @@ namespace platf::win_input {
 
   backend_t virtual_hid_transport_t::backend() const noexcept {
     return backend_.load();
+  }
+
+  result_t virtual_hid_transport_t::start_session() {
+    const auto retry_deadline = std::chrono::steady_clock::now() + exclusive_claim_retry_budget;
+    for (std::uint32_t attempt = 0; attempt < maximum_exclusive_claim_attempts; ++attempt) {
+      {
+        std::lock_guard lock(mutex_);
+        const auto backend = backend_.load();
+        if (backend == backend_t::virtual_hid) {
+          return {};
+        }
+        if (backend == backend_t::fail_closed) {
+          return {completion_t::ambiguous, ERROR_NOT_READY};
+        }
+        backend_.store(backend_t::probing);
+      }
+      if (initialize()) {
+        BOOST_LOG(info) << "Windows keyboard and mouse session acquired Lumen Virtual HID"sv;
+        return {};
+      }
+      if (failure_stage() != "exclusive claim" || failure_status() != ERROR_BUSY ||
+          attempt + 1U == maximum_exclusive_claim_attempts || std::chrono::steady_clock::now() >= retry_deadline) {
+        break;
+      }
+      SwitchToThread();
+    }
+    BOOST_LOG(warning)
+      << "Windows keyboard and mouse session using SendInput fallback (stage="sv
+      << failure_stage() << ", status="sv << failure_status() << ')';
+    return {};
   }
 
   LUMEN_VHID_KEYBOARD_REPORT virtual_hid_transport_t::keyboard_report() const {
@@ -989,6 +1042,11 @@ namespace platf::win_input {
   result_t virtual_hid_transport_t::reset_session() {
     std::lock_guard lock(mutex_);
     if (backend_.load() == backend_t::send_input) {
+      const auto result = fallback_->reset_session();
+      backend_.store(backend_t::probing);
+      return result;
+    }
+    if (backend_.load() == backend_t::probing) {
       return fallback_->reset_session();
     }
     if (backend_.load() != backend_t::virtual_hid && backend_.load() != backend_t::fail_closed) {
@@ -1004,21 +1062,19 @@ namespace platf::win_input {
     }
 
     accepted_virtual_input_ = false;
-    const auto claim = channel_->claim();
-    if (!claim) {
-      set_failure("session reclaim", claim.status);
-      channel_->close();
-      backend_.store(backend_t::send_input);
-      return fallback_->neutralize();
-    }
-
-    backend_.store(backend_t::virtual_hid);
+    channel_->close();
+    backend_.store(backend_t::probing);
     return fallback_->neutralize();
   }
 
   result_t virtual_hid_transport_t::neutralize() {
     std::lock_guard lock(mutex_);
     if (backend_.load() == backend_t::send_input) {
+      const auto result = fallback_->neutralize();
+      backend_.store(backend_t::probing);
+      return result;
+    }
+    if (backend_.load() == backend_t::probing) {
       return fallback_->neutralize();
     }
     if (backend_.load() != backend_t::virtual_hid && backend_.load() != backend_t::fail_closed) {
@@ -1032,7 +1088,7 @@ namespace platf::win_input {
       backend_.store(backend_t::fail_closed);
       return {completion_t::ambiguous, result.status};
     }
-    backend_.store(backend_t::send_input);
+    backend_.store(backend_t::probing);
     return fallback_->neutralize();
   }
 
@@ -1051,8 +1107,8 @@ namespace platf::win_input {
       std::make_shared<system_virtual_hid_channel_t>(),
       make_send_input_transport()
     );
-    if (transport->initialize()) {
-      BOOST_LOG(info) << "Windows keyboard and mouse backend: Lumen Virtual HID"sv;
+    if (transport->preflight()) {
+      BOOST_LOG(info) << "Windows keyboard and mouse backend: Lumen Virtual HID available; session claim deferred"sv;
     } else {
       BOOST_LOG(warning)
         << "Windows keyboard and mouse backend: SendInput fallback (stage="sv

@@ -416,6 +416,13 @@ namespace lumen::lsp::runtime {
         bool active {};  ///< Whether START awaits dispatch outside the provider callback.
       } pending_start;  ///< One bounded capture-preparation operation per connection.
 
+      /** @brief One input-rate request awaiting dispatch after its receipt ACK leaves the DTLS callback. */
+      struct PendingInputRate {
+        packet_slab<maximum_control_frame_bytes> request {};  ///< Exact request retained until its receipt ACK is flushed.
+        lspc_header header {};  ///< Original request correlation and generation.
+        bool active {};  ///< Whether rate selection awaits dispatch outside the DTLS callback.
+      } pending_input_rate;  ///< At most one deferred rate selection per connection.
+
       bool hello_complete {};  ///< Whether CLIENT_HELLO completed.
     };
 
@@ -1121,6 +1128,15 @@ namespace lumen::lsp::runtime {
         return false;
       }
 
+      if (connection.pending_input_rate.active &&
+          parsed.header.request_id == connection.pending_input_rate.header.request_id) {
+        if (std::ranges::equal(connection.pending_input_rate.request.bytes(), frame)) {
+          return send_acknowledgement_only(connection);
+        }
+        transport_.close(peer);
+        return false;
+      }
+
       const auto observed = connection.inbound.observe(parsed.header.message_id);
       if (observed == receive_id_result::duplicate) {
         transport_.close(peer);
@@ -1162,7 +1178,7 @@ namespace lumen::lsp::runtime {
         case ControlMessageType::text_input:
           return text_input(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::input_rate_request:
-          return input_rate(connection, frame, parsed.header, parsed.payload, now_microseconds);
+          return queue_input_rate(connection, frame, parsed.header, now_microseconds);
         case ControlMessageType::path_probe:
           return receive_path_probe(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::object_chunk:
@@ -1195,7 +1211,7 @@ namespace lumen::lsp::runtime {
       return send_error(connection, frame, parsed.header, message_type, ControlStatus::unsupported, now_microseconds);
     }
 
-    /** @brief Dispatch receipt-ACKed media activation and START work outside DTLS callbacks. */
+    /** @brief Dispatch receipt-ACKed media activation, START, and input-rate work outside DTLS callbacks. */
     void tick(const std::uint64_t now_microseconds) noexcept {
       std::scoped_lock lock(mutex_);
       for (std::size_t index = 0; index < connections_.size();) {
@@ -1297,6 +1313,24 @@ namespace lumen::lsp::runtime {
                 control_monotonic_microseconds()
               )) {
             const auto peer = connection.peer;
+            transport_.close(peer);
+            if (const auto remaining = find(peer); remaining != connections_.size()) {
+              connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+            }
+            continue;
+          }
+        }
+        if (connection.pending_input_rate.active) {
+          const auto pending = connection.pending_input_rate;
+          connection.pending_input_rate = {};
+          const auto peer = connection.peer;
+          if (!input_rate(
+                connection,
+                pending.request.bytes(),
+                pending.header,
+                pending.request.bytes().subspan(lspc_header_size),
+                control_monotonic_microseconds()
+              )) {
             transport_.close(peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
@@ -1971,7 +2005,7 @@ namespace lumen::lsp::runtime {
              outbound_submission_result::submitted;
     }
 
-    /** @brief Send one untracked ACK-only LSPC frame for an accepted client response. */
+    /** @brief Send one untracked ACK-only LSPC frame confirming receipt of accepted client control. */
     bool send_acknowledgement_only(Connection &connection) noexcept {
       if (connection.next_message_id == 0) {
         return false;
@@ -3131,7 +3165,8 @@ namespace lumen::lsp::runtime {
         auto encoded = encode_applications(*snapshot);
         if (!encoded) {
           const auto status = encoded.error() == ControlWireError::size_limit ?
-                                ControlStatus::busy : ControlStatus::internal_failure;
+                                ControlStatus::busy :
+                                ControlStatus::internal_failure;
           return send_error(connection, request, header, ControlMessageType::applications, status, now_microseconds);
         }
         response = std::move(*encoded);
@@ -3255,7 +3290,49 @@ namespace lumen::lsp::runtime {
       return true;
     }
 
-    /** @brief Validate and execute one generation-scoped device rate offer. */
+    /**
+     * @brief Receipt-ACK one authenticated rate request before acquiring the platform input lock.
+     *
+     * The UDP owner flushes this ACK after the DTLS callback returns and before calling tick().
+     * The ACK confirms receipt only; the deferred response still validates and selects the offer.
+     *
+     * @param connection Authenticated association retaining the pending request.
+     * @param request Complete byte-identical request retained for duplicate handling and response caching.
+     * @param header Parsed request identity and generation.
+     * @param now_microseconds Current receipt time used for immediate admission errors.
+     * @return True when the receipt ACK or bounded error response was queued.
+     */
+    bool queue_input_rate(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (!connection.authenticated_client ||
+          !connection.authenticated_client->permissions.contains(Permission::input)) {
+        return send_error(connection, request, header, ControlMessageType::input_rate_response, ControlStatus::permission_denied, now_microseconds);
+      }
+      if (connection.pending_input_rate.active) {
+        return send_error(connection, request, header, ControlMessageType::input_rate_response, ControlStatus::busy, now_microseconds);
+      }
+      if (!connection.pending_input_rate.request.assign(request)) {
+        return send_error(connection, request, header, ControlMessageType::input_rate_response, ControlStatus::internal_failure, now_microseconds);
+      }
+      connection.pending_input_rate.header = header;
+      connection.pending_input_rate.active = true;
+      return send_acknowledgement_only(connection);
+    }
+
+    /**
+     * @brief Validate and execute one receipt-ACKed generation-scoped device rate offer.
+     *
+     * @param connection Association whose current input authority must still match the offer.
+     * @param request Retained request bytes used for exact response caching.
+     * @param header Original request correlation and generation.
+     * @param payload Encoded rate offer validated before applying any change.
+     * @param now_microseconds Dispatch time used for errors before backend work.
+     * @return True when the selected rates or semantic error response was queued.
+     */
     bool input_rate(
       Connection &connection,
       const std::span<const std::uint8_t> request,
@@ -3277,11 +3354,13 @@ namespace lumen::lsp::runtime {
         connection.generation,
         *decoded
       );
+      // Lock acquisition and selection must not consume the response's retransmission lifetime.
+      const auto response_now = control_monotonic_microseconds();
       if (!selected) {
-        return send_error(connection, request, header, ControlMessageType::input_rate_response, selected.error(), now_microseconds);
+        return send_error(connection, request, header, ControlMessageType::input_rate_response, selected.error(), response_now);
       }
       const auto response = encode_input_rate_response(*selected);
-      return response && send_response(connection, request, header, ControlMessageType::input_rate_response, *response, false, now_microseconds);
+      return response && send_response(connection, request, header, ControlMessageType::input_rate_response, *response, false, response_now);
     }
 
     /** @brief Append one authenticated contiguous object chunk and cache its terminal prefix. */

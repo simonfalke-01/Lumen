@@ -23,6 +23,7 @@ namespace client_microphone {
   namespace {
     std::mutex writer_mutex;  ///< Serializes writer arbitration.
     std::optional<writer_owner_t> writer_owner;  ///< Exact owner of the single writer.
+    constexpr std::int64_t maximum_forward_resynchronization_frames = 50;  ///< One second at the fixed 20 ms cadence.
   }  // namespace
 
   writer_owner_t writer_owner_t::legacy(const std::uint32_t launch_session_id) {
@@ -176,12 +177,15 @@ namespace client_microphone {
     clock_t::time_point last_packet {};  ///< Arrival time of the most recently accepted packet.
     std::uint64_t generation {};  ///< Current media generation identifier.
     std::uint64_t expected_sequence {};  ///< Sequence assigned to the next playout frame.
+    std::uint64_t greatest_admitted_sequence {};  ///< Greatest sequence accepted since the last explicit rebase.
     std::uint32_t expected_timestamp {};  ///< Sample timestamp assigned to the next playout frame.
     bool active {};  ///< Whether decoder and sink initialization succeeded.
     bool scheduled {};  ///< Whether the first packet established a playout deadline.
     bool played {};  ///< Whether the first playout deadline has passed.
     bool inactivity_flushed {};  ///< Whether the current no-packet interval was already flushed.
+    bool admitted_sequence_initialized {};  ///< Whether `greatest_admitted_sequence` has an authenticated origin.
     bool inband_fec {true};  ///< Whether a following Opus packet may repair one missing frame.
+    bool bounded_forward_resynchronization {};  ///< Whether authenticated low-latency RTP may skip a bounded stale prefix.
     std::chrono::milliseconds initial_delay;  ///< Protocol-selected startup preroll; legacy remains 60 ms.
 
     /**
@@ -191,11 +195,19 @@ namespace client_microphone {
      * @param sink Platform sink borrowed by the receiver.
      * @param inband_fec Whether next-packet FEC is negotiated.
      * @param initial_delay Bounded protocol-selected startup delay.
+     * @param bounded_forward_resynchronization Whether low-latency playout may skip a bounded stale prefix.
      */
-    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec, const std::chrono::milliseconds initial_delay):
+    impl_t(
+      std::unique_ptr<decoder_t> decoder,
+      sink_t &sink,
+      const bool inband_fec,
+      const std::chrono::milliseconds initial_delay,
+      const bool bounded_forward_resynchronization
+    ):
         decoder(std::move(decoder)),
         sink(sink),
         inband_fec(inband_fec),
+        bounded_forward_resynchronization(bounded_forward_resynchronization),
         initial_delay(initial_delay) {
       packets.reserve(MAX_QUEUED_PACKETS);
     }
@@ -283,14 +295,15 @@ namespace client_microphone {
   };
 
   receiver_t::receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec):
-      receiver_t(std::move(decoder), sink, inband_fec, JITTER_WINDOW) {
+      receiver_t(std::move(decoder), sink, inband_fec, JITTER_WINDOW, false) {
   }
 
   receiver_t::receiver_t(
     std::unique_ptr<decoder_t> decoder,
     sink_t &sink,
     const bool inband_fec,
-    const std::chrono::milliseconds initial_delay
+    const std::chrono::milliseconds initial_delay,
+    const bool bounded_forward_resynchronization
   ) {
     if (!decoder) {
       throw std::invalid_argument("Client microphone receiver requires a decoder");
@@ -299,7 +312,13 @@ namespace client_microphone {
       throw std::invalid_argument("Client microphone startup delay is outside its bounded jitter window");
     }
 
-    impl_ = std::make_unique<impl_t>(std::move(decoder), sink, inband_fec, initial_delay);
+    impl_ = std::make_unique<impl_t>(
+      std::move(decoder),
+      sink,
+      inband_fec,
+      initial_delay,
+      bounded_forward_resynchronization
+    );
   }
 
   receiver_t::~receiver_t() {
@@ -313,9 +332,11 @@ namespace client_microphone {
     impl_->stats = {};
     impl_->packets.clear();
     impl_->last_packet = now;
+    impl_->greatest_admitted_sequence = 0;
     impl_->scheduled = false;
     impl_->played = false;
     impl_->inactivity_flushed = false;
+    impl_->admitted_sequence_initialized = false;
 
     if (impl_->decoder->reset() < 0) {
       return false;
@@ -368,6 +389,22 @@ namespace client_microphone {
       ++impl_->stats.invalid_payload_packets;
       return submit_result_e::payload_too_large;
     }
+    if (packet.discontinuity && impl_->scheduled) {
+      if (impl_->decoder->reset() < 0) {
+        ++impl_->stats.decode_errors;
+        return submit_result_e::invalid_payload;
+      }
+      impl_->packets.clear();
+      impl_->expected_sequence = packet.sequence;
+      impl_->expected_timestamp = packet.timestamp;
+      impl_->next_playout = now + impl_->initial_delay;
+      impl_->last_packet = now;
+      impl_->played = false;
+      impl_->inactivity_flushed = false;
+      impl_->greatest_admitted_sequence = 0;
+      impl_->admitted_sequence_initialized = false;
+      ++impl_->stats.discontinuity_resets;
+    }
     if (impl_->find(packet.sequence) != impl_->packets.end()) {
       ++impl_->stats.duplicate_packets;
       return submit_result_e::duplicate;
@@ -382,33 +419,76 @@ namespace client_microphone {
     } else {
       const auto distance = sequence_distance(packet.sequence, impl_->expected_sequence);
       if (distance < 0) {
-        if (impl_->played || distance < -static_cast<std::int64_t>(MAX_QUEUED_PACKETS - 1U)) {
-          ++impl_->stats.late_packets;
-          return submit_result_e::late;
-        }
-
         const auto expected_timestamp = impl_->expected_timestamp -
                                         static_cast<std::uint32_t>(-distance) *
                                           static_cast<std::uint32_t>(SAMPLES_PER_FRAME);
+        const auto fresh_one_frame_late = impl_->bounded_forward_resynchronization && impl_->played &&
+                                          distance == -1 && impl_->packets.empty() &&
+                                          (!impl_->admitted_sequence_initialized ||
+                                           packet.sequence > impl_->greatest_admitted_sequence);
+        if (fresh_one_frame_late) {
+          if (packet.timestamp != expected_timestamp) {
+            ++impl_->stats.timestamp_discontinuity_packets;
+            return submit_result_e::timestamp_discontinuity;
+          }
+          if (impl_->decoder->reset() < 0) {
+            ++impl_->stats.decode_errors;
+            return submit_result_e::invalid_payload;
+          }
+          impl_->expected_sequence = packet.sequence;
+          impl_->expected_timestamp = packet.timestamp;
+          impl_->next_playout = now + FRAME_DURATION;
+          impl_->played = false;
+          ++impl_->stats.late_resynchronizations;
+        } else {
+          if (impl_->played || distance < -static_cast<std::int64_t>(MAX_QUEUED_PACKETS - 1U)) {
+            ++impl_->stats.late_packets;
+            return submit_result_e::late;
+          }
+
+          if (packet.timestamp != expected_timestamp) {
+            ++impl_->stats.timestamp_discontinuity_packets;
+            return submit_result_e::timestamp_discontinuity;
+          }
+
+          impl_->expected_sequence = packet.sequence;
+          impl_->expected_timestamp = packet.timestamp;
+          const auto first_outside_window = std::remove_if(
+            impl_->packets.begin(),
+            impl_->packets.end(),
+            [&](const queued_packet_t &queued) {
+              return sequence_distance(queued.sequence, impl_->expected_sequence) >=
+                     static_cast<std::int64_t>(MAX_QUEUED_PACKETS);
+            }
+          );
+          impl_->packets.erase(first_outside_window, impl_->packets.end());
+        }
+      } else if (distance >= static_cast<std::int64_t>(MAX_QUEUED_PACKETS)) {
+        const auto expected_timestamp = impl_->expected_timestamp +
+                                        static_cast<std::uint32_t>(distance) *
+                                          static_cast<std::uint32_t>(SAMPLES_PER_FRAME);
+        if (!impl_->bounded_forward_resynchronization ||
+            distance > maximum_forward_resynchronization_frames) {
+          ++impl_->stats.out_of_window_packets;
+          return submit_result_e::too_far_ahead;
+        }
         if (packet.timestamp != expected_timestamp) {
           ++impl_->stats.timestamp_discontinuity_packets;
           return submit_result_e::timestamp_discontinuity;
         }
-
-        impl_->expected_sequence = packet.sequence;
-        impl_->expected_timestamp = packet.timestamp;
-        const auto first_outside_window = std::remove_if(
+        const auto skipped = static_cast<std::uint64_t>(distance) - (MAX_QUEUED_PACKETS - 1U);
+        impl_->expected_sequence += skipped;
+        impl_->expected_timestamp += static_cast<std::uint32_t>(skipped) *
+                                     static_cast<std::uint32_t>(SAMPLES_PER_FRAME);
+        const auto first_current_packet = std::remove_if(
           impl_->packets.begin(),
           impl_->packets.end(),
           [&](const queued_packet_t &queued) {
-            return sequence_distance(queued.sequence, impl_->expected_sequence) >=
-                   static_cast<std::int64_t>(MAX_QUEUED_PACKETS);
+            return sequence_distance(queued.sequence, impl_->expected_sequence) < 0;
           }
         );
-        impl_->packets.erase(first_outside_window, impl_->packets.end());
-      } else if (distance >= static_cast<std::int64_t>(MAX_QUEUED_PACKETS)) {
-        ++impl_->stats.out_of_window_packets;
-        return submit_result_e::too_far_ahead;
+        impl_->packets.erase(first_current_packet, impl_->packets.end());
+        impl_->stats.skipped_playout_frames += skipped;
       } else {
         const auto expected_timestamp = impl_->expected_timestamp +
                                         static_cast<std::uint32_t>(distance) *
@@ -433,6 +513,10 @@ namespace client_microphone {
     };
     std::ranges::copy(payload, queued.payload.begin());
     impl_->packets.push_back(std::move(queued));
+    if (!impl_->admitted_sequence_initialized || packet.sequence > impl_->greatest_admitted_sequence) {
+      impl_->greatest_admitted_sequence = packet.sequence;
+      impl_->admitted_sequence_initialized = true;
+    }
     impl_->last_packet = now;
     impl_->inactivity_flushed = false;
     ++impl_->stats.accepted_packets;
@@ -521,8 +605,14 @@ namespace client_microphone {
     bool shut_down {};  ///< Whether `shutdown_worker()` permanently closed this wrapper.
     std::jthread worker;  ///< Independent monotonic playout worker; declared last to start after state initialization.
 
-    impl_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, const bool inband_fec, const std::chrono::milliseconds initial_delay):
-        receiver(std::move(decoder), sink, inband_fec, initial_delay) {
+    impl_t(
+      std::unique_ptr<decoder_t> decoder,
+      sink_t &sink,
+      const bool inband_fec,
+      const std::chrono::milliseconds initial_delay,
+      const bool bounded_forward_resynchronization
+    ):
+        receiver(std::move(decoder), sink, inband_fec, initial_delay, bounded_forward_resynchronization) {
     }
 
     ~impl_t() {
@@ -593,9 +683,16 @@ namespace client_microphone {
     std::unique_ptr<decoder_t> decoder,
     sink_t &sink,
     const bool inband_fec,
-    const std::chrono::milliseconds initial_delay
+    const std::chrono::milliseconds initial_delay,
+    const bool bounded_forward_resynchronization
   ):
-      impl_(std::make_unique<impl_t>(std::move(decoder), sink, inband_fec, initial_delay)) {
+      impl_(std::make_unique<impl_t>(
+        std::move(decoder),
+        sink,
+        inband_fec,
+        initial_delay,
+        bounded_forward_resynchronization
+      )) {
   }
 
   clocked_receiver_t::~clocked_receiver_t() = default;

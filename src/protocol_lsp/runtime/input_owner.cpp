@@ -219,6 +219,52 @@ namespace lumen::lsp::runtime {
            reserved_input_wire_bits_per_second > 0 && reserved_input_wire_bits_per_second <= 32'000'000U;
   }
 
+  InputRateBudgetClampResult clamp_input_rate_budget(
+    const std::uint64_t aggregate_wire_bits,
+    const std::uint64_t budget_wire_bits,
+    const std::uint64_t state_wire_bits_per_report,
+    const std::uint64_t sensor_wire_bits_per_report,
+    const std::uint64_t sensor_fallback_wire_bits_per_report,
+    const std::uint32_t sensor_fallback_saturation_rate,
+    const std::uint32_t state_rate,
+    const std::uint32_t minimum_state_rate,
+    const std::uint32_t sensor_rate,
+    const std::uint32_t minimum_sensor_rate
+  ) noexcept {
+    InputRateBudgetClampResult result {
+      .wire_bits = aggregate_wire_bits,
+      .state_rate = state_rate,
+      .sensor_rate = sensor_rate,
+    };
+    const auto reduce = [&](std::uint32_t &rate, const std::uint32_t minimum, const std::uint64_t cost) {
+      if (result.wire_bits <= budget_wire_bits || rate <= minimum) {
+        return;
+      }
+      if (cost == 0) {
+        rate = minimum;
+        return;
+      }
+      const auto excess = result.wire_bits - budget_wire_bits;
+      const auto required = excess / cost + static_cast<std::uint64_t>(excess % cost != 0);
+      const auto available = static_cast<std::uint64_t>(rate - minimum);
+      const auto reduction = std::min(required, available);
+      rate -= static_cast<std::uint32_t>(reduction);
+      result.wire_bits -= reduction * cost;
+    };
+    const auto saturated_sensor_floor = std::max(
+      minimum_sensor_rate,
+      std::min(result.sensor_rate, sensor_fallback_saturation_rate)
+    );
+    reduce(result.sensor_rate, saturated_sensor_floor, sensor_wire_bits_per_report);
+    reduce(
+      result.sensor_rate,
+      minimum_sensor_rate,
+      sensor_wire_bits_per_report + sensor_fallback_wire_bits_per_report
+    );
+    reduce(result.state_rate, minimum_state_rate, state_wire_bits_per_report);
+    return result;
+  }
+
   class InputOwner::Impl {
   public:
     class DigestVerifier final: public input_plane::baseline_digest_verifier {
@@ -307,6 +353,7 @@ namespace lumen::lsp::runtime {
     /** @brief Install one preflighted mapping while the owner lock is held. */
     void commit_configuration_locked(const InputSessionMapping &mapping) noexcept {
       input::neutralize_lsp_platform_input(*platform_);
+      input::start_lsp_platform_input_session(*platform_);
       mapping_ = mapping;
       baseline_.reset();
       edges_.reset(mapping.input_generation);
@@ -544,6 +591,8 @@ namespace lumen::lsp::runtime {
         std::uint32_t sensor {};
         std::uint32_t reconciliation {};
         std::uint64_t wire_bits {};
+        std::uint64_t sensor_rate_without_selected {};  ///< Unsaturated sensor rate contributed by the mapping and other devices.
+        bool sensor_fallback {};  ///< Whether the aggregate sensor fallback adds a rate-dependent wire cost.
       };
 
       const auto family = mapping_->peer.family == IpAddressFamily::ipv6 ?
@@ -555,6 +604,7 @@ namespace lumen::lsp::runtime {
           .controller = mapping_->controller_rate,
           .sensor = mapping_->sensor_rate,
           .reconciliation = mapping_->reconciliation_rate,
+          .sensor_rate_without_selected = mapping_->sensor_rate,
         };
         std::array<bool, 4> represented {};
         std::array<std::uint64_t, 4> sums {};
@@ -569,6 +619,9 @@ namespace lumen::lsp::runtime {
             4'000U,
             static_cast<std::uint64_t>(result.sensor) + rate.sensor_rate
           ));
+          if (std::addressof(rate) != std::addressof(*selected)) {
+            result.sensor_rate_without_selected += rate.sensor_rate;
+          }
           result.wire_bits += input_plane::wire_bits_per_second(family, rate.maximum_state_packet_bytes, rate.state_rate);
           if (rate.sensor_rate != 0) {
             result.wire_bits += input_plane::wire_bits_per_second(
@@ -589,6 +642,7 @@ namespace lumen::lsp::runtime {
           result.wire_bits += input_plane::wire_bits_per_second(family, 96, result.controller);
         }
         if (!represented[2]) {
+          result.sensor_fallback = true;
           result.wire_bits += input_plane::wire_bits_per_second(family, 32, result.sensor);
         }
         if (!represented[3]) {
@@ -601,14 +655,29 @@ namespace lumen::lsp::runtime {
         return result;
       };
       auto aggregate = totals(candidate);
-      while (!removal && aggregate.wire_bits > mapping_->reserved_input_wire_bits_per_second &&
-             selected->sensor_rate > request.minimum_sensor_rate) {
-        --selected->sensor_rate;
-        aggregate = totals(candidate);
-      }
-      while (!removal && aggregate.wire_bits > mapping_->reserved_input_wire_bits_per_second &&
-             selected->state_rate > request.minimum_state_rate) {
-        --selected->state_rate;
+      if (!removal && aggregate.wire_bits > mapping_->reserved_input_wire_bits_per_second) {
+        const auto sensor_fallback_cost = aggregate.sensor_fallback ?
+                                            input_plane::wire_bits_per_second(family, 32, 1) :
+                                            0;
+        const auto sensor_fallback_saturation_rate = aggregate.sensor_rate_without_selected >= 4'000U ?
+                                                       0U :
+                                                       static_cast<std::uint32_t>(
+                                                         4'000U - aggregate.sensor_rate_without_selected
+                                                       );
+        const auto clamped = clamp_input_rate_budget(
+          aggregate.wire_bits,
+          mapping_->reserved_input_wire_bits_per_second,
+          input_plane::wire_bits_per_second(family, selected->maximum_state_packet_bytes, 1),
+          input_plane::wire_bits_per_second(family, selected->maximum_sensor_packet_bytes, 1),
+          sensor_fallback_cost,
+          sensor_fallback_saturation_rate,
+          selected->state_rate,
+          request.minimum_state_rate,
+          selected->sensor_rate,
+          request.minimum_sensor_rate
+        );
+        selected->state_rate = clamped.state_rate;
+        selected->sensor_rate = clamped.sensor_rate;
         aggregate = totals(candidate);
       }
       if (aggregate.wire_bits == 0 || aggregate.wire_bits > mapping_->reserved_input_wire_bits_per_second ||
@@ -916,6 +985,7 @@ namespace lumen::lsp::runtime {
       safety_reset_pending_ = false;
       baseline_requested_ = false;
       input::neutralize_lsp_platform_input(*platform_);
+      input::stop_lsp_platform_input_session(*platform_);
     }
 
     /** @brief Retained selected rates for one generation-qualified device/report class. */

@@ -27,6 +27,8 @@ namespace platf::win_input {
     class system_win32_api_t final: public win32_api_t {
     public:
       UINT send_input(UINT count, INPUT *inputs, int size) override {
+        // UIPI rejection need not set an error; do not report a stale desktop/API error.
+        SetLastError(ERROR_SUCCESS);
         return SendInput(count, inputs, size);
       }
 
@@ -114,6 +116,10 @@ namespace platf::win_input {
 
   backend_t send_input_transport_t::backend() const noexcept {
     return backend_t::send_input;
+  }
+
+  result_t send_input_transport_t::start_session() {
+    return {};
   }
 
   result_t send_input_transport_t::submit(INPUT input) {

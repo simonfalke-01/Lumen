@@ -191,9 +191,15 @@ TEST(ControllerTimerGeneration, ReconnectInvalidatesOldCallbacksAndReturnsBothTi
 
 TEST(InputSessionResetGate, SharedTransportResetsOnlyAfterFinalSession) {
   input::detail::input_session_reset_gate_t gate;
+  std::atomic<int> starts {0};
   std::atomic<int> resets {0};
-  const auto first = gate.register_session();
-  const auto second = gate.register_session();
+  const auto first = gate.register_session([&starts]() {
+    ++starts;
+  });
+  const auto second = gate.register_session([&starts]() {
+    ++starts;
+  });
+  EXPECT_EQ(starts, 1);
   ASSERT_EQ(gate.active_sessions(), 2u);
 
   EXPECT_TRUE(gate.unregister_session(first, [&resets]() {
@@ -211,6 +217,15 @@ TEST(InputSessionResetGate, SharedTransportResetsOnlyAfterFinalSession) {
     ++resets;
   }));
   EXPECT_EQ(resets, 1);
+
+  const auto third = gate.register_session([&starts]() {
+    ++starts;
+  });
+  EXPECT_EQ(starts, 2);
+  EXPECT_TRUE(gate.unregister_session(third, [&resets]() {
+    ++resets;
+  }));
+  EXPECT_EQ(resets, 2);
 }
 
 TEST(InputCausalWatermark, AdvancesOnlyAfterConsumerCompletionAndCapturesImmutableValue) {

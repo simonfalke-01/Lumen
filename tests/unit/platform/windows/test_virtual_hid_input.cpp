@@ -62,6 +62,11 @@ namespace {
 
     channel_result_t claim() override {
       ++claim_calls;
+      if (!claim_results.empty()) {
+        const auto result = claim_results.front();
+        claim_results.pop_front();
+        return result;
+      }
       return claim_result;
     }
 
@@ -89,6 +94,7 @@ namespace {
     channel_result_t get_info_result {};  ///< Info result.
     channel_result_t claim_result {};  ///< Claim result.
     channel_result_t reset_result {};  ///< Reset result.
+    std::deque<channel_result_t> claim_results;  ///< Ordered claim results.
     std::deque<channel_result_t> submit_results;  ///< Ordered submission results.
     std::vector<LUMEN_VHID_SUBMIT_REPORT_REQUEST> submissions;  ///< Captured requests.
     int open_calls {0};  ///< Open calls.
@@ -415,6 +421,42 @@ TEST_F(virtual_hid_input_test, InitializesThroughExactLeanOperations) {
   EXPECT_EQ(channel->get_info_calls, 1);
   EXPECT_EQ(channel->claim_calls, 1);
   EXPECT_TRUE(channel->submissions.empty());
+}
+
+TEST_F(virtual_hid_input_test, IdlePreflightDoesNotClaimVirtualHid) {
+  ASSERT_TRUE(transport->preflight());
+
+  EXPECT_EQ(channel->open_calls, 1);
+  EXPECT_EQ(channel->get_info_calls, 1);
+  EXPECT_EQ(channel->claim_calls, 0);
+  EXPECT_EQ(channel->close_calls, 1);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::probing);
+
+  ASSERT_TRUE(transport->start_session());
+  EXPECT_EQ(channel->open_calls, 2);
+  EXPECT_EQ(channel->get_info_calls, 2);
+  EXPECT_EQ(channel->claim_calls, 1);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
+}
+
+TEST_F(virtual_hid_input_test, FirstSessionRetriesTransientBusyVirtualHidClaim) {
+  ASSERT_TRUE(transport->preflight());
+  channel->claim_results = {{false, ERROR_BUSY}, {}};
+  ASSERT_TRUE(transport->start_session());
+
+  EXPECT_EQ(channel->claim_calls, 2);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
+}
+
+TEST_F(virtual_hid_input_test, FirstSessionDoesNotRetryNonBusyClaimFailure) {
+  ASSERT_TRUE(transport->preflight());
+  channel->claim_result = {false, ERROR_SHARING_VIOLATION};
+
+  ASSERT_TRUE(transport->start_session());
+
+  EXPECT_EQ(channel->claim_calls, 1);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::send_input);
+  EXPECT_EQ(transport->failure_stage(), "exclusive claim");
 }
 
 TEST_F(virtual_hid_input_test, FallsBackWhenOpenFails) {
@@ -831,6 +873,7 @@ TEST_F(virtual_hid_input_test, ResetSessionClearsFractionalVirtualHidWheelDetent
   ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA / 2));
   ASSERT_TRUE(transport->horizontal_scroll(WHEEL_DELTA / 2));
   ASSERT_TRUE(transport->reset_session());
+  ASSERT_TRUE(transport->start_session());
   ASSERT_TRUE(transport->vertical_scroll(WHEEL_DELTA / 2));
   ASSERT_TRUE(transport->horizontal_scroll(WHEEL_DELTA / 2));
   EXPECT_TRUE(channel->submissions.empty());
@@ -846,7 +889,7 @@ TEST_F(virtual_hid_input_test, ResetSessionClearsFractionalVirtualHidWheelDetent
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
 }
 
-TEST_F(virtual_hid_input_test, SessionResetNeutralizesAndReclaimsAbsoluteMouseState) {
+TEST_F(virtual_hid_input_test, SessionResetReleasesClaimUntilNextSession) {
   initialize();
   ASSERT_TRUE(transport->absolute_mouse(75.0f, 25.0f, 100, 100));
   ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
@@ -854,9 +897,12 @@ TEST_F(virtual_hid_input_test, SessionResetNeutralizesAndReclaimsAbsoluteMouseSt
   ASSERT_TRUE(transport->reset_session());
 
   EXPECT_EQ(channel->reset_calls, 1);
+  EXPECT_EQ(channel->claim_calls, 1);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::probing);
+  EXPECT_EQ(transport->acknowledged_mouse_buttons(), 0);
+  ASSERT_TRUE(transport->start_session());
   EXPECT_EQ(channel->claim_calls, 2);
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
-  EXPECT_EQ(transport->acknowledged_mouse_buttons(), 0);
   ASSERT_TRUE(transport->mouse_button(BUTTON_LEFT, false));
   ASSERT_EQ(channel->submissions.size(), 3);
   EXPECT_EQ(channel->submissions.back().report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
@@ -1042,9 +1088,12 @@ TEST_F(virtual_hid_input_test, ResetRecoversFailClosedTransportWithoutReplay) {
 
   ASSERT_TRUE(result);
   EXPECT_EQ(channel->reset_calls, 1);
+  EXPECT_EQ(channel->claim_calls, 1);
+  EXPECT_EQ(transport->backend(), platf::win_input::backend_t::probing);
+  EXPECT_TRUE(fallback_api->submitted.empty());
+  ASSERT_TRUE(transport->start_session());
   EXPECT_EQ(channel->claim_calls, 2);
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::virtual_hid);
-  EXPECT_TRUE(fallback_api->submitted.empty());
   ASSERT_TRUE(transport->move_mouse(3, 4));
   EXPECT_TRUE(fallback_api->submitted.empty());
   ASSERT_EQ(channel->submissions.size(), 4);

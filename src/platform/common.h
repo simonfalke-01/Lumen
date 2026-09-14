@@ -1207,7 +1207,14 @@ namespace platf {
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags);
 #ifdef _WIN32
   /**
-   * @brief Complete a Windows input-session reset after pressed maps clear.
+   * @brief Acquire the Windows keyboard and mouse backend for the first active input session.
+   *
+   * @param input Platform input backend to acquire.
+   */
+  void start_input_session(input_t &input);
+
+  /**
+   * @brief Reset and release the Windows backend after the final active input session.
    *
    * @param input Platform input backend to reset.
    */

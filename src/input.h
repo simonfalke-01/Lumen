@@ -81,6 +81,18 @@ namespace input {
   );
 
   /**
+   * @brief Register one active LSP authority with the shared platform input transport.
+   * @param input LSP platform owner becoming active.
+   */
+  void start_lsp_platform_input_session(lsp_platform_input_t &input) noexcept;
+
+  /**
+   * @brief Release one active LSP authority from the shared platform input transport.
+   * @param input LSP platform owner becoming inactive.
+   */
+  void stop_lsp_platform_input_session(lsp_platform_input_t &input) noexcept;
+
+  /**
    * @brief Disable controller feedback and join its queue worker exactly once.
    *
    * @param input LSP platform owner that remains valid for the duration of the call.

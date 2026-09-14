@@ -131,6 +131,12 @@ namespace platf::win_input {
     ~virtual_hid_transport_t() override;
 
     /**
+     * @brief Verify Virtual HID availability without claiming exclusive ownership.
+     * @return `true` only when the installed driver is compatible and ready.
+     */
+    bool preflight();
+
+    /**
      * @brief Open, validate, and claim the Virtual HID interface.
      * @return `true` only when Virtual HID becomes active.
      */
@@ -161,6 +167,7 @@ namespace platf::win_input {
     [[nodiscard]] std::uint8_t acknowledged_mouse_buttons() const;
 
     backend_t backend() const noexcept override;
+    result_t start_session() override;
     result_t move_mouse(std::int32_t delta_x, std::int32_t delta_y) override;
     result_t absolute_mouse(float x, float y, std::int32_t source_width, std::int32_t source_height) override;
     result_t mouse_button(int button, bool release) override;
@@ -172,6 +179,12 @@ namespace platf::win_input {
     result_t neutralize() override;
 
   private:
+    /**
+     * @brief Open and validate the driver while retaining the channel for an optional claim.
+     * @return `true` when the channel is open and the driver identity is valid.
+     */
+    bool open_and_validate_driver();
+
     /**
      * @brief Build a complete NKRO report from held keyboard state.
      * @return Keyboard report snapshot.
@@ -255,7 +268,7 @@ namespace platf::win_input {
 
   /**
    * @brief Create and probe the production preferred Windows input transport.
-   * @return Virtual HID transport in Virtual HID, SendInput, or fail-closed state.
+   * @return Virtual HID transport preflighted without claiming, or a SendInput fallback.
    */
   std::unique_ptr<transport_t> make_preferred_input_transport();
 }  // namespace platf::win_input

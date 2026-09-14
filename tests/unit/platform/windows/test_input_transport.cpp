@@ -109,6 +109,11 @@ TEST_F(send_input_transport_test, ReportsSendInputBackend) {
   EXPECT_EQ(transport->backend(), platf::win_input::backend_t::send_input);
 }
 
+TEST_F(send_input_transport_test, StartsSessionWithoutSyntheticInput) {
+  EXPECT_TRUE(transport->start_session());
+  EXPECT_TRUE(api->submitted.empty());
+}
+
 TEST_F(send_input_transport_test, BuildsRelativeMouseInput) {
   const auto result = transport->move_mouse(-123, 456);
 

@@ -528,6 +528,91 @@ TEST_F(client_microphone_test, RejectsTimestampDiscontinuityWithoutReset) {
   EXPECT_EQ(receiver_->submit(opus_packet(10, 1, 55, 1), START + 5ms), submit_result_e::accepted);
 }
 
+TEST_F(client_microphone_test, AuthenticatedDiscontinuityRebasesDecoderAndPlayoutWithoutRestartingSink) {
+  ASSERT_TRUE(receiver_->reset(93, START));
+  ASSERT_EQ(receiver_->submit(opus_packet(93, 100, 1'000, 1), START), submit_result_e::accepted);
+  EXPECT_EQ(receiver_->submit(opus_packet(93, 106, 9'999, 2), START + 1ms), submit_result_e::too_far_ahead);
+
+  auto discontinuity = opus_packet(93, 106, 9'999, 3);
+  discontinuity.discontinuity = true;
+  EXPECT_EQ(receiver_->submit(std::move(discontinuity), START + 2ms), submit_result_e::accepted);
+  EXPECT_EQ(receiver_->queued_packets(), 1U);
+  EXPECT_EQ(receiver_->statistics().discontinuity_resets, 1U);
+  EXPECT_EQ(decoder_->reset_calls, 2);
+  EXPECT_EQ(sink_.begin_generations.size(), 1U);
+  EXPECT_TRUE(sink_.end_generations.empty());
+
+  EXPECT_EQ(receiver_->poll(START + 61ms), 0U);
+  EXPECT_EQ(receiver_->poll(START + 62ms), 1U);
+  ASSERT_EQ(sink_.frames.size(), 1U);
+  EXPECT_EQ(sink_.frames[0].front(), 3);
+}
+
+TEST(ClientMicrophoneReceiver, BoundedLowLatencyModeSkipsAContinuousForwardBurstWithoutLockout) {
+  fake_sink_t sink;
+  client_microphone::receiver_t receiver {
+    std::make_unique<fake_decoder_t>(),
+    sink,
+    true,
+    20ms,
+    true,
+  };
+  ASSERT_TRUE(receiver.reset(94, START));
+  for (std::uint64_t sequence = 100; sequence <= 106; ++sequence) {
+    const auto timestamp = 1'000U + static_cast<std::uint32_t>(sequence - 100U) *
+                                      client_microphone::SAMPLES_PER_FRAME;
+    EXPECT_EQ(receiver.submit(opus_packet(94, sequence, timestamp, static_cast<std::uint8_t>(sequence)), START), submit_result_e::accepted);
+  }
+
+  EXPECT_EQ(receiver.queued_packets(), client_microphone::MAX_QUEUED_PACKETS);
+  EXPECT_EQ(receiver.statistics().skipped_playout_frames, 1U);
+  EXPECT_EQ(receiver.statistics().out_of_window_packets, 0U);
+  ASSERT_EQ(receiver.poll(START + 20ms), 1U);
+  ASSERT_EQ(sink.frames.size(), 1U);
+  EXPECT_EQ(sink.frames[0].front(), 101);
+
+  EXPECT_EQ(receiver.submit(opus_packet(94, 200, 9'999, 4), START + 21ms), submit_result_e::too_far_ahead);
+}
+
+TEST(ClientMicrophoneReceiver, BoundedLowLatencyModeRephasesOnOneFreshLateFrameWithoutAdmittingReplay) {
+  fake_sink_t sink;
+  client_microphone::receiver_t receiver {
+    std::make_unique<fake_decoder_t>(),
+    sink,
+    true,
+    20ms,
+    true,
+  };
+  ASSERT_TRUE(receiver.reset(95, START));
+  ASSERT_EQ(receiver.submit(opus_packet(95, 100, 1'000, 100), START), submit_result_e::accepted);
+  ASSERT_EQ(receiver.poll(START + 20ms), 1U);
+  ASSERT_EQ(receiver.poll(START + 40ms), 1U);
+
+  EXPECT_EQ(receiver.submit(opus_packet(95, 101, 1'960, 101), START + 41ms), submit_result_e::accepted);
+  EXPECT_EQ(receiver.statistics().late_resynchronizations, 1U);
+  EXPECT_EQ(receiver.poll(START + 60ms), 0U);
+  EXPECT_EQ(receiver.submit(opus_packet(95, 102, 2'920, 102), START + 61ms), submit_result_e::accepted);
+  ASSERT_EQ(receiver.poll(START + 61ms), 1U);
+
+  EXPECT_EQ(receiver.submit(opus_packet(95, 101, 1'960, 101), START + 62ms), submit_result_e::late);
+  EXPECT_EQ(receiver.submit(opus_packet(95, 103, 3'880, 103), START + 81ms), submit_result_e::accepted);
+  ASSERT_EQ(receiver.poll(START + 81ms), 1U);
+  EXPECT_EQ(receiver.submit(opus_packet(95, 104, 4'840, 104), START + 101ms), submit_result_e::accepted);
+  ASSERT_EQ(receiver.poll(START + 101ms), 1U);
+
+  ASSERT_EQ(sink.frames.size(), 5U);
+  EXPECT_EQ(sink.frames[0].front(), 100);
+  EXPECT_TRUE(std::ranges::all_of(sink.frames[1], [](const std::int16_t sample) {
+    return sample == 0;
+  }));
+  EXPECT_EQ(sink.frames[2].front(), 101);
+  EXPECT_EQ(sink.frames[3].front(), 102);
+  EXPECT_EQ(sink.frames[4].front(), 103);
+  EXPECT_EQ(receiver.statistics().silence_frames, 1U);
+  EXPECT_EQ(receiver.statistics().late_packets, 1U);
+  EXPECT_EQ(receiver.statistics().late_resynchronizations, 1U);
+}
+
 TEST_F(client_microphone_test, BoundsExtremeAndVeryLateMonotonicSequences) {
   constexpr auto MAX_SEQUENCE = std::numeric_limits<std::uint64_t>::max();
   ASSERT_TRUE(receiver_->reset(90, START));

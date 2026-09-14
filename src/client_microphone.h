@@ -82,6 +82,7 @@ namespace client_microphone {
     std::vector<std::uint8_t> payload;  ///< Opus packet bytes.
     std::array<std::uint8_t, MAX_OPUS_PAYLOAD_SIZE> fixed_payload {};  ///< Allocation-free LSP Opus storage.
     std::uint16_t fixed_payload_size {};  ///< Populated leading bytes in `fixed_payload`; zero selects `payload`.
+    bool discontinuity {};  ///< Reset decoder and playout continuity before admitting this packet.
 
     /** @brief Return encoded bytes from fixed LSP storage or the legacy vector. */
     [[nodiscard]] std::span<const std::uint8_t> payload_view() const noexcept;
@@ -122,6 +123,8 @@ namespace client_microphone {
     std::uint64_t decode_errors {};  ///< Decoder calls that did not produce one complete frame.
     std::uint64_t sink_errors {};  ///< Complete frames rejected by the platform sink.
     std::uint64_t inactivity_flushes {};  ///< Jitter states flushed after the inactivity timeout.
+    std::uint64_t discontinuity_resets {};  ///< Authenticated sender discontinuities that rebased playout.
+    std::uint64_t late_resynchronizations {};  ///< Fresh one-frame-late LSP packets that safely rephased playout.
   };
 
   /**
@@ -294,9 +297,16 @@ namespace client_microphone {
      * @param sink Platform endpoint that receives decoded PCM.
      * @param inband_fec Whether next-packet FEC is negotiated.
      * @param initial_delay Startup preroll from zero through the legacy jitter window.
+     * @param bounded_forward_resynchronization Whether low-latency playout may skip a bounded stale prefix.
      * @throws std::invalid_argument If the decoder or delay is invalid.
      */
-    receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, bool inband_fec, std::chrono::milliseconds initial_delay);
+    receiver_t(
+      std::unique_ptr<decoder_t> decoder,
+      sink_t &sink,
+      bool inband_fec,
+      std::chrono::milliseconds initial_delay,
+      bool bounded_forward_resynchronization = false
+    );
 
     /**
      * @brief Stop the active generation and destroy the receiver.
@@ -412,9 +422,16 @@ namespace client_microphone {
      * @param sink Platform injection sink.
      * @param inband_fec Whether next-packet FEC is negotiated.
      * @param initial_delay Startup preroll from zero through the legacy jitter window.
+     * @param bounded_forward_resynchronization Whether low-latency playout may skip a bounded stale prefix.
      * @throws std::invalid_argument If the decoder or delay is invalid.
      */
-    clocked_receiver_t(std::unique_ptr<decoder_t> decoder, sink_t &sink, bool inband_fec, std::chrono::milliseconds initial_delay);
+    clocked_receiver_t(
+      std::unique_ptr<decoder_t> decoder,
+      sink_t &sink,
+      bool inband_fec,
+      std::chrono::milliseconds initial_delay,
+      bool bounded_forward_resynchronization = false
+    );
     ~clocked_receiver_t();
 
     clocked_receiver_t(const clocked_receiver_t &) = delete;

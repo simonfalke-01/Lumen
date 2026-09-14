@@ -818,6 +818,9 @@ namespace lumen::lsp::runtime {
         retirement_worker_ = std::jthread {[this](const std::stop_token stop_token) {
           run_retirement_worker(stop_token);
         }};
+        microphone_worker_ = std::jthread {[this](const std::stop_token stop_token) {
+          run_microphone_worker(stop_token);
+        }};
         worker_ = std::jthread {[this](const std::stop_token stop_token) {
           run(stop_token);
         }};
@@ -832,6 +835,11 @@ namespace lumen::lsp::runtime {
         retirement_condition_.notify_all();
         if (retirement_worker_.joinable()) {
           retirement_worker_.join();
+        }
+        microphone_worker_.request_stop();
+        microphone_condition_.notify_all();
+        if (microphone_worker_.joinable()) {
+          microphone_worker_.join();
         }
         service_->stop();
         return ServiceStartResult::socket_bind_failed;
@@ -875,6 +883,11 @@ namespace lumen::lsp::runtime {
       if (retirement_worker_.joinable()) {
         retirement_worker_.join();
       }
+      microphone_worker_.request_stop();
+      microphone_condition_.notify_all();
+      if (microphone_worker_.joinable()) {
+        microphone_worker_.join();
+      }
       std::unique_ptr<ActiveAudioRuntime> audio;
       std::unique_ptr<ActiveVideoRuntime> video;
       std::unique_ptr<LspMicrophoneReceiver> microphone;
@@ -898,6 +911,7 @@ namespace lumen::lsp::runtime {
         pending_inbound_path_probe_ = {};
         active_microphone_configuration_.reset();
         active_microphone_required_ = false;
+        cancel_microphone_activations_locked();
         clear_attach_lifecycle();
         clear_session_ssrc_history();
       }
@@ -922,11 +936,12 @@ namespace lumen::lsp::runtime {
         }
       }
       for (auto &pending : pending_microphone_retirements_) {
-        if (pending) {
-          pending->stop();
+        if (pending.receiver) {
+          pending.receiver->stop();
         }
       }
 
+      drain_microphone_activation_jobs();
       retire_all_forward_paths();
 
       input_owner_.reset();
@@ -1286,6 +1301,46 @@ namespace lumen::lsp::runtime {
       std::atomic<bool> retirement_complete {};  ///< Release-published after the worker's last owner access.
     };
 
+    /** @brief Forward declaration for microphone jobs that retain exact aggregate callback ownership. */
+    struct ForwardPathGeneration;
+
+    /** @brief Background lifecycle state for one acknowledged microphone generation. */
+    enum class MicrophoneActivationState : std::uint8_t {
+      empty,  ///< Slot is available.
+      queued,  ///< Snapshot is waiting for the media lifecycle worker.
+      running,  ///< Slow platform stop/probe/begin work is executing without the session lock.
+      completed,  ///< Socket owner must revalidate and publish or retire the result.
+    };
+
+    /** @brief Bounded snapshot-to-worker-to-socket handoff for microphone activation. */
+    struct PendingMicrophoneActivation {
+      PeerEndpoint peer {};  ///< Exact acknowledged association.
+      Identifier128 client_id {};  ///< Client authority captured at acknowledgement.
+      Identifier128 session_id {};  ///< Stream session captured at acknowledgement.
+      MicrophoneReceiverConfig receiver {};  ///< Exact validated provider/path/media snapshot used by the worker.
+      std::shared_ptr<ForwardPathGeneration> forward_owner;  ///< Keeps aggregate callbacks and SRTP cleanup fenced.
+      std::shared_ptr<ForwardPathGeneration> prior_forward_owner;  ///< Predecessor callback/key lifetime fence.
+      std::unique_ptr<LspMicrophoneReceiver> prior;  ///< Predecessor stopped before the new writer is claimed.
+      std::unique_ptr<LspMicrophoneReceiver> replacement;  ///< Worker-created result awaiting socket publication.
+      std::uint32_t connection_generation {};  ///< Exact control/input association generation.
+      std::uint32_t stream_generation {};  ///< Exact stream generation owning the selection.
+      std::uint32_t revocation_generation {};  ///< Trust generation revalidated before publication.
+      MicrophoneActivationState state {MicrophoneActivationState::empty};  ///< Current ownership phase.
+      bool required {};  ///< Whether current-generation activation failure is session-fatal.
+      bool succeeded {};  ///< Whether `replacement` contains a started receiver.
+      bool cancelled {};  ///< STOP, revoke, association loss, or successor authority invalidated this work.
+    };
+
+    /** @brief Callback-safe microphone shutdown retained until the socket owner releases its path and keys. */
+    struct PendingMicrophoneRetirement {
+      std::unique_ptr<LspMicrophoneReceiver> receiver;  ///< Receiver being stopped and joined.
+      std::shared_ptr<ForwardPathGeneration> forward_owner;  ///< Exact raw-callback context lifetime fence.
+      PeerEndpoint peer {};  ///< Exact association whose keys remain installed during shutdown.
+      std::uint32_t connection_generation {};  ///< Exact forward-path and SRTP namespace generation.
+      bool retirement_claimed {};  ///< Background worker borrowed `receiver` under the session lock.
+      std::atomic<bool> retirement_complete {};  ///< Release-published after the worker's last receiver access.
+    };
+
     /** @brief One committed ATTACH waiting for every replacement authority boundary. */
     struct AttachReadinessBarrier {
       PeerEndpoint successor_peer {};  ///< Fresh authenticated association receiving the replacement authority.
@@ -1341,10 +1396,6 @@ namespace lumen::lsp::runtime {
       std::atomic<bool> planned_lifetime_latched {};  ///< One planned rekey per association.
       std::atomic<bool> hard_lifetime_latched {};  ///< Permanent fail-closed association protection fence.
       std::atomic<std::uint64_t> last_authenticated_receive_microseconds {};  ///< Latest validated DTLS/SRTP ingress.
-      std::mutex dtls_mutex;  ///< Serializes DTLS records through one completion-ordered path fence.
-      std::condition_variable dtls_condition;  ///< Wakes the record producer after terminal submission.
-      HostForwardCompletion dtls_completion {HostForwardCompletion::fatal};  ///< Latest fenced record disposition.
-      bool dtls_in_flight {};  ///< Whether one record owns the ordering fence.
 
       /**
        * @brief Advance authenticated receive activity without regressing its monotonic timestamp.
@@ -1679,8 +1730,13 @@ namespace lumen::lsp::runtime {
       const std::uint64_t now_microseconds
     ) noexcept {
       auto authority = transport::validate_compound_rtcp_authority(packet, mapping.input_ssrc);
-      if (!authority && microphone_runtime_ && active_microphone_configuration_ &&
-          microphone_runtime_->peer() == mapping.peer) {
+      // The selected SSRC is authenticated before the asynchronous device opens.
+      // Its first sender report may precede worker publication; device readiness
+      // must not turn that valid compound report into a fatal association error.
+      if (!authority && active_microphone_configuration_ &&
+          active_microphone_configuration_->session_id == mapping.session_id &&
+          active_association_peer_ == mapping.peer &&
+          active_association_generation_ == mapping.connection_generation) {
         authority = transport::validate_compound_rtcp_authority(
           packet,
           active_microphone_configuration_->microphone.microphone_ssrc
@@ -1770,7 +1826,15 @@ namespace lumen::lsp::runtime {
         return owner && owner->peer == peer;
       };
       return std::ranges::any_of(pending_audio_retirements_, matches) ||
-             std::ranges::any_of(pending_video_retirements_, matches);
+             std::ranges::any_of(pending_video_retirements_, matches) ||
+             std::ranges::any_of(pending_microphone_retirements_, [&peer](const auto &retirement) {
+               return retirement.receiver && retirement.peer == peer;
+             }) ||
+             std::ranges::any_of(pending_microphone_activations_, [&peer](const auto &activation) {
+               return activation.state != MicrophoneActivationState::empty &&
+                      (activation.peer == peer ||
+                       (activation.prior_forward_owner && activation.prior_forward_owner->peer == peer));
+             });
     }
 
     /** @brief Retire closed keys only after every producer for the exact connection generation joined. */
@@ -2761,89 +2825,389 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    /** @brief Queue a microphone receiver for destruction after the current callback. */
+    /** @brief Mark every in-flight microphone activation stale while retaining worker ownership. */
+    void cancel_microphone_activations_locked() noexcept {
+      for (auto &activation : pending_microphone_activations_) {
+        if (activation.state != MicrophoneActivationState::empty) {
+          activation.cancelled = true;
+        }
+      }
+      microphone_condition_.notify_all();
+    }
+
+    /** @brief Mark activations for one closed association stale without affecting its successor. */
+    void cancel_microphone_activations_locked(const PeerEndpoint &peer) noexcept {
+      for (auto &activation : pending_microphone_activations_) {
+        if (activation.state != MicrophoneActivationState::empty && activation.peer == peer) {
+          activation.cancelled = true;
+        }
+      }
+      microphone_condition_.notify_all();
+    }
+
+    /** @brief Queue a microphone receiver for destruction on its dedicated lifecycle worker. */
     void queue_microphone_retirement(std::unique_ptr<LspMicrophoneReceiver> receiver) noexcept {
       if (!receiver) {
         return;
       }
+      const auto peer = receiver->peer();
+      auto forward_owner = find_forward_path(peer);
       std::scoped_lock lock(session_mutex_);
       for (auto &pending : pending_microphone_retirements_) {
-        if (!pending) {
-          pending = std::move(receiver);
+        if (!pending.receiver) {
+          pending.forward_owner = std::move(forward_owner);
+          pending.peer = peer;
+          pending.connection_generation = pending.forward_owner ? pending.forward_owner->generation : 0;
+          pending.retirement_claimed = false;
+          pending.retirement_complete.store(false, std::memory_order_relaxed);
+          pending.receiver = std::move(receiver);
+          microphone_condition_.notify_one();
           return;
         }
       }
       std::terminate();
     }
 
-    /** @brief Stop, join, and release every deferred microphone writer outside callbacks. */
-    void process_pending_microphone_retirements() noexcept {
-      while (true) {
-        std::unique_ptr<LspMicrophoneReceiver> receiver;
+    /** @brief Return whether the microphone lifecycle worker has queued ownership work. */
+    [[nodiscard]] bool microphone_work_pending_locked() const noexcept {
+      return std::ranges::any_of(pending_microphone_retirements_, [](const auto &candidate) {
+               return candidate.receiver && !candidate.retirement_claimed;
+             }) ||
+             std::ranges::any_of(pending_microphone_activations_, [](const auto &activation) {
+               return activation.state == MicrophoneActivationState::queued;
+             });
+    }
+
+    /** @brief Run blocking microphone stop/probe/begin work without holding socket or session ownership. */
+    void run_microphone_worker(const std::stop_token stop_token) noexcept {
+      while (!stop_token.stop_requested()) {
+        PendingMicrophoneRetirement *retirement = nullptr;
+        std::unique_ptr<LspMicrophoneReceiver> prior;
+        std::size_t activation_index = pending_microphone_activations_.size();
+        MicrophoneReceiverConfig receiver;
         {
-          std::scoped_lock lock(session_mutex_);
-          const auto pending = std::ranges::find_if(pending_microphone_retirements_, [](const auto &candidate) {
-            return static_cast<bool>(candidate);
+          std::unique_lock lock(session_mutex_);
+          microphone_condition_.wait(lock, [&]() {
+            return stop_token.stop_requested() || microphone_work_pending_locked();
           });
-          if (pending == pending_microphone_retirements_.end()) {
+          if (stop_token.stop_requested()) {
             return;
           }
-          receiver = std::move(*pending);
+          const auto pending_retirement = std::ranges::find_if(
+            pending_microphone_retirements_,
+            [](const auto &candidate) {
+              return candidate.receiver && !candidate.retirement_claimed;
+            }
+          );
+          if (pending_retirement != pending_microphone_retirements_.end()) {
+            pending_retirement->retirement_claimed = true;
+            retirement = &*pending_retirement;
+          } else {
+            const auto pending_activation = std::ranges::find(
+              pending_microphone_activations_,
+              MicrophoneActivationState::queued,
+              &PendingMicrophoneActivation::state
+            );
+            if (pending_activation == pending_microphone_activations_.end()) {
+              continue;
+            }
+            activation_index = static_cast<std::size_t>(
+              std::distance(pending_microphone_activations_.begin(), pending_activation)
+            );
+            receiver = pending_activation->receiver;
+            prior = std::move(pending_activation->prior);
+            pending_activation->state = MicrophoneActivationState::running;
+          }
         }
-        receiver->shutdown();
+        if (retirement) {
+          retirement->receiver->shutdown();
+          retirement->retirement_complete.store(true, std::memory_order_release);
+          continue;
+        }
+        if (prior) {
+          prior->shutdown();
+        }
+
+        bool cancelled = false;
+        {
+          std::scoped_lock lock(session_mutex_);
+          cancelled = stop_token.stop_requested() ||
+                      activation_index >= pending_microphone_activations_.size() ||
+                      pending_microphone_activations_[activation_index].state != MicrophoneActivationState::running ||
+                      pending_microphone_activations_[activation_index].cancelled;
+        }
+        std::unique_ptr<LspMicrophoneReceiver> replacement;
+        if (!cancelled) {
+          replacement = create_microphone_runtime(receiver);
+        }
+        std::unique_ptr<LspMicrophoneReceiver> stale_replacement;
+        bool complete_cancelled_activation = false;
+        {
+          std::scoped_lock lock(session_mutex_);
+          if (activation_index >= pending_microphone_activations_.size()) {
+            stale_replacement = std::move(replacement);
+          } else {
+            auto &activation = pending_microphone_activations_[activation_index];
+            if (activation.state != MicrophoneActivationState::running || activation.cancelled ||
+                stop_token.stop_requested()) {
+              stale_replacement = std::move(replacement);
+              complete_cancelled_activation = activation.state == MicrophoneActivationState::running;
+            } else {
+              activation.succeeded = static_cast<bool>(replacement);
+              activation.replacement = std::move(replacement);
+              activation.state = MicrophoneActivationState::completed;
+            }
+          }
+        }
+        if (stale_replacement) {
+          stale_replacement->shutdown();
+        }
+        if (complete_cancelled_activation) {
+          std::scoped_lock lock(session_mutex_);
+          auto &activation = pending_microphone_activations_[activation_index];
+          if (activation.state == MicrophoneActivationState::running) {
+            activation.succeeded = false;
+            activation.state = MicrophoneActivationState::completed;
+          }
+        }
       }
     }
 
-    /** @brief Create the real Windows virtual microphone and bounded clocked receiver. */
+    /** @brief Drain activation ownership after the lifecycle worker has joined during shutdown. */
+    void drain_microphone_activation_jobs() noexcept {
+      while (true) {
+        std::unique_ptr<LspMicrophoneReceiver> prior;
+        std::unique_ptr<LspMicrophoneReceiver> replacement;
+        std::shared_ptr<ForwardPathGeneration> forward_owner;
+        std::shared_ptr<ForwardPathGeneration> prior_forward_owner;
+        {
+          std::scoped_lock lock(session_mutex_);
+          const auto pending = std::ranges::find_if(pending_microphone_activations_, [](const auto &activation) {
+            return activation.state != MicrophoneActivationState::empty;
+          });
+          if (pending == pending_microphone_activations_.end()) {
+            return;
+          }
+          prior = std::move(pending->prior);
+          replacement = std::move(pending->replacement);
+          forward_owner = std::move(pending->forward_owner);
+          prior_forward_owner = std::move(pending->prior_forward_owner);
+          *pending = {};
+        }
+        if (prior) {
+          prior->shutdown();
+        }
+        if (replacement) {
+          replacement->shutdown();
+        }
+        prior_forward_owner.reset();
+        forward_owner.reset();
+      }
+    }
+
+    /** @brief Release completed microphone shutdowns and retire closed path/key ownership on the socket owner. */
+    void process_pending_microphone_retirements() noexcept {
+      while (true) {
+        std::unique_ptr<LspMicrophoneReceiver> receiver;
+        std::shared_ptr<ForwardPathGeneration> forward_owner;
+        PeerEndpoint peer;
+        std::uint32_t connection_generation = 0;
+        bool synchronous = false;
+        {
+          std::scoped_lock lock(session_mutex_);
+          synchronous = !microphone_worker_.joinable();
+          const auto pending = std::ranges::find_if(
+            pending_microphone_retirements_,
+            [synchronous](const auto &candidate) {
+              return candidate.receiver &&
+                     (synchronous || candidate.retirement_complete.load(std::memory_order_acquire));
+            }
+          );
+          if (pending == pending_microphone_retirements_.end()) {
+            return;
+          }
+          receiver = std::move(pending->receiver);
+          forward_owner = std::move(pending->forward_owner);
+          peer = pending->peer;
+          connection_generation = pending->connection_generation;
+          pending->peer = {};
+          pending->connection_generation = 0;
+          pending->retirement_claimed = false;
+          pending->retirement_complete.store(false, std::memory_order_relaxed);
+        }
+        if (synchronous) {
+          receiver->shutdown();
+        }
+        receiver.reset();
+        forward_owner.reset();
+        retire_closed_peer_if_quiescent(peer, connection_generation);
+      }
+    }
+
+    /** @brief Create the real Windows virtual microphone from one immutable acknowledged snapshot. */
     std::unique_ptr<LspMicrophoneReceiver> create_microphone_runtime(
-      const PeerEndpoint &peer,
-      const MicrophoneSelectionPayload &selection
+      MicrophoneReceiverConfig receiver
     ) noexcept {
   #ifdef _WIN32
       try {
-        const auto forward = find_forward_path(peer);
-        const auto input_mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
-        const auto rtcp_cname = input_mapping ?
-                                  association_rtcp_cname(
-                                    input_mapping->client_id,
-                                    input_mapping->connection_generation
-                                  ) :
-                                  std::nullopt;
-        if (!srtp_ || !forward || !forward->path || !input_mapping || input_mapping->peer != peer ||
-            input_mapping->connection_generation != forward->generation || !rtcp_cname) {
+        if (!srtp_) {
+          BOOST_LOG(warning) << "LSP microphone activation failed: SRTP provider unavailable"sv;
+          return nullptr;
+        }
+        if (!receiver.valid()) {
+          BOOST_LOG(warning) << "LSP microphone activation failed: acknowledged receiver snapshot is no longer valid"sv;
           return nullptr;
         }
         auto sink = platf::win_audio::make_virtual_microphone();
-        if (!sink || !sink->probe()) {
+        if (!sink) {
+          BOOST_LOG(warning) << "LSP microphone activation failed: virtual microphone allocation failed"sv;
           return nullptr;
         }
-        return LspMicrophoneReceiver::create(
-          MicrophoneReceiverConfig {
-            .peer = peer,
-            .generation = selection.microphone_generation,
-            .ssrc = selection.microphone_ssrc,
-            .payload_type = selection.microphone_payload_type,
-            .clock_rate = selection.clock_rate,
-            .channels = selection.channels,
-            .frame_samples = selection.frame_samples,
-            .forward_path = forward->path,
-            .forward_path_generation = forward->generation,
-            .feedback_ssrc = input_mapping->acknowledgement_ssrc,
-            .rtcp_cname = *rtcp_cname,
-            .inband_fec = selection.inband_fec,
-            .dtx = selection.dtx,
-          },
+        if (!sink->probe()) {
+          BOOST_LOG(warning) << "LSP microphone activation failed: virtual microphone probe failed"sv;
+          return nullptr;
+        }
+        auto microphone = LspMicrophoneReceiver::create(
+          std::move(receiver),
           std::move(sink),
           *srtp_
         );
+        if (!microphone) {
+          BOOST_LOG(warning) << "LSP microphone activation failed: decoder reset or virtual microphone begin failed"sv;
+        }
+        return microphone;
       } catch (...) {
+        BOOST_LOG(warning) << "LSP microphone activation failed: platform initialization raised an exception"sv;
         return nullptr;
       }
   #else
-      (void) peer;
-      (void) selection;
+      (void) receiver;
       return nullptr;
   #endif
+    }
+
+    /** @brief Revalidate and publish completed microphone activation on the socket owner. */
+    void process_pending_microphone_activations() noexcept {
+      while (true) {
+        std::unique_ptr<LspMicrophoneReceiver> replacement;
+        std::unique_ptr<LspMicrophoneReceiver> displaced;
+        std::shared_ptr<ForwardPathGeneration> forward_owner;
+        std::shared_ptr<ForwardPathGeneration> prior_forward_owner;
+        PeerEndpoint peer;
+        PeerEndpoint prior_peer;
+        std::uint32_t connection_generation = 0;
+        std::uint32_t prior_connection_generation = 0;
+        bool current = false;
+        bool activated = false;
+        bool worker_succeeded = false;
+        bool report_activation_failure = false;
+        bool required_failure = false;
+        bool readiness_changed = false;
+        std::uint32_t validation_failures = 0;
+        {
+          std::scoped_lock lock(session_mutex_);
+          const auto pending = std::ranges::find(
+            pending_microphone_activations_,
+            MicrophoneActivationState::completed,
+            &PendingMicrophoneActivation::state
+          );
+          if (pending == pending_microphone_activations_.end()) {
+            return;
+          }
+          peer = pending->peer;
+          connection_generation = pending->connection_generation;
+          forward_owner = std::move(pending->forward_owner);
+          prior_forward_owner = std::move(pending->prior_forward_owner);
+          if (prior_forward_owner) {
+            prior_peer = prior_forward_owner->peer;
+            prior_connection_generation = prior_forward_owner->generation;
+          }
+          replacement = std::move(pending->replacement);
+          const auto snapshot = authority_.snapshot();
+          const auto mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
+          const auto client_current = active_client_ && active_client_->client_id == pending->client_id &&
+                                      active_client_->connection_generation == pending->connection_generation &&
+                                      active_client_->revocation_generation == pending->revocation_generation &&
+                                      active_client_->permissions.contains(Permission::microphone);
+          const auto authority_current = snapshot.state == SessionState::streaming &&
+                                         snapshot.owner_client_id == pending->client_id &&
+                                         snapshot.effective_permissions.contains(Permission::microphone) &&
+                                         snapshot.session_id == pending->session_id &&
+                                         snapshot.generations.connection == pending->connection_generation &&
+                                         snapshot.generations.stream == pending->stream_generation;
+          const auto association_current = active_association_peer_ == pending->peer &&
+                                           active_association_generation_ == pending->connection_generation;
+          const auto configuration_current = active_microphone_configuration_ &&
+                                             active_microphone_configuration_->session_id == pending->session_id &&
+                                             active_microphone_configuration_->stream_generation ==
+                                               pending->stream_generation &&
+                                             active_microphone_configuration_->microphone.microphone_generation ==
+                                               pending->receiver.generation &&
+                                             active_microphone_configuration_->microphone.microphone_ssrc ==
+                                               pending->receiver.ssrc &&
+                                             active_microphone_configuration_->microphone.microphone_payload_type ==
+                                               pending->receiver.payload_type &&
+                                             active_microphone_configuration_->microphone.clock_rate ==
+                                               pending->receiver.clock_rate &&
+                                             active_microphone_configuration_->microphone.channels ==
+                                               pending->receiver.channels &&
+                                             active_microphone_configuration_->microphone.frame_samples ==
+                                               pending->receiver.frame_samples &&
+                                             active_microphone_configuration_->microphone.inband_fec ==
+                                               pending->receiver.inband_fec &&
+                                             active_microphone_configuration_->microphone.dtx == pending->receiver.dtx;
+          const auto mapping_current = mapping && mapping->peer == pending->peer &&
+                                       mapping->client_id == pending->client_id &&
+                                       mapping->session_id == pending->session_id &&
+                                       mapping->connection_generation == pending->connection_generation &&
+                                       mapping->acknowledgement_ssrc == pending->receiver.feedback_ssrc;
+          const auto forward_current = forward_owner && forward_owner->peer == pending->peer &&
+                                       forward_owner->generation == pending->connection_generation &&
+                                       forward_owner->path == pending->receiver.forward_path &&
+                                       pending->receiver.forward_path_generation == pending->connection_generation;
+          validation_failures = (!client_current ? 1U : 0U) |
+                                (!authority_current ? 2U : 0U) |
+                                (!association_current ? 4U : 0U) |
+                                (!configuration_current ? 8U : 0U) |
+                                (!mapping_current ? 16U : 0U) |
+                                (!forward_current ? 32U : 0U);
+          current = !pending->cancelled && validation_failures == 0;
+          worker_succeeded = pending->succeeded && static_cast<bool>(replacement);
+          activated = current && worker_succeeded && replacement->peer() == pending->peer &&
+                      replacement->generation() == pending->receiver.generation;
+          report_activation_failure = !pending->cancelled && !activated;
+          if (activated) {
+            displaced = std::move(microphone_runtime_);
+            microphone_runtime_ = std::move(replacement);
+          }
+          if (current && attach_readiness_.active && attach_readiness_.successor_peer == pending->peer &&
+              attach_readiness_.connection_generation == pending->connection_generation &&
+              attach_readiness_.microphone_generation == pending->receiver.generation) {
+            attach_readiness_.microphone_terminal = true;
+            attach_readiness_.microphone_ready = activated;
+            readiness_changed = true;
+          }
+          required_failure = current && pending->required && !activated;
+          *pending = {};
+        }
+        if (report_activation_failure) {
+          BOOST_LOG(warning) << "LSP microphone activation was not published: validation_failures="sv
+                             << validation_failures << ", worker_succeeded="sv << worker_succeeded;
+        }
+        queue_microphone_retirement(std::move(displaced));
+        queue_microphone_retirement(std::move(replacement));
+        prior_forward_owner.reset();
+        forward_owner.reset();
+        retire_closed_peer_if_quiescent(prior_peer, prior_connection_generation);
+        retire_closed_peer_if_quiescent(peer, connection_generation);
+        if (required_failure) {
+          fail_required_video_session(peer);
+          return;
+        }
+        if (readiness_changed) {
+          complete_attach_readiness_if_possible();
+        }
+      }
     }
 
     /**
@@ -3302,6 +3666,7 @@ namespace lumen::lsp::runtime {
     /** @brief Clear secret-bearing intent cache and every incomplete handoff owner. */
     void clear_attach_lifecycle() noexcept {
       record_reconnect_failed();
+      cancel_microphone_activations_locked();
       for (auto &outcome : attach_intent_outcomes_) {
         outcome = {};
       }
@@ -4333,12 +4698,20 @@ namespace lumen::lsp::runtime {
       const MicrophoneConfigAckPayload &acknowledgement
     ) noexcept override {
       std::unique_ptr<LspMicrophoneReceiver> prior_microphone;
+      bool required_failure = false;
+      bool readiness_changed = false;
       {
         std::scoped_lock lock(session_mutex_);
         const auto snapshot = authority_.snapshot();
         if (!active_client_ || !active_microphone_configuration_ ||
             active_client_->client_id != client.client_id ||
             active_client_->connection_generation != connection_generation ||
+            active_client_->revocation_generation != client.revocation_generation ||
+            !active_client_->permissions.contains(Permission::microphone) ||
+            !client.permissions.contains(Permission::microphone) ||
+            snapshot.state != SessionState::streaming ||
+            snapshot.owner_client_id != client.client_id ||
+            snapshot.generations.connection != connection_generation ||
             snapshot.session_id != acknowledgement.session_id ||
             active_microphone_configuration_->session_id != acknowledgement.session_id ||
             active_microphone_configuration_->stream_generation != snapshot.generations.stream ||
@@ -4347,50 +4720,102 @@ namespace lumen::lsp::runtime {
         }
         if (microphone_runtime_ && microphone_runtime_->peer() == peer &&
             microphone_runtime_->generation() == acknowledgement.microphone_generation) {
+          if (acknowledgement.status != ControlStatus::success) {
+            prior_microphone = std::move(microphone_runtime_);
+            required_failure = active_microphone_required_;
+          }
           if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
               attach_readiness_.connection_generation == connection_generation &&
               attach_readiness_.microphone_generation == acknowledgement.microphone_generation) {
             attach_readiness_.microphone_terminal = true;
-            attach_readiness_.microphone_ready = acknowledgement.status == ControlStatus::success;
+            attach_readiness_.microphone_ready = acknowledgement.status == ControlStatus::success &&
+                                                 static_cast<bool>(microphone_runtime_);
+            readiness_changed = true;
           }
-          complete_attach_readiness_if_possible();
-          return acknowledgement.status == ControlStatus::success;
-        }
-        if (acknowledgement.status == ControlStatus::success) {
-          // ATTACH has already committed successor authority. End the old
-          // sink's writes before claiming the replacement microphone writer;
-          // its outstanding feedback still retires through the deferred owner.
-          if (microphone_runtime_) {
-            microphone_runtime_->stop();
-          }
-          auto replacement = create_microphone_runtime(peer, active_microphone_configuration_->microphone);
-          if (!replacement) {
-            if (active_microphone_required_) {
-              fail_required_video_session(peer);
-              return true;
-            }
-            prior_microphone = std::move(microphone_runtime_);
-          } else {
-            prior_microphone = std::move(microphone_runtime_);
-            microphone_runtime_ = std::move(replacement);
+        } else if (acknowledgement.status != ControlStatus::success) {
+          cancel_microphone_activations_locked();
+          prior_microphone = std::move(microphone_runtime_);
+          required_failure = active_microphone_required_;
+          if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
+              attach_readiness_.connection_generation == connection_generation &&
+              attach_readiness_.microphone_generation == acknowledgement.microphone_generation) {
+            attach_readiness_.microphone_terminal = true;
+            attach_readiness_.microphone_ready = false;
+            readiness_changed = true;
           }
         } else {
-          if (active_microphone_required_) {
-            fail_required_video_session(peer);
-            return true;
+          cancel_microphone_activations_locked();
+          const auto forward = find_forward_path(peer);
+          const auto mapping = input_owner_ ? input_owner_->mapping() : std::nullopt;
+          const auto rtcp_cname = mapping ?
+                                    association_rtcp_cname(
+                                      mapping->client_id,
+                                      mapping->connection_generation
+                                    ) :
+                                    std::nullopt;
+          const auto slot = std::ranges::find(
+            pending_microphone_activations_,
+            MicrophoneActivationState::empty,
+            &PendingMicrophoneActivation::state
+          );
+          if (!forward || !forward->path || !mapping || mapping->peer != peer ||
+              mapping->client_id != client.client_id || mapping->session_id != acknowledgement.session_id ||
+              mapping->connection_generation != connection_generation ||
+              mapping->connection_generation != forward->generation || !rtcp_cname ||
+              slot == pending_microphone_activations_.end()) {
+            prior_microphone = std::move(microphone_runtime_);
+            required_failure = active_microphone_required_;
+            if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
+                attach_readiness_.connection_generation == connection_generation &&
+                attach_readiness_.microphone_generation == acknowledgement.microphone_generation) {
+              attach_readiness_.microphone_terminal = true;
+              attach_readiness_.microphone_ready = false;
+              readiness_changed = true;
+            }
+          } else {
+            const auto prior_forward_owner = microphone_runtime_ ?
+                                               find_forward_path(microphone_runtime_->peer()) :
+                                               std::shared_ptr<ForwardPathGeneration> {};
+            *slot = {
+              .peer = peer,
+              .client_id = client.client_id,
+              .session_id = acknowledgement.session_id,
+              .receiver = {
+                .peer = peer,
+                .generation = active_microphone_configuration_->microphone.microphone_generation,
+                .ssrc = active_microphone_configuration_->microphone.microphone_ssrc,
+                .payload_type = active_microphone_configuration_->microphone.microphone_payload_type,
+                .clock_rate = active_microphone_configuration_->microphone.clock_rate,
+                .channels = active_microphone_configuration_->microphone.channels,
+                .frame_samples = active_microphone_configuration_->microphone.frame_samples,
+                .forward_path = forward->path,
+                .forward_path_generation = forward->generation,
+                .feedback_ssrc = mapping->acknowledgement_ssrc,
+                .rtcp_cname = *rtcp_cname,
+                .inband_fec = active_microphone_configuration_->microphone.inband_fec,
+                .dtx = active_microphone_configuration_->microphone.dtx,
+              },
+              .forward_owner = forward,
+              .prior_forward_owner = prior_forward_owner,
+              .prior = std::move(microphone_runtime_),
+              .connection_generation = connection_generation,
+              .stream_generation = snapshot.generations.stream,
+              .revocation_generation = client.revocation_generation,
+              .state = MicrophoneActivationState::queued,
+              .required = active_microphone_required_,
+            };
+            microphone_condition_.notify_one();
           }
-          prior_microphone = std::move(microphone_runtime_);
-        }
-        if (attach_readiness_.active && attach_readiness_.successor_peer == peer &&
-            attach_readiness_.connection_generation == connection_generation &&
-            attach_readiness_.microphone_generation == acknowledgement.microphone_generation) {
-          attach_readiness_.microphone_terminal = true;
-          attach_readiness_.microphone_ready = microphone_runtime_ && microphone_runtime_->peer() == peer &&
-                                               microphone_runtime_->generation() == acknowledgement.microphone_generation;
         }
       }
       queue_microphone_retirement(std::move(prior_microphone));
-      complete_attach_readiness_if_possible();
+      if (required_failure) {
+        fail_required_video_session(peer);
+        return true;
+      }
+      if (readiness_changed) {
+        complete_attach_readiness_if_possible();
+      }
       return true;
     }
 
@@ -4717,10 +5142,14 @@ namespace lumen::lsp::runtime {
           process_control_sends();
           process_identity_rotation();
           if (datagram_result_requires_association_close(disposition)) {
+            BOOST_LOG(warning) << "LSP closing association after rejected datagram (class="
+                               << static_cast<unsigned>(packet_class) << ", result="
+                               << static_cast<unsigned>(disposition) << ").";
             (void) queue_association_close(datagram.peer);
           }
           process_pending_audio_retirements();
           process_pending_video_retirements();
+          process_pending_microphone_activations();
           process_pending_microphone_retirements();
           process_failed_forward_paths();
           process_pending_association_closes();
@@ -4747,6 +5176,7 @@ namespace lumen::lsp::runtime {
         process_dtls_timers(now);
         process_pending_audio_retirements();
         process_pending_video_retirements();
+        process_pending_microphone_activations();
         process_pending_microphone_retirements();
         process_failed_forward_paths();
         process_authenticated_receive_inactivity(now);
@@ -4965,6 +5395,7 @@ namespace lumen::lsp::runtime {
           peer = owner->peer;
         }
         if (dtls_) {
+          BOOST_LOG(warning) << "LSP closing association after fatal forward-path submission.";
           (void) dtls_->request_close(peer);
         }
       }
@@ -5003,6 +5434,9 @@ namespace lumen::lsp::runtime {
           continue;
         }
         if (dtls_) {
+          BOOST_LOG(warning) << "LSP renewing association after SRTP lifetime event (action="
+                             << static_cast<unsigned>(action) << ", direction="
+                             << static_cast<unsigned>(direction) << ").";
           (void) dtls_->close_association(owner->peer);
         }
       }
@@ -5186,28 +5620,6 @@ namespace lumen::lsp::runtime {
       }
     }
 
-    /** @brief Release one completion-ordered established DTLS record fence. */
-    static void dtls_forward_completed_callback(
-      void *context,
-      std::uint64_t,
-      HostForwardLane,
-      const HostForwardCompletion completion,
-      std::uint64_t,
-      std::size_t,
-      std::uint16_t
-    ) noexcept {
-      auto *owner = static_cast<ForwardPathGeneration *>(context);
-      if (owner == nullptr) {
-        return;
-      }
-      {
-        std::scoped_lock lock(owner->dtls_mutex);
-        owner->dtls_completion = completion;
-        owner->dtls_in_flight = false;
-      }
-      owner->dtls_condition.notify_all();
-    }
-
     static bool dtls_send_callback(
       void *context,
       const PeerEndpoint &peer,
@@ -5222,32 +5634,15 @@ namespace lumen::lsp::runtime {
         const auto deadline = now > std::numeric_limits<std::uint64_t>::max() - lifetime ?
                                 std::numeric_limits<std::uint64_t>::max() :
                                 now + lifetime;
-        std::unique_lock lock(forward->dtls_mutex);
-        if (!forward->dtls_condition.wait_for(lock, std::chrono::microseconds {lifetime}, [&]() {
-              return !forward->dtls_in_flight;
-            })) {
-          return false;
-        }
-        forward->dtls_in_flight = true;
-        forward->dtls_completion = HostForwardCompletion::fatal;
-        const auto submitted = forward->path->submit_copy(
-          lane,
-          datagram,
-          deadline,
-          0,
-          {.context = forward.get(), .completed = dtls_forward_completed_callback}
-        );
-        if (submitted != HostForwardSubmitResult::accepted) {
-          forward->dtls_in_flight = false;
-          forward->dtls_condition.notify_all();
-          return false;
-        }
-        if (!forward->dtls_condition.wait_for(lock, std::chrono::microseconds {lifetime}, [&]() {
-              return !forward->dtls_in_flight;
-            })) {
-          return false;
-        }
-        return forward->dtls_completion == HostForwardCompletion::sent;
+        // wolfSSL's send callback only needs the transient record bytes to be
+        // durably accepted by the transport owner. submit_copy() owns an exact
+        // copy and HostForwardPath preserves lane order, so waiting here for
+        // kernel completion would unnecessarily block the sole UDP/DTLS receive
+        // thread. A paced or transient kernel delay must not be reported to
+        // wolfSSL as an I/O failure and close an otherwise healthy association;
+        // final fatal completion still reaches forward_completed_callback().
+        return forward->path->submit_copy(lane, datagram, deadline, 0) ==
+               HostForwardSubmitResult::accepted;
       }
       return runtime.direct_dtls_output_allowed(peer) && runtime.socket_.send_datagram(peer, datagram);
     }
@@ -5383,6 +5778,7 @@ namespace lumen::lsp::runtime {
       std::unique_ptr<LspMicrophoneReceiver> microphone;
       {
         std::scoped_lock session_lock(runtime.session_mutex_);
+        runtime.cancel_microphone_activations_locked(peer);
         if (runtime.pending_inbound_path_probe_.active && runtime.pending_inbound_path_probe_.peer == peer) {
           runtime.pending_inbound_path_probe_ = {};
         }
@@ -5527,7 +5923,7 @@ namespace lumen::lsp::runtime {
               return false;
             }
             const auto input_accepted = runtime.input_owner_->receive_rtcp(peer, plaintext, received_at_microseconds);
-            const auto microphone_accepted = runtime.microphone_runtime_ &&
+            const auto microphone_accepted = !runtime.microphone_runtime_ ||
                                              runtime.microphone_runtime_->receive_rtcp(peer, plaintext);
             const auto video_accepted = sender.receive_compound_rtcp(plaintext, now);
             {
@@ -5764,10 +6160,13 @@ namespace lumen::lsp::runtime {
     std::size_t pending_association_close_count_ {};  ///< Live leading deferred-close entries.
     std::array<std::unique_ptr<ActiveAudioRuntime>, 64> pending_audio_retirements_ {};  ///< Quiescent audio owners awaiting callback-safe joins.
     std::array<std::unique_ptr<ActiveVideoRuntime>, 64> pending_video_retirements_ {};  ///< Video owners awaiting callback-safe capture/sender joins.
-    std::array<std::unique_ptr<LspMicrophoneReceiver>, 64> pending_microphone_retirements_ {};  ///< Microphone owners awaiting callback-safe destruction.
+    std::array<PendingMicrophoneRetirement, 64> pending_microphone_retirements_ {};  ///< Microphone owners awaiting callback-safe destruction.
+    std::array<PendingMicrophoneActivation, 4> pending_microphone_activations_ {};  ///< Bounded slow initialization handoffs.
     std::jthread repair_worker_;  ///< Dedicated NACK/PLI/FIR consumer outside session authority.
     std::condition_variable_any retirement_condition_;  ///< Wakes background joins for queued retained media.
     std::jthread retirement_worker_;  ///< Joins stopped media while socket/control processing continues.
+    std::condition_variable_any microphone_condition_;  ///< Wakes blocking microphone activation/retirement work.
+    std::jthread microphone_worker_;  ///< Owns platform microphone stop/probe/begin outside UDP callbacks.
     std::jthread worker_;  ///< Socket receive/control timer owner.
     std::atomic<bool> active_ {};  ///< Listener/worker availability.
     std::atomic<bool> stopping_ {};  ///< Idempotent full teardown ownership.

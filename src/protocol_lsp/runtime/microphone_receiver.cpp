@@ -10,6 +10,7 @@
 #include "../transport/rtcp.h"
 #include "host_congestion_feedback.h"
 #include "udp_socket.h"
+#include "src/logging.h"
 
 #include <algorithm>
 #include <array>
@@ -514,9 +515,16 @@ namespace lumen::lsp::runtime {
         .timestamp = rtp.header.timestamp,
         .kind = client_microphone::packet_kind_e::opus,
         .fixed_payload_size = static_cast<std::uint16_t>(payload.size()),
+        .discontinuity = rtp.header.marker,
       };
       std::ranges::copy(payload, microphone_packet.fixed_payload.begin());
-      if (receiver_->submit(std::move(microphone_packet)) != client_microphone::submit_result_e::accepted) {
+      const auto admission = receiver_->submit(std::move(microphone_packet));
+      if (admission != client_microphone::submit_result_e::accepted) {
+        if (!playout_rejection_logged_) {
+          BOOST_LOG(warning) << "LSP microphone playout rejected a packet (result="
+                             << static_cast<unsigned>(admission) << ").";
+          playout_rejection_logged_ = true;
+        }
         ++rejected_rtp_packets_;
         return true;
       }
@@ -635,6 +643,7 @@ namespace lumen::lsp::runtime {
     bool sequence_initialized_ {};  ///< Whether `highest_sequence_` has an origin.
     bool has_transit_ {};  ///< Whether jitter differencing has a prior transit sample.
     bool active_ {};  ///< Whether writer and receiver remain active.
+    bool playout_rejection_logged_ {};  ///< Bounds playout-admission diagnosis to one warning per generation.
   };
 
   std::unique_ptr<LspMicrophoneReceiver> LspMicrophoneReceiver::create(
@@ -654,7 +663,8 @@ namespace lumen::lsp::runtime {
         std::make_unique<client_microphone::opus_decoder_t>(),
         *sink,
         config.inband_fec,
-        client_microphone::FRAME_DURATION
+        client_microphone::FRAME_DURATION,
+        true
       );
       if (!receiver->reset(config.generation)) {
         receiver->shutdown();

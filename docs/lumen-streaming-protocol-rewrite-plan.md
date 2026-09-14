@@ -43,10 +43,107 @@ contracts.
 
 ## 0. Implementation status
 
-Last updated: 2026-09-13. This table is the durable progress ledger for the
+Last updated: 2026-09-14. This table is the durable progress ledger for the
 rewrite. A row moves to **Done** only after the named implementation and its
 smallest decisive verification both pass. Source-only scaffolding remains
 **In progress** until the real product boundary works.
+
+### September 14 resumed runtime repair
+
+The user resumed fixes after Moonlight disconnected normally at 00:12:56.
+GameStream subsequently reported `SUNSHINE_SERVER_FREE`, with no Moonlight or
+Umbra client process running. Build/deployment work is resumed; recheck idle
+state before replacing either host. Preserve configurations, pairings, VDD-off
+policy, signing identity, and rollback executables. The earlier failed
+rate-only deployment remains a failure, not a completed reconnect fix.
+
+- [x] Build and sign the client level-triggered socket-read correction.
+- [x] Finish and deploy nonblocking host DTLS output plus worker-owned
+  microphone activation/retirement, retaining exact forward/SRTP lifetimes.
+- [x] Deploy first/last-session Virtual HID ownership to **both** daemons.
+  Real Moonlight connected at 00:49:37, acquired Virtual HID, decoded HEVC
+  through VideoToolbox/Metal, and shut down normally; the LSP daemon stayed
+  idle/running throughout. LSP subsequently acquired the same driver.
+- [x] Build/install real audio underrun/rebuffer counters and bounded
+  post-underrun refill while preserving one-packet initial preroll. Three
+  existing audio-buffering regressions pass; live audio durability is pending.
+- [x] Build/install AWDL helper invalid-connection recovery while retaining
+  the acquire-to-release connection lease. Effective interface disable and
+  restoration remain part of the next live check.
+- [x] Run real LSP startup with microphone, observe sustained generations and
+  audio counters, then exercise normal stop/start and legacy compatibility.
+
+Live corrections and evidence:
+
+- The first async-microphone deployment exposed a startup race: a valid
+  microphone sender report could arrive before the worker published its
+  device. RTCP authority incorrectly depended on that device existing, and
+  the callback's false result closed the entire association. Authority now
+  uses the exact negotiated microphone SSRC and current session/association;
+  an unready sink does not invalidate the authenticated report.
+- The remaining microphone-only reconnect matched the client's 512-record
+  send ledger wrapping at 20 ms cadence (10.24 seconds). An old unreported
+  packet made a successful new send return terminal resource exhaustion.
+  The bounded ledger now retires that old record as lost feedback, corrects
+  bytes-in-flight, and continues. Early feedback missing the initial compound
+  RTCP authority barrier is a plausible source of stale records, not separately
+  proven packet-by-packet.
+- The final 00:50:50 microphone-required run exceeded 150 seconds with all
+  media on generation 1, zero reconnect attempts, 7,689 accepted microphone
+  packets, zero microphone reject/decode/sink/PLC errors, and 4,909 sent video
+  frames without host pressure/deadline/decoder drops. The test sound delivered
+  118 Opus packets with zero host audio expiry/loss. Silent Desktop periods
+  produce client empty-audio callbacks; their counters must not be described
+  as confirmed audible gameplay dropouts. These are Desktop/sound transport
+  results, not sustained gameplay or physical input-to-photon qualification.
+- Legacy executable: `3FEA004F20CBE41E86F393EA05110148C03DD91C7BCEA04DF4B1102308CF5A24`.
+  Latest isolated LSP executable:
+  `DA68E135079081EC585599389CE2BE7167D4826FF0D933A8B6D5A9E486ECEB6E`.
+  Both retain adjacent hash-named rollback executables and original configs.
+- AWDL disable/restore worked during initial LSP-only testing. Switching from
+  Moonlight exposed the already-down fast-path skipping lease acquisition;
+  a later external restoration could leave AWDL up during LSP. The client now
+  always takes the approved helper lease, and the helper reasserts DOWN while
+  leases exist. The same approved job was reloaded with `launchctl kickstart`
+  without a new password/registration prompt. Real subsequent starts held
+  AWDL DOWN and normal STOP restored UP; all three existing lifecycle tests
+  pass. Forced external re-enable was not injected during live verification.
+- A later microphone restart showed intermittent packet rejection/silence
+  without reconnect; the following instrumented run did not reproduce it.
+  A deterministic receiver regression nevertheless establishes the
+  one-frame-late deadline-phase defect. Bounded LSP mode now rephases only an
+  empty queue's exactly one-frame-late, timestamp-consistent, never-previously-
+  admitted packet. The decoder resets, the sink stays open, and preroll is
+  bounded to one frame. All 22 targeted receiver tests pass, including legacy
+  behavior and replay rejection. This is not a claim that every historical
+  microphone reject was proven to have that cause.
+- The 20-second host sound loop reached client decode/playout without a
+  transport reconnect. Rebuffer count was one during the loop and two after
+  the source stopped; idle empty callbacks are not treated as audible loss.
+- Latest deployed isolated executable after the guarded late-frame repair:
+  `F31FFEBFA221C1D95A6A7366803199A29F62FE8E8A3AC1413E540BBACE63ED2A`.
+  Signed Umbra is installed at `/Applications/Umbra.app`; the prior complete
+  bundle and host binaries remain recoverable. Final gameplay/physical input
+  and audible-quality confirmation still require the user's actual use.
+- Final handoff run started at 01:13:14 and remains open for the user. At
+  68 seconds it had zero reconnects/authentication failures, all media on
+  generation 1, 3,404 accepted microphone packets with zero rejection/decode/
+  sink errors, one microphone silence frame, and 2,167 sent video frames with
+  zero host pressure/deadline/decoder drops. AWDL was confirmed DOWN. Do not
+  restart this user-facing handoff stream without new direction.
+- Signed milestone commit failed with `1Password: failed to fill whole buffer`.
+  Changes remain staged/preserved; signing was not silently bypassed.
+
+The signed installed client also completed fresh authenticated application
+browsing and returned Desktop in under one second before host deployment.
+The current macOS build still emits the previously recorded deployment-target
+warnings from legacy Homebrew OpenSSL objects; this is not a release-wide
+packaging qualification claim.
+
+Additional read-only reboot evidence found no recent WHEA/BugCheck/display
+error or new minidump accompanying the 23:14 unexpected restart. The latest
+minidump predates this incident by months. Its underlying cause is still
+unknown; no reboot/driver-change remedy is claimed.
 
 ### Resumption checkpoint — 2026-09-11
 
@@ -689,6 +786,65 @@ LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorize
 ### September 13 input, readable statistics, and stutter follow-up
 
 Latest live correction (19:31, supersedes earlier input-cause hypotheses below):
+
+Latest protected-Moonlight follow-up:
+
+- The user reports that the deployed reconnect patch did not resolve full
+  stream-restart freezes or audio gaps. The rate-only Windows executable was
+  SHA256 `F9D9AFF5A51DBD4502EFC193E4D791604036BF35B7A64BC1B3665D3555923C52`.
+  Do not describe that deployment as a successful runtime fix.
+- Source-only follow-up removes EV_CLEAR from Umbra's bounded socket-read
+  loop, and removes Lumen's synchronous DTLS wait for paced kernel submission.
+  Both remove concrete starvation/premature-close risks; neither is live-proven
+  as the sole cause. Microphone activation off the UDP owner is still being
+  implemented. No further builds/deployments/restarts are permitted while the
+  user is gaming in Moonlight.
+- Moonlight's Virtual HID regression is consistent with the two deployed
+  daemons still claiming the globally exclusive driver at startup. The pending
+  first/last input-session patch must reach both daemons (or one combined host)
+  to fix this durably; current-session ownership must not be disturbed.
+- Read-only investigation of the later Moonlight drop found Windows booted at
+  `2026-09-13T23:14:16.5000000+08:00`, with Kernel-Power 41 and EventLog 6008.
+  BugcheckCode was zero and no planned-restart event appeared in that query;
+  the underlying unexpected-shutdown cause remains unknown. No agent restart
+  or deployment was issued during this protected background-work period.
+  Legacy Lumen returned as PID 10504 and its 23:14:53 startup log selected
+  Lumen Virtual HID; the isolated LSP process returned as PID 10488.
+
+Source-only reconnect repair — user is gaming; no build, restart, or deployment:
+
+- Read-only samples confirmed six automatic reconnects (11 to 17), media
+  generations advancing from 5 to 11, and a latest recovery duration of
+  1,080,674 us. Client input-rate timeout logs coincide with those recoveries.
+- The source input-rate handler recalculated a 64-device budget after each
+  one-hertz reduction, potentially reducing a 16 kHz offer back to 1 kHz before
+  acknowledging it. Replace this with direct sensor-first/state-second budget
+  reduction while preserving minimum rates and whole-packet/IP byte accounting.
+- Receipt-ACK input-rate requests in the DTLS callback, retain one exact pending
+  request per association, ACK exact duplicates, and perform semantic rate
+  selection in tick() after the UDP owner flushes receipts. Conflicting reuse,
+  permissions, and generation checks remain intact. Start response retention
+  from the post-handler time instead of backdating it to request receipt.
+- Status: source patch prepared and source-reviewed, with regression cases for
+  16 kHz to 1 kHz selection, rounding, minimums, sensor-first reduction, sensor
+  fallback saturation, and IPv4/IPv6 costs. Formatting/diff checks pass.
+  Compiling, running tests, and live verification/deployment are deliberately
+  deferred until the user permits them. The currently running app and host
+  have not been altered. Prior unrelated microphone/input-lifecycle edits remain
+  preserved separately in the worktree.
+
+Build permission resumed for the reconnect repair:
+
+- The user now permits builds/restarts. All nine focused budget regressions
+  passed using the current production calculation; no monolithic suite was run.
+- The Windows two-job build is running from `/tmp/lsp-reconnect.h996N7`'s staged
+  source archive. It contains the control ACK/deadline and budget fixes only;
+  the pending microphone and first/last input-session ownership work is not
+  included. Local pending edits are preserved. The existing precise SendInput
+  error initialization is retained in the staged Windows transport.
+- Deployment will replace only `LumenLSPLive`, wait for its UDP listener, and
+  preserve the legacy service and game processes. Runtime verification remains
+  pending until the new executable is installed and reconnect counters are read.
 
 - [ ] New AWDL requirement supersedes the per-stream administrator prompt:
   authorize once during setup, then use a narrowly restricted authenticated

@@ -357,10 +357,17 @@ namespace input::detail {
     /**
      * @brief Register one active input session.
      *
+     * The callback executes under the registration mutex only when the session
+     * is the first active owner, preventing last-release from racing acquisition.
+     *
+     * @param start_shared_transport Callback that acquires shared platform transport.
      * @return Unique nonzero session identifier.
      */
-    session_id_t register_session() {
+    session_id_t register_session(const std::function<void()> &start_shared_transport = {}) {
       std::lock_guard lock(mutex_);
+      if (active_.empty() && start_shared_transport) {
+        start_shared_transport();
+      }
       const auto id = next_id_++;
       active_.insert(id);
       return id;
