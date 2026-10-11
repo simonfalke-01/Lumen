@@ -6,55 +6,106 @@
 #include <gtest/gtest.h>
 
 #ifdef _WIN32
-#include "src/platform/windows/wasapi_virtual_microphone.h"
+  #include "src/platform/windows/wasapi_virtual_microphone.h"
 
-#include <array>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <limits>
-#include <string>
-#include <vector>
+  #include <array>
+  #include <cstddef>
+  #include <cstdint>
+  #include <cstring>
+  #include <limits>
+  #include <string>
+  #include <vector>
 
 namespace platf::win_audio {
-  TEST(WasapiVirtualMicrophone, SelectsOnlyACompleteWhitelistedPair) {
-    const std::vector<std::wstring> renders {
-      L"CABLE Input (VB-Audio Virtual Cable)",
-    };
-    const std::vector<std::wstring> captures {
-      L"CABLE Output (VB-Audio Virtual Cable)",
-    };
-    const auto *pair = select_wasapi_virtual_microphone_pair(renders, captures);
-    ASSERT_NE(pair, nullptr);
-    EXPECT_EQ(pair->render_name, L"CABLE Input (VB-Audio Virtual Cable)");
-    EXPECT_EQ(pair->capture_name, L"CABLE Output (VB-Audio Virtual Cable)");
+  namespace {
+    constexpr GUID CONTAINER_A {0x10203040, 0x5060, 0x7080, {0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x01}};
+    constexpr GUID CONTAINER_B {0x10203040, 0x5060, 0x7080, {0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x02}};
+  }  // namespace
 
-    const std::vector<std::wstring> empty;
-    const std::vector<std::wstring> untrusted {L"Untrusted Virtual Input"};
-    EXPECT_EQ(select_wasapi_virtual_microphone_pair(renders, empty), nullptr);
-    EXPECT_EQ(select_wasapi_virtual_microphone_pair(untrusted, captures), nullptr);
+  TEST(WasapiVirtualMicrophone, SelectsOnlyACompleteWhitelistedPair) {
+    const std::vector<wasapi_endpoint_identity_t> renders {
+      {L"render", L"CABLE Input (VB-Audio Virtual Cable)", L"VB-Audio Virtual Cable", CONTAINER_A},
+    };
+    const std::vector<wasapi_endpoint_identity_t> captures {
+      {L"capture", L"CABLE Output (VB-Audio Virtual Cable)", L"VB-Audio Virtual Cable", CONTAINER_A},
+    };
+    const auto *render = select_wasapi_virtual_microphone_endpoint(
+      renders,
+      captures,
+      wasapi_virtual_microphone_kind_e::vb_cable
+    );
+    ASSERT_NE(render, nullptr);
+    EXPECT_EQ(render->device_id, L"render");
+
+    const std::vector<wasapi_endpoint_identity_t> empty;
+    const std::vector<wasapi_endpoint_identity_t> untrusted {
+      {L"untrusted", L"CABLE Input (VB-Audio Virtual Cable)", L"Untrusted adapter", CONTAINER_A},
+    };
+    EXPECT_EQ(
+      select_wasapi_virtual_microphone_endpoint(renders, empty, wasapi_virtual_microphone_kind_e::vb_cable),
+      nullptr
+    );
+    EXPECT_EQ(
+      select_wasapi_virtual_microphone_endpoint(untrusted, captures, wasapi_virtual_microphone_kind_e::vb_cable),
+      nullptr
+    );
   }
 
-  TEST(WasapiVirtualMicrophone, PrefersSteamWhenBothExactPairsExist) {
-    const std::vector<std::wstring> renders {
-      L"CABLE Input (VB-Audio Virtual Cable)",
-      L"Speakers (Steam Streaming Microphone)",
+  TEST(WasapiVirtualMicrophone, SelectsLocalizedSteamEndpointsByStableAdapterIdentity) {
+    const std::vector<wasapi_endpoint_identity_t> renders {
+      {L"vb-render", L"CABLE Input (VB-Audio Virtual Cable)", L"VB-Audio Virtual Cable", CONTAINER_A},
+      {L"steam-render", L"\u626c\u58f0\u5668 (Steam Streaming Microphone)", L"Steam Streaming Microphone", CONTAINER_B},
     };
-    const std::vector<std::wstring> captures {
-      L"CABLE Output (VB-Audio Virtual Cable)",
-      L"Microphone (Steam Streaming Microphone)",
+    const std::vector<wasapi_endpoint_identity_t> captures {
+      {L"vb-capture", L"CABLE Output (VB-Audio Virtual Cable)", L"VB-Audio Virtual Cable", CONTAINER_A},
+      {L"steam-capture", L"\u9ea6\u514b\u98ce (Steam Streaming Microphone)", L"Steam Streaming Microphone", CONTAINER_B},
     };
-    const auto *pair = select_wasapi_virtual_microphone_pair(renders, captures);
-    ASSERT_NE(pair, nullptr);
-    EXPECT_EQ(pair->render_name, L"Speakers (Steam Streaming Microphone)");
+    const auto *render = select_wasapi_virtual_microphone_endpoint(
+      renders,
+      captures,
+      wasapi_virtual_microphone_kind_e::steam
+    );
+    ASSERT_NE(render, nullptr);
+    EXPECT_EQ(render->device_id, L"steam-render");
+  }
+
+  TEST(WasapiVirtualMicrophone, DoesNotFallThroughOrCrossAdapterContainers) {
+    const std::vector<wasapi_endpoint_identity_t> renders {
+      {L"steam-render", L"\u626c\u58f0\u5668 (Steam Streaming Microphone)", L"Steam Streaming Microphone", CONTAINER_A},
+      {L"vb-render", L"CABLE Input (VB-Audio Virtual Cable)", L"VB-Audio Virtual Cable", CONTAINER_B},
+    };
+    const std::vector<wasapi_endpoint_identity_t> mismatched_captures {
+      {L"steam-capture", L"\u9ea6\u514b\u98ce (Steam Streaming Microphone)", L"Steam Streaming Microphone", CONTAINER_B},
+      {L"vb-capture", L"CABLE Output (VB-Audio Virtual Cable)", L"VB-Audio Virtual Cable", CONTAINER_B},
+    };
+
+    EXPECT_EQ(
+      select_wasapi_virtual_microphone_endpoint(
+        renders,
+        mismatched_captures,
+        wasapi_virtual_microphone_kind_e::steam
+      ),
+      nullptr
+    );
+    const auto *vb_render = select_wasapi_virtual_microphone_endpoint(
+      renders,
+      mismatched_captures,
+      wasapi_virtual_microphone_kind_e::vb_cable
+    );
+    ASSERT_NE(vb_render, nullptr);
+    EXPECT_EQ(vb_render->device_id, L"vb-render");
   }
 
   TEST(WasapiVirtualMicrophone, FrameRingIsBoundedAlignedAndWrapsWithoutLoss) {
     wasapi_frame_ring_t ring;
     ASSERT_TRUE(ring.reset(4, 2));
     const std::array<std::byte, 6> first {
-      std::byte {1}, std::byte {2}, std::byte {3},
-      std::byte {4}, std::byte {5}, std::byte {6},
+      std::byte {1},
+      std::byte {2},
+      std::byte {3},
+      std::byte {4},
+      std::byte {5},
+      std::byte {6},
     };
     ASSERT_TRUE(ring.push(first));
     EXPECT_EQ(ring.size_frames(), 3U);
@@ -65,8 +116,12 @@ namespace platf::win_audio {
     EXPECT_EQ(output[3], std::byte {4});
 
     const std::array<std::byte, 6> second {
-      std::byte {7}, std::byte {8}, std::byte {9},
-      std::byte {10}, std::byte {11}, std::byte {12},
+      std::byte {7},
+      std::byte {8},
+      std::byte {9},
+      std::byte {10},
+      std::byte {11},
+      std::byte {12},
     };
     ASSERT_TRUE(ring.push(second));
     EXPECT_EQ(ring.size_frames(), 4U);
@@ -76,8 +131,14 @@ namespace platf::win_audio {
     std::array<std::byte, 8> remaining {};
     EXPECT_EQ(ring.pop(remaining), 4U);
     const std::array<std::byte, 8> expected {
-      std::byte {5}, std::byte {6}, std::byte {7}, std::byte {8},
-      std::byte {9}, std::byte {10}, std::byte {11}, std::byte {12},
+      std::byte {5},
+      std::byte {6},
+      std::byte {7},
+      std::byte {8},
+      std::byte {9},
+      std::byte {10},
+      std::byte {11},
+      std::byte {12},
     };
     EXPECT_EQ(remaining, expected);
   }

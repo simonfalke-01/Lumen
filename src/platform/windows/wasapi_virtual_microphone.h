@@ -13,10 +13,17 @@
 #include <memory>
 #include <span>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace platf::win_audio {
+  /**
+   * @brief Supported exact WASAPI client-microphone destinations.
+   */
+  enum class wasapi_virtual_microphone_kind_e {
+    steam,  ///< Steam Streaming Microphone render/capture adapter.
+    vb_cable  ///< VB-Audio Virtual Cable render/capture pair.
+  };
+
   /**
    * @brief Supported endpoint sample encodings for mono microphone conversion.
    */
@@ -38,23 +45,27 @@ namespace platf::win_audio {
   };
 
   /**
-   * @brief One exact render/capture virtual-cable identity.
+   * @brief Stable identity fields for one active WASAPI endpoint.
    */
-  struct wasapi_endpoint_pair_t {
-    std::wstring_view render_name;  ///< Exact active render endpoint friendly name.
-    std::wstring_view capture_name;  ///< Exact active paired capture endpoint friendly name.
+  struct wasapi_endpoint_identity_t {
+    std::wstring device_id;  ///< Exact MMDevice identifier used to reopen the endpoint.
+    std::wstring friendly_name;  ///< Localized endpoint label used only for diagnostics.
+    std::wstring adapter_name;  ///< Stable device-interface friendly name.
+    GUID container_id {};  ///< Physical or virtual adapter container shared across endpoint flows.
   };
 
   /**
-   * @brief Select the first complete exact virtual-cable pair in security preference order.
+   * @brief Select the exact render endpoint whose capture peer belongs to the same allowed adapter.
    *
-   * @param render_names Active render endpoint friendly names.
-   * @param capture_names Active capture endpoint friendly names.
-   * @return Selected pair, or `nullptr` when no complete whitelisted pair exists.
+   * @param render_endpoints Active render endpoint identities.
+   * @param capture_endpoints Active capture endpoint identities.
+   * @param kind Configured destination kind.
+   * @return Selected render identity, or `nullptr` when no complete exact pair exists.
    */
-  [[nodiscard]] const wasapi_endpoint_pair_t *select_wasapi_virtual_microphone_pair(
-    std::span<const std::wstring> render_names,
-    std::span<const std::wstring> capture_names
+  [[nodiscard]] const wasapi_endpoint_identity_t *select_wasapi_virtual_microphone_endpoint(
+    std::span<const wasapi_endpoint_identity_t> render_endpoints,
+    std::span<const wasapi_endpoint_identity_t> capture_endpoints,
+    wasapi_virtual_microphone_kind_e kind
   ) noexcept;
 
   /**
@@ -192,8 +203,9 @@ namespace platf::win_audio {
   };
 
   /**
-   * @brief Create the exact-pair, event-driven WASAPI virtual microphone fallback.
+   * @brief Create the exact-pair, event-driven WASAPI virtual microphone sink.
+   * @param kind Configured destination kind.
    * @return Unprobed fallback sink.
    */
-  std::unique_ptr<virtual_microphone_sink_t> make_wasapi_virtual_microphone();
+  std::unique_ptr<virtual_microphone_sink_t> make_wasapi_virtual_microphone(wasapi_virtual_microphone_kind_e kind);
 }  // namespace platf::win_audio

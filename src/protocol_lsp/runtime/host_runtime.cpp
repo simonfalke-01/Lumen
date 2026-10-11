@@ -2116,7 +2116,7 @@ namespace lumen::lsp::runtime {
   #ifdef _WIN32
       if (config::audio.client_microphone) {
         try {
-          auto sink = platf::win_audio::make_virtual_microphone();
+          auto sink = platf::win_audio::make_virtual_microphone(config::audio.client_microphone_sink);
           available = sink && sink->probe();
         } catch (...) {
           available = false;
@@ -3058,7 +3058,7 @@ namespace lumen::lsp::runtime {
           BOOST_LOG(warning) << "LSP microphone activation failed: acknowledged receiver snapshot is no longer valid"sv;
           return nullptr;
         }
-        auto sink = platf::win_audio::make_virtual_microphone();
+        auto sink = platf::win_audio::make_virtual_microphone(config::audio.client_microphone_sink);
         if (!sink) {
           BOOST_LOG(warning) << "LSP microphone activation failed: virtual microphone allocation failed"sv;
           return nullptr;

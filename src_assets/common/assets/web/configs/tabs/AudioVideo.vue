@@ -72,12 +72,14 @@ const config = ref(props.config)
                   v-model="config.client_microphone"
                   default="false"
         ></Checkbox>
-        <div class="form-text mb-3">
-          {{ $t('config.client_microphone_vb_cable_help') }}
-          <a href="https://vb-audio.com/Cable/" target="_blank" rel="noopener noreferrer">
-            {{ $t('config.client_microphone_vb_cable_link') }}
-          </a>
-          {{ $t('config.client_microphone_vb_cable_note') }}
+        <div class="mb-3">
+          <label for="client_microphone_sink" class="form-label">{{ $t('config.client_microphone_sink') }}</label>
+          <select id="client_microphone_sink" class="form-select" v-model="config.client_microphone_sink">
+            <option value="steam">{{ $t('config.client_microphone_sink_steam') }}</option>
+            <option value="vb-cable">{{ $t('config.client_microphone_sink_vb_cable') }}</option>
+            <option value="lumen-driver">{{ $t('config.client_microphone_sink_lumen_driver') }}</option>
+          </select>
+          <div class="form-text">{{ $t('config.client_microphone_sink_desc') }}</div>
         </div>
       </template>
     </PlatformLayout>

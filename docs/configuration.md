@@ -1001,8 +1001,8 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Accepts an authenticated microphone stream from a compatible client and exposes it through the
-            Lumen Virtual Microphone capture endpoint.
+            Accepts an authenticated microphone stream from a compatible client and sends it to the configured
+            Windows microphone destination.
             @note{This option is only supported on Windows and is advertised to clients only when the virtual
             microphone backend is available.}
         </td>
@@ -1017,6 +1017,32 @@ The key retains its upstream name for compatibility with existing configuration 
         <td>Example</td>
         <td colspan="2">@code{}
             client_microphone = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### client_microphone_sink
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Selects the exact Windows destination that receives authenticated client microphone audio.
+            Supported values are `steam`, `vb-cable`, and `lumen-driver`. Lumen does not silently switch to
+            another destination when the selected device is unavailable; microphone requests are rejected instead.
+            @note{This option is only supported on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            steam
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            client_microphone_sink = vb-cable
             @endcode</td>
     </tr>
 </table>

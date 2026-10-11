@@ -384,6 +384,13 @@ TEST(VirtualMicrophoneConstructionTest, RejectsNullChannel) {
   );
 }
 
+TEST(VirtualMicrophoneConstructionTest, CreatesOnlyTheExactConfiguredDestination) {
+  EXPECT_NE(platf::win_audio::make_virtual_microphone("steam"), nullptr);
+  EXPECT_NE(platf::win_audio::make_virtual_microphone("vb-cable"), nullptr);
+  EXPECT_NE(platf::win_audio::make_virtual_microphone("lumen-driver"), nullptr);
+  EXPECT_EQ(platf::win_audio::make_virtual_microphone("automatic"), nullptr);
+}
+
 #else
 TEST(VirtualMicrophoneTest, IsWindowsOnly) {
   GTEST_SKIP() << "Windows virtual microphone transport is not available on this platform";

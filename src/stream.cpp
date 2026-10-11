@@ -202,7 +202,7 @@ namespace stream {
 
   bool client_microphone_available() {
 #ifdef _WIN32
-    auto microphone = platf::win_audio::make_virtual_microphone();
+    auto microphone = platf::win_audio::make_virtual_microphone(config::audio.client_microphone_sink);
     return microphone && microphone->probe();
 #else
     return false;
@@ -3219,7 +3219,10 @@ namespace stream {
 
 #ifdef _WIN32
           try {
-            session->microphone.sink = platf::win_audio::make_virtual_microphone();
+            session->microphone.sink = platf::win_audio::make_virtual_microphone(config::audio.client_microphone_sink);
+            if (!session->microphone.sink) {
+              throw std::invalid_argument("Unsupported client microphone destination: " + config::audio.client_microphone_sink);
+            }
             session->microphone.receiver = std::make_unique<client_microphone::receiver_t>(
               std::make_unique<client_microphone::opus_decoder_t>(),
               *session->microphone.sink

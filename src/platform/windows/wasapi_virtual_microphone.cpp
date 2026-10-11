@@ -10,10 +10,13 @@
 
 // platform includes
 #include <Audioclient.h>
+#include <ksmedia.h>
 #include <Mmdeviceapi.h>
 #include <Propsys.h>
 #include <Windows.h>
-#include <ksmedia.h>
+
+// Declares the undocumented endpoint format policy interface; keep after the platform headers.
+#include "PolicyConfig.h"
 
 // standard includes
 #include <algorithm>
@@ -44,13 +47,21 @@ namespace platf::win_audio {
       {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
       14,
     };  ///< Local value of PKEY_Device_FriendlyName without a new library dependency.
+    constexpr PROPERTYKEY DEVICE_INTERFACE_FRIENDLY_NAME_KEY {
+      {0x026e516e, 0xb814, 0x414b, {0x83, 0xcd, 0x85, 0x6d, 0x6f, 0xef, 0x48, 0x22}},
+      2,
+    };  ///< Local value of PKEY_DeviceInterface_FriendlyName without a new library dependency.
+    constexpr PROPERTYKEY DEVICE_CONTAINER_ID_KEY {
+      {0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}},
+      2,
+    };  ///< Local value of PKEY_Device_ContainerId without a new library dependency.
+    constexpr PROPERTYKEY AUDIO_ENGINE_DEVICE_FORMAT_KEY {
+      {0xf19f064d, 0x082c, 0x4e27, {0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c}},
+      0,
+    };  ///< Local value of PKEY_AudioEngine_DeviceFormat without a new library dependency.
 
-    constexpr std::array ENDPOINT_PAIRS {
-      wasapi_endpoint_pair_t {L"Speakers (Steam Streaming Microphone)", L"Microphone (Steam Streaming Microphone)"},
-      wasapi_endpoint_pair_t {L"Steam Streaming Microphone", L"Steam Streaming Microphone"},
-      wasapi_endpoint_pair_t {L"CABLE Input (VB-Audio Virtual Cable)", L"CABLE Output (VB-Audio Virtual Cable)"},
-      wasapi_endpoint_pair_t {L"CABLE Input (VB-Audio Virtual Cable)", L"CABLE Output"},
-    };  ///< Exact security allowlist in preference order.
+    constexpr auto STEAM_STREAMING_MICROPHONE_ADAPTER = L"Steam Streaming Microphone"sv;  ///< Stable nonlocalized adapter name.
+    constexpr auto VB_CABLE_ADAPTER = L"VB-Audio Virtual Cable"sv;  ///< Stable nonlocalized adapter name.
 
     /**
      * @brief MTA lifetime that outlives every subsequently constructed COM pointer in its scope.
@@ -233,19 +244,16 @@ namespace platf::win_audio {
     }
 
     /**
-     * @brief Read the exact endpoint friendly name.
-     * @param device Endpoint device.
-     * @return Friendly name on success.
+     * @brief Read one exact string property.
+     * @param properties Open endpoint property store.
+     * @param key Property key.
+     * @return String value on success.
      */
-    [[nodiscard]] std::optional<std::wstring> endpoint_friendly_name(IMMDevice &device) {
-      com_ptr_t<IPropertyStore> properties;
-      if (FAILED(device.OpenPropertyStore(STGM_READ, properties.put()))) {
-        return std::nullopt;
-      }
-
+    [[nodiscard]] std::optional<std::wstring> string_property(IPropertyStore &properties, const PROPERTYKEY &key) {
       PROPVARIANT value {};
-      const auto result = properties->GetValue(DEVICE_FRIENDLY_NAME_KEY, &value);
+      const auto result = properties.GetValue(key, &value);
       if (FAILED(result)) {
+        PropVariantClear(&value);
         return std::nullopt;
       }
 
@@ -258,12 +266,66 @@ namespace platf::win_audio {
     }
 
     /**
-     * @brief Enumerate active endpoint names for one data flow.
+     * @brief Read one exact GUID property.
+     * @param properties Open endpoint property store.
+     * @param key Property key.
+     * @return GUID value on success.
+     */
+    [[nodiscard]] std::optional<GUID> guid_property(IPropertyStore &properties, const PROPERTYKEY &key) {
+      PROPVARIANT value {};
+      const auto result = properties.GetValue(key, &value);
+      if (FAILED(result)) {
+        PropVariantClear(&value);
+        return std::nullopt;
+      }
+
+      std::optional<GUID> guid;
+      if (value.vt == VT_CLSID && value.puuid) {
+        guid = *value.puuid;
+      }
+      PropVariantClear(&value);
+      return guid;
+    }
+
+    /**
+     * @brief Read the stable identity fields required to authorize one endpoint.
+     * @param device Endpoint device.
+     * @return Complete identity on success.
+     */
+    [[nodiscard]] std::optional<wasapi_endpoint_identity_t> endpoint_identity(IMMDevice &device) {
+      LPWSTR raw_device_id = nullptr;
+      if (FAILED(device.GetId(&raw_device_id)) || !raw_device_id) {
+        CoTaskMemFree(raw_device_id);
+        return std::nullopt;
+      }
+      std::wstring device_id {raw_device_id};
+      CoTaskMemFree(raw_device_id);
+
+      com_ptr_t<IPropertyStore> properties;
+      if (FAILED(device.OpenPropertyStore(STGM_READ, properties.put()))) {
+        return std::nullopt;
+      }
+      const auto adapter_name = string_property(*properties.get(), DEVICE_INTERFACE_FRIENDLY_NAME_KEY);
+      const auto container_id = guid_property(*properties.get(), DEVICE_CONTAINER_ID_KEY);
+      if (!adapter_name || !container_id) {
+        return std::nullopt;
+      }
+      auto friendly_name = string_property(*properties.get(), DEVICE_FRIENDLY_NAME_KEY);
+      return wasapi_endpoint_identity_t {
+        std::move(device_id),
+        friendly_name ? std::move(*friendly_name) : std::wstring {},
+        *adapter_name,
+        *container_id,
+      };
+    }
+
+    /**
+     * @brief Enumerate active endpoint identities for one data flow.
      * @param enumerator MMDevice enumerator.
      * @param flow Render or capture flow.
-     * @return Every friendly name successfully read.
+     * @return Every complete stable identity successfully read.
      */
-    [[nodiscard]] std::vector<std::wstring> enumerate_endpoint_names(
+    [[nodiscard]] std::vector<wasapi_endpoint_identity_t> enumerate_endpoint_identities(
       IMMDeviceEnumerator &enumerator,
       EDataFlow flow
     ) {
@@ -277,49 +339,17 @@ namespace platf::win_audio {
         return {};
       }
 
-      std::vector<std::wstring> names;
-      names.reserve(count);
+      std::vector<wasapi_endpoint_identity_t> identities;
+      identities.reserve(count);
       for (UINT index = 0; index < count; ++index) {
         com_ptr_t<IMMDevice> device;
         if (SUCCEEDED(collection->Item(index, device.put()))) {
-          if (auto name = endpoint_friendly_name(*device.get())) {
-            names.emplace_back(std::move(*name));
+          if (auto identity = endpoint_identity(*device.get())) {
+            identities.emplace_back(std::move(*identity));
           }
         }
       }
-      return names;
-    }
-
-    /**
-     * @brief Find one active render endpoint by exact friendly name.
-     * @param enumerator MMDevice enumerator.
-     * @param name Exact friendly name.
-     * @return Owned matching device.
-     */
-    [[nodiscard]] com_ptr_t<IMMDevice> find_render_endpoint(
-      IMMDeviceEnumerator &enumerator,
-      std::wstring_view name
-    ) {
-      com_ptr_t<IMMDeviceCollection> collection;
-      if (FAILED(enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, collection.put()))) {
-        return {};
-      }
-
-      UINT count = 0;
-      if (FAILED(collection->GetCount(&count))) {
-        return {};
-      }
-
-      for (UINT index = 0; index < count; ++index) {
-        com_ptr_t<IMMDevice> device;
-        if (SUCCEEDED(collection->Item(index, device.put()))) {
-          const auto candidate = endpoint_friendly_name(*device.get());
-          if (candidate && *candidate == name) {
-            return device;
-          }
-        }
-      }
-      return {};
+      return identities;
     }
 
     /**
@@ -345,7 +375,7 @@ namespace platf::win_audio {
         subformat = extensible.SubFormat;
         tag = IsEqualGUID(subformat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? WAVE_FORMAT_IEEE_FLOAT :
               IsEqualGUID(subformat, KSDATAFORMAT_SUBTYPE_PCM)        ? WAVE_FORMAT_PCM :
-                                                                       0;
+                                                                        0;
         bits = extensible.Format.wBitsPerSample;
       }
 
@@ -379,10 +409,178 @@ namespace platf::win_audio {
     }
 
     /**
-     * @brief Discover the preferred complete exact endpoint pair and supported render format.
+     * @brief Read the shared-mode engine format of one endpoint.
+     * @param enumerator MMDevice enumerator.
+     * @param device_id Exact endpoint identifier.
+     * @return Copied device format on success.
+     */
+    [[nodiscard]] std::optional<WAVEFORMATEXTENSIBLE> endpoint_device_format(
+      IMMDeviceEnumerator &enumerator,
+      const std::wstring &device_id
+    ) {
+      com_ptr_t<IMMDevice> device;
+      com_ptr_t<IPropertyStore> properties;
+      if (FAILED(enumerator.GetDevice(device_id.c_str(), device.put())) ||
+          FAILED(device->OpenPropertyStore(STGM_READ, properties.put()))) {
+        return std::nullopt;
+      }
+
+      PROPVARIANT value {};
+      if (FAILED(properties->GetValue(AUDIO_ENGINE_DEVICE_FORMAT_KEY, &value))) {
+        PropVariantClear(&value);
+        return std::nullopt;
+      }
+      std::optional<WAVEFORMATEXTENSIBLE> format;
+      if (value.vt == VT_BLOB && value.blob.pBlobData && value.blob.cbSize >= sizeof(WAVEFORMATEX)) {
+        WAVEFORMATEXTENSIBLE copy {};
+        std::memcpy(&copy, value.blob.pBlobData, std::min<std::size_t>(value.blob.cbSize, sizeof(copy)));
+        if (copy.Format.wFormatTag != WAVE_FORMAT_EXTENSIBLE) {
+          copy.Format.cbSize = 0;
+        }
+        format = copy;
+      }
+      PropVariantClear(&value);
+      return format;
+    }
+
+    /**
+     * @brief Render a device format for diagnostics.
+     * @param format Endpoint device format.
+     * @return Compact rate/channel/bit description.
+     */
+    [[nodiscard]] std::string describe_format(const WAVEFORMATEXTENSIBLE &format) {
+      return std::to_string(format.Format.nSamplesPerSec) + " Hz, " + std::to_string(format.Format.nChannels) +
+             " ch, " + std::to_string(format.Format.wBitsPerSample) + "-bit";
+    }
+
+    /**
+     * @brief Whether two endpoint device formats produce byte-identical PCM layouts.
+     * @param left First format.
+     * @param right Second format.
+     * @return True when rate, channels, container, and sample type match.
+     */
+    [[nodiscard]] bool same_byte_layout(const WAVEFORMATEXTENSIBLE &left, const WAVEFORMATEXTENSIBLE &right) noexcept {
+      const auto is_float = [](const WAVEFORMATEXTENSIBLE &format) {
+        return format.Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+               (format.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                IsEqualGUID(format.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
+      };
+      return left.Format.nSamplesPerSec == right.Format.nSamplesPerSec &&
+             left.Format.nChannels == right.Format.nChannels &&
+             left.Format.wBitsPerSample == right.Format.wBitsPerSample &&
+             left.Format.nBlockAlign == right.Format.nBlockAlign && is_float(left) == is_float(right);
+    }
+
+    /**
+     * @brief Default loopback cable format: 2 channel, 32-bit integer PCM, 48000 Hz.
+     * @return Extensible format accepted by both Steam Streaming Microphone endpoints.
+     */
+    [[nodiscard]] WAVEFORMATEXTENSIBLE preferred_loopback_format() noexcept {
+      WAVEFORMATEXTENSIBLE format {};
+      format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+      format.Format.nChannels = 2;
+      format.Format.nSamplesPerSec = SOURCE_SAMPLE_RATE;
+      format.Format.wBitsPerSample = 32;
+      format.Format.nBlockAlign = 2 * sizeof(std::int32_t);
+      format.Format.nAvgBytesPerSec = SOURCE_SAMPLE_RATE * format.Format.nBlockAlign;
+      format.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+      format.Samples.wValidBitsPerSample = 32;
+      format.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+      format.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+      return format;
+    }
+
+    /**
+     * @brief Make a loopback cable's render and capture endpoints use one device format.
+     *
+     * Steam Streaming Microphone and VB-CABLE copy raw bytes from their render side to
+     * their capture side without converting. When the two endpoint formats differ
+     * (for example stereo render and mono capture), every sample is reinterpreted, which
+     * plays the microphone at the wrong speed and pitch and starves or overruns the capture
+     * side. Set both endpoints to one known-good format before the render stream is opened,
+     * or at least make them match if the driver rejects it.
+     *
+     * @param enumerator MMDevice enumerator.
+     * @param render_id Exact render endpoint identifier.
+     * @param capture_id Exact paired capture endpoint identifier.
+     */
+    void align_loopback_formats(
+      IMMDeviceEnumerator &enumerator,
+      const std::wstring &render_id,
+      const std::wstring &capture_id
+    ) {
+      const auto render_format = endpoint_device_format(enumerator, render_id);
+      const auto capture_format = endpoint_device_format(enumerator, capture_id);
+      if (!render_format || !capture_format) {
+        BOOST_LOG(warning) << "Unable to read virtual microphone endpoint formats; microphone pitch may be wrong"sv;
+        return;
+      }
+      const auto preferred = preferred_loopback_format();
+      if (same_byte_layout(*render_format, preferred) && same_byte_layout(*capture_format, preferred)) {
+        BOOST_LOG(info) << "Virtual microphone endpoints use "sv << describe_format(preferred);
+        return;
+      }
+
+      BOOST_LOG(info) << "Virtual microphone endpoint formats are render "sv << describe_format(*render_format)
+                      << ", capture "sv << describe_format(*capture_format) << "; setting both to "sv
+                      << describe_format(preferred);
+
+      com_ptr_t<IPolicyConfig> policy;
+      if (FAILED(CoCreateInstance(
+            CLSID_CPolicyConfigClient,
+            nullptr,
+            CLSCTX_ALL,
+            IID_IPolicyConfig,
+            reinterpret_cast<void **>(policy.put())
+          ))) {
+        BOOST_LOG(warning) << "Unable to open audio policy config; set both virtual microphone endpoints to the same format in Sound settings"sv;
+        return;
+      }
+
+      // The policy API is undocumented; pass private copies only.
+      auto try_set = [&](const std::wstring &device_id, WAVEFORMATEXTENSIBLE format) {
+        auto id_copy = device_id;
+        WAVEFORMATEXTENSIBLE mix_format {};
+        return SUCCEEDED(policy->SetDeviceFormat(
+          id_copy.c_str(),
+          reinterpret_cast<WAVEFORMATEX *>(&format),
+          reinterpret_cast<WAVEFORMATEX *>(&mix_format)
+        ));
+      };
+
+      const auto render_ok = same_byte_layout(*render_format, preferred) || try_set(render_id, preferred);
+      const auto capture_ok = same_byte_layout(*capture_format, preferred) || try_set(capture_id, preferred);
+      if (render_ok && capture_ok) {
+        BOOST_LOG(info) << "Set virtual microphone endpoints to "sv << describe_format(preferred);
+        return;
+      }
+
+      // The driver rejected the preferred format on one side; at least make both sides match.
+      const auto current_render = endpoint_device_format(enumerator, render_id);
+      const auto current_capture = endpoint_device_format(enumerator, capture_id);
+      if (current_render && current_capture) {
+        if (same_byte_layout(*current_render, *current_capture)) {
+          BOOST_LOG(info) << "Virtual microphone endpoints share format: "sv << describe_format(*current_capture);
+          return;
+        }
+        if (try_set(capture_id, *current_render)) {
+          BOOST_LOG(info) << "Set virtual microphone capture endpoint to "sv << describe_format(*current_render);
+          return;
+        }
+        if (try_set(render_id, *current_capture)) {
+          BOOST_LOG(info) << "Set virtual microphone render endpoint to "sv << describe_format(*current_capture);
+          return;
+        }
+      }
+      BOOST_LOG(warning) << "Unable to align virtual microphone endpoint formats; set both to 2 channel, 32 bit, 48000 Hz in Sound settings"sv;
+    }
+
+    /**
+     * @brief Discover the configured complete exact endpoint pair and supported render format.
+     * @param kind Configured destination kind.
      * @return Selected endpoint on success.
      */
-    [[nodiscard]] std::optional<endpoint_selection_t> discover_endpoint() {
+    [[nodiscard]] std::optional<endpoint_selection_t> discover_endpoint(wasapi_virtual_microphone_kind_e kind) {
       com_ptr_t<IMMDeviceEnumerator> enumerator;
       auto result = CoCreateInstance(
         __uuidof(MMDeviceEnumerator),
@@ -395,15 +593,23 @@ namespace platf::win_audio {
         return std::nullopt;
       }
 
-      const auto render_names = enumerate_endpoint_names(*enumerator.get(), eRender);
-      const auto capture_names = enumerate_endpoint_names(*enumerator.get(), eCapture);
-      const auto *pair = select_wasapi_virtual_microphone_pair(render_names, capture_names);
-      if (!pair) {
+      const auto render_endpoints = enumerate_endpoint_identities(*enumerator.get(), eRender);
+      const auto capture_endpoints = enumerate_endpoint_identities(*enumerator.get(), eCapture);
+      const auto *render = select_wasapi_virtual_microphone_endpoint(render_endpoints, capture_endpoints, kind);
+      if (!render) {
         return std::nullopt;
       }
 
-      auto render_device = find_render_endpoint(*enumerator.get(), pair->render_name);
-      if (!render_device) {
+      const auto capture = std::ranges::find_if(capture_endpoints, [&](const wasapi_endpoint_identity_t &candidate) {
+        return IsEqualGUID(candidate.container_id, render->container_id) &&
+               candidate.adapter_name == render->adapter_name;
+      });
+      if (capture != capture_endpoints.end()) {
+        align_loopback_formats(*enumerator.get(), render->device_id, capture->device_id);
+      }
+
+      com_ptr_t<IMMDevice> render_device;
+      if (FAILED(enumerator->GetDevice(render->device_id.c_str(), render_device.put()))) {
         return std::nullopt;
       }
 
@@ -428,7 +634,7 @@ namespace platf::win_audio {
         return std::nullopt;
       }
 
-      return endpoint_selection_t {std::move(render_device), std::wstring {pair->render_name}, *mix_format};
+      return endpoint_selection_t {std::move(render_device), render->friendly_name, *mix_format};
     }
 
     /**
@@ -440,33 +646,37 @@ namespace platf::win_audio {
     void store_frame(std::int16_t sample, const wasapi_mix_format_t &format, std::byte *output) noexcept {
       for (std::uint16_t channel = 0; channel < format.channels; ++channel) {
         switch (format.sample_format) {
-          case wasapi_sample_format_e::pcm_s16: {
-            const auto value = static_cast<std::uint16_t>(sample);
-            *output++ = static_cast<std::byte>(value & 0xffU);
-            *output++ = static_cast<std::byte>((value >> 8U) & 0xffU);
-            break;
-          }
-          case wasapi_sample_format_e::pcm_s24: {
-            const auto value = static_cast<std::uint32_t>(static_cast<std::int32_t>(sample) * 256);
-            *output++ = static_cast<std::byte>(value & 0xffU);
-            *output++ = static_cast<std::byte>((value >> 8U) & 0xffU);
-            *output++ = static_cast<std::byte>((value >> 16U) & 0xffU);
-            break;
-          }
-          case wasapi_sample_format_e::pcm_s32: {
-            const auto value = static_cast<std::uint32_t>(static_cast<std::int32_t>(sample) * 65536);
-            *output++ = static_cast<std::byte>(value & 0xffU);
-            *output++ = static_cast<std::byte>((value >> 8U) & 0xffU);
-            *output++ = static_cast<std::byte>((value >> 16U) & 0xffU);
-            *output++ = static_cast<std::byte>((value >> 24U) & 0xffU);
-            break;
-          }
-          case wasapi_sample_format_e::float_f32: {
-            const float value = static_cast<float>(sample) / 32768.0f;
-            std::memcpy(output, &value, sizeof(value));
-            output += sizeof(value);
-            break;
-          }
+          case wasapi_sample_format_e::pcm_s16:
+            {
+              const auto value = static_cast<std::uint16_t>(sample);
+              *output++ = static_cast<std::byte>(value & 0xffU);
+              *output++ = static_cast<std::byte>((value >> 8U) & 0xffU);
+              break;
+            }
+          case wasapi_sample_format_e::pcm_s24:
+            {
+              const auto value = static_cast<std::uint32_t>(static_cast<std::int32_t>(sample) * 256);
+              *output++ = static_cast<std::byte>(value & 0xffU);
+              *output++ = static_cast<std::byte>((value >> 8U) & 0xffU);
+              *output++ = static_cast<std::byte>((value >> 16U) & 0xffU);
+              break;
+            }
+          case wasapi_sample_format_e::pcm_s32:
+            {
+              const auto value = static_cast<std::uint32_t>(static_cast<std::int32_t>(sample) * 65536);
+              *output++ = static_cast<std::byte>(value & 0xffU);
+              *output++ = static_cast<std::byte>((value >> 8U) & 0xffU);
+              *output++ = static_cast<std::byte>((value >> 16U) & 0xffU);
+              *output++ = static_cast<std::byte>((value >> 24U) & 0xffU);
+              break;
+            }
+          case wasapi_sample_format_e::float_f32:
+            {
+              const float value = static_cast<float>(sample) / 32768.0f;
+              std::memcpy(output, &value, sizeof(value));
+              output += sizeof(value);
+              break;
+            }
         }
       }
     }
@@ -476,6 +686,14 @@ namespace platf::win_audio {
      */
     class wasapi_virtual_microphone_t final: public virtual_microphone_sink_t {
     public:
+      /**
+       * @brief Bind this sink to one exact configured destination.
+       * @param kind Destination kind.
+       */
+      explicit wasapi_virtual_microphone_t(wasapi_virtual_microphone_kind_e kind) noexcept:
+          kind_(kind) {
+      }
+
       /** @brief Stop and join the render worker. */
       ~wasapi_virtual_microphone_t() override {
         stop_worker();
@@ -483,13 +701,17 @@ namespace platf::win_audio {
 
       bool probe() override {
         bool available = false;
-        std::thread probe_thread {[&available] {
+        std::thread probe_thread {[this, &available] {
           const com_apartment_t apartment;
           if (apartment) {
-            available = discover_endpoint().has_value();
+            available = discover_endpoint(kind_).has_value();
           }
         }};
         probe_thread.join();
+        if (!available) {
+          BOOST_LOG(warning) << "Configured client microphone destination is unavailable: "sv << destination_name()
+                             << ". Enable its render and capture endpoints, or select another destination."sv;
+        }
         return available;
       }
 
@@ -581,8 +803,10 @@ namespace platf::win_audio {
           return;
         }
 
-        auto endpoint = discover_endpoint();
+        auto endpoint = discover_endpoint(kind_);
         if (!endpoint) {
+          BOOST_LOG(warning) << "Configured client microphone destination became unavailable: "sv << destination_name()
+                             << ". Enable its render and capture endpoints, or select another destination."sv;
           report_startup(false);
           return;
         }
@@ -655,7 +879,7 @@ namespace platf::win_audio {
           return;
         }
 
-        BOOST_LOG(info) << "Client microphone using exact WASAPI virtual render endpoint"sv;
+        BOOST_LOG(info) << "Client microphone using exact WASAPI destination: "sv << destination_name();
         report_startup(true);
 
         const std::array events {stop_event_, audio_event_};
@@ -779,6 +1003,17 @@ namespace platf::win_audio {
         }
       }
 
+      /**
+       * @brief Return the configured destination label for actionable logs.
+       * @return Human-readable destination name.
+       */
+      [[nodiscard]] std::string_view destination_name() const noexcept {
+        return kind_ == wasapi_virtual_microphone_kind_e::steam ?
+                 "Steam Streaming Microphone"sv :
+                 "VB-CABLE"sv;
+      }
+
+      wasapi_virtual_microphone_kind_e kind_;  ///< Exact configured destination.
       std::mutex mutex_;  ///< Serializes producer state and bounded ring access.
       std::condition_variable startup_condition_;  ///< Publishes worker startup.
       std::thread worker_;  ///< COM-owning event-driven render worker.
@@ -792,19 +1027,27 @@ namespace platf::win_audio {
     };
   }  // namespace
 
-  const wasapi_endpoint_pair_t *select_wasapi_virtual_microphone_pair(
-    std::span<const std::wstring> render_names,
-    std::span<const std::wstring> capture_names
+  const wasapi_endpoint_identity_t *select_wasapi_virtual_microphone_endpoint(
+    std::span<const wasapi_endpoint_identity_t> render_endpoints,
+    std::span<const wasapi_endpoint_identity_t> capture_endpoints,
+    wasapi_virtual_microphone_kind_e kind
   ) noexcept {
-    const auto contains = [](std::span<const std::wstring> names, std::wstring_view expected) {
-      return std::ranges::any_of(names, [expected](const std::wstring &name) {
-        return name == expected;
+    const auto expected_adapter = kind == wasapi_virtual_microphone_kind_e::steam ?
+                                    STEAM_STREAMING_MICROPHONE_ADAPTER :
+                                    VB_CABLE_ADAPTER;
+    const auto has_capture_peer = [&](const wasapi_endpoint_identity_t &render) {
+      const GUID zero {};
+      if (IsEqualGUID(render.container_id, zero)) {
+        return false;
+      }
+      return std::ranges::any_of(capture_endpoints, [&](const wasapi_endpoint_identity_t &capture) {
+        return IsEqualGUID(render.container_id, capture.container_id) && capture.adapter_name == expected_adapter;
       });
     };
 
-    for (const auto &pair : ENDPOINT_PAIRS) {
-      if (contains(render_names, pair.render_name) && contains(capture_names, pair.capture_name)) {
-        return &pair;
+    for (const auto &render : render_endpoints) {
+      if (render.adapter_name == expected_adapter && has_capture_peer(render)) {
+        return &render;
       }
     }
     return nullptr;
@@ -994,7 +1237,7 @@ namespace platf::win_audio {
     return failed_;
   }
 
-  std::unique_ptr<virtual_microphone_sink_t> make_wasapi_virtual_microphone() {
-    return std::make_unique<wasapi_virtual_microphone_t>();
+  std::unique_ptr<virtual_microphone_sink_t> make_wasapi_virtual_microphone(wasapi_virtual_microphone_kind_e kind) {
+    return std::make_unique<wasapi_virtual_microphone_t>(kind);
   }
 }  // namespace platf::win_audio

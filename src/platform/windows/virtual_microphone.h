@@ -17,6 +17,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 
 namespace platf::win_audio {
   /**
@@ -212,8 +213,10 @@ namespace platf::win_audio {
   };
 
   /**
-   * @brief Create the production Windows virtual microphone sink.
-   * @return Unprobed sink using the secured system driver channel.
+   * @brief Create the exact configured Windows virtual microphone sink.
+   *
+   * @param destination `steam`, `vb-cable`, or `lumen-driver`.
+   * @return Unprobed exact sink, or null for an unsupported destination.
    */
-  std::unique_ptr<virtual_microphone_sink_t> make_virtual_microphone();
+  std::unique_ptr<virtual_microphone_sink_t> make_virtual_microphone(std::string_view destination);
 }  // namespace platf::win_audio
