@@ -1,6 +1,130 @@
 # Lumen Streaming Protocol ground-up rewrite plan
 
-Status: implementation active on branch `feature/lsp-rewrite`.
+Status: paused on branch `feature/lsp-rewrite`; wait for the user to return to LAN.
+
+### Current pause — September 14, after consolidation
+
+The user explicitly revoked SSH access and requested that all work be saved
+until they announce their return to LAN. **Do not initiate SSH/SCP, change the
+host, restart applications/services, build, or continue cleanup until that
+resumption.** Local source changes and this checkpoint are preserved. No goal
+completion is claimed.
+
+Latest confirmed Windows state:
+
+- [x] Exactly one streaming-host service, SCM name/display name `Lumen`,
+  automatic startup, running as LocalSystem. One `Lumen.exe` at
+  `C:\Program Files\Lumen\Lumen.exe` owns both TCP 47989 (GameStream) and UDP
+  48030 (LSP). Last verified PID 13448, console session 1, owner SYSTEM.
+- [x] Retired `LumenService` and `LumenLSPLive`; neither protocol requires a
+  separate host process. The normal small Windows service launcher remains
+  `tools\lumensvc.exe`, not a second protocol host.
+- [x] Preserved the main installation's applications, GameStream pairing root,
+  TLS certificate/key, and admin credentials. Merged only the LSP trust subtree
+  and copied its exact identity into the canonical config directory.
+- [x] Canonical firewall setup converges on `Lumen TCP` and `Lumen UDP` rules,
+  scoped to the canonical executable, all profiles/remote addresses. Removed
+  the two old test-instance UDP rules. A second consolidation run preserved
+  the same PID and did not create services. Public-address LSP authentication
+  and both LSP/Moonlight app lists succeeded through the then-active VPN route;
+  do not label this a VPN-independent WAN streaming qualification.
+- [x] Removed scheduled tasks `Lumen-LSP-live-20260912`,
+  `Lumen-LSP-input-context-20260913`, and `Lumen Protocol V3 Host`.
+- [x] Moved the two dated test deployments and obsolete MsQuic DLLs out of
+  active installation paths into the protected rollback tree. Source/build
+  staging directories and other artifacts have NOT yet been comprehensively
+  cleaned.
+- Host SHA256:
+  `1ABC4CD51E3BBE7B65EF6BF214509523163400F4396C07B5114AC9B3319A4389`.
+  Launcher SHA256:
+  `ED019091202F7F3DF95EB85F247A472B4445130F2D0DD4180F7F81C60272A8C6`.
+
+Permissions and installer work:
+
+- The first migration's recursive `icacls` directory inheritance flags produced
+  empty FILE DACLs, causing HTTP private-key access failure. Rollback preserved
+  all data. This was corrected with per-object protected DACLs: SYSTEM and
+  Administrators full control; inheritance flags on directories only, none on
+  files; ownership preserved. Private-key readability was verified before the
+  successful second migration.
+- The same normalization is now integrated in installer SOURCE for standalone
+  and MSI flows, replacing the broad root ACL reset and ordinary-Users key
+  grants. Those final installer-script changes still need deployment/verification;
+  do not assume the live scripts include edits made after the native build.
+- Main configuration and credential access must remain SYSTEM/Administrators;
+  never repeat `(OI)(CI)` file grants or alter unrelated directories.
+
+Steam microphone and English settings:
+
+- [x] Source/build adds persistent `client_microphone_sink`, default `steam`,
+  with explicit `vb-cable` and `lumen-driver` choices and no silent fallback.
+  The Audio/Video selector is in the built web assets. Steam drivers already
+  exist and are healthy; no Steam driver installation was needed on this host.
+- [x] Device selection uses exact adapter identity plus matching container ID,
+  not translated endpoint labels. Existing Steam microphone render/capture
+  endpoints have Chinese prefixes despite the adapter name remaining English.
+- A required-microphone LSP START reached encoder creation after consolidation,
+  then ended after approximately 28 seconds. The end was not attributed; no
+  sustained new-build qualification claim is made. Host log recorded one
+  microphone late-packet rejection (`result=7`). Verify the exact Steam
+  destination log and sustained audio/input when resumed.
+- [x] Console user `SIMON\simonfalke` (SID ending 1001, profile `C:\Users\simon`)
+  was already en-US. SSH user `SIMON\sshuser` (SID ending 1013) is now configured
+  en-US. English settings were copied to Windows welcome/system/default-user
+  profiles. `.DEFAULT` locale verified en-US. Legacy non-Unicode system locale
+  was set to en-US but still reports the old active zh-CN locale until a reboot.
+  No reboot or forced sign-out was performed.
+- [ ] Existing audio endpoint DISPLAY NAMES still need English renaming through
+  the supported Windows sound UI. The user explicitly approved host-side UI
+  automation for this. Do not write protected MMDevice properties/registry blobs.
+- Immediately before pause, an SCP and an SSH invocation attempted to run a
+  read-only Sound-panel inspection. No rename operation was in that script.
+  Completion was not confirmed after SSH was revoked. Check/remove any temporary
+  task `Lumen English Audio Labels` and close the temporary Sound panel when
+  access is restored. No new remote calls were made after revocation.
+
+Resume work, in order:
+
+1. Wait for explicit user confirmation of LAN return/access resumption.
+2. Read-only recheck the one `Lumen` service/process, account/session, boot mode,
+   firewall rules, saved identities, and whether the user is streaming.
+3. Finish English audio-label renaming; verify English user/system preferences.
+   Any pending system-language reboot must be coordinated, not forced.
+4. Deploy final installer permission/idempotence scripts. Verify a controlled
+   service restart still gives one process and both listeners, preserving pairings.
+5. Verify Steam microphone selection, real input, LSP streaming, and legacy
+   Moonlight without running competing streams.
+6. Complete requested artifact cleanup on Windows and locally: dated test
+   deployments, generated `cmake-build-*`/build outputs, temporary bootstraps,
+   and obsolete tasks. Preserve actual source repositories, live dependencies,
+   user settings/pairings, and one protected compressed rollback archive. Verify
+   the installed products do not depend on staging paths before deleting builds.
+7. Retire the two obsolete committed driver-resume transactions/tasks after
+   exporting them into that archive. Both recorded `Committed=true`,
+   `DriverPendingReboot=true`, and failed at the last boot:
+   `6315104AE1AC4EE8B54036A02F0315BE` and `7C4A4122FE444A4B9260F8F660CC7BB3`.
+   Their leaves are under `C:\ProgramData\LumenVirtualMicrophoneInstallerV1`;
+   do not execute their old bootstrap or uninstall functioning HID/Steam drivers.
+8. Update this ledger and sign remaining source changes when 1Password permits.
+   Signed checkpoints remain Lumen `34d0c8bd` and Umbra `f9b0e26`; subsequent
+   endpoint-editor and consolidation changes remain staged/dirty, not committed.
+
+Working/rollback locations (not final runtime dependencies):
+
+- Local maintenance scripts/logs: `/tmp/lumen-consolidate.WdsLF2`.
+- Windows source/build staging:
+  `C:\Users\sshuser\source\Lumen-LSP\cmake-build-lsp-windows`.
+- Successful protected rollback tree:
+  `C:\ProgramData\Lumen\rollback\consolidation-20260914-112355`.
+  Includes `retired-lsp-installation` and `retired-lsp-task-installation`.
+- Earlier rollback tree:
+  `C:\ProgramData\Lumen\rollback\consolidation-20260914-111403`;
+  its failed-config DACLs were repaired so the archive can be read safely.
+- English settings backups/results:
+  `C:\ProgramData\Lumen\maintenance\english-20260914`.
+- Mac endpoint editor build/screenshots: `/tmp/lsp-endpoint-edit.FlBRzd`.
+  Installed app remains `/Applications/Umbra.app`; saved public address is
+  `165.173.23.160:48030` with manual override enabled.
 
 ### Current delivery scope — user update, 2026-09-12
 
@@ -133,6 +257,21 @@ Live corrections and evidence:
   restart this user-facing handoff stream without new direction.
 - Signed milestone commit failed with `1Password: failed to fill whole buffer`.
   Changes remain staged/preserved; signing was not silently bypassed.
+
+### September 14 signed checkpoints and remote address editing
+
+- [x] Retry 1Password signing: Lumen `34d0c8bd` and Umbra `f9b0e26` were
+  committed successfully. Both SSH signatures verify against the repository's
+  configured signing key. This supersedes the earlier signing failure above.
+- [x] Add paired-host address/UDP-port editing for users outside the LAN.
+  The signed macOS app is installed/reopened with native Address, UDP port,
+  and Save controls in Host Details. Offline save preserves trust/pins/permissions,
+  clears obsolete interface scope, and protects manual endpoints against Bonjour
+  and stale pending probes. Active streams reject edits without disconnection.
+  Nine focused persistence/discovery/app checks pass, and the real native sheet
+  was rendered and inspected in light/dark appearances. No public endpoint was
+  supplied or substituted by the agent, and no router settings were changed;
+  internet streaming still requires a reachable public address and UDP forwarding.
 
 The signed installed client also completed fresh authenticated application
 browsing and returned Desktop in under one second before host deployment.
