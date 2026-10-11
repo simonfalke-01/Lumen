@@ -25,19 +25,6 @@ namespace audio {
    */
   using opus_t = util::safe_ptr<OpusMSEncoder, opus_multistream_encoder_destroy>;
 
-  /**
-   * @brief Shared queue carrying captured PCM sample buffers to the encoder thread.
-   */
-  struct captured_frame_t {
-    std::vector<float> samples;  ///< Complete interleaved PCM frame.
-    std::uint64_t sample_position {};  ///< Exact first-sample position at 48 kHz.
-    std::uint32_t gap_frames {};  ///< Missing frames represented by silence before this frame.
-    bool discontinuity {};  ///< Whether capture reinitialization invalidated prior continuity.
-  };
-
-  using sample_queue_t = std::shared_ptr<safe::queue_t<captured_frame_t>>;
-  using pcm_slab_queue_t = std::shared_ptr<safe::queue_t<std::vector<float>>>;
-
   static int start_audio_control(audio_ctx_t &ctx);
   static void stop_audio_control(audio_ctx_t &);
   static void apply_surround_params(opus_stream_config_t &stream, const stream_params_t &params);
@@ -223,27 +210,41 @@ namespace audio {
           (void) free_pcm_slabs->raise(std::move(sample->samples));
         }
       });
-      const auto first_gap_position = sample->sample_position -
-                                      static_cast<std::uint64_t>(sample->gap_frames) * frame_size;
-      for (std::uint32_t gap = 0; gap < sample->gap_frames; ++gap) {
-        const auto result = encode_and_publish(
-          silence,
-          first_gap_position + static_cast<std::uint64_t>(gap) * frame_size,
-          gap == 0 || publication_discontinuity_pending
-        );
-        if (!result || *result == AudioPacketDestination::enqueue_result_e::closed) {
+      bool fill_capture_gaps;
+      {
+        const auto policy_destination = destination.lock();
+        if (!policy_destination) {
           return;
         }
-        if (*result == AudioPacketDestination::enqueue_result_e::backpressure) {
-          publication_discontinuity_pending = true;
-          break;
-        }
-        publication_discontinuity_pending = false;
+        fill_capture_gaps = policy_destination->fill_capture_gaps_with_silence();
       }
+      if (fill_capture_gaps) {
+        const auto first_gap_position = sample->sample_position -
+                                        static_cast<std::uint64_t>(sample->gap_frames) * frame_size;
+        for (std::uint32_t gap = 0; gap < sample->gap_frames; ++gap) {
+          const auto result = encode_and_publish(
+            silence,
+            first_gap_position + static_cast<std::uint64_t>(gap) * frame_size,
+            gap == 0 || publication_discontinuity_pending
+          );
+          if (!result || *result == AudioPacketDestination::enqueue_result_e::closed) {
+            return;
+          }
+          if (*result == AudioPacketDestination::enqueue_result_e::backpressure) {
+            publication_discontinuity_pending = true;
+            break;
+          }
+          publication_discontinuity_pending = false;
+        }
+      }
+      const auto current_discontinuity = publication_discontinuity_pending ||
+                                         (fill_capture_gaps ?
+                                            sample->discontinuity && sample->gap_frames == 0 :
+                                            sample->discontinuity || sample->gap_frames != 0);
       const auto result = encode_and_publish(
         sample->samples,
         sample->sample_position,
-        (sample->discontinuity && sample->gap_frames == 0) || publication_discontinuity_pending
+        current_discontinuity
       );
       if (!result || *result == AudioPacketDestination::enqueue_result_e::closed) {
         return;
@@ -258,6 +259,9 @@ namespace audio {
 
   /**
    * @brief Run the capture loop for this backend.
+   * @details Wait briefly for occupied PCM slabs without advancing the sample
+   * timeline. Only rejection of captured PCM contributes missing audio frames;
+   * pool contention must never be converted into synthetic silence.
    */
   void capture(safe::mail_t mail, config_t config, packet_destination_t destination) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
@@ -374,11 +378,12 @@ namespace audio {
     std::uint32_t pending_gap_frames {};
     bool pending_discontinuity {};
     while (!shutdown_event->peek() && encoding->load(std::memory_order_acquire)) {
-      auto sample_buffer = free_pcm_slabs->pop(std::chrono::milliseconds {0});
+      // An unavailable slab means the encoder still owns the captured PCM;
+      // no audio frame has been lost. Wait briefly so this critical-priority
+      // thread cannot starve the encoder or manufacture silence from CPU polls.
+      // Keep the wait bounded so shutdown and encoder failure are observed.
+      auto sample_buffer = free_pcm_slabs->pop(std::chrono::milliseconds {5});
       if (!sample_buffer) {
-        if (pending_gap_frames != UINT32_MAX) {
-          ++pending_gap_frames;
-        }
         continue;
       }
 

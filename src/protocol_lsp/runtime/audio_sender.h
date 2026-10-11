@@ -166,6 +166,9 @@ namespace lumen::lsp::runtime {
     /** @copydoc audio::AudioPacketDestination::requires_fixed_packet_storage */
     [[nodiscard]] bool requires_fixed_packet_storage() const noexcept override;
 
+    /** @copydoc audio::AudioPacketDestination::fill_capture_gaps_with_silence */
+    [[nodiscard]] bool fill_capture_gaps_with_silence() const noexcept override;
+
     /** @copydoc audio::AudioPacketDestination::commit_packet_storage */
     [[nodiscard]] enqueue_result_e commit_packet_storage(
       const packet_write_lease_t &lease,

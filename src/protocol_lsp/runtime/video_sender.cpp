@@ -1096,6 +1096,13 @@ namespace lumen::lsp::runtime {
                                 config.video.selected_bits_per_second + config.reserved_overhead_bits_per_second;
       return std::min(config.aggregate_pacing_bits_per_second, media_rate);
     }
+
+    /** @brief Bound unsent encoded frames so the sender plus queue cannot exceed decoder surfaces. */
+    [[nodiscard]] std::size_t video_egress_capacity(const HostVideoSenderConfig &config) noexcept {
+      return config.video.decoder_surfaces > 1U ?
+               static_cast<std::size_t>(config.video.decoder_surfaces - 1U) :
+               1U;
+    }
   }  // namespace
 
   bool write_video_frame_identity_extension(
@@ -1294,6 +1301,7 @@ namespace lumen::lsp::runtime {
         srtp_ {srtp},
         invalidation_request_events_ {config_.capture_mail ? config_.capture_mail->event<video::reference_invalidation_request_t>(mail::lsp_invalidate_ref_frames) : safe::mail_raw_t::event_t<video::reference_invalidation_request_t> {}},
         invalidation_result_events_ {config_.capture_mail ? config_.capture_mail->event<video::reference_invalidation_result_t>(mail::invalidate_ref_frames_result) : safe::mail_raw_t::event_t<video::reference_invalidation_result_t> {}},
+        egress_ {video_egress_capacity(config_)},
         congestion_({
           .profile = config_.network_profile == VideoNetworkProfile::competition ?
                        transport::controller_profile::competition_lan :
@@ -1369,20 +1377,25 @@ namespace lumen::lsp::runtime {
       join();
     }
 
-    /** @brief Register capacity-one egress and start the packet worker. */
+    /** @brief Register negotiated bounded egress and start the packet worker. */
     bool start() noexcept {
       if (!ready_ || started_.exchange(true, std::memory_order_acq_rel)) {
         return false;
       }
-      const auto numerator = static_cast<std::uint64_t>(config_.video.refresh_numerator);
-      const auto denominator = static_cast<std::uint64_t>(config_.video.refresh_denominator);
-      const auto frame_interval = std::chrono::nanoseconds {
-        static_cast<std::chrono::nanoseconds::rep>(1'000'000'000ULL * denominator / numerator)
+      const auto queue_capacity = video_egress_capacity(config_);
+      const auto maximum_queue_age = std::chrono::microseconds {
+        config_.maximum_capture_to_present_microseconds
       };
       const auto registered = egress_.register_session(
         this,
         video::egress_queue_t::behavior_e::latency,
-        {.capacity = 1, .max_queue_age = std::max(frame_interval, 1ns)},
+        {
+          .capacity = queue_capacity,
+          // Queueing remains opportunistic: the sender pops immediately. The
+          // negotiated capture-relative deadline, rather than one refresh, is
+          // the safety bound when one paced frame transiently spans intervals.
+          .max_queue_age = std::max(maximum_queue_age, 1us),
+        },
         [this](const video::egress_queue_t::recovery_request_t &request) {
           pressure_events_.fetch_add(1, std::memory_order_relaxed);
           forward_capacity_drops_.fetch_add(request.dropped_frames, std::memory_order_relaxed);
@@ -5072,7 +5085,7 @@ namespace lumen::lsp::runtime {
     LibsrtpServerProvider &srtp_;  ///< Installed association provider.
     safe::mail_raw_t::event_t<video::reference_invalidation_request_t> invalidation_request_events_;  ///< Generation-qualified encoder invalidation requests.
     safe::mail_raw_t::event_t<video::reference_invalidation_result_t> invalidation_result_events_;  ///< Encoder invalidation terminal results.
-    video::egress_queue_t egress_ {1};  ///< One-unsent-frame encoded egress owner.
+    video::egress_queue_t egress_;  ///< Decoder-surface-bounded encoded egress owner.
     transport::congestion_controller congestion_;  ///< Independent forward-path RFC 8888 controller.
     transport::path_mtu_discovery path_mtu_;  ///< Authenticated host-to-client DPLPMTUD search state.
     transport::recovery_controller recovery_;  ///< Coalesces reference damage into one recovery epoch/request.

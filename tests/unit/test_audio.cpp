@@ -200,6 +200,51 @@ namespace {
     std::atomic_bool discontinuity_ {};
   };
 
+  /** @brief Two-packet destination modeling the bounded LSP sender admission policy. */
+  class bounded_live_audio_destination_t final: public AudioPacketDestination {
+  public:
+    bool fill_capture_gaps_with_silence() const noexcept override {
+      return false;
+    }
+
+    enqueue_result_e enqueue(packet_t packet) override {
+      std::lock_guard lock {mutex_};
+      if (closed_) {
+        return enqueue_result_e::closed;
+      }
+      if (packets_.size() == 2U) {
+        return enqueue_result_e::backpressure;
+      }
+      packets_.emplace_back(std::move(packet));
+      available_.notify_all();
+      return enqueue_result_e::enqueued;
+    }
+
+    void close() noexcept override {
+      std::lock_guard lock {mutex_};
+      closed_ = true;
+      available_.notify_all();
+    }
+
+    bool wait_for_packet(const std::chrono::milliseconds timeout) {
+      std::unique_lock lock {mutex_};
+      return available_.wait_for(lock, timeout, [this] {
+        return !packets_.empty() || closed_;
+      }) && !packets_.empty();
+    }
+
+    std::vector<packet_t> packets() const {
+      std::lock_guard lock {mutex_};
+      return packets_;
+    }
+
+  private:
+    mutable std::mutex mutex_;  ///< Protects bounded packet ownership.
+    std::condition_variable available_;  ///< Wakes the regression after the first encoded packet.
+    std::vector<packet_t> packets_;  ///< At most two accepted packets, matching LSP sender capacity.
+    bool closed_ {};  ///< Whether the fake destination has stopped accepting packets.
+  };
+
   struct blocking_destination_state_t {
     std::promise<void> entered;
     std::promise<void> release;
@@ -368,6 +413,45 @@ TEST_F(AudioPacketDestinationTest, FixedSlabPressureMarksTheNextPublishedPacketD
   EXPECT_GE(destination->attempts(), 3U);
   EXPECT_TRUE(destination->discontinuity());
   EXPECT_EQ(destination->fallback_enqueues(), 0U);
+}
+
+TEST(AudioEncodeThreadTest, LiveDestinationPublishesFreshPcmBeforeCapturedGapSilence) {
+  constexpr std::uint16_t frame_samples = 480;
+  constexpr std::uint32_t gap_frames = 50;
+  constexpr std::uint64_t current_sample_position =
+    static_cast<std::uint64_t>(frame_samples) * gap_frames;
+  auto samples = std::make_shared<sample_queue_t::element_type>(1);
+  const auto destination = std::make_shared<bounded_live_audio_destination_t>();
+  const auto encoding = std::make_shared<std::atomic_bool>(true);
+  config_t config {10, 2, 0x3, {0}, {}};
+  config.frameSamples = frame_samples;
+  config.bitrate = 96'000;
+
+  std::jthread encoder([samples, destination, encoding, config] {
+    encodeThread(samples, {}, config, destination, encoding);
+  });
+  std::vector<float> current_pcm(static_cast<std::size_t>(frame_samples) * config.channels, 0.25f);
+  const auto raised = samples->raise(captured_frame_t {
+    .samples = std::move(current_pcm),
+    .sample_position = current_sample_position,
+    .gap_frames = gap_frames,
+  });
+  if (!raised) {
+    samples->stop();
+    encoder.join();
+    FAIL() << "Captured PCM could not enter the headless encoder queue";
+    return;
+  }
+  const auto packet_ready = destination->wait_for_packet(2s);
+  samples->stop();
+  encoder.join();
+  ASSERT_TRUE(packet_ready);
+
+  const auto packets = destination->packets();
+  ASSERT_EQ(packets.size(), 1U);
+  EXPECT_NE(packets.front().payload.size(), 0U);
+  EXPECT_EQ(packets.front().sample_position, current_sample_position);
+  EXPECT_TRUE(packets.front().discontinuity);
 }
 
 // AUD-U01: the encoder owns only a weak typed destination reference while an enqueue is active.

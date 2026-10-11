@@ -1228,6 +1228,10 @@ namespace lumen::lsp::runtime {
     return true;
   }
 
+  bool HostAudioSender::fill_capture_gaps_with_silence() const noexcept {
+    return false;
+  }
+
   audio::AudioPacketDestination::enqueue_result_e HostAudioSender::commit_packet_storage(
     const packet_write_lease_t &lease,
     const std::size_t payload_bytes,

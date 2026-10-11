@@ -9,11 +9,13 @@
 #include "thread_safe.h"
 #include "utility.h"
 
+#include <atomic>
 #include <bitset>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace audio {
   /**
@@ -81,6 +83,17 @@ namespace audio {
     std::uint32_t captureQueueFrames {};  ///< Optional PCM queue bound; zero retains the legacy 120 ms-derived default.
     std::uint16_t frameSamples {};  ///< Exact negotiated 48 kHz frame samples; zero derives the legacy millisecond duration.
   };
+
+  /** @brief Captured interleaved PCM plus its exact source timeline metadata. */
+  struct captured_frame_t {
+    std::vector<float> samples;  ///< Complete interleaved PCM frame.
+    std::uint64_t sample_position {};  ///< Exact first-sample position at 48 kHz.
+    std::uint32_t gap_frames {};  ///< Captured frames missing immediately before this frame.
+    bool discontinuity {};  ///< Whether capture reinitialization invalidated prior continuity.
+  };
+
+  using sample_queue_t = std::shared_ptr<safe::queue_t<captured_frame_t>>;  ///< Captured PCM queue shared with the encoder.
+  using pcm_slab_queue_t = std::shared_ptr<safe::queue_t<std::vector<float>>>;  ///< Reusable capture PCM storage.
 
   /**
    * @brief Select one built-in validated Opus layout without legacy fallback behavior.
@@ -160,6 +173,19 @@ namespace audio {
     }
 
     /**
+     * @brief Return whether captured timeline gaps should be encoded as silence before fresh PCM.
+     *
+     * Legacy transports preserve their established continuous-timeline behavior. Low-latency
+     * destinations may return `false` to discard elapsed audio and publish the current frame with
+     * a discontinuity instead of allowing silence backfill to occupy their bounded send queue.
+     *
+     * @return `true` to encode silence for every captured gap frame.
+     */
+    [[nodiscard]] virtual bool fill_capture_gaps_with_silence() const noexcept {
+      return true;
+    }
+
+    /**
      * @brief Reserve destination-owned codec output storage without allocation.
      *
      * Legacy destinations may return no value and receive the ordinary move-owned packet fallback.
@@ -218,6 +244,24 @@ namespace audio {
    * @brief Non-owning destination reference retained by capture and encode workers.
    */
   using packet_destination_t = std::weak_ptr<AudioPacketDestination>;
+
+  /**
+   * @brief Encode captured PCM and publish Opus packets to one weak protocol destination.
+   *
+   * @param samples Captured PCM queue.
+   * @param free_pcm_slabs Reusable PCM storage returned after each consumed frame; may be empty in tests.
+   * @param config Negotiated encoder configuration.
+   * @param destination Weak protocol-owned destination.
+   * @param encoding Set false when the encoder worker exits.
+   */
+  void encodeThread(
+    sample_queue_t samples,
+    pcm_slab_queue_t free_pcm_slabs,
+    config_t config,
+    packet_destination_t destination,
+    const std::shared_ptr<std::atomic_bool> &encoding
+  );
+
   /**
    * @brief Shared mailbox reference to the global audio context.
    */

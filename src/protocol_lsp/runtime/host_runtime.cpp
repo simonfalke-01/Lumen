@@ -2058,7 +2058,7 @@ namespace lumen::lsp::runtime {
         return std::nullopt;
       }
       for (const auto &offer : request.audio_offers) {
-        const auto stream = audio::select_opus_stream_config(offer.channels, false);
+        const auto stream = audio::select_opus_stream_config(offer.channels, true);
         if (!stream) {
           continue;
         }
@@ -2676,17 +2676,37 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    /**
+     * @brief Run one video shutdown phase and report it when it stalls.
+     *
+     * A reconnect after a GPU encoder stall waited ~50 s for the previous video owner
+     * to retire; these logs identify which phase blocks.
+     */
+    template<typename Phase>
+    static void timed_video_shutdown_phase(const std::string_view name, Phase &&phase) noexcept {
+      const auto start = std::chrono::steady_clock::now();
+      phase();
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+      if (elapsed >= std::chrono::milliseconds {500}) {
+        BOOST_LOG(warning) << "LSP video retirement phase '"sv << name << "' took "sv << elapsed.count() << " ms"sv;
+      }
+    }
+
     /** @brief Join detached video threads without releasing socket-owner provider/display state. */
     static void join_video_runtime(ActiveVideoRuntime &runtime) noexcept {
       if (runtime.mail) {
         runtime.mail->event<bool>(mail::shutdown)->raise(true);
       }
       if (runtime.capture_thread.joinable()) {
-        runtime.capture_thread.join();
+        timed_video_shutdown_phase("capture thread join"sv, [&runtime] {
+          runtime.capture_thread.join();
+        });
       }
       if (runtime.sender) {
-        runtime.sender->close();
-        runtime.sender->join();
+        timed_video_shutdown_phase("sender join"sv, [&runtime] {
+          runtime.sender->close();
+          runtime.sender->join();
+        });
       }
     }
 
@@ -2710,11 +2730,15 @@ namespace lumen::lsp::runtime {
       join_video_runtime(*runtime);
   #ifdef _WIN32
       if (runtime->display_lease) {
-        (void) runtime->display_lease->release();
-        runtime->display_lease.reset();
+        timed_video_shutdown_phase("display lease release"sv, [&runtime] {
+          (void) runtime->display_lease->release();
+          runtime->display_lease.reset();
+        });
       }
   #endif
-      release_video_platform_streaming_lease(*runtime);
+      timed_video_shutdown_phase("streaming performance release"sv, [&runtime] {
+        release_video_platform_streaming_lease(*runtime);
+      });
     }
 
     /** @brief Make one video capture/sender runtime quiescent without joining in a callback. */
