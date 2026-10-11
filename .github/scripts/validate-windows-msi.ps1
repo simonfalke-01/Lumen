@@ -121,10 +121,10 @@ if ($lumenUpgradeRows.Count -eq 0) {
 }
 
 if ($services.Count -ne 1 -or
-    $services[0][1] -ne 'LumenService' -or
+    $services[0][1] -ne 'Lumen' -or
     $services[0][2] -ne '2' -or
     $services[0][4] -ne 'LocalSystem') {
-    throw 'Generated MSI does not contain an automatic LocalSystem LumenService row.'
+    throw 'Generated MSI does not contain an automatic LocalSystem Lumen row.'
 }
 $expectedFirewallProtocols = @{
     'Lumen TCP' = '6'

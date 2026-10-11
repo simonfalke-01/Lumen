@@ -113,8 +113,36 @@ assert_file_excludes(
     "Lumen must not reuse the official Sunshine UpgradeCode")
 assert_file_contains(
     "cmake/packaging/wix_resources/patch.xml"
-    "Name=\"LumenService\""
+    "Name=\"@LUMEN_WINDOWS_SERVICE_NAME@\""
     "The MSI service must use the Lumen product identity")
+assert_file_contains(
+    "cmake/packaging/windows_wix.cmake"
+    "set\\(LUMEN_WINDOWS_SERVICE_NAME \"Lumen\"\\)"
+    "The generated MSI service name must be exactly Lumen")
+assert_file_contains(
+    "cmake/packaging/windows_wix.cmake"
+    "set\\(LUMEN_WINDOWS_LEGACY_SERVICE_NAME \"LumenService\"\\)"
+    "The MSI must recognize the previous Lumen service name only for migration")
+assert_file_contains(
+    "cmake/packaging/wix_resources/patch.xml"
+    "Name=\"@LUMEN_WINDOWS_LEGACY_SERVICE_NAME@\""
+    "The MSI must stop the old Lumen-owned service during migration")
+assert_file_contains_literal(
+    "cmake/packaging/wix_resources/patch.xml"
+    [=[DisplayName="Lumen"]=]
+    "The Windows service display name must be exactly Lumen")
+assert_file_contains_literal(
+    "src_assets/windows/misc/service/install-service.bat"
+    [=[set "SERVICE_NAME=Lumen"]=]
+    "The standalone installer must use the canonical Lumen service name")
+assert_file_contains_literal(
+    "src_assets/windows/misc/service/install-service.bat"
+    [=[set SERVICE_START_TYPE=auto]=]
+    "Fresh standalone installs must enable boot startup by default")
+assert_file_contains_literal(
+    "src_assets/windows/misc/service/install-service.bat"
+    [=[set "LEGACY_SERVICE_NAME=LumenService"]=]
+    "Standalone upgrades must recognize the previous Lumen service name")
 assert_file_contains_literal(
     "cmake/packaging/wix_resources/patch.xml"
     [=[Start="auto"]=]
@@ -138,6 +166,37 @@ foreach(lumen_firewall_contract IN ITEMS
         "${lumen_firewall_contract}"
         "The MSI must retain its transactional Lumen firewall contract")
 endforeach()
+foreach(lumen_standalone_firewall_contract IN ITEMS
+        [=[set "TCP_RULE_NAME=Lumen TCP"]=]
+        [=[set "UDP_RULE_NAME=Lumen UDP"]=]
+        [=[program="%PROGRAM_BIN%"]=]
+        [=[profile=any]=]
+        [=[remoteip=any]=])
+    assert_file_contains_literal(
+        "src_assets/windows/misc/firewall/add-firewall-rule.bat"
+        "${lumen_standalone_firewall_contract}"
+        "Standalone firewall setup must match the scoped MSI rules")
+endforeach()
+assert_file_contains_literal(
+    "src_assets/windows/misc/firewall/delete-firewall-rule.bat"
+    [=[program="%PROGRAM_BIN%"]=]
+    "Standalone firewall cleanup must be scoped to the canonical executable")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[function Set-LumenConfigAcl]=]
+    "Standalone and MSI setup must share configuration ACL normalization")
+assert_file_contains_literal(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    [=[Set-LumenConfigAcl -Path (Join-Path $RootDir "config")]=]
+    "Setup must normalize only Lumen's mutable configuration tree")
+assert_file_excludes(
+    "src_assets/windows/misc/sunshine-setup.ps1"
+    "icacls.exe"
+    "Setup must not recursively replace the installation root ACL")
+assert_file_excludes(
+    "src_assets/windows/misc/migration/migrate-config.bat"
+    "S-1-5-32-545"
+    "Credential migration must not grant normal users direct access")
 assert_file_contains_literal(
     "cmake/packaging/windows_wix.cmake"
     [=["WixToolset.Firewall.wixext"]=]

@@ -21,20 +21,27 @@
   </CPackWiXFragment>
   <!-- LUMEN_VDD_FEATURE_END -->
   <CPackWiXFragment Id="CM_CP_application.tools.lumensvc.exe">
-    <ServiceInstall Id="InstallLumenService"
-                    Name="LumenService"
-                    DisplayName="Lumen Service"
+    <ServiceInstall Id="InstallLumen"
+                    Name="@LUMEN_WINDOWS_SERVICE_NAME@"
+                    DisplayName="Lumen"
                     Description="Lumen is a self-hosted game stream host for Moonlight."
                     Type="ownProcess"
                     Start="auto"
                     ErrorControl="normal"
                     Account="LocalSystem"
                     Vital="yes"/>
-    <ServiceControl Id="ControlLumenService"
-                    Name="LumenService"
+    <ServiceControl Id="ControlLumen"
+                    Name="@LUMEN_WINDOWS_SERVICE_NAME@"
                     Start="install"
                     Stop="both"
                     Remove="uninstall"
+                    Wait="yes"/>
+    <!-- Stop an older Lumen-owned wrapper before the canonical service starts.
+         A successful major upgrade removes it with the old product; the
+         commit action removes an orphaned legacy registration. -->
+    <ServiceControl Id="StopLegacyLumen"
+                    Name="@LUMEN_WINDOWS_LEGACY_SERVICE_NAME@"
+                    Stop="install"
                     Wait="yes"/>
   </CPackWiXFragment>
   <CPackWiXFragment Id="CM_FP_application.Lumen.exe">

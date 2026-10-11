@@ -93,7 +93,7 @@ understanding that it is independently maintained and may still use the upstream
 
 The Windows 11 x64 installer offers the optional **Virtual Keyboard and Mouse** driver feature. It is not selected by
 default. Lumen uses `windows_input_backend = auto` by default, which prefers the driver when it is installed,
-compatible, and accessible to `LumenService`; otherwise, Lumen uses the Windows `SendInput` backend and records
+compatible, and accessible to the `Lumen` service; otherwise, Lumen uses the Windows `SendInput` backend and records
 the reason in the log. Deselect the feature to install without a bundled driver.
 
 > [!IMPORTANT]
@@ -137,7 +137,7 @@ overflow menu. Different versions of Windows may provide slightly different step
 > recommended for most users. No support will be provided!
 
 The lite package does not install the Lumen Virtual HID driver. With the default `auto` setting, it can use an existing
-compatible driver only when Lumen runs through `LumenService`; set `windows_input_backend = sendinput` to force a
+compatible driver only when Lumen runs through the `Lumen` service; set `windows_input_backend = sendinput` to force a
 SendInput-only setup.
 
 1. Download and extract based on your architecture:

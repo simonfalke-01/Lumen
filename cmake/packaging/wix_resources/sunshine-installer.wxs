@@ -129,13 +129,13 @@
 
     <!-- Service installation/removal remains in MSI service tables. These two
          actions select the declaratively installed service's start mode. -->
-    <CustomAction Id="CA_LumenServiceAutoStart"
+    <CustomAction Id="CA_LumenAutoStart"
                   Directory="System64Folder"
-                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config LumenService start= auto"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config @LUMEN_WINDOWS_SERVICE_NAME@ start= auto"
                   Execute="deferred" Return="check" Impersonate="no"/>
-    <CustomAction Id="CA_LumenServiceDemandStart"
+    <CustomAction Id="CA_LumenDemandStart"
                   Directory="System64Folder"
-                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config LumenService start= demand"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; config @LUMEN_WINDOWS_SERVICE_NAME@ start= demand"
                   Execute="deferred" Return="check" Impersonate="no"/>
 
     <!-- MSI service ownership is declarative above. WixQuietExec is used here
@@ -188,9 +188,9 @@
       <Custom Action="CA_LumenInstallCommit" After="CA_LumenInstall"
               Condition="NOT (REMOVE=&quot;ALL&quot;)"/>
 
-      <Custom Action="CA_LumenServiceAutoStart" After="InstallServices"
+      <Custom Action="CA_LumenAutoStart" After="InstallServices"
               Condition="NOT (REMOVE=&quot;ALL&quot;) AND &amp;CM_C_autostart = 3"/>
-      <Custom Action="CA_LumenServiceDemandStart" After="InstallServices"
+      <Custom Action="CA_LumenDemandStart" After="InstallServices"
               Condition="NOT (REMOVE=&quot;ALL&quot;) AND &amp;CM_C_autostart &lt;&gt; 3"/>
 
       <Custom Action="CA_LumenUninstallRollback" After="SetLumenUninstallCommitData"

@@ -87,6 +87,8 @@ set(CPACK_WIX_HELP_LINK "https://github.com/simonfalke-01/Lumen")
 set(CPACK_WIX_PRODUCT_ICON "${SUNSHINE_ICON_PATH}")
 set(CPACK_WIX_PRODUCT_URL "${CMAKE_PROJECT_HOMEPAGE_URL}")
 set(CPACK_WIX_PROGRAM_MENU_FOLDER "Lumen")
+set(LUMEN_WINDOWS_SERVICE_NAME "Lumen")
+set(LUMEN_WINDOWS_LEGACY_SERVICE_NAME "LumenService")
 # Force package files to replace existing files when switching between release
 # and PR builds, regardless of their embedded file versions.
 # https://learn.microsoft.com/en-us/windows/win32/msi/reinstallmode
@@ -106,6 +108,10 @@ message(STATUS "cpack package directory: ${CPACK_PACKAGE_DIRECTORY}")
 # copy custom wxs files to the build directory
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/wix_resources/"
         DESTINATION "${WIX_BUILD_PARENT_DIRECTORY}/")
+configure_file(
+        "${CMAKE_CURRENT_LIST_DIR}/wix_resources/patch.xml"
+        "${WIX_BUILD_PARENT_DIRECTORY}/patch.xml"
+        @ONLY)
 set(LUMEN_MSICA_BINARY "${CMAKE_BINARY_DIR}/tools/lumen_msica.dll")
 file(TO_NATIVE_PATH "${LUMEN_MSICA_BINARY}" LUMEN_MSICA_BINARY_WIX)
 if(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)

@@ -47,16 +47,16 @@ function Invoke-Msi {
 }
 
 function Assert-ServiceRunning {
-    $service = Get-Service LumenService -ErrorAction Stop
+    $service = Get-Service Lumen -ErrorAction Stop
     if ($service.Status -ne 'Running') {
-        throw 'LumenService is not running after MSI installation.'
+        throw 'Lumen is not running after MSI installation.'
     }
     $serviceConfiguration = Get-CimInstance `
         -ClassName Win32_Service `
-        -Filter "Name='LumenService'" `
+        -Filter "Name='Lumen'" `
         -ErrorAction Stop
     if ([string]$serviceConfiguration.StartName -cne 'LocalSystem') {
-        throw "LumenService runs as unexpected principal: $($serviceConfiguration.StartName)"
+        throw "Lumen runs as unexpected principal: $($serviceConfiguration.StartName)"
     }
     $deadline = (Get-Date).AddSeconds(30)
     do {
@@ -67,7 +67,7 @@ function Assert-ServiceRunning {
         }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
-    throw 'LumenService is running but did not launch Lumen.exe.'
+    throw 'Lumen is running but did not launch Lumen.exe.'
 }
 
 function Install-ViGEmBus {
@@ -90,7 +90,7 @@ function Install-ViGEmBus {
     if ($process.ExitCode -ne 0) {
         throw "ViGEmBus installation failed with exit code $($process.ExitCode)."
     }
-    Restart-Service -Name LumenService -Force
+    Restart-Service -Name Lumen -Force
     Assert-ServiceRunning
 }
 

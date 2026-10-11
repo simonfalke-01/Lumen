@@ -55,6 +55,8 @@ param(
 
 # Constants
 $DocsUrl = "https://github.com/simonfalke-01/Lumen"
+$lumenServiceName = "Lumen"
+$legacyLumenServiceName = "LumenService"
 $virtualHidCertificateSubject = "CN=Lumen Virtual HID Driver"
 $vbCablePackageUrl = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip"
 $vbCablePackageSha256 = "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb"
@@ -610,6 +612,97 @@ function Invoke-SetupScript {
     if ($exitCode -ne 0) {
         throw "$Description failed with exit code $exitCode."
     }
+}
+
+function Set-LumenConfigAcl {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        [System.IO.Directory]::CreateDirectory($Path) | Out-Null
+    }
+
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Lumen's configuration root cannot be a reparse point: $Path"
+    }
+
+    $items = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
+    $directories = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
+    $directories.Push($root)
+    while ($directories.Count -ne 0) {
+        $directory = $directories.Pop()
+        $items.Add($directory)
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)) {
+            if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                Write-LogMessage `
+                    -Message "Skipped configuration reparse point while normalizing permissions: $($child.FullName)" `
+                    -Level "Warning"
+                continue
+            }
+            if ($child.PSIsContainer) {
+                $directories.Push($child)
+            } else {
+                $items.Add($child)
+            }
+        }
+    }
+
+    $systemSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-18")
+    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+    $directoryInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor `
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    foreach ($item in $items) {
+        $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($accessRule in @($acl.Access)) {
+            $acl.RemoveAccessRuleSpecific($accessRule)
+        }
+        $inheritance = if ($item.PSIsContainer) {
+            $directoryInheritance
+        } else {
+            [System.Security.AccessControl.InheritanceFlags]::None
+        }
+        foreach ($sid in @($systemSid, $administratorsSid)) {
+            $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                $inheritance,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            ))
+        }
+        Set-Acl -LiteralPath $item.FullName -AclObject $acl -ErrorAction Stop
+
+        $verifiedAcl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+        if (-not $verifiedAcl.AreAccessRulesProtected) {
+            throw "Lumen configuration ACL still inherits access rules: $($item.FullName)"
+        }
+        $verifiedSids = @{}
+        foreach ($accessRule in $verifiedAcl.Access) {
+            $ruleSid = $accessRule.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]
+            )
+            if ($accessRule.IsInherited -or
+                $accessRule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+                $ruleSid.Value -notin @($systemSid.Value, $administratorsSid.Value) -or
+                $accessRule.FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
+                $accessRule.InheritanceFlags -ne $inheritance) {
+                throw "Lumen configuration ACL contains an unexpected rule: $($item.FullName)"
+            }
+            $verifiedSids[$ruleSid.Value] = $true
+        }
+        if (-not $verifiedSids.ContainsKey($systemSid.Value) -or
+            -not $verifiedSids.ContainsKey($administratorsSid.Value)) {
+            throw "Lumen configuration ACL is missing SYSTEM or Administrators: $($item.FullName)"
+        }
+    }
+
+    Write-LogMessage `
+        -Message "Granted SYSTEM and Administrators full control over Lumen configuration." `
+        -Level "Success"
 }
 
 # Invoke the required Virtual HID management helper and preserve its output in
@@ -1710,7 +1803,7 @@ function Assert-NoPendingRollbackTransaction {
 
 function Get-ServiceSnapshot {
     param(
-        [string]$Name = "LumenService"
+        [string]$Name = $script:lumenServiceName
     )
 
     $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
@@ -1757,25 +1850,48 @@ function Restore-ServiceSnapshot {
         default { throw "Unsupported saved service start mode: $StartMode" }
     }
     $scPath = Join-Path $env:SystemRoot "System32\sc.exe"
-    $output = & $scPath config LumenService start= $startArgument 2>&1
+    $output = & $scPath config $lumenServiceName start= $startArgument 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Restoring the Lumen service start mode failed: $($output -join ' ')"
     }
-    $service = Get-Service -Name "LumenService" -ErrorAction Stop
+    $service = Get-Service -Name $lumenServiceName -ErrorAction Stop
     if ($Running) {
         if ($StartMode -eq "Disabled") {
             throw "Saved service state is internally inconsistent: disabled and running."
         }
         if ($service.Status -ne "Running") {
-            Start-Service -Name "LumenService" -ErrorAction Stop
+            Start-Service -Name $lumenServiceName -ErrorAction Stop
         }
         $service.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
     } else {
         if ($service.Status -ne "Stopped") {
-            Stop-Service -Name "LumenService" -Force -ErrorAction Stop
+            Stop-Service -Name $lumenServiceName -Force -ErrorAction Stop
         }
         $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
     }
+}
+
+function Remove-LegacyLumenService {
+    $legacyService = Get-Service `
+        -Name $legacyLumenServiceName `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $legacyService) {
+        return
+    }
+
+    if ($legacyService.Status -ne "Stopped") {
+        Stop-Service -Name $legacyLumenServiceName -Force -ErrorAction Stop
+        $legacyService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+    }
+
+    $scPath = Join-Path $env:SystemRoot "System32\sc.exe"
+    $output = & $scPath delete $legacyLumenServiceName 2>&1
+    if ($LASTEXITCODE -notin @(0, 1072)) {
+        throw "Removing the legacy Lumen service failed: $($output -join ' ')"
+    }
+    Write-LogMessage `
+        -Message "Removed the legacy LumenService registration." `
+        -Level "Information"
 }
 
 function Remove-InstallRollbackArtifacts {
@@ -2120,10 +2236,10 @@ function Invoke-PersistedRollback {
         $driverWasPresent -or $transactionKind -eq "install"
     )
     if ($driverNeedsRollback) {
-        $currentService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
+        $currentService = Get-Service -Name $lumenServiceName -ErrorAction SilentlyContinue
         if ($null -ne $currentService -and $currentService.Status -ne "Stopped") {
             try {
-                Stop-Service -Name "LumenService" -Force -ErrorAction Stop
+                Stop-Service -Name $lumenServiceName -Force -ErrorAction Stop
                 $currentService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
             } catch {
                 $rollbackErrors.Add(
@@ -2185,16 +2301,16 @@ function Invoke-PersistedRollback {
                 throw "Service restore reported exit code $serviceExitCode."
             }
 
-            $restoredService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
+            $restoredService = Get-Service -Name $lumenServiceName -ErrorAction SilentlyContinue
             if ($null -eq $restoredService) {
                 throw "The Lumen service is still absent after rollback."
             }
             if ([string]::IsNullOrWhiteSpace($serviceStartMode)) {
                 if ($serviceWasRunning -and $restoredService.Status -ne "Running") {
-                    Start-Service -Name "LumenService" -ErrorAction Stop
+                    Start-Service -Name $lumenServiceName -ErrorAction Stop
                     $restoredService.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
                 } elseif (-not $serviceWasRunning -and $restoredService.Status -ne "Stopped") {
-                    Stop-Service -Name "LumenService" -Force -ErrorAction Stop
+                    Stop-Service -Name $lumenServiceName -Force -ErrorAction Stop
                     $restoredService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
                 }
             } else {
@@ -2221,7 +2337,7 @@ function Invoke-PersistedRollback {
             if ($serviceExitCode -ne 0) {
                 throw "Service rollback reported exit code $serviceExitCode."
             }
-            if ($null -ne (Get-Service -Name "LumenService" -ErrorAction SilentlyContinue)) {
+            if ($null -ne (Get-Service -Name $lumenServiceName -ErrorAction SilentlyContinue)) {
                 throw "The newly installed Lumen service is still present after rollback."
             }
             $rollbackState.ServiceRollbackComplete = $true
@@ -2619,9 +2735,9 @@ function Invoke-PersistedVirtualMicrophoneRollback {
         return $false
     }
     if (-not [bool]$state.DriverRollbackComplete) {
-        $service = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
+        $service = Get-Service -Name $lumenServiceName -ErrorAction SilentlyContinue
         if ($null -ne $service -and $service.Status -ne "Stopped") {
-            Stop-Service -Name "LumenService" -Force -ErrorAction Stop
+            Stop-Service -Name $lumenServiceName -Force -ErrorAction Stop
             $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
         }
 
@@ -2813,73 +2929,6 @@ if ($Action -eq "install") {
     $totalSteps = 7
     $currentStep = 0
 
-    # Reset permissions on the install directory
-    $currentStep++
-    Write-Progress `
-        -Activity "Installing Lumen" `
-        -Status "Resetting permissions on installation directory" `
-        -PercentComplete (($currentStep / $totalSteps) * 100)
-    Write-LogMessage -Message "🔐 Resetting permissions on installation directory" -Level "Step"
-    try {
-        Write-LogMessage -Message "Executing: icacls.exe `"$RootDir`" /reset" -Level "Information"
-
-        # Capture output to suppress it from console but log it
-        $stdoutFile = [System.IO.Path]::GetTempFileName()
-        $stderrFile = [System.IO.Path]::GetTempFileName()
-
-        try {
-            $icaclsProcess = Start-Process `
-                -FilePath "icacls.exe" `
-                -ArgumentList "`"$RootDir`" /reset" `
-                -Wait `
-                -PassThru `
-                -NoNewWindow `
-                -RedirectStandardOutput $stdoutFile `
-                -RedirectStandardError $stderrFile
-
-            # Log and display the output
-            if (Test-Path $stdoutFile) {
-                $output = Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue
-                if ($output) {
-                    # Display output with indentation
-                    $output -split "`r?`n" | ForEach-Object {
-                        if ($_.Trim()) {
-                            Write-LogMessage -Message "  $_" -Level "Information" -Color "DarkGray"
-                        }
-                    }
-                }
-            }
-            if (Test-Path $stderrFile) {
-                $errors = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
-                if ($errors) {
-                    # Display errors with indentation
-                    $errors -split "`r?`n" | ForEach-Object {
-                        if ($_.Trim()) {
-                            Write-LogMessage -Message "  $_" -Level "Warning"
-                        }
-                    }
-                }
-            }
-
-            if ($icaclsProcess.ExitCode -eq 0) {
-                Write-LogMessage -Message "  ✓ Done" -Level "Success"
-            } else {
-                Write-LogMessage -Message "  ⚠ Exit code $($icaclsProcess.ExitCode)" -Level "Warning"
-            }
-        } finally {
-            # Clean up temp files
-            if (Test-Path $stdoutFile) {
-                Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue
-            }
-            if (Test-Path $stderrFile) {
-                Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
-            }
-        }
-    } catch {
-        Write-LogMessage -Message "  ⚠ Failed to reset permissions: $($_.Exception.Message)" -Level "Warning"
-    }
-    Write-Information ""
-
     # 1. Update PATH (add)
     $currentStep++
     Write-Progress `
@@ -2897,13 +2946,25 @@ if ($Action -eq "install") {
         -Status "Migrating configuration" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     $migrateConfigScript = Join-Path $RootDir "scripts\migrate-config.bat"
-    Invoke-ScriptIfExist `
+    Invoke-SetupScript `
         -ScriptPath $migrateConfigScript `
         -Description "Migrating configuration files" `
         -Emoji "⚙️"
     Write-Information ""
 
-    # 3. Add firewall rules
+    # 3. Normalize only the mutable configuration tree. This is intentionally
+    # retained across rollback because both forward and restored services run
+    # as SYSTEM and require the same access to applications and credentials.
+    $currentStep++
+    Write-Progress `
+        -Activity "Installing Lumen" `
+        -Status "Securing configuration permissions" `
+        -PercentComplete (($currentStep / $totalSteps) * 100)
+    Write-LogMessage -Message "🔐 Securing Lumen configuration" -Level "Step"
+    Set-LumenConfigAcl -Path (Join-Path $RootDir "config")
+    Write-Information ""
+
+    # 4. Add firewall rules
     $currentStep++
     Write-Progress `
         -Activity "Installing Lumen" `
@@ -2920,7 +2981,7 @@ if ($Action -eq "install") {
     }
     Write-Information ""
 
-    # 4. Install or update selected Lumen device drivers. This must complete
+    # 5. Install or update selected Lumen device drivers. This must complete
     # before the service is installed or started.
     $currentStep++
     Write-Progress `
@@ -2965,12 +3026,25 @@ if ($Action -eq "install") {
             -Message "Lumen Virtual Microphone feature is not selected." `
             -Level "Information"
     }
+    $existingServiceName = $lumenServiceName
+    $existingService = if ($Msi) {
+        $null
+    } else {
+        Get-Service -Name $existingServiceName -ErrorAction SilentlyContinue
+    }
+    if (-not $Msi -and $null -eq $existingService) {
+        $existingServiceName = $legacyLumenServiceName
+        $existingService = Get-Service `
+            -Name $existingServiceName `
+            -ErrorAction SilentlyContinue
+    }
     $serviceSnapshot = if ($Msi) {
         @{ Present = $false; Running = $false; StartMode = $null; DelayedAutoStart = $null }
-    } else {
+    } elseif ($null -eq $existingService) {
         Get-ServiceSnapshot
+    } else {
+        Get-ServiceSnapshot -Name $existingServiceName
     }
-    $existingService = if ($Msi) { $null } else { Get-Service -Name "LumenService" -ErrorAction SilentlyContinue }
     $serviceWasPresent = $serviceSnapshot.Present
     $serviceWasRunning = $serviceSnapshot.Running
     $driverWasPresent = $driverStatus -in @(0, 4)
@@ -3004,7 +3078,7 @@ if ($Action -eq "install") {
         Write-LogMessage `
             -Message "Stopping the Lumen service before updating device drivers" `
             -Level "Step"
-        Stop-Service -Name "LumenService" -Force -ErrorAction Stop
+        Stop-Service -Name $existingServiceName -Force -ErrorAction Stop
         $existingService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
     }
     if ($virtualHidSelected) {
@@ -3044,7 +3118,7 @@ if ($Action -eq "install") {
     }
     Write-Information ""
 
-    # 5. Install service. MSI owns this through ServiceInstall/ServiceControl;
+    # 6. Install service. MSI owns this through ServiceInstall/ServiceControl;
     # the scripts remain the NSIS path only.
     $currentStep++
     Write-Progress `
@@ -3062,7 +3136,7 @@ if ($Action -eq "install") {
     }
     Write-Information ""
 
-    # 6. Configure autostart
+    # 7. Configure autostart
     $currentStep++
     Write-Progress `
         -Activity "Installing Lumen" `
@@ -3082,6 +3156,7 @@ if ($Action -eq "install") {
     Write-Progress -Activity "Installing Lumen" -Completed
     if (-not $Msi) {
         Invoke-AllPersistedCommits
+        Remove-LegacyLumenService
     }
     if ($script:RebootRequired) {
         Write-FramedText `
@@ -3145,7 +3220,7 @@ if ($Action -eq "install") {
         $virtualMicrophoneSelected -and -not $virtualMicrophoneUsesVbCable -and `
         $virtualMicrophoneStatus -in @(0, 3, 4)
     $serviceSnapshot = Get-ServiceSnapshot
-    $existingService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
+    $existingService = Get-Service -Name $lumenServiceName -ErrorAction SilentlyContinue
     $uninstallServiceWasPresent = -not $Msi -and $serviceSnapshot.Present
     $uninstallServiceWasRunning = -not $Msi -and `
         $null -ne $existingService -and $existingService.Status -eq "Running"
@@ -3195,13 +3270,13 @@ if ($Action -eq "install") {
         -Status "Removing selected Lumen device drivers" `
         -PercentComplete (($currentStep / $totalSteps) * 100)
     if ($Msi) {
-        $msiOwnedService = Get-Service -Name "LumenService" -ErrorAction SilentlyContinue
+        $msiOwnedService = Get-Service -Name $lumenServiceName -ErrorAction SilentlyContinue
         if ($null -ne $msiOwnedService -and $msiOwnedService.Status -ne "Stopped") {
             $msiOwnedService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
             $msiOwnedService.Refresh()
         }
         if ($null -ne $msiOwnedService -and $msiOwnedService.Status -ne "Stopped") {
-            throw "Windows Installer did not stop LumenService before driver removal."
+            throw "Windows Installer did not stop Lumen before driver removal."
         }
     }
     if ($virtualDisplaySelected) {
@@ -3292,6 +3367,9 @@ if ($Action -eq "install") {
     }
 } elseif ($Action -eq "commit") {
     Invoke-AllPersistedCommits
+    if ($TransactionKind -eq "install") {
+        Remove-LegacyLumenService
+    }
     if (-not $script:RebootRequired) {
         Unregister-DriverResumeTask
         Clear-PendingDriverRebootMarker

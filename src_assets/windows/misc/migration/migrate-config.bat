@@ -7,31 +7,26 @@ for %%I in ("%~dp0\..") do set "OLD_DIR=%%~fI"
 rem Create the config directory if it didn't already exist
 set "NEW_DIR=%OLD_DIR%\config"
 if not exist "%NEW_DIR%\" mkdir "%NEW_DIR%"
-icacls "%NEW_DIR%" /reset
 
 rem Migrate all files that aren't already present in the config dir
 if exist "%OLD_DIR%\apps.json" (
     if not exist "%NEW_DIR%\apps.json" (
         move "%OLD_DIR%\apps.json" "%NEW_DIR%\apps.json"
-        icacls "%NEW_DIR%\apps.json" /reset
     )
 )
 if exist "%OLD_DIR%\lumen.conf" (
     if not exist "%NEW_DIR%\lumen.conf" (
         move "%OLD_DIR%\lumen.conf" "%NEW_DIR%\lumen.conf"
-        icacls "%NEW_DIR%\lumen.conf" /reset
     )
 )
 if exist "%OLD_DIR%\sunshine.conf" (
     if not exist "%NEW_DIR%\lumen.conf" (
         move "%OLD_DIR%\sunshine.conf" "%NEW_DIR%\lumen.conf"
-        icacls "%NEW_DIR%\lumen.conf" /reset
     )
 )
 if exist "%NEW_DIR%\sunshine.conf" (
     if not exist "%NEW_DIR%\lumen.conf" (
         move "%NEW_DIR%\sunshine.conf" "%NEW_DIR%\lumen.conf"
-        icacls "%NEW_DIR%\lumen.conf" /reset
     )
 )
 rem sunshine_state.json remains a compatibility filename so existing pairing
@@ -39,7 +34,6 @@ rem identity is preserved during migration.
 if exist "%OLD_DIR%\sunshine_state.json" (
     if not exist "%NEW_DIR%\sunshine_state.json" (
         move "%OLD_DIR%\sunshine_state.json" "%NEW_DIR%\sunshine_state.json"
-        icacls "%NEW_DIR%\sunshine_state.json" /reset
     )
 )
 
@@ -53,11 +47,8 @@ if exist "%OLD_DIR%\credentials\" (
 rem Create the credentials directory if it wasn't migrated or already existing
 if not exist "%NEW_DIR%\credentials\" mkdir "%NEW_DIR%\credentials"
 
-rem Disallow read access to the credentials directory contents for normal users
-rem Note: We must use the SIDs directly because "Users" and "Administrators" are localized
-icacls "%NEW_DIR%\credentials" /inheritance:r
-icacls "%NEW_DIR%\credentials" /grant:r *S-1-5-32-544:(OI)(CI)(F)
-icacls "%NEW_DIR%\credentials" /grant:r *S-1-5-32-545:(R)
+rem The shared setup script applies the final per-object SYSTEM and
+rem Administrators ACL after all configuration migration is complete.
 
 rem Migrate the covers directory
 if exist "%OLD_DIR%\covers\" (

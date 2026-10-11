@@ -298,7 +298,7 @@ launchctl load -w /Library/LaunchAgents/org.freedesktop.dbus-session.plist
 ### Virtual keyboard or mouse is unavailable
 
 With the default `windows_input_backend = auto`, Lumen uses the Lumen Virtual HID keyboard and mouse driver when it
-is compatible and accessible to `LumenService`. Set `windows_input_backend = sendinput` to skip the driver probe and
+is compatible and accessible to the `Lumen` service. Set `windows_input_backend = sendinput` to skip the driver probe and
 always use SendInput.
 
 Check the log in the web UI's `Troubleshooting` tab or at `config/lumen.log` in the Lumen installation directory.
@@ -334,7 +334,7 @@ Virtual HID.
 
 > [!NOTE]
 > A direct Lumen launch cannot access the Virtual HID report interface, even when run as Administrator. Run the
-> installed `LumenService` to use Virtual HID. `SunshineService` belongs to the upstream product and is never used as
+> installed `Lumen` service to use Virtual HID. `SunshineService` belongs to the upstream product and is never used as
 > a Lumen fallback. Standalone/lite builds use `SendInput` when no
 > compatible, accessible driver is installed.
 
@@ -349,7 +349,7 @@ supported relative and absolute mouse input remains on Virtual HID, while unsupp
 and Unicode text are rejected. A later report failure fails closed and stops keyboard and mouse injection instead of
 risking duplicate or stuck input. Disconnect Moonlight to trigger the input session's atomic reset-and-release
 operation. A successful reset neutralizes and reclaims Virtual HID without replaying held state; a failed reset keeps
-input fail closed. If disconnecting does not recover input, restart `LumenService` and review the failure before
+input fail closed. If disconnecting does not recover input, restart the `Lumen` service and review the failure before
 reconnecting. Reboot Windows if the topology remains `unhealthy`, the installer reports that a reboot is required, or a
 service restart does not recover the driver; then rerun repair if `status --json` is still not `installed`.
 
@@ -377,7 +377,7 @@ tools\lumen-vmicctl.exe probe --json
 ```
 
 Healthy output reports one `ROOT\LumenVirtualMicrophone` root, one active `Lumen Virtual Microphone` capture endpoint,
-and ABI state `compatible`. The control path is restricted to `LumenService`, so `probe` reports `inaccessible` from a
+and ABI state `compatible`. The control path is restricted to the `Lumen` service, so `probe` reports `inaccessible` from a
 normal Administrator shell. Endpoint names are diagnostic only because Windows permits users to rename them. The
 helper identifies the active capture endpoint through the exact `PKEY_DeviceInterface_FriendlyName` adapter identity
 owned by the driver INF. Windows does not expose a usable `PKEY_Device_InstanceId` for this MMDevice endpoint.

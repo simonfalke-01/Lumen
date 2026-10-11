@@ -24,7 +24,7 @@ SERVICE_STATUS service_status;
 HANDLE stop_event;
 HANDLE session_change_event;
 
-constexpr auto DEFAULT_SERVICE_NAME = L"LumenService";  ///< Stable Windows service name for normal Lumen installations.
+constexpr auto DEFAULT_SERVICE_NAME = L"Lumen";  ///< Canonical Windows service name for normal Lumen installations.
 constexpr auto DEFAULT_LOG_FILE_NAME = L"lumen.log";  ///< Stable service log filename for normal Lumen installations.
 constexpr std::size_t MAX_SERVICE_LOG_NAME_LENGTH = 64;  ///< Maximum normalized alternate service name stored in its log filename.
 constexpr auto LUMEN_EXECUTABLE = L"Lumen.exe";  ///< Executable name published by current packages.
@@ -46,7 +46,7 @@ bool IsSafeServiceLogCharacter(wchar_t character) {
 /**
  * @brief Build the service wrapper's log filename.
  *
- * The installed `LumenService` retains the historical `lumen.log` filename.
+ * The installed `Lumen` service retains the historical `lumen.log` filename.
  * Alternate SCM services receive a bounded filename derived from their actual
  * service name so they cannot truncate or share the installed service's log.
  * Characters that are unsafe or ambiguous in Windows filenames are replaced.
@@ -84,7 +84,7 @@ const wchar_t *ResolveHostExecutable() {
   if (GetFileAttributesW(LUMEN_EXECUTABLE) != INVALID_FILE_ATTRIBUTES) {
     return LUMEN_EXECUTABLE;
   }
-  OutputDebugStringW(L"LumenService: Lumen.exe is missing from the installation root.\n");
+  OutputDebugStringW(L"Lumen: Lumen.exe is missing from the installation root.\n");
   return nullptr;
 }
 
@@ -355,7 +355,7 @@ VOID WINAPI ServiceMain(DWORD argc, LPWSTR *argv) {
     PROCESS_INFORMATION process_info {};
     if (!host_executable || !CreateProcessAsUserW(console_token, host_executable, nullptr, nullptr, nullptr, TRUE, CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, (LPSTARTUPINFOW) &startup_info, &process_info)) {
       const DWORD launch_error = host_executable ? GetLastError() : ERROR_FILE_NOT_FOUND;
-      const std::string message = std::format("LumenService failed to launch Lumen.exe (error {}).\r\n", launch_error);
+      const std::string message = std::format("Lumen failed to launch Lumen.exe (error {}).\r\n", launch_error);
       DWORD written = 0;
       WriteFile(log_file_handle, message.data(), static_cast<DWORD>(message.size()), &written, nullptr);
       service_status.dwWin32ExitCode = launch_error;
