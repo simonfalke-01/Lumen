@@ -202,6 +202,33 @@ namespace lumen::lsp::runtime {
       std::uint64_t deadline_microseconds
     ) noexcept = 0;
 
+    /**
+     * @brief Replace the host clipboard with one validated client clipboard update.
+     *
+     * Implementations must not block on the platform clipboard; the control lock is held.
+     *
+     * @param peer Exact authenticated association.
+     * @param client Authenticated trusted-client record with clipboard permission.
+     * @param connection_generation Current connection generation.
+     * @param request Exact decoded update.
+     * @param utf8 Complete validated clipboard bundle.
+     * @return Stable disposition returned to the client.
+     */
+    virtual ControlStatus clipboard_update(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      std::uint32_t connection_generation,
+      const ClipboardUpdatePayload &request,
+      std::span<const std::uint8_t> utf8
+    ) noexcept {
+      (void) peer;
+      (void) client;
+      (void) connection_generation;
+      (void) request;
+      (void) utf8;
+      return ControlStatus::unsupported;
+    }
+
     /** @brief Select hot-plugged device rates within the current input budget. */
     [[nodiscard]] virtual std::expected<InputRateResponsePayload, ControlStatus> input_rate(
       const PeerEndpoint &peer,
@@ -803,6 +830,25 @@ namespace lumen::lsp::runtime {
     bool send_stream_ended(
       const PeerEndpoint &peer,
       const StreamEndedPayload &ended,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /**
+     * @brief Send one host clipboard bundle to one authenticated clipboard-permitted peer.
+     *
+     * Only the newest bundle is retained while an earlier update is in flight. Bundles larger than
+     * one inline payload is transferred through OBJECT_CHUNK before its CLIPBOARD_UPDATE.
+     *
+     * @param peer Exact authenticated association that owns the stream.
+     * @param session_id Active stream-session identifier.
+     * @param utf8 Complete valid clipboard bundle, at most `maximum_clipboard_bytes`.
+     * @param now_microseconds Monotonic first-send time.
+     * @return True when the text was sent or retained for sending.
+     */
+    bool send_clipboard_update(
+      const PeerEndpoint &peer,
+      const Identifier128 &session_id,
+      std::vector<std::uint8_t> utf8,
       std::uint64_t now_microseconds
     ) noexcept;
 

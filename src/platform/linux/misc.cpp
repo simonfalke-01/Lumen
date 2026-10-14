@@ -1305,6 +1305,10 @@ namespace platf {
     return nullptr;
   }
 
+  std::unique_ptr<clipboard_t> clipboard() {
+    return nullptr;
+  }
+
   /**
    * @brief Initialize the Linux high-precision timer file descriptor.
    */

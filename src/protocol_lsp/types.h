@@ -70,6 +70,7 @@ namespace lumen::lsp {
     stop_own_stream = 1U << 4U,  ///< Stop a stream owned by the client.
     quit_application = 1U << 5U,  ///< Quit the hosted application.
     controller_output = 1U << 6U,  ///< Receive controller output and haptics.
+    clipboard = 1U << 7U,  ///< Exchange clipboard text with the host while streaming.
   };
 
   /**
@@ -77,13 +78,14 @@ namespace lumen::lsp {
    */
   class PermissionSet {
   public:
-    inline static constexpr std::uint32_t known_mask = 0x7fU;  ///< Mask containing every LSP/1 permission bit.
+    inline static constexpr std::uint32_t known_mask = 0xffU;  ///< Mask containing every LSP/1 permission bit.
     inline static constexpr std::uint32_t default_pairing_mask =
       static_cast<std::uint32_t>(Permission::browse_applications) |
       static_cast<std::uint32_t>(Permission::start_attach) |
       static_cast<std::uint32_t>(Permission::input) |
       static_cast<std::uint32_t>(Permission::stop_own_stream) |
-      static_cast<std::uint32_t>(Permission::controller_output);  ///< Safe default pairing permissions.
+      static_cast<std::uint32_t>(Permission::controller_output) |
+      static_cast<std::uint32_t>(Permission::clipboard);  ///< Safe default pairing permissions.
 
     /**
      * @brief Construct an empty permission set.
@@ -106,7 +108,7 @@ namespace lumen::lsp {
     /**
      * @brief Construct the safe default pairing permissions.
      *
-     * @return Browse, start/attach, input, stop-own-stream, and controller-output permissions.
+     * @return Browse, start/attach, input, stop-own-stream, controller-output, and clipboard permissions.
      */
     [[nodiscard]] static constexpr PermissionSet default_pairing() noexcept {
       return PermissionSet {default_pairing_mask};

@@ -63,6 +63,8 @@ namespace lumen::lsp::runtime {
     input_rate_request = 0x0218,  ///< Offer hot-plugged device capture and packet-rate bounds.
     input_rate_response = 0x0219,  ///< Select device rates within the active input budget.
     stream_ended = 0x0220,  ///< Notify the client that one generation-bound stream ended.
+    clipboard_update = 0x0222,  ///< Replace the peer clipboard with bounded UTF-8 text.
+    clipboard_update_response = 0x0223,  ///< Return session- and sequence-bound clipboard disposition.
     path_probe = 0x0300,  ///< Establish authenticated intent for one exact-size SRTCP path probe.
     path_probe_ack = 0x0301,  ///< Confirm one authenticated exact-size path probe.
     object_chunk = 0x0400,  ///< Transfer or acknowledge one bounded contiguous object chunk.
@@ -627,6 +629,45 @@ namespace lumen::lsp::runtime {
     std::uint64_t reserved_input_wire_bits_per_second {};  ///< Updated aggregate reserved input budget.
   };
 
+  /** @brief One clipboard bundle replacement, inline or object-backed, sent by either peer. */
+  struct ClipboardUpdatePayload {
+    Identifier128 session_id {};  ///< Active stream-session identifier.
+    std::uint64_t sequence {};  ///< Nonzero sender-local sequence, increasing within one session.
+    std::uint32_t content_length {};  ///< Complete clipboard bundle length, at most 16 MiB.
+    std::vector<std::uint8_t> inline_content;  ///< Inline bundle bytes, or empty for an object-backed bundle.
+    std::optional<Identifier128> object_id;  ///< Completed object identity for non-inline text.
+    std::optional<Digest256> sha256;  ///< Complete object commitment for non-inline text.
+  };
+
+  /** @brief Exact four-key clipboard update response. */
+  struct ClipboardUpdateResponsePayload {
+    ControlStatus status {ControlStatus::success};  ///< Clipboard disposition.
+    Identifier128 session_id {};  ///< Exact requested session identifier.
+    std::uint64_t sequence {};  ///< Exact requested sequence.
+  };
+
+  /** @brief Largest clipboard bundle either peer may transfer. */
+  inline constexpr std::uint32_t maximum_clipboard_bytes = 16U * 1'024U * 1'024U;
+
+  /** @brief Clipboard bundle entry kinds. */
+  enum class ClipboardKind : std::uint8_t {
+    text = 1,  ///< UTF-8 plain text with LF line endings.
+    html = 2,  ///< UTF-8 HTML markup.
+    png = 3,  ///< PNG image.
+  };
+
+  /**
+   * @brief Validate one clipboard bundle.
+   *
+   * A bundle is one or more entries of a 1-byte kind, a 4-byte big-endian length, and that many
+   * bytes. Each kind appears at most once, text and HTML are valid UTF-8, and PNG data starts with
+   * the PNG signature. Unknown kinds are rejected.
+   */
+  [[nodiscard]] bool valid_clipboard_bundle(std::span<const std::uint8_t> bundle) noexcept;
+
+  /** @brief Largest clipboard bundle carried inline instead of through OBJECT_CHUNK. */
+  inline constexpr std::size_t maximum_inline_clipboard_bytes = 768;
+
   /** @brief Exact four-key generation-bound terminal stream notification. */
   struct StreamEndedPayload {
     Identifier128 session_id {};  ///< Session that reached a terminal state.
@@ -771,6 +812,18 @@ namespace lumen::lsp::runtime {
 
   /** @brief Encode exact generation-bound STREAM_ENDED deterministic CBOR. */
   [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_stream_ended(const StreamEndedPayload &payload);
+
+  /** @brief Decode exact seven-key CLIPBOARD_UPDATE deterministic CBOR. */
+  [[nodiscard]] std::expected<ClipboardUpdatePayload, ControlWireError> decode_clipboard_update(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact seven-key CLIPBOARD_UPDATE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_clipboard_update(const ClipboardUpdatePayload &payload);
+
+  /** @brief Decode exact four-key successful CLIPBOARD_UPDATE_RESPONSE deterministic CBOR. */
+  [[nodiscard]] std::expected<ClipboardUpdateResponsePayload, ControlWireError> decode_clipboard_update_response(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact four-key successful CLIPBOARD_UPDATE_RESPONSE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_clipboard_update_response(const ClipboardUpdateResponsePayload &payload);
 
   /** @brief Decode one exact OBJECT_CHUNK request deterministic CBOR. */
   [[nodiscard]] std::expected<ObjectChunkPayload, ControlWireError> decode_object_chunk(std::span<const std::uint8_t> payload);

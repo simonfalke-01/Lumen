@@ -75,6 +75,10 @@ namespace platf {
     return screen_capture_allowed;
   }
 
+  std::unique_ptr<clipboard_t> clipboard() {
+    return nullptr;
+  }
+
   std::unique_ptr<deinit_t> init() {
     // This will generate a warning about CGPreflightScreenCaptureAccess and
     // CGRequestScreenCaptureAccess being unavailable before macOS 10.15, but

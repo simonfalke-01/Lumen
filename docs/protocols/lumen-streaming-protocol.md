@@ -376,10 +376,11 @@ Pairing grants an explicit LSP permission mask. Unknown bits are rejected.
 | 4 | stop own stream |
 | 5 | quit the hosted application |
 | 6 | receive controller output/haptics |
+| 7 | exchange clipboard text |
 
 Authentication returns the currently effective subset and its revocation
 generation. Raw input packets, input rate changes, text, microphone, stop,
-quit, and controller feedback are accepted only with their exact permission
+quit, controller feedback, and clipboard updates are accepted only with their exact permission
 and live session ownership. Permission loss neutralizes affected input before
 the revocation response is acknowledged.
 
@@ -602,6 +603,8 @@ product control operation is enabled. The top-level message types are reserved:
 | `0x0218` | `INPUT_RATE_REQUEST` | client to host |
 | `0x0219` | `INPUT_RATE_RESPONSE` | host to client |
 | `0x0220` | `STREAM_ENDED` | host to client |
+| `0x0222` | `CLIPBOARD_UPDATE` | either direction |
+| `0x0223` | `CLIPBOARD_UPDATE_RESPONSE` | opposite direction |
 | `0x0300` | `PATH_PROBE` | either direction |
 | `0x0301` | `PATH_PROBE_ACK` | opposite direction |
 | `0x0400` | `OBJECT_CHUNK` | either direction |
@@ -643,6 +646,13 @@ consecutive integers starting at one; no omitted or additional keys are valid.
   aggregate reserved input wire bits per second.
 - `STREAM_ENDED` (four keys): wire version, session ID, stream generation, and
   terminal reason. It is a reliable request-ID-zero notification.
+- `CLIPBOARD_UPDATE` (seven keys): wire version, session ID, nonzero
+  sender-local sequence, clipboard bundle length (1 byte to 16 MiB), nullable
+  inline bytes, nullable object ID, and nullable SHA-256. Bundles of at most
+  768 bytes are inline; longer bundles are first sent through `OBJECT_CHUNK`
+  and referenced by object ID and SHA-256. Its success response has four keys:
+  wire version, status, session ID, and sequence. Failure uses the generic
+  two-key error map.
 - An `OBJECT_CHUNK` request has six keys: wire version, object ID, contiguous
   offset, total length, nonempty bytes, and complete-object SHA-256. A
   response-flagged successful acknowledgement has five keys: wire version,
@@ -1761,7 +1771,33 @@ its object ID, length, and SHA-256; total text remains limited to 16 KiB. The
 host injects only after the complete object and edge barrier validate. Text is
 valid Unicode scalar sequences, cannot carry platform commands or alter input
 authority, and never consumes the urgent input packet reserve. Clipboard
-synchronization, if later enabled, uses a separate permission and control type.
+synchronization uses the separate clipboard permission and `CLIPBOARD_UPDATE`.
+
+### 15.8 Clipboard sharing
+
+While a client with the clipboard permission owns a stream, each peer sends a
+`CLIPBOARD_UPDATE` when its local clipboard changes. Only changes made after
+the stream starts are sent, and content just received from the peer is not
+echoed back. Each sender keeps at most one update in flight and replaces any
+queued content with the newest copy. The receiver validates the session and
+the complete bundle, replaces its local clipboard with every representation it
+received, and responds. Clipboard updates never inject input, never consume the
+input reserve, and stop when the stream or permission ends.
+
+A clipboard bundle is one or more entries, each a 1-byte kind, a 4-byte
+big-endian length, and that many bytes. Each kind appears at most once and
+unknown kinds are rejected:
+
+| Kind | Representation |
+| ---: | --- |
+| 1 | UTF-8 plain text with LF line endings |
+| 2 | UTF-8 HTML markup (a fragment or a complete document) |
+| 3 | PNG image |
+
+Platforms convert to and from their native clipboard formats. A Windows host
+performs clipboard access in a helper process running as the interactive user,
+because clipboard data owned by user applications is not reliably readable from
+the SYSTEM service account.
 
 ## 16. Scheduler and pacer
 

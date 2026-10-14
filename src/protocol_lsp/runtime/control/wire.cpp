@@ -1623,6 +1623,148 @@ namespace lumen::lsp::runtime {
     });
   }
 
+  bool valid_clipboard_bundle(const std::span<const std::uint8_t> bundle) noexcept {
+    if (bundle.empty() || bundle.size() > maximum_clipboard_bytes) {
+      return false;
+    }
+    std::uint8_t seen = 0;
+    std::size_t index = 0;
+    while (index < bundle.size()) {
+      if (bundle.size() - index < 5U) {
+        return false;
+      }
+      const auto kind = bundle[index];
+      const std::size_t size = (std::size_t {bundle[index + 1]} << 24U) | (std::size_t {bundle[index + 2]} << 16U) |
+                               (std::size_t {bundle[index + 3]} << 8U) | std::size_t {bundle[index + 4]};
+      index += 5U;
+      if (kind < static_cast<std::uint8_t>(ClipboardKind::text) || kind > static_cast<std::uint8_t>(ClipboardKind::png) ||
+          (seen & (1U << kind)) != 0 || size == 0 || size > bundle.size() - index) {
+        return false;
+      }
+      seen = static_cast<std::uint8_t>(seen | (1U << kind));
+      const auto entry = bundle.subspan(index, size);
+      if (kind == static_cast<std::uint8_t>(ClipboardKind::png)) {
+        constexpr std::array<std::uint8_t, 8> signature {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+        if (entry.size() < signature.size() || !std::equal(signature.begin(), signature.end(), entry.begin())) {
+          return false;
+        }
+      } else if (!cbor::is_valid_utf8({reinterpret_cast<const char *>(entry.data()), entry.size()})) {
+        return false;
+      }
+      index += size;
+    }
+    return true;
+  }
+
+  std::expected<ClipboardUpdatePayload, ControlWireError> decode_clipboard_update(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 7);
+    ClipboardUpdatePayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *sequence = map ? unsigned_value((*map)[2].second) : nullptr;
+    const auto *content_length = map ? unsigned_value((*map)[3].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version ||
+        !fixed_bytes((*map)[1].second, result.session_id) || is_zero(result.session_id) ||
+        sequence == nullptr || *sequence == 0 ||
+        content_length == nullptr || *content_length == 0 || *content_length > maximum_clipboard_bytes) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.sequence = *sequence;
+    result.content_length = static_cast<std::uint32_t>(*content_length);
+    const auto *inline_content = byte_string((*map)[4].second);
+    if (inline_content != nullptr) {
+      if (inline_content->empty() || inline_content->size() != result.content_length ||
+          inline_content->size() > maximum_inline_clipboard_bytes || !valid_clipboard_bundle(*inline_content) ||
+          !null_value((*map)[5].second) || !null_value((*map)[6].second)) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      result.inline_content = *inline_content;
+      return result;
+    }
+    Identifier128 object_id;
+    Digest256 digest;
+    if (!null_value((*map)[4].second) || result.content_length <= maximum_inline_clipboard_bytes ||
+        !fixed_bytes((*map)[5].second, object_id) || is_zero(object_id) ||
+        !fixed_bytes((*map)[6].second, digest) || is_zero(digest)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.object_id = object_id;
+    result.sha256 = digest;
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_clipboard_update(
+    const ClipboardUpdatePayload &payload
+  ) {
+    if (is_zero(payload.session_id) || payload.sequence == 0 || payload.content_length == 0 ||
+        payload.content_length > maximum_clipboard_bytes) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    if (!payload.inline_content.empty()) {
+      if (payload.inline_content.size() != payload.content_length ||
+          payload.inline_content.size() > maximum_inline_clipboard_bytes || !valid_clipboard_bundle(payload.inline_content) ||
+          payload.object_id || payload.sha256) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      return encode({
+        {1, wire_version},
+        {2, bytes(payload.session_id)},
+        {3, payload.sequence},
+        {4, payload.content_length},
+        {5, cbor::Value::Bytes {payload.inline_content}},
+        {6, cbor::Value {cbor::Null {}}},
+        {7, cbor::Value {cbor::Null {}}},
+      });
+    }
+    if (payload.content_length <= maximum_inline_clipboard_bytes || !payload.object_id || !payload.sha256 ||
+        is_zero(*payload.object_id) || is_zero(*payload.sha256)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, bytes(payload.session_id)},
+      {3, payload.sequence},
+      {4, payload.content_length},
+      {5, cbor::Value {cbor::Null {}}},
+      {6, bytes(*payload.object_id)},
+      {7, bytes(*payload.sha256)},
+    });
+  }
+
+  std::expected<ClipboardUpdateResponsePayload, ControlWireError> decode_clipboard_update_response(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 4);
+    ClipboardUpdateResponsePayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *sequence = map ? unsigned_value((*map)[3].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || status == nullptr ||
+        *status != static_cast<std::uint8_t>(ControlStatus::success) ||
+        !fixed_bytes((*map)[2].second, result.session_id) || is_zero(result.session_id) ||
+        sequence == nullptr || *sequence == 0) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.status = ControlStatus::success;
+    result.sequence = *sequence;
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_clipboard_update_response(
+    const ClipboardUpdateResponsePayload &payload
+  ) {
+    if (payload.status != ControlStatus::success || is_zero(payload.session_id) || payload.sequence == 0) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, bytes(payload.session_id)},
+      {4, payload.sequence},
+    });
+  }
+
   std::expected<ObjectChunkPayload, ControlWireError> decode_object_chunk(
     const std::span<const std::uint8_t> payload
   ) {

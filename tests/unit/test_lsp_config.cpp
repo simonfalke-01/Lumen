@@ -51,7 +51,7 @@ namespace {
         .port = 48'030,
         .profile = "adaptive-low-latency",
         .competition_capacity_mbps = 0,
-        .pairing_permissions = 0x57U,
+        .pairing_permissions = 0xd7U,
       };
     }
 
@@ -65,7 +65,7 @@ TEST_F(LspConfigTest, UsesSafeCompileProfileDefaults) {
   EXPECT_EQ(config::lsp.port, 48'030);
   EXPECT_EQ(config::lsp.profile, "adaptive-low-latency");
   EXPECT_EQ(config::lsp.competition_capacity_mbps, 0U);
-  EXPECT_EQ(config::lsp.pairing_permissions, 0x57U);
+  EXPECT_EQ(config::lsp.pairing_permissions, 0xd7U);
 }
 
 TEST_F(LspConfigTest, ParsesEverySupportedLspSetting) {
@@ -74,7 +74,7 @@ TEST_F(LspConfigTest, ParsesEverySupportedLspSetting) {
     "lsp_port = 50000\n"
     "lsp_profile = competition\n"
     "lsp_competition_capacity_mbps = 2500\n"
-    "lsp_pairing_permissions = 127\n"
+    "lsp_pairing_permissions = 255\n"
   );
 
 #if LUMEN_LSP_DEFAULT_ENABLED
@@ -85,7 +85,7 @@ TEST_F(LspConfigTest, ParsesEverySupportedLspSetting) {
   EXPECT_EQ(config::lsp.port, 50'000);
   EXPECT_EQ(config::lsp.profile, "competition");
   EXPECT_EQ(config::lsp.competition_capacity_mbps, 2'500U);
-  EXPECT_EQ(config::lsp.pairing_permissions, 0x7fU);
+  EXPECT_EQ(config::lsp.pairing_permissions, 0xffU);
 }
 
 TEST_F(LspConfigTest, RejectsOutOfRangeAndUnknownValuesWithoutChangingSafeDefaults) {
@@ -93,13 +93,13 @@ TEST_F(LspConfigTest, RejectsOutOfRangeAndUnknownValuesWithoutChangingSafeDefaul
     "lsp_port = 0\n"
     "lsp_profile = fastest\n"
     "lsp_competition_capacity_mbps = -1\n"
-    "lsp_pairing_permissions = 128\n"
+    "lsp_pairing_permissions = 256\n"
   );
 
   EXPECT_EQ(config::lsp.port, 48'030);
   EXPECT_EQ(config::lsp.profile, "adaptive-low-latency");
   EXPECT_EQ(config::lsp.competition_capacity_mbps, 0U);
-  EXPECT_EQ(config::lsp.pairing_permissions, 0x57U);
+  EXPECT_EQ(config::lsp.pairing_permissions, 0xd7U);
 }
 
 TEST_F(LspConfigTest, ReportsAndDropsRetiredKeysWithoutReinterpretingThemAsLsp) {
@@ -114,5 +114,5 @@ TEST_F(LspConfigTest, ReportsAndDropsRetiredKeysWithoutReinterpretingThemAsLsp) 
   EXPECT_FALSE(config::modified_config_settings.contains("legacy_compatibility"));
   EXPECT_EQ(config::lsp.port, 48'030);
   EXPECT_EQ(config::lsp.profile, "adaptive-low-latency");
-  EXPECT_EQ(config::lsp.pairing_permissions, 0x57U);
+  EXPECT_EQ(config::lsp.pairing_permissions, 0xd7U);
 }

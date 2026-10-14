@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1432,6 +1433,41 @@ namespace platf {
    * @return A unique pointer to timer
    */
   std::unique_ptr<high_precision_timer> create_high_precision_timer();
+
+  /**
+   * @brief Host clipboard bridge owned by one streaming session.
+   *
+   * Calls are nonblocking; platform clipboard access happens outside the caller's thread.
+   * Content crosses this interface as LSP clipboard bundles (text, HTML, and PNG entries).
+   */
+  class clipboard_t {
+  public:
+    virtual ~clipboard_t() = default;
+
+    /**
+     * @brief Replace the host clipboard without reporting it back as a local change.
+     * @param bundle Valid clipboard bundle.
+     */
+    virtual void set_content(std::vector<std::uint8_t> bundle) = 0;
+
+    /**
+     * @brief Return the newest local clipboard change since the previous call.
+     * @return Changed bundle, or nullopt when nothing new was copied on the host.
+     */
+    virtual std::optional<std::vector<std::uint8_t>> take_change() = 0;
+
+    /**
+     * @brief Report whether the bridge can still observe and change the host clipboard.
+     * @return False after the platform helper has stopped.
+     */
+    [[nodiscard]] virtual bool running() const noexcept = 0;
+  };
+
+  /**
+   * @brief Start watching the host clipboard.
+   * @return A clipboard bridge, or nullptr when clipboard sharing is unsupported.
+   */
+  std::unique_ptr<clipboard_t> clipboard();
 
   /**
    * @brief Check is the current process is running with elevated privileges (e.g. system admin/etc.)

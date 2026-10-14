@@ -11,8 +11,8 @@ const props = defineProps([
 ])
 
 const defaultMoonlightPort = 47989
-const lspKnownPermissionMask = 0x7f
-const lspDefaultPermissionMask = 0x57
+const lspKnownPermissionMask = 0xff
+const lspDefaultPermissionMask = 0xd7
 
 const config = ref(props.config)
 const effectivePort = computed(() => +config.value?.port ?? defaultMoonlightPort)
@@ -37,6 +37,7 @@ const lspPermissionMicrophone = lspPermissionModel(1 << 3)
 const lspPermissionStopOwnStream = lspPermissionModel(1 << 4)
 const lspPermissionQuitApplication = lspPermissionModel(1 << 5)
 const lspPermissionControllerOutput = lspPermissionModel(1 << 6)
+const lspPermissionClipboard = lspPermissionModel(1 << 7)
 const lspCompetitionNeedsCapacity = computed(() =>
   config.value?.lsp_profile === 'competition' && Number(config.value?.lsp_competition_capacity_mbps) <= 0
 )
@@ -281,6 +282,10 @@ const lspCompetitionNeedsCapacity = computed(() =>
           <div class="col-12 col-md-6 form-check">
             <input id="lsp_permission_controller_output" v-model="lspPermissionControllerOutput" class="form-check-input" type="checkbox" />
             <label for="lsp_permission_controller_output" class="form-check-label">{{ $t('config.lsp_permission_controller_output') }}</label>
+          </div>
+          <div class="col-12 col-md-6 form-check">
+            <input id="lsp_permission_clipboard" v-model="lspPermissionClipboard" class="form-check-input" type="checkbox" />
+            <label for="lsp_permission_clipboard" class="form-check-label">{{ $t('config.lsp_permission_clipboard') }}</label>
           </div>
         </div>
         <div id="lsp-pairing-permissions-help" class="form-text mt-2">

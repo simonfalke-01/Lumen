@@ -848,7 +848,7 @@ namespace config {
     48'030,  // single LSP UDP application port
     "adaptive-low-latency",  // congestion-safe default profile
     0,  // competition is unavailable until a capacity ceiling is configured
-    0x57U,  // browse, start/attach, input, stop-own-stream, and controller output
+    0xd7U,  // browse, start/attach, input, stop-own-stream, controller output, and clipboard
   };
 
   /**
@@ -1819,7 +1819,7 @@ namespace config {
     }
     {
       int pairing_permissions = static_cast<int>(lsp.pairing_permissions);
-      int_between_f(vars, "lsp_pairing_permissions", pairing_permissions, {0, 0x7f});
+      int_between_f(vars, "lsp_pairing_permissions", pairing_permissions, {0, 0xff});
       lsp.pairing_permissions = static_cast<std::uint32_t>(pairing_permissions);
     }
 #if !LUMEN_LSP_RUNTIME_AVAILABLE

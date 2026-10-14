@@ -34,6 +34,7 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_applications = 64;
     constexpr std::size_t maximum_application_image_bytes = 512;
     constexpr std::uint64_t response_deadline_microseconds = 1'000'000;
+    constexpr std::uint64_t clipboard_response_deadline_microseconds = 5'000'000;
     constexpr std::uint64_t path_probe_semantic_deadline_microseconds = 60'000'000;  ///< Covers all legal LSPP retries plus margin.
 
     /** @brief Return local monotonic microseconds for asynchronous terminal responses. */
@@ -404,6 +405,28 @@ namespace lumen::lsp::runtime {
       std::size_t accepted_certificate_rotation_ack_size {};  ///< Populated leading ACK bytes.
       std::uint64_t accepted_certificate_rotation_request_id {};  ///< Latest accepted request correlation.
 
+      struct OutboundClipboard {
+        Identifier128 session_id {};  ///< Stream session bound into the update.
+        std::uint64_t sequence {};  ///< Host-local update sequence.
+        std::vector<std::uint8_t> utf8;  ///< Complete UTF-8 text being delivered.
+        Identifier128 object_id {};  ///< OBJECT_CHUNK identity for non-inline text.
+        Digest256 sha256 {};  ///< Complete-object commitment for non-inline text.
+        std::uint64_t request_id {};  ///< CLIPBOARD_UPDATE response correlation.
+        std::uint64_t message_id {};  ///< Reliable CLIPBOARD_UPDATE message identifier.
+        std::uint64_t deadline_microseconds {};  ///< Semantic response deadline.
+        bool awaiting_object {};  ///< Whether the object transfer must finish before the update.
+        bool awaiting_response {};  ///< Whether CLIPBOARD_UPDATE_RESPONSE remains outstanding.
+      } outbound_clipboard;  ///< At most one host clipboard update in flight.
+
+      struct QueuedClipboard {
+        Identifier128 session_id {};  ///< Stream session for the newest text.
+        std::vector<std::uint8_t> utf8;  ///< Newest text superseding older queued text.
+        bool active {};  ///< Whether text waits for the in-flight update.
+      } queued_clipboard;  ///< Latest-wins clipboard text behind the in-flight update.
+
+      std::uint64_t next_clipboard_sequence {1};  ///< Next host clipboard sequence.
+      std::uint64_t completed_clipboard_request_id {};  ///< Latest accepted clipboard response correlation.
+
       struct PendingText {
         packet_slab<maximum_control_frame_bytes> request {};  ///< Byte-identical request for terminal caching.
         lspc_header header {};  ///< Exact deferred response correlation.
@@ -717,6 +740,8 @@ namespace lumen::lsp::runtime {
         connection.outgoing_object_request_id = 0;
         connection.outgoing_object_message_id = 0;
         connection.outgoing_object_pending = false;
+        connection.outbound_clipboard = {};
+        connection.queued_clipboard = {};
       }
       text_work_.clear();
       shutdown_complete_ = true;
@@ -1064,6 +1089,9 @@ namespace lumen::lsp::runtime {
         if (message_type == ControlMessageType::object_chunk) {
           return object_chunk_acknowledgement(connection, frame, parsed.header, parsed.payload, now_microseconds);
         }
+        if (message_type == ControlMessageType::clipboard_update_response) {
+          return clipboard_update_response(connection, parsed.header, parsed.payload, now_microseconds);
+        }
         transport_.close(peer);
         return false;
       }
@@ -1183,6 +1211,9 @@ namespace lumen::lsp::runtime {
           return receive_path_probe(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::object_chunk:
           return object_chunk(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::clipboard_update:
+          return clipboard_update(connection, frame, parsed.header, parsed.payload, now_microseconds);
+        case ControlMessageType::clipboard_update_response:
         case ControlMessageType::certificate_rotate:
         case ControlMessageType::certificate_rotate_ack:
         case ControlMessageType::quit_application_response:
@@ -1371,6 +1402,16 @@ namespace lumen::lsp::runtime {
             continue;
           }
           connection.outbound_path_probe = {};
+        }
+        if (connection.outbound_clipboard.awaiting_response &&
+            now_microseconds >= connection.outbound_clipboard.deadline_microseconds &&
+            !finish_clipboard(connection, now_microseconds)) {
+          const auto peer = connection.peer;
+          transport_.close(peer);
+          if (const auto remaining = find(peer); remaining != connections_.size()) {
+            connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+          }
+          continue;
         }
         if (connection.outbound.has_failed(now_microseconds)) {
           const auto peer = connection.peer;
@@ -1654,6 +1695,33 @@ namespace lumen::lsp::runtime {
       return true;
     }
 
+    bool send_clipboard_update(
+      const PeerEndpoint &peer,
+      const Identifier128 &session_id,
+      std::vector<std::uint8_t> utf8,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (index == connections_.size() || !connections_[index].authenticated_client ||
+          !connections_[index].authenticated_client->permissions.contains(Permission::clipboard) ||
+          is_zero(session_id) || !valid_clipboard_bundle(utf8)) {
+        return false;
+      }
+      auto &connection = connections_[index];
+      if (connection.outbound_clipboard.awaiting_object || connection.outbound_clipboard.awaiting_response) {
+        try {
+          connection.queued_clipboard.session_id = session_id;
+          connection.queued_clipboard.utf8 = std::move(utf8);
+          connection.queued_clipboard.active = true;
+        } catch (...) {
+          return false;
+        }
+        return true;
+      }
+      return start_clipboard(connection, session_id, std::move(utf8), now_microseconds);
+    }
+
     bool send_stream_ended(
       const PeerEndpoint &peer,
       const StreamEndedPayload &ended,
@@ -1889,6 +1957,9 @@ namespace lumen::lsp::runtime {
           return ControlMessageType::path_probe_ack;
         case ControlMessageType::object_chunk:
           return ControlMessageType::object_chunk;
+        case ControlMessageType::clipboard_update:
+          return ControlMessageType::clipboard_update_response;
+        case ControlMessageType::clipboard_update_response:
         case ControlMessageType::certificate_rotate_ack:
         case ControlMessageType::quit_application_response:
         case ControlMessageType::microphone_config_ack:
@@ -2043,6 +2114,10 @@ namespace lumen::lsp::runtime {
         if (connection.outgoing_object_index >= connection.outgoing_objects.size()) {
           connection.outgoing_objects.clear();
           connection.outgoing_object_index = 0;
+          if (connection.outbound_clipboard.awaiting_object) {
+            connection.outbound_clipboard.awaiting_object = false;
+            return send_clipboard_request(connection, now_microseconds);
+          }
           return true;
         }
         auto &object = connection.outgoing_objects[connection.outgoing_object_index];
@@ -2134,8 +2209,13 @@ namespace lumen::lsp::runtime {
           connection.rto
         );
         connection.outgoing_objects.clear();
+        connection.outgoing_object_index = 0;
+        connection.outgoing_object_offset = 0;
         connection.outgoing_object_pending = false;
-        return send_acknowledgement_only(connection);
+        if (!send_acknowledgement_only(connection)) {
+          return false;
+        }
+        return !connection.outbound_clipboard.awaiting_object || finish_clipboard(connection, now_microseconds);
       }
       const auto acknowledgement = decode_object_chunk_ack(payload);
       const auto &object = connection.outgoing_objects[connection.outgoing_object_index];
@@ -3182,6 +3262,13 @@ namespace lumen::lsp::runtime {
       }
       try {
         connection.outgoing_objects = *artwork;
+        if (connection.outbound_clipboard.awaiting_object) {
+          connection.outgoing_objects.push_back({
+            .object_id = connection.outbound_clipboard.object_id,
+            .sha256 = connection.outbound_clipboard.sha256,
+            .bytes = connection.outbound_clipboard.utf8,
+          });
+        }
       } catch (...) {
         return false;
       }
@@ -3363,6 +3450,203 @@ namespace lumen::lsp::runtime {
       return response && send_response(connection, request, header, ControlMessageType::input_rate_response, *response, false, response_now);
     }
 
+    /** @brief Resolve an inline/object bundle and hand one client clipboard update to the product. */
+    bool clipboard_update(
+      Connection &connection,
+      const std::span<const std::uint8_t> request,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      if (!connection.authenticated_client ||
+          !connection.authenticated_client->permissions.contains(Permission::clipboard)) {
+        return send_error(connection, request, header, ControlMessageType::clipboard_update_response, ControlStatus::permission_denied, now_microseconds);
+      }
+      const auto decoded = decode_clipboard_update(payload);
+      if (!decoded) {
+        return send_error(connection, request, header, ControlMessageType::clipboard_update_response, ControlStatus::malformed, now_microseconds);
+      }
+      std::span<const std::uint8_t> utf8 = decoded->inline_content;
+      auto object = connection.incoming_objects.end();
+      if (decoded->object_id) {
+        object = std::ranges::find(connection.incoming_objects, *decoded->object_id, &Connection::IncomingObject::object_id);
+        if (object == connection.incoming_objects.end() || !object->complete || !decoded->sha256 ||
+            object->sha256 != *decoded->sha256 || object->bytes.size() != decoded->content_length) {
+          return send_error(connection, request, header, ControlMessageType::clipboard_update_response, ControlStatus::stale_generation, now_microseconds);
+        }
+        utf8 = object->bytes;
+      }
+      auto status = valid_clipboard_bundle(utf8) ?
+                      start_handler_.clipboard_update(
+                        connection.peer,
+                        *connection.authenticated_client,
+                        connection.generation,
+                        *decoded,
+                        utf8
+                      ) :
+                      ControlStatus::malformed;
+      if (object != connection.incoming_objects.end()) {
+        connection.buffered_object_bytes -= object->total_length;
+        connection.incoming_objects.erase(object);
+      }
+      if (status != ControlStatus::success) {
+        return send_error(connection, request, header, ControlMessageType::clipboard_update_response, status, now_microseconds);
+      }
+      const auto response = encode_clipboard_update_response({
+        .status = ControlStatus::success,
+        .session_id = decoded->session_id,
+        .sequence = decoded->sequence,
+      });
+      return response && send_response(
+                           connection,
+                           request,
+                           header,
+                           ControlMessageType::clipboard_update_response,
+                           *response,
+                           false,
+                           now_microseconds
+                         );
+    }
+
+    /** @brief Begin delivering one host clipboard text, inline or after its object transfer. */
+    bool start_clipboard(
+      Connection &connection,
+      const Identifier128 &session_id,
+      std::vector<std::uint8_t> utf8,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      try {
+        auto &outbound = connection.outbound_clipboard;
+        outbound = {};
+        outbound.session_id = session_id;
+        outbound.sequence = connection.next_clipboard_sequence++;
+        outbound.utf8 = std::move(utf8);
+        if (outbound.utf8.size() <= maximum_inline_clipboard_bytes) {
+          return send_clipboard_request(connection, now_microseconds);
+        }
+        if (!crypto_.random(outbound.object_id) || is_zero(outbound.object_id) ||
+            !crypto_.sha256(outbound.utf8, outbound.sha256)) {
+          outbound = {};
+          return false;
+        }
+        connection.outgoing_objects.push_back({
+          .object_id = outbound.object_id,
+          .sha256 = outbound.sha256,
+          .bytes = outbound.utf8,
+        });
+        outbound.awaiting_object = true;
+        return send_next_object_chunk(connection, now_microseconds);
+      } catch (...) {
+        connection.outbound_clipboard = {};
+        return false;
+      }
+    }
+
+    /** @brief Reliably send the CLIPBOARD_UPDATE request for the current outbound text. */
+    bool send_clipboard_request(Connection &connection, const std::uint64_t now_microseconds) noexcept {
+      auto &outbound = connection.outbound_clipboard;
+      ClipboardUpdatePayload update {
+        .session_id = outbound.session_id,
+        .sequence = outbound.sequence,
+        .content_length = static_cast<std::uint32_t>(outbound.utf8.size()),
+      };
+      try {
+        if (outbound.utf8.size() <= maximum_inline_clipboard_bytes) {
+          update.inline_content = outbound.utf8;
+        } else {
+          update.object_id = outbound.object_id;
+          update.sha256 = outbound.sha256;
+        }
+      } catch (...) {
+        return false;
+      }
+      const auto payload = encode_clipboard_update(update);
+      std::array<std::uint8_t, 8> request_bytes {};
+      if (!payload || connection.next_message_id == 0 || !crypto_.random(request_bytes)) {
+        return false;
+      }
+      auto request_id = wire::read_be<std::uint64_t>(request_bytes);
+      if (request_id == 0) {
+        request_id = 1;
+      }
+      std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
+      const lspc_header header {
+        .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
+        .message_type = static_cast<std::uint16_t>(ControlMessageType::clipboard_update),
+        .connection_generation = connection.generation,
+        .payload_length = static_cast<std::uint32_t>(payload->size()),
+        .message_id = connection.next_message_id,
+        .request_id = request_id,
+        .acknowledgement_base = connection.inbound.base(),
+        .acknowledgement_bitmap = connection.inbound.bitmap(),
+      };
+      const auto serialized = serialize_lspc(header, *payload, storage);
+      if (!serialized) {
+        return false;
+      }
+      const auto frame = std::span<const std::uint8_t> {storage}.first(serialized.bytes_written);
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(connection.next_message_id, frame, deadline) != outbound_store_result::stored) {
+        return false;
+      }
+      outbound.request_id = request_id;
+      outbound.message_id = connection.next_message_id;
+      outbound.deadline_microseconds = saturating_add(now_microseconds, clipboard_response_deadline_microseconds);
+      outbound.awaiting_response = true;
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(connection.peer, frame)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
+    }
+
+    /** @brief Retire the current outbound clipboard update and start the newest queued text. */
+    bool finish_clipboard(Connection &connection, const std::uint64_t now_microseconds) noexcept {
+      connection.outbound_clipboard = {};
+      if (!connection.queued_clipboard.active) {
+        return true;
+      }
+      auto queued = std::move(connection.queued_clipboard);
+      connection.queued_clipboard = {};
+      return start_clipboard(connection, queued.session_id, std::move(queued.utf8), now_microseconds);
+    }
+
+    /** @brief Validate one client response to the in-flight host clipboard update. */
+    bool clipboard_update_response(
+      Connection &connection,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      const auto observed = connection.inbound.observe(header.message_id);
+      if (observed != receive_id_result::accepted) {
+        return header.request_id == connection.completed_clipboard_request_id && send_acknowledgement_only(connection);
+      }
+      auto &outbound = connection.outbound_clipboard;
+      if (!outbound.awaiting_response || header.request_id != outbound.request_id) {
+        // A response that arrives after the semantic deadline only needs receipt confirmation.
+        return send_acknowledgement_only(connection);
+      }
+      if (has_flag(header.flags, lspc_flag::error_response)) {
+        const auto error = decode_control_error(payload);
+        if (!error || *error == ControlStatus::success) {
+          return false;
+        }
+      } else {
+        const auto response = decode_clipboard_update_response(payload);
+        if (!response || response->session_id != outbound.session_id || response->sequence != outbound.sequence) {
+          return false;
+        }
+      }
+      (void) connection.outbound.acknowledge(outbound.message_id, 0, now_microseconds, connection.rto);
+      connection.completed_clipboard_request_id = header.request_id;
+      if (!send_acknowledgement_only(connection)) {
+        return false;
+      }
+      return finish_clipboard(connection, now_microseconds);
+    }
+
     /** @brief Append one authenticated contiguous object chunk and cache its terminal prefix. */
     bool object_chunk(
       Connection &connection,
@@ -3372,7 +3656,8 @@ namespace lumen::lsp::runtime {
       const std::uint64_t now_microseconds
     ) noexcept {
       if (!connection.authenticated_client ||
-          !connection.authenticated_client->permissions.contains(Permission::input)) {
+          (!connection.authenticated_client->permissions.contains(Permission::input) &&
+           !connection.authenticated_client->permissions.contains(Permission::clipboard))) {
         return send_error(connection, request, header, ControlMessageType::object_chunk, ControlStatus::permission_denied, now_microseconds);
       }
       const auto decoded = decode_object_chunk(payload);
@@ -3763,6 +4048,15 @@ namespace lumen::lsp::runtime {
     const std::uint64_t now_microseconds
   ) noexcept {
     return impl_ && impl_->send_stream_ended(peer, ended, now_microseconds);
+  }
+
+  bool HostControlServer::send_clipboard_update(
+    const PeerEndpoint &peer,
+    const Identifier128 &session_id,
+    std::vector<std::uint8_t> utf8,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->send_clipboard_update(peer, session_id, std::move(utf8), now_microseconds);
   }
 
   bool HostControlServer::start_certificate_rotation(

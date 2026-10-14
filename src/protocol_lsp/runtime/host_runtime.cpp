@@ -5033,6 +5033,114 @@ namespace lumen::lsp::runtime {
       );
     }
 
+    ControlStatus clipboard_update(
+      const PeerEndpoint &peer,
+      const TrustedClient &client,
+      const std::uint32_t connection_generation,
+      const ClipboardUpdatePayload &request,
+      const std::span<const std::uint8_t> utf8
+    ) noexcept override {
+      {
+        std::scoped_lock lock(session_mutex_);
+        const auto snapshot = authority_.snapshot();
+        if (!active_client_ || active_client_->client_id != client.client_id ||
+            active_client_->connection_generation != connection_generation ||
+            snapshot.generations.connection != connection_generation || snapshot.session_id != request.session_id) {
+          return ControlStatus::stale_generation;
+        }
+      }
+      if (!input_owner_) {
+        return ControlStatus::internal_failure;
+      }
+      const auto mapping = input_owner_->mapping();
+      if (!mapping || mapping->peer != peer || mapping->session_id != request.session_id) {
+        return ControlStatus::stale_generation;
+      }
+      try {
+        std::scoped_lock lock(clipboard_mutex_);
+        if (!clipboard_) {
+          clipboard_ = platf::clipboard();
+        }
+        if (!clipboard_) {
+          return ControlStatus::unsupported;
+        }
+        clipboard_->set_content(std::vector<std::uint8_t> {utf8.begin(), utf8.end()});
+      } catch (...) {
+        return ControlStatus::busy;
+      }
+      return ControlStatus::success;
+    }
+
+    /**
+     * @brief Forward host clipboard changes to the clipboard-permitted stream owner.
+     *
+     * The platform bridge starts with the first eligible session and stops when no
+     * clipboard-permitted client owns the stream.
+     *
+     * @param now_microseconds Current socket-owner monotonic time.
+     */
+    void process_clipboard(const std::uint64_t now_microseconds) noexcept {
+      if (now_microseconds < next_clipboard_poll_microseconds_) {
+        return;
+      }
+      next_clipboard_poll_microseconds_ = now_microseconds + 100'000U;
+      std::optional<PeerEndpoint> peer;
+      Identifier128 session_id {};
+      {
+        std::scoped_lock lock(session_mutex_);
+        if (active_client_ && active_client_->permissions.contains(Permission::clipboard) && input_owner_) {
+          const auto snapshot = authority_.snapshot();
+          const auto mapping = input_owner_->mapping();
+          if (mapping && mapping->session_id == snapshot.session_id) {
+            peer = mapping->peer;
+            session_id = snapshot.session_id;
+          }
+        }
+      }
+      if (peer.has_value() != clipboard_eligible_) {
+        clipboard_eligible_ = peer.has_value();
+        BOOST_LOG(info) << "Clipboard sharing "sv << (clipboard_eligible_ ? "active"sv : "inactive"sv) << " for the stream owner"sv;
+      }
+      std::optional<std::vector<std::uint8_t>> change;
+      {
+        std::scoped_lock lock(clipboard_mutex_);
+        if (!peer) {
+          clipboard_.reset();
+          return;
+        }
+        if (clipboard_ && !clipboard_->running()) {
+          clipboard_.reset();
+        }
+        if (!clipboard_) {
+          try {
+            clipboard_ = platf::clipboard();
+          } catch (...) {
+            clipboard_.reset();
+          }
+          if (!clipboard_) {
+            // Unsupported platforms and failed bridges are retried rarely.
+            next_clipboard_poll_microseconds_ = now_microseconds + 10'000'000U;
+            return;
+          }
+        }
+        change = clipboard_->take_change();
+      }
+      if (!change || !control_) {
+        return;
+      }
+      try {
+        // The control lock is taken without the clipboard lock; inbound updates nest the other way.
+        const auto sent = control_->send_clipboard_update(
+          *peer,
+          session_id,
+          std::move(*change),
+          now_microseconds
+        );
+        BOOST_LOG(info) << "Clipboard sharing: "sv << (sent ? "sent the host clipboard to the client"sv : "could not send the host clipboard"sv);
+      } catch (...) {
+      }
+    }
+
     std::expected<InputRateResponsePayload, ControlStatus> input_rate(
       const PeerEndpoint &peer,
       const TrustedClient &client,
@@ -5210,6 +5318,11 @@ namespace lumen::lsp::runtime {
         process_attach_readiness_deadline(now);
         process_detached_grace(now);
         process_application_exit();
+        process_clipboard(now);
+      }
+      {
+        std::scoped_lock lock(clipboard_mutex_);
+        clipboard_.reset();
       }
       if (dtls_) {
         (void) dtls_->process_pending();
@@ -6110,6 +6223,10 @@ namespace lumen::lsp::runtime {
     std::unique_ptr<HostService> service_;  ///< RFC 7983 dispatcher and socket activation guard.
     SessionAuthority authority_;  ///< START/baseline/disconnect input authority state.
     std::optional<AuthenticatedClient> active_client_;  ///< Current input session owner.
+    std::mutex clipboard_mutex_;  ///< Guards the platform clipboard bridge; never held while taking the control lock.
+    std::unique_ptr<platf::clipboard_t> clipboard_;  ///< Host clipboard bridge for the clipboard-permitted owner.
+    std::uint64_t next_clipboard_poll_microseconds_ {};  ///< Socket-owner-only next clipboard change poll.
+    bool clipboard_eligible_ {};  ///< Socket-owner-only latest logged clipboard eligibility.
     PeerEndpoint active_association_peer_ {};  ///< Exact DTLS/SRTP five-tuple owning stream authority.
     std::uint32_t active_association_generation_ {};  ///< Exact connection generation owning the active five-tuple.
     std::string active_application_id_;  ///< Stable application ID owned by the active session.

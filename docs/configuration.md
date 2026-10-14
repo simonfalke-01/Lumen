@@ -1767,21 +1767,21 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Sets the maximum LSP permission mask offered to newly paired clients. The default value `87` enables
-            application browsing, start/attach, input, stop-own-stream, and controller output. Microphone and
-            application quit remain opt-in permissions.
+            Sets the maximum LSP permission mask offered to newly paired clients. The default value `215` enables
+            application browsing, start/attach, input, stop-own-stream, controller output, and clipboard sharing.
+            Microphone and application quit remain opt-in permissions.
         </td>
     </tr>
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            87
+            215
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            lsp_pairing_permissions = 87
+            lsp_pairing_permissions = 215
             @endcode</td>
     </tr>
 </table>

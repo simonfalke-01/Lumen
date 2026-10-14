@@ -39,6 +39,7 @@ install(TARGETS audio-info RUNTIME DESTINATION "tools" COMPONENT audio)
 
 # Mandatory tools
 install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
+install(TARGETS lumen-clipboard RUNTIME DESTINATION "tools" COMPONENT application)
 
 # Lumen Virtual HID driver
 #

@@ -41,6 +41,14 @@ target_link_libraries(audio-info
 )
 target_compile_options(audio-info PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
+add_executable(lumen-clipboard lumen-clipboard.cpp)
+target_link_libraries(lumen-clipboard
+        ole32
+        shlwapi
+        windowscodecs
+        ${PLATFORM_LIBRARIES})
+target_compile_options(lumen-clipboard PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
 add_executable(sunshinesvc sunshinesvc.cpp)
 target_link_libraries(sunshinesvc
         ${Boost_LIBRARIES}

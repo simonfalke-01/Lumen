@@ -1,5 +1,5 @@
 /** Every permission bit defined by LSP wire version 1. */
-export const LSP_DEFINED_PERMISSION_MASK = 0x7f
+export const LSP_DEFINED_PERMISSION_MASK = 0xff
 
 /**
  * Normalize an LSP permission mask received from configuration or the admin API.
@@ -36,7 +36,7 @@ export function hasLspPermission(mask, bit) {
  */
 export function buildLspPermissionUpdate(currentMask, bit, enabled) {
   const current = normalizeLspPermissionMask(currentMask)
-  if (current === null || bit < 0 || bit > 6) return { permissions: null, error: 'invalid' }
+  if (current === null || bit < 0 || bit > 7) return { permissions: null, error: 'invalid' }
   const permission = 1 << bit
   const permissions = enabled ? current | permission : current & ~permission
   if (permissions === 0) return { permissions: null, error: 'empty' }
