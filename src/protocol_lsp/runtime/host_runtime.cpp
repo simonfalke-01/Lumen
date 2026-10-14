@@ -58,6 +58,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -975,7 +976,7 @@ namespace lumen::lsp::runtime {
       if (!active_) {
         return std::nullopt;
       }
-      return DiscoveryDescriptor {
+      DiscoveryDescriptor descriptor {
         .type = std::string {discovery_service},
         .port = config_.host.port,
         .txt = {
@@ -986,6 +987,15 @@ namespace lumen::lsp::runtime {
           {"spki", lowercase_hex(dtls_->server_spki_sha256())},
         },
       };
+      // Lets clients recognize this host's GameStream listing as the same machine.
+      if (!http::unique_id.empty()) {
+        std::string legacy_id = http::unique_id;
+        std::ranges::transform(legacy_id, legacy_id.begin(), [](const unsigned char character) {
+          return static_cast<char>(std::tolower(character));
+        });
+        descriptor.txt.emplace_back("gs", std::move(legacy_id));
+      }
+      return descriptor;
     }
 
     RuntimeAdministrationSnapshot administration_snapshot() const override {
