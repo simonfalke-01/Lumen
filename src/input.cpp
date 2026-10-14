@@ -655,21 +655,39 @@ namespace input {
     return true;
   }
 
+  /**
+   * @brief Map an LSP pointer button (HID button usage) to the platform's Moonlight button code.
+   *
+   * LSP numbers buttons by HID usage: 1 primary, 2 secondary, 3 tertiary. Moonlight numbers
+   * them 1 left, 2 middle, 3 right, so the secondary and tertiary buttons swap.
+   */
+  std::uint16_t moonlight_button_from_lsp(const std::uint16_t button) noexcept {
+    switch (button) {
+      case 2:
+        return BUTTON_RIGHT;
+      case 3:
+        return BUTTON_MIDDLE;
+      default:
+        return button;
+    }
+  }
+
   bool apply_lsp_pointer_button(lsp_platform_input_t &input, const std::uint16_t button, const bool release) noexcept {
     if (button == 0 || button >= input.pointer_buttons.size()) {
       return false;
     }
+    const auto platform_button = moonlight_button_from_lsp(button);
     std::lock_guard lock(platform_input_mutex);
     if (input.pointer_buttons[button] == !release) {
       return true;
     }
     input.pointer_buttons[button] = !release;
     if (!release) {
-      if (global_mouse_holds.acquire(button)) {
-        platf::button_mouse(platf_input, button, false);
+      if (global_mouse_holds.acquire(platform_button)) {
+        platf::button_mouse(platf_input, platform_button, false);
       }
-    } else if (global_mouse_holds.release(button)) {
-      platf::button_mouse(platf_input, button, true);
+    } else if (global_mouse_holds.release(platform_button)) {
+      platf::button_mouse(platf_input, platform_button, true);
     }
     return true;
   }
@@ -687,8 +705,9 @@ namespace input {
       input.keyboard_usages[usage] = false;
     }
     for (std::size_t button = 1; button < input.pointer_buttons.size(); ++button) {
-      if (input.pointer_buttons[button] && global_mouse_holds.release(static_cast<int>(button))) {
-        platf::button_mouse(platf_input, static_cast<int>(button), true);
+      const auto platform_button = moonlight_button_from_lsp(static_cast<std::uint16_t>(button));
+      if (input.pointer_buttons[button] && global_mouse_holds.release(platform_button)) {
+        platf::button_mouse(platf_input, platform_button, true);
       }
       input.pointer_buttons[button] = false;
     }
