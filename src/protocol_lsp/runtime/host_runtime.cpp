@@ -46,10 +46,12 @@
 
 #if LUMEN_LSP_RUNTIME_AVAILABLE
   #include "../../config.h"
+  #include "../../display_device.h"
   #include "../../globals.h"
   #include "../../httpcommon.h"
   #include "../../platform/common.h"
   #include "../../process.h"
+  #include "../../rtsp.h"
 
   #include <wolfssl/options.h>
   #include <wolfssl/wolfcrypt/ed25519.h>
@@ -59,6 +61,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -241,6 +244,7 @@ namespace lumen::lsp::runtime {
           client.permissions = *permission_set;
           client.revocation_generation = *revocation;
           client.enabled = enabled.value_or(true);
+          client.name = state.get<std::string>(base + ".name", "");
           return client.valid() ? std::optional<TrustedClient> {client} : std::nullopt;
         } catch (...) {
           return std::nullopt;
@@ -257,6 +261,9 @@ namespace lumen::lsp::runtime {
           state.put(base + ".permissions", client.permissions.mask());
           state.put(base + ".revocation_generation", client.revocation_generation);
           state.put(base + ".enabled", client.enabled);
+          if (!client.name.empty()) {
+            state.put(base + ".name", client.name);
+          }
         });
       }
 
@@ -300,6 +307,9 @@ namespace lumen::lsp::runtime {
             state.put(base + ".permissions", client.permissions.mask());
             state.put(base + ".revocation_generation", client.revocation_generation);
             state.put(base + ".enabled", client.enabled);
+            if (!client.name.empty()) {
+              state.put(base + ".name", client.name);
+            }
             effective = client;
             outcome = TrustInsertResult::inserted;
           });
@@ -333,6 +343,7 @@ namespace lumen::lsp::runtime {
               client.permissions = *permission_set;
               client.revocation_generation = *revocation;
               client.enabled = enabled.value_or(true);
+              client.name = record.get<std::string>("name", "");
               clients.push_back(client);
             }
           }
@@ -355,6 +366,16 @@ namespace lumen::lsp::runtime {
         client->enabled = enabled;
         ++client->revocation_generation;
         return upsert(*client);
+      }
+
+      bool rename(const Identifier128 &client_id, const std::string_view name) noexcept {
+        if (name.empty() || name.size() > 64 || !find(client_id)) {
+          return false;
+        }
+        const auto base = "lsp.trusted_clients." + lowercase_hex(client_id);
+        return http::update_state_file(state_file_.string(), [&](http::state_file_tree_t &state) {
+          state.put(base + ".name", std::string {name});
+        });
       }
 
       bool revoke_existing(const Identifier128 &client_id) noexcept override {
@@ -395,7 +416,11 @@ namespace lumen::lsp::runtime {
           applications.reserve(configured.size());
           for (const auto &application : configured) {
             std::string image_reference;
-            std::ifstream file(application.image_path, std::ios::binary | std::ios::ate);
+            // Stock artwork is not sent: clients draw their own icon from the application kind.
+            std::ifstream file;
+            if (const auto image = proc::custom_image_path(application)) {
+              file.open(*image, std::ios::binary | std::ios::ate);
+            }
             if (file) {
               const auto length = file.tellg();
               if (length > 0 && length <= 16 * 1'024 * 1'024) {
@@ -436,6 +461,7 @@ namespace lumen::lsp::runtime {
               .process_generation = process.running && application.id == running_application_id ?
                                       process.process_generation :
                                       0,
+              .kind = application_kind(application),
             });
           }
           {
@@ -458,6 +484,18 @@ namespace lumen::lsp::runtime {
       }
 
     private:
+      static ApplicationKind application_kind(const proc::ctx_t &application) {
+        switch (proc::app_kind(application)) {
+          case proc::app_kind_e::desktop:
+            return ApplicationKind::desktop;
+          case proc::app_kind_e::steam:
+            return ApplicationKind::steam;
+          case proc::app_kind_e::app:
+            break;
+        }
+        return ApplicationKind::app;
+      }
+
       const std::atomic<bool> &resume_available_;  ///< True only while fresh START may claim authority.
       std::mutex mutex_;  ///< Serializes listing refresh with outgoing artwork snapshots.
       std::vector<ArtworkObject> artwork_;  ///< Objects frozen by the latest successful snapshot.
@@ -898,6 +936,7 @@ namespace lumen::lsp::runtime {
           (void) authority_.stop_from_host(NeutralizationReason::service_shutdown);
         }
         session_start_available_.store(true, std::memory_order_release);
+        revert_lsp_display_configuration();
         if (active_process_generation_ != 0) {
           (void) proc::proc.terminate_lsp_generation(active_process_generation_);
           active_process_generation_ = 0;
@@ -1127,6 +1166,10 @@ namespace lumen::lsp::runtime {
       }
     }
 
+    bool cancel_pairing(const Identifier128 &pairing_session_id) noexcept override {
+      return control_ && control_->cancel_pairing(pairing_session_id);
+    }
+
     std::vector<TrustedClientSummary> trusted_clients() noexcept override {
       return trust_store_ ? trust_store_->list() : std::vector<TrustedClientSummary> {};
     }
@@ -1141,6 +1184,10 @@ namespace lumen::lsp::runtime {
 
     bool revoke_trusted_client(const Identifier128 &client_id) noexcept override {
       return control_ && control_->revoke_trusted_client(client_id);
+    }
+
+    bool rename_trusted_client(const Identifier128 &client_id, const std::string_view name) noexcept override {
+      return trust_store_ && trust_store_->rename(client_id, name);
     }
 
     IdentityRotationResult rotate_identity() noexcept override {
@@ -1290,6 +1337,9 @@ namespace lumen::lsp::runtime {
       bool process_started_by_request {};  ///< Whether rollback must terminate this START-owned launch.
       bool reference_invalidation {};  ///< Native no-IDR reference invalidation capability.
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease;  ///< Prepared VDD owner before ACK.
+  #ifdef _WIN32
+      std::shared_ptr<platf::virtual_display::cursor_source_t> cursor_source;  ///< Hardware-cursor feed for a client-drawn cursor.
+  #endif
     };
 
     static_assert(std::is_nothrow_move_assignable_v<ActiveVideoConfiguration>);
@@ -2167,6 +2217,16 @@ namespace lumen::lsp::runtime {
      * @param rtx_ssrc Collision-free candidate RTX SSRC.
      * @return Fully encoded/preflighted configuration or the exact START failure status.
      */
+    /** @brief Restore the display configuration applied for the ended LSP stream. */
+    void revert_lsp_display_configuration() noexcept {
+      if (lsp_display_configured_.exchange(false, std::memory_order_acq_rel)) {
+        try {
+          display_device::revert_configuration();
+        } catch (...) {
+        }
+      }
+    }
+
     std::expected<ActiveVideoConfiguration, ControlStatus> select_video(
       const PeerEndpoint &peer,
       const StartRequestPayload &request,
@@ -2185,6 +2245,7 @@ namespace lumen::lsp::runtime {
       if (request.network_profile != expected_profile || video_generation == 0 || primary_ssrc == 0 ||
           repair_ssrc == 0 || rtx_ssrc == 0 || primary_ssrc == repair_ssrc || primary_ssrc == rtx_ssrc ||
           repair_ssrc == rtx_ssrc || is_zero(session_id) || stream_generation == 0) {
+        BOOST_LOG(warning) << "LSP START failed at check 10"sv;
         return std::unexpected(ControlStatus::unsupported_media_tuple);
       }
       int numeric_application_id = 0;
@@ -2196,13 +2257,41 @@ namespace lumen::lsp::runtime {
       if (parsed_application.ec != std::errc {} ||
           parsed_application.ptr != request.application_id.data() + request.application_id.size() ||
           numeric_application_id <= 0) {
+        BOOST_LOG(warning) << "LSP START failed at check 11"sv;
         return std::unexpected(ControlStatus::malformed);
       }
       const auto process_state = proc::proc.lsp_process_state();
       if (process_state.running &&
           (!process_state.lsp_owned || process_state.application_id != numeric_application_id ||
            process_state.process_generation == 0)) {
+        BOOST_LOG(warning) << "LSP START failed at check 12"sv;
         return std::unexpected(ControlStatus::busy);
+      }
+      // Apply the configured display-device policy (resolution, refresh, HDR) before
+      // capture selection, as the GameStream launch path does. Offers share one size.
+      // The Lumen virtual display is created at the client's exact mode; changing the
+      // physical display configuration as well only races that creation.
+      const bool lumen_virtual_display_enabled =
+        config::video.dd.virtual_display_policy != config::video_t::dd_t::virtual_display_policy_e::disabled;
+      if (!lumen_virtual_display_enabled && !request.video_offers.empty() &&
+          !lsp_display_configured_.exchange(true, std::memory_order_acq_rel)) {
+        const auto &primary = request.video_offers.front();
+        rtsp_stream::launch_session_t display_session {};
+        display_session.width = static_cast<int>(primary.width);
+        display_session.height = static_cast<int>(primary.height);
+        display_session.fps = static_cast<int>(std::max<std::uint64_t>(
+          1,
+          static_cast<std::uint64_t>(primary.refresh_numerator) / std::max<std::uint32_t>(1, primary.refresh_denominator)
+        ));
+        display_session.refresh_numerator = primary.refresh_numerator;
+        display_session.refresh_denominator = primary.refresh_denominator;
+        display_session.enable_sops = true;
+        display_session.enable_hdr = primary.transfer_function == video_transfer_pq || primary.transfer_function == video_transfer_hlg;
+        try {
+          display_device::configure_display(config::video, display_session);
+        } catch (...) {
+          BOOST_LOG(warning) << "LSP display configuration failed; streaming the current display mode"sv;
+        }
       }
       const auto competition_capacity = static_cast<std::uint64_t>(config_.host.competition_capacity_mbps) * 1'000'000ULL;
       for (const auto &offer : request.video_offers) {
@@ -2221,12 +2310,14 @@ namespace lumen::lsp::runtime {
                          offer.matrix_coefficients == video_matrix_bt2020_ncl;
         const auto hdr = hdr10 || hlg;
         if ((ten_bit != hdr) || (hdr && offer.full_range)) {
+          BOOST_LOG(warning) << "LSP START rejected an offer at check 1"sv;
           continue;
         }
         auto selected_bitrate = offer.preferred_bits_per_second;
         auto pacing_ceiling = offer.maximum_bits_per_second;
         if (request.network_profile == VideoNetworkProfile::competition) {
           if (competition_capacity == 0) {
+            BOOST_LOG(warning) << "LSP START failed at check 13"sv;
             return std::unexpected(ControlStatus::path_capacity_insufficient);
           }
           pacing_ceiling = std::min(pacing_ceiling, competition_capacity);
@@ -2234,6 +2325,7 @@ namespace lumen::lsp::runtime {
         }
         if (selected_bitrate < video_minimum_bits_per_second || selected_bitrate > pacing_ceiling ||
             selected_bitrate / 1'000U > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+          BOOST_LOG(warning) << "LSP START rejected an offer at check 2"sv;
           continue;
         }
         const auto refresh = std::max<std::uint64_t>(
@@ -2243,6 +2335,7 @@ namespace lumen::lsp::runtime {
         const auto refresh_x100 = static_cast<std::uint64_t>(offer.refresh_numerator) * 100U / offer.refresh_denominator;
         if (refresh > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
             refresh_x100 > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+          BOOST_LOG(warning) << "LSP START rejected an offer at check 3"sv;
           continue;
         }
         ActiveVideoConfiguration selected;
@@ -2278,6 +2371,7 @@ namespace lumen::lsp::runtime {
                                              0,
           };
         } catch (...) {
+          BOOST_LOG(warning) << "LSP START failed at check 14"sv;
           return std::unexpected(ControlStatus::internal_failure);
         }
   #ifdef _WIN32
@@ -2308,6 +2402,7 @@ namespace lumen::lsp::runtime {
         }
                                      .normalized();
         if (!refresh_ratio) {
+          BOOST_LOG(warning) << "LSP START rejected an offer at check 4"sv;
           continue;
         }
         auto encoder_limits = platf::virtual_display::mode_limits_t {};
@@ -2318,27 +2413,61 @@ namespace lumen::lsp::runtime {
           encoder_limits.maximum_height = 4'096;
           encoder_limits.maximum_pixels = 4'096ULL * 4'096ULL;
         }
-        auto prepared = platf::virtual_display::prepare_system_stream_session(
-          activation,
-          platf::virtual_display::modern_stream_request(
-            vdd_session_id,
-            {
-              offer.width,
-              offer.height,
-              *refresh_ratio,
-              hdr10 ?
-                platf::virtual_display::dynamic_range_e::hdr10 :
-                platf::virtual_display::dynamic_range_e::sdr,
-              static_cast<std::uint8_t>(ten_bit ? 10 : 8),
-            },
-            platf::virtual_display::delivery_policy_e::latency,
-            platf::virtual_display::fidelity_e::lossless
-          ),
-          encoder_limits,
-          selected.capture.output_name
-        );
+        // Capture wakes at the stream rate and grabs the newest composed frame, so that frame is
+        // up to one VDD refresh old. Composing at the highest whole multiple of the stream rate
+        // cuts that age (8.3 ms at 120 Hz to 2.1 ms at 480 Hz) without raising the encoded rate.
+        auto composition_refresh = *refresh_ratio;
+        if (const auto multiple = (static_cast<std::uint64_t>(LUMEN_START_MODE_MAX_REFRESH_HZ) * refresh_ratio->denominator) /
+                                  refresh_ratio->numerator;
+            multiple > 1) {
+          if (const auto boosted = platf::virtual_display::rational_t {
+                static_cast<std::uint32_t>(refresh_ratio->numerator * multiple),
+                refresh_ratio->denominator,
+              }
+                                     .normalized()) {
+            composition_refresh = *boosted;
+          }
+        }
+        const auto prepare_display = [&](const platf::virtual_display::rational_t &refresh) {
+          return platf::virtual_display::prepare_system_stream_session(
+            activation,
+            platf::virtual_display::modern_stream_request(
+              vdd_session_id,
+              {
+                offer.width,
+                offer.height,
+                refresh,
+                hdr10 ?
+                  platf::virtual_display::dynamic_range_e::hdr10 :
+                  platf::virtual_display::dynamic_range_e::sdr,
+                static_cast<std::uint8_t>(ten_bit ? 10 : 8),
+              },
+              platf::virtual_display::delivery_policy_e::latency,
+              platf::virtual_display::fidelity_e::lossless,
+              request.cursor_mode == CursorMode::client
+            ),
+            encoder_limits,
+            selected.capture.output_name
+          );
+        };
+        auto prepared = prepare_display(composition_refresh);
+        if (prepared.outcome != platf::virtual_display::session_prepare_e::virtual_display &&
+            !(composition_refresh == *refresh_ratio)) {
+          BOOST_LOG(warning) << "LSP START: Lumen virtual display rejected "sv << composition_refresh.numerator << "/"sv
+                             << composition_refresh.denominator << " Hz composition; using the stream rate"sv;
+          prepared = prepare_display(*refresh_ratio);
+        }
         if (prepared.outcome == platf::virtual_display::session_prepare_e::rejected) {
+          BOOST_LOG(warning) << "LSP START: Lumen virtual display rejected the session (start_error="sv
+                             << static_cast<int>(prepared.diagnostic) << ", validation_error="sv
+                             << static_cast<int>(prepared.validation_error) << ")"sv;
           continue;
+        }
+        if (prepared.outcome == platf::virtual_display::session_prepare_e::physical &&
+            activation != platf::virtual_display::activation_policy_e::disabled) {
+          BOOST_LOG(warning) << "LSP START: Lumen virtual display unavailable; capturing the physical desktop (start_error="sv
+                             << static_cast<int>(prepared.diagnostic) << ", validation_error="sv
+                             << static_cast<int>(prepared.validation_error) << ")"sv;
         }
         selected.capture.output_name = std::move(prepared.capture_name);
         selected.display_lease = std::move(prepared.lease);
@@ -2350,18 +2479,41 @@ namespace lumen::lsp::runtime {
             activation == platf::virtual_display::activation_policy_e::required;
           selected.capture.virtual_display_generation = prepared.selection->generation;
           selected.capture.virtual_display_desktop_fallback_permitted = false;
-          selected.capture.virtual_display_frame_source = platf::virtual_display::make_system_frame_source(
-            *prepared.selection,
-            std::chrono::milliseconds {250}
-          );
+          // Direct VDD frames are the raw swap-chain surfaces and never contain the cursor, so a
+          // host-drawn cursor needs desktop duplication, which composites it into each frame.
+          if (request.cursor_mode == CursorMode::client || selected.capture.virtual_display_direct_required) {
+            selected.capture.virtual_display_frame_source = platf::virtual_display::make_system_frame_source(
+              *prepared.selection,
+              std::chrono::milliseconds {250}
+            );
+          }
           if (!selected.capture.virtual_display_frame_source && selected.capture.virtual_display_direct_required) {
             if (selected.display_lease) {
               (void) selected.display_lease->release();
             }
+            BOOST_LOG(warning) << "LSP START rejected an offer at check 6"sv;
             continue;
           }
+          if (request.cursor_mode == CursorMode::client) {
+            // Windows stops drawing the cursor into frames once the VDD owns it, so the feed is mandatory.
+            selected.cursor_source = platf::virtual_display::make_system_cursor_source(*prepared.selection);
+            if (!selected.cursor_source) {
+              if (selected.display_lease) {
+                (void) selected.display_lease->release();
+              }
+              BOOST_LOG(warning) << "LSP START rejected an offer: the hardware-cursor feed did not open"sv;
+              continue;
+            }
+          }
+        } else if (request.cursor_mode == CursorMode::client) {
+          if (selected.display_lease) {
+            (void) selected.display_lease->release();
+          }
+          BOOST_LOG(warning) << "LSP START rejected an offer: a client-drawn cursor requires the Lumen virtual display"sv;
+          continue;
         }
   #else
+        BOOST_LOG(warning) << "LSP START rejected an offer at check 7"sv;
         continue;
   #endif
         std::uint64_t process_generation = 0;
@@ -2372,6 +2524,7 @@ namespace lumen::lsp::runtime {
         if (selected_process.running) {
           if (!selected_process.lsp_owned || selected_process.application_id != numeric_application_id ||
               selected_process.process_generation == 0) {
+            BOOST_LOG(warning) << "LSP START failed at check 15"sv;
             return std::unexpected(ControlStatus::busy);
           }
           process_generation = selected_process.process_generation;
@@ -2409,6 +2562,7 @@ namespace lumen::lsp::runtime {
           };
           const auto launched = proc::proc.execute_lsp_if_idle(numeric_application_id, launch_request);
           if (launched.status != 0 || launched.process_generation == 0) {
+            BOOST_LOG(warning) << "LSP START failed at check 16"sv;
             return std::unexpected(launched.status == 409 ? ControlStatus::busy : ControlStatus::internal_failure);
           }
           process_generation = launched.process_generation;
@@ -2421,11 +2575,13 @@ namespace lumen::lsp::runtime {
         };
         if (video::probe_encoders() != 0) {
           rollback_process();
+          BOOST_LOG(warning) << "LSP START failed at check 17"sv;
           return std::unexpected(ControlStatus::unsupported_media_tuple);
         }
         const auto capability = video::active_lsp_sdr_encoder_capability(video_format);
         if (!capability.supported || !capability.hardware || !capability.verified_low_delay) {
           rollback_process();
+          BOOST_LOG(warning) << "LSP START failed at check 18"sv;
           return std::unexpected(ControlStatus::unsupported_media_tuple);
         }
         const auto codec_supports_yuv444 = video::last_encoder_probe_supported_yuv444_for_codec[video_format];
@@ -2439,6 +2595,7 @@ namespace lumen::lsp::runtime {
             (hdr && ((!yuv444 && !hdr420_supported) || (yuv444 && !hdr444_supported))) ||
             (hlg && !video::active_hdr_capture_available(selected.capture))) {
           rollback_process();
+          BOOST_LOG(warning) << "LSP START rejected an offer at check 8"sv;
           continue;
         }
         // Reference invalidation and cyclic intra-refresh are independent
@@ -2447,11 +2604,13 @@ namespace lumen::lsp::runtime {
         auto initialization = video::codec_initialization(selected.capture);
         if (!initialization) {
           rollback_process();
+          BOOST_LOG(warning) << "LSP START failed at check 19"sv;
           return std::unexpected(ControlStatus::unsupported_media_tuple);
         }
         auto codec_units = split_video_codec_units(*initialization, offer.codec);
         if (!codec_units) {
           rollback_process();
+          BOOST_LOG(warning) << "LSP START failed at check 20"sv;
           return std::unexpected(ControlStatus::unsupported_media_tuple);
         }
         std::optional<HdrMetadataPayload> hdr_metadata;
@@ -2459,6 +2618,7 @@ namespace lumen::lsp::runtime {
           const auto captured_metadata = video::active_hdr_metadata(selected.capture);
           if (!captured_metadata) {
             rollback_process();
+            BOOST_LOG(warning) << "LSP START rejected an offer at check 9"sv;
             continue;
           }
           hdr_metadata = HdrMetadataPayload {
@@ -2480,6 +2640,7 @@ namespace lumen::lsp::runtime {
         std::array<std::uint8_t, 8> origin_bytes {};
         if (!crypto_->random(origin_bytes)) {
           rollback_process();
+          BOOST_LOG(warning) << "LSP START failed at check 21"sv;
           return std::unexpected(ControlStatus::internal_failure);
         }
         auto frame_id_origin = wire::read_be<std::uint64_t>(origin_bytes);
@@ -2549,6 +2710,7 @@ namespace lumen::lsp::runtime {
         if (!video_configuration_preflight) {
           rollback_process();
           selected.display_lease.reset();
+          BOOST_LOG(warning) << "LSP START failed at check 22"sv;
           return std::unexpected(ControlStatus::unsupported_media_tuple);
         }
         selected.aggregate_pacing_bits_per_second = pacing_ceiling;
@@ -2557,6 +2719,7 @@ namespace lumen::lsp::runtime {
         selected.reference_invalidation = capability.reference_invalidation;
         return selected;
       }
+      BOOST_LOG(warning) << "LSP START failed at check 23"sv;
       return std::unexpected(ControlStatus::unsupported_media_tuple);
     }
 
@@ -2819,6 +2982,18 @@ namespace lumen::lsp::runtime {
           if (!runtime) {
             return;
           }
+  #ifdef _WIN32
+          // A video runtime retired by a reconnect leaves its session alive; the reattached video
+          // must keep the same Lumen virtual display, so hand its lease on instead of releasing
+          // it. The session configuration releases it when the session itself ends.
+          if (runtime->display_lease && active_video_configuration_) {
+            if (video_runtime_ && !video_runtime_->display_lease) {
+              video_runtime_->display_lease = std::move(runtime->display_lease);
+            } else if (!video_runtime_ && !active_video_configuration_->display_lease) {
+              active_video_configuration_->display_lease = std::move(runtime->display_lease);
+            }
+          }
+  #endif
         }
         const auto connection_generation = runtime->connection_generation;
         const auto peer = runtime->peer;
@@ -3723,6 +3898,7 @@ namespace lumen::lsp::runtime {
           (void) authority_.stop_from_host(NeutralizationReason::transport_loss);
         }
         session_start_available_.store(true, std::memory_order_release);
+        revert_lsp_display_configuration();
         if (active_process_generation_ != 0) {
           (void) proc::proc.terminate_lsp_generation(active_process_generation_);
           active_process_generation_ = 0;
@@ -4098,6 +4274,7 @@ namespace lumen::lsp::runtime {
       if (!input_owner_->configure(mapping)) {
         (void) authority_.stop_from_host(NeutralizationReason::explicit_stop);
         session_start_available_.store(true, std::memory_order_release);
+        revert_lsp_display_configuration();
         rollback_selected_process();
         return std::unexpected(ControlStatus::internal_failure);
       }
@@ -4963,6 +5140,7 @@ namespace lumen::lsp::runtime {
           return ControlStatus::malformed;
         }
         session_start_available_.store(true, std::memory_order_release);
+        revert_lsp_display_configuration();
         process_stopped = active_process_generation_ == 0 ||
                           proc::proc.terminate_lsp_generation(active_process_generation_);
         active_process_generation_ = 0;
@@ -5079,6 +5257,65 @@ namespace lumen::lsp::runtime {
         return ControlStatus::busy;
       }
       return ControlStatus::success;
+    }
+
+    /**
+     * @brief Forward hardware-cursor visibility and shape to a stream owner that draws the cursor.
+     *
+     * @param now_microseconds Current socket-owner monotonic time.
+     */
+    void process_cursor(const std::uint64_t now_microseconds) noexcept {
+  #ifdef _WIN32
+      std::shared_ptr<platf::virtual_display::cursor_source_t> source;
+      PeerEndpoint peer {};
+      Identifier128 session_id {};
+      {
+        std::scoped_lock lock(session_mutex_);
+        if (active_video_configuration_ && active_video_configuration_->cursor_source && input_owner_) {
+          const auto snapshot = authority_.snapshot();
+          const auto mapping = input_owner_->mapping();
+          if (mapping && mapping->session_id == snapshot.session_id) {
+            source = active_video_configuration_->cursor_source;
+            peer = mapping->peer;
+            session_id = snapshot.session_id;
+          }
+        }
+      }
+      if (!source || !control_ || !crypto_) {
+        cursor_sent_ = {};
+        return;
+      }
+      const auto latest = source->latest();
+      const bool same_owner = cursor_sent_.peer == peer && cursor_sent_.session_id == session_id;
+      if (latest.sequence == 0 || (same_owner && cursor_sent_.sequence == latest.sequence)) {
+        return;
+      }
+      // Standard cursors go by kind so the client draws its native equivalent; animated ones
+      // (wait, app starting) change frames constantly, and resending images would flood the
+      // control channel that input setup shares.
+      if (latest.system_cursor != 0) {
+        if (same_owner && cursor_sent_.visible == latest.visible && cursor_sent_.system_cursor == latest.system_cursor) {
+          cursor_sent_.sequence = latest.sequence;
+          return;
+        }
+        if (control_->send_cursor_state(peer, session_id, latest.visible, std::nullopt, nullptr, latest.system_cursor, now_microseconds)) {
+          cursor_sent_ = {peer, session_id, latest.sequence, latest.visible, latest.system_cursor, cursor_sent_.shape_sent_microseconds};
+        }
+        return;
+      }
+      // App-defined cursors are sent without their image: cursor images exceed the inline limit,
+      // and the OBJECT_CHUNK transfer they would need stalls the reliable control channel the
+      // session depends on. The client shows its native arrow for them.
+      if (same_owner && cursor_sent_.visible == latest.visible && cursor_sent_.system_cursor == 0) {
+        cursor_sent_.sequence = latest.sequence;
+        return;
+      }
+      if (control_->send_cursor_state(peer, session_id, latest.visible, std::nullopt, nullptr, 0, now_microseconds)) {
+        cursor_sent_ = {peer, session_id, latest.sequence, latest.visible, 0, now_microseconds};
+      }
+  #else
+      (void) now_microseconds;
+  #endif
     }
 
     /**
@@ -5256,6 +5493,7 @@ namespace lumen::lsp::runtime {
     void run(const std::stop_token stop_token) noexcept {
       while (!stop_token.stop_requested() && active_) {
         (void) socket_.wait_readable(runtime_poll_milliseconds);
+        const auto batch_started = monotonic_microseconds();
         const auto result = socket_.receive_batch(runtime_receive_batch, [this](const ReceivedDatagram &datagram) {
           if (closed_peer_pending_retirement(datagram.peer)) {
             return;
@@ -5304,31 +5542,48 @@ namespace lumen::lsp::runtime {
         if (result == ReceiveBatchResult::fatal || result == ReceiveBatchResult::closed) {
           break;
         }
+        if (const auto batch_elapsed = monotonic_microseconds() - batch_started; batch_elapsed > 150'000U) {
+          BOOST_LOG(warning) << "LSP socket loop stalled "sv << batch_elapsed / 1000U << " ms in receive batch"sv;
+        }
         const auto now = monotonic_microseconds();
-        if (control_) {
-          control_->tick(now);
-        }
-        process_srtp_lifetime_events();
-        if (dtls_) {
-          (void) dtls_->process_pending();
-        }
-        process_control_sends();
-        process_identity_rotation();
-        process_path_probes(now);
-        process_dtls_timers(now);
-        process_pending_audio_retirements();
-        process_pending_video_retirements();
-        process_pending_microphone_activations();
-        process_pending_microphone_retirements();
-        process_failed_forward_paths();
-        process_authenticated_receive_inactivity(now);
-        process_pending_association_closes();
-        process_audio_failure();
-        process_video_failure();
-        process_attach_readiness_deadline(now);
-        process_detached_grace(now);
-        process_application_exit();
-        process_clipboard(now);
+        // Temporary diagnostic: name any socket-loop step that stalls control acknowledgements.
+        const auto timed = [](const char *name, auto &&step) {
+          const auto started = monotonic_microseconds();
+          step();
+          const auto elapsed = monotonic_microseconds() - started;
+          if (elapsed > 50'000U) {
+            BOOST_LOG(warning) << "LSP socket loop stalled "sv << elapsed / 1000U << " ms in "sv << name;
+          }
+        };
+        timed("control tick", [&] {
+          if (control_) {
+            control_->tick(now);
+          }
+        });
+        timed("srtp lifetime", [&] { process_srtp_lifetime_events(); });
+        timed("dtls pending", [&] {
+          if (dtls_) {
+            (void) dtls_->process_pending();
+          }
+        });
+        timed("control sends", [&] { process_control_sends(); });
+        timed("identity rotation", [&] { process_identity_rotation(); });
+        timed("path probes", [&] { process_path_probes(now); });
+        timed("dtls timers", [&] { process_dtls_timers(now); });
+        timed("audio retirements", [&] { process_pending_audio_retirements(); });
+        timed("video retirements", [&] { process_pending_video_retirements(); });
+        timed("microphone activations", [&] { process_pending_microphone_activations(); });
+        timed("microphone retirements", [&] { process_pending_microphone_retirements(); });
+        timed("forward paths", [&] { process_failed_forward_paths(); });
+        timed("receive inactivity", [&] { process_authenticated_receive_inactivity(now); });
+        timed("association closes", [&] { process_pending_association_closes(); });
+        timed("audio failure", [&] { process_audio_failure(); });
+        timed("video failure", [&] { process_video_failure(); });
+        timed("attach readiness", [&] { process_attach_readiness_deadline(now); });
+        timed("detached grace", [&] { process_detached_grace(now); });
+        timed("application exit", [&] { process_application_exit(); });
+        timed("clipboard", [&] { process_clipboard(now); });
+        timed("cursor", [&] { process_cursor(now); });
       }
       {
         std::scoped_lock lock(clipboard_mutex_);
@@ -5627,6 +5882,7 @@ namespace lumen::lsp::runtime {
         if (authority_.snapshot().state == SessionState::detached) {
           (void) authority_.stop_from_host(NeutralizationReason::transport_loss);
           session_start_available_.store(true, std::memory_order_release);
+          revert_lsp_display_configuration();
           if (active_process_generation_ != 0) {
             (void) proc::proc.terminate_lsp_generation(active_process_generation_);
             active_process_generation_ = 0;
@@ -5680,6 +5936,7 @@ namespace lumen::lsp::runtime {
         }
         (void) authority_.stop_from_host(NeutralizationReason::explicit_stop);
         session_start_available_.store(true, std::memory_order_release);
+        revert_lsp_display_configuration();
         active_process_generation_ = 0;
         active_client_.reset();
         active_association_peer_ = {};
@@ -6237,6 +6494,16 @@ namespace lumen::lsp::runtime {
     std::unique_ptr<platf::clipboard_t> clipboard_;  ///< Host clipboard bridge for the clipboard-permitted owner.
     std::uint64_t next_clipboard_poll_microseconds_ {};  ///< Socket-owner-only next clipboard change poll.
     bool clipboard_eligible_ {};  ///< Socket-owner-only latest logged clipboard eligibility.
+  #ifdef _WIN32
+    struct {
+      PeerEndpoint peer {};  ///< Association that received the latest cursor state.
+      Identifier128 session_id {};  ///< Session of the latest cursor state.
+      std::uint64_t sequence {};  ///< Hardware-cursor sequence of the latest cursor state.
+      bool visible {};  ///< Visibility of the latest cursor state.
+      std::uint8_t system_cursor {};  ///< Standard cursor kind of the latest cursor state, or 0 for a shape.
+      std::uint64_t shape_sent_microseconds {};  ///< When the latest custom shape was handed to control.
+    } cursor_sent_;  ///< Socket-owner-only latest cursor state handed to control.
+  #endif
     PeerEndpoint active_association_peer_ {};  ///< Exact DTLS/SRTP five-tuple owning stream authority.
     std::uint32_t active_association_generation_ {};  ///< Exact connection generation owning the active five-tuple.
     std::string active_application_id_;  ///< Stable application ID owned by the active session.
@@ -6254,6 +6521,7 @@ namespace lumen::lsp::runtime {
     std::uint32_t next_stream_generation_ {1};  ///< Next nonzero LSP stream-session generation.
     std::uint64_t active_process_generation_ {};  ///< Generation-qualified LSP-owned application process.
     std::atomic<bool> session_start_available_ {true};  ///< Whether fresh START/resume may claim process authority.
+    std::atomic<bool> lsp_display_configured_ {false};  ///< Whether this runtime applied a client display configuration.
 
     struct ActiveRates {
       std::uint32_t pointer {};  ///< Selected pointer reports/s.
@@ -6377,6 +6645,11 @@ namespace lumen::lsp::runtime {
     }
   }
 
+  bool administration_cancel_pairing(const Identifier128 &pairing_session_id) {
+    std::scoped_lock lock(runtime_registry_mutex);
+    return registered_runtime && registered_runtime->cancel_pairing(pairing_session_id);
+  }
+
   bool administration_update_trusted_client(
     const Identifier128 &client_id,
     const PermissionSet permissions,
@@ -6390,6 +6663,11 @@ namespace lumen::lsp::runtime {
     std::scoped_lock lock(runtime_registry_mutex);
     return registered_runtime && registered_runtime->revoke_trusted_client(client_id);
   }
+  bool administration_rename_trusted_client(const Identifier128 &client_id, const std::string_view name) {
+    std::scoped_lock lock(runtime_registry_mutex);
+    return registered_runtime && registered_runtime->rename_trusted_client(client_id, name);
+  }
+
 
   IdentityRotationResult administration_rotate_identity() {
     std::scoped_lock lock(runtime_registry_mutex);

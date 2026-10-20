@@ -1,0 +1,9 @@
+[Desktop Entry]
+Categories=RemoteAccess;Network;
+Comment=@PROJECT_DESCRIPTION@
+Exec=lumen
+Icon=@LUMEN_DESKTOP_ICON@
+Keywords=gamestream;stream;gamestream;remote play;
+Name=@PROJECT_NAME@
+Type=Application
+Version=1.0

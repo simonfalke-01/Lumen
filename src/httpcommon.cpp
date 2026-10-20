@@ -296,7 +296,7 @@ namespace http {
    * @brief Load persisted HTTP credentials and initialize shared request state.
    */
   int init() {
-    bool clean_slate = config::sunshine.flags[config::flag::FRESH_STATE];
+    bool clean_slate = config::general.flags[config::flag::FRESH_STATE];
     origin_web_ui_allowed = net::from_enum_string(config::nvhttp.origin_web_ui_allowed);
 
     if (clean_slate) {
@@ -313,9 +313,9 @@ namespace http {
       BOOST_LOG(error) << "Couldn't apply and verify private-key security for ["sv << config::nvhttp.pkey << ']';
       return -1;
     }
-    if (!user_creds_exist(config::sunshine.credentials_file)) {
-      BOOST_LOG(info) << "Open the Web UI to set your new username and password and getting started";
-    } else if (reload_user_creds(config::sunshine.credentials_file)) {
+    if (!user_creds_exist(config::general.credentials_file)) {
+      BOOST_LOG(info) << "Open the admin panel from this PC to create the administrator account";
+    } else if (reload_user_creds(config::general.credentials_file)) {
       return -1;
     }
     return 0;
@@ -390,9 +390,9 @@ namespace http {
         inputTree.get<std::string>("password"),
         inputTree.get<std::string>("salt")
       };
-      config::sunshine.username = std::move(loaded.username);
-      config::sunshine.password = std::move(loaded.password);
-      config::sunshine.salt = std::move(loaded.salt);
+      config::general.username = std::move(loaded.username);
+      config::general.password = std::move(loaded.password);
+      config::general.salt = std::move(loaded.salt);
     } catch (std::exception &e) {
       BOOST_LOG(error) << "loading user credentials: "sv << e.what();
       return -1;

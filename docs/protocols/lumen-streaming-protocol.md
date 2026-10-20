@@ -162,7 +162,7 @@ Pairing, authentication, application browsing, start, media, input,
 microphone, feedback, path probes, stop, and teardown all use that port.
 
 System mDNS uses the operating system's discovery service and is not an LSP
-application listener. Legacy Moonlight listeners remain separate when enabled.
+application listener. Legacy GameStream listeners remain separate when enabled.
 
 ### 5.1 First-byte demultiplexing
 
@@ -605,6 +605,8 @@ product control operation is enabled. The top-level message types are reserved:
 | `0x0220` | `STREAM_ENDED` | host to client |
 | `0x0222` | `CLIPBOARD_UPDATE` | either direction |
 | `0x0223` | `CLIPBOARD_UPDATE_RESPONSE` | opposite direction |
+| `0x0224` | `CURSOR_STATE` | host to client |
+| `0x0225` | `CURSOR_STATE_RESPONSE` | client to host |
 | `0x0300` | `PATH_PROBE` | either direction |
 | `0x0301` | `PATH_PROBE_ACK` | opposite direction |
 | `0x0400` | `OBJECT_CHUNK` | either direction |
@@ -618,9 +620,11 @@ The following deterministic-CBOR maps are frozen for wire version 1. Keys are
 consecutive integers starting at one; no omitted or additional keys are valid.
 
 - `APPLICATIONS` is the exact three-key response: wire version, status, and
-  at most 64 application entries. Each entry is the exact six-key map: stable
+  at most 64 application entries. Each entry is the exact seven-key map: stable
   application ID, display name, artwork reference (empty when absent), running
-  boolean, resume-available boolean, and process generation. A running entry
+  boolean, resume-available boolean, process generation, and kind (0 program,
+  1 desktop, 2 Steam). Clients draw a default icon from the kind; hosts send
+  artwork only for images the user configured, never stock assets. A running entry
   has a nonzero generation; a stopped entry has generation zero and cannot be
   resumed. A running application may be unavailable for resume, for example
   when its process is owned by legacy streaming. Clients preserve these fields
@@ -653,6 +657,13 @@ consecutive integers starting at one; no omitted or additional keys are valid.
   and referenced by object ID and SHA-256. Its success response has four keys:
   wire version, status, session ID, and sequence. Failure uses the generic
   two-key error map.
+- `CURSOR_STATE` (eight keys): wire version, session ID, nonzero host
+  sequence, visible boolean, nullable shape SHA-256, carried shape length
+  (zero when the shape is not carried), nullable inline shape bytes, and
+  nullable object ID. A carried shape of at most 768 bytes is inline; a longer
+  one is first sent through `OBJECT_CHUNK` and referenced by object ID. Its
+  success response has five keys: wire version, status, session ID, sequence,
+  and a shape-present boolean. Failure uses the generic two-key error map.
 - An `OBJECT_CHUNK` request has six keys: wire version, object ID, contiguous
   offset, total length, nonempty bytes, and complete-object SHA-256. A
   response-flagged successful acknowledgement has five keys: wire version,
@@ -715,7 +726,8 @@ offered range. Strict offers fail instead of being adjusted.
 
 ### 10.1 Frozen video control schema revision three
 
-`START` remains exactly sixteen keys. Keys 1 through 10 retain their input,
+`START` is exactly seventeen keys. Key 17 is the cursor mode: zero for a
+host-composed cursor, one for a client-drawn cursor (section 15.9). Keys 1 through 10 retain their input,
 audio, path, and nullable microphone meanings. Key 11 is network profile zero
 for adaptive-low-latency or one for competition. Key 12 is an ordered array of
 one through eight exact 18-key video offers:
@@ -1798,6 +1810,30 @@ Platforms convert to and from their native clipboard formats. A Windows host
 performs clipboard access in a helper process running as the interactive user,
 because clipboard data owned by user applications is not reliably readable from
 the SYSTEM service account.
+
+### 15.9 Client-drawn cursor
+
+A client that requests cursor mode one in `START` draws the pointer itself. The
+host keeps its cursor out of video frames and sends `CURSOR_STATE` whenever the
+cursor's visibility or shape changes, keeping one update in flight and
+replacing queued state with the newest. While the host shows its cursor, the
+client draws its local cursor with the host's shape and sends absolute pointer
+motion. While the host hides it, typically because a game captured the mouse
+for raw input, the client hides its cursor and sends relative motion.
+
+A Windows host requires the Lumen virtual display for this mode: the driver
+declares an IddCx hardware cursor, so Windows reports the cursor to the driver
+instead of composing it into frames. START fails when the virtual display or
+its cursor feed is unavailable.
+
+A shape bundle is an 8-byte header of big-endian u16 width, height, hotspot X,
+and hotspot Y, followed by width x height premultiplied RGBA pixels. Width and
+height are 1 through 256 and the hotspot lies inside the image. The shape is
+identified by the SHA-256 of its bundle. The host carries the bundle only when
+the client has not confirmed holding that shape on the current connection; a
+client that no longer holds a referenced shape answers shape-present false and
+the host resends the state with the bundle. Masked-color cursor pixels that
+invert the screen are drawn black with a white outline.
 
 ## 16. Scheduler and pacer
 

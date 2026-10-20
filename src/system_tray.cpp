@@ -3,28 +3,28 @@
  * @brief Definitions for the system tray icon and notification system.
  */
 // macros
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined LUMEN_TRAY && LUMEN_TRAY >= 1
 
   /**
    * @def TRAY_ICON
    * @brief Path to the default system tray icon.
    */
-  #define TRAY_ICON WEB_DIR "images/logo-sunshine.svg"
+  #define TRAY_ICON LUMEN_ASSETS_DIR "/lumen-tray.svg"
   /**
    * @def TRAY_ICON_PLAYING
    * @brief Path to the system tray icon used while streaming.
    */
-  #define TRAY_ICON_PLAYING WEB_DIR "images/sunshine-playing.svg"
+  #define TRAY_ICON_PLAYING LUMEN_ASSETS_DIR "/lumen-tray-playing.svg"
   /**
    * @def TRAY_ICON_PAUSING
    * @brief Path to the system tray icon used while streaming is paused.
    */
-  #define TRAY_ICON_PAUSING WEB_DIR "images/sunshine-pausing.svg"
+  #define TRAY_ICON_PAUSING LUMEN_ASSETS_DIR "/lumen-tray-pausing.svg"
   /**
    * @def TRAY_ICON_LOCKED
    * @brief Path to the system tray icon used for pairing requests.
    */
-  #define TRAY_ICON_LOCKED WEB_DIR "images/sunshine-locked.svg"
+  #define TRAY_ICON_LOCKED LUMEN_ASSETS_DIR "/lumen-tray-locked.svg"
 
   #if defined(_WIN32)
     /**
@@ -120,12 +120,12 @@ namespace system_tray {
     // If we're running in a service, return a special status to
     // tell it to terminate too, otherwise it will just respawn us.
     if (GetConsoleWindow() == nullptr) {
-      lifetime::exit_sunshine(ERROR_SHUTDOWN_IN_PROGRESS, true);
+      lifetime::exit_lumen(ERROR_SHUTDOWN_IN_PROGRESS, true);
       return;
     }
   #endif
 
-    lifetime::exit_sunshine(0, true);
+    lifetime::exit_lumen(0, true);
   }
 
   // Tray menu
@@ -151,7 +151,7 @@ namespace system_tray {
     .allIconPaths = {TRAY_ICON, TRAY_ICON_LOCKED, TRAY_ICON_PLAYING, TRAY_ICON_PAUSING},
   };
 
-  #ifdef SUNSHINE_TESTS
+  #ifdef LUMEN_TESTS
   const struct tray &tray_data_for_testing() {
     return tray;
   }

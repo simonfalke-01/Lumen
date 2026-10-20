@@ -740,7 +740,7 @@ namespace config {
     {},  // nv
     true,  // nv_realtime_hags
     true,  // nv_opengl_vulkan_on_dxgi
-    true,  // nv_sunshine_high_power_mode
+    true,  // nv_high_power_mode
     {},  // nv_legacy
 
     {
@@ -860,8 +860,8 @@ namespace config {
     PRIVATE_KEY_FILE,
     CERTIFICATE_FILE,
 
-    platf::get_host_name(),  // sunshine_name,
-    "sunshine_state.json"s,  // file_state
+    platf::get_host_name(),  // host_name,
+    "lumen_state.json"s,  // file_state
     {},  // external_ip
   };
 
@@ -901,7 +901,7 @@ namespace config {
   /**
    * @brief Default top-level Lumen configuration values used before file and CLI overrides.
    */
-  sunshine_t sunshine {
+  general_t general {
     "en",  // locale
     2,  // min_log_level
     0,  // flags
@@ -1323,8 +1323,8 @@ namespace config {
    * @return True when the tested parser condition is met.
    */
   bool to_bool(std::string &boolean) {
-    std::for_each(std::begin(boolean), std::end(boolean), [](char ch) {
-      return (char) std::tolower(ch);
+    std::ranges::transform(boolean, boolean.begin(), [](const unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
     });
 
     return boolean == "true"sv ||
@@ -1493,7 +1493,7 @@ namespace config {
     }
 
     // The framerate list must be cleared before adding values from the file configuration.
-    // If the list is not cleared, then the specified parameters do not affect the behavior of the sunshine server.
+    // If the list is not cleared, then the specified parameters do not affect the behavior of the lumen server.
     // That is, if you set only 30 fps in the configuration file, it will not work because by default, during initialization the list includes 10, 30, 60, 90 and 120 fps.
     input.clear();
     for (auto &el : list) {
@@ -1543,7 +1543,7 @@ namespace config {
   }
 
   /**
-   * @brief Apply single-character command-line flags to the global Sunshine flags bitset.
+   * @brief Apply single-character command-line flags to the global Lumen flags bitset.
    *
    * @param line Configuration line being parsed.
    * @return 0 when all flags are recognized; -1 when at least one flag is unknown.
@@ -1553,16 +1553,16 @@ namespace config {
     while (*line != '\0') {
       switch (*line) {
         case '0':
-          config::sunshine.flags[config::flag::PIN_STDIN].flip();
+          config::general.flags[config::flag::PIN_STDIN].flip();
           break;
         case '1':
-          config::sunshine.flags[config::flag::FRESH_STATE].flip();
+          config::general.flags[config::flag::FRESH_STATE].flip();
           break;
         case '2':
-          config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE].flip();
+          config::general.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE].flip();
           break;
         case 'p':
-          config::sunshine.flags[config::flag::UPNP].flip();
+          config::general.flags[config::flag::UPNP].flip();
           break;
         default:
           BOOST_LOG(warning) << "config: Unrecognized flag: ["sv << *line << ']' << std::endl;
@@ -1610,6 +1610,24 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    */
+  /**
+   * @brief Rename the state file from the name it had before the rename, keeping pairings.
+   *
+   * @param state_file Configured state file path.
+   */
+  void adopt_previous_state_file(const std::string &state_file) {
+    const fs::path current {state_file};
+    const auto previous = current.parent_path() / "sunshine_state.json";
+    std::error_code ec;
+    if (current.filename() != "lumen_state.json" || fs::exists(current, ec) || !fs::exists(previous, ec)) {
+      return;
+    }
+    fs::rename(previous, current, ec);
+    if (ec) {
+      std::cerr << "Couldn't rename "sv << previous << " to "sv << current << ": "sv << ec.message() << std::endl;
+    }
+  }
+
   void apply_config(std::unordered_map<std::string, std::string> &&vars) {
     log_config_settings(vars, true);
 
@@ -1631,7 +1649,7 @@ namespace config {
     generic_f(vars, "nvenc_split_encode", video.nv.split_frame_encoding, nv::split_encode_from_view);
     bool_f(vars, "nvenc_realtime_hags", video.nv_realtime_hags);
     bool_f(vars, "nvenc_opengl_vulkan_on_dxgi", video.nv_opengl_vulkan_on_dxgi);
-    bool_f(vars, "nvenc_latency_over_power", video.nv_sunshine_high_power_mode);
+    bool_f(vars, "nvenc_latency_over_power", video.nv_high_power_mode);
 
 #if !defined(__ANDROID__) && !defined(__APPLE__)
     video.nv_legacy.preset = video.nv.quality_preset + 11;
@@ -1735,18 +1753,19 @@ namespace config {
 
     path_f(vars, "pkey", nvhttp.pkey);
     path_f(vars, "cert", nvhttp.cert);
-    // Retain the established config key so existing configurations continue
-    // to work without a schema or Web UI migration.
-    string_f(vars, "sunshine_name", nvhttp.sunshine_name);
-    path_f(vars, "log_path", config::sunshine.log_file);
+    // Configuration files written before the rename call the host name "sunshine_name".
+    string_f(vars, "sunshine_name", nvhttp.host_name);
+    string_f(vars, "host_name", nvhttp.host_name);
+    path_f(vars, "log_path", config::general.log_file);
     path_f(vars, "file_state", nvhttp.file_state);
+    adopt_previous_state_file(nvhttp.file_state);
 
     // Must be run after "file_state"
-    config::sunshine.credentials_file = config::nvhttp.file_state;
-    path_f(vars, "credentials_file", config::sunshine.credentials_file);
+    config::general.credentials_file = config::nvhttp.file_state;
+    path_f(vars, "credentials_file", config::general.credentials_file);
 
     string_f(vars, "external_ip", nvhttp.external_ip);
-    list_prep_cmd_f(vars, "global_prep_cmd", config::sunshine.prep_cmds);
+    list_prep_cmd_f(vars, "global_prep_cmd", config::general.prep_cmds);
 
     string_f(vars, "audio_sink", audio.sink);
     string_f(vars, "virtual_sink", audio.virtual_sink);
@@ -1762,7 +1781,7 @@ namespace config {
     string_list_f(vars, "csrf_allowed_origins", user_csrf_origins);
 
     // Start with default localhost variants
-    sunshine.csrf_allowed_origins = {
+    general.csrf_allowed_origins = {
       "https://localhost",
       "https://127.0.0.1",
       "https://[::1]"
@@ -1772,7 +1791,7 @@ namespace config {
     bool csrf_invalid_config = false;
     for (const auto &origin : user_csrf_origins) {
       if (origin.size() > 8 && origin.starts_with("https://")) {
-        sunshine.csrf_allowed_origins.push_back(origin);
+        general.csrf_allowed_origins.push_back(origin);
       } else {
         csrf_invalid_config = true;
         BOOST_LOG(warning) << "Invalid 'csrf_allowed_origins' entry rejected: "sv << origin;
@@ -1833,7 +1852,7 @@ namespace config {
 #ifndef __ANDROID__
     // TODO: Android can possibly support this
     if (!fs::exists(stream.file_apps.c_str())) {
-      fs::copy_file(SUNSHINE_ASSETS_DIR "/apps.json", stream.file_apps);
+      fs::copy_file(LUMEN_ASSETS_DIR "/apps.json", stream.file_apps);
       fs::permissions(
         stream.file_apps,
         fs::perms::owner_read | fs::perms::owner_write,
@@ -1892,31 +1911,31 @@ namespace config {
     bool_f(vars, "high_resolution_scrolling", input.high_resolution_scrolling);
     bool_f(vars, "native_pen_touch", input.native_pen_touch);
 
-    bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
-    bool_f(vars, "system_tray", sunshine.system_tray);
+    bool_f(vars, "notify_pre_releases", general.notify_pre_releases);
+    bool_f(vars, "system_tray", general.system_tray);
 
-    int port = sunshine.port;
+    int port = general.port;
     int_between_f(vars, "port"s, port, {1024 + nvhttp::PORT_HTTPS, 65535 - rtsp_stream::RTSP_SETUP_PORT});
-    sunshine.port = (std::uint16_t) port;
+    general.port = (std::uint16_t) port;
 
     // Now that we have the port, add web UI port-specific origins to CSRF allowed list
     // Web UI runs on port + 1 (PORT_HTTPS offset is 1 for confighttp)
-    const unsigned short web_ui_port = sunshine.port + 1;
-    sunshine.csrf_allowed_origins.push_back(std::format("https://localhost:{}", web_ui_port));
-    sunshine.csrf_allowed_origins.push_back(std::format("https://127.0.0.1:{}", web_ui_port));
-    sunshine.csrf_allowed_origins.push_back(std::format("https://[::1]:{}", web_ui_port));
+    const unsigned short web_ui_port = general.port + 1;
+    general.csrf_allowed_origins.push_back(std::format("https://localhost:{}", web_ui_port));
+    general.csrf_allowed_origins.push_back(std::format("https://127.0.0.1:{}", web_ui_port));
+    general.csrf_allowed_origins.push_back(std::format("https://[::1]:{}", web_ui_port));
 
-    string_restricted_f(vars, "address_family", sunshine.address_family, {"ipv4"sv, "both"sv});
-    string_f(vars, "bind_address", sunshine.bind_address);
+    string_restricted_f(vars, "address_family", general.address_family, {"ipv4"sv, "both"sv});
+    string_f(vars, "bind_address", general.bind_address);
 
     bool upnp = false;
     bool_f(vars, "upnp"s, upnp);
 
     if (upnp) {
-      config::sunshine.flags[config::flag::UPNP].flip();
+      config::general.flags[config::flag::UPNP].flip();
     }
 
-    string_restricted_f(vars, "locale", config::sunshine.locale, {
+    string_restricted_f(vars, "locale", config::general.locale, {
                                                                    "bg"sv,  // Bulgarian
                                                                    "cs"sv,  // Czech
                                                                    "de"sv,  // German
@@ -1946,24 +1965,24 @@ namespace config {
 
     if (!log_level_string.empty()) {
       if (log_level_string == "verbose"sv) {
-        sunshine.min_log_level = 0;
+        general.min_log_level = 0;
       } else if (log_level_string == "debug"sv) {
-        sunshine.min_log_level = 1;
+        general.min_log_level = 1;
       } else if (log_level_string == "info"sv) {
-        sunshine.min_log_level = 2;
+        general.min_log_level = 2;
       } else if (log_level_string == "warning"sv) {
-        sunshine.min_log_level = 3;
+        general.min_log_level = 3;
       } else if (log_level_string == "error"sv) {
-        sunshine.min_log_level = 4;
+        general.min_log_level = 4;
       } else if (log_level_string == "fatal"sv) {
-        sunshine.min_log_level = 5;
+        general.min_log_level = 5;
       } else if (log_level_string == "none"sv) {
-        sunshine.min_log_level = 6;
+        general.min_log_level = 6;
       } else {
         // accept digit directly
         auto val = log_level_string[0];
         if (val >= '0' && val < '7') {
-          sunshine.min_log_level = val - '0';
+          general.min_log_level = val - '0';
         }
       }
     }
@@ -1985,14 +2004,14 @@ namespace config {
       }
     }
 
-    if (sunshine.min_log_level <= 3) {
+    if (general.min_log_level <= 3) {
       for (auto &[var, _] : vars) {
         std::cout << "Warning: Unrecognized configurable option ["sv << var << ']' << std::endl;
       }
     }
   }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   /**
    * @brief Parse and apply serialized configuration text for unit tests.
    *
@@ -2003,103 +2022,11 @@ namespace config {
   }
 #endif
 
-  void migrate_legacy_config_file(std::string &config_file, bool custom_config_file) {
-    if (custom_config_file || fs::exists(config_file) || fs::path {config_file}.filename() != "lumen.conf"sv) {
-      return;
-    }
-
-    const auto legacy_config_file = fs::path {config_file}.parent_path() / "sunshine.conf";
-    std::error_code ec;
-    if (!fs::exists(legacy_config_file, ec)) {
-      return;
-    }
-
-    if (fs::path {config_file}.parent_path().filename() == "sunshine"sv) {
-      // Never write authoritative Lumen state into an upstream-owned directory.
-      return;
-    }
-
-    fs::copy_file(legacy_config_file, config_file, fs::copy_options::none, ec);
-    if (ec) {
-      std::cerr << "Failed to copy legacy Sunshine config to " << config_file << ": " << ec.message() << std::endl;
-    } else {
-      std::cout << "Copied legacy Sunshine config to " << config_file << std::endl;
-    }
-  }
-
-  bool copy_legacy_config_directory(
-    const std::string &legacy_directory,
-    const std::string &lumen_directory,
-    std::string &error_message
-  ) {
-    const fs::path source {legacy_directory};
-    const fs::path destination {lumen_directory};
-    std::error_code ec;
-    if (!fs::is_directory(source, ec) || ec) {
-      error_message = ec ? ec.message() : "legacy source is not a directory";
-      return false;
-    }
-    if (fs::exists(destination, ec) || ec) {
-      error_message = ec ? ec.message() : "authoritative destination already exists";
-      return false;
-    }
-
-    const auto source_status = fs::symlink_status(source, ec);
-    if (ec || fs::is_symlink(source_status)) {
-      error_message = ec ? ec.message() : "legacy source is a symlink";
-      return false;
-    }
-    for (fs::recursive_directory_iterator iterator {source, ec}, end; iterator != end && !ec; iterator.increment(ec)) {
-      const auto status = iterator->symlink_status(ec);
-      if (ec || fs::is_symlink(status)) {
-        error_message = ec ? ec.message() : "legacy source contains a symlink";
-        return false;
-      }
-    }
-    if (ec) {
-      error_message = ec.message();
-      return false;
-    }
-
-    fs::create_directories(destination.parent_path(), ec);
-    if (ec) {
-      error_message = ec.message();
-      return false;
-    }
-    auto staging = destination;
-    staging += ".migration-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-    if (!fs::create_directory(staging, ec) || ec) {
-      error_message = ec ? ec.message() : "migration staging path already exists";
-      return false;
-    }
-
-    for (fs::directory_iterator iterator {source, ec}, end; iterator != end && !ec; iterator.increment(ec)) {
-      fs::copy(
-        iterator->path(),
-        staging / iterator->path().filename(),
-        fs::copy_options::recursive | fs::copy_options::skip_symlinks,
-        ec
-      );
-    }
-    if (!ec) {
-      fs::rename(staging, destination, ec);
-    }
-    if (ec) {
-      error_message = ec.message();
-      std::error_code cleanup_ec;
-      fs::remove_all(staging, cleanup_ec);
-      return false;
-    }
-    error_message.clear();
-    return true;
-  }
-
   /**
    * @brief Parse serialized text into the corresponding runtime representation.
    */
   int parse(int argc, char *argv[]) {
     std::unordered_map<std::string, std::string> cmd_vars;
-    bool custom_config_file = false;
 #ifdef _WIN32
     bool shortcut_launch = false;
     bool service_admin_launch = false;
@@ -2121,9 +2048,9 @@ namespace config {
 #endif
       else if (*line == '-') {
         if (*(line + 1) == '-') {
-          sunshine.cmd.name = line + 2;
-          sunshine.cmd.argc = argc - x - 1;
-          sunshine.cmd.argv = argv + x + 1;
+          general.cmd.name = line + 2;
+          general.cmd.argc = argc - x - 1;
+          general.cmd.argv = argv + x + 1;
 
           break;
         }
@@ -2136,8 +2063,7 @@ namespace config {
 
         auto pos = std::find(line, line_end, '=');
         if (pos == line_end) {
-          sunshine.config_file = line;
-          custom_config_file = true;
+          general.config_file = line;
         } else {
           TUPLE_EL(var, 1, parse_option(line, line_end));
           if (!var) {
@@ -2162,17 +2088,13 @@ namespace config {
       // Create appdata folder if it does not exist
       file_handler::make_directory(platf::appdata().string());
 
-      // A copied legacy directory contains sunshine.conf. Seed the authoritative
-      // filename from it without modifying or deleting the legacy file.
-      migrate_legacy_config_file(sunshine.config_file, custom_config_file);
-
       // Create empty config file if it does not exist
-      if (!fs::exists(sunshine.config_file)) {
-        std::ofstream {sunshine.config_file};
+      if (!fs::exists(general.config_file)) {
+        std::ofstream {general.config_file};
       }
 
       // Read config file
-      auto vars = parse_config(file_handler::read_file(sunshine.config_file.c_str()));
+      auto vars = parse_config(file_handler::read_file(general.config_file.c_str()));
 
       for (auto &[name, value] : cmd_vars) {
         vars.insert_or_assign(std::move(name), std::move(value));
@@ -2212,7 +2134,7 @@ namespace config {
       // This is a relaunch as admin to start the service
       service_ctrl::start_service();
 
-      // Always return 1 to ensure Sunshine doesn't start normally
+      // Always return 1 to ensure Lumen doesn't start normally
       return 1;
     }
     if (shortcut_launch) {
@@ -2242,7 +2164,7 @@ namespace config {
         service_ctrl::wait_for_ui_ready();
       }
 
-      // Always return 1 to ensure Sunshine doesn't start normally
+      // Always return 1 to ensure Lumen doesn't start normally
       return 1;
     }
 #endif

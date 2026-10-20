@@ -77,6 +77,7 @@ namespace {
                           {14, 3U},
                           {15, 1U},
                           {16, 20'000U},
+                          {17, 0U},
                         }})
       .bytes;
   }
@@ -125,7 +126,7 @@ TEST(LspProductControlWire, DecodesLaunchAndResumeApplicationIntentWithoutChangi
   const auto launch_bytes = start_request(false);
   const auto launch_map = cbor::decode(launch_bytes);
   ASSERT_TRUE(launch_map);
-  EXPECT_EQ(std::get<cbor::Value::Map>(launch_map.value->storage).size(), 16U);
+  EXPECT_EQ(std::get<cbor::Value::Map>(launch_map.value->storage).size(), 17U);
   const auto launch = lsp::decode_start(launch_bytes);
   ASSERT_TRUE(launch);
   EXPECT_EQ(launch->application_id, "1");

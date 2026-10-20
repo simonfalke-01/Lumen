@@ -81,12 +81,12 @@ protected:
   void SetUp() override {
     BaseTest::SetUp();
     // Save the original bind_address config
-    original_bind_address = config::sunshine.bind_address;
+    original_bind_address = config::general.bind_address;
   }
 
   void TearDown() override {
     // Restore the original bind_address config
-    config::sunshine.bind_address = original_bind_address;
+    config::general.bind_address = original_bind_address;
     BaseTest::TearDown();
   }
 };
@@ -96,7 +96,7 @@ protected:
  */
 TEST_F(BindAddressTest, DefaultBehaviorIPv4) {
   // Clear bind_address to test the default behavior
-  config::sunshine.bind_address = "";
+  config::general.bind_address = "";
 
   const auto bind_addr = net::get_bind_address(net::af_e::IPV4);
   ASSERT_EQ(bind_addr, "0.0.0.0");
@@ -107,7 +107,7 @@ TEST_F(BindAddressTest, DefaultBehaviorIPv4) {
  */
 TEST_F(BindAddressTest, DefaultBehaviorIPv6) {
   // Clear bind_address to test the default behavior
-  config::sunshine.bind_address = "";
+  config::general.bind_address = "";
 
   const auto bind_addr = net::get_bind_address(net::af_e::BOTH);
   ASSERT_EQ(bind_addr, "::");
@@ -118,7 +118,7 @@ TEST_F(BindAddressTest, DefaultBehaviorIPv6) {
  */
 TEST_F(BindAddressTest, ConfiguredIPv4Address) {
   // Set a specific IPv4 address
-  config::sunshine.bind_address = "192.168.1.100";
+  config::general.bind_address = "192.168.1.100";
 
   const auto bind_addr = net::get_bind_address(net::af_e::IPV4);
   ASSERT_EQ(bind_addr, "192.168.1.100");
@@ -129,7 +129,7 @@ TEST_F(BindAddressTest, ConfiguredIPv4Address) {
  */
 TEST_F(BindAddressTest, ConfiguredIPv6Address) {
   // Set a specific IPv6 address
-  config::sunshine.bind_address = "::1";
+  config::general.bind_address = "::1";
 
   const auto bind_addr = net::get_bind_address(net::af_e::BOTH);
   ASSERT_EQ(bind_addr, "::1");
@@ -141,7 +141,7 @@ TEST_F(BindAddressTest, ConfiguredIPv6Address) {
 TEST_F(BindAddressTest, ConfiguredAddressOverridesFamily) {
   // Set a specific IPv6 address but request IPv4 family
   // The configured address should still be returned
-  config::sunshine.bind_address = "2001:db8::1";
+  config::general.bind_address = "2001:db8::1";
 
   const auto bind_addr = net::get_bind_address(net::af_e::IPV4);
   ASSERT_EQ(bind_addr, "2001:db8::1");
@@ -152,12 +152,12 @@ TEST_F(BindAddressTest, ConfiguredAddressOverridesFamily) {
  */
 TEST_F(BindAddressTest, LoopbackAddresses) {
   // Test IPv4 loopback
-  config::sunshine.bind_address = "127.0.0.1";
+  config::general.bind_address = "127.0.0.1";
   const auto bind_addr_v4 = net::get_bind_address(net::af_e::IPV4);
   ASSERT_EQ(bind_addr_v4, "127.0.0.1");
 
   // Test IPv6 loopback
-  config::sunshine.bind_address = "::1";
+  config::general.bind_address = "::1";
   const auto bind_addr_v6 = net::get_bind_address(net::af_e::BOTH);
   ASSERT_EQ(bind_addr_v6, "::1");
 }
@@ -167,12 +167,12 @@ TEST_F(BindAddressTest, LoopbackAddresses) {
  */
 TEST_F(BindAddressTest, LinkLocalAddresses) {
   // Test IPv4 link-local
-  config::sunshine.bind_address = "169.254.1.1";
+  config::general.bind_address = "169.254.1.1";
   const auto bind_addr_v4 = net::get_bind_address(net::af_e::IPV4);
   ASSERT_EQ(bind_addr_v4, "169.254.1.1");
 
   // Test IPv6 link-local
-  config::sunshine.bind_address = "fe80::1";
+  config::general.bind_address = "fe80::1";
   const auto bind_addr_v6 = net::get_bind_address(net::af_e::BOTH);
   ASSERT_EQ(bind_addr_v6, "fe80::1");
 }

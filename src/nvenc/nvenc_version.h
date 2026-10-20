@@ -11,7 +11,7 @@
 namespace nvenc {
 
   /**
-   * @brief NVENC SDK implementations compiled into Sunshine.
+   * @brief NVENC SDK implementations compiled into Lumen.
    */
   enum class nvenc_sdk_version : std::uint32_t {
     unsupported = 0U,  ///< No compatible SDK implementation is available.

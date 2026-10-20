@@ -25,7 +25,7 @@ namespace nvprefs {
        * @brief OpenGL swapchain setting values captured from the driver.
        */
       struct opengl_swapchain_t {
-        uint32_t our_value;  ///< NVIDIA setting value applied by Sunshine.
+        uint32_t our_value;  ///< NVIDIA setting value applied by Lumen.
         std::optional<uint32_t> undo_value;  ///< Previous NVIDIA setting value to restore, if present.
       };
 
@@ -35,7 +35,7 @@ namespace nvprefs {
     /**
      * @brief Set opengl swapchain.
      *
-     * @param our_value NVIDIA setting value applied by Sunshine.
+     * @param our_value NVIDIA setting value applied by Lumen.
      * @param undo_value Previous NVIDIA setting value to restore, if present.
      */
     void set_opengl_swapchain(uint32_t our_value, std::optional<uint32_t> undo_value);

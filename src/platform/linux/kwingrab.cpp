@@ -2,10 +2,10 @@
  * @file src/platform/linux/kwingrab.cpp
  * @brief KWin direct ScreenCast capture via zkde_screencast_unstable_v1 Wayland protocol.
  *
- * Bypasses xdg-desktop-portal entirely. Sunshine connects directly to KWin's
+ * Bypasses xdg-desktop-portal entirely. Lumen connects directly to KWin's
  * Wayland protocol to obtain a PipeWire node_id, then streams frames via PipeWire.
  *
- * Chain: KWin -> Wayland kde_screencast -> PipeWire -> Sunshine
+ * Chain: KWin -> Wayland kde_screencast -> PipeWire -> Lumen
  */
 // standard includes
 #include <algorithm>
@@ -69,7 +69,7 @@ namespace kwin {
       auto filenameprefix = std::format("{}.kwin", PROJECT_FQDN);
       auto executablepath = get_executable_full_path();
 
-      // System: Check system XDG applications for permission (usually installed with Sunshine)
+      // System: Check system XDG applications for permission (usually installed with Lumen)
       if (check_kwin_system_permissions(filenameprefix, executablepath)) {
         create_file = false;
         initialized = true;
@@ -111,7 +111,7 @@ namespace kwin {
             continue;
           }
           if (!entry_executablepath.empty() && std::filesystem::exists(entry_executablepath)) {
-            // This entry is for another sunshine executable that still exists
+            // This entry is for another lumen executable that still exists
             BOOST_LOG(debug) << "[kwingrab] Ignoring other valid temporary KWin wayland permission file: "sv << entry;
             continue;
           }
@@ -167,7 +167,7 @@ namespace kwin {
         return homedir;
       }
       // Fall back to home directory from NSS passwd
-      // Note: This should be thread-safe as we're always accessing the same entry for Sunshine
+      // Note: This should be thread-safe as we're always accessing the same entry for Lumen
       return getpwuid(geteuid())->pw_dir;
     }
 
@@ -743,7 +743,7 @@ namespace platf {
    */
   std::vector<std::string> kwin_display_names() {
     if (has_elevated_privileges(false)) {
-      // We're still in the probing phase of Sunshine startup. Dropping portal security early will break KMS.
+      // We're still in the probing phase of Lumen startup. Dropping portal security early will break KMS.
       // Just return a dummy screen for now. Display re-enumeration after encoder probing will yield full result.
       std::vector<std::string> display_names;
       display_names.emplace_back("");

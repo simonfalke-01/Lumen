@@ -166,7 +166,7 @@ TEST(LibvirtualhidGamepadCoreTest, GenericPidFacadeRejectsUnknownReport) {
 }
 
 TEST(LibvirtualhidGamepadCoreTest, PublicHeaderExposesOnlyLumenOwnedTypes) {
-  const auto header_path = std::filesystem::path {SUNSHINE_SOURCE_DIR} /
+  const auto header_path = std::filesystem::path {LUMEN_SOURCE_DIR} /
                            "src/platform/windows/libvirtualhid_gamepad_core.h";
   std::ifstream stream {header_path};
   ASSERT_TRUE(stream.is_open()) << header_path;

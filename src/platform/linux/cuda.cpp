@@ -27,22 +27,22 @@ extern "C" {
 #include "wayland.h"
 
 /**
- * @def SUNSHINE_STRINGVIEW_HELPER(x)
- * @brief Macro for SUNSHINE STRINGVIEW HELPER.
+ * @def LUMEN_STRINGVIEW_HELPER(x)
+ * @brief Macro for LUMEN STRINGVIEW HELPER.
  */
-#define SUNSHINE_STRINGVIEW_HELPER(x) x##sv
+#define LUMEN_STRINGVIEW_HELPER(x) x##sv
 /**
- * @def SUNSHINE_STRINGVIEW(x)
- * @brief Macro for SUNSHINE STRINGVIEW.
+ * @def LUMEN_STRINGVIEW(x)
+ * @brief Macro for LUMEN STRINGVIEW.
  */
-#define SUNSHINE_STRINGVIEW(x) SUNSHINE_STRINGVIEW_HELPER(x)
+#define LUMEN_STRINGVIEW(x) LUMEN_STRINGVIEW_HELPER(x)
 
 /**
  * @def CU_CHECK(x, y)
  * @brief Macro for CU CHECK.
  */
 #define CU_CHECK(x, y) \
-  if (check((x), SUNSHINE_STRINGVIEW(y ": "))) \
+  if (check((x), LUMEN_STRINGVIEW(y ": "))) \
   return -1
 
 /**
@@ -50,7 +50,7 @@ extern "C" {
  * @brief Macro for CU CHECK IGNORE.
  */
 #define CU_CHECK_IGNORE(x, y) \
-  check((x), SUNSHINE_STRINGVIEW(y ": "))
+  check((x), LUMEN_STRINGVIEW(y ": "))
 
 namespace fs = std::filesystem;
 
@@ -61,7 +61,7 @@ namespace cuda {
   constexpr auto cudaDevAttrMaxThreadsPerMultiProcessor = (CUdevice_attribute) 39;  ///< CUDA dev attr max threads per multi processor.
 
   /**
-   * @brief Convert a CUDA result code into Sunshine's capture status.
+   * @brief Convert a CUDA result code into Lumen's capture status.
    *
    * @param sv String view containing the text to inspect.
    * @param name Human-readable name to assign.
@@ -1207,7 +1207,7 @@ namespace cuda {
       /**
        * @brief Create AVCodec encode device.
        *
-       * @param pix_fmt Sunshine pixel format to convert or allocate for.
+       * @param pix_fmt Lumen pixel format to convert or allocate for.
        * @return Constructed AVCodec encode device object.
        */
       std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(platf::pix_fmt_e pix_fmt) override {

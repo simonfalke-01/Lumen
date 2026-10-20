@@ -29,7 +29,7 @@ namespace platf::dxgi::fused_d3d11 {
 
   /** @brief Client protocol family attached to one isolated telemetry generation. */
   enum class telemetry_client_e : std::uint8_t {
-    vanilla_legacy = 0,  ///< Vanilla Moonlight legacy GameStream client.
+    vanilla_legacy = 0,  ///< Legacy GameStream client.
     third_party_extension = 1,  ///< Non-Umbra client using an independently negotiated extension.
     umbra_legacy = 2,  ///< Umbra using the legacy GameStream transport.
     umbra_v2 = 3,  ///< Umbra using protocol v2.

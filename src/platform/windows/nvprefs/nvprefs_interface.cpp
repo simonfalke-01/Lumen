@@ -12,9 +12,8 @@
 
 namespace {
 
-  // Keep the legacy folder so an upgrade can restore global driver settings
-  // recorded by an interrupted Sunshine or Lumen process.
-  const auto legacy_program_data_folder = "Sunshine";
+  // Folder under %ProgramData% holding the record of driver settings to restore.
+  const auto program_data_folder = "Lumen";
   const auto nvprefs_undo_file_name = "nvprefs_undo.json";
 
 }  // namespace
@@ -55,7 +54,7 @@ namespace nvprefs {
       }
 
       // Prepare undo file path variables
-      pimpl->undo_folder_path = std::filesystem::path(program_data_env) / legacy_program_data_folder;
+      pimpl->undo_folder_path = std::filesystem::path(program_data_env) / program_data_folder;
       pimpl->undo_file_path = pimpl->undo_folder_path / nvprefs_undo_file_name;
 
       // Dynamically load nvapi library and load driver settings

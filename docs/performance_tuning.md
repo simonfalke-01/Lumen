@@ -7,7 +7,7 @@ reported FPS is not proof of lower input-to-photon latency.
 
 ## Session policies
 
-Umbra can request `latency` or `quality`. Unmodified Moonlight clients omit the
+Umbra can request `latency` or `quality`. Unmodified GameStream clients omit the
 extension and retain Lumen's legacy behavior.
 
 | Host behavior | Latency | Quality |
@@ -25,7 +25,7 @@ settings when comparing runs.
 Umbra additionally uses a one-frame compressed queue, two decoder submissions,
 and immediate presentation in Latency mode; Quality uses a two-frame queue,
 five submissions, and display-linked presentation. Latency removes the legacy
-Moonlight input path's deliberate one-millisecond mouse/stylus batching wait.
+GameStream input path's deliberate one-millisecond mouse/stylus batching wait.
 Quality and Legacy retain that wait. Packet ordering and reliable ENet input
 delivery are unchanged in every mode.
 

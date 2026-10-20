@@ -1,6 +1,6 @@
 # Third-Party Packages
 
-No third-party Lumen packages are currently tracked. Packages named Sunshine belong to the upstream project and should
+No third-party Lumen packages are currently tracked. Packages named Lumen belong to the upstream project and should
 not be treated as Lumen releases.
 
 <div class="section_buttons">

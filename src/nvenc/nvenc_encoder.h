@@ -19,7 +19,7 @@ namespace platf {
 
 namespace video {
   struct config_t;
-  struct sunshine_colorspace_t;
+  struct stream_colorspace_t;
 }  // namespace video
 
 namespace nvenc {
@@ -39,7 +39,7 @@ namespace nvenc {
      *
      * @param config NVENC encoder configuration.
      * @param client_config Stream configuration requested by the client.
-     * @param colorspace Sunshine colorspace metadata.
+     * @param colorspace Lumen colorspace metadata.
      * @param buffer_format Platform-agnostic input surface format.
      * @param hdr_metadata Validated HDR10 static metadata, or empty for SDR.
      * @return `true` on success, `false` on error.
@@ -47,7 +47,7 @@ namespace nvenc {
     virtual bool create_encoder(
       const nvenc_config &config,
       const video::config_t &client_config,
-      const video::sunshine_colorspace_t &colorspace,
+      const video::stream_colorspace_t &colorspace,
       platf::pix_fmt_e buffer_format,
       const std::optional<hdr_static_metadata_t> &hdr_metadata
     ) = 0;

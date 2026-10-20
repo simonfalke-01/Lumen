@@ -1,6 +1,6 @@
 # App Examples
 Since not all applications behave the same, we decided to create some examples to help you get started adding games
-and applications to Lumen. New scripts should use the `LUMEN_*` environment variables. Matching `SUNSHINE_*` names
+and applications to Lumen. New scripts should use the `LUMEN_*` environment variables. Matching `LUMEN_*` names
 remain available as compatibility aliases for existing scripts.
 
 > [!TIP]
@@ -297,7 +297,7 @@ unmaintained and do not support newer Mutter features such as HDR and VRR.
 > e.g., On X11, the monitor may be called ``HDMI-A-0``, but on Wayland, it may be called ``HDMI-A-1``.
 
 > [!TIP]
-> Replace ``HDMI-A-1`` with the display name of the monitor you would like to use for Moonlight.
+> Replace ``HDMI-A-1`` with the display name of the monitor you would like to use for the client.
 > You can list the monitors available to you with:
 > ```
 > kscreen-doctor -o
@@ -305,7 +305,7 @@ unmaintained and do not support newer Mutter features such as HDR and VRR.
 >
 > These will also give you the supported display properties for each monitor. You can select them either by
 > hard-coding their corresponding number (e.g. ``kscreen-doctor output.HDMI-A1.mode.0``) or using the above
-> ``do`` command to fetch the resolution requested by your Moonlight client
+> ``do`` command to fetch the resolution requested by your GameStream client
 > (which has a chance of not being supported by your monitor).
 
 ###### NVIDIA

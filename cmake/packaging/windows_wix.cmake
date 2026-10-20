@@ -84,7 +84,7 @@ set(CPACK_WIX_UPGRADE_GUID "89721553-C582-4D70-8BBF-1E6C5431C8D5")
 
 # Installer metadata
 set(CPACK_WIX_HELP_LINK "https://github.com/simonfalke-01/Lumen")
-set(CPACK_WIX_PRODUCT_ICON "${SUNSHINE_ICON_PATH}")
+set(CPACK_WIX_PRODUCT_ICON "${LUMEN_ICON_PATH}")
 set(CPACK_WIX_PRODUCT_URL "${CMAKE_PROJECT_HOMEPAGE_URL}")
 set(CPACK_WIX_PROGRAM_MENU_FOLDER "Lumen")
 set(LUMEN_WINDOWS_SERVICE_NAME "Lumen")
@@ -114,14 +114,14 @@ configure_file(
         @ONLY)
 set(LUMEN_MSICA_BINARY "${CMAKE_BINARY_DIR}/tools/lumen_msica.dll")
 file(TO_NATIVE_PATH "${LUMEN_MSICA_BINARY}" LUMEN_MSICA_BINARY_WIX)
-if(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
+if(LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
     set(LUMEN_INSTALL_VDD_DEFAULT 1)
 else()
     set(LUMEN_INSTALL_VDD_DEFAULT 0)
 endif()
 configure_file(
-        "${CMAKE_CURRENT_LIST_DIR}/wix_resources/sunshine-installer.wxs"
-        "${WIX_BUILD_PARENT_DIRECTORY}/sunshine-installer.wxs"
+        "${CMAKE_CURRENT_LIST_DIR}/wix_resources/lumen-installer.wxs"
+        "${WIX_BUILD_PARENT_DIRECTORY}/lumen-installer.wxs"
         @ONLY)
 
 function(lumen_remove_marked_wix_block file_path start_marker end_marker)
@@ -138,41 +138,41 @@ function(lumen_remove_marked_wix_block file_path start_marker end_marker)
     file(WRITE "${file_path}" "${prefix}${suffix}")
 endfunction()
 
-if(NOT SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
+if(NOT LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
     lumen_remove_marked_wix_block(
             "${WIX_BUILD_PARENT_DIRECTORY}/patch.xml"
             "<!-- LUMEN_VHID_FEATURE_START -->"
             "<!-- LUMEN_VHID_FEATURE_END -->")
     lumen_remove_marked_wix_block(
-            "${WIX_BUILD_PARENT_DIRECTORY}/sunshine-installer.wxs"
+            "${WIX_BUILD_PARENT_DIRECTORY}/lumen-installer.wxs"
             "<!-- LUMEN_VHID_FEATURE_START -->"
             "<!-- LUMEN_VHID_FEATURE_END -->")
 endif()
 
-if(NOT SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR)
+if(NOT LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR)
     lumen_remove_marked_wix_block(
             "${WIX_BUILD_PARENT_DIRECTORY}/patch.xml"
             "<!-- LUMEN_VMIC_FEATURE_START -->"
             "<!-- LUMEN_VMIC_FEATURE_END -->")
     lumen_remove_marked_wix_block(
-            "${WIX_BUILD_PARENT_DIRECTORY}/sunshine-installer.wxs"
+            "${WIX_BUILD_PARENT_DIRECTORY}/lumen-installer.wxs"
             "<!-- LUMEN_VMIC_FEATURE_START -->"
             "<!-- LUMEN_VMIC_FEATURE_END -->")
 endif()
 
-if(NOT SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
+if(NOT LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
     lumen_remove_marked_wix_block(
             "${WIX_BUILD_PARENT_DIRECTORY}/patch.xml"
             "<!-- LUMEN_VDD_FEATURE_START -->"
             "<!-- LUMEN_VDD_FEATURE_END -->")
     lumen_remove_marked_wix_block(
-            "${WIX_BUILD_PARENT_DIRECTORY}/sunshine-installer.wxs"
+            "${WIX_BUILD_PARENT_DIRECTORY}/lumen-installer.wxs"
             "<!-- LUMEN_VDD_FEATURE_START -->"
             "<!-- LUMEN_VDD_FEATURE_END -->")
 endif()
 
 set(CPACK_WIX_EXTRA_SOURCES
-        "${WIX_BUILD_PARENT_DIRECTORY}/sunshine-installer.wxs"
+        "${WIX_BUILD_PARENT_DIRECTORY}/lumen-installer.wxs"
 )
 set(CPACK_WIX_PATCH_FILE
         "${WIX_BUILD_PARENT_DIRECTORY}/patch.xml"

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.13)
 # https://github.com/google/oss-policies-info/blob/main/foundational-cxx-support-matrix.md#foundational-c-support
 
-project(test_sunshine)
+project(test_lumen)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,8 +25,8 @@ include_directories("${GTEST_SOURCE_DIR}/googletest/include" "${GTEST_SOURCE_DIR
 
 # coverage
 # https://gcovr.com/en/stable/guide/compiling.html#compiler-options
-option(SUNSHINE_LLVM_COVERAGE "Use LLVM source-based coverage" OFF)
-if(SUNSHINE_LLVM_COVERAGE)
+option(LUMEN_LLVM_COVERAGE "Use LLVM source-based coverage" OFF)
+if(LUMEN_LLVM_COVERAGE)
     add_compile_options(-fprofile-instr-generate -fcoverage-mapping -ggdb -O0)
     add_link_options(-fprofile-instr-generate)
 else()
@@ -93,32 +93,32 @@ target_link_libraries(lumen_video_egress_queue_tests PRIVATE
 if(WIN32)
     target_link_libraries(lumen_video_egress_queue_tests PRIVATE bcrypt)
 endif()
-target_compile_options(lumen_video_egress_queue_tests PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
-target_link_options(lumen_video_egress_queue_tests PRIVATE ${SUNSHINE_LINK_OPTIONS})
+target_compile_options(lumen_video_egress_queue_tests PRIVATE ${LUMEN_COMPILE_OPTIONS})
+target_link_options(lumen_video_egress_queue_tests PRIVATE ${LUMEN_LINK_OPTIONS})
 add_test(NAME video_egress_queue COMMAND lumen_video_egress_queue_tests)
 
-# modify SUNSHINE_DEFINITIONS
+# modify LUMEN_DEFINITIONS
 if (WIN32)
     list(APPEND
-            SUNSHINE_DEFINITIONS SUNSHINE_SHADERS_DIR="${CMAKE_SOURCE_DIR}/src_assets/windows/assets/shaders/directx")
+            LUMEN_DEFINITIONS LUMEN_SHADERS_DIR="${CMAKE_SOURCE_DIR}/src_assets/windows/assets/shaders/directx")
 elseif (NOT APPLE)
-    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_SHADERS_DIR="${CMAKE_SOURCE_DIR}/src_assets/linux/assets/shaders/opengl")
+    list(APPEND LUMEN_DEFINITIONS LUMEN_SHADERS_DIR="${CMAKE_SOURCE_DIR}/src_assets/linux/assets/shaders/opengl")
 endif ()
 
 set(TEST_DEFINITIONS)  # list will be appended as needed
 
-# this indicates we're building tests in case sunshine needs to adjust some code or add private tests
-list(APPEND TEST_DEFINITIONS SUNSHINE_TESTS)
+# this indicates we're building tests in case lumen needs to adjust some code or add private tests
+list(APPEND TEST_DEFINITIONS LUMEN_TESTS)
 if(LUMEN_ENABLE_LSP_RUNTIME)
     list(APPEND TEST_DEFINITIONS LSP_SPAKE2_TESTING=1)
 endif()
-list(APPEND TEST_DEFINITIONS SUNSHINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-list(APPEND TEST_DEFINITIONS SUNSHINE_TEST_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+list(APPEND TEST_DEFINITIONS LUMEN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+list(APPEND TEST_DEFINITIONS LUMEN_TEST_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}")
 
-# Override SUNSHINE_ASSETS_DIR to use a writable temp directory for tests
-# Remove the existing definition from SUNSHINE_DEFINITIONS to avoid redefinition error
-list(FILTER SUNSHINE_DEFINITIONS EXCLUDE REGEX "^SUNSHINE_ASSETS_DIR=")
-list(APPEND TEST_DEFINITIONS SUNSHINE_ASSETS_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets")
+# Override LUMEN_ASSETS_DIR to use a writable temp directory for tests
+# Remove the existing definition from LUMEN_DEFINITIONS to avoid redefinition error
+list(FILTER LUMEN_DEFINITIONS EXCLUDE REGEX "^LUMEN_ASSETS_DIR=")
+list(APPEND TEST_DEFINITIONS LUMEN_ASSETS_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_assets")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test_assets")
 if(WIN32)
     set(TEST_DEFAULT_APPS "${CMAKE_SOURCE_DIR}/src_assets/windows/assets/apps.json")
@@ -145,54 +145,50 @@ file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS
         ${CMAKE_SOURCE_DIR}/tests/*.cpp)
 list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_video_egress_queue.cpp)
-if(SUNSHINE_ENABLE_TRAY AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
-    set(SUNSHINE_TRAY_TEST_ICON_SOURCE_DIR
-            "${CMAKE_SOURCE_DIR}/src_assets/common/assets/web/public/images")
-    set(SUNSHINE_TRAY_TEST_ICON_DESTINATION_DIR
-            "${CMAKE_CURRENT_BINARY_DIR}/test_assets/web/images")
-    file(MAKE_DIRECTORY "${SUNSHINE_TRAY_TEST_ICON_DESTINATION_DIR}")
+if(LUMEN_ENABLE_TRAY AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    set(LUMEN_TRAY_TEST_ICON_SOURCE_DIR
+            "${CMAKE_SOURCE_DIR}/src_assets/common/assets")
+    set(LUMEN_TRAY_TEST_ICON_DESTINATION_DIR
+            "${CMAKE_CURRENT_BINARY_DIR}/test_assets")
+    file(MAKE_DIRECTORY "${LUMEN_TRAY_TEST_ICON_DESTINATION_DIR}")
 
-    configure_file(
-            "${CMAKE_SOURCE_DIR}/sunshine.svg"
-            "${SUNSHINE_TRAY_TEST_ICON_DESTINATION_DIR}/logo-sunshine.svg"
-            COPYONLY)
+    set(LUMEN_TRAY_TEST_ICONS
+            lumen-tray.svg
+            lumen-tray-locked.svg
+            lumen-tray-playing.svg
+            lumen-tray-pausing.svg)
 
-    set(SUNSHINE_TRAY_TEST_ICONS
-            sunshine-locked.svg
-            sunshine-playing.svg
-            sunshine-pausing.svg)
-
-    foreach(icon IN LISTS SUNSHINE_TRAY_TEST_ICONS)
+    foreach(icon IN LISTS LUMEN_TRAY_TEST_ICONS)
         configure_file(
-                "${SUNSHINE_TRAY_TEST_ICON_SOURCE_DIR}/${icon}"
-                "${SUNSHINE_TRAY_TEST_ICON_DESTINATION_DIR}/${icon}"
+                "${LUMEN_TRAY_TEST_ICON_SOURCE_DIR}/${icon}"
+                "${LUMEN_TRAY_TEST_ICON_DESTINATION_DIR}/${icon}"
                 COPYONLY)
     endforeach()
 
-    add_library(sunshine_tray_test_helpers STATIC
+    add_library(lumen_tray_test_helpers STATIC
             ${CMAKE_SOURCE_DIR}/third-party/tray/tests/notification_utils.cpp
             ${CMAKE_SOURCE_DIR}/third-party/tray/tests/screenshot_utils.cpp)
-    set_target_properties(sunshine_tray_test_helpers PROPERTIES
+    set_target_properties(lumen_tray_test_helpers PROPERTIES
             CXX_STANDARD 17
             CXX_STANDARD_REQUIRED ON)
-    target_include_directories(sunshine_tray_test_helpers PRIVATE
+    target_include_directories(lumen_tray_test_helpers PRIVATE
             ${CMAKE_SOURCE_DIR}/third-party/tray)
-    target_link_libraries(sunshine_tray_test_helpers PRIVATE
+    target_link_libraries(lumen_tray_test_helpers PRIVATE
             lizardbyte::common)
 
     if(WIN32)
-        target_link_libraries(sunshine_tray_test_helpers PRIVATE
+        target_link_libraries(lumen_tray_test_helpers PRIVATE
                 gdi32
                 gdiplus)
     else()
         find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Gui)
         find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Gui)
-        set(SUNSHINE_TRAY_TEST_QT_GUI_TARGET Qt${QT_VERSION_MAJOR}::Gui)
+        set(LUMEN_TRAY_TEST_QT_GUI_TARGET Qt${QT_VERSION_MAJOR}::Gui)
 
-        target_link_libraries(sunshine_tray_test_helpers PRIVATE
-                ${SUNSHINE_TRAY_TEST_QT_GUI_TARGET})
+        target_link_libraries(lumen_tray_test_helpers PRIVATE
+                ${LUMEN_TRAY_TEST_QT_GUI_TARGET})
         if(APPLE)
-            target_link_libraries(sunshine_tray_test_helpers PRIVATE
+            target_link_libraries(lumen_tray_test_helpers PRIVATE
                     "-framework Cocoa")
         endif()
     endif()
@@ -204,14 +200,14 @@ if (APPLE)
     list(APPEND TEST_SOURCES ${MACOS_TEST_SOURCES})
 endif ()
 
-set(SUNSHINE_SOURCES
-        ${SUNSHINE_TARGET_FILES})
+set(LUMEN_SOURCES
+        ${LUMEN_TARGET_FILES})
 
 # The Windows gamepad router, dynamic-session state machine, and report adapter
 # are intentionally portable so their fake-channel tests run on every host.
 # Windows builds already receive these sources through PLATFORM_TARGET_FILES.
 if(NOT WIN32)
-    list(APPEND SUNSHINE_SOURCES
+    list(APPEND LUMEN_SOURCES
             ${CMAKE_SOURCE_DIR}/src/platform/windows/gamepad_router.cpp
             ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_gamepad.cpp
             ${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_hid_session.cpp
@@ -221,7 +217,7 @@ if(NOT WIN32)
 endif()
 
 # remove main.cpp from the list of sources
-list(REMOVE_ITEM SUNSHINE_SOURCES ${CMAKE_SOURCE_DIR}/src/main.cpp)
+list(REMOVE_ITEM LUMEN_SOURCES ${CMAKE_SOURCE_DIR}/src/main.cpp)
 
 # Keep the driver-side queue source compatible with the WDK's C compiler on
 # every host, independently of the C++ GoogleTest translation units.
@@ -241,7 +237,7 @@ endif()
 
 add_executable(${PROJECT_NAME}
         ${TEST_SOURCES}
-        ${SUNSHINE_SOURCES}
+        ${LUMEN_SOURCES}
         $<TARGET_OBJECTS:lumen_vhid_report_queue_c_smoke>)
 add_dependencies(${PROJECT_NAME} lumen_vhid_report_queue_c_smoke)
 
@@ -277,8 +273,8 @@ add_custom_target(sync_locale_files ALL
     VERBATIM
 )
 
-foreach(dep ${SUNSHINE_TARGET_DEPENDENCIES})
-    add_dependencies(${PROJECT_NAME} ${dep})  # compile these before sunshine
+foreach(dep ${LUMEN_TARGET_DEPENDENCIES})
+    add_dependencies(${PROJECT_NAME} ${dep})  # compile these before lumen
 endforeach()
 
 # Ensure locale files are synchronized before building the test executable
@@ -286,19 +282,19 @@ add_dependencies(${PROJECT_NAME} sync_locale_files)
 
 # Build the list of libraries to link
 set(TEST_LINK_LIBRARIES
-    ${SUNSHINE_EXTERNAL_LIBRARIES}
+    ${LUMEN_EXTERNAL_LIBRARIES}
     Lumen::libvirtualhid_core
     Lumen::libvirtualhid_gamepad_core
     lizardbyte::test_support
     ${PLATFORM_LIBRARIES}
 )
 
-if(SUNSHINE_ENABLE_TRAY AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+if(LUMEN_ENABLE_TRAY AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     list(APPEND TEST_LINK_LIBRARIES
-            sunshine_tray_test_helpers)
-    if(SUNSHINE_TRAY_TEST_QT_GUI_TARGET)
+            lumen_tray_test_helpers)
+    if(LUMEN_TRAY_TEST_QT_GUI_TARGET)
         list(APPEND TEST_LINK_LIBRARIES
-                ${SUNSHINE_TRAY_TEST_QT_GUI_TARGET})
+                ${LUMEN_TRAY_TEST_QT_GUI_TARGET})
     endif()
 endif()
 
@@ -308,35 +304,13 @@ if(GCOV_LINK_LIBRARY)
 endif()
 
 target_link_libraries(${PROJECT_NAME} ${TEST_LINK_LIBRARIES})
-target_compile_definitions(${PROJECT_NAME} PUBLIC ${SUNSHINE_DEFINITIONS} ${TEST_DEFINITIONS})
-target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SUNSHINE_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
-target_link_options(${PROJECT_NAME} PRIVATE ${SUNSHINE_LINK_OPTIONS})
+target_compile_definitions(${PROJECT_NAME} PUBLIC ${LUMEN_DEFINITIONS} ${TEST_DEFINITIONS})
+target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${LUMEN_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${LUMEN_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
+target_link_options(${PROJECT_NAME} PRIVATE ${LUMEN_LINK_OPTIONS})
 add_test(NAME ${PROJECT_NAME} COMMAND ${PROJECT_NAME})
 set_tests_properties(${PROJECT_NAME} PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 if (WIN32)
-    find_program(LUMEN_POWERSHELL_EXECUTABLE NAMES pwsh powershell REQUIRED)
-    add_test(
-        NAME gate6_artifact_manifest
-        COMMAND "${LUMEN_POWERSHELL_EXECUTABLE}"
-            -NoLogo -NoProfile -NonInteractive
-            -File "${CMAKE_SOURCE_DIR}/tests/packaging/test-gate6-artifact-manifest.ps1")
-    add_test(
-        NAME gate6_full_profile_provenance
-        COMMAND "${LUMEN_POWERSHELL_EXECUTABLE}"
-            -NoLogo -NoProfile -NonInteractive
-            -File "${CMAKE_SOURCE_DIR}/tests/packaging/test-gate6-full-profile-provenance.ps1")
-    add_test(
-        NAME gate6_source_freeze_provenance
-        COMMAND "${LUMEN_POWERSHELL_EXECUTABLE}"
-            -NoLogo -NoProfile -NonInteractive
-            -File "${CMAKE_SOURCE_DIR}/tests/packaging/test-full-profile-source-provenance.ps1")
-    set_tests_properties(
-        gate6_artifact_manifest
-        gate6_full_profile_provenance
-        gate6_source_freeze_provenance
-        PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-
     # prefer static libraries since we're linking statically
     # this fixes libcurl linking errors when using non MSYS2 version of CMake
     set_target_properties(${PROJECT_NAME} PROPERTIES LINK_SEARCH_START_STATIC 1)

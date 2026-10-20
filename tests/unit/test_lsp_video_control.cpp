@@ -163,6 +163,7 @@ TEST(LspVideoControlWire, DecodesExactSixteenKeyStartWithEighteenKeyVideoOffers)
                           {14, 3U},
                           {15, 1U},
                           {16, capture_to_present},
+                          {17, 0U},
                         }})
       .bytes;
   };

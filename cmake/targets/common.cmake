@@ -1,13 +1,13 @@
 # common target definitions
 # this file will also load platform specific macros
 
-if(APPLE AND NOT SUNSHINE_BUILD_HOMEBREW)
-    add_executable(sunshine MACOSX_BUNDLE ${SUNSHINE_TARGET_FILES})
+if(APPLE AND NOT LUMEN_BUILD_HOMEBREW)
+    add_executable(lumen MACOSX_BUNDLE ${LUMEN_TARGET_FILES})
 else()
-    add_executable(sunshine ${SUNSHINE_TARGET_FILES})
+    add_executable(lumen ${LUMEN_TARGET_FILES})
 endif()
-foreach(dep ${SUNSHINE_TARGET_DEPENDENCIES})
-    add_dependencies(sunshine ${dep})  # compile these before sunshine
+foreach(dep ${LUMEN_TARGET_DEPENDENCIES})
+    add_dependencies(lumen ${dep})  # compile these before lumen
 endforeach()
 
 # platform specific target definitions
@@ -23,26 +23,26 @@ elseif(UNIX)
     endif()
 endif()
 
-target_link_libraries(sunshine ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
-target_compile_definitions(sunshine PUBLIC ${SUNSHINE_DEFINITIONS})
+target_link_libraries(lumen ${LUMEN_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
+target_compile_definitions(lumen PUBLIC ${LUMEN_DEFINITIONS})
 
 # CLion complains about unknown flags after running cmake, and cannot add symbols to the index for cuda files
 if(CUDA_INHERIT_COMPILE_OPTIONS)
-    foreach(flag IN LISTS SUNSHINE_COMPILE_OPTIONS)
-        list(APPEND SUNSHINE_COMPILE_OPTIONS_CUDA "$<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=${flag}>")
+    foreach(flag IN LISTS LUMEN_COMPILE_OPTIONS)
+        list(APPEND LUMEN_COMPILE_OPTIONS_CUDA "$<$<COMPILE_LANGUAGE:CUDA>:--compiler-options=${flag}>")
     endforeach()
 endif()
 
-target_compile_options(sunshine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SUNSHINE_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
-target_link_options(sunshine PRIVATE ${SUNSHINE_LINK_OPTIONS})
+target_compile_options(lumen PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${LUMEN_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${LUMEN_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
+target_link_options(lumen PRIVATE ${LUMEN_LINK_OPTIONS})
 
 # Homebrew build fails the vite build if we set these environment variables
-if(${SUNSHINE_BUILD_HOMEBREW})
+if(${LUMEN_BUILD_HOMEBREW})
     set(NPM_SOURCE_ASSETS_DIR "")
     set(NPM_ASSETS_DIR "")
     set(NPM_BUILD_HOMEBREW "true")
 else()
-    set(NPM_SOURCE_ASSETS_DIR ${SUNSHINE_SOURCE_ASSETS_DIR})
+    set(NPM_SOURCE_ASSETS_DIR ${LUMEN_SOURCE_ASSETS_DIR})
     set(NPM_ASSETS_DIR ${CMAKE_BINARY_DIR})
     set(NPM_BUILD_HOMEBREW "")
 endif()
@@ -59,7 +59,7 @@ add_custom_target(web-ui ALL
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "Installing NPM Dependencies and Building the Web UI"
         COMMAND "$<$<BOOL:${WIN32}>:cmd;/C>" "${NPM}" ci ${NPM_INSTALL_FLAGS}
-        COMMAND "${CMAKE_COMMAND}" -E env "SUNSHINE_BUILD_HOMEBREW=${NPM_BUILD_HOMEBREW}" "SUNSHINE_SOURCE_ASSETS_DIR=${NPM_SOURCE_ASSETS_DIR}" "SUNSHINE_ASSETS_DIR=${NPM_ASSETS_DIR}" "$<$<BOOL:${WIN32}>:cmd;/C>" "${NPM}" run build  # cmake-lint: disable=C0301
+        COMMAND "${CMAKE_COMMAND}" -E env "LUMEN_BUILD_HOMEBREW=${NPM_BUILD_HOMEBREW}" "LUMEN_SOURCE_ASSETS_DIR=${NPM_SOURCE_ASSETS_DIR}" "LUMEN_ASSETS_DIR=${NPM_ASSETS_DIR}" "$<$<BOOL:${WIN32}>:cmd;/C>" "${NPM}" run build  # cmake-lint: disable=C0301
         COMMAND_EXPAND_LISTS
         VERBATIM)
 

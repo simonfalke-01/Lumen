@@ -91,6 +91,7 @@ namespace lumen::lsp::runtime {
     PermissionSet permissions {};  ///< Current effective permissions.
     std::uint32_t revocation_generation {};  ///< Current trust generation.
     bool enabled {};  ///< Whether new authentication is allowed.
+    std::string name;  ///< Display name, empty for clients paired before names were stored.
   };
 
   /** @brief Terminal state of the most recent reconnect or planned-rekey attempt. */
@@ -279,6 +280,9 @@ namespace lumen::lsp::runtime {
     /** @brief Cancel every pending LSP PIN pairing session. */
     virtual void cancel_pairings() noexcept = 0;
 
+    /** @brief Cancel one pending LSP PIN pairing session. */
+    virtual bool cancel_pairing(const Identifier128 &pairing_session_id) noexcept = 0;
+
     /** @brief Return every persisted LSP trusted client without public keys or secrets. */
     [[nodiscard]] virtual std::vector<TrustedClientSummary> trusted_clients() noexcept = 0;
 
@@ -302,6 +306,9 @@ namespace lumen::lsp::runtime {
      * @return True only after persistent removal.
      */
     virtual bool revoke_trusted_client(const Identifier128 &client_id) noexcept = 0;
+
+    /** @brief Persist a new display name for one trusted client. */
+    virtual bool rename_trusted_client(const Identifier128 &client_id, std::string_view name) noexcept = 0;
 
     /** @brief Run one complete administrative certificate rotation transaction. */
     virtual IdentityRotationResult rotate_identity() noexcept = 0;
@@ -343,11 +350,17 @@ namespace lumen::lsp::runtime {
   /** @brief Cancel every process-runtime pending PIN session. */
   void administration_cancel_pairings();
 
+  /** @brief Cancel one process-runtime pending PIN session. */
+  bool administration_cancel_pairing(const Identifier128 &pairing_session_id);
+
   /** @brief Update one process-runtime trusted client. */
   bool administration_update_trusted_client(const Identifier128 &client_id, PermissionSet permissions, bool enabled);
 
   /** @brief Revoke one process-runtime trusted client. */
   bool administration_revoke_trusted_client(const Identifier128 &client_id);
+
+  /** @brief Rename one process-runtime trusted client. */
+  bool administration_rename_trusted_client(const Identifier128 &client_id, std::string_view name);
 
   /** @brief Rotate the process runtime's certificate through the authenticated transaction. */
   IdentityRotationResult administration_rotate_identity();

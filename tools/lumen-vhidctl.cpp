@@ -1257,7 +1257,7 @@ namespace {
     return static_cast<int>(exit_code::success);
   }
 
-  /** Probe the SYSTEM-only control interface using Sunshine's exact GET_INFO ABI. */
+  /** Probe the SYSTEM-only control interface using Lumen's exact GET_INFO ABI. */
   int probe(bool json) {
     const probe_result result = query_protocol();
 

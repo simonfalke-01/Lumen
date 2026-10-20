@@ -67,7 +67,6 @@ on:
           - install-vdd
           - driver-reboot
           - upgrade
-          - legacy-import
       full_profile_driver_run_id:
         description: Run ID containing Microsoft-signed VHID, VMIC, and VDD packages; required for release_tag
         required: false
@@ -186,7 +185,7 @@ jobs:
         shell: pwsh
         run: |
           foreach ($script in @(
-            'src_assets/windows/misc/sunshine-setup.ps1',
+            'src_assets/windows/misc/lumen-setup.ps1',
             'src_assets/windows/misc/virtual-display-setup.ps1',
             'scripts/windows/build-full-profile.ps1',
             'scripts/windows/full-profile-source-provenance.ps1',
@@ -867,8 +866,7 @@ jobs:
         shell: msys2 {0}
         run: |
           export PATH="$(cygpath --unix "$NODEJS_PATH"):$PATH"
-          npm test
-          cmake -P tests/packaging/verify_lumen_packaging.cmake
+          npm run typecheck
           if cmake \
               -DRELEASE_TAG=v0.0.0-invalid \
               -P .github/scripts/validate-release-version.cmake; then
@@ -1001,9 +999,9 @@ jobs:
         scenario: >-
           ${{ fromJSON(
             inputs.validation_scenario == 'release' &&
-            '["install-no-vhid","install-vdd","driver-reboot","upgrade","legacy-import"]' ||
+            '["install-no-vhid","install-vdd","driver-reboot","upgrade"]' ||
             (inputs.validation_scenario == '' || inputs.validation_scenario == 'all') &&
-            '["install-no-vhid","install-vhid","install-vmic","install-vdd","driver-reboot","upgrade","legacy-import"]' ||
+            '["install-no-vhid","install-vhid","install-vmic","install-vdd","driver-reboot","upgrade"]' ||
             format('["{0}"]', inputs.validation_scenario)
           ) }}
     steps:

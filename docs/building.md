@@ -194,7 +194,7 @@ Static Qt is enabled by default on Windows. Lumen automatically adds the MSYS2 s
 derives the same prefix from the selected compiler. If static Qt is installed in a custom location, specify it with
 `-DCMAKE_PREFIX_PATH=/path/to/qt6-static`.
 
-To use dynamic Qt instead, configure with `-DSUNSHINE_USE_STATIC_QT=OFF` and ensure the dynamic Qt package is
+To use dynamic Qt instead, configure with `-DLUMEN_USE_STATIC_QT=OFF` and ensure the dynamic Qt package is
 available through the normal toolchain prefix.
 
 To create a WiX installer, you also need to install [.NET](https://dotnet.microsoft.com/download).
@@ -220,11 +220,11 @@ msbuild src\platform\windows\virtual_hid_driver\LumenVirtualHid.vcxproj /m /t:Bu
 The default build output is
 `src/platform/windows/virtual_hid_driver/build/x64/Release/package`. The regular CMake build does not build or sign the
 driver. To include it in an installer, supply its package directory with
-`SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR`. Omitting that option produces a package without the Virtual HID driver;
+`LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR`. Omitting that option produces a package without the Virtual HID driver;
 Lumen remains usable with `windows_input_backend = sendinput`, and Xbox 360 gamepads remain available through ViGEm.
 
 A Lumen Windows package contains the x64 `LumenVirtualHid.inf`, `LumenVirtualHid.cat`, `LumenVirtualHid.dll`, and
-a bundled `.cer` file when configured with `SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON`. Setup trusts only that
+a bundled `.cer` file when configured with `LUMEN_VIRTUAL_HID_BUNDLED_CERTIFICATE=ON`. Setup trusts only that
 certificate. A committed upgrade replaces only the recorded prior Lumen signer, and a committed uninstall removes
 only the recorded thumbprint. The MSI exposes one optional **Lumen Virtual Input** feature for the entire driver; it
 does not install libvirtualhid's broker, service, installer, or licensing UI. Users can deselect this feature and use
@@ -257,7 +257,7 @@ msbuild src\platform\windows\virtual_microphone_driver\LumenVirtualMicrophone.vc
 
 The driver project stages `LumenVirtualMicrophone.inf`, `LumenVirtualMicrophone.sys`, and
 `LumenVirtualMicrophone.cat`. Pass that directory to CMake with
-`-DSUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR=<package-directory>`. The packager rejects extra files, missing
+`-DLUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR=<package-directory>`. The packager rejects extra files, missing
 files, a non-AMD64 target, or an INF without the exact `ROOT\LumenVirtualMicrophone` identity. The MSI exposes the
 package as the optional, default-off **Client Microphone Passthrough** feature. Lite ZIP packages exclude both the
 driver and `lumen-vmicctl.exe`. Automated tagged builds omit this optional driver until the production driver pipeline
@@ -269,7 +269,7 @@ The repository contains an x64 UMDF2 indirect-display driver under
 `src/platform/windows/virtual_display_driver`. The regular CMake build does not
 build it. A Windows MSI includes and selects the VDD component by default only
 when CMake receives an exact signed package through
-`SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR`; an MSI built without that
+`LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR`; an MSI built without that
 payload has no VDD feature to select. Lite ZIP packages always exclude the
 driver and continue to use the existing DDA/WGC capture paths.
 

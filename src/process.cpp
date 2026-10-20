@@ -5,6 +5,7 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <iomanip>
@@ -139,33 +140,20 @@ namespace proc {
     env["LUMEN_CLIENT_HOST_AUDIO"] = launch_session.host_audio ? "true" : "false";
     env["LUMEN_CLIENT_ENABLE_SOPS"] = launch_session.enable_sops ? "true" : "false";
 
-    env["SUNSHINE_APP_ID"] = std::to_string(app_id);
-    env["SUNSHINE_APP_NAME"] = std::string {app_name};
-    env["SUNSHINE_CLIENT_WIDTH"] = std::to_string(launch_session.width);
-    env["SUNSHINE_CLIENT_HEIGHT"] = std::to_string(launch_session.height);
-    env["SUNSHINE_CLIENT_FPS"] = std::to_string(launch_session.fps);
-    env["SUNSHINE_CLIENT_HDR"] = launch_session.enable_hdr ? "true" : "false";
-    env["SUNSHINE_CLIENT_GCMAP"] = std::to_string(launch_session.gcmap);
-    env["SUNSHINE_CLIENT_HOST_AUDIO"] = launch_session.host_audio ? "true" : "false";
-    env["SUNSHINE_CLIENT_ENABLE_SOPS"] = launch_session.enable_sops ? "true" : "false";
 
     const auto channel_count = launch_session.surround_info & 65535;
     switch (channel_count) {
       case 2:
         env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "2.0";
-        env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "2.0";
         break;
       case 6:
         env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "5.1";
-        env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "5.1";
         break;
       case 8:
         env["LUMEN_CLIENT_AUDIO_CONFIGURATION"] = "7.1";
-        env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "7.1";
         break;
     }
     env["LUMEN_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session.surround_params;
-    env["SUNSHINE_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session.surround_params;
   }
 
   bool lsp_launch_request_t::valid() const noexcept {
@@ -334,11 +322,12 @@ namespace proc {
     (*_lifecycle)->legacy_attachable = !launch_session->client_cert.empty();
 
     _app_id = app_id;
+    _app_started_at = std::chrono::system_clock::now();
     _app = *iter;
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
 
-    // LUMEN_* carries exact modern values while SUNSHINE_* retains the legacy shape.
+    // LUMEN_* carries exact modern values while LUMEN_* retains the legacy shape.
     clear_lsp_launch_environment(_env);
     apply_launch_environment(_env, _app_id, _app.name, *launch_session);
     if (lsp_request != nullptr) {
@@ -383,7 +372,7 @@ namespace proc {
       if (ec) {
         BOOST_LOG(error) << "Couldn't run ["sv << cmd.do_cmd << "]: System: "sv << ec.message();
         // We don't want any prep commands failing launch of the desktop.
-        // This is to prevent the issue where users reboot their PC and need to log in with Sunshine.
+        // This is to prevent the issue where users reboot their PC and need to log in with Lumen.
         // permission_denied is typically returned when the user impersonation fails, which can happen when user is not signed in yet.
         if (!(_app.cmd.empty() && ec == std::errc::permission_denied)) {
           return -1;
@@ -640,7 +629,7 @@ namespace proc {
     // Only show the Stopped notification if we actually have an app to stop
     // Since terminate() is always run when a new app has started
     if (proc::proc.get_last_run_app_name().length() > 0 && has_run) {
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined LUMEN_TRAY && LUMEN_TRAY >= 1
       system_tray::update_tray_stopped(proc::proc.get_last_run_app_name());
 #endif
 
@@ -674,6 +663,14 @@ namespace proc {
   std::string proc_t::get_last_run_app_name() {
     auto lifecycle = _lifecycle->lock();
     return _app.name;
+  }
+
+  std::optional<std::chrono::system_clock::time_point> proc_t::started_at() {
+    if (running() <= 0) {
+      return std::nullopt;
+    }
+    auto lifecycle = _lifecycle->lock();
+    return _app_started_at;
   }
 
   proc_t::~proc_t() {
@@ -827,7 +824,7 @@ namespace proc {
     }
 
     // check if image is in assets directory
-    if (auto full_image_path = std::filesystem::path(SUNSHINE_ASSETS_DIR) / app_image_path; std::filesystem::exists(full_image_path)) {
+    if (auto full_image_path = std::filesystem::path(LUMEN_ASSETS_DIR) / app_image_path; std::filesystem::exists(full_image_path)) {
       // Validate PNG signature
       if (!check_valid_png(full_image_path)) {
         BOOST_LOG(warning) << "Invalid PNG file at path ["sv << full_image_path << ']';
@@ -838,7 +835,7 @@ namespace proc {
 
     if (app_image_path == "./assets/steam.png") {
       // handle old default steam image definition
-      return SUNSHINE_ASSETS_DIR "/steam.png";
+      return LUMEN_ASSETS_DIR "/steam.png";
     }
 
     // check if specified image exists
@@ -857,6 +854,34 @@ namespace proc {
     // image is a png, and not in assets directory
     // return only "content-type" http header compatible image type
     return app_image_path;
+  }
+
+  app_kind_e app_kind(const ctx_t &app) {
+    const auto launches_steam = [](std::string command) {
+      boost::to_lower(command);
+      return command.find("steam://") != std::string::npos || command.find("steam.exe") != std::string::npos;
+    };
+    if (launches_steam(app.cmd) || std::ranges::any_of(app.detached, launches_steam)) {
+      return app_kind_e::steam;
+    }
+    if (app.cmd.empty() && app.detached.empty()) {
+      return app_kind_e::desktop;
+    }
+    return app_kind_e::app;
+  }
+
+  std::optional<std::string> custom_image_path(const ctx_t &app) {
+    if (app.image_path.empty()) {
+      return std::nullopt;
+    }
+    auto path = validate_app_image_path(app.image_path);
+    std::error_code error;
+    const auto image = std::filesystem::weakly_canonical(path, error);
+    const auto assets = std::filesystem::weakly_canonical(LUMEN_ASSETS_DIR, error);
+    if (error || image.parent_path() == assets) {
+      return std::nullopt;
+    }
+    return path;
   }
 
   /**
@@ -910,6 +935,15 @@ namespace proc {
     boost::crc_32_type result;
     result.process_bytes(input.data(), input.length());
     return result.checksum();
+  }
+
+  bool is_valid_app_id(const std::string_view id) {
+    if (id.empty() || id.size() > 10 || id.front() == '0' || !std::ranges::all_of(id, [](const char c) {
+          return c >= '0' && c <= '9';
+        })) {
+      return false;
+    }
+    return std::stoll(std::string {id}) <= std::numeric_limits<std::int32_t>::max();
   }
 
   std::tuple<std::string, std::string> calculate_app_id(const std::string &app_name, std::string app_image_path, int index) {
@@ -982,8 +1016,8 @@ namespace proc {
 
         std::vector<proc::cmd_t> prep_cmds;
         if (!exclude_global_prep.value_or(false)) {
-          prep_cmds.reserve(config::sunshine.prep_cmds.size());
-          for (auto &prep_cmd : config::sunshine.prep_cmds) {
+          prep_cmds.reserve(config::general.prep_cmds.size());
+          for (auto &prep_cmd : config::general.prep_cmds) {
             auto do_cmd = parse_env_val(this_env, prep_cmd.do_cmd);
             auto undo_cmd = parse_env_val(this_env, prep_cmd.undo_cmd);
 
@@ -1049,8 +1083,12 @@ namespace proc {
         ctx.wait_all = wait_all.value_or(true);
         ctx.exit_timeout = std::chrono::seconds {exit_timeout.value_or(5)};
 
+        // The administration API stores a stable ID with each app; older files derive one.
         auto possible_ids = calculate_app_id(name, ctx.image_path, i++);
-        if (ids.count(std::get<0>(possible_ids)) == 0) {
+        if (const auto stored_id = app_node.get_optional<std::string>("id"s);
+            stored_id && is_valid_app_id(*stored_id) && ids.count(*stored_id) == 0) {
+          ctx.id = *stored_id;
+        } else if (ids.count(std::get<0>(possible_ids)) == 0) {
           // Avoid using index to generate id if possible
           ctx.id = std::get<0>(possible_ids);
         } else {

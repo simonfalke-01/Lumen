@@ -24,7 +24,7 @@
     <ServiceInstall Id="InstallLumen"
                     Name="@LUMEN_WINDOWS_SERVICE_NAME@"
                     DisplayName="Lumen"
-                    Description="Lumen is a self-hosted game stream host for Moonlight."
+                    Description="Lumen is a self-hosted game stream host for the client."
                     Type="ownProcess"
                     Start="auto"
                     ErrorControl="normal"

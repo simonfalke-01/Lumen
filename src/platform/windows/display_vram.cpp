@@ -5,6 +5,7 @@
 // standard includes
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
@@ -12,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 // platform includes
@@ -40,12 +42,12 @@ extern "C" {
 #include "src/video.h"
 #include "utf_utils.h"
 
-#if !defined(SUNSHINE_SHADERS_DIR)  // for testing this needs to be defined in cmake as we don't do an install
+#if !defined(LUMEN_SHADERS_DIR)  // for testing this needs to be defined in cmake as we don't do an install
   /**
-   * @def SUNSHINE_SHADERS_DIR
-   * @brief Macro for SUNSHINE SHADERS DIR.
+   * @def LUMEN_SHADERS_DIR
+   * @brief Macro for LUMEN SHADERS DIR.
    */
-  #define SUNSHINE_SHADERS_DIR SUNSHINE_ASSETS_DIR "/shaders/directx"
+  #define LUMEN_SHADERS_DIR LUMEN_ASSETS_DIR "/shaders/directx"
 #endif
 namespace platf {
   using namespace std::literals;
@@ -228,9 +230,9 @@ namespace platf::dxgi {
     }
 
     /**
-     * @brief Map a Sunshine pixel format to the pure fused-path policy format.
+     * @brief Map a Lumen pixel format to the pure fused-path policy format.
      *
-     * @param format Sunshine encoder input format.
+     * @param format Lumen encoder input format.
      * @return Policy surface format.
      */
     fused_d3d11::surface_format_e fused_surface_format(pix_fmt_e format) {
@@ -1081,7 +1083,7 @@ namespace platf::dxgi {
      *
      * @param colorspace Colorimetry information used for conversion or encoding.
      */
-    void apply_colorspace(const ::video::sunshine_colorspace_t &colorspace) {
+    void apply_colorspace(const ::video::stream_colorspace_t &colorspace) {
       std::unique_lock<std::mutex> context_lock;
       if (fused) {
         context_lock = std::unique_lock(*shared_context_mutex);
@@ -1386,7 +1388,7 @@ namespace platf::dxgi {
      *
      * @param display Display object or identifier associated with the operation.
      * @param adapter_p Adapter p.
-     * @param pix_fmt Sunshine pixel format to convert or allocate for.
+     * @param pix_fmt Lumen pixel format to convert or allocate for.
      * @param use_capture_device Whether conversion reuses the capture D3D11 device and immediate context.
      * @return 0 on success; nonzero or negative platform status on failure.
      */
@@ -1736,7 +1738,7 @@ namespace platf::dxgi {
      *
      * @param display Display object or identifier associated with the operation.
      * @param adapter_p Adapter p.
-     * @param pix_fmt Sunshine pixel format to convert or allocate for.
+     * @param pix_fmt Lumen pixel format to convert or allocate for.
      * @return 0 on success; nonzero or negative platform status on failure.
      */
     int init(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p, pix_fmt_e pix_fmt) {
@@ -1908,7 +1910,7 @@ namespace platf::dxgi {
     bool create_encoder(
       const nvenc::nvenc_config &config,
       const ::video::config_t &client_config,
-      const ::video::sunshine_colorspace_t &colorspace,
+      const ::video::stream_colorspace_t &colorspace,
       platf::pix_fmt_e buffer_format,
       const std::optional<nvenc::hdr_static_metadata_t> &hdr_metadata
     ) override {
@@ -1990,7 +1992,7 @@ namespace platf::dxgi {
      *
      * @param display Display object or identifier associated with the operation.
      * @param adapter_p Adapter p.
-     * @param pix_fmt Sunshine pixel format to convert or allocate for.
+     * @param pix_fmt Lumen pixel format to convert or allocate for.
      * @return True when the D3D11 device resources are initialized.
      */
     bool init_device(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p, pix_fmt_e pix_fmt) {
@@ -2133,7 +2135,7 @@ namespace platf::dxgi {
      * @param colorspace Colorimetry information used for conversion or encoding.
      * @return True when the NVENC encoder initializes for the client configuration.
      */
-    bool init_encoder(const ::video::config_t &client_config, const ::video::sunshine_colorspace_t &colorspace) override {
+    bool init_encoder(const ::video::config_t &client_config, const ::video::stream_colorspace_t &colorspace) override {
       if (!nvenc_d3d) {
         return false;
       }
@@ -2468,7 +2470,7 @@ namespace platf::dxgi {
         } else {
           // ...and we don't need to blend the mouse cursor.
           // This happens when the mouse cursor disappears from screen,
-          // or there's mouse cursor on screen, but its drawing is disabled in sunshine.
+          // or there's mouse cursor on screen, but its drawing is disabled in lumen.
           if (std::holds_alternative<texture2d_t>(last_frame_variant)) {
             // We have the intermediate surface that was used as the mouse cursor blending base.
             // Replace it with an image from pull_free_image_cb copying contents and freeing up the surface memory.
@@ -2989,6 +2991,7 @@ namespace platf::dxgi {
     source_ = config.virtual_display_frame_source;
     direct_required_ = config.virtual_display_direct_required;
     if (!source_ || !source_->healthy()) {
+      BOOST_LOG(error) << "Lumen VDD direct-frame init failed at check 1"sv;
       return -1;
     }
     resources_ = source_->resources();
@@ -2998,6 +3001,7 @@ namespace platf::dxgi {
                                        virtual_display::dynamic_range_e::hdr10 :
                                        virtual_display::dynamic_range_e::sdr)) {
       source_->stop();
+      BOOST_LOG(error) << "Lumen VDD direct-frame init failed at check 2"sv;
       return -1;
     }
 
@@ -3006,6 +3010,7 @@ namespace platf::dxgi {
     auto *native_adapter = static_cast<IDXGIAdapter1 *>(source_->native_adapter());
     if (native_device == nullptr || native_context == nullptr || native_adapter == nullptr) {
       source_->stop();
+      BOOST_LOG(error) << "Lumen VDD direct-frame init failed at check 3"sv;
       return -1;
     }
     native_device->AddRef();
@@ -3015,39 +3020,89 @@ namespace platf::dxgi {
     native_adapter->AddRef();
     adapter.reset(native_adapter);
 
-    factory1_t::pointer factory_raw = nullptr;
-    if (FAILED(CreateDXGIFactory1(IID_IDXGIFactory1, reinterpret_cast<void **>(&factory_raw)))) {
-      source_->stop();
-      return -1;
-    }
-    factory.reset(factory_raw);
-    const auto expected_output = utf_utils::from_utf8(display_name);
-    for (UINT index = 0;; ++index) {
-      output_t::pointer candidate_raw = nullptr;
-      if (adapter->EnumOutputs(index, &candidate_raw) == DXGI_ERROR_NOT_FOUND) {
-        break;
+    // A session restarted while the VDD is still settling (client reconnect) can see its output
+    // missing or at a transient size; wait for it instead of failing over to another display.
+    const auto output_deadline = std::chrono::steady_clock::now() + std::chrono::seconds {3};
+    DXGI_OUTPUT_DESC output_desc {};
+    while (true) {
+      output.reset();
+      factory1_t::pointer factory_raw = nullptr;
+      if (FAILED(CreateDXGIFactory1(IID_IDXGIFactory1, reinterpret_cast<void **>(&factory_raw)))) {
+        source_->stop();
+        BOOST_LOG(error) << "Lumen VDD direct-frame init failed at check 4"sv;
+        return -1;
       }
-      output_t candidate {candidate_raw};
-      DXGI_OUTPUT_DESC description {};
-      if (SUCCEEDED(candidate->GetDesc(&description)) && description.AttachedToDesktop &&
-          expected_output == description.DeviceName) {
-        if (output) {
+      factory.reset(factory_raw);
+      const auto expected_output = utf_utils::from_utf8(display_name);
+      std::string seen_outputs;
+      // The indirect display's output can be listed under a different adapter than the
+      // one rendering its frames (hybrid iGPU/dGPU laptops). Frames come from the source;
+      // the output only supplies desktop placement, so search the render adapter first,
+      // then every adapter.
+      const auto find_output_on = [&](IDXGIAdapter1 *search_adapter) -> int {
+        for (UINT index = 0;; ++index) {
+          output_t::pointer candidate_raw = nullptr;
+          if (search_adapter->EnumOutputs(index, &candidate_raw) == DXGI_ERROR_NOT_FOUND) {
+            break;
+          }
+          output_t candidate {candidate_raw};
+          DXGI_OUTPUT_DESC description {};
+          if (FAILED(candidate->GetDesc(&description))) {
+            continue;
+          }
+          seen_outputs += utf_utils::to_utf8(description.DeviceName);
+          seen_outputs += description.AttachedToDesktop ? "(attached) "s : "(detached) "s;
+          // The virtual-display session may not name its output; the frame source's own
+          // render adapter then identifies it.
+          if (description.AttachedToDesktop &&
+              (expected_output.empty() ? search_adapter == adapter.get() : expected_output == description.DeviceName)) {
+            if (output) {
+              return -1;
+            }
+            output = std::move(candidate);
+          }
+        }
+        return 0;
+      };
+      if (find_output_on(adapter.get()) != 0) {
+        source_->stop();
+        BOOST_LOG(error) << "Lumen VDD direct-frame init failed at check 5"sv;
+        return -1;
+      }
+      for (UINT adapter_index = 0; !output; ++adapter_index) {
+        adapter_t::pointer other_raw = nullptr;
+        if (factory->EnumAdapters1(adapter_index, &other_raw) == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        adapter_t other {other_raw};
+        if (find_output_on(other.get()) != 0) {
           source_->stop();
+          BOOST_LOG(error) << "Lumen VDD direct-frame init failed at check 5"sv;
           return -1;
         }
-        output = std::move(candidate);
       }
-    }
-    if (!output) {
-      source_->stop();
-      return -1;
-    }
-    DXGI_OUTPUT_DESC output_desc {};
-    if (FAILED(output->GetDesc(&output_desc)) ||
-        output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left != config.width ||
-        output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top != config.height) {
-      source_->stop();
-      return -1;
+      output_desc = {};
+      const bool output_ready = output && SUCCEEDED(output->GetDesc(&output_desc)) &&
+                                output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left == config.width &&
+                                output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top == config.height;
+      if (output_ready) {
+        break;
+      }
+      // Only a named VDD output can be settling; an unnamed lookup (codec prewarm) fails fast.
+      if (expected_output.empty() || std::chrono::steady_clock::now() >= output_deadline) {
+        source_->stop();
+        if (!output) {
+          BOOST_LOG(error) << "Lumen VDD direct-frame init failed at check 6: expected output ["sv << display_name
+                           << "], saw: "sv << seen_outputs;
+        } else {
+          BOOST_LOG(error) << "Lumen VDD direct-frame init failed at check 7: output is "sv
+                           << (output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left) << "x"sv
+                           << (output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top) << ", expected "sv
+                           << config.width << "x"sv << config.height;
+        }
+        return -1;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds {100});
     }
 
     width = config.width;
@@ -3505,12 +3560,12 @@ namespace platf::dxgi {
 
 #ifndef DOXYGEN
   #define compile_vertex_shader_helper(x) \
-    if (!(x##_hlsl = compile_vertex_shader(SUNSHINE_SHADERS_DIR "/" #x ".hlsl"))) \
+    if (!(x##_hlsl = compile_vertex_shader(LUMEN_SHADERS_DIR "/" #x ".hlsl"))) \
       return -1;
 #endif
 #ifndef DOXYGEN
   #define compile_pixel_shader_helper(x) \
-    if (!(x##_hlsl = compile_pixel_shader(SUNSHINE_SHADERS_DIR "/" #x ".hlsl"))) \
+    if (!(x##_hlsl = compile_pixel_shader(LUMEN_SHADERS_DIR "/" #x ".hlsl"))) \
       return -1;
 #endif
 

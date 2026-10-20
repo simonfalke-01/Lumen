@@ -309,9 +309,9 @@ namespace platf::win_input {
     }
 
     /**
-     * @brief Map a Moonlight mouse button constant to its HID report bit.
+     * @brief Map a GameStream mouse button constant to its HID report bit.
      *
-     * @param button Moonlight mouse button constant.
+     * @param button GameStream mouse button constant.
      * @return HID button bit, or zero when invalid.
      */
     constexpr std::uint8_t mouse_button_bit(int button) noexcept {
@@ -334,7 +334,7 @@ namespace platf::win_input {
     /**
      * @brief Build the stable identity of one keyboard transition stream.
      * @param modcode Windows virtual-key code.
-     * @param flags Moonlight keyboard packet flags.
+     * @param flags GameStream keyboard packet flags.
      * @return Key identity preserving both the code and mapping mode.
      */
     constexpr std::uint32_t key_transition_id(std::uint16_t modcode, std::uint8_t flags) noexcept {
@@ -352,7 +352,7 @@ namespace platf::win_input {
         return std::nullopt;
       }
       const auto clamped = std::clamp(static_cast<double>(coordinate), 0.0, static_cast<double>(extent));
-      return static_cast<std::uint16_t>(std::lround(clamped * (65535.0 / static_cast<double>(extent))));
+      return static_cast<std::uint16_t>(std::lround(clamped * (32767.0 / static_cast<double>(extent))));
     }
   }  // namespace
 

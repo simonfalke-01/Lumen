@@ -99,7 +99,7 @@ namespace input {
    */
   void stop_lsp_platform_input_feedback(lsp_platform_input_t &input) noexcept;
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   namespace detail {
     /** @brief Inject one platform feedback value into the production queue for lifetime testing. */
     bool raise_lsp_platform_feedback_for_test(
@@ -378,7 +378,7 @@ namespace input {
    * @brief Internal input helpers exposed for focused unit testing.
    */
   namespace detail {
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     /** @brief Run one packet through the production checked dispatcher for focused tests. */
     bool passthrough_packet_for_test(input_t *input, std::vector<std::uint8_t> packet);
 #endif
@@ -458,7 +458,7 @@ namespace input {
      */
     bool checked_add_int16(std::int16_t lhs, std::int16_t rhs, std::int16_t &result);
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     /**
      * @brief Exercise relative mouse packet batching through the production batch implementation.
      *

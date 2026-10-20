@@ -626,7 +626,7 @@ function run_step_deps() {
 
   # compile doxygen if version is too low
   if ! check_version "${DOXYGEN}" "$doxygen_min" "$doxygen_max"; then
-    if [[ "${SUNSHINE_COMPILE_DOXYGEN}" == "true" ]]; then
+    if [[ "${LUMEN_COMPILE_DOXYGEN}" == "true" ]]; then
       echo "Compiling doxygen"
       doxygen_url="https://github.com/doxygen/doxygen/releases/download/Release_${_doxygen_min}/${DOXYGEN}-${doxygen_min}.src.tar.gz"
       echo "${DOXYGEN} url: ${doxygen_url}"
@@ -695,44 +695,44 @@ function run_step_cmake() {
     "-DBUILD_WERROR=ON"
     "-DCMAKE_BUILD_TYPE=Release"
     "-DCMAKE_INSTALL_PREFIX=/usr"
-    "-DSUNSHINE_ASSETS_DIR=share/lumen"
-    "-DSUNSHINE_EXECUTABLE_PATH=/usr/bin/lumen"
-    "-DSUNSHINE_ENABLE_DRM=ON"
-    "-DSUNSHINE_ENABLE_KWIN=ON"
-    "-DSUNSHINE_ENABLE_PORTAL=ON"
-    "-DSUNSHINE_ENABLE_WAYLAND=ON"
-    "-DSUNSHINE_ENABLE_X11=ON"
+    "-DLUMEN_ASSETS_DIR=share/lumen"
+    "-DLUMEN_EXECUTABLE_PATH=/usr/bin/lumen"
+    "-DLUMEN_ENABLE_DRM=ON"
+    "-DLUMEN_ENABLE_KWIN=ON"
+    "-DLUMEN_ENABLE_PORTAL=ON"
+    "-DLUMEN_ENABLE_WAYLAND=ON"
+    "-DLUMEN_ENABLE_X11=ON"
   )
 
   if [[ "$appimage_build" == 1 ]]; then
-    cmake_args+=("-DSUNSHINE_BUILD_APPIMAGE=ON")
+    cmake_args+=("-DLUMEN_BUILD_APPIMAGE=ON")
   fi
 
   # Publisher metadata
   if [[ -n "$publisher_name" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_NAME=${publisher_name}")
+    cmake_args+=("-DLUMEN_PUBLISHER_NAME=${publisher_name}")
   fi
   if [[ -n "$publisher_website" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_WEBSITE=${publisher_website}")
+    cmake_args+=("-DLUMEN_PUBLISHER_WEBSITE=${publisher_website}")
   fi
   if [[ -n "$publisher_issue_url" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_ISSUE_URL=${publisher_issue_url}")
+    cmake_args+=("-DLUMEN_PUBLISHER_ISSUE_URL=${publisher_issue_url}")
   fi
 
   # Handle doxygen docs flag
-  if ! check_version "${DOXYGEN}" "$doxygen_min" "$doxygen_max" && [[ "${SUNSHINE_COMPILE_DOXYGEN}" != "true" ]]; then
+  if ! check_version "${DOXYGEN}" "$doxygen_min" "$doxygen_max" && [[ "${LUMEN_COMPILE_DOXYGEN}" != "true" ]]; then
     cmake_args+=("-DBUILD_DOCS=OFF")
   fi
 
   # Handle CUDA
   if [[ "$skip_cuda" == 0 ]]; then
-    cmake_args+=("-DSUNSHINE_ENABLE_CUDA=ON")
+    cmake_args+=("-DLUMEN_ENABLE_CUDA=ON")
     if [[ -n "$nvcc_path" ]]; then
       cmake_args+=("-DCMAKE_CUDA_COMPILER:PATH=$nvcc_path")
       cmake_args+=("-DCMAKE_CUDA_HOST_COMPILER=gcc-${gcc_version}")
     fi
   else
-    cmake_args+=("-DSUNSHINE_ENABLE_CUDA=OFF")
+    cmake_args+=("-DLUMEN_ENABLE_CUDA=OFF")
   fi
 
   # Cmake stuff here

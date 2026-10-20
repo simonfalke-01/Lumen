@@ -51,24 +51,24 @@ namespace nvhttp {
   constexpr std::uint32_t SCM_LUMEN_HEVC_LOSSLESS = 0x01000000;  ///< Runtime NVENC HEVC lossless proof.
   constexpr std::uint32_t SCM_LUMEN_AV1_LOSSLESS = 0x02000000;  ///< Runtime NVENC AV1 lossless proof.
 
-  static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Lumen. Moonlight-qt will report Malformed XML (missing root element)."sv;
+  static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Lumen. a GameStream client will report Malformed XML (missing root element)."sv;
 
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
 
   /**
-   * @brief HTTPS server backend that adds Sunshine's client-certificate verification.
+   * @brief HTTPS server backend that adds Lumen's client-certificate verification.
    */
-  class SunshineHTTPSServer: public SimpleWeb::ServerBase<SunshineHTTPS> {
+  class LumenHTTPSServer: public SimpleWeb::ServerBase<LumenHTTPS> {
   public:
     /**
-     * @brief Initialize the HTTPS server with Sunshine's certificate and key files.
+     * @brief Initialize the HTTPS server with Lumen's certificate and key files.
      *
      * @param certification_file Path to the server certificate file.
      * @param private_key_file Path to the matching private key file.
      */
-    SunshineHTTPSServer(const std::string &certification_file, const std::string &private_key_file):
-        ServerBase<SunshineHTTPS>::ServerBase(443),
+    LumenHTTPSServer(const std::string &certification_file, const std::string &private_key_file):
+        ServerBase<LumenHTTPS>::ServerBase(443),
         context(boost::asio::ssl::context::tls_server) {
       // Disabling TLS 1.0 and 1.1 (see RFC 8996)
       context.set_options(boost::asio::ssl::context::no_tlsv1);
@@ -81,7 +81,7 @@ namespace nvhttp {
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
 
   protected:
-    boost::asio::ssl::context context;  ///< TLS server context configured with Sunshine's certificate and protocol policy.
+    boost::asio::ssl::context context;  ///< TLS server context configured with Lumen's certificate and protocol policy.
 
     /**
      * @brief Enable client-certificate verification after the listening socket is bound.
@@ -151,7 +151,7 @@ namespace nvhttp {
   /**
    * @brief HTTPS server type used for GameStream endpoints requiring TLS.
    */
-  using https_server_t = SunshineHTTPSServer;
+  using https_server_t = LumenHTTPSServer;
   /**
    * @brief Plain HTTP server type used for GameStream endpoints without TLS.
    */
@@ -163,23 +163,23 @@ namespace nvhttp {
   struct conf_intern_t {
     std::string servercert;  ///< Server certificate PEM string.
     std::string pkey;  ///< Private key PEM string or path.
-  } conf_intern;  ///< TLS credential paths loaded from Sunshine's runtime configuration.
+  } conf_intern;  ///< TLS credential paths loaded from Lumen's runtime configuration.
 
   /**
    * @brief Certificate entry associated with a client name and UUID.
    */
   struct named_cert_t {
     std::string name;  ///< Human-readable name for this item.
-    std::string uuid;  ///< Persistent Moonlight client UUID associated with the certificate.
+    std::string uuid;  ///< Persistent GameStream client UUID associated with the certificate.
     std::string cert;  ///< Certificate PEM string or path.
     bool enabled = true;  ///< Whether this persisted client entry may connect.
   };
 
   /**
-   * @brief Persisted pairing data for one Moonlight client.
+   * @brief Persisted pairing data for one GameStream client.
    */
   struct client_t {
-    std::vector<named_cert_t> named_devices;  ///< Persisted Moonlight clients allowed to pair or reconnect.
+    std::vector<named_cert_t> named_devices;  ///< Persisted GameStream clients allowed to pair or reconnect.
   };
 
   struct paired_client_registry_t {
@@ -198,11 +198,11 @@ namespace nvhttp {
   /**
    * @brief Shared HTTPS response object passed to GameStream handlers.
    */
-  using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response>;
+  using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<LumenHTTPS>::Response>;
   /**
    * @brief Shared HTTPS request object received by GameStream handlers.
    */
-  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request>;
+  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<LumenHTTPS>::Request>;
   /**
    * @brief Shared HTTP response object passed to redirect and discovery handlers.
    */
@@ -239,7 +239,7 @@ namespace nvhttp {
       return existing != clients.end() && existing->enabled;
     }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     std::string query_log_value(std::string_view name, std::string_view value) {
       return is_sensitive_query_field(name) ? "[redacted]" : std::string {value};
     }
@@ -253,7 +253,7 @@ namespace nvhttp {
       return transport->verified_client_certificate();
     }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     std::string serialize_legacy_xml(const pt::ptree &tree) {
       std::ostringstream data;
       pt::write_xml(data, tree);
@@ -324,7 +324,7 @@ namespace nvhttp {
     void populate_server_state(pt::ptree &tree) {
       const auto current_appid = proc::proc.running();
       tree.put("root.currentgame", current_appid);
-      tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
+      tree.put("root.state", current_appid > 0 ? "LUMEN_SERVER_BUSY" : "LUMEN_SERVER_FREE");
     }
 
     bool has_held_pairing_response(const pair_session_t &session) {
@@ -338,7 +338,7 @@ namespace nvhttp {
 
       auto &response = session.async_insert_pin.response;
       std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> http_response;
-      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> https_response;
+      std::shared_ptr<typename SimpleWeb::ServerBase<LumenHTTPS>::Response> https_response;
       if (response.has_left()) {
         http_response = std::move(response.left());
       } else if (response.has_right()) {
@@ -755,7 +755,7 @@ namespace nvhttp {
   }
 
   bool commit_client_state(client_t candidate) {
-    if (!config::sunshine.flags[config::flag::FRESH_STATE] && !persist_client_state(candidate)) {
+    if (!config::general.flags[config::flag::FRESH_STATE] && !persist_client_state(candidate)) {
       return false;
     }
     paired_clients.clients = std::move(candidate);
@@ -780,7 +780,7 @@ namespace nvhttp {
 
     auto unique_id_p = tree.get_optional<std::string>("root.uniqueid");
     if (!unique_id_p) {
-      // This file doesn't contain moonlight credentials
+      // This file doesn't contain gamestream credentials
       http::unique_id = uuid_util::uuid_t::generate().string();
       return;
     }
@@ -1173,7 +1173,7 @@ namespace nvhttp {
    * @brief HTTPS tunnel session used for encrypted client requests.
    */
   template<>
-  struct tunnel<SunshineHTTPS> {
+  struct tunnel<LumenHTTPS> {
     static auto constexpr to_string = "HTTPS"sv;  ///< To string.
   };
 
@@ -1318,7 +1318,7 @@ namespace nvhttp {
           return;
         }
         sess.async_insert_pin.salt = salt;
-        if (!config::sunshine.flags[config::flag::PIN_STDIN]) {
+        if (!config::general.flags[config::flag::PIN_STDIN]) {
           sess.async_insert_pin.response = response;
         }
 
@@ -1356,7 +1356,7 @@ namespace nvhttp {
           return;
         }
 
-        if (config::sunshine.flags[config::flag::PIN_STDIN]) {
+        if (config::general.flags[config::flag::PIN_STDIN]) {
           std::string pin;
 
           std::cout << "Please insert pin: "sv;
@@ -1381,7 +1381,7 @@ namespace nvhttp {
           getservercert(stored.session(), tree, pin);
           return;
         } else {
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined LUMEN_TRAY && LUMEN_TRAY >= 1
           system_tray::update_tray_require_pin();
 #endif
           fg.disable();
@@ -1528,7 +1528,7 @@ namespace nvhttp {
     return rtsp_stream::cancel_sessions_and_process_by_cert(client_certificate);
   }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   pairing_session_manager_t &pairing_sessions_for_tests() {
     return pairing_sessions;
   }
@@ -1606,7 +1606,7 @@ namespace nvhttp {
     return is_trusted_pairing_source(address) ? std::string {} : serialize_legacy_xml(build_untrusted_pairing_source_tree());
   }
 
-  std::string verified_transport_certificate_for_tests(const SunshineHTTPS &transport) {
+  std::string verified_transport_certificate_for_tests(const LumenHTTPS &transport) {
     return registry_allows_certificate(transport.verified_client_certificate()) ? transport.verified_client_certificate() : std::string {};
   }
 #endif
@@ -1614,7 +1614,7 @@ namespace nvhttp {
   /**
    * @brief Get codec mode flags.
    *
-   * @return Moonlight codec capability bitmask for the currently probed encoders.
+   * @return GameStream codec capability bitmask for the currently probed encoders.
    */
   uint32_t get_codec_mode_flags() {
     uint32_t codec_mode_flags = SCM_H264;
@@ -1669,7 +1669,7 @@ namespace nvhttp {
     print_req<T>(request);
 
     int pair_status = 0;
-    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+    if constexpr (std::is_same_v<LumenHTTPS, T>) {
       auto args = request->parse_query_string();
       auto clientID = args.find("uniqueid"s);
 
@@ -1683,7 +1683,7 @@ namespace nvhttp {
     pt::ptree tree;
 
     tree.put("root.<xmlattr>.status_code", 200);
-    tree.put("root.hostname", config::nvhttp.sunshine_name);
+    tree.put("root.hostname", config::nvhttp.host_name);
 
     tree.put("root.appversion", VERSION);
     tree.put("root.GfeVersion", GFE_VERSION);
@@ -1693,21 +1693,21 @@ namespace nvhttp {
     tree.put("root.MaxLumaPixelsHEVC", video::active_hevc_mode > 1 ? "1869449984" : "0");
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.
-    // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
-    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+    // For HTTP requests, use a placeholder MAC address that the client knows to ignore.
+    if constexpr (std::is_same_v<LumenHTTPS, T>) {
       tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address())));
     } else {
       tree.put("root.mac", "00:00:00:00:00:00");
     }
 
-    // Moonlight clients track LAN IPv6 addresses separately from LocalIP which is expected to
+    // GameStream clients track LAN IPv6 addresses separately from LocalIP which is expected to
     // always be an IPv4 address. If we return that same IPv6 address here, it will clobber the
     // stored LAN IPv4 address. To avoid this, we need to return an IPv4 address in this field
     // when we get a request over IPv6.
     //
     // HACK: We should return the IPv4 address of local interface here, but we don't currently
     // have that implemented. For now, we will emulate the behavior of GFE+GS-IPv6-Forwarder,
-    // which returns 127.0.0.1 as LocalIP for IPv6 connections. Moonlight clients with IPv6
+    // which returns 127.0.0.1 as LocalIP for IPv6 connections. GameStream clients with IPv6
     // support know to ignore this bogus address.
     if (local_endpoint.address().is_v6() && !local_endpoint.address().to_v6().is_v4_mapped()) {
       tree.put("root.LocalIP", "127.0.0.1");
@@ -1754,7 +1754,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void applist(resp_https_t response, req_https_t request) {
-    print_req<SunshineHTTPS>(request);
+    print_req<LumenHTTPS>(request);
 
     pt::ptree tree;
 
@@ -1781,7 +1781,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void launch(std::atomic_bool &committed_host_audio, resp_https_t response, req_https_t request) {
-    print_req<SunshineHTTPS>(request);
+    print_req<LumenHTTPS>(request);
 
     pt::ptree tree;
     bool revert_display_configuration {false};
@@ -1934,7 +1934,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void resume(std::atomic_bool &committed_host_audio, resp_https_t response, req_https_t request) {
-    print_req<SunshineHTTPS>(request);
+    print_req<LumenHTTPS>(request);
 
     pt::ptree tree;
     bool revert_display_configuration {false};
@@ -2073,7 +2073,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void cancel(resp_https_t response, req_https_t request) {
-    print_req<SunshineHTTPS>(request);
+    print_req<LumenHTTPS>(request);
 
     pt::ptree tree;
     auto g = util::fail_guard([&]() {
@@ -2103,7 +2103,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void appasset(resp_https_t response, req_https_t request) {
-    print_req<SunshineHTTPS>(request);
+    print_req<LumenHTTPS>(request);
 
     auto args = request->parse_query_string();
     auto app_image = proc::proc.get_app_image((int) util::from_view(get_arg(args, "appid")));
@@ -2135,9 +2135,9 @@ namespace nvhttp {
 
     auto port_http = net::map_port(PORT_HTTP);
     auto port_https = net::map_port(PORT_HTTPS);
-    auto address_family = net::af_from_enum_string(config::sunshine.address_family);
+    auto address_family = net::af_from_enum_string(config::general.address_family);
 
-    bool clean_slate = config::sunshine.flags[config::flag::FRESH_STATE];
+    bool clean_slate = config::general.flags[config::flag::FRESH_STATE];
 
     if (!clean_slate) {
       load_state();
@@ -2216,10 +2216,10 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
     };
 
-    https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
-    https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SunshineHTTPS>;
+    https_server.default_resource["GET"] = not_found<LumenHTTPS>;
+    https_server.resource["^/serverinfo$"]["GET"] = serverinfo<LumenHTTPS>;
     https_server.resource["^/pair$"]["GET"] = [&add_cert](auto resp, auto req) {
-      pair<SunshineHTTPS>(add_cert, resp, req);
+      pair<LumenHTTPS>(add_cert, resp, req);
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
@@ -2335,6 +2335,20 @@ namespace nvhttp {
       }
     }
     return std::nullopt;
+  }
+
+  bool rename_client(const std::string_view uuid, std::string name) {
+    if (name.empty()) {
+      return false;
+    }
+    std::lock_guard lock {paired_clients.mutex};
+    auto candidate = paired_clients.clients;
+    const auto existing = std::ranges::find(candidate.named_devices, uuid, &named_cert_t::uuid);
+    if (existing == candidate.named_devices.end()) {
+      return false;
+    }
+    existing->name = std::move(name);
+    return commit_client_state(std::move(candidate));
   }
 
   /**

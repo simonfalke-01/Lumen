@@ -38,7 +38,7 @@ namespace stream {
 
   struct session_t;
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   namespace session {
     /**
      * @brief Copy the session's video configuration for integration tests.
@@ -159,7 +159,7 @@ namespace stream {
 
     int packetsize;  ///< Maximum payload size for network packets.
     int minRequiredFecPackets;  ///< Minimum recovery packets required before FEC is emitted.
-    int mlFeatureFlags;  ///< Moonlight feature flags negotiated for this session.
+    int mlFeatureFlags;  ///< GameStream feature flags negotiated for this session.
     int controlProtocolType;  ///< GameStream control protocol variant selected by the client.
     int audioQosType;  ///< Audio QoS type.
     int videoQosType;  ///< Video QoS type.
@@ -228,7 +228,7 @@ namespace stream {
       RUNNING,  ///< The session is running
     };
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     /** @brief Observations from the production ordered worker-start boundary. */
     struct startup_order_probe_t {
       state_e worker_observed_state {state_e::STOPPED};  ///< State observed immediately after the worker is launched.
@@ -349,7 +349,7 @@ namespace stream {
     void release_client_microphone(std::uint32_t launch_session_id);
   }  // namespace session
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   /** @brief Raw observations from the exact production audio packet queue. */
   struct audio_packet_queue_probe_t {
     audio::AudioPacketDestination::enqueue_result_e first_enqueue;  ///< Admission of the first capacity-one packet.

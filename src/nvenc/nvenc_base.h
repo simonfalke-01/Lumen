@@ -55,7 +55,7 @@ namespace NVENC_NAMESPACE {
     bool create_encoder(
       const ::nvenc::nvenc_config &config,
       const video::config_t &client_config,
-      const video::sunshine_colorspace_t &colorspace,
+      const video::stream_colorspace_t &colorspace,
       platf::pix_fmt_e buffer_format,
       const std::optional<::nvenc::hdr_static_metadata_t> &hdr_metadata
     ) override;

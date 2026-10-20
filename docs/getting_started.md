@@ -8,7 +8,7 @@ and release artifacts may be missing when merging changes on a faster cadence.
 
 ## Client and protocol compatibility
 
-Unmodified Moonlight clients use Lumen's production GameStream path. A client
+Unmodified GameStream clients use Lumen's production GameStream path. A client
 that does not send Lumen extensions receives legacy policy and wire behavior;
 Lumen does not require Umbra.
 
@@ -23,14 +23,14 @@ Umbra can additionally request one of two per-session policies:
 
 Neither policy is a latency or fidelity guarantee. Resolution, refresh rate,
 codec support, host load, display pacing, and network conditions still apply.
-Both modes preserve legacy Moonlight input ordering and reliability. Codec,
+Both modes preserve legacy GameStream input ordering and reliability. Codec,
 HDR, and YUV 4:4:4 remain separate explicit preferences.
 Quality mode remains rate-controlled unless Umbra explicitly requests the
 separate fail-closed codec-lossless option.
 
 ## Network exposure
 
-The production Moonlight protocol uses multiple listeners. With the default
+The production GameStream protocol uses multiple listeners. With the default
 base port `47989`, the relevant service ports are:
 
 | Purpose | Default transport and port |
@@ -64,16 +64,10 @@ This fork currently publishes Windows AMD64 MSI and ZIP artifacts. Versioned ass
 
 ### Other platforms
 
-Lumen currently publishes no fork-owned FreeBSD, Linux, macOS, Docker, Flatpak, Homebrew, or community-repository
-artifacts. Build those platforms from source using [Building](building.md), or use community packaging with the
-understanding that it is independently maintained and may still use the upstream Sunshine identity.
+Lumen publishes no FreeBSD, Linux, macOS, Docker, Flatpak, or Homebrew packages. Build those platforms from source
+using [Building](building.md).
 
 ### Windows
-
-> [!WARNING]
-> Lumen has its own installer and service identity and will not replace an official Sunshine installation. When
-> Sunshine is detected, the installer can copy its configuration without deleting the source, but the two hosts cannot
-> run at the same time because they use the same GameStream ports. Stop or uninstall Sunshine before starting Lumen.
 
 #### Installer (recommended)
 
@@ -227,7 +221,7 @@ If you prefer to manage your own loopback device, you can still use
 and enter its device name in the [audio_sink](configuration.md#audio_sink) field.
 
 > [!NOTE]
-> Command Keys are not forwarded by Moonlight. Right Option-Key is mapped to CMD-Key.
+> Command Keys are not forwarded by the client. Right Option-Key is mapped to CMD-Key.
 
 > [!CAUTION]
 > Gamepads are not currently supported.
@@ -247,7 +241,6 @@ logs that Virtual HID error and falls back to Xbox 360/ViGEm; explicit profiles 
 identity. The driver control interface remains restricted to the Lumen service; no separate broker or user-accessible
 control service is installed.
 
-![ViGEmBus Installation](images/vigembus-installer.png)
 
 ## Usage
 
@@ -295,35 +288,21 @@ See the project [Discussions](https://github.com/simonfalke-01/Lumen/discussions
 
 ### Configuration
 
-Lumen is configured via the web ui, which is available on [https://localhost:47990](https://localhost:47990)
-by default. You may replace *localhost* with your internal ip address.
+Lumen is configured in its admin panel at [https://localhost:47990](https://localhost:47990). From another
+computer on your network, replace *localhost* with the PC's address.
 
 > [!NOTE]
-> Lumen generates a local HTTPS certificate on first use. Add it to your browser's trust store if required.
+> Lumen generates a local HTTPS certificate on first use, so your browser will ask you to trust it.
 
-> [!CAUTION]
-> If running for the first time, make sure to note the username and password that you created.
+The first visit, from a browser on the PC itself, creates the administrator account. After that:
 
-1. Change the web-ui to your desired theme, using the dropdown menu in the navbar.
-   ![Theme Selection](images/split-themes.png)
-2. Add games and applications.
-   ![Applications](images/applications.png)
-3. Adjust any configuration settings as needed. You can search for options in the search bar.
-   ![Configuration](images/configuration-search.png)
-4. Find Moonlight clients and other tools for Lumen in the `Featured Apps` tab.
-   ![Featured Apps](images/featured-apps.png)
-5. In Moonlight, you may need to add the PC manually.
-6. When Moonlight requests for you insert the pin:
-
-   - Login to the web-ui
-   - Go to "PIN" in the Navbar
-   - Type in your PIN and press `Enter`, and enter a name of your choosing for the device.
-     You should get a Success Message!
-   - In Moonlight, select one of the Applications listed
-
-7. If you run into issues, logs are available in the `Troubleshooting` tab.
-   You can navigate through each warning/error message for clues to the issue.
-   ![Logs](images/troubleshooting-logs.png)
+1. **Apps** lists what devices can start. Desktop and Steam Big Picture are there by default.
+2. **Devices** lists every paired device, Lumen and GameStream alike. Rename a device, change what a Lumen device
+   may do, turn a device off, or remove it.
+3. To pair a Lumen device such as Umbra, start pairing on the device. The request appears on **Overview**; type the
+   PIN the device shows.
+4. To pair a GameStream client, start pairing on the client, then choose **Enter GameStream PIN…** on **Devices**.
+5. **Settings** holds the host name, network, video, audio, and input options. **Logs** shows the live log.
 
 ### Arguments
 To get a list of available arguments, run the following command.
@@ -335,9 +314,9 @@ To get a list of available arguments, run the following command.
 }
 
 ### Shortcuts
-All shortcuts start with `Ctrl+Alt+Shift`, just like Moonlight.
+All shortcuts start with `Ctrl+Alt+Shift`, just like GameStream.
 
-* `Ctrl+Alt+Shift+N`: Hide/Unhide the cursor (This may be useful for Remote Desktop Mode for Moonlight)
+* `Ctrl+Alt+Shift+N`: Hide/Unhide the cursor (This may be useful for Remote Desktop Mode for the client)
 * `Ctrl+Alt+Shift+F1/F12`: Switch to different monitor for Streaming
 
 ### Application List
@@ -383,7 +362,7 @@ Streaming HDR content is officially supported on Windows hosts and experimentall
 
   * HDR must be activated in the host OS, which may require an HDR-capable display or EDID emulator dongle
     connected to your host PC.
-  * You must also enable the HDR option in your Moonlight client settings, otherwise the stream will be SDR
+  * You must also enable the HDR option in your GameStream client settings, otherwise the stream will be SDR
     (and probably overexposed if your host is HDR).
   * A good HDR experience relies on proper HDR display calibration both in the OS and in game. HDR calibration can
     differ significantly between client and host displays.

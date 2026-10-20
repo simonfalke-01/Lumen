@@ -3,9 +3,9 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "Sunshine"
+name = "Lumen"
 version = "0.0.0"
-description = "Python tooling for Sunshine"
+description = "Python tooling for Lumen"
 requires-python = ">=3.14"
 license = {text = "GPL-3.0-only"}
 authors = [
@@ -29,9 +29,9 @@ flatpak = [
 ]
 
 [project.urls]
-Homepage = "https://app.lizardbyte.dev/Sunshine"
-Repository = "https://github.com/LizardByte/Sunshine"
-Issues = "https://github.com/LizardByte/Sunshine/issues"
+Homepage = "https://app.lizardbyte.dev/Lumen"
+Repository = "https://github.com/LizardByte/Lumen"
+Issues = "https://github.com/LizardByte/Lumen/issues"
 
 [tool.setuptools]
 py-modules = []

@@ -166,7 +166,7 @@ if (-not $uploadBlock.Success -or
 
 $serviceMatch = [regex]::Match(
     $windowsTargets,
-    '(?s)set_target_properties\(sunshinesvc\s+PROPERTIES\s+OUTPUT_NAME\s+"(?<name>[^"]+)"\)'
+    '(?s)set_target_properties\(lumensvc\s+PROPERTIES\s+OUTPUT_NAME\s+"(?<name>[^"]+)"\)'
 )
 if (-not $serviceMatch.Success) {
     throw "Unable to resolve the installed Windows service executable name."
@@ -180,8 +180,8 @@ Assert-ContainsLiteral `
     $artifactInventoryText `
     "`"path`": `"$servicePackagePath`"" `
     "Gate6 artifact inventories must use the configured service executable name."
-if ($buildScript.Contains('tools/sunshinesvc.exe', [StringComparison]::Ordinal) -or
-    $artifactInventoryText.Contains('tools/sunshinesvc.exe', [StringComparison]::Ordinal)) {
+if ($buildScript.Contains('tools/lumensvc.exe', [StringComparison]::Ordinal) -or
+    $artifactInventoryText.Contains('tools/lumensvc.exe', [StringComparison]::Ordinal)) {
     throw "Windows package contracts retain the pre-rename service executable path."
 }
 
@@ -203,11 +203,11 @@ foreach ($webInput in $webInputs) {
 
 Assert-ContainsLiteral `
     $testProject `
-    'project(test_sunshine)' `
+    'project(test_lumen)' `
     "The downstream nonhardware test executable target was renamed or removed."
 Assert-ContainsLiteral `
     $buildScript `
-    "'`$buildMsys/tests/test_sunshine.exe'" `
+    "'`$buildMsys/tests/test_lumen.exe'" `
     "The full-profile preflight must execute the built gtest binary."
 Assert-ContainsLiteral `
     $packagingCommon `

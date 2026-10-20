@@ -80,7 +80,7 @@ namespace net {
   std::string_view to_enum_string(net_e net);
 
   /**
-   * @brief Convert a Boost address family to Sunshine network enum value.
+   * @brief Convert a Boost address family to Lumen network enum value.
    *
    * @param view Boost.Log record view being formatted.
    * @return Value converted from address.

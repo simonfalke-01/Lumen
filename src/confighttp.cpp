@@ -1,43 +1,47 @@
 /**
  * @file src/confighttp.cpp
- * @brief Definitions for the Web UI Config HTTP server.
+ * @brief Lumen's administration server: the web panel and the `/api/v1` API it uses.
  *
- * @todo Authentication, better handling of routes common to nvhttp, cleanup
+ * One API covers both streaming protocols. Lumen devices and GameStream devices appear in one
+ * device list, pairing requests from either protocol are answered in one place, and settings are
+ * read and written as typed values rather than as a raw configuration file.
+ *
+ * Every API request must carry `X-Lumen-Request: 1`. Browsers cannot attach a custom header to a
+ * cross-site request without a CORS preflight, which this server never approves, so the header
+ * stops cross-site request forgery without per-form tokens. Sessions are HttpOnly cookies.
  */
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <random>
+#include <ranges>
+#include <set>
 #include <string_view>
+#include <thread>
 
 // lib includes
 #include <boost/algorithm/string.hpp>
 #include <boost/asio/buffers_iterator.hpp>
-#include <boost/asio/ssl/context.hpp>
 #include <boost/asio/streambuf.hpp>
-#include <boost/filesystem.hpp>
 #include <nlohmann/json.hpp>
 #include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_https.hpp>
-
-#ifdef _WIN32
-  #include "platform/windows/misc.h"
-  #include "platform/windows/virtual_display_status.h"
-
-  #include <vector>
-  #include <Windows.h>
-#endif
 
 // local includes
 #include "config.h"
 #include "confighttp.h"
 #include "crypto.h"
-#include "display_device.h"
 #include "file_handler.h"
 #include "globals.h"
 #include "httpcommon.h"
@@ -50,66 +54,17 @@
 #include "protocol_lsp/security/secure_zero.h"
 #include "rtsp.h"
 #include "utility.h"
-#include "uuid.h"
 
 using namespace std::literals;
 
 namespace confighttp {
   namespace fs = std::filesystem;
-
-  /**
-   * @brief HTTPS server type used for Sunshine's configuration UI.
-   */
-  using https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;
-
-  /**
-   * @brief Case-insensitive map used for HTTP headers and query parameters.
-   */
-  using args_t = SimpleWeb::CaseInsensitiveMultimap;
-  /**
-   * @brief Shared HTTPS response object passed to configuration handlers.
-   */
-  using resp_https_t = std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
-  /**
-   * @brief Shared HTTPS request object received by configuration handlers.
-   */
-  using req_https_t = std::shared_ptr<SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
-  /**
-   * @brief Handler signature for configuration UI HTTPS routes.
-   */
+  using json = nlohmann::json;
+  using status_t = SimpleWeb::StatusCode;
+  using headers_t = SimpleWeb::CaseInsensitiveMultimap;
   using https_handler_t = std::function<void(resp_https_t, req_https_t)>;
 
-  /**
-   * @brief Client certificate operations accepted by the configuration API.
-   */
-  enum class op_e {
-    ADD,  ///< Add client
-    REMOVE  ///< Remove client
-  };
-
-  // CSRF token management
-  /**
-   * @brief CSRF token value and its expiration deadline.
-   */
-  struct csrf_token_t {
-    std::string token;  ///< Random token value that must be echoed by the client.
-    std::chrono::steady_clock::time_point expiration;  ///< Monotonic deadline after which the token is rejected.
-  };
-
-  std::map<std::string, csrf_token_t, std::less<>> csrf_tokens;  ///< CSRF tokens by client identifier. NOSONAR(cpp:S5421) - intentionally mutable global
-  std::mutex csrf_tokens_mutex;  ///< Mutex protecting CSRF token storage. NOSONAR(cpp:S5421) - intentionally mutable global
-
-  // CSRF token configuration
-  /**
-   * @brief Number of random bytes used when generating a CSRF token.
-   */
-  constexpr auto CSRF_TOKEN_SIZE = 32;  // 32 bytes = 256 bits
-  /**
-   * @brief Amount of time a generated CSRF token remains valid.
-   */
-  constexpr auto CSRF_TOKEN_LIFETIME = std::chrono::hours(1);  // Tokens valid for 1 hour
-
-  login_throttle_t login_throttle;  ///< Process-local Web UI failed-login budgets. NOSONAR(cpp:S5421) - intentionally mutable global
+  login_throttle_t login_throttle;  ///< Failed sign-in budgets by source. NOSONAR(cpp:S5421) - intentionally mutable global
 
   login_throttle_t::login_throttle_t(
     const std::size_t maximum_sources,
@@ -176,2508 +131,1450 @@ namespace confighttp {
     return net::normalize_address(address).is_loopback();
   }
 
-  std::string_view request_log_value(const std::string_view name, const std::string_view value) {
-    constexpr std::array sensitive_fields {
-      "Authorization"sv,
-      "Proxy-Authorization"sv,
-      "Cookie"sv,
-      "X-CSRF-Token"sv,
-      "csrf_token"sv,
-    };
-    const bool sensitive = std::ranges::any_of(sensitive_fields, [name](const std::string_view candidate) {
-      return boost::iequals(name, candidate);
-    });
-    return sensitive ? "[redacted]"sv : value;
-  }
-
-#ifdef SUNSHINE_TESTS
-  void reset_login_throttle_for_tests() {
-    login_throttle.record_success(boost::asio::ip::make_address("127.0.0.1"));
-    login_throttle.record_success(boost::asio::ip::make_address("::1"));
-  }
-#endif
-
-  /**
-   * @brief Log the request details.
-   * @param request The HTTP request object.
-   */
-  void print_req(const req_https_t &request) {
-    BOOST_LOG(debug) << "METHOD :: "sv << request->method;
-    BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
-
-    for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << request_log_value(name, val);
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
-
-    for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << request_log_value(name, val);
-    }
-
-    BOOST_LOG(debug) << " [--] "sv;
-  }
-
-  /**
-   * @brief Send a response.
-   * @param response The HTTP response object.
-   * @param output_tree The JSON tree to send.
-   */
-  void send_response(const resp_https_t &response, const nlohmann::json &output_tree) {
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "application/json");
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-    response->write(output_tree.dump(), headers);
-  }
-
-  /**
-   * @brief Send a 401 Unauthorized response.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   */
-  void send_unauthorized(const resp_https_t &response, const req_https_t &request) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-    BOOST_LOG(info) << "Web UI: ["sv << address << "] -- not authorized"sv;
-
-    constexpr auto code = SimpleWeb::StatusCode::client_error_unauthorized;
-
-    nlohmann::json tree;
-    tree["status_code"] = code;
-    tree["status"] = false;
-    tree["error"] = "Unauthorized";
-
-    const SimpleWeb::CaseInsensitiveMultimap headers {
-      {"Content-Type", "application/json"},
-      {"WWW-Authenticate", R"(Basic realm="Lumen GameStream Host", charset="UTF-8")"},
-      {"X-Frame-Options", "DENY"},
-      {"Content-Security-Policy", "frame-ancestors 'none';"}
-    };
-
-    response->write(code, tree.dump(), headers);
-  }
-
-  /**
-   * @brief Send a redirect response.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @param path The path to redirect to.
-   */
-  void send_redirect(const resp_https_t &response, const req_https_t &request, const char *path) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-    BOOST_LOG(info) << "Web UI: ["sv << address << "] -- not authorized"sv;
-    const SimpleWeb::CaseInsensitiveMultimap headers {
-      {"Location", path},
-      {"X-Frame-Options", "DENY"},
-      {"Content-Security-Policy", "frame-ancestors 'none';"}
-    };
-    response->write(SimpleWeb::StatusCode::redirection_temporary_redirect, headers);
-  }
-
-  /**
-   * @brief Authenticate the user.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @return True if the user is authenticated, false otherwise.
-   */
-  bool authenticate(const resp_https_t &response, const req_https_t &request) {
-    const auto remote_address = request->remote_endpoint().address();
-    const auto address = net::addr_to_normalized_string(remote_address);
-
-    if (const auto ip_type = net::from_address(address); ip_type > http::origin_web_ui_allowed) {
-      BOOST_LOG(info) << "Web UI: ["sv << address << "] -- denied"sv;
-      response->write(SimpleWeb::StatusCode::client_error_forbidden);
-      return false;
-    }
-
-    // If credentials are shown, redirect the user to a /welcome page
-    if (config::sunshine.username.empty()) {
-      send_redirect(response, request, "/welcome");
-      return false;
-    }
-
-    if (login_throttle.is_blocked(remote_address)) {
-      send_unauthorized(response, request);
-      return false;
-    }
-
-    auto fg = util::fail_guard([&]() {
-      send_unauthorized(response, request);
-    });
-
-    const auto auth = request->header.find("authorization");
-    if (auth == request->header.end()) {
-      return false;
-    }
-
-    std::string auth_data;
-    try {
-      const auto &raw_auth = auth->second;
-      if (!raw_auth.starts_with("Basic "sv)) {
-        login_throttle.record_failure(remote_address);
-        return false;
-      }
-      auth_data = SimpleWeb::Crypto::Base64::decode(raw_auth.substr("Basic "sv.length()));
-    } catch (const std::exception &) {
-      login_throttle.record_failure(remote_address);
-      return false;
-    }
-
-    const auto separator = auth_data.find(':');
-    if (separator == std::string::npos || separator == 0 || separator + 1 >= auth_data.size()) {
-      login_throttle.record_failure(remote_address);
-      return false;
-    }
-
-    const auto username = auth_data.substr(0, separator);
-    const auto password = auth_data.substr(separator + 1);
-    const auto password_result = http::verify_user_password(password, config::sunshine.password, config::sunshine.salt);
-
-    if (!boost::iequals(username, config::sunshine.username) || password_result == http::password_verification_e::INVALID) {
-      login_throttle.record_failure(remote_address);
-      return false;
-    }
-
-    login_throttle.record_success(remote_address);
-    if (password_result == http::password_verification_e::LEGACY) {
-      http::user_credentials_t migrated;
-      if (http::save_user_creds(config::sunshine.credentials_file, config::sunshine.username, password, false, &migrated) == 0) {
-        config::sunshine.username = std::move(migrated.username);
-        config::sunshine.password = std::move(migrated.password);
-        config::sunshine.salt = std::move(migrated.salt);
-      }
-    }
-
-    fg.disable();
-    return true;
-  }
-
-  /**
-   * @brief Send a 404 Not Found response.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @param error_message The error message to include in the response.
-   */
-  void not_found(const resp_https_t &response, [[maybe_unused]] const req_https_t &request, const std::string &error_message) {
-    constexpr auto code = SimpleWeb::StatusCode::client_error_not_found;
-
-    nlohmann::json tree;
-    tree["status_code"] = code;
-    tree["error"] = error_message;
-
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "application/json");
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-
-    response->write(code, tree.dump(), headers);
-  }
-
-  /**
-   * @brief Send a 400 Bad Request response.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @param error_message The error message to include in the response.
-   */
-  void bad_request(const resp_https_t &response, [[maybe_unused]] const req_https_t &request, const std::string &error_message) {
-    constexpr auto code = SimpleWeb::StatusCode::client_error_bad_request;
-
-    nlohmann::json tree;
-    tree["status_code"] = code;
-    tree["status"] = false;
-    tree["error"] = error_message;
-
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "application/json");
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-
-    response->write(code, tree.dump(), headers);
-  }
-
-  /**
-   * @brief Validate the request content type and send a bad request when mismatched.
-   */
-  bool check_content_type(const resp_https_t &response, const req_https_t &request, const std::string_view &contentType) {
-    const auto requestContentType = request->header.find("content-type");
-    if (requestContentType == request->header.end()) {
-      bad_request(response, request, "Content type not provided");
-      return false;
-    }
-    // Extract the media type part before any parameters (e.g., charset)
-    std::string actualContentType = requestContentType->second;
-    if (const size_t semicolonPos = actualContentType.find(';'); semicolonPos != std::string::npos) {
-      actualContentType = actualContentType.substr(0, semicolonPos);
-    }
-
-    // Trim whitespace and convert to lowercase for case-insensitive comparison
-    boost::algorithm::trim(actualContentType);
-    boost::algorithm::to_lower(actualContentType);
-
-    std::string expectedContentType(contentType);
-    boost::algorithm::to_lower(expectedContentType);
-
-    if (actualContentType != expectedContentType) {
-      bad_request(response, request, "Content type mismatch");
-      return false;
-    }
-    return true;
-  }
-
-  /**
-   * @brief Get a unique client identifier for CSRF token management.
-   * @param request The HTTP request object.
-   * @return A unique identifier based on username or IP address.
-   */
-  std::string get_client_id(const req_https_t &request) {
-    // Try to use the authenticated username as client ID
-    if (const auto auth = request->header.find("authorization"); !config::sunshine.username.empty() && auth != request->header.end()) {
-      if (const auto &rawAuth = auth->second; rawAuth.rfind("Basic "sv, 0) == 0) {
-        auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr("Basic "sv.length()));
-        if (const auto index = static_cast<int>(authData.find(':')); index < authData.size() - 1) {
-          return authData.substr(0, index);  // Return username
-        }
-      }
-    }
-
-    // Fall back to IP address if no username
-    return net::addr_to_normalized_string(request->remote_endpoint().address());
-  }
-
-  /**
-   * @brief Generate a new CSRF token for a client.
-   * @param client_id A unique identifier for the client (e.g., session ID or username).
-   * @return The generated CSRF token.
-   */
-  std::string generate_csrf_token(const std::string &client_id) {
-    // Generate a cryptographically secure random token
-    std::string token = crypto::rand_alphabet(CSRF_TOKEN_SIZE);
-
-    std::scoped_lock lock(csrf_tokens_mutex);
-
-    // Clean up expired tokens first
-    const auto now = std::chrono::steady_clock::now();
-    std::erase_if(csrf_tokens, [&now](const auto &entry) {
-      return entry.second.expiration < now;
-    });
-
-    // Store the token with expiration
-    csrf_tokens[client_id] = csrf_token_t {
-      token,
-      now + CSRF_TOKEN_LIFETIME
-    };
-
-    return token;
-  }
-
-  /**
-   * @brief Validate a stored CSRF token for a client against a provided token string.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @param client_id A unique identifier for the client.
-   * @param provided_token The token string to validate.
-   * @return True if the token is valid, false otherwise.
-   */
-  bool validate_stored_csrf_token(const resp_https_t &response, const req_https_t &request, const std::string_view client_id, const std::string_view provided_token) {
-    std::scoped_lock lock(csrf_tokens_mutex);
-    const auto token_it = csrf_tokens.find(client_id);
-
-    if (token_it == csrf_tokens.end()) {
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: no token found for client"sv;
-      bad_request(response, request, "Invalid CSRF token");
-      return false;
-    }
-
-    if (const auto now = std::chrono::steady_clock::now(); token_it->second.expiration < now) {
-      csrf_tokens.erase(token_it);
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token expired"sv;
-      bad_request(response, request, "CSRF token expired");
-      return false;
-    }
-
-    if (token_it->second.token != provided_token) {
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-      BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token mismatch"sv;
-      bad_request(response, request, "Invalid CSRF token");
-      return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * @brief Validate CSRF token.
-   */
-  bool validate_csrf_token(const resp_https_t &response, const req_https_t &request, const std::string &client_id) {
-    // Helper function to check if a URL starts with any allowed origin
-    auto is_allowed_origin = [](const std::string_view url) {
-      return std::ranges::any_of(config::sunshine.csrf_allowed_origins, [&url](const std::string &allowed_origin) {
-        // Ensure exact prefix match (with ":" or "/" after to prevent malicious.com matching allowed.com)
-        if (url.rfind(allowed_origin, 0) != 0) {  // rfind with pos=0 checks if the url starts with allowed_origin
-          return false;
-        }
-        // Check that it's followed by ":" (port) or "/" (path) or is an exact match
-        const size_t len = allowed_origin.length();
-        return url.length() == len || url[len] == ':' || url[len] == '/';
-      });
-    };
-
-    // Check if the request is from the same origin (Origin or Referer header matches configured allowed origins)
-    const auto origin_it = request->header.find("Origin");
-    if (origin_it != request->header.end() && is_allowed_origin(origin_it->second)) {
-      // Same origin request - allow without CSRF token
-      return true;
-    }
-
-    // If we have a Referer header, check if it's same-origin
-    const auto referer_it = request->header.find("Referer");
-    if (referer_it != request->header.end() && is_allowed_origin(referer_it->second)) {
-      // Same origin request - allow without CSRF token
-      return true;
-    }
-
-    // If neither Origin nor Referer is present, this cannot be a browser-initiated CSRF attack.
-    // Non-browser clients (e.g. curl, scripts) never send these headers, and a malicious web page
-    // cannot cause a non-browser client to make requests on a user's behalf.
-    if (origin_it == request->header.end() && referer_it == request->header.end()) {
-      return true;
-    }
-
-    // A browser-like request arrived with an Origin/Referer that doesn't match an allowed origin.
-    // Require a CSRF token.
-    const std::string_view blocked_origin = (origin_it != request->header.end()) ? origin_it->second : referer_it->second;
-    // Extract token from X-CSRF-Token header
-    const auto header_it = request->header.find("X-CSRF-Token");
-    if (header_it == request->header.end()) {
-      // Also check query parameters as fallback
-      auto query_params = request->parse_query_string();
-      const auto query_it = query_params.find("csrf_token");
-      if (query_it == query_params.end()) {
-        auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request from origin: "sv << blocked_origin;
-        BOOST_LOG(error) << "Web UI: To allow this origin, add it to the 'csrf_allowed_origins' option in your Lumen configuration"sv;
-        bad_request(response, request, "Missing CSRF token");
-        return false;
-      }
-
-      return validate_stored_csrf_token(response, request, client_id, query_it->second);
-    }
-
-    // Validate token from header
-    return validate_stored_csrf_token(response, request, client_id, header_it->second);
-  }
-
-  /**
-   * @brief Validates the application index and sends an error response if invalid.
-   */
-  bool check_app_index(const resp_https_t &response, const req_https_t &request, int index) {
-    std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-    nlohmann::json file_tree = nlohmann::json::parse(file);
-    if (const auto &apps = file_tree["apps"]; index < 0 || index >= static_cast<int>(apps.size())) {
-      std::string error;
-      if (const int max_index = static_cast<int>(apps.size()) - 1; max_index < 0) {
-        error = "No applications found";
-      } else {
-        error = std::format("'index' {} out of range, max index is {}", index, max_index);
-      }
-      bad_request(response, request, error);
-      return false;
-    }
-    return true;
-  }
-
-  /**
-   * @brief Get an HTML page.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @param html_file The HTML file to serve (relative to WEB_DIR).
-   * @param require_auth Whether to require authentication (default: true).
-   * @param redirect_if_username If true, redirect to "/" when the username is set (for welcome page).
-   */
-  void getPage(const resp_https_t &response, const req_https_t &request, const char *html_file, const bool require_auth, const bool redirect_if_username) {
-    // Special handling for welcome page: redirect if the username is already set
-    if (redirect_if_username && !config::sunshine.username.empty()) {
-      send_redirect(response, request, "/");
-      return;
-    }
-
-    if (require_auth && !authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    const std::string content = file_handler::read_file((std::string(WEB_DIR) + html_file).c_str());
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "text/html; charset=utf-8");
-
-    // prevent click jacking
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-
-    response->write(content, headers);
-  }
-
-  /**
-   * @brief Get the favicon image.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @todo combine function with getSunshineLogoImage and possibly getNodeModules
-   * @todo use mime_types map
-   */
-  void getFaviconImage(const resp_https_t &response, const req_https_t &request) {
-    print_req(request);
-
-    std::ifstream in(WEB_DIR "images/sunshine.ico", std::ios::binary);
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "image/x-icon");
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-    response->write(SimpleWeb::StatusCode::success_ok, in, headers);
-  }
-
-  /**
-   * @brief Get the Sunshine logo image.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @todo combine function with getFaviconImage and possibly getNodeModules
-   * @todo use mime_types map
-   */
-  void getSunshineLogoImage(const resp_https_t &response, const req_https_t &request) {
-    print_req(request);
-
-    std::ifstream in(WEB_DIR "images/logo-sunshine-45.png", std::ios::binary);
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "image/png");
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-    response->write(SimpleWeb::StatusCode::success_ok, in, headers);
-  }
-
-  /**
-   * @brief Check if a path is a child of another path.
-   * @param base The base path.
-   * @param query The path to check.
-   * @return True if the path is a child of the base path, false otherwise.
-   */
-  bool isChildPath(fs::path const &base, fs::path const &query) {
-    auto relPath = fs::relative(base, query);
-    return *(relPath.begin()) != fs::path("..");
-  }
-
-  /**
-   * @brief Get an asset.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   */
-  void getAsset(const resp_https_t &response, const req_https_t &request) {
-    print_req(request);
-    fs::path webDirPath(WEB_DIR);
-    fs::path nodeModulesPath(webDirPath / "assets");
-
-    // .relative_path is needed to shed any leading slash that might exist in the request path
-    auto filePath = fs::weakly_canonical(webDirPath / fs::path(request->path).relative_path());
-
-    // Don't do anything if the file does not exist or is outside the assets directory
-    if (!isChildPath(filePath, nodeModulesPath)) {
-      BOOST_LOG(warning) << "Someone requested a path " << filePath << " that is outside the assets folder";
-      bad_request(response, request);
-      return;
-    }
-    if (!fs::exists(filePath)) {
-      not_found(response, request);
-      return;
-    }
-
-    auto relPath = fs::relative(filePath, webDirPath);
-    // get the mime type from the file extension mime_types map
-    // remove the leading period from the extension
-    auto mimeType = mime_types.find(relPath.extension().string().substr(1));
-    // check if the extension is in the map at the x position
-    if (mimeType == mime_types.end()) {
-      bad_request(response, request);
-      return;
-    }
-
-    // if it is, set the content type to the mime type
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", mimeType->second);
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-    std::ifstream in(filePath.string(), std::ios::binary);
-    response->write(SimpleWeb::StatusCode::success_ok, in, headers);
-  }
-
-  /**
-   * @brief Get a CSRF token for the authenticated user.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/csrf-token| GET| null}
-   */
-  void getCSRFToken(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    std::string client_id = get_client_id(request);
-    std::string token = generate_csrf_token(client_id);
-
-    nlohmann::json output_tree;
-    output_tree["csrf_token"] = token;
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Get the list of available applications.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/apps| GET| null}
-   */
-  void getApps(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    try {
-      std::string content = file_handler::read_file(config::stream.file_apps.c_str());
-      nlohmann::json file_tree = nlohmann::json::parse(content);
-
-      // Legacy versions of Sunshine used strings for boolean and integers, let's convert them
-      // List of keys to convert to boolean
-      const std::vector<std::string> boolean_keys = {
-        "exclude-global-prep-cmd",
-        "elevated",
-        "auto-detach",
-        "wait-all"
+  namespace {
+    using resp_t = resp_https_t;
+    using req_t = req_https_t;
+
+    // ---------------------------------------------------------------------------------------------
+    // Responses
+
+    /** @brief Headers every response carries. */
+    headers_t base_headers(const std::string_view content_type) {
+      return {
+        {"Content-Type", std::string {content_type}},
+        {"Cache-Control", "no-store"},
+        {"X-Content-Type-Options", "nosniff"},
+        {"X-Frame-Options", "DENY"},
+        {"Referrer-Policy", "no-referrer"},
       };
+    }
 
-      // List of keys to convert to integers
-      std::vector<std::string> integer_keys = {
-        "exit-timeout"
-      };
-
-      // Walk fileTree and convert true/false strings to boolean or integer values
-      for (auto &app : file_tree["apps"]) {
-        for (const auto &key : boolean_keys) {
-          if (app.contains(key) && app[key].is_string()) {
-            app[key] = app[key] == "true";
-          }
-        }
-        for (const auto &key : integer_keys) {
-          if (app.contains(key) && app[key].is_string()) {
-            app[key] = std::stoi(app[key].get<std::string>());
-          }
-        }
-        if (app.contains("prep-cmd")) {
-          for (auto &prep : app["prep-cmd"]) {
-            if (prep.contains("elevated") && prep["elevated"].is_string()) {
-              prep["elevated"] = prep["elevated"] == "true";
-            }
-          }
-        }
+    void send_json(const resp_t &response, const status_t status, const json &body, headers_t extra = {}) {
+      auto headers = base_headers("application/json");
+      for (auto &[name, value] : extra) {
+        headers.emplace(name, value);
       }
-
-      send_response(response, file_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "GetApps: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Save an application. To save a new application, the index must be `-1`. To update an existing application, you must provide the current index of the application.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * The body for the post request should be JSON serialized in the following format:
-   * @code{.json}
-   * {
-   *   "name": "Application Name",
-   *   "output": "Log Output Path",
-   *   "cmd": "Command to run the application",
-   *   "index": -1,
-   *   "exclude-global-prep-cmd": false,
-   *   "elevated": false,
-   *   "auto-detach": true,
-   *   "wait-all": true,
-   *   "exit-timeout": 5,
-   *   "prep-cmd": [
-   *     {
-   *       "do": "Command to prepare",
-   *       "undo": "Command to undo preparation",
-   *       "elevated": false
-   *     }
-   *   ],
-   *   "detached": [
-   *     "Detached command"
-   *   ],
-   *   "image-path": "Full path to the application image. Must be a png file."
-   * }
-   * @endcode
-   *
-   * @api_examples{/api/apps| POST| {"name":"Hello, World!","index":-1}}
-   */
-  void saveApp(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-    if (!authenticate(response, request)) {
-      return;
+      response->write(status, body.dump(), headers);
     }
 
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
+    void send_ok(const resp_t &response, const json &body) {
+      send_json(response, status_t::success_ok, body);
     }
 
-    print_req(request);
-
-    std::stringstream ss;
-    ss << request->content.rdbuf();
-    try {
-      // TODO: Input Validation
-      nlohmann::json output_tree;
-      nlohmann::json input_tree = nlohmann::json::parse(ss);
-      std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      nlohmann::json file_tree = nlohmann::json::parse(file);
-
-      if (input_tree["prep-cmd"].empty()) {
-        input_tree.erase("prep-cmd");
+    void send_no_content(const resp_t &response, headers_t extra = {}) {
+      auto headers = base_headers("text/plain");
+      for (auto &[name, value] : extra) {
+        headers.emplace(name, value);
       }
-
-      if (input_tree["detached"].empty()) {
-        input_tree.erase("detached");
-      }
-
-      auto &apps_node = file_tree["apps"];
-      int index = input_tree["index"].get<int>();  // this will intentionally cause an exception if the provided value is the wrong type
-
-      input_tree.erase("index");
-
-      if (index == -1) {
-        apps_node.push_back(input_tree);
-      } else {
-        nlohmann::json newApps = nlohmann::json::array();
-        for (size_t i = 0; i < apps_node.size(); ++i) {
-          if (i == index) {
-            newApps.push_back(input_tree);
-          } else {
-            newApps.push_back(apps_node[i]);
-          }
-        }
-        file_tree["apps"] = newApps;
-      }
-
-      // Sort the apps array by name
-      std::sort(apps_node.begin(), apps_node.end(), [](const nlohmann::json &a, const nlohmann::json &b) {
-        return a["name"].get<std::string>() < b["name"].get<std::string>();
-      });
-
-      file_handler::write_file(config::stream.file_apps.c_str(), file_tree.dump(4));
-      proc::refresh(config::stream.file_apps);
-
-      output_tree["status"] = true;
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SaveApp: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Close the currently running application.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/apps/close| POST| null}
-   */
-  void closeApp(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
+      response->write(status_t::success_no_content, headers);
     }
 
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
+    /** @brief Send an error whose message the panel shows as is, so it must read as plain English. */
+    void send_error(const resp_t &response, const status_t status, const std::string_view message) {
+      send_json(response, status, {{"error", message}});
     }
 
-    print_req(request);
-
-    proc::proc.terminate();
-
-    nlohmann::json output_tree;
-    output_tree["status"] = true;
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Delete an application.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/apps/9999| DELETE| null}
-   */
-  void deleteApp(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
+    std::string body_of(const req_t &request) {
+      return request->content.string();
     }
 
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    try {
-      nlohmann::json output_tree;
-      nlohmann::json new_apps = nlohmann::json::array();
-      const int index = std::stoi(request->path_match[1]);
-
-      if (!check_app_index(response, request, index)) {
-        return;
-      }
-
-      std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      nlohmann::json file_tree = nlohmann::json::parse(file);
-      auto &apps = file_tree["apps"];
-
-      for (size_t i = 0; i < apps.size(); ++i) {
-        if (i != index) {
-          new_apps.push_back(apps[i]);
-        }
-      }
-      file_tree["apps"] = new_apps;
-
-      file_handler::write_file(config::stream.file_apps.c_str(), file_tree.dump(4));
-      proc::refresh(config::stream.file_apps);
-
-      output_tree["status"] = true;
-      output_tree["result"] = std::format("application {} deleted", index);
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "DeleteApp: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Get the list of paired clients.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/clients/list| GET| null}
-   */
-  void getClients(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    const nlohmann::json named_certs = nvhttp::get_all_clients();
-
-    nlohmann::json output_tree;
-    output_tree["named_certs"] = named_certs;
-    output_tree["status"] = true;
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Enable or disable a client.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * The body for the POST request should be JSON serialized in the following format:
-   * @code{.json}
-   * {
-   *   "uuid": "<uuid>",
-   *   "enabled": true
-   * }
-   * @endcode
-   *
-   * @api_examples{/api/clients/update| POST| {"uuid":"<uuid>","enabled":true}}
-   */
-  void updateClient(resp_https_t response, req_https_t request) {
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-    if (!authenticate(response, request)) {
-      return;
-    }
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    std::stringstream ss;
-    ss << request->content.rdbuf();
-    try {
-      nlohmann::json input_tree = nlohmann::json::parse(ss.str());
-      nlohmann::json output_tree;
-      std::string uuid = input_tree.value("uuid", "");
-      bool enabled = input_tree.value("enabled", true);
-      const auto updated_certificate = nvhttp::set_client_enabled_with_certificate(uuid, enabled);
-      output_tree["status"] = updated_certificate.has_value();
-
-      if (!enabled && updated_certificate) {
-        rtsp_stream::terminate_sessions_by_cert(*updated_certificate);
-
-        if (!rtsp_stream::has_session_or_pending_launch() && proc::proc.running() > 0) {
-          proc::proc.terminate();
-        }
-      }
-
-      send_response(response, output_tree);
-    } catch (nlohmann::json::exception &e) {
-      BOOST_LOG(warning) << "Update Client: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Unpair a client.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * The body for the POST request should be JSON serialized in the following format:
-   * @code{.json}
-   * {
-   *  "uuid": "<uuid>"
-   * }
-   * @endcode
-   *
-   * @api_examples{/api/unpair| POST| {"uuid":"1234"}}
-   */
-  void unpair(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    std::stringstream ss;
-    ss << request->content.rdbuf();
-
-    try {
-      // TODO: Input Validation
-      nlohmann::json output_tree;
-      const nlohmann::json input_tree = nlohmann::json::parse(ss);
-      const std::string uuid = input_tree.value("uuid", "");
-      const auto removed_certificate = nvhttp::revoke_client(uuid);
-      output_tree["status"] = removed_certificate.has_value();
-
-      if (removed_certificate) {
-        rtsp_stream::terminate_sessions_by_cert(*removed_certificate);
-        if (nvhttp::get_all_clients().empty()) {
-          proc::proc.terminate();
-        }
-      }
-
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "Unpair: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Unpair all clients.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/clients/unpair-all| POST| null}
-   */
-  void unpairAll(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    nlohmann::json output_tree;
-    output_tree["status"] = nvhttp::erase_all_clients();
-    if (output_tree["status"]) {
-      proc::proc.terminate();
-    }
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Convert one LSP fixed-width identifier to lowercase hexadecimal.
-   *
-   * @param identifier Identifier bytes to encode.
-   * @return Stable 32-character lowercase client identifier.
-   */
-  std::string encode_lsp_client_id(const lumen::lsp::Identifier128 &identifier) {
-    constexpr std::string_view digits = "0123456789abcdef";
-    std::string encoded(identifier.size() * 2, '0');
-    for (std::size_t index = 0; index < identifier.size(); ++index) {
-      encoded[index * 2] = digits[identifier[index] >> 4U];
-      encoded[index * 2 + 1] = digits[identifier[index] & 0x0fU];
-    }
-    return encoded;
-  }
-
-  /** @brief Convert one LSP SHA-256 fingerprint to lowercase hexadecimal. */
-  std::string encode_lsp_fingerprint(const lumen::lsp::Digest256 &fingerprint) {
-    constexpr std::string_view digits = "0123456789abcdef";
-    std::string encoded(fingerprint.size() * 2, '0');
-    for (std::size_t index = 0; index < fingerprint.size(); ++index) {
-      encoded[index * 2] = digits[fingerprint[index] >> 4U];
-      encoded[index * 2 + 1] = digits[fingerprint[index] & 0x0fU];
-    }
-    return encoded;
-  }
-
-  /**
-   * @brief Decode one canonical LSP client identifier.
-   *
-   * @param encoded Exact 32-character lowercase hexadecimal identifier.
-   * @return Decoded identifier, or no value for malformed input.
-   */
-  std::optional<lumen::lsp::Identifier128> decode_lsp_client_id(const std::string_view encoded) noexcept {
-    constexpr std::size_t encoded_client_id_size = 32;
-    if (encoded.size() != encoded_client_id_size) {
-      return std::nullopt;
-    }
-
-    const auto hex_value = [](const char value) -> std::optional<std::uint8_t> {
-      if (value >= '0' && value <= '9') {
-        return static_cast<std::uint8_t>(value - '0');
-      }
-      if (value >= 'a' && value <= 'f') {
-        return static_cast<std::uint8_t>(value - 'a' + 10);
-      }
-      return std::nullopt;
-    };
-
-    lumen::lsp::Identifier128 identifier {};
-    for (std::size_t index = 0; index < identifier.size(); ++index) {
-      const auto high = hex_value(encoded[index * 2]);
-      const auto low = hex_value(encoded[index * 2 + 1]);
-      if (!high || !low) {
+    /** @brief Parse a JSON object body; send 400 and return no value when it is not one. */
+    std::optional<json> json_body(const resp_t &response, const req_t &request) {
+      const auto content_type = request->header.find("Content-Type");
+      if (content_type == request->header.end() || !boost::istarts_with(content_type->second, "application/json")) {
+        send_error(response, status_t::client_error_unsupported_media_type, "Send JSON.");
         return std::nullopt;
       }
-      identifier[index] = static_cast<std::uint8_t>((*high << 4U) | *low);
-    }
-    return lumen::lsp::is_zero(identifier) ? std::nullopt : std::optional {identifier};
-  }
-
-  /**
-   * @brief Return the stable Web API name for one LSP network profile.
-   *
-   * @param profile Configured LSP profile.
-   * @return Public profile name.
-   */
-  std::string_view lsp_profile_name(const lumen::lsp::NetworkProfile profile) noexcept {
-    switch (profile) {
-      case lumen::lsp::NetworkProfile::adaptive_low_latency:
-        return "adaptive-low-latency"sv;
-      case lumen::lsp::NetworkProfile::competition:
-        return "competition"sv;
-    }
-    return "unknown"sv;
-  }
-
-  /**
-   * @brief Return the stable Web API name for one LSP reconnect outcome.
-   *
-   * @param outcome Secret-free runtime reconnect outcome.
-   * @return Public reconnect outcome name.
-   */
-  std::string_view lsp_reconnect_outcome_name(const lumen::lsp::runtime::ReconnectOutcome outcome) noexcept {
-    using lumen::lsp::runtime::ReconnectOutcome;
-    switch (outcome) {
-      case ReconnectOutcome::none:
-        return "none"sv;
-      case ReconnectOutcome::rejected:
-        return "rejected"sv;
-      case ReconnectOutcome::committed:
-        return "committed"sv;
-      case ReconnectOutcome::ready:
-        return "ready"sv;
-      case ReconnectOutcome::failed:
-        return "failed"sv;
-    }
-    return "unknown"sv;
-  }
-
-  /** @brief Return one stable secret-free PIN pairing state name. */
-  std::string_view lsp_pairing_state_name(const lumen::lsp::runtime::PairingAdministrationState state) noexcept {
-    using lumen::lsp::runtime::PairingAdministrationState;
-    switch (state) {
-      case PairingAdministrationState::awaiting_pin:
-        return "awaiting-pin"sv;
-      case PairingAdministrationState::deriving:
-        return "deriving"sv;
-      case PairingAdministrationState::challenge_ready:
-        return "challenge-ready"sv;
-      case PairingAdministrationState::cooldown:
-        return "cooldown"sv;
-    }
-    return "unknown"sv;
-  }
-
-  /** @brief Scope guard that wipes the original LSP PIN request body on every handler exit. */
-  class LspPinRequestBodyGuard {
-  public:
-    /** @brief Retain the request without allocating or reading its body. */
-    explicit LspPinRequestBodyGuard(req_https_t request) noexcept:
-        request_ {std::move(request)} {
-    }
-
-    LspPinRequestBodyGuard(const LspPinRequestBodyGuard &) = delete;
-    LspPinRequestBodyGuard &operator=(const LspPinRequestBodyGuard &) = delete;
-
-    /** @brief Wipe and consume the underlying HTTP request buffer. */
-    ~LspPinRequestBodyGuard() {
-      auto *buffer = dynamic_cast<boost::asio::streambuf *>(request_->content.rdbuf());
-      if (buffer == nullptr) {
-        return;
+      auto body = json::parse(body_of(request), nullptr, false);
+      if (!body.is_object()) {
+        send_error(response, status_t::client_error_bad_request, "The request isn’t valid JSON.");
+        return std::nullopt;
       }
-      const auto data = buffer->data();
-      for (auto iterator = boost::asio::buffers_begin(data); iterator != boost::asio::buffers_end(data); ++iterator) {
-        auto &byte = const_cast<char &>(*iterator);
-        byte = 0;
-      }
-      buffer->consume(buffer->size());
+      return body;
     }
 
-  private:
-    req_https_t request_;  ///< Request retaining the original buffer through scope exit.
-  };
-
-  /** @brief Scope-owned PIN copies for the LSP administration handler. */
-  class LspPinSubmissionSecrets {
-  public:
-    /** @brief Copy the exact bounded request body after its length and session pass preflight. */
-    explicit LspPinSubmissionSecrets(const req_https_t &request):
-        pin {request->content.string()} {
+    std::string remote_address(const req_t &request) {
+      return net::addr_to_normalized_string(request->remote_endpoint().address());
     }
 
-    LspPinSubmissionSecrets(const LspPinSubmissionSecrets &) = delete;
-    LspPinSubmissionSecrets &operator=(const LspPinSubmissionSecrets &) = delete;
+    // ---------------------------------------------------------------------------------------------
+    // Sessions
 
-    /** @brief Wipe every PIN copy on scope exit. */
-    ~LspPinSubmissionSecrets() {
-      lumen::lsp::secure_zero(std::span<char> {pin.data(), pin.size()});
-      lumen::lsp::secure_zero(digits);
-    }
+    constexpr auto session_cookie = "lumen_session"sv;
+    constexpr auto session_idle_lifetime = std::chrono::hours(12);
+    constexpr std::size_t maximum_sessions = 32;
 
-    std::string pin;  ///< Exact six-byte body copy, securely cleared on scope exit.
-    std::array<std::uint8_t, 6> digits {};  ///< Validated worker input, securely cleared on scope exit.
-  };
-
-  /**
-   * @brief Send a non-cacheable LSP administration JSON response.
-   *
-   * @param response Shared HTTPS response object.
-   * @param status HTTP response status.
-   * @param output_tree Public administration response body.
-   */
-  void send_lsp_admin_response(
-    const resp_https_t &response,
-    const SimpleWeb::StatusCode status,
-    const nlohmann::json &output_tree
-  ) {
-    const SimpleWeb::CaseInsensitiveMultimap headers {
-      {"Content-Type", "application/json"},
-      {"Cache-Control", "no-store"},
-      {"Pragma", "no-cache"},
-      {"Referrer-Policy", "no-referrer"},
-      {"X-Frame-Options", "DENY"},
-      {"Content-Security-Policy", "frame-ancestors 'none';"},
+    struct session_t {
+      std::string username;
+      std::chrono::steady_clock::time_point expires;
     };
-    response->write(status, output_tree.dump(), headers);
-  }
 
-  /**
-   * @brief Reject an LSP administration request with a stable JSON error.
-   *
-   * @param response Shared HTTPS response object.
-   * @param status HTTP failure status.
-   * @param error Public error string without secret material.
-   */
-  void send_lsp_admin_error(
-    const resp_https_t &response,
-    const SimpleWeb::StatusCode status,
-    const std::string_view error
-  ) {
-    send_lsp_admin_response(response, status, {
-                                                {"status", false},
-                                                {"error", error},
-                                              });
-  }
+    std::mutex sessions_mutex;
+    std::map<std::string, session_t, std::less<>> sessions;  ///< Session token to session.
 
-  /**
-   * @brief Enforce authenticated trusted-LAN access and an explicit CSRF token.
-   *
-   * General Web UI routes retain their existing origin-aware CSRF behavior.
-   * LSP PIN and trust administration always requires the token header,
-   * including same-origin GET requests.
-   *
-   * @param response Shared HTTPS response object.
-   * @param request Shared HTTPS request object.
-   * @return True only for an authenticated PC/LAN source with a valid token.
-   */
-  bool authorize_lsp_administration(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return false;
+    std::string cookie_header(const std::string_view token, const std::chrono::seconds max_age) {
+      return std::format("{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", session_cookie, token, max_age.count());
     }
 
-    const auto remote_address = net::addr_to_normalized_string(request->remote_endpoint().address());
-    if (net::from_address(remote_address) > net::LAN) {
-      send_lsp_admin_error(
-        response,
-        SimpleWeb::StatusCode::client_error_forbidden,
-        "LSP administration is restricted to the trusted local network"
-      );
-      return false;
-    }
-
-    const auto token = request->header.find("X-CSRF-Token");
-    if (token == request->header.end()) {
-      bad_request(response, request, "Missing CSRF token");
-      return false;
-    }
-    return validate_stored_csrf_token(response, request, get_client_id(request), token->second);
-  }
-
-  /**
-   * @brief Send the current LSP listener administration status.
-   *
-   * @api_examples{/api/lsp/status| GET| null}
-   */
-  void getLspStatus(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-
-    const auto snapshot = lumen::lsp::runtime::administration_snapshot();
-    if (!snapshot) {
-      send_lsp_admin_error(
-        response,
-        SimpleWeb::StatusCode::server_error_service_unavailable,
-        "LSP runtime is unavailable"
-      );
-      return;
-    }
-
-    const nlohmann::json reconnect {
-      {"attempts", snapshot->reconnect.attempts},
-      {"committed", snapshot->reconnect.committed},
-      {"completed", snapshot->reconnect.completed},
-      {"rejected", snapshot->reconnect.rejected},
-      {"failed", snapshot->reconnect.failed},
-      {"latestConnectionGeneration", snapshot->reconnect.latest_connection_generation},
-      {"latestOutcome", lsp_reconnect_outcome_name(snapshot->reconnect.latest_outcome)},
-      {"latestRequestToCommitMicroseconds", snapshot->reconnect.latest_request_to_commit_microseconds},
-      {"latestCommitToReadyMicroseconds", snapshot->reconnect.latest_commit_to_ready_microseconds},
-      {"latestTotalMicroseconds", snapshot->reconnect.latest_total_microseconds},
-    };
-    const nlohmann::json media {
-      {"audioGeneration", snapshot->media.audio_generation},
-      {"videoGeneration", snapshot->media.video_generation},
-      {"microphoneGeneration", snapshot->media.microphone_generation},
-      {"audioSentPackets", snapshot->media.audio_sent_packets},
-      {"audioExpiredPackets", snapshot->media.audio_expired_packets},
-      {"audioDeliveredBytes", snapshot->media.audio_delivered_bytes},
-      {"audioLostBytes", snapshot->media.audio_lost_bytes},
-      {"audioEcnCeBytes", snapshot->media.audio_ecn_ce_bytes},
-      {"videoSentFrames", snapshot->media.video_sent_frames},
-      {"videoAdmittedFrames", snapshot->media.video_admitted_frames},
-      {"videoDroppedFrames", snapshot->media.video_dropped_frames},
-      {"videoDecoderSaturatedDrops", snapshot->media.video_decoder_saturated_drops},
-      {"videoDeadlineMissDrops", snapshot->media.video_deadline_miss_drops},
-      {"videoInvalidReferenceDrops", snapshot->media.video_invalid_reference_drops},
-      {"videoForwardCapacityDrops", snapshot->media.video_forward_capacity_drops},
-      {"videoPressureEvents", snapshot->media.video_pressure_events},
-      {"videoDecoderCredit", snapshot->media.video_decoder_credit},
-      {"videoPacingBitsPerSecond", snapshot->media.video_pacing_bits_per_second},
-      {"videoEncoderBitsPerSecond", snapshot->media.video_encoder_bits_per_second},
-      {"videoFeedbackReports", snapshot->media.video_feedback_reports},
-      {"videoFeedbackRejections", snapshot->media.video_feedback_rejections},
-      {"videoRepairFeedbackPackets", snapshot->media.video_repair_feedback_packets},
-      {"videoSentPackets", snapshot->media.video_sent_packets},
-      {"flexfecSentPackets", snapshot->media.flexfec_sent_packets},
-      {"rtxSentPackets", snapshot->media.rtx_sent_packets},
-      {"videoLostBytes", snapshot->media.video_lost_bytes},
-      {"videoEcnCeBytes", snapshot->media.video_ecn_ce_bytes},
-      {"microphoneAcceptedPackets", snapshot->media.microphone_accepted_packets},
-      {"microphoneRejectedPackets", snapshot->media.microphone_rejected_packets},
-      {"microphoneReceiverReports", snapshot->media.microphone_receiver_reports},
-      {"microphoneCongestionReports", snapshot->media.microphone_congestion_reports},
-      {"microphoneDecodedFrames", snapshot->media.microphone_decoded_frames},
-      {"microphoneFecFrames", snapshot->media.microphone_fec_frames},
-      {"microphonePlcFrames", snapshot->media.microphone_plc_frames},
-      {"microphoneSilenceFrames", snapshot->media.microphone_silence_frames},
-      {"microphoneDecodeErrors", snapshot->media.microphone_decode_errors},
-      {"microphoneSinkErrors", snapshot->media.microphone_sink_errors},
-      {"microphonePlayoutActive", snapshot->media.microphone_playout_active},
-      {"forwardSentBytes", snapshot->media.forward_sent_bytes},
-      {"inputFeedbackSentBytes", snapshot->media.input_feedback_sent_bytes},
-      {"inputAuthenticatedPackets", snapshot->media.input_authenticated_packets},
-      {"inputCongestionReports", snapshot->media.input_congestion_reports},
-      {"inputReceiverReports", snapshot->media.input_receiver_reports},
-      {"inputFeedbackStorageDrops", snapshot->media.input_feedback_storage_drops},
-      {"inputPendingFeedbackPositions", snapshot->media.input_pending_feedback_positions},
-      {"appliedInputStateSequence", snapshot->media.applied_input_state_sequence},
-      {"appliedInputEdgeId", snapshot->media.applied_input_edge_id},
-      {"inputLatencySamples", snapshot->media.input_latency_samples},
-      {"latestInputLatencyMicroseconds", snapshot->media.latest_input_latency_microseconds},
-      {"maximumInputLatencyMicroseconds", snapshot->media.maximum_input_latency_microseconds},
-      {"ecnAvailable", snapshot->media.ecn_available},
-      {"receivedEct0Datagrams", snapshot->media.received_ect0_datagrams},
-      {"receivedEct1Datagrams", snapshot->media.received_ect1_datagrams},
-      {"receivedCeDatagrams", snapshot->media.received_ce_datagrams},
-      {"sentEct0Datagrams", snapshot->media.sent_ect0_datagrams},
-      {"ecnFallbacks", snapshot->media.ecn_fallbacks},
-      {"cachedPeerHandles", snapshot->media.cached_peer_handles},
-    };
-    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                           {"status", true},
-                                                                           {"active", snapshot->active},
-                                                                           {"port", snapshot->port},
-                                                                           {"profile", lsp_profile_name(snapshot->profile)},
-                                                                           {"pendingPairings", snapshot->pending_pairings},
-                                                                           {"reconnect", reconnect},
-                                                                           {"media", media},
-                                                                         });
-  }
-
-  /** @brief Return secret-free pending LSP PIN pairing sessions. */
-  void getLspPairing(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-    if (!lumen::lsp::runtime::administration_snapshot()) {
-      send_lsp_admin_error(
-        response,
-        SimpleWeb::StatusCode::server_error_service_unavailable,
-        "LSP runtime is unavailable"
-      );
-      return;
-    }
-    nlohmann::json pending = nlohmann::json::array();
-    for (const auto &pairing : lumen::lsp::runtime::administration_pending_pairings()) {
-      pending.push_back({
-        {"sessionId", encode_lsp_client_id(pairing.pairing_session_id)},
-        {"clientId", encode_lsp_client_id(pairing.client_id)},
-        {"identityKeyFingerprint", encode_lsp_fingerprint(pairing.identity_key_fingerprint)},
-        {"clientName", pairing.client_name},
-        {"clientNameVerified", pairing.client_name_verified},
-        {"permissions", pairing.effective_permissions.mask()},
-        {"expiresAt", pairing.expires_at_utc_seconds},
-        {"challengesUsed", pairing.challenges_used},
-        {"state", lsp_pairing_state_name(pairing.state)},
+    std::string create_session(const std::string &username) {
+      constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+      auto token = crypto::rand_alphabet(43, alphabet);
+      std::scoped_lock lock(sessions_mutex);
+      const auto now = std::chrono::steady_clock::now();
+      std::erase_if(sessions, [now](const auto &entry) {
+        return entry.second.expires <= now;
       });
-    }
-    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                           {"status", true},
-                                                                           {"pending", std::move(pending)},
-                                                                         });
-  }
-
-  /**
-   * @brief Queue one exact six-digit PIN without logging or echoing it.
-   */
-  void submitLspPairingPin(const resp_https_t &response, const req_https_t &request) {
-    LspPinRequestBodyGuard request_body_guard {request};
-    if (!check_content_type(response, request, "text/plain")) {
-      return;
-    }
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-    const auto content_length = request->header.find("Content-Length");
-    if (content_length == request->header.end() || content_length->second != "6") {
-      send_lsp_admin_error(response, SimpleWeb::StatusCode::client_error_bad_request, "PIN body must be exactly six bytes");
-      return;
-    }
-    const auto session_header = request->header.find("X-LSP-Pairing-Session");
-    const auto pairing_session_id = session_header == request->header.end() ?
-                                      std::nullopt :
-                                      decode_lsp_client_id(session_header->second);
-    if (!pairing_session_id) {
-      send_lsp_admin_error(response, SimpleWeb::StatusCode::client_error_bad_request, "A selected pairing session is required");
-      return;
-    }
-    LspPinSubmissionSecrets secrets {request};
-    if (secrets.pin.size() != 6 || std::ranges::any_of(secrets.pin, [](const char digit) {
-          return digit < '0' || digit > '9';
-        })) {
-      send_lsp_admin_error(response, SimpleWeb::StatusCode::client_error_bad_request, "PIN must contain exactly six digits");
-      return;
-    }
-    std::ranges::transform(secrets.pin, secrets.digits.begin(), [](const char digit) {
-      return static_cast<std::uint8_t>(digit);
-    });
-    const auto submitted = lumen::lsp::runtime::administration_submit_pairing_pin(*pairing_session_id, secrets.digits);
-    if (submitted == 0) {
-      send_lsp_admin_error(
-        response,
-        SimpleWeb::StatusCode::client_error_conflict,
-        "No pending LSP client can accept a PIN yet"
-      );
-      return;
-    }
-    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                           {"status", true},
-                                                                           {"submitted", submitted},
-                                                                         });
-  }
-
-  /** @brief Cancel every pending LSP PIN pairing session. */
-  void cancelLspPairing(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-    if (!lumen::lsp::runtime::administration_snapshot()) {
-      send_lsp_admin_error(
-        response,
-        SimpleWeb::StatusCode::server_error_service_unavailable,
-        "LSP runtime is unavailable"
-      );
-      return;
-    }
-    lumen::lsp::runtime::administration_cancel_pairings();
-    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
-  }
-
-  /**
-   * @brief Return persisted LSP trusted clients without identity key material.
-   *
-   * @api_examples{/api/lsp/clients| GET| null}
-   */
-  void getLspClients(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-    if (!lumen::lsp::runtime::administration_snapshot()) {
-      send_lsp_admin_error(
-        response,
-        SimpleWeb::StatusCode::server_error_service_unavailable,
-        "LSP runtime is unavailable"
-      );
-      return;
-    }
-
-    nlohmann::json clients = nlohmann::json::array();
-    for (const auto &client : lumen::lsp::runtime::administration_trusted_clients()) {
-      clients.push_back({
-        {"clientId", encode_lsp_client_id(client.client_id)},
-        {"permissions", client.permissions.mask()},
-        {"revocationGeneration", client.revocation_generation},
-        {"enabled", client.enabled},
-      });
-    }
-    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                           {"status", true},
-                                                                           {"clients", std::move(clients)},
-                                                                         });
-  }
-
-  /**
-   * @brief Atomically update one LSP trusted client's permissions and enable state.
-   *
-   * @api_examples{/api/lsp/clients| PATCH| {"clientId":"00112233445566778899aabbccddeeff","permissions":87,"enabled":true}}
-   */
-  void updateLspClient(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-
-    try {
-      std::stringstream content;
-      content << request->content.rdbuf();
-      nlohmann::json input_tree = nlohmann::json::parse(content);
-      if (!input_tree.is_object() || input_tree.size() != 3 ||
-          !input_tree.contains("clientId") || !input_tree["clientId"].is_string() ||
-          !input_tree.contains("permissions") || !input_tree["permissions"].is_number_unsigned() ||
-          !input_tree.contains("enabled") || !input_tree["enabled"].is_boolean()) {
-        bad_request(response, request, "Invalid LSP client update");
-        return;
+      if (sessions.size() >= maximum_sessions) {
+        sessions.erase(std::ranges::min_element(sessions, {}, [](const auto &entry) {
+          return entry.second.expires;
+        }));
       }
+      sessions.emplace(token, session_t {username, now + session_idle_lifetime});
+      return token;
+    }
 
-      const auto client_id = decode_lsp_client_id(input_tree["clientId"].get<std::string>());
-      const auto raw_permissions = input_tree["permissions"].get<std::uint64_t>();
-      if (!client_id || raw_permissions == 0 || raw_permissions > std::numeric_limits<std::uint32_t>::max()) {
-        bad_request(response, request, "Invalid LSP client update");
-        return;
+    std::optional<std::string> session_token(const req_t &request) {
+      const auto cookie = request->header.find("Cookie");
+      if (cookie == request->header.end()) {
+        return std::nullopt;
       }
-      const auto permissions = lumen::lsp::PermissionSet::from_mask(static_cast<std::uint32_t>(raw_permissions));
-      if (!permissions) {
-        bad_request(response, request, "Invalid LSP permission mask");
-        return;
-      }
-
-      const bool updated = lumen::lsp::runtime::administration_update_trusted_client(
-        *client_id,
-        *permissions,
-        input_tree["enabled"].get<bool>()
-      );
-      if (!updated) {
-        send_lsp_admin_error(
-          response,
-          SimpleWeb::StatusCode::client_error_not_found,
-          "LSP trusted client was not found or could not be saved"
-        );
-        return;
-      }
-      send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
-    } catch (const nlohmann::json::exception &) {
-      bad_request(response, request, "Invalid LSP client update");
-    }
-  }
-
-  /**
-   * @brief Revoke one persisted LSP trusted client.
-   *
-   * @api_examples{/api/lsp/clients| DELETE| {"clientId":"00112233445566778899aabbccddeeff"}}
-   */
-  void revokeLspClient(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-
-    try {
-      std::stringstream content;
-      content << request->content.rdbuf();
-      nlohmann::json input_tree = nlohmann::json::parse(content);
-      if (!input_tree.is_object() || input_tree.size() != 1 ||
-          !input_tree.contains("clientId") || !input_tree["clientId"].is_string()) {
-        bad_request(response, request, "Invalid LSP client revocation");
-        return;
-      }
-      const auto client_id = decode_lsp_client_id(input_tree["clientId"].get<std::string>());
-      if (!client_id) {
-        bad_request(response, request, "Invalid LSP client revocation");
-        return;
-      }
-
-      if (!lumen::lsp::runtime::administration_revoke_trusted_client(*client_id)) {
-        send_lsp_admin_error(
-          response,
-          SimpleWeb::StatusCode::client_error_not_found,
-          "LSP trusted client was not found or could not be revoked"
-        );
-        return;
-      }
-      send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
-    } catch (const nlohmann::json::exception &) {
-      bad_request(response, request, "Invalid LSP client revocation");
-    }
-  }
-
-  /** @brief Rotate the LSP DTLS certificate through authenticated client persistence and atomic swap. */
-  void rotateLspIdentity(const resp_https_t &response, const req_https_t &request) {
-    if (!authorize_lsp_administration(response, request)) {
-      return;
-    }
-    const auto result = lumen::lsp::runtime::administration_rotate_identity();
-    if (result != lumen::lsp::runtime::IdentityRotationResult::success) {
-      send_lsp_admin_error(
-        response,
-        result == lumen::lsp::runtime::IdentityRotationResult::inactive ?
-          SimpleWeb::StatusCode::client_error_conflict :
-          SimpleWeb::StatusCode::server_error_internal_server_error,
-        "LSP certificate rotation did not commit; the prior identity remains active"
-      );
-      return;
-    }
-    send_lsp_admin_response(response, SimpleWeb::StatusCode::success_ok, {{"status", true}});
-  }
-
-  /**
-   * @brief Get the configuration settings.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/config| GET| null}
-   */
-  void getConfig(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    nlohmann::json output_tree;
-    output_tree["status"] = true;
-    output_tree["platform"] = SUNSHINE_PLATFORM;
-    output_tree["version"] = PROJECT_VERSION;
-
-    auto vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
-
-    for (auto &[name, value] : vars) {
-      output_tree[name] = std::move(value);
-    }
-
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Get the locale setting. This endpoint does not require authentication.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/configLocale| GET| null}
-   */
-  void getLocale(const resp_https_t &response, const req_https_t &request) {
-    // we need to return the locale whether authenticated or not
-
-    print_req(request);
-
-    nlohmann::json output_tree;
-    output_tree["status"] = true;
-    output_tree["locale"] = config::sunshine.locale;
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Save the configuration settings.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * The body for the POST request should be JSON serialized in the following format:
-   * @code{.json}
-   * {
-   *   "key": "value"
-   * }
-   * @endcode
-   *
-   * @attention{It is recommended to ONLY save the config settings that differ from the default behavior.}
-   *
-   * @api_examples{/api/config| POST| {"key":"value"}}
-   */
-  void saveConfig(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    std::stringstream ss;
-    ss << request->content.rdbuf();
-    try {
-      // TODO: Input Validation
-      std::stringstream config_stream;
-      nlohmann::json output_tree;
-      nlohmann::json input_tree = nlohmann::json::parse(ss);
-      for (const auto &[k, v] : input_tree.items()) {
-        if (v.is_null() || (v.is_string() && v.get<std::string>().empty())) {
-          continue;
+      for (const auto part : std::views::split(std::string_view {cookie->second}, ';')) {
+        auto pair = std::string_view {part.begin(), part.end()};
+        while (!pair.empty() && pair.front() == ' ') {
+          pair.remove_prefix(1);
         }
-
-        // v.dump() will dump valid json, which we do not want for strings in the config, right now
-        // we should migrate the config file to straight JSON and get rid of all this nonsense
-        config_stream << k << " = " << (v.is_string() ? v.get<std::string>() : v.dump()) << std::endl;
-      }
-      file_handler::write_file(config::sunshine.config_file.c_str(), config_stream.str());
-      output_tree["status"] = true;
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SaveConfig: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Get an application's image.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @note{The index in the url path is the application index.}
-   *
-   * @api_examples{/api/covers/9999 | GET| null}
-   */
-  void getCover(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    try {
-      const int index = std::stoi(request->path_match[1]);
-      if (!check_app_index(response, request, index)) {
-        return;
-      }
-
-      std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      nlohmann::json file_tree = nlohmann::json::parse(file);
-      auto &apps = file_tree["apps"];
-
-      auto &app = apps[index];
-
-      // Get the image path from the app configuration
-      std::string app_image_path;
-      if (app.contains("image-path") && !app["image-path"].is_null()) {
-        app_image_path = app["image-path"];
-      }
-
-      // Use validate_app_image_path to resolve and validate the path
-      // This handles extension validation, PNG signature validation, and path resolution
-      std::string validated_path = proc::validate_app_image_path(app_image_path);
-
-      // Check if we got the default image path (means validation failed or no image configured)
-      if (validated_path == DEFAULT_APP_IMAGE_PATH) {
-        BOOST_LOG(debug) << "Application at index " << index << " does not have a valid cover image";
-        not_found(response, request, "Cover image not found");
-        return;
-      }
-
-      // Open and stream the validated file
-      std::ifstream in(validated_path, std::ios::binary);
-      if (!in) {
-        BOOST_LOG(warning) << "Unable to read cover image file: " << validated_path;
-        bad_request(response, request, "Unable to read cover image file");
-        return;
-      }
-
-      SimpleWeb::CaseInsensitiveMultimap headers;
-      headers.emplace("Content-Type", "image/png");
-      headers.emplace("X-Frame-Options", "DENY");
-      headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-
-      response->write(SimpleWeb::StatusCode::success_ok, in, headers);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "GetCover: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Upload a cover image.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * The body for the post request should be JSON serialized in the following format:
-   * @code{.json}
-   * {
-   *   "key": "igdb_<game_id>",
-   *   "url": "https://images.igdb.com/igdb/image/upload/t_cover_big_2x/<slug>.png"
-   * }
-   * @endcode
-   *
-   * @api_examples{/api/covers/upload| POST| {"key":"igdb_1234","url":"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/abc123.png"}}
-   */
-  void uploadCover(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::stringstream ss;
-    ss << request->content.rdbuf();
-    try {
-      nlohmann::json output_tree;
-      nlohmann::json input_tree = nlohmann::json::parse(ss);
-
-      std::string key = input_tree.value("key", "");
-      if (key.empty()) {
-        bad_request(response, request, "Cover key is required");
-        return;
-      }
-      std::string url = input_tree.value("url", "");
-
-      const std::string coverdir = platf::appdata().string() + "/covers/";
-      file_handler::make_directory(coverdir);
-
-      std::basic_string path = coverdir + http::url_escape(key) + ".png";
-      if (!url.empty()) {
-        if (http::url_get_host(url) != "images.igdb.com") {
-          bad_request(response, request, "Only images.igdb.com is allowed");
-          return;
-        }
-        if (!http::download_file(url, path)) {
-          bad_request(response, request, "Failed to download cover");
-          return;
-        }
-      } else {
-        auto data = SimpleWeb::Crypto::Base64::decode(input_tree.value("data", ""));
-
-        std::ofstream imgfile(path);
-        imgfile.write(data.data(), static_cast<int>(data.size()));
-      }
-      output_tree["status"] = true;
-      output_tree["path"] = path;
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "UploadCover: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Get the logs from the log file.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/logs| GET| null}
-   */
-  void getLogs(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    std::string content = file_handler::read_file(config::sunshine.log_file.c_str());
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "text/plain");
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-    response->write(SimpleWeb::StatusCode::success_ok, content, headers);
-  }
-
-  /**
-   * @brief Update existing credentials.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * The body for the post request should be JSON serialized in the following format:
-   * @code{.json}
-   * {
-   *   "currentUsername": "Current Username",
-   *   "currentPassword": "Current Password",
-   *   "newUsername": "New Username",
-   *   "newPassword": "New Password",
-   *   "confirmNewPassword": "Confirm New Password"
-   * }
-   * @endcode
-   *
-   * @api_examples{/api/password| POST| {"currentUsername":"admin","currentPassword":"admin","newUsername":"admin","newPassword":"admin","confirmNewPassword":"admin"}}
-   */
-  void savePassword(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-    if (config::sunshine.username.empty()) {
-      if (!bootstrap_allowed(request->remote_endpoint().address())) {
-        response->write(SimpleWeb::StatusCode::client_error_forbidden);
-        return;
-      }
-    } else {
-      if (!authenticate(response, request)) {
-        return;
-      }
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    std::vector<std::string> errors = {};
-    std::stringstream ss;
-    std::stringstream config_stream;
-    ss << request->content.rdbuf();
-    try {
-      // TODO: Input Validation
-      nlohmann::json output_tree;
-      nlohmann::json input_tree = nlohmann::json::parse(ss);
-      std::string username = input_tree.value("currentUsername", "");
-      std::string newUsername = input_tree.value("newUsername", "");
-      std::string password = input_tree.value("currentPassword", "");
-      std::string newPassword = input_tree.value("newPassword", "");
-      std::string confirmPassword = input_tree.value("confirmNewPassword", "");
-      if (newUsername.empty()) {
-        newUsername = username;
-      }
-      if (newUsername.empty()) {
-        errors.emplace_back("Invalid Username");
-      } else {
-        const auto password_result = http::verify_user_password(password, config::sunshine.password, config::sunshine.salt);
-        if (config::sunshine.username.empty() || (boost::iequals(username, config::sunshine.username) && password_result != http::password_verification_e::INVALID)) {
-          if (newPassword.empty() || newPassword != confirmPassword) {
-            errors.emplace_back("Password Mismatch");
-          } else {
-            http::user_credentials_t saved;
-            if (http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword, false, &saved) != 0) {
-              errors.emplace_back("Failed to save credentials");
-            } else {
-              config::sunshine.username = std::move(saved.username);
-              config::sunshine.password = std::move(saved.password);
-              config::sunshine.salt = std::move(saved.salt);
-              output_tree["status"] = true;
-            }
-          }
-        } else {
-          errors.emplace_back("Invalid Current Credentials");
+        if (pair.starts_with(session_cookie) && pair.size() > session_cookie.size() && pair[session_cookie.size()] == '=') {
+          return std::string {pair.substr(session_cookie.size() + 1)};
         }
       }
+      return std::nullopt;
+    }
 
-      if (!errors.empty()) {
-        // join the errors array
-        std::string error = std::accumulate(errors.begin(), errors.end(), std::string(), [](const std::string &a, const std::string &b) {
-          return a.empty() ? b : a + ", " + b;
-        });
-        bad_request(response, request, error);
-        return;
+    /** @brief Return the signed-in username, extending the session, or no value. */
+    std::optional<std::string> session_user(const req_t &request) {
+      const auto token = session_token(request);
+      if (!token) {
+        return std::nullopt;
       }
-
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SavePassword: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief Send a pin code to the host. The pin is generated from the Moonlight client during the pairing process.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * The body for the post request should be JSON serialized in the following format:
-   * @code{.json}
-   * {
-   *   "pin": "<pin>",
-   *   "name": "Friendly Client Name",
-   *   "requestId": "<pairing request ID>"
-   * }
-   * @endcode
-   *
-   * @api_examples{/api/pin| POST| {"pin":"1234","name":"My PC"}}
-   */
-  void savePin(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-    if (!authenticate(response, request)) {
-      return;
+      std::scoped_lock lock(sessions_mutex);
+      const auto session = sessions.find(*token);
+      const auto now = std::chrono::steady_clock::now();
+      if (session == sessions.end() || session->second.expires <= now) {
+        return std::nullopt;
+      }
+      session->second.expires = now + session_idle_lifetime;
+      return session->second.username;
     }
 
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-    if (request->content.size() > 1024) {
-      bad_request(response, request, "PIN request body is too large");
-      return;
-    }
-
-    print_req(request);
-
-    std::stringstream ss;
-    ss << request->content.rdbuf();
-    try {
-      nlohmann::json output_tree;
-      nlohmann::json input_tree = nlohmann::json::parse(ss);
-      const std::string name = input_tree.value("name", "");
-      const std::string pin = input_tree.value("pin", "");
-      const std::string request_id = input_tree.value("requestId", "");
-
-      output_tree["status"] = request_id.empty() ? nvhttp::pin(pin, name) : nvhttp::pin(pin, name, request_id);
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SavePin: "sv << e.what();
-      bad_request(response, request, e.what());
-    }
-  }
-
-  /**
-   * @brief List the opaque IDs of pairing requests currently awaiting a PIN.
-   */
-  void getPendingPairingRequests(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    nlohmann::json output_tree;
-    output_tree["requests"] = nlohmann::json::array();
-    for (const auto &pending : nvhttp::pending_pairing_requests()) {
-      output_tree["requests"].push_back({{"requestId", pending.request_id}, {"source", pending.source}, {"ageSeconds", pending.age_seconds}, {"clientFingerprint", pending.client_fingerprint}});
-    }
-    SimpleWeb::CaseInsensitiveMultimap headers;
-    headers.emplace("Content-Type", "application/json");
-    headers.emplace("X-Frame-Options", "DENY");
-    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-    headers.emplace("Cache-Control", "no-store");
-    response->write(output_tree.dump(), headers);
-  }
-
-  /**
-   * @brief Cancel one pending pairing request by opaque request ID.
-   */
-  void cancelPendingPairingRequest(const resp_https_t &response, const req_https_t &request) {
-    if (!check_content_type(response, request, "application/json")) {
-      return;
-    }
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    const std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-    if (request->content.size() > 256) {
-      bad_request(response, request, "Pairing cancellation body is too large");
-      return;
-    }
-
-    std::stringstream body;
-    body << request->content.rdbuf();
-    try {
-      const auto input_tree = nlohmann::json::parse(body);
-      const std::string request_id = input_tree.value("requestId", "");
-      nlohmann::json output_tree;
-      output_tree["status"] = nvhttp::cancel_pairing_request(request_id);
-      send_response(response, output_tree);
-    } catch (const std::exception &error) {
-      BOOST_LOG(warning) << "CancelPairingRequest: "sv << error.what();
-      bad_request(response, request, error.what());
-    }
-  }
-
-  /**
-   * @brief Reset the display device persistence.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/reset-display-device-persistence| POST| null}
-   */
-  void resetDisplayDevicePersistence(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    nlohmann::json output_tree;
-    output_tree["status"] = display_device::reset_persistence();
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Authenticate a Web UI request and restart the Sunshine process.
-   *
-   * @param response HTTP response used for authentication or CSRF failures.
-   * @param request HTTP request carrying the client identity and CSRF token.
-   *
-   * @api_examples{/api/restart| POST| null}
-   */
-  void restart(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    // We may not return from this call
-    platf::restart();
-  }
-
-  /**
-   * @brief Get ViGEmBus driver version and installation status.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/vigembus/status| GET| null}
-   */
-  void getViGEmBusStatus(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    print_req(request);
-
-    nlohmann::json output_tree;
-
-#ifdef _WIN32
-    std::string version_str;
-    bool installed = false;
-    bool version_compatible = false;
-
-    // Check if ViGEmBus driver exists
-    std::filesystem::path driver_path = std::filesystem::path(std::getenv("SystemRoot") ? std::getenv("SystemRoot") : "C:\\Windows") / "System32" / "drivers" / "ViGEmBus.sys";
-
-    if (std::filesystem::exists(driver_path)) {
-      installed = platf::getFileVersionInfo(driver_path, version_str);
-      if (installed) {
-        // Parse version string to check compatibility (>= 1.17.0.0)
-        std::vector<std::string> version_parts;
-        std::stringstream ss(version_str);
-        std::string part;
-        while (std::getline(ss, part, '.')) {
-          version_parts.push_back(part);
-        }
-
-        if (version_parts.size() >= 2) {
-          int major = std::stoi(version_parts[0]);
-          int minor = std::stoi(version_parts[1]);
-          version_compatible = (major > 1) || (major == 1 && minor >= 17);
-        }
+    void end_session(const req_t &request) {
+      if (const auto token = session_token(request)) {
+        std::scoped_lock lock(sessions_mutex);
+        sessions.erase(*token);
       }
     }
 
-    output_tree["installed"] = installed;
-    output_tree["version"] = version_str;
-    output_tree["version_compatible"] = version_compatible;
-    output_tree["packaged_version"] = VIGEMBUS_PACKAGED_VERSION;
-#else
-    output_tree["error"] = "ViGEmBus is only available on Windows";
-    output_tree["installed"] = false;
-    output_tree["version"] = "";
-    output_tree["version_compatible"] = false;
-    output_tree["packaged_version"] = "";
-#endif
-
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Return read-only Lumen Virtual Display health and active-path status.
-   * @param response HTTP response populated after authentication.
-   * @param request HTTP request carrying the dashboard credentials.
-   *
-   * @api_examples{/api/vdd/status| GET| null}
-   */
-  void getVddStatus(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
+    void end_all_sessions() {
+      std::scoped_lock lock(sessions_mutex);
+      sessions.clear();
     }
 
-    print_req(request);
+    // ---------------------------------------------------------------------------------------------
+    // Admission
 
-    nlohmann::json output_tree {
-      {"installed", false},
-      {"compatible", false},
-      {"deviceHealthy", false},
-      {"problem", nullptr},
-      {"active", false},
-      {"generation", nullptr},
-      {"mode", nullptr},
-      {"deliveryPolicy", nullptr},
-      {"directFrameBound", false},
-      {"quarantined", false},
-      {"fallback", false},
-      {"captureState", "inactive"},
-      {"diagnostic", "Lumen Virtual Display is available only on Windows."},
-    };
+    /** @brief Reject sources outside the configured network scope. */
+    bool admit_source(const resp_t &response, const req_t &request) {
+      const auto address = remote_address(request);
+      if (net::from_address(address) > http::origin_web_ui_allowed) {
+        BOOST_LOG(info) << "Admin: ["sv << address << "] denied by origin_web_ui_allowed"sv;
+        send_error(response, status_t::client_error_forbidden, "This PC doesn’t allow administration from your network.");
+        return false;
+      }
+      return true;
+    }
 
-#ifdef _WIN32
-    const auto status = platf::virtual_display::query_system_status();
-    output_tree["installed"] = status.installed;
-    output_tree["compatible"] = status.compatible;
-    output_tree["deviceHealthy"] = status.device_healthy;
-    output_tree["problem"] = status.device_problem ?
-                               nlohmann::json {*status.device_problem} :
-                               nlohmann::json {nullptr};
-    output_tree["directFrameBound"] = status.direct_frame_bound;
-    output_tree["quarantined"] = status.direct_frame_quarantined;
-    output_tree["fallback"] = status.fallback;
-    output_tree["captureState"] = std::string {platf::virtual_display::capture_path_status_name(status.capture_path)};
-    output_tree["diagnostic"] = status.diagnostic;
-    if (status.active) {
-      output_tree["active"] = true;
-      output_tree["generation"] = status.active->generation;
-      output_tree["deliveryPolicy"] =
-        status.active->delivery_policy == platf::virtual_display::delivery_policy_e::latency ?
-          "latency" :
-          "quality";
-      output_tree["mode"] = {
-        {"width", status.active->mode.width},
-        {"height", status.active->mode.height},
-        {"refreshNumerator", status.active->mode.refresh.numerator},
-        {"refreshDenominator", status.active->mode.refresh.denominator},
-        {"hdr", status.active->mode.dynamic_range == platf::virtual_display::dynamic_range_e::hdr10},
-        {"bitDepth", status.active->mode.bits_per_channel},
+    /** @brief Admit an API request: allowed source and the anti-forgery header. */
+    bool admit_api(const resp_t &response, const req_t &request) {
+      if (!admit_source(response, request)) {
+        return false;
+      }
+      const auto marker = request->header.find("X-Lumen-Request");
+      if (marker == request->header.end() || marker->second != "1") {
+        send_error(response, status_t::client_error_forbidden, "Missing X-Lumen-Request header.");
+        return false;
+      }
+      return true;
+    }
+
+    /** @brief Admit an API request that needs a signed-in administrator. */
+    bool admit_signed_in(const resp_t &response, const req_t &request) {
+      if (!admit_api(response, request)) {
+        return false;
+      }
+      if (!session_user(request)) {
+        send_error(response, status_t::client_error_unauthorized, "Sign in to continue.");
+        return false;
+      }
+      return true;
+    }
+
+    using handler_t = void (*)(const resp_t &, const req_t &);
+
+    void run_handler(const handler_t handler, const resp_t &response, const req_t &request) {
+      try {
+        handler(response, request);
+      } catch (const std::exception &failure) {
+        BOOST_LOG(error) << "Admin: "sv << request->method << ' ' << request->path << " failed: "sv << failure.what();
+        send_error(response, status_t::server_error_internal_server_error, "Lumen couldn’t complete that request.");
+      }
+    }
+
+    /** @brief Wrap a handler so it runs only for signed-in requests and never throws into the server. */
+    https_handler_t signed_in(const handler_t handler) {
+      return [handler](const resp_t &response, const req_t &request) {
+        if (admit_signed_in(response, request)) {
+          run_handler(handler, response, request);
+        }
       };
     }
-#endif
 
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Install ViGEmBus driver with elevated permissions.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   *
-   * @api_examples{/api/vigembus/install| POST| null}
-   */
-  void installViGEmBus(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
-    }
-
-    std::string client_id = get_client_id(request);
-    if (!validate_csrf_token(response, request, client_id)) {
-      return;
-    }
-
-    print_req(request);
-
-    nlohmann::json output_tree;
-
-#ifdef _WIN32
-    // Get the path to the packaged ViGEmBus installer.
-    const std::filesystem::path installer_path = platf::appdata().parent_path() / "third-party" / "vigembus_installer.exe";
-
-    if (!std::filesystem::exists(installer_path)) {
-      output_tree["status"] = false;
-      output_tree["error"] = "ViGEmBus installer not found";
-      send_response(response, output_tree);
-      return;
-    }
-
-    // Run the installer with elevated permissions
-    std::error_code ec;
-    boost::filesystem::path working_dir = boost::filesystem::path(installer_path.string()).parent_path();
-    boost::process::v1::environment env = boost::this_process::environment();
-
-    // Run with elevated permissions, non-interactive
-    const std::string install_cmd = std::format("{} /quiet", installer_path.string());
-    auto child = platf::run_command(true, false, install_cmd, working_dir, env, nullptr, ec, nullptr);
-
-    if (ec) {
-      output_tree["status"] = false;
-      output_tree["error"] = "Failed to start installer: " + ec.message();
-      send_response(response, output_tree);
-      return;
-    }
-
-    // Wait for the installer to complete
-    child.wait(ec);
-
-    if (ec) {
-      output_tree["status"] = false;
-      output_tree["error"] = "Installer failed: " + ec.message();
-    } else {
-      int exit_code = child.exit_code();
-      output_tree["status"] = (exit_code == 0);
-      output_tree["exit_code"] = exit_code;
-      if (exit_code != 0) {
-        output_tree["error"] = std::format("Installer exited with code {}", exit_code);
-      }
-    }
-#else
-    output_tree["status"] = false;
-    output_tree["error"] = "ViGEmBus installation is only available on Windows";
-#endif
-
-    send_response(response, output_tree);
-  }
-
-  /**
-   * @brief Checks whether a directory entry qualifies as an executable file.
-   * @param entry The directory entry to check.
-   * @param status The cached file status for the entry.
-   * @return True if the file should be included in an executable-type listing.
-   */
-  bool is_browsable_executable([[maybe_unused]] const fs::directory_entry &entry, [[maybe_unused]] const fs::file_status &status) {
-#ifdef _WIN32
-    auto ext = entry.path().extension().string();
-    boost::algorithm::to_lower(ext);
-    return ext == ".exe" || ext == ".bat" || ext == ".cmd" || ext == ".com" || ext == ".ps1";
-#else
-    const auto perms = status.permissions();
-    return (perms & fs::perms::owner_exec) != fs::perms::none ||
-           (perms & fs::perms::group_exec) != fs::perms::none ||
-           (perms & fs::perms::others_exec) != fs::perms::none;
-#endif
-  }
-
-#ifdef _WIN32
-  /**
-   * @brief Builds a JSON array of available Windows drive letters.
-   * @return JSON array of drive-letter entries.
-   */
-  nlohmann::json get_windows_drives() {
-    nlohmann::json entries = nlohmann::json::array();
-    const DWORD drives = GetLogicalDrives();
-    for (int i = 0; i < 26; ++i) {
-      if (drives & (1 << i)) {
-        const auto drive_letter = static_cast<char>('A' + i);
-        const auto drive_path = std::string(1, drive_letter) + ":\\";
-        nlohmann::json entry;
-        entry["name"] = drive_path;
-        entry["type"] = "directory";
-        entry["path"] = drive_path;
-        entries.push_back(entry);
-      }
-    }
-    return entries;
-  }
-#endif
-
-  /**
-   * @brief Lists, filters, and sorts the entries of a directory for the browse API.
-   * @param dir_path The directory to list.
-   * @param type_str Filter type: "directory", "executable", "file", or "any".
-   * @return Sorted JSON array of entry objects with name/type/path fields.
-   */
-  nlohmann::json build_browse_entries(const fs::path &dir_path, const std::string &type_str) {
-    nlohmann::json entries = nlohmann::json::array();
-
-    std::error_code iter_ec;
-    for (auto it = fs::directory_iterator(dir_path, fs::directory_options::skip_permission_denied, iter_ec);
-         !iter_ec && it != fs::directory_iterator();
-         it.increment(iter_ec)) {
-      try {
-        const auto status = it->status();
-        const bool is_dir = fs::is_directory(status);
-
-        if (const bool is_regular = fs::is_regular_file(status); !is_dir && !is_regular) {
-          continue;
+    /** @brief Like signed_in, for reads the browser makes without the request header. */
+    https_handler_t signed_in_read(const handler_t handler) {
+      return [handler](const resp_t &response, const req_t &request) {
+        if (!admit_source(response, request)) {
+          return;
         }
-
-        // Apply type filter (directories are always included for navigation)
-        if (type_str == "directory" && !is_dir) {
-          continue;
+        if (!session_user(request)) {
+          send_error(response, status_t::client_error_unauthorized, "Sign in to continue.");
+          return;
         }
-
-        if (type_str == "executable" && !is_dir && !is_browsable_executable(*it, status)) {
-          continue;
-        }
-
-        nlohmann::json file_entry;
-        file_entry["name"] = it->path().filename().string();
-        file_entry["path"] = it->path().string();
-        file_entry["type"] = is_dir ? "directory" : "file";
-        entries.push_back(file_entry);
-      } catch (const fs::filesystem_error &e) {
-        BOOST_LOG(debug) << "BrowseDirectory: skipping entry due to error: "sv << e.what();
-      }
+        run_handler(handler, response, request);
+      };
     }
 
-    if (iter_ec) {
-      BOOST_LOG(debug) << "BrowseDirectory: directory iteration error: "sv << iter_ec.message();
+    // ---------------------------------------------------------------------------------------------
+    // Account
+
+    bool credentials_match(const std::string &username, const std::string &password) {
+      if (!boost::iequals(username, config::general.username)) {
+        return false;
+      }
+      return http::verify_user_password(password, config::general.password, config::general.salt) !=
+             http::password_verification_e::INVALID;
     }
 
-    // Sort: directories first, then files; both case-insensitively alphabetical
-    std::sort(entries.begin(), entries.end(), [](const nlohmann::json &a, const nlohmann::json &b) {
-      const bool a_dir = (a["type"] == "directory");
-      if (const bool b_dir = (b["type"] == "directory"); a_dir != b_dir) {
-        return a_dir && !b_dir;
+    bool save_credentials(const std::string &username, const std::string &password) {
+      http::user_credentials_t saved;
+      if (http::save_user_creds(config::general.credentials_file, username, password, false, &saved) != 0) {
+        return false;
       }
-      auto a_name = a["name"].get<std::string>();
-      auto b_name = b["name"].get<std::string>();
-      boost::algorithm::to_lower(a_name);
-      boost::algorithm::to_lower(b_name);
-      return a_name < b_name;
-    });
-
-    return entries;
-  }
-
-  /**
-   * @brief Browse the server filesystem.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @note On Windows, an empty or root path returns the list of available drive letters.
-   * @note On non-Windows, an empty path defaults to the filesystem root ("/").
-   *
-   * @api_examples{/api/browse?path=/home/user&type=directory| GET| null}
-   */
-  void browseDirectory(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
-      return;
+      config::general.username = std::move(saved.username);
+      config::general.password = std::move(saved.password);
+      config::general.salt = std::move(saved.salt);
+      return true;
     }
 
-    print_req(request);
+    void sign_in_response(const resp_t &response, const std::string &username, const status_t status = status_t::success_ok) {
+      const auto token = create_session(username);
+      send_json(
+        response,
+        status,
+        {{"username", username}},
+        {{"Set-Cookie", cookie_header(token, std::chrono::duration_cast<std::chrono::seconds>(session_idle_lifetime))}}
+      );
+    }
 
-    try {
-      const auto query_params = request->parse_query_string();
-
-      std::string path_str;
-      if (const auto path_it = query_params.find("path"); path_it != query_params.end()) {
-        path_str = path_it->second;
-      }
-
-      std::string type_str = "any";
-      if (const auto type_it = query_params.find("type"); type_it != query_params.end() && !type_it->second.empty()) {
-        type_str = type_it->second;
-      }
-
-      nlohmann::json output_tree;
-
-#ifdef _WIN32
-      // On Windows with an empty or root path, return the list of available drive letters
-      if (path_str.empty() || path_str == "/" || path_str == "\\") {
-        output_tree["path"] = "";
-        output_tree["parent"] = "";
-        output_tree["entries"] = get_windows_drives();
-        send_response(response, output_tree);
+    void get_setup(const resp_t &response, const req_t &request) {
+      if (!admit_api(response, request)) {
         return;
       }
-#else
-      // On non-Windows, default an empty path to the filesystem root
-      if (path_str.empty()) {
-        path_str = "/";
+      send_ok(response, {{"required", config::general.username.empty()}});
+    }
+
+    void post_setup(const resp_t &response, const req_t &request) {
+      if (!admit_api(response, request)) {
+        return;
       }
-#endif
+      if (!config::general.username.empty()) {
+        send_error(response, status_t::client_error_conflict, "Lumen already has an administrator.");
+        return;
+      }
+      if (!bootstrap_allowed(request->remote_endpoint().address())) {
+        send_error(response, status_t::client_error_forbidden, "Set up Lumen from a browser on this PC.");
+        return;
+      }
+      const auto body = json_body(response, request);
+      if (!body) {
+        return;
+      }
+      const auto username = body->value("username", ""s);
+      const auto password = body->value("password", ""s);
+      if (username.empty() || password.empty()) {
+        send_error(response, status_t::client_error_bad_request, "Enter a username and password.");
+        return;
+      }
+      if (!save_credentials(username, password)) {
+        send_error(response, status_t::server_error_internal_server_error, "The account wasn’t saved.");
+        return;
+      }
+      BOOST_LOG(info) << "Admin: created administrator account"sv;
+      sign_in_response(response, config::general.username, status_t::success_created);
+    }
 
-      // Normalize the path
-      fs::path dir_path = fs::weakly_canonical(fs::path(path_str));
+    void get_session(const resp_t &response, const req_t &request) {
+      if (!admit_api(response, request)) {
+        return;
+      }
+      const auto username = session_user(request);
+      if (!username) {
+        send_error(response, status_t::client_error_unauthorized, "Sign in to continue.");
+        return;
+      }
+      send_ok(response, {{"username", *username}});
+    }
 
-      // If the path points to a file, use its parent directory
-      std::error_code ec;
-      if (fs::is_regular_file(dir_path, ec)) {
-        dir_path = dir_path.parent_path();
+    void post_session(const resp_t &response, const req_t &request) {
+      if (!admit_api(response, request)) {
+        return;
+      }
+      if (config::general.username.empty()) {
+        send_error(response, status_t::client_error_conflict, "Create an administrator account first.");
+        return;
+      }
+      const auto address = request->remote_endpoint().address();
+      if (login_throttle.is_blocked(address)) {
+        send_error(response, status_t::client_error_too_many_requests, "Too many attempts. Try again in a few minutes.");
+        return;
+      }
+      const auto body = json_body(response, request);
+      if (!body) {
+        return;
+      }
+      const auto username = body->value("username", ""s);
+      const auto password = body->value("password", ""s);
+      const auto result = http::verify_user_password(password, config::general.password, config::general.salt);
+      if (!boost::iequals(username, config::general.username) || result == http::password_verification_e::INVALID) {
+        login_throttle.record_failure(address);
+        BOOST_LOG(info) << "Admin: ["sv << remote_address(request) << "] sign-in failed"sv;
+        send_error(response, status_t::client_error_unauthorized, "The username or password is incorrect.");
+        return;
+      }
+      login_throttle.record_success(address);
+      if (result == http::password_verification_e::LEGACY) {
+        save_credentials(config::general.username, password);
+      }
+      sign_in_response(response, config::general.username);
+    }
+
+    void delete_session(const resp_t &response, const req_t &request) {
+      if (!admit_api(response, request)) {
+        return;
+      }
+      end_session(request);
+      send_no_content(response, {{"Set-Cookie", cookie_header("", 0s)}});
+    }
+
+    void put_account(const resp_t &response, const req_t &request) {
+      const auto body = json_body(response, request);
+      if (!body) {
+        return;
+      }
+      const auto current_password = body->value("currentPassword", ""s);
+      const auto username = body->value("username", ""s);
+      const auto password = body->value("password", ""s);
+      if (!credentials_match(config::general.username, current_password)) {
+        send_error(response, status_t::client_error_forbidden, "The current password is incorrect.");
+        return;
+      }
+      if (username.empty() || password.empty()) {
+        send_error(response, status_t::client_error_bad_request, "Enter a username and password.");
+        return;
+      }
+      if (!save_credentials(username, password)) {
+        send_error(response, status_t::server_error_internal_server_error, "The account wasn’t saved.");
+        return;
+      }
+      // Other browsers signed in with the old credentials must sign in again.
+      end_all_sessions();
+      sign_in_response(response, config::general.username);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Permissions and identifiers
+
+    struct permission_name_t {
+      lumen::lsp::Permission permission;
+      std::string_view name;
+    };
+
+    constexpr std::array permission_names {
+      permission_name_t {lumen::lsp::Permission::browse_applications, "browse"sv},
+      permission_name_t {lumen::lsp::Permission::start_attach, "start"sv},
+      permission_name_t {lumen::lsp::Permission::input, "input"sv},
+      permission_name_t {lumen::lsp::Permission::microphone, "microphone"sv},
+      permission_name_t {lumen::lsp::Permission::stop_own_stream, "stop"sv},
+      permission_name_t {lumen::lsp::Permission::quit_application, "quit"sv},
+      permission_name_t {lumen::lsp::Permission::controller_output, "controller-output"sv},
+      permission_name_t {lumen::lsp::Permission::clipboard, "clipboard"sv},
+    };
+
+    json permission_list(const lumen::lsp::PermissionSet permissions) {
+      auto list = json::array();
+      for (const auto &[permission, name] : permission_names) {
+        if ((permissions.mask() & static_cast<std::uint32_t>(permission)) != 0) {
+          list.push_back(name);
+        }
+      }
+      return list;
+    }
+
+    std::optional<lumen::lsp::PermissionSet> permissions_from(const json &list) {
+      if (!list.is_array()) {
+        return std::nullopt;
+      }
+      std::uint32_t mask = 0;
+      for (const auto &entry : list) {
+        if (!entry.is_string()) {
+          return std::nullopt;
+        }
+        const auto match = std::ranges::find(permission_names, entry.get<std::string>(), &permission_name_t::name);
+        if (match == permission_names.end()) {
+          return std::nullopt;
+        }
+        mask |= static_cast<std::uint32_t>(match->permission);
+      }
+      return lumen::lsp::PermissionSet::from_mask(mask);
+    }
+
+    template<std::size_t Size>
+    std::string to_hex(const std::array<std::uint8_t, Size> &bytes) {
+      constexpr std::string_view digits = "0123456789abcdef";
+      std::string encoded(bytes.size() * 2, '0');
+      for (std::size_t index = 0; index < bytes.size(); ++index) {
+        encoded[index * 2] = digits[bytes[index] >> 4U];
+        encoded[index * 2 + 1] = digits[bytes[index] & 0x0fU];
+      }
+      return encoded;
+    }
+
+    std::optional<lumen::lsp::Identifier128> identifier_from_hex(const std::string_view encoded) {
+      lumen::lsp::Identifier128 identifier {};
+      if (encoded.size() != identifier.size() * 2) {
+        return std::nullopt;
+      }
+      const auto nibble = [](const char value) -> int {
+        if (value >= '0' && value <= '9') {
+          return value - '0';
+        }
+        if (value >= 'a' && value <= 'f') {
+          return value - 'a' + 10;
+        }
+        return -1;
+      };
+      for (std::size_t index = 0; index < identifier.size(); ++index) {
+        const auto high = nibble(encoded[index * 2]);
+        const auto low = nibble(encoded[index * 2 + 1]);
+        if (high < 0 || low < 0) {
+          return std::nullopt;
+        }
+        identifier[index] = static_cast<std::uint8_t>((high << 4) | low);
+      }
+      return lumen::lsp::is_zero(identifier) ? std::nullopt : std::optional {identifier};
+    }
+
+    std::uint64_t unix_seconds(const std::chrono::system_clock::time_point time) {
+      return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(time.time_since_epoch()).count());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Status
+
+    std::atomic<bool> restart_required {false};  ///< Settings changed since this process started.
+
+    void get_status(const resp_t &response, const req_t &) {
+      const auto snapshot = lumen::lsp::runtime::administration_snapshot();
+      json stream = nullptr;
+      if (const auto running = proc::proc.running(); running > 0) {
+        const auto &apps = proc::proc.get_apps();
+        const auto app = std::ranges::find(apps, std::to_string(running), &proc::ctx_t::id);
+        const auto started = proc::proc.started_at();
+        stream = {
+          {"appName", app == apps.end() ? proc::proc.get_last_run_app_name() : app->name},
+          {"startedAt", started ? json(unix_seconds(*started)) : json(nullptr)},
+        };
+      }
+      send_ok(response, {
+                          {"hostName", config::nvhttp.host_name},
+                          {"version", PROJECT_VERSION},
+                          {"lsp",
+                           {
+                             {"enabled", config::lsp.enabled},
+                             {"listening", snapshot && snapshot->active},
+                             {"port", snapshot ? snapshot->port : config::lsp.port},
+                           }},
+                          {"stream", stream},
+                          {"restartRequired", restart_required.load()},
+                        });
+    }
+
+    void post_stream_stop(const resp_t &response, const req_t &) {
+      proc::proc.terminate();
+      send_no_content(response);
+    }
+
+    void post_restart(const resp_t &response, const req_t &) {
+      send_no_content(response);
+      // Give the response time to leave before the process restarts.
+      std::thread([] {
+        std::this_thread::sleep_for(300ms);
+        platf::restart();
+      }).detach();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Pairing
+
+    std::string_view pairing_state(const lumen::lsp::runtime::PairingAdministrationState state) {
+      using lumen::lsp::runtime::PairingAdministrationState;
+      switch (state) {
+        case PairingAdministrationState::awaiting_pin:
+          return "awaiting-pin"sv;
+        case PairingAdministrationState::deriving:
+          return "verifying"sv;
+        case PairingAdministrationState::challenge_ready:
+          return "ready"sv;
+        case PairingAdministrationState::cooldown:
+          return "cooldown"sv;
+      }
+      return "awaiting-pin"sv;
+    }
+
+    void get_pairing(const resp_t &response, const req_t &) {
+      auto requests = json::array();
+      for (const auto &pairing : lumen::lsp::runtime::administration_pending_pairings()) {
+        requests.push_back({
+          {"id", to_hex(pairing.pairing_session_id)},
+          {"deviceName", pairing.client_name},
+          {"nameVerified", pairing.client_name_verified},
+          {"fingerprint", to_hex(pairing.identity_key_fingerprint)},
+          {"permissions", permission_list(pairing.effective_permissions)},
+          {"expiresAt", pairing.expires_at_utc_seconds},
+          {"state", pairing_state(pairing.state)},
+        });
+      }
+      send_ok(response, {{"requests", std::move(requests)}});
+    }
+
+    /** @brief Wipe the request buffer that carried a PIN, on every exit path. */
+    class pin_body_guard_t {
+    public:
+      explicit pin_body_guard_t(req_t request) noexcept:
+          request_ {std::move(request)} {
       }
 
-      // If the path doesn't exist, try the parent
-      if (!fs::exists(dir_path, ec)) {
-        dir_path = dir_path.parent_path();
+      pin_body_guard_t(const pin_body_guard_t &) = delete;
+      pin_body_guard_t &operator=(const pin_body_guard_t &) = delete;
+
+      ~pin_body_guard_t() {
+        auto *buffer = dynamic_cast<boost::asio::streambuf *>(request_->content.rdbuf());
+        if (buffer == nullptr) {
+          return;
+        }
+        const auto data = buffer->data();
+        for (auto iterator = boost::asio::buffers_begin(data); iterator != boost::asio::buffers_end(data); ++iterator) {
+          const_cast<char &>(*iterator) = 0;
+        }
+        buffer->consume(buffer->size());
       }
 
-      if (!fs::is_directory(dir_path, ec)) {
-        bad_request(response, request, "Path is not a directory");
+    private:
+      req_t request_;
+    };
+
+    void post_pairing_pin(const resp_t &response, const req_t &request) {
+      pin_body_guard_t guard {request};
+      const auto session_id = identifier_from_hex(request->path_match[1].str());
+      if (!session_id) {
+        send_error(response, status_t::client_error_not_found, "That pairing request has ended.");
+        return;
+      }
+      std::array<std::uint8_t, 6> digits {};
+      auto wipe = util::fail_guard([&digits] {
+        lumen::lsp::secure_zero(digits);
+      });
+      {
+        auto *buffer = dynamic_cast<boost::asio::streambuf *>(request->content.rdbuf());
+        if (buffer == nullptr || buffer->size() != digits.size()) {
+          send_error(response, status_t::client_error_bad_request, "Enter the six-digit PIN.");
+          return;
+        }
+        const auto data = buffer->data();
+        auto iterator = boost::asio::buffers_begin(data);
+        for (auto &digit : digits) {
+          const auto character = *iterator++;
+          if (character < '0' || character > '9') {
+            send_error(response, status_t::client_error_bad_request, "Enter the six-digit PIN.");
+            return;
+          }
+          digit = static_cast<std::uint8_t>(character);
+        }
+      }
+      if (lumen::lsp::runtime::administration_submit_pairing_pin(*session_id, digits) == 0) {
+        send_error(response, status_t::client_error_conflict, "That pairing request has ended or isn’t ready for a PIN.");
+        return;
+      }
+      send_no_content(response);
+    }
+
+    void delete_pairing(const resp_t &response, const req_t &request) {
+      const auto session_id = identifier_from_hex(request->path_match[1].str());
+      if (!session_id || !lumen::lsp::runtime::administration_cancel_pairing(*session_id)) {
+        send_error(response, status_t::client_error_not_found, "That pairing request has already ended.");
+        return;
+      }
+      send_no_content(response);
+    }
+
+    void post_pairing_gamestream(const resp_t &response, const req_t &request) {
+      const auto body = json_body(response, request);
+      if (!body) {
+        return;
+      }
+      auto pin = body->value("pin", ""s);
+      auto name = body->value("name", ""s);
+      auto wipe = util::fail_guard([&pin] {
+        lumen::lsp::secure_zero(std::span<char> {pin.data(), pin.size()});
+      });
+      if (pin.size() != 4 || !std::ranges::all_of(pin, [](const char c) {
+            return c >= '0' && c <= '9';
+          })) {
+        send_error(response, status_t::client_error_bad_request, "Enter the four-digit PIN shown on the device.");
+        return;
+      }
+      if (name.empty()) {
+        name = "GameStream device";
+      }
+      if (!nvhttp::pin(pin, name)) {
+        send_error(response, status_t::client_error_conflict, "No GameStream device is waiting to pair. Start pairing on the device, then try again.");
+        return;
+      }
+      send_no_content(response);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Devices
+
+    json lsp_device(const lumen::lsp::runtime::TrustedClientSummary &client) {
+      return {
+        {"id", to_hex(client.client_id)},
+        {"protocol", "lsp"},
+        {"name", client.name.empty() ? "Unnamed device"s : client.name},
+        {"enabled", client.enabled},
+        {"permissions", permission_list(client.permissions)},
+      };
+    }
+
+    std::optional<lumen::lsp::runtime::TrustedClientSummary> find_lsp_device(const lumen::lsp::Identifier128 &id) {
+      for (auto &client : lumen::lsp::runtime::administration_trusted_clients()) {
+        if (client.client_id == id) {
+          return client;
+        }
+      }
+      return std::nullopt;
+    }
+
+    std::optional<json> find_gamestream_device(const std::string_view uuid) {
+      for (const auto &client : nvhttp::get_all_clients()) {
+        if (client.value("uuid", ""s) == uuid) {
+          return json {
+            {"id", client.value("uuid", ""s)},
+            {"protocol", "gamestream"},
+            {"name", client.value("name", ""s)},
+            {"enabled", client.value("enabled", true)},
+            {"permissions", nullptr},
+          };
+        }
+      }
+      return std::nullopt;
+    }
+
+    void get_devices(const resp_t &response, const req_t &) {
+      auto devices = json::array();
+      for (const auto &client : lumen::lsp::runtime::administration_trusted_clients()) {
+        devices.push_back(lsp_device(client));
+      }
+      for (const auto &client : nvhttp::get_all_clients()) {
+        if (auto device = find_gamestream_device(client.value("uuid", ""s))) {
+          devices.push_back(std::move(*device));
+        }
+      }
+      send_ok(response, {{"devices", std::move(devices)}});
+    }
+
+    /** @brief End a GameStream device's sessions after its access was removed or disabled. */
+    void end_gamestream_sessions(const std::string &certificate) {
+      rtsp_stream::terminate_sessions_by_cert(certificate);
+      if (!rtsp_stream::has_session_or_pending_launch() && proc::proc.running() > 0) {
+        proc::proc.terminate_if_owned_by_certificate(certificate);
+      }
+    }
+
+    void patch_device(const resp_t &response, const req_t &request) {
+      const auto protocol = request->path_match[1].str();
+      const auto id = request->path_match[2].str();
+      const auto body = json_body(response, request);
+      if (!body) {
+        return;
+      }
+      const auto name = body->contains("name") && (*body)["name"].is_string() ? std::optional {(*body)["name"].get<std::string>()} : std::nullopt;
+      const auto enabled = body->contains("enabled") && (*body)["enabled"].is_boolean() ? std::optional {(*body)["enabled"].get<bool>()} : std::nullopt;
+      if (name && (name->empty() || name->size() > 64)) {
+        send_error(response, status_t::client_error_bad_request, "Names must be 1 to 64 characters.");
         return;
       }
 
-      output_tree["path"] = dir_path.string();
+      if (protocol == "lsp") {
+        const auto client_id = identifier_from_hex(id);
+        const auto current = client_id ? find_lsp_device(*client_id) : std::nullopt;
+        if (!current) {
+          send_error(response, status_t::client_error_not_found, "That device is no longer paired.");
+          return;
+        }
+        auto permissions = current->permissions;
+        if (body->contains("permissions")) {
+          const auto requested = permissions_from((*body)["permissions"]);
+          if (!requested) {
+            send_error(response, status_t::client_error_bad_request, "A device needs at least one permission.");
+            return;
+          }
+          permissions = *requested;
+        }
+        const bool access_changed = permissions != current->permissions || (enabled && *enabled != current->enabled);
+        if (access_changed &&
+            !lumen::lsp::runtime::administration_update_trusted_client(*client_id, permissions, enabled.value_or(current->enabled))) {
+          send_error(response, status_t::server_error_internal_server_error, "The change wasn’t saved.");
+          return;
+        }
+        if (name && !lumen::lsp::runtime::administration_rename_trusted_client(*client_id, *name)) {
+          send_error(response, status_t::server_error_internal_server_error, "The name wasn’t saved.");
+          return;
+        }
+        send_ok(response, lsp_device(*find_lsp_device(*client_id)));
+        return;
+      }
 
-      // Determine the parent path for the "Up" navigation
-      const fs::path parent = dir_path.parent_path();
-#ifdef _WIN32
-      // At a drive root (e.g., C:\) the parent equals itself; signal the drive list with an empty string
-      output_tree["parent"] = (parent == dir_path) ? "" : parent.string();
-#else
-      output_tree["parent"] = parent.string();
-#endif
-
-      output_tree["entries"] = build_browse_entries(dir_path, type_str);
-      send_response(response, output_tree);
-    } catch (const fs::filesystem_error &e) {
-      BOOST_LOG(warning) << "BrowseDirectory: "sv << e.what();
-      bad_request(response, request, e.what());
+      if (!find_gamestream_device(id)) {
+        send_error(response, status_t::client_error_not_found, "That device is no longer paired.");
+        return;
+      }
+      if (enabled) {
+        const auto certificate = nvhttp::set_client_enabled_with_certificate(id, *enabled);
+        if (!certificate) {
+          send_error(response, status_t::server_error_internal_server_error, "The change wasn’t saved.");
+          return;
+        }
+        if (!*enabled) {
+          end_gamestream_sessions(*certificate);
+        }
+      }
+      if (name && !nvhttp::rename_client(id, *name)) {
+        send_error(response, status_t::server_error_internal_server_error, "The name wasn’t saved.");
+        return;
+      }
+      send_ok(response, *find_gamestream_device(id));
     }
-  }
 
-  /**
-   * @brief Start the HTTPS configuration server.
-   */
+    void delete_device(const resp_t &response, const req_t &request) {
+      const auto protocol = request->path_match[1].str();
+      const auto id = request->path_match[2].str();
+      if (protocol == "lsp") {
+        const auto client_id = identifier_from_hex(id);
+        if (!client_id || !lumen::lsp::runtime::administration_revoke_trusted_client(*client_id)) {
+          send_error(response, status_t::client_error_not_found, "That device is no longer paired.");
+          return;
+        }
+        send_no_content(response);
+        return;
+      }
+      const auto certificate = nvhttp::revoke_client(id);
+      if (!certificate) {
+        send_error(response, status_t::client_error_not_found, "That device is no longer paired.");
+        return;
+      }
+      end_gamestream_sessions(*certificate);
+      send_no_content(response);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Apps
+    //
+    // Apps live in apps.json. Each entry stores a stable numeric "id" so renaming an app or
+    // changing its image doesn't change the ID clients cached. Files written before IDs were
+    // stored get the IDs clients already know, the ones Lumen derived when it loaded them.
+
+    std::mutex apps_mutex;  ///< Serializes read-modify-write of apps.json.
+
+    json read_apps_file() {
+      auto file = json::parse(file_handler::read_file(config::stream.file_apps.c_str()), nullptr, false);
+      if (!file.is_object()) {
+        file = json::object();
+      }
+      if (!file.contains("apps") || !file["apps"].is_array()) {
+        file["apps"] = json::array();
+      }
+      if (!file.contains("env") || !file["env"].is_object()) {
+        file["env"] = json::object();
+      }
+      return file;
+    }
+
+    void write_apps_file(const json &file) {
+      if (file_handler::write_file(config::stream.file_apps.c_str(), file.dump(2)) != 0) {
+        throw std::runtime_error("couldn't write apps.json");
+      }
+      proc::refresh(config::stream.file_apps);
+    }
+
+    std::string new_app_id(const json &apps) {
+      std::set<std::string> used;
+      for (const auto &app : apps) {
+        used.insert(app.value("id", ""s));
+      }
+      std::random_device device;
+      std::uniform_int_distribution<std::int32_t> distribution {1, std::numeric_limits<std::int32_t>::max()};
+      for (;;) {
+        if (auto id = std::to_string(distribution(device)); !used.contains(id)) {
+          return id;
+        }
+      }
+    }
+
+    /** @brief Load apps.json and persist an ID for any app that lacks one. */
+    json load_apps() {
+      auto file = read_apps_file();
+      auto &apps = file["apps"];
+      const auto &loaded = proc::proc.get_apps();
+      bool changed = false;
+      for (std::size_t index = 0; index < apps.size(); ++index) {
+        auto &app = apps[index];
+        if (app.contains("id") && app["id"].is_string() && proc::is_valid_app_id(app["id"].get<std::string>())) {
+          continue;
+        }
+        app["id"] = loaded.size() == apps.size() ? loaded[index].id : new_app_id(apps);
+        changed = true;
+      }
+      if (changed) {
+        write_apps_file(file);
+      }
+      return file;
+    }
+
+    json app_json(const json &stored) {
+      const auto id = stored.value("id", ""s);
+      const auto &loaded = proc::proc.get_apps();
+      const auto app = std::ranges::find(loaded, id, &proc::ctx_t::id);
+      auto kind = "app"sv;
+      bool has_image = false;
+      if (app != loaded.end()) {
+        switch (proc::app_kind(*app)) {
+          case proc::app_kind_e::desktop:
+            kind = "desktop"sv;
+            break;
+          case proc::app_kind_e::steam:
+            kind = "steam"sv;
+            break;
+          case proc::app_kind_e::app:
+            break;
+        }
+        has_image = proc::custom_image_path(*app).has_value();
+      }
+      auto prep = json::array();
+      for (const auto &command : stored.value("prep-cmd", json::array())) {
+        prep.push_back({
+          {"do", command.value("do", ""s)},
+          {"undo", command.value("undo", ""s)},
+          {"elevated", command.value("elevated", false)},
+        });
+      }
+      return {
+        {"id", id},
+        {"name", stored.value("name", ""s)},
+        {"kind", kind},
+        {"command", stored.value("cmd", ""s)},
+        {"workingDirectory", stored.value("working-dir", ""s)},
+        {"hasImage", has_image},
+        {"prepCommands", std::move(prep)},
+        {"detachedCommands", stored.value("detached", json::array())},
+        {"elevated", stored.value("elevated", false)},
+        {"autoDetach", stored.value("auto-detach", true)},
+        {"waitAll", stored.value("wait-all", true)},
+        {"exitTimeoutSeconds", stored.value("exit-timeout", 5)},
+        {"excludeGlobalPrepCommands", stored.value("exclude-global-prep-cmd", false)},
+        {"running", proc::proc.running() > 0 && std::to_string(proc::proc.running()) == id},
+      };
+    }
+
+    /** @brief Copy an API app into its stored form, keeping stored keys the API doesn't manage. */
+    std::optional<std::string> apply_app_input(const json &input, json &stored) {
+      const auto string_field = [&](const char *name) -> std::optional<std::string> {
+        return input.contains(name) && input[name].is_string() ? std::optional {input[name].get<std::string>()} : std::nullopt;
+      };
+      const auto name = string_field("name");
+      if (!name || boost::trim_copy(*name).empty()) {
+        return "Enter a name."s;
+      }
+      stored["name"] = boost::trim_copy(*name);
+      stored["cmd"] = string_field("command").value_or("");
+      stored["working-dir"] = string_field("workingDirectory").value_or("");
+      auto prep = json::array();
+      for (const auto &command : input.value("prepCommands", json::array())) {
+        if (!command.is_object()) {
+          return "A preparation command isn’t valid."s;
+        }
+        prep.push_back({
+          {"do", command.value("do", ""s)},
+          {"undo", command.value("undo", ""s)},
+          {"elevated", command.value("elevated", false)},
+        });
+      }
+      stored["prep-cmd"] = std::move(prep);
+      auto detached = json::array();
+      for (const auto &command : input.value("detachedCommands", json::array())) {
+        if (!command.is_string()) {
+          return "A background command isn’t valid."s;
+        }
+        if (!command.get<std::string>().empty()) {
+          detached.push_back(command);
+        }
+      }
+      stored["detached"] = std::move(detached);
+      stored["elevated"] = input.value("elevated", false);
+      stored["auto-detach"] = input.value("autoDetach", true);
+      stored["wait-all"] = input.value("waitAll", true);
+      const auto timeout = input.value("exitTimeoutSeconds", 5);
+      if (timeout < 0 || timeout > 3600) {
+        return "The exit timeout must be 0 to 3600 seconds."s;
+      }
+      stored["exit-timeout"] = timeout;
+      stored["exclude-global-prep-cmd"] = input.value("excludeGlobalPrepCommands", false);
+      return std::nullopt;
+    }
+
+    json *find_stored_app(json &file, const std::string &id) {
+      for (auto &app : file["apps"]) {
+        if (app.value("id", ""s) == id) {
+          return &app;
+        }
+      }
+      return nullptr;
+    }
+
+    void get_apps(const resp_t &response, const req_t &) {
+      std::scoped_lock lock(apps_mutex);
+      const auto file = load_apps();
+      auto apps = json::array();
+      for (const auto &app : file["apps"]) {
+        apps.push_back(app_json(app));
+      }
+      send_ok(response, {{"apps", std::move(apps)}});
+    }
+
+    void post_app(const resp_t &response, const req_t &request) {
+      const auto body = json_body(response, request);
+      if (!body) {
+        return;
+      }
+      std::scoped_lock lock(apps_mutex);
+      auto file = load_apps();
+      json stored = json::object();
+      if (const auto problem = apply_app_input(*body, stored)) {
+        send_error(response, status_t::client_error_bad_request, *problem);
+        return;
+      }
+      stored["id"] = new_app_id(file["apps"]);
+      file["apps"].push_back(stored);
+      write_apps_file(file);
+      send_json(response, status_t::success_created, app_json(stored));
+    }
+
+    void put_app(const resp_t &response, const req_t &request) {
+      const auto body = json_body(response, request);
+      if (!body) {
+        return;
+      }
+      std::scoped_lock lock(apps_mutex);
+      auto file = load_apps();
+      auto *stored = find_stored_app(file, request->path_match[1].str());
+      if (stored == nullptr) {
+        send_error(response, status_t::client_error_not_found, "That app was removed.");
+        return;
+      }
+      if (const auto problem = apply_app_input(*body, *stored)) {
+        send_error(response, status_t::client_error_bad_request, *problem);
+        return;
+      }
+      const auto updated = *stored;
+      write_apps_file(file);
+      send_ok(response, app_json(updated));
+    }
+
+    fs::path covers_directory() {
+      return platf::appdata() / "covers";
+    }
+
+    /** @brief Delete an image file only if Lumen created it for an app. */
+    void remove_owned_image(const std::string &image_path) {
+      if (image_path.empty()) {
+        return;
+      }
+      std::error_code error;
+      const auto image = fs::weakly_canonical(image_path, error);
+      if (!error && image.parent_path() == fs::weakly_canonical(covers_directory(), error) && !error) {
+        fs::remove(image, error);
+      }
+    }
+
+    void delete_app(const resp_t &response, const req_t &request) {
+      std::scoped_lock lock(apps_mutex);
+      auto file = load_apps();
+      auto &apps = file["apps"];
+      const auto id = request->path_match[1].str();
+      const auto app = std::ranges::find_if(apps, [&id](const json &candidate) {
+        return candidate.value("id", ""s) == id;
+      });
+      if (app == apps.end()) {
+        send_error(response, status_t::client_error_not_found, "That app was already removed.");
+        return;
+      }
+      const auto image = app->value("image-path", ""s);
+      apps.erase(app);
+      write_apps_file(file);
+      remove_owned_image(image);
+      send_no_content(response);
+    }
+
+    void get_app_image(const resp_t &response, const req_t &request) {
+      const auto id = request->path_match[1].str();
+      const auto &loaded = proc::proc.get_apps();
+      const auto app = std::ranges::find(loaded, id, &proc::ctx_t::id);
+      const auto image = app == loaded.end() ? std::nullopt : proc::custom_image_path(*app);
+      std::ifstream file;
+      if (image) {
+        file.open(*image, std::ios::binary);
+      }
+      if (!file) {
+        send_error(response, status_t::client_error_not_found, "This app has no image.");
+        return;
+      }
+      auto headers = base_headers("image/png");
+      headers.erase("Cache-Control");
+      headers.emplace("Cache-Control", "no-cache");
+      response->write(status_t::success_ok, file, headers);
+    }
+
+    void put_app_image(const resp_t &response, const req_t &request) {
+      const auto content_type = request->header.find("Content-Type");
+      if (content_type == request->header.end() || !boost::iequals(content_type->second, "image/png")) {
+        send_error(response, status_t::client_error_unsupported_media_type, "Choose a PNG image.");
+        return;
+      }
+      const auto bytes = body_of(request);
+      constexpr std::string_view png_signature = "\x89PNG\r\n\x1a\n";
+      if (!bytes.starts_with(png_signature)) {
+        send_error(response, status_t::client_error_bad_request, "Choose a PNG image.");
+        return;
+      }
+      std::scoped_lock lock(apps_mutex);
+      auto file = load_apps();
+      const auto id = request->path_match[1].str();
+      auto *stored = find_stored_app(file, id);
+      if (stored == nullptr) {
+        send_error(response, status_t::client_error_not_found, "That app was removed.");
+        return;
+      }
+      std::error_code error;
+      fs::create_directories(covers_directory(), error);
+      const auto path = covers_directory() / ("app-" + id + ".png");
+      {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!out) {
+          send_error(response, status_t::server_error_internal_server_error, "The image wasn’t saved.");
+          return;
+        }
+      }
+      const auto previous = stored->value("image-path", ""s);
+      (*stored)["image-path"] = path.string();
+      write_apps_file(file);
+      if (previous != path.string()) {
+        remove_owned_image(previous);
+      }
+      send_no_content(response);
+    }
+
+    void delete_app_image(const resp_t &response, const req_t &request) {
+      std::scoped_lock lock(apps_mutex);
+      auto file = load_apps();
+      auto *stored = find_stored_app(file, request->path_match[1].str());
+      if (stored == nullptr) {
+        send_error(response, status_t::client_error_not_found, "That app was removed.");
+        return;
+      }
+      const auto previous = stored->value("image-path", ""s);
+      stored->erase("image-path");
+      write_apps_file(file);
+      remove_owned_image(previous);
+      send_no_content(response);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Settings
+    //
+    // Values are the configuration file's entries, typed by the matching default: a key whose
+    // default is a boolean reads as a boolean. Writing null removes the entry, restoring the default.
+
+    /** @brief Built-in values of the settings the panel presents; keys absent here are shown as text. */
+    json setting_defaults() {
+      return {
+        {"host_name", platf::get_host_name()},
+        {"system_tray", true},
+        {"min_log_level", "info"},
+        {"lsp_enabled", LUMEN_LSP_DEFAULT_ENABLED != 0},
+        {"lsp_port", 48030},
+        {"lsp_profile", "adaptive-low-latency"},
+        {"lsp_competition_capacity_mbps", 0},
+        {"port", 47989},
+        {"address_family", "ipv4"},
+        {"bind_address", ""},
+        {"upnp", false},
+        {"external_ip", ""},
+        {"origin_web_ui_allowed", "lan"},
+        {"encoder", ""},
+        {"adapter_name", ""},
+        {"output_name", ""},
+        {"max_bitrate", 0},
+        {"minimum_fps_target", 0},
+        {"lumen_vdd_policy", "optional"},
+        {"dd_configuration_option", "disabled"},
+        {"dd_resolution_option", "auto"},
+        {"dd_refresh_rate_option", "auto"},
+        {"dd_hdr_option", "auto"},
+        {"nvenc_preset", 1},
+        {"nvenc_twopass", "quarter_res"},
+        {"nvenc_spatial_aq", false},
+        {"nvenc_latency_over_power", true},
+        {"stream_audio", true},
+        {"audio_sink", ""},
+        {"virtual_sink", ""},
+        {"client_microphone", false},
+        {"client_microphone_sink", "steam"},
+        {"keyboard", true},
+        {"mouse", true},
+        {"controller", true},
+        {"gamepad_backend", "auto"},
+        {"high_resolution_scrolling", true},
+        {"native_pen_touch", true},
+        {"key_rightalt_to_key_win", false},
+      };
+    }
+
+    /** @brief Keys that hold credentials, key material, or file locations and are never exposed. */
+    bool hidden_setting(const std::string_view key) {
+      constexpr std::array hidden {
+        "pkey"sv,
+        "cert"sv,
+        "file_state"sv,
+        "credentials_file"sv,
+        "file_apps"sv,
+        "log_path"sv,
+        "lsp_pairing_permissions"sv,
+      };
+      return std::ranges::find(hidden, key) != hidden.end();
+    }
+
+    json typed_value(const std::string &value, const json &default_value) {
+      if (default_value.is_boolean()) {
+        const auto lower = boost::to_lower_copy(value);
+        return lower == "true" || lower == "yes" || lower == "enable" || lower == "enabled" || lower == "on" || lower == "1";
+      }
+      if (default_value.is_number()) {
+        try {
+          std::size_t used = 0;
+          const auto number = std::stod(value, &used);
+          if (used == value.size()) {
+            return number == std::floor(number) ? json(static_cast<std::int64_t>(number)) : json(number);
+          }
+        } catch (const std::exception &) {
+        }
+      }
+      return value;
+    }
+
+    std::map<std::string, std::string> read_settings_file() {
+      std::map<std::string, std::string> settings;
+      for (auto &[key, value] : config::parse_config(file_handler::read_file(config::general.config_file.c_str()))) {
+        settings.emplace(key, std::move(value));
+      }
+      // Older files name the host "sunshine_name".
+      if (const auto legacy = settings.find("sunshine_name"); legacy != settings.end()) {
+        settings.try_emplace("host_name", legacy->second);
+        settings.erase(legacy);
+      }
+      return settings;
+    }
+
+    json settings_json() {
+      const auto defaults = setting_defaults();
+      auto values = json::object();
+      for (const auto &[key, value] : read_settings_file()) {
+        if (!hidden_setting(key)) {
+          values[key] = typed_value(value, defaults.contains(key) ? defaults[key] : json(""));
+        }
+      }
+      return {{"values", std::move(values)}, {"defaults", defaults}};
+    }
+
+    void get_settings(const resp_t &response, const req_t &) {
+      send_ok(response, settings_json());
+    }
+
+    void patch_settings(const resp_t &response, const req_t &request) {
+      const auto body = json_body(response, request);
+      if (!body) {
+        return;
+      }
+      auto settings = read_settings_file();
+      for (const auto &[key, value] : body->items()) {
+        const bool valid_key = !key.empty() && key.size() <= 64 && std::ranges::all_of(key, [](const char c) {
+          return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+        });
+        if (!valid_key || hidden_setting(key)) {
+          send_error(response, status_t::client_error_bad_request, std::format("“{}” can’t be changed here.", key));
+          return;
+        }
+        if (value.is_null()) {
+          settings.erase(key);
+          continue;
+        }
+        std::string text;
+        if (value.is_boolean()) {
+          text = value.get<bool>() ? "enabled" : "disabled";
+        } else if (value.is_number()) {
+          text = value.dump();
+        } else if (value.is_string()) {
+          text = value.get<std::string>();
+        } else {
+          send_error(response, status_t::client_error_bad_request, std::format("“{}” needs a text, number, or on/off value.", key));
+          return;
+        }
+        if (text.find_first_of("\r\n") != std::string::npos) {
+          send_error(response, status_t::client_error_bad_request, std::format("“{}” must be on one line.", key));
+          return;
+        }
+        if (text.empty()) {
+          settings.erase(key);
+        } else {
+          settings[key] = std::move(text);
+        }
+      }
+      std::string contents;
+      for (const auto &[key, value] : settings) {
+        contents += std::format("{} = {}\n", key, value);
+      }
+      if (file_handler::write_file(config::general.config_file.c_str(), contents) != 0) {
+        send_error(response, status_t::server_error_internal_server_error, "The settings weren’t saved.");
+        return;
+      }
+      restart_required = true;
+      send_ok(response, settings_json());
+    }
+
+    void post_identity_rotate(const resp_t &response, const req_t &) {
+      using lumen::lsp::runtime::IdentityRotationResult;
+      const auto result = lumen::lsp::runtime::administration_rotate_identity();
+      if (result == IdentityRotationResult::success) {
+        send_no_content(response);
+        return;
+      }
+      send_error(
+        response,
+        result == IdentityRotationResult::inactive ? status_t::client_error_conflict : status_t::server_error_internal_server_error,
+        result == IdentityRotationResult::inactive ?
+          "Lumen streaming is off, so there’s no certificate to replace." :
+          "The certificate wasn’t replaced. The current one is still in use."
+      );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Logs
+
+    constexpr std::uintmax_t maximum_log_chunk = 512 * 1024;
+
+    void get_logs(const resp_t &response, const req_t &request) {
+      const auto query = request->parse_query_string();
+      std::uintmax_t after = 0;
+      if (const auto parameter = query.find("after"); parameter != query.end()) {
+        try {
+          after = std::stoull(parameter->second);
+        } catch (const std::exception &) {
+          send_error(response, status_t::client_error_bad_request, "“after” must be a byte offset.");
+          return;
+        }
+      }
+      std::error_code error;
+      const auto size = fs::file_size(config::general.log_file, error);
+      if (error) {
+        send_ok(response, {{"text", ""}, {"next", 0}});
+        return;
+      }
+      // A smaller file means the log was replaced; start over. A first read starts near the end.
+      if (after > size) {
+        after = 0;
+      }
+      std::uintmax_t start = after;
+      if (size - start > maximum_log_chunk) {
+        start = size - maximum_log_chunk;
+      }
+      std::ifstream file(config::general.log_file, std::ios::binary);
+      file.seekg(static_cast<std::streamoff>(start));
+      std::string text(static_cast<std::size_t>(size - start), '\0');
+      file.read(text.data(), static_cast<std::streamsize>(text.size()));
+      text.resize(static_cast<std::size_t>(file.gcount()));
+      if (start != after) {
+        // Skipped ahead: drop the partial first line.
+        if (const auto newline = text.find('\n'); newline != std::string::npos) {
+          text.erase(0, newline + 1);
+        }
+      }
+      send_ok(response, {{"text", text}, {"next", start + static_cast<std::uintmax_t>(file.gcount())}});
+    }
+
+    void get_logs_download(const resp_t &response, const req_t &) {
+      std::ifstream file(config::general.log_file, std::ios::binary);
+      if (!file) {
+        send_error(response, status_t::client_error_not_found, "There’s no log yet.");
+        return;
+      }
+      auto headers = base_headers("text/plain; charset=utf-8");
+      headers.emplace("Content-Disposition", "attachment; filename=\"lumen.log\"");
+      response->write(status_t::success_ok, file, headers);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Panel files
+
+    std::string_view content_type_for(const fs::path &path) {
+      static const std::map<std::string, std::string_view, std::less<>> types {
+        {".css", "text/css; charset=utf-8"},
+        {".html", "text/html; charset=utf-8"},
+        {".ico", "image/x-icon"},
+        {".js", "text/javascript; charset=utf-8"},
+        {".json", "application/json"},
+        {".png", "image/png"},
+        {".svg", "image/svg+xml"},
+        {".woff2", "font/woff2"},
+      };
+      const auto type = types.find(boost::to_lower_copy(path.extension().string()));
+      return type == types.end() ? "application/octet-stream"sv : type->second;
+    }
+
+    constexpr auto panel_security_policy =
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; "
+      "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"sv;
+
+    void send_file(const resp_t &response, const fs::path &path, const bool immutable) {
+      std::ifstream file(path, std::ios::binary);
+      if (!file) {
+        send_error(response, status_t::client_error_not_found, "Not found.");
+        return;
+      }
+      auto headers = base_headers(content_type_for(path));
+      headers.erase("Cache-Control");
+      headers.emplace("Cache-Control", immutable ? "public, max-age=31536000, immutable" : "no-cache");
+      headers.emplace("Content-Security-Policy", std::string {panel_security_policy});
+      response->write(status_t::success_ok, file, headers);
+    }
+
+    /** @brief Serve the panel; every panel route loads the same page, which routes in the browser. */
+    void get_panel(const resp_t &response, const req_t &request) {
+      if (!admit_source(response, request)) {
+        return;
+      }
+      send_file(response, fs::path {WEB_DIR} / "index.html", false);
+    }
+
+    /** @brief Serve a built panel asset. File names carry content hashes, so they never change. */
+    void get_panel_asset(const resp_t &response, const req_t &request) {
+      if (!admit_source(response, request)) {
+        return;
+      }
+      std::error_code error;
+      const auto root = fs::weakly_canonical(fs::path {WEB_DIR} / "assets", error);
+      const auto path = fs::weakly_canonical(fs::path {WEB_DIR} / fs::path {request->path}.relative_path(), error);
+      const auto relative = fs::relative(path, root, error);
+      if (error || relative.empty() || *relative.begin() == "..") {
+        send_error(response, status_t::client_error_not_found, "Not found.");
+        return;
+      }
+      send_file(response, path, true);
+    }
+  }  // namespace
+
   void start() {
     platf::set_thread_name("confighttp");
     const auto shutdown_event = mail::man->event<bool>(mail::shutdown);
 
     const auto port_https = net::map_port(PORT_HTTPS);
-    const auto address_family = net::af_from_enum_string(config::sunshine.address_family);
+    const auto address_family = net::af_from_enum_string(config::general.address_family);
 
     https_server_t server {config::nvhttp.cert, config::nvhttp.pkey};
 
-    // Helper to create page handler lambdas without repeating the signature
-    auto page_handler = [](const char *file, bool require_auth = true, bool redirect_if_username = false) {
-      return [file, require_auth, redirect_if_username](const resp_https_t &response, const req_https_t &request) {
-        getPage(response, request, file, require_auth, redirect_if_username);
-      };
+    const https_handler_t not_found = [](const resp_https_t &response, const req_https_t &) {
+      send_error(response, status_t::client_error_not_found, "Not found.");
     };
+    for (const auto method : {"GET", "POST", "PUT", "PATCH", "DELETE"}) {
+      server.default_resource[method] = not_found;
+    }
 
-    // Default resource handlers
-    const https_handler_t bad_request_handler = [](const resp_https_t &response, const req_https_t &request) {
-      bad_request(response, request);
-    };
-    const https_handler_t not_found_handler = [](const resp_https_t &response, const req_https_t &request) {
-      not_found(response, request);
-    };
+    auto &routes = server.resource;
+    routes["^/api/v1/setup$"]["GET"] = get_setup;
+    routes["^/api/v1/setup$"]["POST"] = post_setup;
+    routes["^/api/v1/session$"]["GET"] = get_session;
+    routes["^/api/v1/session$"]["POST"] = post_session;
+    routes["^/api/v1/session$"]["DELETE"] = delete_session;
+    routes["^/api/v1/account$"]["PUT"] = signed_in(put_account);
 
-    // error by default
-    server.default_resource["DELETE"] = bad_request_handler;
-    server.default_resource["PATCH"] = bad_request_handler;
-    server.default_resource["POST"] = bad_request_handler;
-    server.default_resource["PUT"] = bad_request_handler;
-    server.default_resource["GET"] = not_found_handler;
+    routes["^/api/v1/status$"]["GET"] = signed_in(get_status);
+    routes["^/api/v1/stream/stop$"]["POST"] = signed_in(post_stream_stop);
+    routes["^/api/v1/restart$"]["POST"] = signed_in(post_restart);
 
-    // web pages
-    server.resource["^/$"]["GET"] = page_handler("index.html");
-    server.resource["^/apps/?$"]["GET"] = page_handler("apps.html");
-    server.resource["^/clients/?$"]["GET"] = page_handler("clients.html");
-    server.resource["^/config/?$"]["GET"] = page_handler("config.html");
-    server.resource["^/featured/?$"]["GET"] = page_handler("featured.html");
-    server.resource["^/logout/?$"]["GET"] = page_handler("logout.html", false);
-    server.resource["^/password/?$"]["GET"] = page_handler("password.html");
-    server.resource["^/pin/?$"]["GET"] = page_handler("pin.html");
-    server.resource["^/troubleshooting/?$"]["GET"] = page_handler("troubleshooting.html");
-    server.resource["^/welcome/?$"]["GET"] = page_handler("welcome.html", false, true);
+    routes["^/api/v1/pairing$"]["GET"] = signed_in(get_pairing);
+    routes["^/api/v1/pairing/gamestream$"]["POST"] = signed_in(post_pairing_gamestream);
+    routes["^/api/v1/pairing/([0-9a-f]{32})/pin$"]["POST"] = signed_in(post_pairing_pin);
+    routes["^/api/v1/pairing/([0-9a-f]{32})$"]["DELETE"] = signed_in(delete_pairing);
 
-    // rest api
-    server.resource["^/api/browse$"]["GET"] = browseDirectory;
-    server.resource["^/api/apps$"]["GET"] = getApps;
-    server.resource["^/api/apps$"]["POST"] = saveApp;
-    server.resource["^/api/apps/([0-9]+)$"]["DELETE"] = deleteApp;
-    server.resource["^/api/apps/close$"]["POST"] = closeApp;
-    server.resource["^/api/clients/list$"]["GET"] = getClients;
-    server.resource["^/api/clients/unpair$"]["POST"] = unpair;
-    server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
-    server.resource["^/api/clients/update$"]["POST"] = updateClient;
-    server.resource["^/api/config$"]["GET"] = getConfig;
-    server.resource["^/api/config$"]["POST"] = saveConfig;
-    server.resource["^/api/configLocale$"]["GET"] = getLocale;
-    server.resource["^/api/covers/([0-9]+)$"]["GET"] = getCover;
-    server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
-    server.resource["^/api/csrf-token$"]["GET"] = getCSRFToken;
-    server.resource["^/api/lsp/status$"]["GET"] = getLspStatus;
-    server.resource["^/api/lsp/pairing$"]["GET"] = getLspPairing;
-    server.resource["^/api/lsp/pairing$"]["DELETE"] = cancelLspPairing;
-    server.resource["^/api/lsp/pairing/pin$"]["POST"] = submitLspPairingPin;
-    server.resource["^/api/lsp/clients$"]["GET"] = getLspClients;
-    server.resource["^/api/lsp/clients$"]["PATCH"] = updateLspClient;
-    server.resource["^/api/lsp/clients$"]["DELETE"] = revokeLspClient;
-    server.resource["^/api/lsp/identity/rotate$"]["POST"] = rotateLspIdentity;
-    server.resource["^/api/password$"]["POST"] = savePassword;
-    server.resource["^/api/pin$"]["GET"] = getPendingPairingRequests;
-    server.resource["^/api/pin$"]["POST"] = savePin;
-    server.resource["^/api/pin/cancel$"]["POST"] = cancelPendingPairingRequest;
-    server.resource["^/api/logs$"]["GET"] = getLogs;
-    server.resource["^/api/reset-display-device-persistence$"]["POST"] = resetDisplayDevicePersistence;
-    server.resource["^/api/restart$"]["POST"] = restart;
-    server.resource["^/api/vigembus/status$"]["GET"] = getViGEmBusStatus;
-    server.resource["^/api/vigembus/install$"]["POST"] = installViGEmBus;
-    server.resource["^/api/vdd/status$"]["GET"] = getVddStatus;
+    routes["^/api/v1/devices$"]["GET"] = signed_in(get_devices);
+    routes["^/api/v1/devices/(lsp|gamestream)/([0-9A-Za-z-]{1,64})$"]["PATCH"] = signed_in(patch_device);
+    routes["^/api/v1/devices/(lsp|gamestream)/([0-9A-Za-z-]{1,64})$"]["DELETE"] = signed_in(delete_device);
 
-    // static/dynamic resources
-    server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
-    server.resource["^/images/logo-sunshine-45.png$"]["GET"] = getSunshineLogoImage;
-    server.resource["^/assets\\/.+$"]["GET"] = getAsset;
+    routes["^/api/v1/apps$"]["GET"] = signed_in(get_apps);
+    routes["^/api/v1/apps$"]["POST"] = signed_in(post_app);
+    routes["^/api/v1/apps/([0-9]{1,10})$"]["PUT"] = signed_in(put_app);
+    routes["^/api/v1/apps/([0-9]{1,10})$"]["DELETE"] = signed_in(delete_app);
+    // Images and the log download are loaded by <img> and links, which can't send the request
+    // header. Both only read, so a session cookie is enough.
+    routes["^/api/v1/apps/([0-9]{1,10})/image$"]["GET"] = signed_in_read(get_app_image);
+    routes["^/api/v1/apps/([0-9]{1,10})/image$"]["PUT"] = signed_in(put_app_image);
+    routes["^/api/v1/apps/([0-9]{1,10})/image$"]["DELETE"] = signed_in(delete_app_image);
+
+    routes["^/api/v1/settings$"]["GET"] = signed_in(get_settings);
+    routes["^/api/v1/settings$"]["PATCH"] = signed_in(patch_settings);
+    routes["^/api/v1/identity/rotate$"]["POST"] = signed_in(post_identity_rotate);
+
+    routes["^/api/v1/logs$"]["GET"] = signed_in(get_logs);
+    routes["^/api/v1/logs/download$"]["GET"] = signed_in_read(get_logs_download);
+
+    routes["^/(devices|apps|logs|settings(/[a-z]+)?)?/?$"]["GET"] = get_panel;
+    routes["^/assets/.+$"]["GET"] = get_panel_asset;
 
     server.config.reuse_address = true;
     server.config.timeout_request = REQUEST_HEADER_TIMEOUT_SECONDS;
@@ -2689,34 +1586,25 @@ namespace confighttp {
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
 
-    // Store bind address for logging, use "localhost" as fallback for wildcard addresses
-    const auto bind_addr = server.config.address;
-    const auto display_addr = config::sunshine.bind_address.empty() ? "localhost"sv : std::string_view {bind_addr};
+    const auto display_address = config::general.bind_address.empty() ? "localhost"s : server.config.address;
 
-    auto accept_and_run = [&](auto *server) {
+    std::jthread tcp {[&] {
       try {
         platf::set_thread_name("confighttp::tcp");
-        server->start([&display_addr](const unsigned short port) {
-          BOOST_LOG(info) << "Configuration UI available at [https://"sv << display_addr << ":" << port << "]";
+        server.start([&display_address](const unsigned short port) {
+          BOOST_LOG(info) << "Admin panel available at [https://"sv << display_address << ':' << port << ']';
         });
-      } catch (boost::system::system_error &err) {
-        // It's possible the exception gets thrown after calling server->stop() from a different thread
+      } catch (const boost::system::system_error &failure) {
+        // Stopping the server from another thread can surface here.
         if (shutdown_event->peek()) {
           return;
         }
-
-        BOOST_LOG(fatal) << "Couldn't start Configuration HTTPS server on port ["sv << port_https << "]: "sv << err.what();
+        BOOST_LOG(fatal) << "Couldn't start the admin panel on port ["sv << port_https << "]: "sv << failure.what();
         shutdown_event->raise(true);
-        return;
       }
-    };
-    std::jthread tcp {accept_and_run, &server};
+    }};
 
-    // Wait for any event
     shutdown_event->view();
-
     server.stop();
-
-    tcp.join();
   }
 }  // namespace confighttp

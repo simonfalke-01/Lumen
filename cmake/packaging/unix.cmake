@@ -2,7 +2,7 @@
 # put anything here that applies to both linux and macos
 
 # return here if building a macos .app
-if(APPLE AND NOT SUNSHINE_BUILD_HOMEBREW)
+if(APPLE AND NOT LUMEN_BUILD_HOMEBREW)
     return()
 endif()
 
@@ -12,4 +12,4 @@ if(NOT CMAKE_INSTALL_PREFIX)
     set(CMAKE_INSTALL_PREFIX "/usr/share/lumen")
 endif()
 
-install(TARGETS sunshine RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(TARGETS lumen RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")

@@ -85,10 +85,10 @@ static const short packetTypes[] = {
   0x0302,  // IDR frame
   0x0001,  // fully encrypted
   0x010e,  // HDR mode
-  0x5500,  // Rumble triggers (Sunshine protocol extension)
-  0x5501,  // Set motion event (Sunshine protocol extension)
-  0x5502,  // Set RGB LED (Sunshine protocol extension)
-  0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x5500,  // Rumble triggers (Lumen protocol extension)
+  0x5501,  // Set motion event (Lumen protocol extension)
+  0x5502,  // Set RGB LED (Lumen protocol extension)
+  0x5503,  // Set Adaptive triggers (Lumen protocol extension)
 };
 
 namespace asio = boost::asio;
@@ -325,7 +325,7 @@ namespace stream {
 
     std::uint8_t enabled;  ///< Nonzero when HDR should be enabled.
 
-    // Sunshine protocol extension
+    // Lumen protocol extension
     SS_HDR_METADATA metadata;  ///< HDR10 metadata sent with the control message.
   };
 
@@ -336,7 +336,7 @@ namespace stream {
     std::uint16_t encryptedHeaderType;  ///< Always LE 0x0001.
     std::uint16_t length;  ///< Size of seq, tag, secondary header, and data.
 
-    // seq is accepted as an arbitrary value in Moonlight
+    // seq is accepted as an arbitrary value in the client
     std::uint32_t seq;  ///< Monotonically increasing sequence number used as the AES-GCM IV.
 
     /**
@@ -1170,8 +1170,8 @@ namespace stream {
    */
   int send_feedback_msg(session_t *session, platf::gamepad_feedback_msg_t &msg) {
     if (!session->control.peer) {
-      BOOST_LOG(warning) << "Couldn't send gamepad feedback data, still waiting for PING from Moonlight"sv;
-      // Still waiting for PING from Moonlight
+      BOOST_LOG(warning) << "Couldn't send gamepad feedback data, still waiting for PING from the client"sv;
+      // Still waiting for PING from the client
       return -1;
     }
 
@@ -1282,8 +1282,8 @@ namespace stream {
    */
   int send_hdr_mode(session_t *session, video::hdr_info_t hdr_info) {
     if (!session->control.peer) {
-      BOOST_LOG(warning) << "Couldn't send HDR mode, still waiting for PING from Moonlight"sv;
-      // Still waiting for PING from Moonlight
+      BOOST_LOG(warning) << "Couldn't send HDR mode, still waiting for PING from the client"sv;
+      // Still waiting for PING from the client
       return -1;
     }
 
@@ -1832,7 +1832,7 @@ namespace stream {
         // appear in "Other I/O" and begin waiting for interrupts.
         // This gives inconsistent performance so we'd rather avoid it.
         size_t send_batch_size = 64 * 1024 / blocksize;
-        // Also don't exceed 64 packets, which can happen when Moonlight requests
+        // Also don't exceed 64 packets, which can happen when GameStream requests
         // unusually small packet size.
         // Generic Segmentation Offload on Linux can't do more than 64.
         send_batch_size = std::min<size_t>(64, send_batch_size);
@@ -2452,7 +2452,7 @@ namespace stream {
       return -1;
     }
 
-    auto address_family = net::af_from_enum_string(config::sunshine.address_family);
+    auto address_family = net::af_from_enum_string(config::general.address_family);
     auto protocol = address_family == net::IPV4 ? udp::v4() : udp::v6();
     auto control_port = net::map_port(CONTROL_PORT);
     auto video_port = net::map_port(VIDEO_STREAM_PORT);
@@ -2807,7 +2807,7 @@ namespace stream {
     void join(session_t &session) {
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
-      // The alternative is that Sunshine can never start another session until it's manually restarted.
+      // The alternative is that Lumen can never start another session until it's manually restarted.
       auto task = []() {
         BOOST_LOG(fatal) << "Hang detected! Session failed to terminate in 10 seconds."sv;
         logging::log_flush();
@@ -2858,7 +2858,7 @@ namespace stream {
       if (--running_sessions == 0) {
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
         if (proc::proc.running()) {
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined LUMEN_TRAY && LUMEN_TRAY >= 1
           system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
 #endif
         } else {
@@ -2945,7 +2945,7 @@ namespace stream {
             if (first_session) {
               platform_start_attempted = true;
               platf::streaming_will_start();
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined LUMEN_TRAY && LUMEN_TRAY >= 1
               system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
 #endif
             }
@@ -2989,7 +2989,7 @@ namespace stream {
       return -1;
     }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     startup_order_probe_t startup_order_probe_for_test() {
       std::atomic state {state_e::STOPPED};
       std::promise<void> worker_launched;
@@ -3305,14 +3305,14 @@ namespace stream {
       return session;
     }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     video::config_t video_config_for_test(const std::shared_ptr<session_t> &session) {
       return session ? session->config.monitor : video::config_t {};
     }
 #endif
   }  // namespace session
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   audio_packet_queue_probe_t audio_packet_queue_probe_for_test() {
     const auto packet = [](const std::uint8_t tag) {
       audio::buffer_t payload {1};

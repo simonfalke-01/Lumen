@@ -420,7 +420,7 @@ TEST(LspTransportRecovery, AllowsOneOutstandingIndependentFramePerEpoch) {
   EXPECT_EQ(recovery.snapshot().phase, lsp_transport::recovery_phase::healthy);
 }
 
-TEST(LspTransportCongestion, DefaultsAdaptiveAndRequiresAnExplicitCompetitionCeiling) {
+TEST(LspTransportCongestion, RequiresAnExplicitCompetitionCeiling) {
   lsp_transport::congestion_controller invalid_competition({
     .profile = lsp_transport::controller_profile::competition_lan,
     .initial_pacing_bits_per_second = 100'000'000,
@@ -428,46 +428,94 @@ TEST(LspTransportCongestion, DefaultsAdaptiveAndRequiresAnExplicitCompetitionCei
     .maximum_pacing_bits_per_second = 1'000'000'000,
     .competition_capacity_bits_per_second = 0,
     .reserved_overhead_bits_per_second = 10'000'000,
-    .maximum_rtt_microseconds = 5'000,
+    .rtt_inflation_budget_microseconds = 20'000,
     .queue_delay_budget_microseconds = 2'000,
   });
   EXPECT_EQ(invalid_competition.error(), lsp_transport::controller_error::competition_capacity_required);
+}
 
-  lsp_transport::congestion_controller adaptive({
-    .profile = lsp_transport::controller_profile::adaptive_low_latency,
-    .initial_pacing_bits_per_second = 100'000'000,
-    .minimum_pacing_bits_per_second = 10'000'000,
-    .maximum_pacing_bits_per_second = 200'000'000,
-    .reserved_overhead_bits_per_second = 20'000'000,
-    .maximum_rtt_microseconds = 5'000,
-    .queue_delay_budget_microseconds = 2'000,
-  });
-  ASSERT_EQ(adaptive.error(), lsp_transport::controller_error::none);
-  adaptive.apply_feedback({
-    .delivered_bytes = 10'000,
-    .lost_bytes = 0,
-    .ecn_ce_bytes = 0,
-    .bytes_in_flight = 20'000,
-    .smoothed_rtt_microseconds = 1'000,
-    .rtt_variation_microseconds = 100,
-    .queue_delay_trend_microseconds = 1,
-  });
-  auto state = adaptive.snapshot();
-  EXPECT_EQ(state.pacing_bits_per_second, 101'000'000ULL);
-  EXPECT_EQ(state.encoder_bits_per_second, 81'000'000ULL);
-  adaptive.apply_feedback({
-    .delivered_bytes = 10'000,
-    .lost_bytes = 1'000,
-    .ecn_ce_bytes = 100,
-    .bytes_in_flight = 15'000,
-    .smoothed_rtt_microseconds = 1'000,
-    .rtt_variation_microseconds = 100,
-    .queue_delay_trend_microseconds = 0,
-  });
-  state = adaptive.snapshot();
-  EXPECT_EQ(state.pacing_bits_per_second, 80'800'000ULL);
-  EXPECT_EQ(state.lost_bytes, 1'000ULL);
-  EXPECT_EQ(state.ecn_ce_bytes, 100ULL);
+namespace {
+  lsp_transport::congestion_controller adaptive_controller() {
+    return lsp_transport::congestion_controller({
+      .profile = lsp_transport::controller_profile::adaptive_low_latency,
+      .initial_pacing_bits_per_second = 20'000'000,
+      .minimum_pacing_bits_per_second = 1'000'000,
+      .maximum_pacing_bits_per_second = 30'000'000,
+      .reserved_overhead_bits_per_second = 500'000,
+      .rtt_inflation_budget_microseconds = 50'000,
+      .queue_delay_budget_microseconds = 10'000,
+    });
+  }
+}  // namespace
+
+// Mobile data: long RTT and light random loss that FEC repairs. The old controller cut the rate on
+// every lost packet and every report above 100 ms RTT, pinning streams at the 1 Mbps floor.
+TEST(LspTransportCongestion, LongRttAndLightLossDoNotReduceTheRate) {
+  auto controller = adaptive_controller();
+  ASSERT_EQ(controller.error(), lsp_transport::controller_error::none);
+  for (std::uint64_t report = 1; report <= 2'500; ++report) {
+    const auto sent = controller.snapshot().pacing_bits_per_second / 8U / 500U;
+    const auto lost = report % 100U == 0 ? std::uint64_t {1'200} : std::uint64_t {0};  // about 1%
+    controller.apply_feedback({
+      .delivered_bytes = sent - lost,
+      .lost_bytes = lost,
+      .smoothed_rtt_microseconds = 140'000,
+      .rtt_variation_microseconds = 10'000,
+      .report_microseconds = report * 2'000U,
+    });
+  }
+  EXPECT_GE(controller.snapshot().pacing_bits_per_second, 20'000'000ULL);
+}
+
+TEST(LspTransportCongestion, SustainedHeavyLossCutsOncePerRoundTrip) {
+  auto controller = adaptive_controller();
+  std::uint64_t now = 0;
+  const auto report = [&](const std::uint64_t lost_share_percent) {
+    now += 2'000;
+    const auto sent = controller.snapshot().pacing_bits_per_second / 8U / 500U;
+    const auto lost = sent * lost_share_percent / 100U;
+    controller.apply_feedback({
+      .delivered_bytes = sent - lost,
+      .lost_bytes = lost,
+      .smoothed_rtt_microseconds = 40'000,
+      .report_microseconds = now,
+    });
+  };
+  for (int index = 0; index < 60; ++index) {
+    report(0);
+  }
+  const auto clean_rate = controller.snapshot().pacing_bits_per_second;
+  for (int index = 0; index < 60; ++index) {  // 120 ms of 30% loss: one window, one cut
+    report(30);
+  }
+  const auto after_one_window = controller.snapshot().pacing_bits_per_second;
+  EXPECT_LT(after_one_window, clean_rate);
+  EXPECT_GE(after_one_window, clean_rate * 65U / 100U);
+  for (int index = 0; index < 500; ++index) {
+    report(30);
+  }
+  EXPECT_LT(controller.snapshot().pacing_bits_per_second, after_one_window);
+}
+
+TEST(LspTransportCongestion, RttRiseAboveThePathFloorCutsTheRate) {
+  auto controller = adaptive_controller();
+  std::uint64_t now = 0;
+  const auto report = [&](const std::uint32_t rtt) {
+    now += 2'000;
+    controller.apply_feedback({
+      .delivered_bytes = controller.snapshot().pacing_bits_per_second / 8U / 500U,
+      .smoothed_rtt_microseconds = rtt,
+      .report_microseconds = now,
+    });
+  };
+  for (int index = 0; index < 100; ++index) {
+    report(30'000);
+  }
+  const auto before = controller.snapshot().pacing_bits_per_second;
+  for (int index = 0; index < 100; ++index) {
+    report(110'000);
+  }
+  EXPECT_LT(controller.snapshot().pacing_bits_per_second, before);
 }
 
 TEST(LspTransportPathMtu, Probes1200Then1400ThenTheAddressFamilyCeiling) {

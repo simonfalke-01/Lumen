@@ -59,7 +59,7 @@ protected:
   void SetUp() override {
     BaseTest::SetUp();
     // Create test directory
-    test_dir = fs::temp_directory_path() / "sunshine_process_png_test";  // NOSONAR(cpp:S5443): safe for tests
+    test_dir = fs::temp_directory_path() / "lumen_process_png_test";  // NOSONAR(cpp:S5443): safe for tests
     fs::create_directories(test_dir);
   }
 
@@ -132,7 +132,7 @@ TEST(ProcessLaunchEnvironmentTest, PreservesExactModernRefreshAndLegacyIntegerCo
   EXPECT_EQ(env["LUMEN_CLIENT_HOST_AUDIO"].to_string(), "false");
   EXPECT_EQ(env["LUMEN_CLIENT_AUDIO_CONFIGURATION"].to_string(), "5.1");
   EXPECT_EQ(env["LUMEN_CLIENT_AUDIO_SURROUND_PARAMS"].to_string(), "642012345");
-  EXPECT_EQ(env["SUNSHINE_CLIENT_FPS"].to_string(), "60");
+  EXPECT_EQ(env["LUMEN_CLIENT_FPS"].to_string(), "60");
 }
 
 TEST(ProcessLaunchEnvironmentTest, LegacyLaunchFallsBackToIntegerRefreshRational) {
@@ -146,7 +146,7 @@ TEST(ProcessLaunchEnvironmentTest, LegacyLaunchFallsBackToIntegerRefreshRational
   EXPECT_EQ(env["LUMEN_CLIENT_FPS"].to_string(), "120");
   EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_NUMERATOR"].to_string(), "120");
   EXPECT_EQ(env["LUMEN_CLIENT_REFRESH_DENOMINATOR"].to_string(), "1");
-  EXPECT_EQ(env["SUNSHINE_CLIENT_FPS"].to_string(), "120");
+  EXPECT_EQ(env["LUMEN_CLIENT_FPS"].to_string(), "120");
 }
 
 TEST(ProcessLaunchEnvironmentTest, PopulatesExactLspControllerAudioAndVideoSelection) {
@@ -371,13 +371,10 @@ TEST_F(ProcessPNGTest, CheckValidPNG_NonExistentFile) {
 }
 
 TEST_F(ProcessPNGTest, CheckValidPNG_RealFile) {
-  // Test with the actual sunshine.png from the project root
-
-  // Only run this test if the file exists
-  if (const fs::path sunshine_png = fs::path(SUNSHINE_SOURCE_DIR) / "sunshine.png"; fs::exists(sunshine_png)) {
-    EXPECT_TRUE(proc::check_valid_png(sunshine_png));
+  if (const fs::path icon = fs::path(LUMEN_SOURCE_DIR) / "lumen.png"; fs::exists(icon)) {
+    EXPECT_TRUE(proc::check_valid_png(icon));
   } else {
-    GTEST_SKIP() << "sunshine.png not found in project root";
+    GTEST_SKIP() << "lumen.png not found in project root";
   }
 }
 
@@ -519,5 +516,5 @@ TEST_F(ProcessPNGTest, ValidateAppImagePath_ValidPNG) {
 TEST_F(ProcessPNGTest, ValidateAppImagePath_OldSteamDefault) {
   // Test the special case for old steam image path
   const std::string result = proc::validate_app_image_path("./assets/steam.png");
-  EXPECT_EQ(result, SUNSHINE_ASSETS_DIR "/steam.png");
+  EXPECT_EQ(result, LUMEN_ASSETS_DIR "/steam.png");
 }

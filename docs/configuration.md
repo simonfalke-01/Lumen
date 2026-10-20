@@ -33,19 +33,8 @@ location by modifying the configuration file.
 
 The default configuration and log filenames are `lumen.conf` and `lumen.log`.
 
-### Migrating from Sunshine
-
-On Linux and macOS, Lumen checks the legacy `~/.config/sunshine` directory on first start. If the Lumen directory does
-not exist, Lumen copies the complete legacy directory to `~/.config/lumen`, preserving applications, credentials,
-certificates, and pairing state. It then copies `sunshine.conf` to the authoritative `lumen.conf` filename. The legacy
-directory and files are never deleted. If both directories already exist, Lumen uses its own directory and leaves the
-Sunshine directory untouched.
-
-Set `LUMEN_MIGRATE_CONFIG=0` to disable the automatic copy. `SUNSHINE_MIGRATE_CONFIG` remains accepted as a legacy
-alias; `LUMEN_MIGRATE_CONFIG` takes precedence when both are set.
-
-Although it is recommended to use the configuration UI, it is possible manually configure Lumen by
-editing the `conf` file in a text editor. Use the examples as reference.
+The admin panel is the usual way to change settings. You can also edit `lumen.conf` in a text editor; restart Lumen
+afterwards. Use the examples below as reference.
 
 ## General
 
@@ -153,13 +142,13 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
-### sunshine_name
+### host_name
 
 <table>
     <tr>
         <td>Description</td>
         <td colspan="2">
-            The name displayed by Moonlight.
+            The name displayed by the client.
         </td>
     </tr>
     <tr>
@@ -169,7 +158,7 @@ editing the `conf` file in a text editor. Use the examples as reference.
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            sunshine_name = Lumen
+            host_name = Lumen
             @endcode</td>
     </tr>
 </table>
@@ -717,7 +706,7 @@ The key retains its upstream name for compatibility with existing configuration 
 <table>
     <tr>
         <td>Description</td>
-        <td colspan="2">It may be possible that you cannot send the Windows Key from Moonlight directly. In those cases it may be useful to
+        <td colspan="2">It may be possible that you cannot send the Windows Key from the client directly. In those cases it may be useful to
             make Lumen think the Right Alt key is the Windows key.
             </td>
     </tr>
@@ -764,7 +753,7 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            When enabled, Lumen will pass through high resolution scroll events from Moonlight clients.
+            When enabled, Lumen will pass through high resolution scroll events from GameStream clients.
             <br>
             This can be useful to disable for older applications that scroll too fast with high resolution scroll
             events.
@@ -790,7 +779,7 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            When enabled, Lumen will pass through native pen/touch events from Moonlight clients.
+            When enabled, Lumen will pass through native pen/touch events from GameStream clients.
             <br>
             This can be useful to disable for older applications without native pen/touch support.
         </td>
@@ -1221,13 +1210,13 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Select whether Lumen's owned virtual display is used for LSP or legacy Moonlight sessions.
+            Select whether Lumen's owned virtual display is used for LSP or legacy GameStream sessions.
             Lumen only activates a mode when the requested width, height, and reduced refresh rational are applied exactly.
             ABI 6 admits only exact SDR/8-bit or HDR/10-bit modes after intersecting the driver, OS, GPU, and encoder limits.
             Its two-slot direct-frame path exports BGRA8/sRGB for SDR and FP16/scRGB for HDR, together with validated frame metadata and versioned color transforms.
             HDR on a selected VDD requires that direct path and fails closed if any capability, adapter, handle, fence, metadata, transform, conversion, or NVENC gate fails; Lumen never substitutes untransformed DDA/WGC HDR capture.
             Legacy SDR can use DDA/WGC on the active VDD output when the direct path is unavailable or safely quarantined.
-            @note{For LSP, <code>optional</code> is treated as <code>required</code>; use <code>disabled</code> to opt out of VDD. Legacy Moonlight keeps the compatibility fallback described below.}
+            @note{For LSP, <code>optional</code> is treated as <code>required</code>; use <code>disabled</code> to opt out of VDD. Legacy GameStream keeps the compatibility fallback described below.}
             @note{Applies to Windows only.}
         </td>
     </tr>
@@ -1250,7 +1239,7 @@ The key retains its upstream name for compatibility with existing configuration 
     </tr>
     <tr>
         <td>optional</td>
-        <td>For legacy Moonlight, prefer an exact VDD mode and use the configured physical capture path only after a safe pre-activation rollback. For LSP, require the exact VDD mode and ABI 6 direct-frame channel.</td>
+        <td>For legacy GameStream, prefer an exact VDD mode and use the configured physical capture path only after a safe pre-activation rollback. For LSP, require the exact VDD mode and ABI 6 direct-frame channel.</td>
     </tr>
     <tr>
         <td>required</td>
@@ -1310,7 +1299,7 @@ The key retains its upstream name for compatibility with existing configuration 
         <td>Description</td>
         <td colspan="2">
             Perform additional resolution configuration for the display device.
-            @note{"Optimize game settings" must be enabled in Moonlight for this option to work.}
+            @note{"Optimize game settings" must be enabled in the client for this option to work.}
             @note{Applies to Windows only.}
         </td>
     </tr>
@@ -1619,7 +1608,7 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            The maximum bitrate (in Kbps) that Lumen will encode the stream at. If set to 0, it will always use the bitrate requested by Moonlight.
+            The maximum bitrate (in Kbps) that Lumen will encode the stream at. If set to 0, it will always use the bitrate requested by the client.
         </td>
     </tr>
     <tr>
@@ -2075,7 +2064,7 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            How long to wait, in milliseconds, for data from Moonlight before shutting down the stream.
+            How long to wait, in milliseconds, for data from the client before shutting down the stream.
         </td>
     </tr>
     <tr>
@@ -2100,7 +2089,7 @@ The key retains its upstream name for compatibility with existing configuration 
         <td colspan="2">
             Limit the packetsize to avoid fragmentation on a low MTU link.
             @note{This helps avoid packet loss and micro-stutter on a layer 2 VPN with
-            clients that cannot configure this value, e.g. Moonlight for Android/iOS.
+            clients that cannot configure this value, e.g. GameStream for Android/iOS.
             }
             @tip{To discover the optimal value:
             <ul>
@@ -2162,7 +2151,7 @@ The key retains its upstream name for compatibility with existing configuration 
         <td>Description</td>
         <td colspan="2">
             The application configuration file path. The file contains a JSON formatted list of applications that
-            can be started by Moonlight.
+            can be started by the client.
         </td>
     </tr>
     <tr>
@@ -2191,13 +2180,13 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            sunshine_state.json
+            lumen_state.json
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            credentials_file = sunshine_state.json
+            credentials_file = lumen_state.json
             @endcode</td>
     </tr>
 </table>
@@ -2232,9 +2221,9 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            The private key used for the web UI and Moonlight client pairing. For best compatibility,
+            The private key used for the web UI and GameStream client pairing. For best compatibility,
             this should be an RSA-2048 private key.
-            @warning{Not all Moonlight clients support ECDSA keys or RSA key lengths other than 2048 bits.}
+            @warning{Not all GameStream clients support ECDSA keys or RSA key lengths other than 2048 bits.}
         </td>
     </tr>
     <tr>
@@ -2257,9 +2246,9 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Description</td>
         <td colspan="2">
-            The certificate used for the web UI and Moonlight client pairing. For best compatibility,
+            The certificate used for the web UI and GameStream client pairing. For best compatibility,
             this should have an RSA-2048 public key.
-            @warning{Not all Moonlight clients support ECDSA keys or RSA key lengths other than 2048 bits.}
+            @warning{Not all GameStream clients support ECDSA keys or RSA key lengths other than 2048 bits.}
         </td>
     </tr>
     <tr>
@@ -2288,13 +2277,13 @@ The key retains its upstream name for compatibility with existing configuration 
     <tr>
         <td>Default</td>
         <td colspan="2">@code{}
-            sunshine_state.json
+            lumen_state.json
             @endcode</td>
     </tr>
     <tr>
         <td>Example</td>
         <td colspan="2">@code{}
-            file_state = sunshine_state.json
+            file_state = lumen_state.json
             @endcode</td>
     </tr>
 </table>

@@ -40,12 +40,12 @@ extern "C" {
  */
 #define DRM_FORMAT_MOD_INVALID fourcc_mod_code(0, ((1ULL << 56) - 1))
 
-#if !defined(SUNSHINE_SHADERS_DIR)  // for testing this needs to be defined in cmake as we don't do an install
+#if !defined(LUMEN_SHADERS_DIR)  // for testing this needs to be defined in cmake as we don't do an install
   /**
-   * @def SUNSHINE_SHADERS_DIR
-   * @brief Macro for SUNSHINE SHADERS DIR.
+   * @def LUMEN_SHADERS_DIR
+   * @brief Macro for LUMEN SHADERS DIR.
    */
-  #define SUNSHINE_SHADERS_DIR SUNSHINE_ASSETS_DIR "/shaders/opengl"
+  #define LUMEN_SHADERS_DIR LUMEN_ASSETS_DIR "/shaders/opengl"
 #endif
 
 using namespace std::literals;
@@ -932,7 +932,7 @@ namespace egl {
     return yuv444;
   }
 
-  void sws_t::apply_colorspace(const video::sunshine_colorspace_t &colorspace, bool is_yuv444) {
+  void sws_t::apply_colorspace(const video::stream_colorspace_t &colorspace, bool is_yuv444) {
     auto color_p = video::color_vectors_from_colorspace(colorspace, true);
 
     std::string_view members[] {
@@ -1021,11 +1021,11 @@ namespace egl {
 
     {
       constexpr std::array<const char *, 5> sources {{
-        SUNSHINE_SHADERS_DIR "/ConvertUV.frag",
-        SUNSHINE_SHADERS_DIR "/ConvertUV.vert",
-        SUNSHINE_SHADERS_DIR "/ConvertY.frag",
-        SUNSHINE_SHADERS_DIR "/Scene.vert",
-        SUNSHINE_SHADERS_DIR "/Scene.frag",
+        LUMEN_SHADERS_DIR "/ConvertUV.frag",
+        LUMEN_SHADERS_DIR "/ConvertUV.vert",
+        LUMEN_SHADERS_DIR "/ConvertY.frag",
+        LUMEN_SHADERS_DIR "/Scene.vert",
+        LUMEN_SHADERS_DIR "/Scene.frag",
       }};
 
       constexpr std::array<GLenum, 2> shader_type {{
@@ -1125,11 +1125,11 @@ namespace egl {
 
     {
       constexpr std::array<const char *, 5> sources {{
-        SUNSHINE_SHADERS_DIR "/Scene.vert",
-        SUNSHINE_SHADERS_DIR "/ConvertV.frag",
-        SUNSHINE_SHADERS_DIR "/ConvertU.frag",
-        SUNSHINE_SHADERS_DIR "/ConvertY.frag",
-        SUNSHINE_SHADERS_DIR "/Scene.frag",
+        LUMEN_SHADERS_DIR "/Scene.vert",
+        LUMEN_SHADERS_DIR "/ConvertV.frag",
+        LUMEN_SHADERS_DIR "/ConvertU.frag",
+        LUMEN_SHADERS_DIR "/ConvertY.frag",
+        LUMEN_SHADERS_DIR "/Scene.frag",
       }};
 
       constexpr std::array<GLenum, 2> shader_type {{

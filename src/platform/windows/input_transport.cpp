@@ -42,8 +42,8 @@ namespace platf::win_input {
     };
 
     /**
-     * @brief Return the held-state bit for a Moonlight mouse button.
-     * @param button Moonlight mouse button number.
+     * @brief Return the held-state bit for a GameStream mouse button.
+     * @param button GameStream mouse button number.
      * @return Button bit, or zero when the number is invalid.
      */
     constexpr std::uint8_t button_bit(int button) noexcept {
@@ -54,7 +54,7 @@ namespace platf::win_input {
      * @brief Populate a keyboard `INPUT` record using existing Lumen semantics.
      * @param modcode Windows virtual-key code.
      * @param release `true` to release the key.
-     * @param flags Moonlight keyboard flags.
+     * @param flags GameStream keyboard flags.
      * @return Populated input record.
      */
     INPUT keyboard_input(std::uint16_t modcode, bool release, std::uint8_t flags) {

@@ -66,7 +66,7 @@ namespace config {
     nvenc::nvenc_config nv;  ///< NVIDIA NVENC encoder settings.
     bool nv_realtime_hags;  ///< Enable the NVIDIA realtime HAGS workaround.
     bool nv_opengl_vulkan_on_dxgi;  ///< Prefer NVIDIA OpenGL/Vulkan-on-DXGI interop.
-    bool nv_sunshine_high_power_mode;  ///< Request NVIDIA high-power mode for Sunshine.
+    bool nv_high_power_mode;  ///< Request NVIDIA high-power mode for Lumen.
 
     struct {
       int preset;
@@ -145,7 +145,7 @@ namespace config {
       };
 
       /**
-       * @brief Selects how Sunshine prepares the active display before streaming.
+       * @brief Selects how Lumen prepares the active display before streaming.
        */
       enum class config_option_e {
         disabled,  ///< Disable the configuration for the device.
@@ -156,29 +156,29 @@ namespace config {
       };
 
       /**
-       * @brief Selects how Sunshine chooses the stream display resolution.
+       * @brief Selects how Lumen chooses the stream display resolution.
        */
       enum class resolution_option_e {
         disabled,  ///< Do not change resolution.
-        automatic,  ///< Change resolution and use the one received from Moonlight.
+        automatic,  ///< Change resolution and use the one received from the client.
         manual  ///< Change resolution and use the manually provided one.
       };
 
       /**
-       * @brief Selects how Sunshine chooses the stream display refresh rate.
+       * @brief Selects how Lumen chooses the stream display refresh rate.
        */
       enum class refresh_rate_option_e {
         disabled,  ///< Do not change refresh rate.
-        automatic,  ///< Change refresh rate and use the one received from Moonlight.
+        automatic,  ///< Change refresh rate and use the one received from the client.
         manual  ///< Change refresh rate and use the manually provided one.
       };
 
       /**
-       * @brief Selects how Sunshine handles HDR state for the stream display.
+       * @brief Selects how Lumen handles HDR state for the stream display.
        */
       enum class hdr_option_e {
         disabled,  ///< Do not change HDR settings.
-        automatic  ///< Change HDR settings and use the state requested by Moonlight.
+        automatic  ///< Change HDR settings and use the state requested by the client.
       };
 
       /**
@@ -282,7 +282,7 @@ namespace config {
     std::string pkey;  ///< Private key PEM string or path.
     std::string cert;  ///< Certificate PEM string or path.
 
-    std::string sunshine_name;  ///< Host name advertised to Moonlight clients; retained for source compatibility.
+    std::string host_name;  ///< Host name advertised to GameStream clients; retained for source compatibility.
 
     std::string file_state;  ///< Path to the persisted Lumen state file.
 
@@ -368,7 +368,7 @@ namespace config {
   /**
    * @brief Top-level Lumen configuration and credential state.
    */
-  struct sunshine_t {
+  struct general_t {
     std::string locale;  ///< Locale selected for Lumen UI and log messages.
     int min_log_level;  ///< Minimum severity level written to the configured log sink.
     std::bitset<flag::FLAG_SIZE> flags;  ///< Runtime flags parsed from command-line options.
@@ -409,9 +409,9 @@ namespace config {
   extern lsp_t lsp;
   extern nvhttp_t nvhttp;
   extern input_t input;
-  extern sunshine_t sunshine;
+  extern general_t general;
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   /**
    * @brief Parse and apply serialized configuration text for unit tests.
    *
@@ -435,30 +435,4 @@ namespace config {
    * @return Parsed configuration key-value entries.
    */
   std::unordered_map<std::string, std::string> parse_config(const std::string_view &file_content);
-
-  /**
-   * @brief Select or copy a legacy Sunshine configuration for Lumen startup.
-   *
-   * @param config_file Path to the authoritative configuration file; never
-   * redirected into the legacy Sunshine directory.
-   * @param custom_config_file Whether the user supplied the path explicitly.
-   */
-  void migrate_legacy_config_file(std::string &config_file, bool custom_config_file);
-
-  /**
-   * @brief Safely copy a legacy configuration tree into a new Lumen directory.
-   *
-   * The copy refuses symlinks, reserves a private staging directory, and
-   * atomically publishes the completed tree without modifying the source.
-   *
-   * @param legacy_directory Legacy Sunshine directory to read.
-   * @param lumen_directory Authoritative Lumen directory to create.
-   * @param error_message Receives a diagnostic when the copy is rejected.
-   * @return `true` only when the complete tree is published.
-   */
-  bool copy_legacy_config_directory(
-    const std::string &legacy_directory,
-    const std::string &lumen_directory,
-    std::string &error_message
-  );
 }  // namespace config

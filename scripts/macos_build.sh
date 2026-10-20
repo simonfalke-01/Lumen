@@ -103,7 +103,7 @@ function run_step_cmake() {
     "-DICU_ROOT=$(brew --prefix icu4c@78 2>/dev/null)"
     "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3 2>/dev/null)"
     "-DOpus_ROOT_DIR=$(brew --prefix opus 2>/dev/null)"
-    "-DSUNSHINE_ENABLE_TRAY=ON"
+    "-DLUMEN_ENABLE_TRAY=ON"
   )
 
   if [[ -n "${sign_app}" ]]; then
@@ -117,13 +117,13 @@ function run_step_cmake() {
 
   # Publisher metadata
   if [[ -n "$publisher_name" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_NAME=${publisher_name}")
+    cmake_args+=("-DLUMEN_PUBLISHER_NAME=${publisher_name}")
   fi
   if [[ -n "$publisher_website" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_WEBSITE=${publisher_website}")
+    cmake_args+=("-DLUMEN_PUBLISHER_WEBSITE=${publisher_website}")
   fi
   if [[ -n "$publisher_issue_url" ]]; then
-    cmake_args+=("-DSUNSHINE_PUBLISHER_ISSUE_URL=${publisher_issue_url}")
+    cmake_args+=("-DLUMEN_PUBLISHER_ISSUE_URL=${publisher_issue_url}")
   fi
 
   # Cmake stuff here

@@ -169,8 +169,8 @@ namespace crypto {
     int err_code = X509_STORE_CTX_get_error(ctx);
 
     switch (err_code) {
-      // Expired or not-yet-valid certificates are fine. Sometimes Moonlight is running on embedded devices
-      // that don't have accurate clocks (or haven't yet synchronized by the time Moonlight first runs).
+      // Expired or not-yet-valid certificates are fine. Sometimes GameStream is running on embedded devices
+      // that don't have accurate clocks (or haven't yet synchronized by the time GameStream first runs).
       // This behavior also matches what GeForce Experience does.
       case X509_V_ERR_CERT_NOT_YET_VALID:
       case X509_V_ERR_CERT_HAS_EXPIRED:
@@ -183,9 +183,9 @@ namespace crypto {
 
   /**
    * @brief Verify the certificate chain.
-   * When certificates from two or more instances of Moonlight have been added to x509_store_t,
+   * When certificates from two or more instances of the client have been added to x509_store_t,
    * only one of them will be verified by X509_verify_cert, resulting in only a single instance of
-   * Moonlight to be able to use Sunshine
+   * GameStream to be able to use Lumen
    *
    * To circumvent this, x509_store_t instance will be created for each instance of the certificates.
    * @param cert The certificate to verify.
@@ -202,7 +202,7 @@ namespace crypto {
       X509_STORE_CTX_set_verify_cb(_cert_ctx.get(), openssl_verify_cb);
 
       // We don't care to validate the entire chain for the purposes of client auth.
-      // Some clients forked from Moonlight Embedded produce leaf certificates
+      // Some clients forked from embedded GameStream clients produce leaf certificates
       // whose X509v3 extensions OpenSSL does not recognize as a complete chain.
       X509_STORE_CTX_set_flags(_cert_ctx.get(), X509_V_FLAG_PARTIAL_CHAIN);
 
@@ -597,7 +597,7 @@ namespace crypto {
   }
 
   /**
-   * @brief Generate a certificate and private key for Sunshine pairing.
+   * @brief Generate a certificate and private key for Lumen pairing.
    */
   creds_t gen_creds(const std::string_view &cn, std::uint32_t key_bits) {
     x509_t x509 {X509_new()};

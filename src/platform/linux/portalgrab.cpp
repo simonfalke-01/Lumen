@@ -834,7 +834,7 @@ namespace platf {
     }
 
     if (has_elevated_privileges(true)) {
-      // We're still in the probing phase of Sunshine startup. Dropping portal security early will break KMS.
+      // We're still in the probing phase of Lumen startup. Dropping portal security early will break KMS.
       // Just return a dummy screen for now. Display re-enumeration after encoder probing will yield full result.
       display_names.emplace_back("init");
       return display_names;

@@ -118,7 +118,7 @@ namespace platf::publish {
    * @brief Main entry point for publication of our service on macOS.
    *
    * This function initiates a connection to the macOS mDNS service and requests to register
-   * our Sunshine service. Registration will occur asynchronously (unless it fails immediately,
+   * our Lumen service. Registration will occur asynchronously (unless it fails immediately,
    * which is probably only possible if the host machine is misconfigured).
    *
    * @return Either `nullptr` (if the registration fails immediately) or a `uniqur_ptr<deinit_t>`,

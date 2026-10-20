@@ -193,7 +193,7 @@ LRESULT CALLBACK SessionMonitorWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, L
       {
         // Terminate ourselves with a blocking exit call
         std::cout << "Received WM_ENDSESSION"sv << std::endl;
-        lifetime::exit_sunshine(0, false);
+        lifetime::exit_lumen(0, false);
         return 0;
       }
     default:
@@ -210,13 +210,13 @@ LRESULT CALLBACK SessionMonitorWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, L
 WINAPI BOOL ConsoleCtrlHandler(DWORD type) {
   if (type == CTRL_CLOSE_EVENT) {
     BOOST_LOG(info) << "Console closed handler called";
-    lifetime::exit_sunshine(0, false);
+    lifetime::exit_lumen(0, false);
   }
   return FALSE;
 }
 #endif
 
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined LUMEN_TRAY && LUMEN_TRAY >= 1
 constexpr bool tray_is_enabled = true;  ///< Compile-time flag indicating tray support is enabled.
 #else
 constexpr bool tray_is_enabled = false;
@@ -232,7 +232,7 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
 
   // Conditions that would require the main thread event loop
 #ifndef _WIN32
-  run_loop = tray_is_enabled && config::sunshine.system_tray;  // On Windows, tray runs in separate thread, so no main loop needed for tray
+  run_loop = tray_is_enabled && config::general.system_tray;  // On Windows, tray runs in separate thread, so no main loop needed for tray
 #endif
 
   if (!run_loop) {
@@ -244,7 +244,7 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
 
   // Main thread event loop
   BOOST_LOG(info) << "Starting main loop"sv;
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+#if defined LUMEN_TRAY && LUMEN_TRAY >= 1
   while (system_tray::process_tray_events() == 0);
 #endif
   BOOST_LOG(info) << "Main loop has exited"sv;
@@ -302,7 +302,7 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
-  auto log_deinit_guard = logging::init(config::sunshine.min_log_level, config::sunshine.log_file);
+  auto log_deinit_guard = logging::init(config::general.min_log_level, config::general.log_file);
   if (!log_deinit_guard) {
     BOOST_LOG(error) << "Logging failed to initialize"sv;
   }
@@ -323,10 +323,10 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(warning) << "Some retired native-protocol state could not be removed"sv;
   }
 
-  if (!config::sunshine.cmd.name.empty()) {
-    auto fn = cmd_to_func.find(config::sunshine.cmd.name);
+  if (!config::general.cmd.name.empty()) {
+    auto fn = cmd_to_func.find(config::general.cmd.name);
     if (fn == std::end(cmd_to_func)) {
-      BOOST_LOG(fatal) << "Unknown command: "sv << config::sunshine.cmd.name;
+      BOOST_LOG(fatal) << "Unknown command: "sv << config::general.cmd.name;
 
       BOOST_LOG(info) << "Possible commands:"sv;
       for (auto &[key, _] : cmd_to_func) {
@@ -336,7 +336,7 @@ int main(int argc, char *argv[]) {
       return 7;
     }
 
-    return fn->second(argv[0], config::sunshine.cmd.argc, config::sunshine.cmd.argv);
+    return fn->second(argv[0], config::general.cmd.argc, config::general.cmd.argv);
   }
 
   // Adding guard here first as it also performs recovery after crash,
@@ -350,9 +350,9 @@ int main(int argc, char *argv[]) {
 #ifdef _WIN32
   // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
   if (nvprefs_instance.load()) {
-    // Restore global settings to the undo file left by improper termination of sunshine.exe
+    // Restore global settings to the undo file left by improper termination of lumen.exe
     nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
-    // Modify application settings for sunshine.exe
+    // Modify application settings for lumen.exe
     nvprefs_instance.modify_application_profile();
     // Modify global settings, undo file is produced in the process to restore after improper termination
     nvprefs_instance.modify_global_profile();
@@ -360,7 +360,7 @@ int main(int argc, char *argv[]) {
     nvprefs_instance.unload();
   }
 
-  // Wait as long as possible to terminate Sunshine.exe during logoff/shutdown
+  // Wait as long as possible to terminate Lumen.exe during logoff/shutdown
   SetProcessShutdownParameters(0x100, SHUTDOWN_NORETRY);
 
   // We must create a hidden window to receive shutdown notifications since we load gdi32.dll
@@ -452,7 +452,7 @@ int main(int argc, char *argv[]) {
     // Break out of the main loop
     shutdown_event->raise(true);
 
-    if (tray_is_enabled && config::sunshine.system_tray) {
+    if (tray_is_enabled && config::general.system_tray) {
       system_tray::end_tray();
     }
 
@@ -472,7 +472,7 @@ int main(int argc, char *argv[]) {
     // Break out of the main loop
     shutdown_event->raise(true);
 
-    if (tray_is_enabled && config::sunshine.system_tray) {
+    if (tray_is_enabled && config::general.system_tray) {
       system_tray::end_tray();
     }
 
@@ -486,7 +486,7 @@ int main(int argc, char *argv[]) {
 
   proc::refresh(config::stream.file_apps);
 
-  // If any of the following fail, we log an error and continue event though sunshine will not function correctly.
+  // If any of the following fail, we log an error and continue event though lumen will not function correctly.
   // This allows access to the UI to fix configuration problems or view the logs.
 
   auto platf_deinit_guard = platf::init();
@@ -579,17 +579,17 @@ int main(int argc, char *argv[]) {
 
 #ifdef _WIN32
   // If we're using the default port and GameStream is enabled, warn the user
-  if (config::sunshine.port == 47989 && is_gamestream_enabled()) {
+  if (config::general.port == 47989 && is_gamestream_enabled()) {
     BOOST_LOG(fatal) << "GameStream is still enabled in GeForce Experience! This *will* cause streaming problems with Lumen!"sv;
     BOOST_LOG(fatal) << "Disable GameStream on the SHIELD tab in GeForce Experience or change the Port setting on the Advanced tab in the Lumen Web UI."sv;
   }
 #endif
 
-  if (tray_is_enabled && config::sunshine.system_tray) {
+  if (tray_is_enabled && config::general.system_tray) {
     BOOST_LOG(info) << "Starting system tray"sv;
 #ifdef _WIN32
     // TODO: Windows has a weird bug where when running as a service and on the first Windows boot,
-    // the tray icon would not appear even though Sunshine is running correctly otherwise.
+    // the tray icon would not appear even though Lumen is running correctly otherwise.
     // Restarting the service would allow the icon to appear normally.
     // For now we will keep the Windows tray icon on a separate thread.
     // Ideally, we would run the system tray on the main thread for all platforms.

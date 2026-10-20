@@ -85,27 +85,27 @@ namespace platf {
   // Limited by bits in activeGamepadMask
   constexpr auto MAX_GAMEPADS = 16;  ///< Maximum number of simultaneously tracked gamepads.
 
-  constexpr std::uint32_t DPAD_UP = 0x0001;  ///< Moonlight gamepad button mask bit for D-pad up.
-  constexpr std::uint32_t DPAD_DOWN = 0x0002;  ///< Moonlight gamepad button mask bit for D-pad down.
-  constexpr std::uint32_t DPAD_LEFT = 0x0004;  ///< Moonlight gamepad button mask bit for D-pad left.
-  constexpr std::uint32_t DPAD_RIGHT = 0x0008;  ///< Moonlight gamepad button mask bit for D-pad right.
-  constexpr std::uint32_t START = 0x0010;  ///< Moonlight gamepad button mask bit for Start.
-  constexpr std::uint32_t BACK = 0x0020;  ///< Moonlight gamepad button mask bit for Back.
-  constexpr std::uint32_t LEFT_STICK = 0x0040;  ///< Moonlight gamepad button mask bit for left stick press.
-  constexpr std::uint32_t RIGHT_STICK = 0x0080;  ///< Moonlight gamepad button mask bit for right stick press.
-  constexpr std::uint32_t LEFT_BUTTON = 0x0100;  ///< Moonlight gamepad button mask bit for left shoulder.
-  constexpr std::uint32_t RIGHT_BUTTON = 0x0200;  ///< Moonlight gamepad button mask bit for right shoulder.
-  constexpr std::uint32_t HOME = 0x0400;  ///< Moonlight gamepad button mask bit for Home.
-  constexpr std::uint32_t A = 0x1000;  ///< Moonlight gamepad button mask bit for A.
-  constexpr std::uint32_t B = 0x2000;  ///< Moonlight gamepad button mask bit for B.
-  constexpr std::uint32_t X = 0x4000;  ///< Moonlight gamepad button mask bit for X.
-  constexpr std::uint32_t Y = 0x8000;  ///< Moonlight gamepad button mask bit for Y.
-  constexpr std::uint32_t PADDLE1 = 0x010000;  ///< Moonlight gamepad button mask bit for paddle 1.
-  constexpr std::uint32_t PADDLE2 = 0x020000;  ///< Moonlight gamepad button mask bit for paddle 2.
-  constexpr std::uint32_t PADDLE3 = 0x040000;  ///< Moonlight gamepad button mask bit for paddle 3.
-  constexpr std::uint32_t PADDLE4 = 0x080000;  ///< Moonlight gamepad button mask bit for paddle 4.
-  constexpr std::uint32_t TOUCHPAD_BUTTON = 0x100000;  ///< Moonlight gamepad button mask bit for touchpad click.
-  constexpr std::uint32_t MISC_BUTTON = 0x200000;  ///< Moonlight gamepad button mask bit for the miscellaneous button.
+  constexpr std::uint32_t DPAD_UP = 0x0001;  ///< GameStream gamepad button mask bit for D-pad up.
+  constexpr std::uint32_t DPAD_DOWN = 0x0002;  ///< GameStream gamepad button mask bit for D-pad down.
+  constexpr std::uint32_t DPAD_LEFT = 0x0004;  ///< GameStream gamepad button mask bit for D-pad left.
+  constexpr std::uint32_t DPAD_RIGHT = 0x0008;  ///< GameStream gamepad button mask bit for D-pad right.
+  constexpr std::uint32_t START = 0x0010;  ///< GameStream gamepad button mask bit for Start.
+  constexpr std::uint32_t BACK = 0x0020;  ///< GameStream gamepad button mask bit for Back.
+  constexpr std::uint32_t LEFT_STICK = 0x0040;  ///< GameStream gamepad button mask bit for left stick press.
+  constexpr std::uint32_t RIGHT_STICK = 0x0080;  ///< GameStream gamepad button mask bit for right stick press.
+  constexpr std::uint32_t LEFT_BUTTON = 0x0100;  ///< GameStream gamepad button mask bit for left shoulder.
+  constexpr std::uint32_t RIGHT_BUTTON = 0x0200;  ///< GameStream gamepad button mask bit for right shoulder.
+  constexpr std::uint32_t HOME = 0x0400;  ///< GameStream gamepad button mask bit for Home.
+  constexpr std::uint32_t A = 0x1000;  ///< GameStream gamepad button mask bit for A.
+  constexpr std::uint32_t B = 0x2000;  ///< GameStream gamepad button mask bit for B.
+  constexpr std::uint32_t X = 0x4000;  ///< GameStream gamepad button mask bit for X.
+  constexpr std::uint32_t Y = 0x8000;  ///< GameStream gamepad button mask bit for Y.
+  constexpr std::uint32_t PADDLE1 = 0x010000;  ///< GameStream gamepad button mask bit for paddle 1.
+  constexpr std::uint32_t PADDLE2 = 0x020000;  ///< GameStream gamepad button mask bit for paddle 2.
+  constexpr std::uint32_t PADDLE3 = 0x040000;  ///< GameStream gamepad button mask bit for paddle 3.
+  constexpr std::uint32_t PADDLE4 = 0x080000;  ///< GameStream gamepad button mask bit for paddle 4.
+  constexpr std::uint32_t TOUCHPAD_BUTTON = 0x100000;  ///< GameStream gamepad button mask bit for touchpad click.
+  constexpr std::uint32_t MISC_BUTTON = 0x200000;  ///< GameStream gamepad button mask bit for the miscellaneous button.
 
   /**
    * @brief Gamepad type exposed to clients and why it may be disabled.
@@ -138,7 +138,7 @@ namespace platf {
   };
 
   /**
-   * @brief Feedback command sent from Sunshine to a virtual gamepad.
+   * @brief Feedback command sent from Lumen to a virtual gamepad.
    */
   struct gamepad_feedback_msg_t {
     /**
@@ -284,14 +284,14 @@ namespace platf {
     };
 
     /**
-     * @brief Moonlight speaker order for stereo audio.
+     * @brief GameStream speaker order for stereo audio.
      */
     constexpr std::uint8_t map_stereo[] {
       FRONT_LEFT,
       FRONT_RIGHT
     };
     /**
-     * @brief Moonlight speaker order for 5.1 surround audio.
+     * @brief GameStream speaker order for 5.1 surround audio.
      */
     constexpr std::uint8_t map_surround51[] {
       FRONT_LEFT,
@@ -302,7 +302,7 @@ namespace platf {
       BACK_RIGHT,
     };
     /**
-     * @brief Moonlight speaker order for 7.1 surround audio.
+     * @brief GameStream speaker order for 7.1 surround audio.
      */
     constexpr std::uint8_t map_surround71[] {
       FRONT_LEFT,
@@ -345,9 +345,9 @@ namespace platf {
   };
 
   /**
-   * @brief Convert a Sunshine pixel format enum to its string name.
+   * @brief Convert a Lumen pixel format enum to its string name.
    *
-   * @param pix_fmt Sunshine pixel format to convert or allocate for.
+   * @param pix_fmt Lumen pixel format to convert or allocate for.
    * @return Value converted from pix fmt.
    */
   inline std::string_view from_pix_fmt(pix_fmt_e pix_fmt) {
@@ -407,7 +407,7 @@ namespace platf {
    * @brief Button and axis state received for a virtual gamepad.
    */
   struct gamepad_state_t {
-    std::uint32_t buttonFlags;  ///< Moonlight button mask for the current gamepad state.
+    std::uint32_t buttonFlags;  ///< GameStream button mask for the current gamepad state.
     std::uint8_t lt;  ///< Left trigger value.
     std::uint8_t rt;  ///< Right trigger value.
     std::int16_t lsX;  ///< Left stick X-axis value.
@@ -451,7 +451,7 @@ namespace platf {
    */
   struct gamepad_touch_t {
     gamepad_id_t id;  ///< Gamepad identifier for the event.
-    std::uint8_t eventType;  ///< Moonlight event type for the input packet.
+    std::uint8_t eventType;  ///< GameStream event type for the input packet.
     std::uint32_t pointerId;  ///< Client-provided pointer identifier for a touch contact.
     float x;  ///< Horizontal coordinate or vector component.
     float y;  ///< Vertical coordinate or vector component.
@@ -485,7 +485,7 @@ namespace platf {
    * @brief Absolute touchscreen event data from the client.
    */
   struct touch_input_t {
-    std::uint8_t eventType;  ///< Moonlight event type for the input packet.
+    std::uint8_t eventType;  ///< GameStream event type for the input packet.
     std::uint16_t rotation;  ///< Degrees (0..360) or LI_ROT_UNKNOWN.
     std::uint32_t pointerId;  ///< Client-provided pointer identifier for a touch contact.
     float x;  ///< Horizontal coordinate or vector component.
@@ -499,7 +499,7 @@ namespace platf {
    * @brief Pen tablet event data from the client.
    */
   struct pen_input_t {
-    std::uint8_t eventType;  ///< Moonlight event type for the input packet.
+    std::uint8_t eventType;  ///< GameStream event type for the input packet.
     std::uint8_t toolType;  ///< Pen tool type reported by the client.
     std::uint8_t penButtons;  ///< Button mask for the active pen tool.
     std::uint8_t tilt;  ///< Degrees (0..90) or LI_TILT_UNKNOWN.
@@ -584,7 +584,7 @@ namespace platf {
      */
     virtual int convert(platf::img_t &img) = 0;
 
-    video::sunshine_colorspace_t colorspace;  ///< Colorspace metadata expected by the encoder.
+    video::stream_colorspace_t colorspace;  ///< Colorspace metadata expected by the encoder.
   };
 
   /**
@@ -663,7 +663,7 @@ namespace platf {
      * @param colorspace Colorimetry information used for conversion or encoding.
      * @return True when the backend successfully completes the requested action.
      */
-    virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
+    virtual bool init_encoder(const video::config_t &client_config, const video::stream_colorspace_t &colorspace) = 0;
 
     nvenc::nvenc_encoder *nvenc = nullptr;  ///< NVENC encoder instance owned by the encode device.
   };
@@ -741,7 +741,7 @@ namespace platf {
     /**
      * @brief Create AVCodec encode device.
      *
-     * @param pix_fmt Sunshine pixel format to convert or allocate for.
+     * @param pix_fmt Lumen pixel format to convert or allocate for.
      * @return Constructed AVCodec encode device object.
      */
     virtual std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) {
@@ -751,7 +751,7 @@ namespace platf {
     /**
      * @brief Create NVENC encode device.
      *
-     * @param pix_fmt Sunshine pixel format to convert or allocate for.
+     * @param pix_fmt Lumen pixel format to convert or allocate for.
      * @return Constructed NVENC encode device object.
      */
     virtual std::unique_ptr<nvenc_encode_device_t> make_nvenc_encode_device(pix_fmt_e pix_fmt) {
@@ -821,7 +821,7 @@ namespace platf {
   class mic_t {
   public:
     /**
-     * @brief Deliver a captured audio sample to Sunshine's audio pipeline.
+     * @brief Deliver a captured audio sample to Lumen's audio pipeline.
      *
      * @param frame_buffer Destination for captured floating-point PCM samples.
      * @return Capture status reported to the streaming pipeline.
@@ -865,7 +865,7 @@ namespace platf {
     virtual bool is_sink_available(const std::string &sink) = 0;
 
     /**
-     * @brief Query host and virtual sink names available to Sunshine.
+     * @brief Query host and virtual sink names available to Lumen.
      *
      * @return Host and virtual sink names when the backend can report them.
      */
@@ -1175,6 +1175,22 @@ namespace platf {
    * @param y Vertical absolute coordinate from the client.
    */
   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y);
+#ifdef _WIN32
+  /**
+   * @brief Move the pointer toward a normalized position on the primary display with relative input.
+   *
+   * Absolute mouse reports are mapped through the sign-in DPI, and placing the cursor directly is
+   * not pointer input, so modern Windows UI shows no hover for it. Each call measures the remaining
+   * distance in physical pixels and sends one relative report through the input backend, scaled by
+   * the pointer-acceleration gain observed from the previous report; repeated calls converge.
+   *
+   * @param input Platform input backend that receives the relative report.
+   * @param x Horizontal position from 0 to 1.
+   * @param y Vertical position from 0 to 1.
+   * @return `true` when the pointer position could be measured.
+   */
+  bool move_pointer_toward(input_t &input, float x, float y) noexcept;
+#endif
   /**
    * @brief Press or release a virtual mouse button.
    *

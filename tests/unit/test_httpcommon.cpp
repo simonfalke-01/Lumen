@@ -74,7 +74,7 @@ TEST(HttpCommonStateFileTest, TransactionsSerializeAndFailedMutationDoesNotCommi
 TEST(HttpCommonStateFileTest, RemovedTransportMigrationPreservesLegacyStateAndCredentials) {
   const auto root = std::filesystem::temp_directory_path() /
                     std::format("lumen-retired-transport-{}", std::chrono::steady_clock::now().time_since_epoch().count());
-  const auto state_file = root / "sunshine_state.json";
+  const auto state_file = root / "lumen_state.json";
   const auto credentials = root / "credentials";
   std::error_code ignored;
   std::filesystem::create_directories(credentials);
@@ -157,7 +157,7 @@ TEST_P(DownloadFileTest, Run) {
   ASSERT_TRUE(http::download_file(url, path, CURL_SSLVERSION_TLSv1_0));
 }
 
-#ifdef SUNSHINE_BUILD_FLATPAK
+#ifdef LUMEN_BUILD_FLATPAK
 // requires running `npm run serve` prior to running the tests
 constexpr const char *URL_1 = "http://0.0.0.0:3000/hello.txt";
 constexpr const char *URL_2 = "http://0.0.0.0:3000/hello-redirect.txt";

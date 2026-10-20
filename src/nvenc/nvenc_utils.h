@@ -28,19 +28,19 @@ namespace NVENC_NAMESPACE {
 #endif
 
   /**
-   * @brief Convert a Sunshine pixel format to the matching NVENC buffer format.
+   * @brief Convert a Lumen pixel format to the matching NVENC buffer format.
    *
    * @param format Pixel, audio, or protocol format being converted.
-   * @return NVENC buffer format compatible with the Sunshine pixel format.
+   * @return NVENC buffer format compatible with the Lumen pixel format.
    */
-  NV_ENC_BUFFER_FORMAT nvenc_format_from_sunshine_format(platf::pix_fmt_e format);
+  NV_ENC_BUFFER_FORMAT nvenc_format_from_stream_format(platf::pix_fmt_e format);
 
   /**
-   * @brief Convert Sunshine colorspace metadata to NVENC VUI metadata.
+   * @brief Convert Lumen colorspace metadata to NVENC VUI metadata.
    *
-   * @param sunshine_colorspace Sunshine colorspace.
-   * @return NVENC colorspace and VUI fields for the Sunshine metadata.
+   * @param stream_colorspace Lumen colorspace.
+   * @return NVENC colorspace and VUI fields for the Lumen metadata.
    */
-  nvenc_colorspace_t nvenc_colorspace_from_sunshine_colorspace(const video::sunshine_colorspace_t &sunshine_colorspace);
+  nvenc_colorspace_t nvenc_colorspace_from_stream_colorspace(const video::stream_colorspace_t &stream_colorspace);
 
 }  // namespace NVENC_NAMESPACE

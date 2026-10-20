@@ -89,7 +89,7 @@ namespace platf::win_input {
 
     /**
      * @brief Change one mouse button.
-     * @param button Moonlight mouse button number in the range 1 through 5.
+     * @param button GameStream mouse button number in the range 1 through 5.
      * @param release `true` to release the button.
      * @return Operation result.
      */
@@ -113,7 +113,7 @@ namespace platf::win_input {
      * @brief Change one keyboard key.
      * @param modcode Windows virtual-key code.
      * @param release `true` to release the key.
-     * @param flags Moonlight keyboard packet flags.
+     * @param flags GameStream keyboard packet flags.
      * @return Operation result.
      */
     virtual result_t keyboard(std::uint16_t modcode, bool release, std::uint8_t flags) = 0;

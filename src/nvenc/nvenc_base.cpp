@@ -66,9 +66,9 @@ namespace {
   }
 
   /**
-   * @brief Get the display name for a Sunshine video format.
+   * @brief Get the display name for a Lumen video format.
    *
-   * @param video_format Sunshine video format identifier.
+   * @param video_format Lumen video format identifier.
    * @return Display name including its trailing separator.
    */
   std::string_view video_format_name(int video_format) {
@@ -665,8 +665,8 @@ namespace NVENC_NAMESPACE {
   bool nvenc_base::create_encoder(
     const ::nvenc::nvenc_config &configured_nvenc,
     const video::config_t &client_config,
-    const video::sunshine_colorspace_t &sunshine_colorspace,
-    platf::pix_fmt_e sunshine_buffer_format,
+    const video::stream_colorspace_t &stream_colorspace,
+    platf::pix_fmt_e lumen_buffer_format,
     const std::optional<::nvenc::hdr_static_metadata_t> &hdr_metadata
   ) {
     const auto effective_nvenc = stream_policy::current_thread_nvenc_config(configured_nvenc);
@@ -681,9 +681,9 @@ namespace NVENC_NAMESPACE {
       destroy_encoder();
     });
 
-    const auto transfer = sunshine_colorspace.colorspace == video::colorspace_e::bt2020 ?
+    const auto transfer = stream_colorspace.colorspace == video::colorspace_e::bt2020 ?
                             ::nvenc::hdr_transfer_e::hdr10_pq :
-                          sunshine_colorspace.colorspace == video::colorspace_e::bt2020hlg ?
+                          stream_colorspace.colorspace == video::colorspace_e::bt2020hlg ?
                             ::nvenc::hdr_transfer_e::hlg :
                             ::nvenc::hdr_transfer_e::sdr;
     const auto hdr_policy = ::nvenc::evaluate_hdr_metadata_policy(
@@ -708,8 +708,8 @@ namespace NVENC_NAMESPACE {
 #endif
     }
 
-    const auto colorspace = nvenc_colorspace_from_sunshine_colorspace(sunshine_colorspace);
-    const auto buffer_format = nvenc_format_from_sunshine_format(sunshine_buffer_format);
+    const auto colorspace = nvenc_colorspace_from_stream_colorspace(stream_colorspace);
+    const auto buffer_format = nvenc_format_from_stream_format(lumen_buffer_format);
     if (buffer_format == NV_ENC_BUFFER_FORMAT_UNDEFINED) {
       BOOST_LOG(error) << "NvEnc: unsupported input pixel format";
       return false;

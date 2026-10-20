@@ -136,9 +136,9 @@ namespace {
     bool saved_always_send_scancodes_ {false};  ///< Restored mapping setting.
   };
 
-  /** @brief Expected HID bitmap bit for one Moonlight mouse button. */
+  /** @brief Expected HID bitmap bit for one GameStream mouse button. */
   struct virtual_hid_mouse_button_case_t {
-    int button;  ///< Moonlight mouse button constant.
+    int button;  ///< GameStream mouse button constant.
     std::uint8_t hid_bit;  ///< Expected HID mouse button bit.
   };
 
@@ -628,8 +628,8 @@ TEST_F(virtual_hid_input_test, RoutesAbsoluteMouseExclusivelyThroughVirtualHid) 
   const auto &absolute = channel->submissions.front();
   EXPECT_EQ(absolute.report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
   EXPECT_EQ(absolute.report.absolute_mouse.report_id, LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE);
-  EXPECT_EQ(absolute.report.absolute_mouse.x, 32768);
-  EXPECT_EQ(absolute.report.absolute_mouse.y, 16384);
+  EXPECT_EQ(absolute.report.absolute_mouse.x, 16384);
+  EXPECT_EQ(absolute.report.absolute_mouse.y, 8192);
   EXPECT_TRUE(fallback_api->submitted.empty());
 }
 
@@ -655,8 +655,8 @@ TEST_F(virtual_hid_input_test, SendsInitialAbsoluteLeftClickAsCompleteAbsoluteSn
   for (const auto &submission : channel->submissions) {
     EXPECT_EQ(submission.report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
     EXPECT_EQ(submission.report.absolute_mouse.report_id, LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE);
-    EXPECT_EQ(submission.report.absolute_mouse.x, 6554);
-    EXPECT_EQ(submission.report.absolute_mouse.y, 13107);
+    EXPECT_EQ(submission.report.absolute_mouse.x, 3277);
+    EXPECT_EQ(submission.report.absolute_mouse.y, 6553);
   }
   EXPECT_EQ(channel->submissions[1].report.absolute_mouse.buttons, 0x01);
   EXPECT_EQ(channel->submissions[2].report.absolute_mouse.buttons, 0x00);
@@ -679,8 +679,8 @@ TEST_F(virtual_hid_input_test, PreservesAbsoluteCoordinatesAcrossRightThenLeftCl
   EXPECT_EQ(channel->submissions[4].report.absolute_mouse.buttons, 0x00);
   for (const auto &submission : channel->submissions) {
     EXPECT_EQ(submission.report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
-    EXPECT_EQ(submission.report.absolute_mouse.x, 49151);
-    EXPECT_EQ(submission.report.absolute_mouse.y, 16384);
+    EXPECT_EQ(submission.report.absolute_mouse.x, 24575);
+    EXPECT_EQ(submission.report.absolute_mouse.y, 8192);
   }
   EXPECT_TRUE(fallback_api->submitted.empty());
 }
@@ -717,12 +717,12 @@ TEST_F(virtual_hid_input_test, InterleavesAbsoluteMovesButtonsAndWheelsInOneRepo
     EXPECT_EQ(submission.report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
   }
   EXPECT_EQ(channel->submissions[2].report.absolute_mouse.buttons, 0x01);
-  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.x, 16384);
-  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.y, 49151);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.x, 8192);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.y, 24575);
   EXPECT_EQ(channel->submissions[2].report.absolute_mouse.vertical_wheel, 1);
   EXPECT_EQ(channel->submissions[4].report.absolute_mouse.buttons, 0x01);
-  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.x, 32768);
-  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.y, 16384);
+  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.x, 16384);
+  EXPECT_EQ(channel->submissions[4].report.absolute_mouse.y, 8192);
   EXPECT_EQ(channel->submissions[4].report.absolute_mouse.horizontal_wheel, -2);
   EXPECT_TRUE(fallback_api->submitted.empty());
 }
@@ -760,8 +760,8 @@ TEST_F(virtual_hid_input_test, RelativeToAbsoluteSwitchNeutralizesOldMouseCollec
   EXPECT_EQ(channel->submissions[2].report.relative_mouse.buttons, 0x00);
   EXPECT_EQ(channel->submissions[3].report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
   EXPECT_EQ(channel->submissions[3].report.absolute_mouse.buttons, 0x03);
-  EXPECT_EQ(channel->submissions[3].report.absolute_mouse.x, 49151);
-  EXPECT_EQ(channel->submissions[3].report.absolute_mouse.y, 16384);
+  EXPECT_EQ(channel->submissions[3].report.absolute_mouse.x, 24575);
+  EXPECT_EQ(channel->submissions[3].report.absolute_mouse.y, 8192);
   EXPECT_EQ(transport->acknowledged_mouse_buttons(), 0x03);
   EXPECT_TRUE(fallback_api->submitted.empty());
 }
@@ -778,8 +778,8 @@ TEST_F(virtual_hid_input_test, AbsoluteToRelativeSwitchNeutralizesOldMouseCollec
   EXPECT_EQ(channel->submissions[1].report.absolute_mouse.buttons, 0x01);
   EXPECT_EQ(channel->submissions[2].report_kind, LUMEN_VHID_REPORT_KIND_ABSOLUTE_MOUSE);
   EXPECT_EQ(channel->submissions[2].report.absolute_mouse.buttons, 0x00);
-  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.x, 16384);
-  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.y, 49151);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.x, 8192);
+  EXPECT_EQ(channel->submissions[2].report.absolute_mouse.y, 24575);
   EXPECT_EQ(channel->submissions[3].report_kind, LUMEN_VHID_REPORT_KIND_RELATIVE_MOUSE);
   EXPECT_EQ(channel->submissions[3].report.relative_mouse.buttons, 0x01);
   EXPECT_EQ(channel->submissions[3].report.relative_mouse.x, 4);

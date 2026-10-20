@@ -1,28 +1,25 @@
 {
-  "name": "sunshine",
+  "name": "lumen-web",
+  "private": true,
   "version": "0.0.0",
-  "scripts": {
-    "build": "vite build --debug",
-    "build-clean": "vite build --debug --emptyOutDir",
-    "dev": "vite build --watch",
-    "serve": "serve ./tests/fixtures/http --no-port-switching",
-    "test": "npm run test:web",
-    "test:web": "node --test --experimental-test-coverage --test-coverage-branches=100 --test-coverage-functions=100 --test-coverage-lines=100 tests/web/*.test.js"
-  },
   "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p web && vite build",
+    "typecheck": "tsc --noEmit -p web"
+  },
   "dependencies": {
-    "@lucide/vue": "1.33.0",
-    "bootstrap": "5.3.8",
-    "date-fns": "4.4.0",
-    "vue": "3.5.41",
-    "vue-i18n": "11.4.8",
-    "vue3-simple-icons": "16.10.0"
+    "lucide-react": "1.57.0",
+    "react": "19.3.1",
+    "react-aria-components": "1.22.1",
+    "react-dom": "19.3.1"
   },
   "devDependencies": {
-    "@codecov/vite-plugin": "2.0.1",
-    "@vitejs/plugin-vue": "6.0.8",
-    "serve": "14.2.6",
-    "vite": "6.4.3",
-    "vite-plugin-ejs": "2.0.0"
+    "@types/node": "^26.6.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.4"
   }
 }

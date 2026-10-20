@@ -1,0 +1,6 @@
+[2026-09-14 10:53:08.013]: Tests: From /Users/brandonli/Documents/Repositories/Lumen/tests/integration/test_config_consistency.cpp:441
+[2026-09-14 10:53:08.013]: Tests:   ConfigConsistencyTest/AllConfigOptionsExistInAllFiles started
+[2026-09-14 10:53:08.679]: Tests: ConfigConsistencyTest/AllConfigOptionsExistInAllFiles passed
+[2026-09-14 10:53:08.679]: Tests: From /Users/brandonli/Documents/Repositories/Lumen/tests/integration/test_config_consistency.cpp:472
+[2026-09-14 10:53:08.679]: Tests:   ConfigConsistencyTest/ConfigTabsMatchDocumentationSections started
+[2026-09-14 10:53:08.805]: Tests: ConfigConsistencyTest/ConfigTabsMatchDocumentationSections passed

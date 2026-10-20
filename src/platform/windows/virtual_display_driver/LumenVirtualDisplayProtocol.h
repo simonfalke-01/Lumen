@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 /** Fixed driver ABI version. */
-#define LUMEN_VDD_ABI_VERSION 6u
+#define LUMEN_VDD_ABI_VERSION 7u
 /** Minimum supported width shared with host mode admission. */
 #define LUMEN_VDD_MIN_WIDTH LUMEN_START_MODE_MIN_WIDTH
 /** Maximum supported width shared with host mode admission. */
@@ -59,6 +59,19 @@ extern "C" {
 #define LUMEN_VDD_CAP_FRAME_METADATA_V2 0x00000200u
 /** Driver capability: immutable versioned gamma/color-transform queries. */
 #define LUMEN_VDD_CAP_COLOR_TRANSFORM_V1 0x00000400u
+/** Prepare flag: keep the cursor out of frames and publish it through QUERY_CURSOR. */
+#define LUMEN_VDD_PREPARE_FLAG_HARDWARE_CURSOR 0x00000001u
+/** Every prepare flag defined by this ABI. */
+#define LUMEN_VDD_PREPARE_FLAGS_KNOWN LUMEN_VDD_PREPARE_FLAG_HARDWARE_CURSOR
+
+/** Largest hardware-cursor width or height the driver accepts from the OS. */
+#define LUMEN_VDD_CURSOR_MAX_DIMENSION 256u
+/** Largest 32-bit cursor shape copied by QUERY_CURSOR. */
+#define LUMEN_VDD_CURSOR_MAX_SHAPE_BYTES (LUMEN_VDD_CURSOR_MAX_DIMENSION * LUMEN_VDD_CURSOR_MAX_DIMENSION * 4u)
+/** Cursor shape types: 32-bit BGRA with straight alpha, or 32-bit masked color (alpha 0xFF XORs). */
+#define LUMEN_VDD_CURSOR_SHAPE_NONE 0u
+#define LUMEN_VDD_CURSOR_SHAPE_ALPHA 1u
+#define LUMEN_VDD_CURSOR_SHAPE_MASKED_COLOR 2u
 
 /** Dynamic range values in the fixed control ABI. */
 #define LUMEN_VDD_DYNAMIC_RANGE_SDR 0u
@@ -109,6 +122,9 @@ extern "C" {
 #define IOCTL_LUMEN_VDD_RELEASE_FRAME LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 8u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_WRITE_DATA)
 #define IOCTL_LUMEN_VDD_OPEN_FRAME_EVENT LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 9u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_READ_DATA | LUMEN_VDD_FILE_WRITE_DATA)
 #define IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 10u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_READ_DATA | LUMEN_VDD_FILE_WRITE_DATA)
+/** Transfer the cursor-change event; uses the OPEN_FRAME_CHANNEL request and OPEN_FRAME_EVENT response. */
+#define IOCTL_LUMEN_VDD_OPEN_CURSOR_EVENT LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 11u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_READ_DATA | LUMEN_VDD_FILE_WRITE_DATA)
+#define IOCTL_LUMEN_VDD_QUERY_CURSOR LUMEN_VDD_CTL_CODE(LUMEN_VDD_FILE_DEVICE_VIDEO, LUMEN_VDD_IOCTL_INDEX + 12u, LUMEN_VDD_METHOD_BUFFERED, LUMEN_VDD_FILE_READ_DATA | LUMEN_VDD_FILE_WRITE_DATA)
 
 #pragma pack(push, 1)
 
@@ -214,7 +230,7 @@ extern "C" {
   typedef struct LUMEN_VDD_PREPARE_MODE_REQUEST {
     uint64_t generation;  ///< Nonzero strictly newer generation, or exact idempotent retry.
     uint32_t owner_process_id;  ///< Calling service PID.
-    uint32_t reserved;  ///< Must be zero.
+    uint32_t flags;  ///< LUMEN_VDD_PREPARE_FLAG_*.
     uint64_t preferred_render_adapter_luid;  ///< Nonzero packed LUID from the active encoder probe.
     LUMEN_VDD_MODE mode;  ///< Exact requested mode.
   } LUMEN_VDD_PREPARE_MODE_REQUEST;
@@ -305,6 +321,31 @@ extern "C" {
     uint32_t reserved;  ///< Must be zero.
   } LUMEN_VDD_RELEASE_FRAME_REQUEST;
 
+  /** Query the latest hardware-cursor state for one exact generation. */
+  typedef struct LUMEN_VDD_QUERY_CURSOR_REQUEST {
+    uint64_t generation;  ///< Exact active generation.
+    uint64_t known_shape_sequence;  ///< Shape the host already holds; its bytes are not copied again.
+  } LUMEN_VDD_QUERY_CURSOR_REQUEST;
+
+  /**
+   * Latest hardware-cursor state. The output buffer is this header followed by
+   * LUMEN_VDD_CURSOR_MAX_SHAPE_BYTES; only header plus shape_bytes are returned.
+   */
+  typedef struct LUMEN_VDD_QUERY_CURSOR_RESPONSE {
+    uint64_t generation;  ///< Exact active generation.
+    uint64_t sequence;  ///< Increments whenever visibility or shape changes; zero before the first OS report.
+    uint64_t shape_sequence;  ///< Increments whenever the shape changes; zero before the first shape.
+    uint32_t visible;  ///< One while the OS shows the cursor on this monitor.
+    uint32_t shape_type;  ///< LUMEN_VDD_CURSOR_SHAPE_*.
+    uint32_t width;  ///< Shape width in pixels.
+    uint32_t height;  ///< Shape height in pixels.
+    uint32_t pitch;  ///< Shape row pitch in bytes.
+    uint32_t x_hot;  ///< Hotspot X from the shape's top-left pixel.
+    uint32_t y_hot;  ///< Hotspot Y from the shape's top-left pixel.
+    uint32_t shape_bytes;  ///< Shape bytes following this header; zero when known_shape_sequence is current.
+    uint64_t reserved;  ///< Must be zero.
+  } LUMEN_VDD_QUERY_CURSOR_RESPONSE;
+
 #pragma pack(pop)
 
 #define LUMEN_VDD_STATIC_ASSERT(expression, name) typedef char lumen_vdd_static_assert_##name[(expression) ? 1 : -1]
@@ -327,6 +368,8 @@ extern "C" {
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_DEQUEUE_FRAME_REQUEST) == 8, dequeue_frame_request_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_DEQUEUE_FRAME_RESPONSE) == 96, dequeue_frame_response_size);
   LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_RELEASE_FRAME_REQUEST) == 40, release_frame_request_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_CURSOR_REQUEST) == 16, query_cursor_request_size);
+  LUMEN_VDD_STATIC_ASSERT(sizeof(LUMEN_VDD_QUERY_CURSOR_RESPONSE) == 64, query_cursor_response_size);
   LUMEN_VDD_STATIC_ASSERT((IOCTL_LUMEN_VDD_PREPARE_MODE & 3u) == LUMEN_VDD_METHOD_BUFFERED, prepare_is_buffered);
   LUMEN_VDD_STATIC_ASSERT((IOCTL_LUMEN_VDD_QUERY_COLOR_TRANSFORM & 3u) == LUMEN_VDD_METHOD_BUFFERED, query_color_transform_is_buffered);
 #undef LUMEN_VDD_STATIC_ASSERT

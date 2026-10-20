@@ -38,7 +38,7 @@ protocol.
 
 The existing QUIC implementation does not provide a usable performance
 baseline. Its behavior is low-frame-rate and periodically stuttery even where
-the legacy Moonlight path works smoothly on the same host and network.
+the legacy GameStream path works smoothly on the same host and network.
 Consequently, the replacement must not encode existing behavior as a contract
 or treat passing existing protocol tests as evidence that its architecture is
 sound.
@@ -99,7 +99,7 @@ delivery after the presentation deadline has failed the primary use case.
 - A clean wired path must not pay a permanent high FEC tax.
 - Protocol telemetry must distinguish capture, encode, network, reassembly,
   decode, render submission, and presentation-proxy time.
-- Legacy Moonlight compatibility remains separate. It is not tunneled through
+- Legacy GameStream compatibility remains separate. It is not tunneled through
   LSP and does not constrain the LSP wire format.
 
 ## 5. Why not QUIC
@@ -410,7 +410,7 @@ The platform evidence also changes the client design:
 - GameController exposes value/motion change handlers and
   `lastEventTimestamp`; Apple recommends change handlers instead of polling
   controller buttons once per frame.
-- Moonlight Common's mature C input sender already applies the same semantic
+- GameStream Common's mature C input sender already applies the same semantic
   split selected for LSP: latency mode bypasses its intentional mouse wait,
   relative motion accumulates rather than losing deltas, absolute/controller
   motion keeps the latest state, and physical button/lifecycle changes use

@@ -9,6 +9,8 @@
 #ifdef _WIN32
   #include <initguid.h>
   #include <Windows.h>
+
+  #include "misc.h"
 #endif
 
 #ifndef _WIN32
@@ -16,10 +18,19 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
+#include <array>
+#include <chrono>
+#include <thread>
 #include <cstring>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
+
+#include "src/logging.h"
+
+using namespace std::literals;
 #include <string_view>
 #include <utility>
 
@@ -110,6 +121,63 @@ namespace platf::virtual_display {
     }
 
     /** @brief Match one DisplayConfig monitor interface to its stable PnP container identity. */
+    /** DisplayConfig DPI-scale requests (undocumented, used by Windows Settings). */
+    struct dpi_scale_get_t {
+      DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+      std::int32_t minimum;  ///< Lowest step relative to the recommended scale (always 100%).
+      std::int32_t current;  ///< Current step relative to the recommended scale.
+      std::int32_t maximum;  ///< Highest step relative to the recommended scale.
+    };
+
+    struct dpi_scale_set_t {
+      DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+      std::int32_t relative;  ///< Requested step relative to the recommended scale.
+    };
+
+    /**
+     * @brief Scale the stream display by its height so UI keeps one size across resolutions.
+     *
+     * Windows stores a virtual monitor's scale relative to the recommended scale for the current
+     * mode, so the same setting means a different size at every resolution. Following the
+     * 1080p = 100% convention, 2160 lines get 200% and 1080 lines 100%.
+     */
+    void apply_stream_dpi_scale(const LUID &adapter, const UINT32 source, const std::uint32_t height) noexcept {
+      static constexpr std::array<std::uint32_t, 12> steps {100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500};
+      dpi_scale_get_t current {};
+      current.header.type = static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(-3);
+      current.header.size = sizeof(current);
+      current.header.adapterId = adapter;
+      current.header.id = source;
+      if (DisplayConfigGetDeviceInfo(&current.header) != ERROR_SUCCESS || current.minimum > 0) {
+        BOOST_LOG(warning) << "Lumen VDD display scale query failed"sv;
+        return;
+      }
+      const auto recommended = static_cast<std::int32_t>(-current.minimum);
+      const auto wanted = static_cast<double>(height) * 100.0 / 1080.0;
+      std::int32_t target = 0;
+      for (std::int32_t index = 0; index < static_cast<std::int32_t>(steps.size()); ++index) {
+        if (std::abs(steps[index] - wanted) < std::abs(steps[target] - wanted)) {
+          target = index;
+        }
+      }
+      const auto relative = std::clamp(target - recommended, current.minimum, current.maximum);
+      if (relative == current.current) {
+        return;
+      }
+      dpi_scale_set_t request {};
+      request.header.type = static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(-4);
+      request.header.size = sizeof(request);
+      request.header.adapterId = adapter;
+      request.header.id = source;
+      request.relative = relative;
+      if (DisplayConfigSetDeviceInfo(&request.header) != ERROR_SUCCESS) {
+        BOOST_LOG(warning) << "Lumen VDD display scale change failed"sv;
+        return;
+      }
+      BOOST_LOG(info) << "Lumen VDD display scale set to "sv << steps[std::clamp(recommended + relative, 0, 11)] << "% for "sv
+                      << height << " lines"sv;
+    }
+
     bool monitor_interface_has_container_id(const std::wstring &path, const GUID &expected) noexcept {
       constexpr std::wstring_view device_path_prefix {L"\\\\?\\"};
       if (!path.starts_with(device_path_prefix)) {
@@ -300,9 +368,10 @@ namespace platf::virtual_display {
     std::uint64_t session_id,
     mode_t mode,
     delivery_policy_e delivery_policy,
-    fidelity_e minimum_fidelity
+    fidelity_e minimum_fidelity,
+    bool hardware_cursor
   ) noexcept {
-    return {session_id, mode, delivery_policy, minimum_fidelity};
+    return {session_id, mode, delivery_policy, minimum_fidelity, std::nullopt, hardware_cursor};
   }
 
   coordinator_t::coordinator_t(
@@ -345,7 +414,8 @@ namespace platf::virtual_display {
           active_->selection.requested_mode == request.mode &&
           active_->selection.delivery_policy == request.delivery_policy &&
           active_->selection.fidelity == request.minimum_fidelity &&
-          active_->selection.render_adapter == request.render_adapter) {
+          active_->selection.render_adapter == request.render_adapter &&
+          active_->selection.hardware_cursor == request.hardware_cursor) {
         return {start_error_e::none, validation_error_e::none, active_->selection};
       }
       return {start_error_e::busy, validation_error_e::none, std::nullopt};
@@ -412,6 +482,7 @@ namespace platf::virtual_display {
           request.delivery_policy,
           request.minimum_fidelity,
           preferred_render_adapter_luid,
+          request.hardware_cursor,
           prepared
         )) {
       return fail_transaction_locked(start_error_e::driver_prepare_failed, request.session_id, generation, std::move(snapshot));
@@ -446,6 +517,7 @@ namespace platf::virtual_display {
       committed.mode != request.mode,
       request.render_adapter,
       prepared.render_adapter_preference_submitted,
+      request.hardware_cursor,
     };
     active_ = active_t {selection, std::move(snapshot)};
     return {start_error_e::none, validation_error_e::none, std::move(selection)};
@@ -746,7 +818,10 @@ namespace platf::virtual_display {
     auto owned_start = backend->start_owned(request, limits);
     auto &started = owned_start.started;
     if (started.error != start_error_e::none) {
-      if (policy == activation_policy_e::optional && permits_physical_fallback(started.error)) {
+      // A pending rollback leaves the VDD unusable until cleanup succeeds, but the current
+      // desktop (including the sign-in screen) is still capturable.
+      if (policy == activation_policy_e::optional &&
+          (permits_physical_fallback(started.error) || started.error == start_error_e::rollback_failed)) {
         return physical(started.error, started.validation_error);
       }
       return rejected(started.error, started.validation_error);
@@ -804,14 +879,34 @@ namespace platf::virtual_display {
     display_snapshot_t snapshot
   ) {
     if (rollback_locked(generation, &snapshot)) {
+      BOOST_LOG(warning) << "Lumen VDD start failed (error="sv << static_cast<int>(error) << "); prior display state restored"sv;
       return {error, validation_error_e::none, std::nullopt};
     }
+    BOOST_LOG(::error) << "Lumen VDD start failed (error="sv << static_cast<int>(error)
+                     << ") and the prior display state could not be restored; cleanup will be retried"sv;
     pending_cleanup_ = pending_cleanup_t {session_id, generation, std::move(snapshot)};
     return {start_error_e::rollback_failed, validation_error_e::none, std::nullopt};
   }
 
 #ifdef _WIN32
   namespace {
+    /**
+     * @brief Bind the calling thread to the current input desktop.
+     *
+     * SetDisplayConfig only succeeds from a thread attached to the input desktop. At the
+     * sign-in or lock screen that is the secure Winlogon desktop, not the user's desktop,
+     * so without this the VDD can neither activate nor roll back until the user signs in.
+     */
+    void bind_to_input_desktop() noexcept {
+      thread_local HDESK bound = nullptr;
+      if (auto desktop = platf::syncThreadDesktop()) {
+        if (bound != nullptr && bound != desktop) {
+          CloseDesktop(bound);
+        }
+        bound = desktop;
+      }
+    }
+
     std::optional<mode_t> from_abi(const LUMEN_VDD_MODE &mode) {
       if ((mode.dynamic_range != LUMEN_VDD_DYNAMIC_RANGE_SDR && mode.dynamic_range != LUMEN_VDD_DYNAMIC_RANGE_HDR10) ||
           (mode.bits_per_channel != 8 && mode.bits_per_channel != 10) ||
@@ -1029,12 +1124,13 @@ namespace platf::virtual_display {
         delivery_policy_e delivery_policy,
         fidelity_e minimum_fidelity,
         const std::uint64_t preferred_render_adapter_luid,
+        const bool hardware_cursor,
         prepared_mode_t &prepared
       ) override {
         const LUMEN_VDD_PREPARE_MODE_REQUEST request {
           generation,
           GetCurrentProcessId(),
-          0,
+          hardware_cursor ? LUMEN_VDD_PREPARE_FLAG_HARDWARE_CURSOR : 0U,
           preferred_render_adapter_luid,
           to_abi(mode, delivery_policy, minimum_fidelity),
         };
@@ -1141,11 +1237,9 @@ namespace platf::virtual_display {
       }
 
       bool commit(const std::string &connector_id, const mode_t &mode, display_commit_t &applied) override {
+        bind_to_input_desktop();
         std::vector<DISPLAYCONFIG_PATH_INFO> paths;
         std::vector<DISPLAYCONFIG_MODE_INFO> modes;
-        if (!query(QDC_ALL_PATHS, paths, modes)) {
-          return false;
-        }
         const auto matches_connector = [&connector_id](const DISPLAYCONFIG_PATH_INFO &path) {
           if (connector_id != "LUM0001") {
             return false;
@@ -1163,13 +1257,32 @@ namespace platf::virtual_display {
             GUID_CONTAINERID_LUMEN_VIRTUAL_DISPLAY_MONITOR
           );
         };
+        // Windows enumerates the connector the driver just published asynchronously, so the
+        // first query after a fresh driver start can predate it; wait briefly for it to appear.
         std::vector<std::uint8_t> connector_matches;
-        connector_matches.reserve(paths.size());
-        for (const auto &path : paths) {
-          connector_matches.push_back(matches_connector(path) ? 1U : 0U);
+        std::optional<std::size_t> connector_index;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {3};
+        while (true) {
+          if (!query(QDC_ALL_PATHS, paths, modes)) {
+            BOOST_LOG(warning) << "Lumen VDD commit: QueryDisplayConfig failed"sv;
+            return false;
+          }
+          connector_matches.clear();
+          connector_matches.reserve(paths.size());
+          for (const auto &path : paths) {
+            connector_matches.push_back(matches_connector(path) ? 1U : 0U);
+          }
+          connector_index = unique_matching_index(connector_matches);
+          if (connector_index ||
+              std::count(connector_matches.begin(), connector_matches.end(), std::uint8_t {1}) != 0 ||
+              std::chrono::steady_clock::now() >= deadline) {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds {50});
         }
-        const auto connector_index = unique_matching_index(connector_matches);
         if (!connector_index) {
+          BOOST_LOG(warning) << "Lumen VDD commit: expected one VDD connector among "sv << paths.size() << " paths, found "sv
+                             << std::count(connector_matches.begin(), connector_matches.end(), std::uint8_t {1});
           return false;
         }
         std::vector<DISPLAYCONFIG_PATH_INFO> configured_paths;
@@ -1216,17 +1329,38 @@ namespace platf::virtual_display {
         configured_modes.push_back(target_mode);
         configured_paths.push_back(path);
 
-        if (SetDisplayConfig(
+        if (const auto status = SetDisplayConfig(
               static_cast<UINT32>(configured_paths.size()),
               configured_paths.data(),
               static_cast<UINT32>(configured_modes.size()),
               configured_modes.data(),
-              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES
-            ) != ERROR_SUCCESS) {
+              // Windows re-applies its saved layout for a newly connected monitor set a moment
+              // after the VDD arrives. Saving this layout makes that re-apply keep the VDD active
+              // instead of restoring a stale entry that turns it off mid-stream.
+              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE
+            );
+            status != ERROR_SUCCESS) {
+          BOOST_LOG(warning) << "Lumen VDD SetDisplayConfig failed (status="sv << status << ")"sv;
           return false;
         }
+        // SDC_ALLOW_CHANGES lets Windows bind the connector to a different source than requested
+        // (e.g. \\.\DISPLAY10 instead of \\.\DISPLAY1), so read the applied path back.
+        {
+          std::vector<DISPLAYCONFIG_PATH_INFO> active_paths;
+          std::vector<DISPLAYCONFIG_MODE_INFO> active_modes;
+          if (query(QDC_ONLY_ACTIVE_PATHS, active_paths, active_modes)) {
+            for (const auto &active : active_paths) {
+              if (matches_connector(active)) {
+                path = active;
+                break;
+              }
+            }
+          }
+        }
+        apply_stream_dpi_scale(path.sourceInfo.adapterId, path.sourceInfo.id, mode.height);
         const auto observed_color = query_advanced_color_state(path.targetInfo.adapterId, path.targetInfo.id);
         if (!observed_color) {
+          BOOST_LOG(warning) << "Lumen VDD commit: advanced color state query failed"sv;
           return false;
         }
         switch (advanced_color_action(mode.dynamic_range, *observed_color)) {
@@ -1243,6 +1377,7 @@ namespace platf::virtual_display {
           case advanced_color_action_e::none:
             break;
           case advanced_color_action_e::reject:
+            BOOST_LOG(warning) << "Lumen VDD commit: advanced color state rejected for the requested range"sv;
             return false;
         }
         DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
@@ -1251,10 +1386,12 @@ namespace platf::virtual_display {
         source.header.adapterId = path.sourceInfo.adapterId;
         source.header.id = path.sourceInfo.id;
         if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) {
+          BOOST_LOG(warning) << "Lumen VDD commit: source device name query failed"sv;
           return false;
         }
         const std::wstring capture {source.viewGdiDeviceName};
         if (capture.empty()) {
+          BOOST_LOG(warning) << "Lumen VDD commit: source has no GDI device name"sv;
           return false;
         }
         applied = {mode, std::string(capture.begin(), capture.end())};
@@ -1302,6 +1439,39 @@ namespace platf::virtual_display {
           }
           Sleep(20);
         } while (std::chrono::steady_clock::now() < deadline);
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+        std::string observed;
+        if (query(QDC_ONLY_ACTIVE_PATHS, paths, modes)) {
+          for (const auto &path : paths) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
+            source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size = sizeof(source);
+            source.header.adapterId = path.sourceInfo.adapterId;
+            source.header.id = path.sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) {
+              continue;
+            }
+            const std::wstring name {source.viewGdiDeviceName};
+            observed += std::string(name.begin(), name.end());
+            if (path.targetInfo.modeInfoIdx < modes.size() &&
+                modes[path.targetInfo.modeInfoIdx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
+              const auto &signal = modes[path.targetInfo.modeInfoIdx].targetMode.targetVideoSignalInfo;
+              observed += " "s + std::to_string(signal.activeSize.cx) + "x"s + std::to_string(signal.activeSize.cy);
+            }
+            observed += " @"s + std::to_string(path.targetInfo.refreshRate.Numerator) + "/"s +
+                        std::to_string(path.targetInfo.refreshRate.Denominator);
+            if (const auto color = query_advanced_color_state(path.targetInfo.adapterId, path.targetInfo.id)) {
+              observed += advanced_color_matches(mode.dynamic_range, *color) ? " color-ok"s : " color-mismatch"s;
+            } else {
+              observed += " color-unknown"s;
+            }
+            observed += "; "s;
+          }
+        }
+        BOOST_LOG(warning) << "Lumen VDD display did not settle: expected "sv << capture_name << " " << mode.width << "x"sv
+                           << mode.height << " @"sv << mode.refresh.numerator << "/"sv << mode.refresh.denominator
+                           << ", active paths: "sv << observed;
         return false;
       }
 
@@ -1314,14 +1484,24 @@ namespace platf::virtual_display {
         const auto mode_count = static_cast<UINT32>(snapshot.modes.size() / sizeof(DISPLAYCONFIG_MODE_INFO));
         auto *paths = reinterpret_cast<DISPLAYCONFIG_PATH_INFO *>(const_cast<std::byte *>(snapshot.paths.data()));
         auto *modes = reinterpret_cast<DISPLAYCONFIG_MODE_INFO *>(const_cast<std::byte *>(snapshot.modes.data()));
-        if (SetDisplayConfig(
+        bind_to_input_desktop();
+        if (const auto status = SetDisplayConfig(
               path_count,
               paths,
               mode_count,
               modes,
               SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-            ) != ERROR_SUCCESS) {
-          return false;
+            );
+            status != ERROR_SUCCESS) {
+          // A snapshot can reference displays that have since disappeared, which would
+          // leave the VDD locked out forever. Fall back to Windows' persisted layout.
+          const auto database_status = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_USE_DATABASE_CURRENT);
+          BOOST_LOG(warning) << "Lumen VDD display snapshot restore failed (status="sv << status
+                             << "); Windows saved layout restore status="sv << database_status;
+          if (database_status != ERROR_SUCCESS) {
+            return false;
+          }
+          return true;
         }
         return restore_all_advanced_color_states(snapshot.advanced_color, [&](const auto &saved, const bool enabled) {
           const auto adapter_id = unpack_display_luid(saved.adapter_luid);
@@ -1431,7 +1611,16 @@ namespace platf::virtual_display {
       start_result_t start(const stream_request_t &request, const mode_limits_t &limits) override {
         auto bound_request = request;
 #ifdef _WIN32
-        const auto probe = ::video::active_encoder_probe_device_identity();
+        auto probe = ::video::active_encoder_probe_device_identity();
+        if (!probe) {
+          // The previous stream's VDD output disappeared with its session, which only invalidates
+          // the probe's output generation; the encoding adapter is unchanged, so bind to it
+          // without a multi-second re-probe that would outlast the client's START deadline.
+          probe = ::video::last_encoder_probe_device_identity();
+        }
+        if (!probe && ::video::probe_encoders() == 0) {
+          probe = ::video::active_encoder_probe_device_identity();
+        }
         if (!probe) {
           return {start_error_e::driver_unavailable, validation_error_e::none, std::nullopt};
         }

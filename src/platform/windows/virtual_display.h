@@ -185,6 +185,7 @@ namespace platf::virtual_display {
       delivery_policy_e delivery_policy,
       fidelity_e minimum_fidelity,
       std::uint64_t preferred_render_adapter_luid,
+      bool hardware_cursor,
       prepared_mode_t &prepared
     ) = 0;  ///< Expose an exact mode and shared-surface policy.
     virtual channel_result_t start_monitor(std::uint64_t generation) = 0;  ///< Make the connector present.
@@ -306,6 +307,7 @@ namespace platf::virtual_display {
     delivery_policy_e delivery_policy {delivery_policy_e::latency};  ///< Shared-surface delivery policy.
     fidelity_e minimum_fidelity {fidelity_e::lossless};  ///< Minimum accepted fidelity.
     std::optional<render_adapter_identity_t> render_adapter;  ///< Exact identity frozen from the active encoder probe.
+    bool hardware_cursor {};  ///< Keep the cursor out of frames and publish it for client-side drawing.
   };
 
   /** @brief Adapt vanilla GameStream width/height/integer FPS without changing its wire protocol. */
@@ -322,7 +324,8 @@ namespace platf::virtual_display {
     std::uint64_t session_id,
     mode_t mode,
     delivery_policy_e delivery_policy,
-    fidelity_e minimum_fidelity = fidelity_e::lossless
+    fidelity_e minimum_fidelity = fidelity_e::lossless,
+    bool hardware_cursor = false
   ) noexcept;
 
   /** @brief Successful exact selection returned to legacy or modern control. */
@@ -337,6 +340,7 @@ namespace platf::virtual_display {
     bool adjusted {};  ///< Explicit indication that selected differs from requested.
     std::optional<render_adapter_identity_t> render_adapter;  ///< Frozen encoder/render adapter identity.
     bool render_adapter_preference_submitted {};  ///< Whether IddCx received the preference before monitor arrival.
+    bool hardware_cursor {};  ///< Whether the driver publishes the cursor instead of composing it.
   };
 
   /** @brief Return whether a frozen adapter identity is usable at the VDD trust boundary. */
@@ -377,7 +381,9 @@ namespace platf::virtual_display {
   [[nodiscard]] constexpr activation_policy_e lsp_activation_policy(
     const activation_policy_e configured
   ) noexcept {
-    return configured == activation_policy_e::optional ? activation_policy_e::required : configured;
+    // Honor optional: when the VDD cannot start (e.g. the secure sign-in desktop refuses
+    // display changes) the stream must fall back to capturing the current desktop.
+    return configured;
   }
 
   class session_lease_t;

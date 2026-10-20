@@ -1049,7 +1049,7 @@ namespace rtsp_stream {
       return route != announced_routes_.end() && route_matches_launch_locked(route->second, launch_session);
     }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     /** @brief Return the current pending generation under the lifecycle boundary. */
     std::uint64_t pending_launch_generation_for_tests() {
       std::lock_guard lifecycle {lifecycle_mutex_};
@@ -1182,7 +1182,7 @@ namespace rtsp_stream {
 
     /** @brief Restore display state for a generation-matched idle RTSP cleanup. */
     void revert_idle_display_locked() {
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
       ++idle_display_revert_count_;
 #endif
       display_device::revert_configuration();
@@ -1213,7 +1213,7 @@ namespace rtsp_stream {
     bool pending_launch_cancelled_ {};  ///< Whether cancellation awaits the reserving HTTP transaction's exact rollback.
     std::unordered_map<std::string, announced_route_t> announced_routes_;  ///< Address-bound post-ANNOUNCE routes guarded by lifecycle_mutex_.
     std::uint64_t pending_launch_generation_ {};  ///< Monotonic pending-slot generation.
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
     std::size_t idle_display_revert_count_ {};  ///< Explicit no-process display cleanup observations.
 #endif
 
@@ -1265,7 +1265,7 @@ namespace rtsp_stream {
     return server.has_session_or_pending_launch();
   }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   bool expire_pending_launch_for_tests() {
     const auto pending_generation = server.pending_launch_generation_for_tests();
     return pending_generation != 0 && server.expire_pending_launch(pending_generation);
@@ -1523,7 +1523,7 @@ namespace rtsp_stream {
 
       /**
        * GFE advertises incorrect mapping for normal quality configurations,
-       * as a result, Moonlight rotates all channels from index '3' to the right
+       * as a result, GameStream rotates all channels from index '3' to the right
        * To work around this, rotate channels to the left from index '3'
        */
       if (x == audio::SURROUND51 || x == audio::SURROUND71) {
@@ -1641,7 +1641,7 @@ namespace rtsp_stream {
 
     session_option.next = &port_option;
 
-    // Moonlight merely requires 'server_port=<port>'
+    // GameStream merely requires 'server_port=<port>'
     auto port_value = std::format("server_port={}", static_cast<int>(port));
 
     port_option.option = const_cast<char *>("Transport");
@@ -1868,7 +1868,7 @@ namespace rtsp_stream {
       config.monitor.width = (int) util::from_view(args.at("x-nv-video[0].clientViewportWd"sv));
       config.monitor.framerate = (int) util::from_view(args.at("x-nv-video[0].maxFPS"sv));
       config.monitor.framerateX100 = (int) util::from_view(args.at("x-nv-video[0].clientRefreshRateX100"sv));
-      // Validate framerateX100 against framerate. Some clients (e.g. Moonlight Android) send the
+      // Validate framerateX100 against framerate. Some clients (e.g. an Android client) send the
       // client display's refresh rate as clientRefreshRateX100, which may differ from the requested
       // streaming framerate. Discard framerateX100 if the derived fps is not within 1% of framerate.
       if (config.monitor.framerateX100 > 0) {
@@ -1902,7 +1902,7 @@ namespace rtsp_stream {
     }
 
     // When using stereo audio, the audio quality is (strangely) indicated by whether the Host field
-    // in the RTSP message matches a local interface's IP address. Fortunately, Moonlight always sends
+    // in the RTSP message matches a local interface's IP address. Fortunately, GameStream always sends
     // 0.0.0.0 when it wants low quality, so it is easy to check without enumerating interfaces.
     if (config.audio.channels == 2) {
       for (auto option = req->options; option != nullptr; option = option->next) {
@@ -2200,7 +2200,7 @@ namespace rtsp_stream {
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   std::string encrypt_rtsp_request_for_tests(
     const crypto::aes_t &key,
     const std::uint32_t sequence,
@@ -2396,7 +2396,7 @@ namespace rtsp_stream {
     server.map("PLAY"sv, &cmd_play);
 
     boost::system::error_code ec;
-    if (server.bind(net::af_from_enum_string(config::sunshine.address_family), net::map_port(rtsp_stream::RTSP_SETUP_PORT), ec)) {
+    if (server.bind(net::af_from_enum_string(config::general.address_family), net::map_port(rtsp_stream::RTSP_SETUP_PORT), ec)) {
       BOOST_LOG(fatal) << "Couldn't bind RTSP server to port ["sv << net::map_port(rtsp_stream::RTSP_SETUP_PORT) << "], " << ec.message();
       shutdown_event->raise(true);
 

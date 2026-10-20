@@ -24,16 +24,16 @@
 # project metadata
 DOCSET_BUNDLE_ID = io.github.simonfalke.Lumen
 DOCSET_PUBLISHER_ID = io.github.simonfalke.Lumen.documentation
-PROJECT_BRIEF = "Self-hosted game stream host for Moonlight."
-PROJECT_ICON = ../sunshine.ico
-PROJECT_LOGO = ../sunshine.svg
+PROJECT_BRIEF = "Self-hosted game stream host for the client."
+PROJECT_ICON = ../lumen.ico
+PROJECT_LOGO = ../lumen.svg
 PROJECT_NAME = Lumen
 
 # project specific settings
 DOT_GRAPH_MAX_NODES = 60
 IMAGE_PATH = ../docs/images
-PREDEFINED += SUNSHINE_BUILD_WAYLAND
-PREDEFINED += SUNSHINE_TRAY=1
+PREDEFINED += LUMEN_BUILD_WAYLAND
+PREDEFINED += LUMEN_TRAY=1
 
 # files and directories to process
 USE_MDFILE_AS_MAINPAGE = ../README.md

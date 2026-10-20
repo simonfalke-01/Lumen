@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/test_system_tray.cpp
- * @brief Tests for Sunshine's system tray integration.
+ * @brief Tests for Lumen's system tray integration.
  */
 #include "../tests_common.h"
 
@@ -15,7 +15,7 @@
 #include <tuple>
 
 // Only test the system tray if it is enabled.
-#if defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
+#if defined(LUMEN_TRAY) && LUMEN_TRAY >= 1
 
   // lib includes
   #include <tray.h>
@@ -147,14 +147,14 @@ namespace {
   void verify_state_transitions() {
     verify_state(0, PROJECT_NAME, nullptr, nullptr, std::nullopt, false);
 
-    system_tray::update_tray_playing("Moonlight");
-    verify_state(2, "Streaming started for Moonlight", "Stream Started", "Streaming started for Moonlight", 2, false);
+    system_tray::update_tray_playing("GameStream");
+    verify_state(2, "Streaming started for the client", "Stream Started", "Streaming started for the client", 2, false);
 
-    system_tray::update_tray_pausing("Moonlight");
-    verify_state(3, "Streaming paused for Moonlight", "Stream Paused", "Streaming paused for Moonlight", 3, false);
+    system_tray::update_tray_pausing("GameStream");
+    verify_state(3, "Streaming paused for the client", "Stream Paused", "Streaming paused for the client", 3, false);
 
-    system_tray::update_tray_stopped("Moonlight");
-    verify_state(0, PROJECT_NAME, "Application Stopped", "Application Moonlight successfully stopped", 0, false);
+    system_tray::update_tray_stopped("GameStream");
+    verify_state(0, PROJECT_NAME, "Application Stopped", "Application GameStream successfully stopped", 0, false);
 
     system_tray::update_tray_require_pin();
     verify_state(0, PROJECT_NAME, "Incoming Pairing Request", "Click here to complete the pairing process", 1, true);
@@ -217,9 +217,9 @@ TEST_F(SystemTrayTest, UpdatesAreIgnoredBeforeInitialization) {
   EXPECT_FALSE(system_tray::tray_initialized_for_testing());
   EXPECT_EQ(system_tray::process_tray_events(), 1);
 
-  system_tray::update_tray_playing("Moonlight");
-  system_tray::update_tray_pausing("Moonlight");
-  system_tray::update_tray_stopped("Moonlight");
+  system_tray::update_tray_playing("GameStream");
+  system_tray::update_tray_pausing("GameStream");
+  system_tray::update_tray_stopped("GameStream");
   system_tray::update_tray_require_pin();
 
   const auto &tray_data = system_tray::tray_data_for_testing();
@@ -254,7 +254,7 @@ TEST_F(SystemTrayTest, LifecycleMenuAndStateTransitions) {
 
   #ifdef _WIN32
 TEST_F(SystemTrayTest, InitializesTrayForWorkflowConfiguration) {
-  if (std::getenv("SUNSHINE_CONFIGURE_TRAY_ICONS") == nullptr) {
+  if (std::getenv("LUMEN_CONFIGURE_TRAY_ICONS") == nullptr) {
     GTEST_SKIP() << "Only required while configuring Windows runner tray icon visibility";
   }
 
@@ -275,7 +275,7 @@ protected:
    * @brief Initialize a clean screenshot output directory for this test suite.
    */
   static void SetUpTestSuite() {
-    const std::filesystem::path test_binary_dir {SUNSHINE_TEST_BIN_DIR};
+    const std::filesystem::path test_binary_dir {LUMEN_TEST_BIN_DIR};
     std::error_code remove_error;
     std::filesystem::remove_all(test_binary_dir / "screenshots", remove_error);
     screenshot::initialize(test_binary_dir);
@@ -348,7 +348,7 @@ TEST_F(SystemTrayVisualTest, CapturesIconTooltipNotificationsAndMenu) {
 
   verify_menu();
   verify_state(0, PROJECT_NAME, nullptr, nullptr, std::nullopt, false);
-  EXPECT_TRUE(screenshot::capture("sunshine_tray_initial"));
+  EXPECT_TRUE(screenshot::capture("lumen_tray_initial"));
 
   const int tooltip_position_result = tray_position_mouse_over_icon();
   if (lizardbyte::common::is_github_actions()) {
@@ -360,23 +360,23 @@ TEST_F(SystemTrayVisualTest, CapturesIconTooltipNotificationsAndMenu) {
     #else
     pump_tray_events(20, 50ms);
     #endif
-    EXPECT_TRUE(screenshot::capture("sunshine_tray_tooltip"));
+    EXPECT_TRUE(screenshot::capture("lumen_tray_tooltip"));
     EXPECT_EQ(tray_restore_mouse_position(), 0);
   }
 
   dismissNativeNotifications();
-  system_tray::update_tray_playing("Moonlight");
-  verify_state(2, "Streaming started for Moonlight", "Stream Started", "Streaming started for Moonlight", 2, false);
-  capture_notification("sunshine_tray_streaming");
-  system_tray::update_tray_pausing("Moonlight");
-  verify_state(3, "Streaming paused for Moonlight", "Stream Paused", "Streaming paused for Moonlight", 3, false);
-  capture_notification("sunshine_tray_paused");
-  system_tray::update_tray_stopped("Moonlight");
-  verify_state(0, PROJECT_NAME, "Application Stopped", "Application Moonlight successfully stopped", 0, false);
-  capture_notification("sunshine_tray_stopped");
+  system_tray::update_tray_playing("GameStream");
+  verify_state(2, "Streaming started for the client", "Stream Started", "Streaming started for the client", 2, false);
+  capture_notification("lumen_tray_streaming");
+  system_tray::update_tray_pausing("GameStream");
+  verify_state(3, "Streaming paused for the client", "Stream Paused", "Streaming paused for the client", 3, false);
+  capture_notification("lumen_tray_paused");
+  system_tray::update_tray_stopped("GameStream");
+  verify_state(0, PROJECT_NAME, "Application Stopped", "Application GameStream successfully stopped", 0, false);
+  capture_notification("lumen_tray_stopped");
   system_tray::update_tray_require_pin();
   verify_state(0, PROJECT_NAME, "Incoming Pairing Request", "Click here to complete the pairing process", 1, true);
-  capture_notification("sunshine_tray_pairing_request");
+  capture_notification("lumen_tray_pairing_request");
 
   int menu_position_result = -1;
   if (lizardbyte::common::is_github_actions()) {
@@ -391,7 +391,7 @@ TEST_F(SystemTrayVisualTest, CapturesIconTooltipNotificationsAndMenu) {
 
   std::atomic_bool capture_result {false};
   std::jthread capture_thread([&capture_result]() {
-    capture_result.store(screenshot::capture("sunshine_tray_menu"), std::memory_order_release);
+    capture_result.store(screenshot::capture("lumen_tray_menu"), std::memory_order_release);
     std::ignore = system_tray::end_tray();
   });
 

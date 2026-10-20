@@ -53,8 +53,8 @@ node_modules/
 .DS_Store
 
 # Test artifacts
-/sunshine_state.json
-/test_sunshine.log*
+/lumen_state.json
+/test_lumen.log*
 /write_file_test_*.txt
 
 # Python

@@ -40,6 +40,19 @@ and target-scoped Advanced Color state. The FP16/scRGB capture source remains
 linear; downstream stream negotiation preserves the selected PQ or HLG transfer
 instead of deriving it from static metadata.
 
+## ABI 7 hardware cursor
+
+`PREPARE_MODE` carries prepare flags. With `LUMEN_VDD_PREPARE_FLAG_HARDWARE_CURSOR`
+the driver calls `IddCxMonitorSetupHardwareCursor` on every swap-chain
+assignment (alpha and full XOR masked-color cursors up to 256x256), so Windows
+stops composing the cursor into surfaces. A per-assignment thread queries the
+cursor when the OS signals new data and, only when visibility or shape changes,
+signals a generation-scoped event. `OPEN_CURSOR_EVENT` transfers that event to
+the owning service like `OPEN_FRAME_EVENT`, and `QUERY_CURSOR` returns the
+latest visibility and shape, copying shape bytes only when the requester's
+known shape sequence is stale. Position is not reported; the client draws the
+cursor.
+
 ## ABI 6 direct frames
 
 ABI 6 intentionally changes handle ownership without changing the packed
@@ -111,7 +124,7 @@ explicitly disabled, startup requires the exact VDD mode and a healthy ABI 6
 direct-frame channel. Direct-frame or NVENC failure ends/reinitializes the v3
 session; it does not switch capture backends mid-session.
 
-Legacy Moonlight keeps its compatibility behavior. With `optional`, a VDD
+Legacy GameStream keeps its compatibility behavior. With `optional`, a VDD
 activation failure may return to the configured physical display only after a
 proven-safe rollback. If an SDR VDD is already active and its direct channel is
 unavailable or quarantined, Lumen may capture that VDD through DDA/WGC.

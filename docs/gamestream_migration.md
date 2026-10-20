@@ -1,24 +1,22 @@
 # GameStream Migration
 
 NVIDIA discontinued the GameStream host feature. Lumen implements a compatible
-host protocol for Moonlight clients, but compatibility does not establish equal
+host protocol for GameStream clients, but compatibility does not establish equal
 latency, quality, HDR behavior, or application discovery on every system.
 
 ## Move applications
 
-The upstream Sunshine project provides the independent
-[GSMS](https://github.com/LizardByte/GSMS) migration tool for custom and
-auto-detected GeForce Experience entries. Review its output before replacing
-your configuration. Lumen reads application working directories, commands, and
-images from `apps.json`.
+Add each application in the admin panel's **Apps** page, or edit `apps.json`
+directly. Lumen reads application commands, working directories, and images
+from `apps.json`.
 
 Keep a backup of the source configuration and test Desktop first. Application
 launch commands, permissions, service-account access, HDR, and display selection
 can differ from NVIDIA GameStream.
 
-## Existing Moonlight clients
+## Existing GameStream clients
 
-Unmodified Moonlight clients can pair with and stream from Lumen through the
+Unmodified GameStream clients can pair with and stream from Lumen through the
 legacy GameStream path. Lumen-specific Latency/Quality and modern protocol
 extensions are optional; a client that does not send them retains legacy
 behavior.
@@ -29,12 +27,12 @@ the four-digit GameStream transcript is unsuitable for Internet exposure.
 
 ## Internet streaming
 
-Remove or disable the Moonlight Internet Hosting Tool before enabling Lumen's
+Remove or disable the GameStream Internet Hosting Tool before enabling Lumen's
 own UPnP or manual forwarding. Running two hosts or two port-mapping tools can
 produce conflicts. Prefer a trusted VPN or authenticated tunnel when practical.
 
 Do not expose Lumen's Web UI or management API directly to the public Internet.
-Legacy Moonlight streaming requires multiple ports.
+Legacy GameStream streaming requires multiple ports.
 
 ## Known migration differences
 

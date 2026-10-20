@@ -7,6 +7,7 @@
 
   // standard includes
   #include <algorithm>
+  #include <array>
   #include <atomic>
 #include <cmath>
   #include <cstdint>
@@ -31,6 +32,7 @@
 
   // local includes
   #include "fused_d3d11_policy.h"
+  #include "misc.h"
   #include "src/logging.h"
   #include "src/utility.h"
   #include "src/video.h"
@@ -1446,6 +1448,382 @@ namespace platf::virtual_display {
                     << selection.generation << "; two persistent shared texture/fence slots; "sv
                     << direct_frame_init_diagnostic_text(diagnostic);
     return source;
+  }
+
+  namespace {
+    /** @brief Convert one driver cursor shape into premultiplied RGBA. */
+    std::shared_ptr<const cursor_image_t> convert_cursor_shape(
+      const LUMEN_VDD_QUERY_CURSOR_RESPONSE &header,
+      const std::uint8_t *bytes
+    ) {
+      const auto width = header.width;
+      const auto height = header.height;
+      if (width == 0 || height == 0 || width > LUMEN_VDD_CURSOR_MAX_DIMENSION || height > LUMEN_VDD_CURSOR_MAX_DIMENSION ||
+          header.pitch < width * 4U || static_cast<std::uint64_t>(header.pitch) * height > header.shape_bytes ||
+          header.x_hot >= width || header.y_hot >= height) {
+        return {};
+      }
+      auto image = std::make_shared<cursor_image_t>();
+      image->width = width;
+      image->height = height;
+      image->hot_x = header.x_hot;
+      image->hot_y = header.y_hot;
+      image->rgba.assign(static_cast<std::size_t>(width) * height * 4U, 0);
+      // Masked-color XOR pixels invert the screen, which a client cursor cannot do. They are
+      // drawn black with a white outline so they stay visible on light and dark content.
+      std::vector<std::uint8_t> inverting;
+      if (header.shape_type == LUMEN_VDD_CURSOR_SHAPE_MASKED_COLOR) {
+        inverting.assign(static_cast<std::size_t>(width) * height, 0);
+      }
+      for (std::uint32_t y = 0; y < height; ++y) {
+        const auto *row = bytes + static_cast<std::size_t>(y) * header.pitch;
+        for (std::uint32_t x = 0; x < width; ++x) {
+          const auto *bgra = row + static_cast<std::size_t>(x) * 4U;
+          auto *rgba = image->rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
+          if (header.shape_type == LUMEN_VDD_CURSOR_SHAPE_ALPHA) {
+            rgba[0] = bgra[2];
+            rgba[1] = bgra[1];
+            rgba[2] = bgra[0];
+            rgba[3] = bgra[3];
+          } else if (bgra[3] == 0) {
+            rgba[0] = bgra[2];
+            rgba[1] = bgra[1];
+            rgba[2] = bgra[0];
+            rgba[3] = 0xFF;
+          } else if (bgra[0] != 0 || bgra[1] != 0 || bgra[2] != 0) {
+            inverting[static_cast<std::size_t>(y) * width + x] = 1;
+            rgba[3] = 0xFF;
+          }
+        }
+      }
+      if (!inverting.empty()) {
+        for (std::uint32_t y = 0; y < height; ++y) {
+          for (std::uint32_t x = 0; x < width; ++x) {
+            auto *rgba = image->rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4U;
+            if (rgba[3] != 0) {
+              continue;
+            }
+            bool edge = false;
+            for (int dy = -1; dy <= 1 && !edge; ++dy) {
+              for (int dx = -1; dx <= 1 && !edge; ++dx) {
+                const auto nx = static_cast<std::int64_t>(x) + dx;
+                const auto ny = static_cast<std::int64_t>(y) + dy;
+                edge = nx >= 0 && ny >= 0 && nx < width && ny < height &&
+                       inverting[static_cast<std::size_t>(ny) * width + static_cast<std::size_t>(nx)] != 0;
+              }
+            }
+            if (edge) {
+              rgba[0] = rgba[1] = rgba[2] = rgba[3] = 0xFF;
+            }
+          }
+        }
+      }
+      return image;
+    }
+
+    /** @brief Identify the standard Windows cursor currently shown, in LSP numbering, or 0 for an app-defined one. */
+    struct windows_cursor_t {
+      bool showing {};  ///< Windows shows the cursor (not hidden by an app or suppressed for touch).
+      std::uint8_t system_cursor {};  ///< Standard cursor kind in LSP numbering, or 0 for an app-defined one.
+    };
+
+    /** @brief Read the cursor Windows shows on the input desktop: whether it is visible and which standard cursor it is. */
+    windows_cursor_t read_windows_cursor() noexcept {
+      // System cursor resource IDs (IDC_*), numeric so the table is independent of UNICODE.
+      static const std::array<std::pair<WORD, std::uint8_t>, 16> standard {{
+        {32512, 1},  // IDC_ARROW
+        {32513, 2},  // IDC_IBEAM
+        {32514, 3},  // IDC_WAIT
+        {32650, 4},  // IDC_APPSTARTING
+        {32649, 5},  // IDC_HAND
+        {32515, 6},  // IDC_CROSS
+        {32644, 7},  // IDC_SIZEWE
+        {32645, 8},  // IDC_SIZENS
+        {32642, 9},  // IDC_SIZENWSE
+        {32643, 10},  // IDC_SIZENESW
+        {32646, 11},  // IDC_SIZEALL
+        {32648, 12},  // IDC_NO
+        {32651, 13},  // IDC_HELP
+        {32516, 14},  // IDC_UPARROW
+        {32671, 15},  // IDC_PIN
+        {32672, 16},  // IDC_PERSON
+      }};
+      CURSORINFO info {};
+      info.cbSize = sizeof(info);
+      if (!GetCursorInfo(&info)) {
+        platf::syncThreadDesktop();
+        if (!GetCursorInfo(&info)) {
+          return {true, 0};
+        }
+      }
+      windows_cursor_t cursor {(info.flags & CURSOR_SHOWING) != 0 && info.hCursor != nullptr, 0};
+      for (const auto &[id, kind] : standard) {
+        if (info.hCursor != nullptr && LoadCursorW(nullptr, MAKEINTRESOURCEW(id)) == info.hCursor) {
+          cursor.system_cursor = kind;
+          break;
+        }
+      }
+      return cursor;
+    }
+
+    /** System cursor IDs (OCR_*) replaced while a client draws the cursor. */
+    constexpr std::array<DWORD, 16> replaced_system_cursors {
+      32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650, 32651, 32671, 32672
+    };
+
+    /** Copies of the user's system cursors taken before blanking, restored afterwards. */
+    using saved_system_cursors_t = std::array<HCURSOR, replaced_system_cursors.size()>;
+
+    /** @brief Put back the cursors saved by blank_system_cursors(). */
+    void restore_system_cursors(saved_system_cursors_t &saved) noexcept {
+      for (std::size_t index = 0; index < saved.size(); ++index) {
+        // SetSystemCursor takes ownership of the cursor it is given.
+        if (saved[index] != nullptr && !SetSystemCursor(saved[index], replaced_system_cursors[index])) {
+          DestroyCursor(saved[index]);
+        }
+        saved[index] = nullptr;
+      }
+    }
+
+    /** @brief Save the standard system cursors, then make them transparent; returns whether any was replaced. */
+    bool blank_system_cursors(saved_system_cursors_t &saved) noexcept {
+      saved.fill(nullptr);
+      std::array<std::uint8_t, 32 * 32 / 8> and_mask {};
+      std::array<std::uint8_t, 32 * 32 / 8> xor_mask {};
+      and_mask.fill(0xFF);
+      const auto blank = CreateCursor(GetModuleHandleW(nullptr), 0, 0, 32, 32, and_mask.data(), xor_mask.data());
+      if (blank == nullptr) {
+        BOOST_LOG(warning) << "Lumen VDD cursor: creating the transparent cursor failed: "sv << GetLastError();
+        return false;
+      }
+      bool replaced = false;
+      for (std::size_t index = 0; index < replaced_system_cursors.size(); ++index) {
+        const auto id = replaced_system_cursors[index];
+        const auto original = LoadCursorW(nullptr, MAKEINTRESOURCEW(id));
+        saved[index] = original != nullptr ? CopyCursor(original) : nullptr;
+        if (saved[index] == nullptr) {
+          continue;
+        }
+        const auto copy = CopyCursor(blank);
+        if (copy != nullptr && SetSystemCursor(copy, id)) {
+          replaced = true;
+          continue;
+        }
+        if (copy != nullptr) {
+          DestroyCursor(copy);
+        }
+        DestroyCursor(saved[index]);
+        saved[index] = nullptr;
+      }
+      DestroyCursor(blank);
+      if (!replaced) {
+        BOOST_LOG(warning) << "Lumen VDD cursor: replacing the system cursors failed: "sv << GetLastError();
+      }
+      return replaced;
+    }
+
+    /** @brief Event-driven reader of one VDD generation's hardware cursor. */
+    class system_cursor_source_t final: public cursor_source_t {
+    public:
+      explicit system_cursor_source_t(std::uint64_t generation):
+          generation_(generation),
+          buffer_(sizeof(LUMEN_VDD_QUERY_CURSOR_RESPONSE) + LUMEN_VDD_CURSOR_MAX_SHAPE_BYTES) {}
+
+      ~system_cursor_source_t() override {
+        if (stop_event_ != nullptr) {
+          SetEvent(stop_event_);
+        }
+        if (worker_.joinable()) {
+          worker_.join();
+        }
+        if (changed_event_ != nullptr) {
+          CloseHandle(changed_event_);
+        }
+        if (stop_event_ != nullptr) {
+          CloseHandle(stop_event_);
+        }
+        if (device_ != INVALID_HANDLE_VALUE) {
+          CloseHandle(device_);
+        }
+      }
+
+      system_cursor_source_t(const system_cursor_source_t &) = delete;
+      system_cursor_source_t &operator=(const system_cursor_source_t &) = delete;
+
+      bool start() {
+        DWORD native_status = ERROR_SUCCESS;
+        device_ = open_device_interface(native_status);
+        if (device_ == INVALID_HANDLE_VALUE) {
+          BOOST_LOG(error) << "Lumen VDD cursor: device open failed: "sv << native_status;
+          return false;
+        }
+        std::uint32_t access_status = ERROR_SUCCESS;
+        if (!grant_umdf_process_access(access_status)) {
+          BOOST_LOG(error) << "Lumen VDD cursor: process access grant failed: "sv << access_status;
+          return false;
+        }
+        const auto process_id = GetCurrentProcessId();
+        const auto creation_time = packed_process_creation_time(GetCurrentProcess());
+        const LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST request {generation_, process_id, 0};
+        LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE response {};
+        DWORD transferred = 0;
+        if (!DeviceIoControl(
+              device_,
+              IOCTL_LUMEN_VDD_OPEN_CURSOR_EVENT,
+              const_cast<LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST *>(&request),
+              sizeof(request),
+              &response,
+              sizeof(response),
+              &transferred,
+              nullptr
+            ) ||
+            transferred != sizeof(response)) {
+          BOOST_LOG(error) << "Lumen VDD cursor: event open failed: "sv << GetLastError();
+          return false;
+        }
+        changed_event_ = reinterpret_cast<HANDLE>(response.event_handle);
+        if (response.generation != generation_ || response.source_process_id != process_id ||
+            response.source_reserved != 0 || response.reserved != 0 ||
+            response.source_process_creation_time != creation_time || changed_event_ == nullptr) {
+          BOOST_LOG(error) << "Lumen VDD cursor: event identity mismatch"sv;
+          return false;
+        }
+        stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (stop_event_ == nullptr) {
+          return false;
+        }
+        worker_ = std::thread([this]() {
+          run();
+        });
+        return true;
+      }
+
+      cursor_snapshot_t latest() const override {
+        std::lock_guard lock(mutex_);
+        return snapshot_;
+      }
+
+    private:
+      void run() noexcept {
+        // GetCursorInfo and the system cursor set apply to the desktop this thread is attached to.
+        platf::syncThreadDesktop();
+        // The client draws the cursor. DWM still composes its own cursor into the frames while a
+        // window is dragged (keeping it in step with the window), so make the system cursors
+        // transparent for the stream: that cursor draws nothing, while the handles, and with them
+        // the standard-cursor kinds sent to the client, stay the same.
+        saved_system_cursors_t saved {};
+        const bool blanked = blank_system_cursors(saved);
+        query();
+        const HANDLE waits[] {changed_event_, stop_event_};
+        while (true) {
+          const auto result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+          if (result != WAIT_OBJECT_0) {
+            if (result == WAIT_FAILED) {
+              BOOST_LOG(warning) << "Lumen VDD cursor: change event wait failed: "sv << GetLastError();
+            }
+            break;
+          }
+          query();
+        }
+        if (blanked) {
+          restore_system_cursors(saved);
+        }
+      }
+
+      void query() noexcept {
+        const LUMEN_VDD_QUERY_CURSOR_REQUEST request {generation_, known_shape_sequence_};
+        DWORD transferred = 0;
+        if (!DeviceIoControl(
+              device_,
+              IOCTL_LUMEN_VDD_QUERY_CURSOR,
+              const_cast<LUMEN_VDD_QUERY_CURSOR_REQUEST *>(&request),
+              sizeof(request),
+              buffer_.data(),
+              static_cast<DWORD>(buffer_.size()),
+              &transferred,
+              nullptr
+            ) ||
+            transferred < sizeof(LUMEN_VDD_QUERY_CURSOR_RESPONSE)) {
+          if (!query_failure_logged_) {
+            query_failure_logged_ = true;
+            BOOST_LOG(warning) << "Lumen VDD cursor: query failed (error="sv << GetLastError() << ", bytes="sv << transferred << ")"sv;
+          }
+          return;
+        }
+        LUMEN_VDD_QUERY_CURSOR_RESPONSE header {};
+        std::memcpy(&header, buffer_.data(), sizeof(header));
+        if (header.generation != generation_ || header.reserved != 0 ||
+            transferred != sizeof(header) + header.shape_bytes) {
+          if (!query_failure_logged_) {
+            query_failure_logged_ = true;
+            BOOST_LOG(warning) << "Lumen VDD cursor: inconsistent query response (generation="sv << header.generation
+                               << ", bytes="sv << transferred << ", shape_bytes="sv << header.shape_bytes << ")"sv;
+          }
+          return;
+        }
+        if (!query_success_logged_) {
+          query_success_logged_ = true;
+          BOOST_LOG(info) << "Lumen VDD cursor: first state sequence="sv << header.sequence << ", visible="sv
+                          << header.visible << ", shape_bytes="sv << header.shape_bytes;
+        }
+        std::shared_ptr<const cursor_image_t> image;
+        if (header.shape_bytes != 0) {
+          try {
+            image = convert_cursor_shape(header, buffer_.data() + sizeof(header));
+          } catch (...) {
+            return;
+          }
+          known_shape_sequence_ = header.shape_sequence;
+        }
+        // Visibility comes from Windows itself: the hardware-cursor feed also reports "invisible"
+        // while Windows composes the cursor in software (e.g. during a drag), which is not a game
+        // hiding it and must not switch the client to relative input.
+        const auto windows_cursor = read_windows_cursor();
+        std::lock_guard lock(mutex_);
+        const bool changed = header.shape_bytes != 0 || snapshot_.sequence == 0 ||
+                             snapshot_.visible != windows_cursor.showing ||
+                             snapshot_.system_cursor != windows_cursor.system_cursor;
+        if (!changed) {
+          return;
+        }
+        ++published_sequence_;
+        snapshot_.sequence = published_sequence_;
+        snapshot_.visible = windows_cursor.showing;
+        snapshot_.system_cursor = windows_cursor.system_cursor;
+        if (header.shape_bytes != 0) {
+          snapshot_.image = std::move(image);
+        }
+      }
+
+      std::uint64_t generation_;  ///< Exact VDD generation.
+      HANDLE device_ {INVALID_HANDLE_VALUE};  ///< Dedicated handle so queries never wait behind frame IOCTLs.
+      HANDLE changed_event_ {};  ///< Driver-signalled cursor change event.
+      HANDLE stop_event_ {};  ///< Worker termination event.
+      std::vector<std::uint8_t> buffer_;  ///< QUERY_CURSOR output buffer.
+      std::uint64_t known_shape_sequence_ {};  ///< Worker-only latest copied shape sequence.
+      std::uint64_t published_sequence_ {};  ///< Guarded by mutex_; changes with any published cursor change.
+      bool query_failure_logged_ {};  ///< Worker-only one-shot failure diagnostic.
+      bool query_success_logged_ {};  ///< Worker-only one-shot first-state diagnostic.
+      std::thread worker_;  ///< Event-driven cursor reader.
+      mutable std::mutex mutex_;  ///< Guards snapshot_.
+      cursor_snapshot_t snapshot_;  ///< Latest published state.
+    };
+  }  // namespace
+
+  std::shared_ptr<cursor_source_t> make_system_cursor_source(const stream_selection_t &selection) {
+    if (!selection.hardware_cursor) {
+      return {};
+    }
+    try {
+      auto source = std::make_shared<system_cursor_source_t>(selection.generation);
+      if (!source->start()) {
+        return {};
+      }
+      BOOST_LOG(info) << "Lumen VDD hardware cursor active for generation "sv << selection.generation;
+      return source;
+    } catch (...) {
+      return {};
+    }
   }
 
   void quarantine_direct_frame_runtime() noexcept {

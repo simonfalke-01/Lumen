@@ -1,7 +1,7 @@
 # common compile definitions
 # this file will also load platform specific definitions
 
-list(APPEND SUNSHINE_COMPILE_OPTIONS -Wall -Wno-sign-compare)
+list(APPEND LUMEN_COMPILE_OPTIONS -Wall -Wno-sign-compare)
 # Wall - enable all warnings
 # Werror - treat warnings as errors
 # Wno-maybe-uninitialized/Wno-uninitialized - disable warnings for maybe uninitialized variables
@@ -12,39 +12,39 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
     # GCC 12 and higher will complain about maybe-uninitialized
     if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
-        list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-maybe-uninitialized)
+        list(APPEND LUMEN_COMPILE_OPTIONS -Wno-maybe-uninitialized)
 
         # Disable the bogus warning that may prevent compilation (only for GCC 12).
         # See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105651.
         if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
-            list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-restrict)
+            list(APPEND LUMEN_COMPILE_OPTIONS -Wno-restrict)
         endif()
     endif()
 
     # GCC 15 will complain about uninitialized variables in some cases (Simple-Web-Server)
     if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
-        list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-uninitialized)
+        list(APPEND LUMEN_COMPILE_OPTIONS -Wno-uninitialized)
     endif()
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
     # Clang specific compile options
 
     # Clang doesn't actually complain about this this, so disabling for now
-    # list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-uninitialized)
+    # list(APPEND LUMEN_COMPILE_OPTIONS -Wno-uninitialized)
 
     # Some libc++ versions on Apple and FreeBSD guard std::jthread behind this flag.
     if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
-        list(APPEND SUNSHINE_COMPILE_OPTIONS -fexperimental-library)
-        list(APPEND SUNSHINE_LINK_OPTIONS -fexperimental-library)
+        list(APPEND LUMEN_COMPILE_OPTIONS -fexperimental-library)
+        list(APPEND LUMEN_LINK_OPTIONS -fexperimental-library)
     endif()
 endif()
 if(BUILD_WERROR)
-    list(APPEND SUNSHINE_COMPILE_OPTIONS -Werror)
+    list(APPEND LUMEN_COMPILE_OPTIONS -Werror)
 endif()
 
 if(WIN32 AND LUMEN_BUILD_PROFILE STREQUAL "full")
-    list(APPEND SUNSHINE_DEFINITIONS LUMEN_LSP_DEFAULT_ENABLED=1)
+    list(APPEND LUMEN_DEFINITIONS LUMEN_LSP_DEFAULT_ENABLED=1)
 else()
-    list(APPEND SUNSHINE_DEFINITIONS LUMEN_LSP_DEFAULT_ENABLED=0)
+    list(APPEND LUMEN_DEFINITIONS LUMEN_LSP_DEFAULT_ENABLED=0)
 endif()
 
 set(LUMEN_PHOTON_DIRECTORY "${CMAKE_SOURCE_DIR}/src/protocol_lsp")
@@ -103,8 +103,8 @@ if(NOT LUMEN_PHOTON_ACTUAL_DIGEST STREQUAL LUMEN_PHOTON_EXPECTED_DIGEST)
 endif()
 
 # setup assets directory
-if(NOT SUNSHINE_ASSETS_DIR)
-    set(SUNSHINE_ASSETS_DIR "assets")
+if(NOT LUMEN_ASSETS_DIR)
+    set(LUMEN_ASSETS_DIR "assets")
 endif()
 
 # platform specific compile definitions
@@ -155,7 +155,7 @@ if(WIN32)
                 NVENC_SDK_VERSION=${sdk_version}
         )
         target_link_libraries(${target_name} PRIVATE ${Boost_LIBRARIES})
-        target_compile_options(${target_name} PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+        target_compile_options(${target_name} PRIVATE ${LUMEN_COMPILE_OPTIONS})
     endfunction()
 
     add_nvenc_sdk_implementation(nvenc_sdk_1100 1100 "${NV_CODEC_HEADERS_11_INCLUDE_DIR}")
@@ -182,10 +182,10 @@ else()
     if(NOT FFMPEG_HAVE_FAST_64BIT_DEFINITION MATCHES "^#define HAVE_FAST_64BIT ([01])$")
         message(FATAL_ERROR "Pinned FFmpeg config does not define HAVE_FAST_64BIT")
     endif()
-    list(APPEND SUNSHINE_DEFINITIONS "HAVE_FAST_64BIT=${CMAKE_MATCH_1}")
+    list(APPEND LUMEN_DEFINITIONS "HAVE_FAST_64BIT=${CMAKE_MATCH_1}")
 endif()
 
-set(SUNSHINE_TARGET_FILES
+set(LUMEN_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/RtspParser.c"
@@ -326,32 +326,32 @@ set(SUNSHINE_TARGET_FILES
         ${PLATFORM_TARGET_FILES})
 
 if(LUMEN_ENABLE_LSP_RUNTIME)
-    list(APPEND SUNSHINE_TARGET_FILES
+    list(APPEND LUMEN_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/wolfssl_spake2.cpp"
             "${CMAKE_SOURCE_DIR}/src/protocol_lsp/security/wolfssl_dtls_server.cpp")
-    list(APPEND SUNSHINE_DEFINITIONS
+    list(APPEND LUMEN_DEFINITIONS
             LUMEN_LSP_WOLFSSL_AVAILABLE=1
             LUMEN_LSP_LIBSRTP_AVAILABLE=1
             LUMEN_LSP_RUNTIME_AVAILABLE=1)
-    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
+    list(APPEND LUMEN_EXTERNAL_LIBRARIES
             Lumen::wolfssl
             Lumen::srtp2)
 else()
-    list(APPEND SUNSHINE_DEFINITIONS
+    list(APPEND LUMEN_DEFINITIONS
             LUMEN_LSP_WOLFSSL_AVAILABLE=0
             LUMEN_LSP_LIBSRTP_AVAILABLE=0
             LUMEN_LSP_RUNTIME_AVAILABLE=0)
 endif()
 
-if(NOT SUNSHINE_ASSETS_DIR_DEF)
-    set(SUNSHINE_ASSETS_DIR_DEF "${SUNSHINE_ASSETS_DIR}")
+if(NOT LUMEN_ASSETS_DIR_DEF)
+    set(LUMEN_ASSETS_DIR_DEF "${LUMEN_ASSETS_DIR}")
 endif()
-list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_ASSETS_DIR="${SUNSHINE_ASSETS_DIR_DEF}")
+list(APPEND LUMEN_DEFINITIONS LUMEN_ASSETS_DIR="${LUMEN_ASSETS_DIR_DEF}")
 
 # Publisher metadata
-list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_NAME="${SUNSHINE_PUBLISHER_NAME}")
-list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_WEBSITE="${SUNSHINE_PUBLISHER_WEBSITE}")
-list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_ISSUE_URL="${SUNSHINE_PUBLISHER_ISSUE_URL}")
+list(APPEND LUMEN_DEFINITIONS LUMEN_PUBLISHER_NAME="${LUMEN_PUBLISHER_NAME}")
+list(APPEND LUMEN_DEFINITIONS LUMEN_PUBLISHER_WEBSITE="${LUMEN_PUBLISHER_WEBSITE}")
+list(APPEND LUMEN_DEFINITIONS LUMEN_PUBLISHER_ISSUE_URL="${LUMEN_PUBLISHER_ISSUE_URL}")
 
 include_directories(BEFORE "${CMAKE_SOURCE_DIR}")
 
@@ -377,7 +377,7 @@ else()
     )
 endif()
 
-list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
+list(APPEND LUMEN_EXTERNAL_LIBRARIES
         ${MINIUPNP_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
         enet
@@ -391,14 +391,14 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${PLATFORM_LIBRARIES})
 
 if(WIN32)
-    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES Lumen::libvirtualhid_gamepad_core)
+    list(APPEND LUMEN_EXTERNAL_LIBRARIES Lumen::libvirtualhid_gamepad_core)
 endif()
 
 # tray icon
-if(SUNSHINE_ENABLE_TRAY)
-    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES tray::tray)
+if(LUMEN_ENABLE_TRAY)
+    list(APPEND LUMEN_EXTERNAL_LIBRARIES tray::tray)
 else()
-    set(SUNSHINE_TRAY 0)
+    set(LUMEN_TRAY 0)
     message(STATUS "Tray icon disabled")
 endif()
-list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY=${SUNSHINE_TRAY})
+list(APPEND LUMEN_DEFINITIONS LUMEN_TRAY=${LUMEN_TRAY})

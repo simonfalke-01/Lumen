@@ -24,6 +24,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #ifndef NOMINMAX
   #define NOMINMAX
@@ -784,6 +785,147 @@ namespace {
     std::atomic_bool direct_enabled_ {true};  ///< Sticky fail-closed state for this generation.
   };
 
+  /** @brief Generation-scoped hardware-cursor state shared by the cursor thread and host queries. */
+  struct cursor_state_t {
+    explicit cursor_state_t(HANDLE changed_event):
+        changed(changed_event) {}
+
+    ~cursor_state_t() {
+      if (changed != nullptr) {
+        CloseHandle(changed);
+      }
+    }
+
+    cursor_state_t(const cursor_state_t &) = delete;
+    cursor_state_t &operator=(const cursor_state_t &) = delete;
+
+    std::mutex mutex;  ///< Guards every field below; never held while taking the device-state lock.
+    HANDLE changed {};  ///< Auto-reset event signalled to the host when visibility or shape changes.
+    std::uint64_t sequence {};  ///< Visibility-or-shape change counter.
+    std::uint64_t shape_sequence {};  ///< Shape change counter.
+    bool visible {};  ///< Latest OS visibility.
+    std::uint32_t shape_type {LUMEN_VDD_CURSOR_SHAPE_NONE};  ///< LUMEN_VDD_CURSOR_SHAPE_*.
+    std::uint32_t width {};  ///< Shape width.
+    std::uint32_t height {};  ///< Shape height.
+    std::uint32_t pitch {};  ///< Shape row pitch.
+    std::uint32_t x_hot {};  ///< Hotspot X.
+    std::uint32_t y_hot {};  ///< Hotspot Y.
+    std::vector<std::uint8_t> shape;  ///< Latest shape bytes, pitch * height.
+  };
+
+  /**
+   * @brief IddCx hardware cursor for one assigned swap chain.
+   *
+   * While set up, the OS no longer composes the cursor into swap-chain surfaces and instead
+   * reports visibility and shape here. Position changes are ignored; the client draws the cursor.
+   */
+  class cursor_processor_t {
+  public:
+    cursor_processor_t(IDDCX_MONITOR monitor, std::shared_ptr<cursor_state_t> state):
+        monitor_(monitor),
+        state_(std::move(state)),
+        data_event_(CreateEventW(nullptr, FALSE, FALSE, nullptr)),
+        stop_event_(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
+        shape_buffer_(LUMEN_VDD_CURSOR_MAX_SHAPE_BYTES) {}
+
+    ~cursor_processor_t() {
+      SetEvent(stop_event_.get());
+      if (worker_.joinable()) {
+        worker_.join();
+      }
+    }
+
+    cursor_processor_t(const cursor_processor_t &) = delete;
+    cursor_processor_t &operator=(const cursor_processor_t &) = delete;
+
+    /** @brief Hand cursor composition to this driver and start the query thread. */
+    NTSTATUS start() noexcept {
+      IDARG_IN_SETUP_HWCURSOR input {};
+      input.CursorInfo.Size = sizeof(input.CursorInfo);
+      input.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_FULL;
+      input.CursorInfo.AlphaCursorSupport = TRUE;
+      input.CursorInfo.MaxX = LUMEN_VDD_CURSOR_MAX_DIMENSION;
+      input.CursorInfo.MaxY = LUMEN_VDD_CURSOR_MAX_DIMENSION;
+      input.hNewCursorDataAvailable = data_event_.get();
+      const auto status = IddCxMonitorSetupHardwareCursor(monitor_, &input);
+      if (!NT_SUCCESS(status)) {
+        return status;
+      }
+      try {
+        worker_ = std::thread([this]() {
+          run();
+        });
+      } catch (...) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+      }
+      return STATUS_SUCCESS;
+    }
+
+  private:
+    void run() noexcept {
+      // The OS reports the current cursor on the first query, before any change event.
+      query();
+      const HANDLE waits[] {data_event_.get(), stop_event_.get()};
+      while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) {
+        query();
+      }
+    }
+
+    void query() noexcept {
+      IDARG_IN_QUERY_HWCURSOR input {};
+      input.LastShapeId = last_shape_id_;
+      input.ShapeBufferSizeInBytes = static_cast<UINT>(shape_buffer_.size());
+      input.pShapeBuffer = shape_buffer_.data();
+      // A driver that reports HDR support must use the version-3 query; the original one fails.
+      IDARG_OUT_QUERY_HWCURSOR3 output {};
+      if (FAILED(IddCxMonitorQueryHardwareCursor3(monitor_, &input, &output))) {
+        return;
+      }
+      const bool visible = output.IsCursorVisible != FALSE;
+      std::lock_guard lock(state_->mutex);
+      bool changed = visible != state_->visible;
+      state_->visible = visible;
+      if (output.IsCursorShapeUpdated) {
+        const auto &info = output.CursorShapeInfo;
+        last_shape_id_ = info.ShapeId;
+        const auto type = info.CursorType == IDDCX_CURSOR_SHAPE_TYPE_ALPHA ? LUMEN_VDD_CURSOR_SHAPE_ALPHA :
+                          info.CursorType == IDDCX_CURSOR_SHAPE_TYPE_MASKED_COLOR ? LUMEN_VDD_CURSOR_SHAPE_MASKED_COLOR :
+                                                                                     LUMEN_VDD_CURSOR_SHAPE_NONE;
+        const auto bytes = static_cast<std::uint64_t>(info.Pitch) * info.Height;
+        if (type != LUMEN_VDD_CURSOR_SHAPE_NONE && info.Width != 0 && info.Height != 0 &&
+            info.Width <= LUMEN_VDD_CURSOR_MAX_DIMENSION && info.Height <= LUMEN_VDD_CURSOR_MAX_DIMENSION &&
+            info.Pitch >= info.Width * 4U && bytes <= shape_buffer_.size() && info.XHot < info.Width &&
+            info.YHot < info.Height) {
+          try {
+            state_->shape.assign(shape_buffer_.begin(), shape_buffer_.begin() + static_cast<std::ptrdiff_t>(bytes));
+          } catch (...) {
+            return;
+          }
+          state_->shape_type = type;
+          state_->width = info.Width;
+          state_->height = info.Height;
+          state_->pitch = info.Pitch;
+          state_->x_hot = info.XHot;
+          state_->y_hot = info.YHot;
+          ++state_->shape_sequence;
+          changed = true;
+        }
+      }
+      if (changed) {
+        ++state_->sequence;
+        SetEvent(state_->changed);
+      }
+    }
+
+    IDDCX_MONITOR monitor_;  ///< Monitor whose swap chain owns this hardware cursor.
+    std::shared_ptr<cursor_state_t> state_;  ///< Generation cursor state published to the host.
+    unique_handle_t data_event_;  ///< OS-signalled new-cursor-data event.
+    unique_handle_t stop_event_;  ///< Thread termination event.
+    std::vector<std::uint8_t> shape_buffer_;  ///< OS shape copy destination.
+    UINT last_shape_id_ {};  ///< Latest shape ID copied from the OS.
+    std::thread worker_;  ///< Cursor query thread.
+  };
+
   /** @brief Generation-fenced mutable driver state. */
   struct device_state_t {
     std::mutex mutex;  ///< Serializes every control and monitor transition.
@@ -796,8 +938,11 @@ namespace {
     WDFFILEOBJECT owner_file {};  ///< Exclusive requestor file.
     WDFFILEOBJECT frame_event_file {};  ///< File that completed the ABI6 event transfer.
     WDFFILEOBJECT frame_consumer_file {};  ///< Exact generation-scoped direct-frame consumer.
+    WDFFILEOBJECT cursor_event_file {};  ///< File that received the cursor event and owns cursor queries.
     HANDLE frame_ready_event {};  ///< Auto-reset availability event for the active generation.
     std::unique_ptr<swap_chain_processor_t> swap_chain;  ///< Active swap-chain consumer.
+    std::shared_ptr<cursor_state_t> cursor_state;  ///< Hardware-cursor state when this generation requested it.
+    std::unique_ptr<cursor_processor_t> cursor;  ///< Hardware cursor for the active swap chain.
     LUMEN_VDD_MODE mode {};  ///< Exact prepared mode.
     std::uint64_t generation {};  ///< Active generation.
     std::uint64_t last_generation {};  ///< Highest generation ever admitted.
@@ -1102,6 +1247,7 @@ namespace {
     if (state.monitor_starting || state.monitor_stopping) {
       return STATUS_DEVICE_BUSY;
     }
+    state.cursor.reset();
     state.swap_chain.reset();
     if (state.monitor != nullptr) {
       state.monitor_stopping = true;
@@ -1119,6 +1265,7 @@ namespace {
     state.owner_file = nullptr;
     state.frame_event_file = nullptr;
     state.frame_consumer_file = nullptr;
+    state.cursor_event_file = nullptr;
     state.owner_process_id = 0;
     state.preferred_render_adapter_luid = 0;
     state.assigned_render_adapter_luid = 0;
@@ -1128,6 +1275,7 @@ namespace {
       CloseHandle(state.frame_ready_event);
       state.frame_ready_event = nullptr;
     }
+    state.cursor_state.reset();
     {
       std::lock_guard descriptor_lock(state.descriptor_context->mutex);
       if (state.descriptor_context->snapshot &&
@@ -1505,6 +1653,9 @@ _Use_decl_annotations_ void LumenVddFileCleanup(WDFFILEOBJECT file_object) {
   } else if (state->frame_event_file == file_object) {
     state->frame_event_file = nullptr;
   }
+  if (state->cursor_event_file == file_object) {
+    state->cursor_event_file = nullptr;
+  }
 }
 
 _Use_decl_annotations_ void LumenVddDeviceIoControl(
@@ -1588,7 +1739,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         if (input == nullptr || output == nullptr) {
           break;
         }
-        if (input->reserved != 0 || input->owner_process_id != requestor_pid || input->generation == 0 ||
+        if ((input->flags & ~LUMEN_VDD_PREPARE_FLAGS_KNOWN) != 0 || input->owner_process_id != requestor_pid || input->generation == 0 ||
             input->preferred_render_adapter_luid == 0 || !valid_mode(input->mode)) {
           status = STATUS_INVALID_PARAMETER;
           break;
@@ -1604,6 +1755,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         if (state->generation != 0) {
           if (state->generation != input->generation || state->owner_file != file ||
               state->preferred_render_adapter_luid != input->preferred_render_adapter_luid ||
+              (state->cursor_state != nullptr) != ((input->flags & LUMEN_VDD_PREPARE_FLAG_HARDWARE_CURSOR) != 0) ||
               std::memcmp(&state->mode, &input->mode, sizeof(input->mode)) != 0) {
             status = STATUS_DEVICE_BUSY;
             break;
@@ -1619,8 +1771,16 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
             break;
           }
           std::shared_ptr<const color_transform_blob_t> default_transform;
+          std::shared_ptr<cursor_state_t> cursor_state;
           try {
             default_transform = default_color_transform();
+            if ((input->flags & LUMEN_VDD_PREPARE_FLAG_HARDWARE_CURSOR) != 0) {
+              HANDLE cursor_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+              if (cursor_event == nullptr) {
+                throw std::bad_alloc();
+              }
+              cursor_state = std::make_shared<cursor_state_t>(cursor_event);
+            }
           } catch (const std::bad_alloc &) {
             CloseHandle(frame_ready_event);
             status = STATUS_INSUFFICIENT_RESOURCES;
@@ -1631,6 +1791,7 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
           state->owner_process_id = requestor_pid;
           state->owner_file = file;
           state->frame_ready_event = frame_ready_event;
+          state->cursor_state = std::move(cursor_state);
           state->mode = input->mode;
           state->preferred_render_adapter_luid = input->preferred_render_adapter_luid;
           state->assigned_render_adapter_luid = 0;
@@ -1974,6 +2135,116 @@ _Use_decl_annotations_ void LumenVddDeviceIoControl(
         *output = published;
         state->frame_event_file = file;
         information = sizeof(*output);
+        break;
+      }
+    case IOCTL_LUMEN_VDD_OPEN_CURSOR_EVENT:
+      {
+        if (input_buffer_length != sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST) ||
+            output_buffer_length != sizeof(LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE)) {
+          status = STATUS_INFO_LENGTH_MISMATCH;
+          break;
+        }
+        auto *input = request_input<LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST>(
+          request,
+          sizeof(LUMEN_VDD_OPEN_FRAME_CHANNEL_REQUEST),
+          status
+        );
+        auto *output = request_output<LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE>(
+          request,
+          sizeof(LUMEN_VDD_OPEN_FRAME_EVENT_RESPONSE),
+          status
+        );
+        const auto requestor_pid = static_cast<std::uint32_t>(WdfRequestGetRequestorProcessId(request));
+        if (input == nullptr || output == nullptr) {
+          break;
+        }
+        *output = {};
+        const lumen::vdd::frame::transfer_request_identity_t request_identity {
+          input->generation,
+          input->owner_process_id,
+          input->reserved,
+        };
+        if (!lumen::vdd::frame::valid_transfer_request_identity(
+              request_identity,
+              state->generation,
+              requestor_pid,
+              state->owner_process_id
+            ) ||
+            state->cursor_state == nullptr) {
+          status = STATUS_ACCESS_DENIED;
+          break;
+        }
+        if (state->cursor_event_file != nullptr) {
+          status = STATUS_DEVICE_BUSY;
+          break;
+        }
+        requestor_process_t requestor_process;
+        status = open_authenticated_requestor_process(requestor_pid, requestor_process);
+        if (!NT_SUCCESS(status)) {
+          break;
+        }
+        const std::array<std::uint64_t, 1> source_handles {
+          reinterpret_cast<std::uint64_t>(state->cursor_state->changed),
+        };
+        std::array<std::uint64_t, 1> transferred_handles {};
+        status = transfer_handles_to_requestor(requestor_process, source_handles, transferred_handles);
+        CloseHandle(requestor_process.process);
+        if (!NT_SUCCESS(status)) {
+          break;
+        }
+        *output = {
+          state->generation,
+          requestor_process.process_id,
+          0,
+          requestor_process.creation_time,
+          transferred_handles[0],
+          0,
+        };
+        state->cursor_event_file = file;
+        information = sizeof(*output);
+        break;
+      }
+    case IOCTL_LUMEN_VDD_QUERY_CURSOR:
+      {
+        constexpr size_t output_size = sizeof(LUMEN_VDD_QUERY_CURSOR_RESPONSE) + LUMEN_VDD_CURSOR_MAX_SHAPE_BYTES;
+        if (input_buffer_length != sizeof(LUMEN_VDD_QUERY_CURSOR_REQUEST) || output_buffer_length != output_size) {
+          status = STATUS_INFO_LENGTH_MISMATCH;
+          break;
+        }
+        auto *input = request_input<LUMEN_VDD_QUERY_CURSOR_REQUEST>(request, sizeof(LUMEN_VDD_QUERY_CURSOR_REQUEST), status);
+        auto *output = request_output<std::uint8_t>(request, output_size, status);
+        const auto requestor_pid = static_cast<std::uint32_t>(WdfRequestGetRequestorProcessId(request));
+        if (input == nullptr || output == nullptr) {
+          break;
+        }
+        if (input->generation != state->generation || requestor_pid != state->owner_process_id ||
+            state->cursor_event_file != file) {
+          status = STATUS_REVISION_MISMATCH;
+          break;
+        }
+        if (state->cursor_state == nullptr) {
+          status = STATUS_NOT_SUPPORTED;
+          break;
+        }
+        LUMEN_VDD_QUERY_CURSOR_RESPONSE header {};
+        auto &cursor = *state->cursor_state;
+        std::lock_guard cursor_lock(cursor.mutex);
+        header.generation = state->generation;
+        header.sequence = cursor.sequence;
+        header.shape_sequence = cursor.shape_sequence;
+        header.visible = cursor.visible ? 1U : 0U;
+        header.shape_type = cursor.shape_type;
+        header.width = cursor.width;
+        header.height = cursor.height;
+        header.pitch = cursor.pitch;
+        header.x_hot = cursor.x_hot;
+        header.y_hot = cursor.y_hot;
+        if (cursor.shape_sequence != input->known_shape_sequence) {
+          header.shape_bytes = static_cast<std::uint32_t>(cursor.shape.size());
+          std::memcpy(output + sizeof(header), cursor.shape.data(), cursor.shape.size());
+        }
+        std::memcpy(output, &header, sizeof(header));
+        information = sizeof(header) + header.shape_bytes;
         break;
       }
     default:
@@ -2324,6 +2595,7 @@ _Use_decl_annotations_
   LumenVddMonitorAssignSwapChain(IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN *input) {
   auto *state = monitor_context(monitor)->state;
   std::lock_guard lock(state->mutex);
+  state->cursor.reset();
   state->swap_chain.reset();
   state->assigned_render_adapter_luid = pack_luid(input->RenderAdapterLuid);
   const bool direct_frames_enabled = lumen::vdd::frame::render_adapter_matches(
@@ -2345,6 +2617,19 @@ _Use_decl_annotations_
   } catch (...) {
     return STATUS_INSUFFICIENT_RESOURCES;
   }
+  if (state->cursor_state != nullptr) {
+    // A new swap chain starts with OS cursor composition; hardware cursor setup is per assignment.
+    try {
+      state->cursor = std::make_unique<cursor_processor_t>(monitor, state->cursor_state);
+    } catch (...) {
+      return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    const auto cursor_status = state->cursor->start();
+    if (!NT_SUCCESS(cursor_status)) {
+      state->cursor.reset();
+      return cursor_status;
+    }
+  }
   return STATUS_SUCCESS;
 }
 
@@ -2353,6 +2638,7 @@ _Use_decl_annotations_
   LumenVddMonitorUnassignSwapChain(IDDCX_MONITOR monitor) {
   auto *state = monitor_context(monitor)->state;
   std::lock_guard lock(state->mutex);
+  state->cursor.reset();
   state->swap_chain.reset();
   return STATUS_SUCCESS;
 }

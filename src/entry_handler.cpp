@@ -40,7 +40,7 @@ namespace args {
       help(name);
     }
 
-    http::save_user_creds(config::sunshine.credentials_file, argv[0], argv[1]);
+    http::save_user_creds(config::general.credentials_file, argv[0], argv[1]);
 
     return 0;
   }
@@ -70,8 +70,8 @@ namespace lifetime {
   char **argv;  ///< Command-line argument vector.
   std::atomic_int desired_exit_code;  ///< Desired exit code.
 
-  void exit_sunshine(int exit_code, bool async) {
-    // Store the exit code of the first exit_sunshine() call
+  void exit_lumen(int exit_code, bool async) {
+    // Store the exit code of the first exit_lumen() call
     int zero = 0;
     desired_exit_code.compare_exchange_strong(zero, exit_code);
 
@@ -99,9 +99,9 @@ namespace lifetime {
 }  // namespace lifetime
 
 void log_publisher_data() {
-  BOOST_LOG(info) << "Package Publisher: "sv << SUNSHINE_PUBLISHER_NAME;
-  BOOST_LOG(info) << "Publisher Website: "sv << SUNSHINE_PUBLISHER_WEBSITE;
-  BOOST_LOG(info) << "Get support: "sv << SUNSHINE_PUBLISHER_ISSUE_URL;
+  BOOST_LOG(info) << "Package Publisher: "sv << LUMEN_PUBLISHER_NAME;
+  BOOST_LOG(info) << "Publisher Website: "sv << LUMEN_PUBLISHER_WEBSITE;
+  BOOST_LOG(info) << "Get support: "sv << LUMEN_PUBLISHER_ISSUE_URL;
 }
 
 #ifdef _WIN32

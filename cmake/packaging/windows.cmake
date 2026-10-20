@@ -1,5 +1,5 @@
 # windows specific packaging
-install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
+install(TARGETS lumen RUNTIME DESTINATION "." COMPONENT application)
 
 option(LUMEN_WINDOWS_FULL_PROFILE
         "Require the complete Lumen driver package set"
@@ -16,11 +16,11 @@ if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64" AND DEFINED _MINHOOK_DLL)
 endif()
 
 # ViGEmBus installer
-set(SUNSHINE_THIRD_PARTY_DIR "third-party")
-set(VIGEMBUS_INSTALLER "${CMAKE_BINARY_DIR}/${SUNSHINE_THIRD_PARTY_DIR}/vigembus_installer.exe")
+set(LUMEN_THIRD_PARTY_DIR "third-party")
+set(VIGEMBUS_INSTALLER "${CMAKE_BINARY_DIR}/${LUMEN_THIRD_PARTY_DIR}/vigembus_installer.exe")
 set(VIGEMBUS_DOWNLOAD_URL_1 "https://github.com/nefarius/ViGEmBus/releases/download")
 set(VIGEMBUS_DOWNLOAD_URL_2 "v${VIGEMBUS_PACKAGED_V_2}/ViGEmBus_${VIGEMBUS_PACKAGED_V}_x64_x86_arm64.exe")
-file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/${SUNSHINE_THIRD_PARTY_DIR}")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/${LUMEN_THIRD_PARTY_DIR}")
 file(DOWNLOAD
         "${VIGEMBUS_DOWNLOAD_URL_1}/${VIGEMBUS_DOWNLOAD_URL_2}"
         ${VIGEMBUS_INSTALLER}
@@ -29,7 +29,7 @@ file(DOWNLOAD
         TIMEOUT 60
 )
 install(FILES ${VIGEMBUS_INSTALLER}
-        DESTINATION "${SUNSHINE_THIRD_PARTY_DIR}"
+        DESTINATION "${LUMEN_THIRD_PARTY_DIR}"
         RENAME "vigembus_installer.exe"
         COMPONENT gamepad)
 
@@ -38,7 +38,7 @@ install(TARGETS dxgi-info RUNTIME DESTINATION "tools" COMPONENT dxgi)
 install(TARGETS audio-info RUNTIME DESTINATION "tools" COMPONENT audio)
 
 # Mandatory tools
-install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
+install(TARGETS lumensvc RUNTIME DESTINATION "tools" COMPONENT application)
 install(TARGETS lumen-clipboard RUNTIME DESTINATION "tools" COMPONENT application)
 
 # Lumen Virtual HID driver
@@ -47,33 +47,33 @@ install(TARGETS lumen-clipboard RUNTIME DESTINATION "tools" COMPONENT applicatio
 # receives the architecture-matched, validated package directory from CI (or a
 # local packager) and stages it without attempting to rebuild MSVC artifacts
 # from the MSYS2 toolchain.
-set(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR "" CACHE PATH
+set(LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR "" CACHE PATH
         "Directory containing the architecture-matched Lumen Virtual HID INF, CAT, and driver binary")
-option(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE
+option(LUMEN_VIRTUAL_HID_BUNDLED_CERTIFICATE
         "Package the bundled Virtual HID certificate"
         OFF)
 
-if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
-    if(NOT IS_DIRECTORY "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
+if(LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
+    if(NOT IS_DIRECTORY "${LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
         message(FATAL_ERROR
-                "SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR does not exist: "
-                "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
+                "LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR does not exist: "
+                "${LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
     endif()
 
     set(VIRTUAL_HID_DRIVER_INF
-            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.inf")
+            "${LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.inf")
     set(VIRTUAL_HID_DRIVER_CAT
-            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.cat")
+            "${LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.cat")
     set(VIRTUAL_HID_DRIVER_DLL
-            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.dll")
+            "${LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.dll")
     set(VIRTUAL_HID_DRIVER_FILES
             "${VIRTUAL_HID_DRIVER_INF}"
             "${VIRTUAL_HID_DRIVER_CAT}"
             "${VIRTUAL_HID_DRIVER_DLL}")
 
-    if(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE)
+    if(LUMEN_VIRTUAL_HID_BUNDLED_CERTIFICATE)
         set(VIRTUAL_HID_DRIVER_CERT
-                "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.cer")
+                "${LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/LumenVirtualHid.cer")
         list(APPEND VIRTUAL_HID_DRIVER_FILES "${VIRTUAL_HID_DRIVER_CERT}")
         set(VIRTUAL_HID_DRIVER_EXPECTED_FILE_COUNT 4)
     else()
@@ -89,10 +89,10 @@ if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
 
     file(GLOB VIRTUAL_HID_DRIVER_PACKAGE_FILES
             LIST_DIRECTORIES false
-            "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*")
+            "${LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR}/*")
     list(LENGTH VIRTUAL_HID_DRIVER_PACKAGE_FILES VIRTUAL_HID_DRIVER_PACKAGE_FILE_COUNT)
     if(NOT VIRTUAL_HID_DRIVER_PACKAGE_FILE_COUNT EQUAL VIRTUAL_HID_DRIVER_EXPECTED_FILE_COUNT)
-        if(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE)
+        if(LUMEN_VIRTUAL_HID_BUNDLED_CERTIFICATE)
             set(VIRTUAL_HID_DRIVER_PACKAGE_CONTENTS
                     "LumenVirtualHid.inf, LumenVirtualHid.cat, LumenVirtualHid.dll, and LumenVirtualHid.cer")
         else()
@@ -101,7 +101,7 @@ if(SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR)
         endif()
         message(FATAL_ERROR
                 "The Lumen Virtual HID package must contain exactly ${VIRTUAL_HID_DRIVER_PACKAGE_CONTENTS}: "
-                "${SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
+                "${LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR}")
     endif()
 
     if(NOT TARGET lumen-vhidctl)
@@ -124,26 +124,26 @@ endif()
 #
 # The WaveRT driver is built separately with MSBuild/WDK. Only an exact x64
 # INF/SYS/CAT package may be supplied to the MSYS2 application packager.
-set(SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR "" CACHE PATH
+set(LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR "" CACHE PATH
         "Directory containing the architecture-matched Lumen Virtual Microphone INF, SYS, and CAT")
 
-if(SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR)
+if(LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR)
     if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
         message(FATAL_ERROR
                 "The current Lumen Virtual Microphone package supports AMD64 packaging only")
     endif()
-    if(NOT IS_DIRECTORY "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
+    if(NOT IS_DIRECTORY "${LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
         message(FATAL_ERROR
-                "SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR does not exist: "
-                "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
+                "LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR does not exist: "
+                "${LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
     endif()
 
     set(VIRTUAL_MICROPHONE_DRIVER_INF
-            "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.inf")
+            "${LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.inf")
     set(VIRTUAL_MICROPHONE_DRIVER_SYS
-            "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.sys")
+            "${LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.sys")
     set(VIRTUAL_MICROPHONE_DRIVER_CAT
-            "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.cat")
+            "${LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/LumenVirtualMicrophone.cat")
     set(VIRTUAL_MICROPHONE_DRIVER_FILES
             "${VIRTUAL_MICROPHONE_DRIVER_INF}"
             "${VIRTUAL_MICROPHONE_DRIVER_SYS}"
@@ -158,13 +158,13 @@ if(SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR)
 
     file(GLOB VIRTUAL_MICROPHONE_DRIVER_PACKAGE_FILES
             LIST_DIRECTORIES false
-            "${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/*")
+            "${LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}/*")
     list(LENGTH VIRTUAL_MICROPHONE_DRIVER_PACKAGE_FILES VIRTUAL_MICROPHONE_DRIVER_PACKAGE_FILE_COUNT)
     if(NOT VIRTUAL_MICROPHONE_DRIVER_PACKAGE_FILE_COUNT EQUAL 3)
         message(FATAL_ERROR
                 "The Lumen Virtual Microphone package must contain exactly "
                 "LumenVirtualMicrophone.inf, LumenVirtualMicrophone.sys, and "
-                "LumenVirtualMicrophone.cat: ${SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
+                "LumenVirtualMicrophone.cat: ${LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR}")
     endif()
 
     file(READ "${VIRTUAL_MICROPHONE_DRIVER_INF}" VIRTUAL_MICROPHONE_DRIVER_INF_CONTENTS)
@@ -206,26 +206,26 @@ endif()
 #
 # The UMDF2 IddCx driver is built separately with MSBuild/WDK. Packaging accepts
 # one exact x64 driver-store package and never rebuilds it with MinGW.
-set(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR "" CACHE PATH
+set(LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR "" CACHE PATH
         "Directory containing the x64 Lumen Virtual Display INF, CAT, and DLL")
 
-if(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
+if(LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
     if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
         message(FATAL_ERROR
                 "The current Lumen Virtual Display package supports AMD64 packaging only")
     endif()
-    if(NOT IS_DIRECTORY "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
+    if(NOT IS_DIRECTORY "${LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
         message(FATAL_ERROR
-                "SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR does not exist: "
-                "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
+                "LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR does not exist: "
+                "${LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
     endif()
 
     set(VIRTUAL_DISPLAY_DRIVER_INF
-            "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.inf")
+            "${LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.inf")
     set(VIRTUAL_DISPLAY_DRIVER_CAT
-            "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.cat")
+            "${LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.cat")
     set(VIRTUAL_DISPLAY_DRIVER_DLL
-            "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.dll")
+            "${LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/LumenVirtualDisplay.dll")
     set(VIRTUAL_DISPLAY_DRIVER_FILES
             "${VIRTUAL_DISPLAY_DRIVER_INF}"
             "${VIRTUAL_DISPLAY_DRIVER_CAT}"
@@ -240,13 +240,13 @@ if(SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
 
     file(GLOB VIRTUAL_DISPLAY_DRIVER_PACKAGE_FILES
             LIST_DIRECTORIES false
-            "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/*")
+            "${LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}/*")
     list(LENGTH VIRTUAL_DISPLAY_DRIVER_PACKAGE_FILES VIRTUAL_DISPLAY_DRIVER_PACKAGE_FILE_COUNT)
     if(NOT VIRTUAL_DISPLAY_DRIVER_PACKAGE_FILE_COUNT EQUAL 3)
         message(FATAL_ERROR
                 "The Lumen Virtual Display package must contain exactly "
                 "LumenVirtualDisplay.inf, LumenVirtualDisplay.cat, and "
-                "LumenVirtualDisplay.dll: ${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
+                "LumenVirtualDisplay.dll: ${LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR}")
     endif()
 
     file(READ "${VIRTUAL_DISPLAY_DRIVER_INF}" VIRTUAL_DISPLAY_DRIVER_INF_CONTENTS)
@@ -287,9 +287,9 @@ install(TARGETS lumen-vddctl
 
 if(LUMEN_WINDOWS_FULL_PROFILE)
     foreach(REQUIRED_FULL_PROFILE_DIRECTORY IN ITEMS
-            SUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR
-            SUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR
-            SUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
+            LUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR
+            LUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR
+            LUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR)
         if(NOT IS_DIRECTORY "${${REQUIRED_FULL_PROFILE_DIRECTORY}}")
             message(FATAL_ERROR
                     "LUMEN_WINDOWS_FULL_PROFILE requires ${REQUIRED_FULL_PROFILE_DIRECTORY}")
@@ -317,45 +317,45 @@ endif()
 
 # Mandatory scripts. The source filename is retained as a build compatibility
 # alias, but new packages expose only the Lumen script name.
-install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sunshine-setup.ps1"
+install(FILES "${LUMEN_SOURCE_ASSETS_DIR}/windows/misc/lumen-setup.ps1"
         DESTINATION "scripts"
         RENAME "lumen-setup.ps1"
         COMPONENT assets)
-install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/virtual-display-setup.ps1"
+install(FILES "${LUMEN_SOURCE_ASSETS_DIR}/windows/misc/virtual-display-setup.ps1"
         DESTINATION "scripts"
         COMPONENT assets)
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/service/"
+install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/windows/misc/service/"
         DESTINATION "scripts"
         COMPONENT assets)
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/migration/"
+install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/windows/misc/migration/"
         DESTINATION "scripts"
         COMPONENT assets)
 # Configurable options for the service
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/autostart/"
+install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/windows/misc/autostart/"
         DESTINATION "scripts"
         COMPONENT autostart)
 
 # scripts
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/firewall/"
+install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/windows/misc/firewall/"
         DESTINATION "scripts"
         COMPONENT firewall)
 
 # Lumen assets
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/"
-        DESTINATION "${SUNSHINE_ASSETS_DIR}"
+install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/windows/assets/"
+        DESTINATION "${LUMEN_ASSETS_DIR}"
         COMPONENT assets)
 
 # copy assets (excluding shaders) to build directory, for running without install
-file(COPY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/"
+file(COPY "${LUMEN_SOURCE_ASSETS_DIR}/windows/assets/"
         DESTINATION "${CMAKE_BINARY_DIR}/assets"
         PATTERN "shaders" EXCLUDE)
 # use junction for shaders directory
-cmake_path(CONVERT "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/shaders"
+cmake_path(CONVERT "${LUMEN_SOURCE_ASSETS_DIR}/windows/assets/shaders"
         TO_NATIVE_PATH_LIST shaders_in_build_src_native)
 cmake_path(CONVERT "${CMAKE_BINARY_DIR}/assets/shaders" TO_NATIVE_PATH_LIST shaders_in_build_dest_native)
 execute_process(COMMAND cmd.exe /c mklink /J "${shaders_in_build_dest_native}" "${shaders_in_build_src_native}")
 
-set(CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}\\\\sunshine.ico")
+set(CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}\\\\lumen.ico")
 
 # The name of the directory that will be created in C:/Program files/
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "${CPACK_PACKAGE_NAME}")
@@ -385,7 +385,7 @@ set(CPACK_COMPONENT_ASSETS_REQUIRED true)
 
 # Lumen Virtual HID driver and management helper
 set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DISPLAY_NAME "Lumen Virtual Input")
-if(SUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE)
+if(LUMEN_VIRTUAL_HID_BUNDLED_CERTIFICATE)
     set(CPACK_COMPONENT_VIRTUAL_HID_DRIVER_DESCRIPTION
             "Optional Lumen Virtual HID keyboard, mouse, consumer-control, and modern gamepad driver.")
 else()
@@ -416,22 +416,22 @@ set(CPACK_COMPONENT_VIRTUAL_DISPLAY_DRIVER_DISABLED false)
 # ZIP packages are intentionally non-privileged. Keep the driver payload out
 # of the lite archive; the lifecycle helper is inert without elevation and an
 # explicit setup transaction.
-get_cmake_property(SUNSHINE_WINDOWS_PACKAGE_COMPONENTS COMPONENTS)
-set(SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG
+get_cmake_property(LUMEN_WINDOWS_PACKAGE_COMPONENTS COMPONENTS)
+set(LUMEN_WINDOWS_CPACK_PROJECT_CONFIG
         "${CMAKE_CURRENT_BINARY_DIR}/LumenWindowsCPackOptions.cmake")
-string(CONCAT SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT
+string(CONCAT LUMEN_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT
         "if(CPACK_GENERATOR STREQUAL \"ZIP\")\n"
         "  set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)\n"
         "  set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)\n"
-        "  set(CPACK_COMPONENTS_ALL \"${SUNSHINE_WINDOWS_PACKAGE_COMPONENTS}\")\n"
+        "  set(CPACK_COMPONENTS_ALL \"${LUMEN_WINDOWS_PACKAGE_COMPONENTS}\")\n"
         "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_hid_driver)\n"
         "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_microphone_driver)\n"
         "  list(REMOVE_ITEM CPACK_COMPONENTS_ALL virtual_display_driver)\n"
         "endif()\n")
 file(GENERATE
-        OUTPUT "${SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG}"
-        CONTENT "${SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT}")
-set(CPACK_PROJECT_CONFIG_FILE "${SUNSHINE_WINDOWS_CPACK_PROJECT_CONFIG}")
+        OUTPUT "${LUMEN_WINDOWS_CPACK_PROJECT_CONFIG}"
+        CONTENT "${LUMEN_WINDOWS_CPACK_PROJECT_CONFIG_CONTENT}")
+set(CPACK_PROJECT_CONFIG_FILE "${LUMEN_WINDOWS_CPACK_PROJECT_CONFIG}")
 
 # audio tool
 set(CPACK_COMPONENT_AUDIO_DISPLAY_NAME "audio-info")

@@ -20,7 +20,7 @@ namespace {
    * @return Complete source text.
    */
   std::string read_source(const std::filesystem::path &relative_path) {
-    const auto path = std::filesystem::path {SUNSHINE_SOURCE_DIR} / relative_path;
+    const auto path = std::filesystem::path {LUMEN_SOURCE_DIR} / relative_path;
     std::ifstream stream {path};
     EXPECT_TRUE(stream.is_open()) << path;
     return {

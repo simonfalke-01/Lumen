@@ -50,7 +50,7 @@
 #include <lizardbyte/common/env.h>
 #include <unistd.h>
 
-#ifdef SUNSHINE_BUILD_DRM
+#ifdef LUMEN_BUILD_DRM
   #include <dirent.h>
   #include <xf86drm.h>
   #include <xf86drmMode.h>
@@ -66,13 +66,13 @@
 #include "vaapi.h"
 
 #ifdef __GNUC__
-  #define SUNSHINE_GNUC_EXTENSION __extension__
+  #define LUMEN_GNUC_EXTENSION __extension__
 #else
   /**
-   * @def SUNSHINE_GNUC_EXTENSION
-   * @brief Macro for SUNSHINE GNUC EXTENSION.
+   * @def LUMEN_GNUC_EXTENSION
+   * @brief Macro for LUMEN GNUC EXTENSION.
    */
-  #define SUNSHINE_GNUC_EXTENSION
+  #define LUMEN_GNUC_EXTENSION
 #endif
 
 #ifndef SOL_IP
@@ -138,7 +138,7 @@ namespace dyn {
     for (auto &func : funcs) {
       TUPLE_2D_REF(fn, name, func);
 
-      *fn = SUNSHINE_GNUC_EXTENSION(apiproc) dlsym(handle, name);
+      *fn = LUMEN_GNUC_EXTENSION(apiproc) dlsym(handle, name);
 
       if (!*fn && strict) {
         BOOST_LOG(error) << "Couldn't find function: "sv << name;
@@ -164,7 +164,7 @@ namespace platf {
    * as warnings but do not fail the call.
    */
   int open_drm_card_fd(const std::filesystem::path &path, int flags) {
-#ifdef SUNSHINE_BUILD_DRM
+#ifdef LUMEN_BUILD_DRM
     int fd = open(path.c_str(), flags | O_CLOEXEC);
     if (fd < 0) {
       BOOST_LOG(error) << "Couldn't open: "sv << path.string() << ": "sv << strerror(errno);
@@ -245,18 +245,16 @@ namespace platf {
   }
 
   /**
-   * @brief Performs migration if necessary, then returns the appdata directory.
+   * @brief Return the appdata directory.
    * @details This is used for the log directory, so it cannot invoke Boost logging!
    * @return The path of the appdata directory that should be used.
    */
   fs::path appdata() {
-    static std::once_flag migration_flag;
+    static std::once_flag resolve_flag;
     static fs::path config_path;
 
-    // Ensure migration is only attempted once
-    std::call_once(migration_flag, []() {
+    std::call_once(resolve_flag, []() {
       bool found = false;
-      bool migrate_config = true;
       fs::path homedir {lizardbyte::common::get_env("HOME")};
 
       // Get the home directory
@@ -279,36 +277,6 @@ namespace platf {
       // As a last resort, use the home directory
       if (!found) {
         config_path = homedir / ".config" / "lumen";
-      }
-
-      // LUMEN_MIGRATE_CONFIG is the primary control; SUNSHINE_MIGRATE_CONFIG remains a compatibility alias.
-      std::string migrate_envvar;
-      if (lizardbyte::common::get_env("LUMEN_MIGRATE_CONFIG", migrate_envvar) ||
-          lizardbyte::common::get_env("SUNSHINE_MIGRATE_CONFIG", migrate_envvar)) {
-        migrate_config = migrate_envvar == "1";
-      }
-
-      // Copy the legacy Sunshine configuration when Lumen has no configuration yet.
-      if (migrate_config) {
-        std::error_code ec;
-        fs::path old_config_path;
-        if (found) {
-          old_config_path = config_path.parent_path() / "sunshine";
-        } else {
-          old_config_path = homedir / ".config" / "sunshine";
-        }
-        if (old_config_path != config_path && fs::exists(old_config_path, ec)) {
-          if (!fs::exists(config_path, ec)) {
-            std::cout << "Copying legacy Sunshine config from "sv << old_config_path << " to "sv << config_path << std::endl;
-            std::string migration_error;
-            if (!config::copy_legacy_config_directory(old_config_path.string(), config_path.string(), migration_error)) {
-              std::cerr << "Legacy config copy failed: " << migration_error << std::endl;
-            }
-          } else {
-            // We cannot use Boost logging because it hasn't been initialized yet!
-            std::cerr << "Config exists in both "sv << old_config_path << " and "sv << config_path << ". Using "sv << config_path << " for Lumen config" << std::endl;
-          }
-        }
       }
     });
 
@@ -545,7 +513,7 @@ namespace platf {
   }
 
   /**
-   * @brief Request a Sunshine process restart on exit.
+   * @brief Request a Lumen process restart on exit.
    */
   void restart_on_exit() {
     char executable[PATH_MAX];
@@ -570,12 +538,12 @@ namespace platf {
   }
 
   /**
-   * @brief Restart the Sunshine process through the platform launcher.
+   * @brief Restart the Lumen process through the platform launcher.
    */
   void restart() {
     // Gracefully clean up and restart ourselves instead of exiting
     atexit(restart_on_exit);
-    lifetime::exit_sunshine(0, true);
+    lifetime::exit_lumen(0, true);
   }
 
   bool request_process_group_exit(std::uintptr_t native_handle) {
@@ -1103,22 +1071,22 @@ namespace platf {
      * @brief Enumerates supported source options.
      */
     enum source_e : std::size_t {
-#ifdef SUNSHINE_BUILD_CUDA
+#ifdef LUMEN_BUILD_CUDA
       NVFBC,  ///< NvFBC
 #endif
-#ifdef SUNSHINE_BUILD_WAYLAND
+#ifdef LUMEN_BUILD_WAYLAND
       WAYLAND,  ///< Wayland
 #endif
-#ifdef SUNSHINE_BUILD_DRM
+#ifdef LUMEN_BUILD_DRM
       KMS,  ///< KMS
 #endif
-#ifdef SUNSHINE_BUILD_X11
+#ifdef LUMEN_BUILD_X11
       X11,  ///< X11
 #endif
-#ifdef SUNSHINE_BUILD_KWIN
+#ifdef LUMEN_BUILD_KWIN
       KWIN,  ///< KWin ScreenCast
 #endif
-#ifdef SUNSHINE_BUILD_PORTAL
+#ifdef LUMEN_BUILD_PORTAL
       PORTAL,  ///< XDG PORTAL
 #endif
       MAX_FLAGS  ///< The maximum number of flags
@@ -1127,7 +1095,7 @@ namespace platf {
 
   static std::bitset<source::MAX_FLAGS> sources;
 
-#ifdef SUNSHINE_BUILD_CUDA
+#ifdef LUMEN_BUILD_CUDA
   std::vector<std::string> nvfbc_display_names();
   std::shared_ptr<display_t> nvfbc_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
 
@@ -1136,7 +1104,7 @@ namespace platf {
   }
 #endif
 
-#ifdef SUNSHINE_BUILD_WAYLAND
+#ifdef LUMEN_BUILD_WAYLAND
   /**
    * @brief Enumerate displays available through the Wayland capture backend.
    *
@@ -1163,7 +1131,7 @@ namespace platf {
   }
 #endif
 
-#ifdef SUNSHINE_BUILD_DRM
+#ifdef LUMEN_BUILD_DRM
   std::vector<std::string> kms_display_names(mem_type_e hwdevice_type);
   std::shared_ptr<display_t> kms_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
 
@@ -1172,7 +1140,7 @@ namespace platf {
   }
 #endif
 
-#ifdef SUNSHINE_BUILD_X11
+#ifdef LUMEN_BUILD_X11
   std::vector<std::string> x11_display_names();
   std::shared_ptr<display_t> x11_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
 
@@ -1181,7 +1149,7 @@ namespace platf {
   }
 #endif
 
-#ifdef SUNSHINE_BUILD_PORTAL
+#ifdef LUMEN_BUILD_PORTAL
   std::vector<std::string> portal_display_names();
   std::shared_ptr<display_t> portal_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
 
@@ -1190,7 +1158,7 @@ namespace platf {
   }
 #endif
 
-#ifdef SUNSHINE_BUILD_KWIN
+#ifdef LUMEN_BUILD_KWIN
   bool kwin_available();
   std::vector<std::string> kwin_display_names();
   std::shared_ptr<display_t> kwin_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
@@ -1205,33 +1173,33 @@ namespace platf {
    * @brief List display names accepted by the selected capture backend.
    */
   std::vector<std::string> display_names(mem_type_e hwdevice_type) {
-#ifdef SUNSHINE_BUILD_CUDA
+#ifdef LUMEN_BUILD_CUDA
     // display using NvFBC only supports mem_type_e::cuda
     if (sources[source::NVFBC] && hwdevice_type == mem_type_e::cuda) {
       return nvfbc_display_names();
     }
 #endif
-#ifdef SUNSHINE_BUILD_WAYLAND
+#ifdef LUMEN_BUILD_WAYLAND
     if (sources[source::WAYLAND]) {
       return wl_display_names();
     }
 #endif
-#ifdef SUNSHINE_BUILD_DRM
+#ifdef LUMEN_BUILD_DRM
     if (sources[source::KMS]) {
       return kms_display_names(hwdevice_type);
     }
 #endif
-#ifdef SUNSHINE_BUILD_X11
+#ifdef LUMEN_BUILD_X11
     if (sources[source::X11]) {
       return x11_display_names();
     }
 #endif
-#ifdef SUNSHINE_BUILD_PORTAL
+#ifdef LUMEN_BUILD_PORTAL
     if (sources[source::PORTAL]) {
       return portal_display_names();
     }
 #endif
-#ifdef SUNSHINE_BUILD_KWIN
+#ifdef LUMEN_BUILD_KWIN
     if (sources[source::KWIN]) {
       return kwin_display_names();
     }
@@ -1259,7 +1227,7 @@ namespace platf {
 
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
     // Keep KMS as first element to check before dropping CAP_SYS_ADMIN
-#ifdef SUNSHINE_BUILD_DRM
+#ifdef LUMEN_BUILD_DRM
     if (sources[source::KMS]) {
       BOOST_LOG(info) << "Screencasting with KMS"sv;
       return kms_display(hwdevice_type, display_name, config);
@@ -1271,31 +1239,31 @@ namespace platf {
       drop_elevated_privileges(false);
     }
 
-#ifdef SUNSHINE_BUILD_CUDA
+#ifdef LUMEN_BUILD_CUDA
     if (sources[source::NVFBC] && hwdevice_type == mem_type_e::cuda) {
       BOOST_LOG(info) << "Screencasting with NvFBC"sv;
       return nvfbc_display(hwdevice_type, display_name, config);
     }
 #endif
-#ifdef SUNSHINE_BUILD_WAYLAND
+#ifdef LUMEN_BUILD_WAYLAND
     if (sources[source::WAYLAND]) {
       BOOST_LOG(info) << "Screencasting with Wayland's protocol"sv;
       return wl_display(hwdevice_type, display_name, config);
     }
 #endif
-#ifdef SUNSHINE_BUILD_X11
+#ifdef LUMEN_BUILD_X11
     if (sources[source::X11]) {
       BOOST_LOG(info) << "Screencasting with X11"sv;
       return x11_display(hwdevice_type, display_name, config);
     }
 #endif
-#ifdef SUNSHINE_BUILD_PORTAL
+#ifdef LUMEN_BUILD_PORTAL
     if (sources[source::PORTAL]) {
       BOOST_LOG(info) << "Screencasting with XDG portal"sv;
       return portal_display(hwdevice_type, display_name, config);
     }
 #endif
-#ifdef SUNSHINE_BUILD_KWIN
+#ifdef LUMEN_BUILD_KWIN
     if (sources[source::KWIN]) {
       BOOST_LOG(info) << "Screencasting with KWin ScreenCast"sv;
       return kwin_display(hwdevice_type, display_name, config);
@@ -1326,49 +1294,49 @@ namespace platf {
     gbm::init();
 
     window_system = window_system_e::NONE;
-#ifdef SUNSHINE_BUILD_WAYLAND
+#ifdef LUMEN_BUILD_WAYLAND
     if (std::string v; lizardbyte::common::get_env("WAYLAND_DISPLAY", v)) {
       window_system = window_system_e::WAYLAND;
     }
 #endif
-#if defined(SUNSHINE_BUILD_X11) || defined(SUNSHINE_BUILD_CUDA)
+#if defined(LUMEN_BUILD_X11) || defined(LUMEN_BUILD_CUDA)
     if (std::string v; lizardbyte::common::get_env("DISPLAY", v) && window_system != window_system_e::WAYLAND) {
       if (lizardbyte::common::get_env("WAYLAND_DISPLAY", v)) {
-        BOOST_LOG(warning) << "Wayland detected, yet sunshine will use X11 for screencasting, screencasting will only work on XWayland applications"sv;
+        BOOST_LOG(warning) << "Wayland detected, yet lumen will use X11 for screencasting, screencasting will only work on XWayland applications"sv;
       }
 
       window_system = window_system_e::X11;
     }
 #endif
 
-#ifdef SUNSHINE_BUILD_CUDA
+#ifdef LUMEN_BUILD_CUDA
     if (((config::video.capture.empty() && sources.none()) || config::video.capture == "nvfbc") && verify_nvfbc()) {
       sources[source::NVFBC] = true;
     }
 #endif
-#ifdef SUNSHINE_BUILD_WAYLAND
+#ifdef LUMEN_BUILD_WAYLAND
     if (((config::video.capture.empty() && sources.none()) || config::video.capture == "wlr") && verify_wl()) {
       sources[source::WAYLAND] = true;
     }
 #endif
-#ifdef SUNSHINE_BUILD_DRM
+#ifdef LUMEN_BUILD_DRM
     if (((config::video.capture.empty() && sources.none()) || config::video.capture == "kms") && verify_kms()) {
       sources[source::KMS] = true;
     }
 #endif
-#ifdef SUNSHINE_BUILD_X11
+#ifdef LUMEN_BUILD_X11
     // We enumerate this capture backend regardless of other suitable sources,
     // since it may be needed as a NvFBC fallback for software encoding on X11.
     if ((config::video.capture.empty() || config::video.capture == "x11") && verify_x11()) {
       sources[source::X11] = true;
     }
 #endif
-#ifdef SUNSHINE_BUILD_PORTAL
+#ifdef LUMEN_BUILD_PORTAL
     if ((config::video.capture.empty() || config::video.capture == "portal") && verify_portal()) {
       sources[source::PORTAL] = true;
     }
 #endif
-#ifdef SUNSHINE_BUILD_KWIN
+#ifdef LUMEN_BUILD_KWIN
     if (((config::video.capture.empty() && sources.none()) || config::video.capture == "kwin") && verify_kwin()) {
       sources[source::KWIN] = true;
     }
@@ -1411,7 +1379,7 @@ namespace platf {
    * @return Render-node path, or an empty string when no matching node is found.
    */
   std::string find_render_node_with_display() {
-#ifdef SUNSHINE_BUILD_DRM
+#ifdef LUMEN_BUILD_DRM
     auto *dir = opendir("/dev/dri");
     if (!dir) {
       return {};

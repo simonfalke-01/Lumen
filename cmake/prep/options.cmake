@@ -1,9 +1,9 @@
 # Publisher Metadata
-set(SUNSHINE_PUBLISHER_NAME "simonfalke"
+set(LUMEN_PUBLISHER_NAME "simonfalke"
         CACHE STRING "The name of the publisher (not developer) of the application.")
-set(SUNSHINE_PUBLISHER_WEBSITE "https://github.com/simonfalke-01/Lumen"
+set(LUMEN_PUBLISHER_WEBSITE "https://github.com/simonfalke-01/Lumen"
         CACHE STRING "The URL of the publisher's website.")
-set(SUNSHINE_PUBLISHER_ISSUE_URL "https://github.com/simonfalke-01/Lumen/issues"
+set(LUMEN_PUBLISHER_ISSUE_URL "https://github.com/simonfalke-01/Lumen/issues"
         CACHE STRING "The URL of the publisher's support site or issue tracker.
         If you provide a modified version of Lumen, use your own project URL.")
 
@@ -14,12 +14,12 @@ option(NPM_OFFLINE "Use offline npm packages. You must ensure packages are in yo
 option(BUILD_WERROR "Enable -Werror flag." OFF)
 
 # if this option is set, the build will exit after configuring special package configuration files
-option(SUNSHINE_CONFIGURE_ONLY "Configure special files only, then exit." OFF)
+option(LUMEN_CONFIGURE_ONLY "Configure special files only, then exit." OFF)
 
-option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
+option(LUMEN_ENABLE_TRAY "Enable system tray icon." ON)
 
 set(LUMEN_BUILD_PROFILE "full" CACHE STRING
-        "Lumen feature profile: full includes bundled platform integrations; legacy keeps only Moonlight compatibility components.")
+        "Lumen feature profile: full includes bundled platform integrations; legacy keeps only GameStream compatibility components.")
 set_property(CACHE LUMEN_BUILD_PROFILE PROPERTY STRINGS full legacy)
 if(NOT LUMEN_BUILD_PROFILE STREQUAL "full" AND
    NOT LUMEN_BUILD_PROFILE STREQUAL "legacy")
@@ -27,7 +27,7 @@ if(NOT LUMEN_BUILD_PROFILE STREQUAL "full" AND
 endif()
 
 if(WIN32)
-    option(SUNSHINE_USE_STATIC_QT
+    option(LUMEN_USE_STATIC_QT
             "Require static Qt libraries and their static third-party dependencies." ON)
 endif()
 
@@ -41,8 +41,8 @@ option(LUMEN_ENABLE_LSP_RUNTIME
         ${_lumen_lsp_runtime_default})
 unset(_lumen_lsp_runtime_default)
 
-option(SUNSHINE_SYSTEM_VULKAN_HEADERS "Use system installation of vulkan-headers rather than the submodule." OFF)
-option(SUNSHINE_SYSTEM_WAYLAND_PROTOCOLS "Use system installation of wayland-protocols rather than the submodule." OFF)
+option(LUMEN_SYSTEM_VULKAN_HEADERS "Use system installation of vulkan-headers rather than the submodule." OFF)
+option(LUMEN_SYSTEM_WAYLAND_PROTOCOLS "Use system installation of wayland-protocols rather than the submodule." OFF)
 
 if(APPLE)
     option(BOOST_USE_STATIC "Use static boost libraries." OFF)
@@ -56,40 +56,40 @@ option(CUDA_INHERIT_COMPILE_OPTIONS
         your IDE throws errors about unknown flags after running cmake." ON)
 
 if(UNIX)
-    option(SUNSHINE_BUILD_HOMEBREW
+    option(LUMEN_BUILD_HOMEBREW
             "Enable a Homebrew build." OFF)
-    option(SUNSHINE_CONFIGURE_HOMEBREW
-            "Configure Homebrew formula. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
+    option(LUMEN_CONFIGURE_HOMEBREW
+            "Configure Homebrew formula. Recommended to use with LUMEN_CONFIGURE_ONLY" OFF)
 endif()
 
 if(APPLE)
-    option(SUNSHINE_CONFIGURE_PORTFILE
-            "Configure macOS Portfile. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
+    option(LUMEN_CONFIGURE_PORTFILE
+            "Configure macOS Portfile. Recommended to use with LUMEN_CONFIGURE_ONLY" OFF)
 elseif(UNIX)  # Linux
-    option(SUNSHINE_BUILD_APPIMAGE
+    option(LUMEN_BUILD_APPIMAGE
             "Enable an AppImage build." OFF)
-    option(SUNSHINE_BUILD_FLATPAK
+    option(LUMEN_BUILD_FLATPAK
             "Enable a Flatpak build." OFF)
-    option(SUNSHINE_CONFIGURE_PKGBUILD
-            "Configure files required for AUR. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
-    option(SUNSHINE_CONFIGURE_FLATPAK_MAN
-            "Configure manifest file required for Flatpak build. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
+    option(LUMEN_CONFIGURE_PKGBUILD
+            "Configure files required for AUR. Recommended to use with LUMEN_CONFIGURE_ONLY" OFF)
+    option(LUMEN_CONFIGURE_FLATPAK_MAN
+            "Configure manifest file required for Flatpak build. Recommended to use with LUMEN_CONFIGURE_ONLY" OFF)
 
     # Linux capture methods
-    option(SUNSHINE_ENABLE_CUDA
+    option(LUMEN_ENABLE_CUDA
             "Enable cuda specific code." ON)
-    option(SUNSHINE_ENABLE_DRM
+    option(LUMEN_ENABLE_DRM
             "Enable KMS grab if available." ON)
-    option(SUNSHINE_ENABLE_VAAPI
+    option(LUMEN_ENABLE_VAAPI
             "Enable building vaapi specific code." ON)
-    option(SUNSHINE_ENABLE_VULKAN
+    option(LUMEN_ENABLE_VULKAN
             "Enable Vulkan video encoding." ON)
-    option(SUNSHINE_ENABLE_WAYLAND
+    option(LUMEN_ENABLE_WAYLAND
             "Enable building wayland specific code." ON)
-    option(SUNSHINE_ENABLE_X11
+    option(LUMEN_ENABLE_X11
             "Enable X11 grab if available." ON)
-    option(SUNSHINE_ENABLE_KWIN
+    option(LUMEN_ENABLE_KWIN
             "Enable KWin ScreenCast grab if available" ON)
-    option(SUNSHINE_ENABLE_PORTAL
+    option(LUMEN_ENABLE_PORTAL
             "Enable XDG portal grab if available" ON)
 endif()

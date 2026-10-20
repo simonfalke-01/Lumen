@@ -22,7 +22,7 @@ namespace platf {
     }
 
     /**
-     * @brief Deliver a captured audio sample to Sunshine's audio pipeline.
+     * @brief Deliver a captured audio sample to Lumen's audio pipeline.
      *
      * @param sample_in Sample in.
      * @return Capture status reported to the streaming pipeline.
@@ -140,7 +140,7 @@ namespace platf {
     }
 
     /**
-     * @brief Query host and virtual sink names available to Sunshine.
+     * @brief Query host and virtual sink names available to Lumen.
      *
      * @return Host and virtual sink names when the backend can report them.
      */

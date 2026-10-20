@@ -25,7 +25,7 @@ namespace lumen::lsp::transport {
     std::uint64_t maximum_pacing_bits_per_second = 1'000'000'000;  ///< Adaptive safety ceiling.
     std::uint64_t competition_capacity_bits_per_second = 0;  ///< Explicit competition ceiling; zero disables the profile.
     std::uint64_t reserved_overhead_bits_per_second = 0;  ///< Audio, input, control, and current repair overhead.
-    std::uint32_t maximum_rtt_microseconds = 100'000;  ///< Profile RTT violation threshold.
+    std::uint32_t rtt_inflation_budget_microseconds = 50'000;  ///< RTT rise above the path's floor that counts as queueing.
     std::uint32_t queue_delay_budget_microseconds = 10'000;  ///< Negotiated positive one-way queue-delay budget.
   };
 
@@ -48,6 +48,7 @@ namespace lumen::lsp::transport {
     std::uint32_t smoothed_rtt_microseconds = 0;  ///< Current smoothed RTT.
     std::uint32_t rtt_variation_microseconds = 0;  ///< Current RTT variation.
     std::int32_t queue_delay_trend_microseconds = 0;  ///< Signed one-way delay trend without clock synchronization.
+    std::uint64_t report_microseconds = 0;  ///< Monotonic time the report was received.
   };
 
   /** @brief Observable aggregate congestion-controller state. */
@@ -90,9 +91,18 @@ namespace lumen::lsp::transport {
     /**
      * @brief Apply one disjoint congestion-feedback interval.
      *
-     * Any loss, ECN-CE, positive delay trend, or RTT-budget violation reduces both the pacing and
-     * derived encoder targets in this interval. Clean intervals increase at a bounded rate and can
-     * never exceed the adaptive maximum or explicit competition ceiling.
+     * Reports arrive every few milliseconds, so single reports are not treated as verdicts:
+     *
+     * - Loss is judged over a window of at least 100 ms or one RTT. Light loss, the kind FEC
+     *   and retransmission repair on Wi-Fi and cellular links, does not reduce the rate; moderate
+     *   loss holds it; heavy loss reduces it in proportion.
+     * - RTT counts against the rate only when it rises above the path's own recent floor by more
+     *   than the inflation budget. A long path is not a congested path.
+     * - ECN-CE, sustained one-way queue growth, and RTT inflation each reduce the rate.
+     * - The rate drops at most once per RTT (and at least 100 ms apart), so one congestion event
+     *   reported across many feedback packets reduces it once.
+     * - Clean time increases the rate in proportion to elapsed time, faster while below the rate
+     *   the session started at, and never above the adaptive maximum or competition ceiling.
      *
      * @param feedback Aggregate interval observation.
      */
@@ -100,6 +110,7 @@ namespace lumen::lsp::transport {
       if (error_ != controller_error::none) {
         return;
       }
+      const auto now = feedback.report_microseconds;
       delivered_bytes_ = saturating_add(delivered_bytes_, feedback.delivered_bytes);
       lost_bytes_ = saturating_add(lost_bytes_, feedback.lost_bytes);
       ecn_ce_bytes_ = saturating_add(ecn_ce_bytes_, feedback.ecn_ce_bytes);
@@ -108,8 +119,7 @@ namespace lumen::lsp::transport {
       rtt_variation_microseconds_ = feedback.rtt_variation_microseconds;
       queue_delay_trend_microseconds_ = feedback.queue_delay_trend_microseconds;
 
-      const auto loss = feedback.lost_bytes != 0;
-      const auto ecn = feedback.ecn_ce_bytes != 0;
+      // Sustained one-way queue growth, filtered against arrival-time quantization noise.
       filtered_queue_delay_trend_microseconds_ = static_cast<std::int32_t>(
         (static_cast<std::int64_t>(filtered_queue_delay_trend_microseconds_) * 7 +
          feedback.queue_delay_trend_microseconds) /
@@ -135,14 +145,72 @@ namespace lumen::lsp::transport {
       }
       const auto positive_delay = positive_queue_intervals_ >= 3U &&
                                   accumulated_queue_growth_microseconds_ > config_.queue_delay_budget_microseconds;
-      const auto rtt_violation = feedback.smoothed_rtt_microseconds > config_.maximum_rtt_microseconds;
-      if (loss || ecn || positive_delay || rtt_violation) {
-        const auto reduction_percent = (loss || ecn || rtt_violation) ? 80U : 90U;
-        const auto reduced = multiply_percent(pacing_bits_per_second_, reduction_percent);
+
+      // RTT inflation over the lowest RTT seen in the last two floor windows.
+      const auto rtt = feedback.smoothed_rtt_microseconds;
+      if (rtt != 0) {
+        if (now - rtt_floor_window_start_microseconds_ >= rtt_floor_window_microseconds || current_rtt_floor_microseconds_ == 0) {
+          previous_rtt_floor_microseconds_ = current_rtt_floor_microseconds_;
+          current_rtt_floor_microseconds_ = rtt;
+          rtt_floor_window_start_microseconds_ = now;
+        } else {
+          current_rtt_floor_microseconds_ = std::min(current_rtt_floor_microseconds_, rtt);
+        }
+      }
+      const auto rtt_floor = previous_rtt_floor_microseconds_ == 0 ?
+                               current_rtt_floor_microseconds_ :
+                               std::min(previous_rtt_floor_microseconds_, current_rtt_floor_microseconds_);
+      // Jittery links (cellular, busy Wi-Fi) widen the allowance so variance alone never reads as queueing.
+      const auto inflation_allowance = std::max<std::uint64_t>(
+        config_.rtt_inflation_budget_microseconds,
+        static_cast<std::uint64_t>(feedback.rtt_variation_microseconds) * 4U
+      );
+      const auto rtt_inflated = rtt != 0 && rtt_floor != 0 && rtt > rtt_floor && rtt - rtt_floor > inflation_allowance;
+
+      // Loss over a window no shorter than one RTT.
+      window_delivered_bytes_ = saturating_add(window_delivered_bytes_, feedback.delivered_bytes);
+      window_lost_bytes_ = saturating_add(window_lost_bytes_, feedback.lost_bytes);
+      const auto loss_window = std::max<std::uint64_t>(minimum_loss_window_microseconds, rtt);
+      bool heavy_loss = false;
+      const auto window_total = saturating_add(window_delivered_bytes_, window_lost_bytes_);
+      if (!loss_window_open_) {
+        loss_window_open_ = true;
+        loss_window_start_microseconds_ = now;
+      } else if (now - loss_window_start_microseconds_ >= loss_window &&
+                 (window_total >= minimum_loss_sample_bytes || now - loss_window_start_microseconds_ >= loss_window * 4U)) {
+        window_loss_permille_ = window_total == 0 ? 0 : static_cast<std::uint32_t>((window_lost_bytes_ * 1'000U) / window_total);
+        // Moderate loss that persists for several windows is a full queue, not noise.
+        moderate_loss_windows_ = window_loss_permille_ > light_loss_permille ?
+                                   static_cast<std::uint8_t>(std::min<unsigned int>(255U, moderate_loss_windows_ + 1U)) :
+                                   std::uint8_t {0};
+        heavy_loss = window_loss_permille_ > heavy_loss_permille ||
+                     moderate_loss_windows_ >= sustained_moderate_loss_windows;
+        if (heavy_loss) {
+          moderate_loss_windows_ = 0;
+        }
+        window_delivered_bytes_ = 0;
+        window_lost_bytes_ = 0;
+        loss_window_start_microseconds_ = now;
+      }
+
+      const auto ecn = feedback.ecn_ce_bytes != 0;
+      if (heavy_loss || ecn || positive_delay || rtt_inflated) {
+        const auto cooldown = std::max<std::uint64_t>(minimum_decrease_spacing_microseconds, rtt);
+        if (has_decreased_ && now - last_decrease_microseconds_ < cooldown) {
+          last_increase_microseconds_ = now;
+          return;
+        }
+        // A loss-driven cut removes the lost share (at least 5%); delay and ECN use a fixed cut.
+        const auto keep_percent = heavy_loss ?
+                                    std::clamp<std::uint64_t>(100U - window_loss_permille_ / 10U, 50U, 95U) :
+                                    85U;
         const auto prior = pacing_bits_per_second_;
-        pacing_bits_per_second_ = std::max(config_.minimum_pacing_bits_per_second, reduced);
+        pacing_bits_per_second_ = std::max(config_.minimum_pacing_bits_per_second, multiply_percent(prior, keep_percent));
         minimum_unsustainable_ = prior == config_.minimum_pacing_bits_per_second &&
                                  pacing_bits_per_second_ == config_.minimum_pacing_bits_per_second;
+        has_decreased_ = true;
+        last_decrease_microseconds_ = now;
+        last_increase_microseconds_ = now;
         if (positive_delay) {
           accumulated_queue_growth_microseconds_ /= 2U;
           positive_queue_intervals_ = 0;
@@ -150,15 +218,23 @@ namespace lumen::lsp::transport {
         return;
       }
 
-      if (filtered_queue_delay_trend_microseconds_ > 0) {
-        minimum_unsustainable_ = false;
+      minimum_unsustainable_ = false;
+      const auto elapsed = last_increase_microseconds_ == 0 ?
+                             0 :
+                             std::min<std::uint64_t>(maximum_increase_step_microseconds, now - last_increase_microseconds_);
+      last_increase_microseconds_ = now;
+      // Hold while loss is moderate or the queue is still growing.
+      if (window_loss_permille_ > light_loss_permille || filtered_queue_delay_trend_microseconds_ > 0 || elapsed == 0) {
         return;
       }
-
-      minimum_unsustainable_ = false;
-      const auto ceiling = profile_ceiling();
-      const auto increase = std::max<std::uint64_t>(64'000, pacing_bits_per_second_ / 100U);
-      pacing_bits_per_second_ = saturating_bounded_add(pacing_bits_per_second_, increase, ceiling);
+      const auto per_second_percent = pacing_bits_per_second_ < config_.initial_pacing_bits_per_second ?
+                                        recovery_percent_per_second :
+                                        probe_percent_per_second;
+      const auto increase = std::max<std::uint64_t>(
+        (pacing_bits_per_second_ / 100U) * per_second_percent / 1'000U * elapsed / 1'000U,
+        minimum_increase_bits_per_second * elapsed / 1'000'000U
+      );
+      pacing_bits_per_second_ = saturating_bounded_add(pacing_bits_per_second_, increase, profile_ceiling());
     }
 
     /**
@@ -214,7 +290,7 @@ namespace lumen::lsp::transport {
           config.reserved_overhead_bits_per_second >= config.maximum_pacing_bits_per_second) {
         return controller_error::invalid_overhead;
       }
-      if (config.maximum_rtt_microseconds == 0 || config.queue_delay_budget_microseconds == 0) {
+      if (config.rtt_inflation_budget_microseconds == 0 || config.queue_delay_budget_microseconds == 0) {
         return controller_error::invalid_latency_budget;
       }
       if (config.profile == controller_profile::competition_lan) {
@@ -290,6 +366,18 @@ namespace lumen::lsp::transport {
                config_.maximum_pacing_bits_per_second;
     }
 
+    static constexpr std::uint64_t minimum_loss_window_microseconds = 100'000;  ///< Shortest loss-judgement window.
+    static constexpr std::uint64_t minimum_decrease_spacing_microseconds = 100'000;  ///< Shortest gap between cuts.
+    static constexpr std::uint64_t rtt_floor_window_microseconds = 10'000'000;  ///< Length of one RTT-floor window.
+    static constexpr std::uint64_t maximum_increase_step_microseconds = 100'000;  ///< Longest gap credited as clean time.
+    static constexpr std::uint64_t minimum_loss_sample_bytes = 30'000;  ///< About 25 full packets per judgement.
+    static constexpr std::uint32_t light_loss_permille = 20;  ///< Up to 2% loss is repaired, not congestion.
+    static constexpr std::uint32_t heavy_loss_permille = 100;  ///< Above 10% loss reduces the rate at once.
+    static constexpr std::uint8_t sustained_moderate_loss_windows = 3;  ///< Windows of 2–10% loss before a cut.
+    static constexpr std::uint64_t recovery_percent_per_second = 25;  ///< Growth while below the starting rate.
+    static constexpr std::uint64_t probe_percent_per_second = 8;  ///< Growth above the starting rate.
+    static constexpr std::uint64_t minimum_increase_bits_per_second = 500'000;  ///< Growth floor at low rates.
+
     controller_config config_ {};  ///< Validated mutable controller configuration.
     controller_error error_ = controller_error::none;  ///< Static configuration status.
     std::uint64_t pacing_bits_per_second_ = 0;  ///< Current aggregate pacing target.
@@ -304,6 +392,18 @@ namespace lumen::lsp::transport {
     std::uint64_t accumulated_queue_growth_microseconds_ = 0;  ///< Sustained positive queue growth against budget.
     std::uint8_t positive_queue_intervals_ = 0;  ///< Consecutive filtered positive-trend intervals.
     bool minimum_unsustainable_ = false;  ///< Whether impairment persisted at minimum rate.
+    std::uint64_t window_delivered_bytes_ = 0;  ///< Delivered bytes in the open loss window.
+    std::uint64_t window_lost_bytes_ = 0;  ///< Lost bytes in the open loss window.
+    std::uint64_t loss_window_start_microseconds_ = 0;  ///< Start of the open loss window.
+    std::uint32_t window_loss_permille_ = 0;  ///< Loss fraction of the last closed window.
+    std::uint32_t current_rtt_floor_microseconds_ = 0;  ///< Lowest RTT in the open floor window.
+    std::uint32_t previous_rtt_floor_microseconds_ = 0;  ///< Lowest RTT in the previous floor window.
+    std::uint64_t rtt_floor_window_start_microseconds_ = 0;  ///< Start of the open floor window.
+    std::uint64_t last_decrease_microseconds_ = 0;  ///< Time of the last rate cut.
+    std::uint64_t last_increase_microseconds_ = 0;  ///< Time clean growth was last credited.
+    bool has_decreased_ = false;  ///< Whether any cut has happened.
+    bool loss_window_open_ = false;  ///< Whether the first loss window has started.
+    std::uint8_t moderate_loss_windows_ = 0;  ///< Consecutive windows with more than light loss.
   };
 
   /** @brief IP family used to clamp standard-Ethernet UDP payload ceilings. */

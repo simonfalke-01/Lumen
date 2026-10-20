@@ -114,7 +114,7 @@ namespace rtsp_stream {
     uint32_t control_connect_data;  ///< Client-provided token used when connecting the control channel.
 
     bool host_audio;  ///< Whether host audio should be played locally.
-    std::string unique_id;  ///< Moonlight client unique identifier for this launch request.
+    std::string unique_id;  ///< GameStream client unique identifier for this launch request.
     int width;  ///< Frame or display width in pixels.
     int height;  ///< Frame or display height in pixels.
     int fps;  ///< Requested video frame rate.
@@ -135,7 +135,7 @@ namespace rtsp_stream {
     std::optional<crypto::cipher::gcm_t> rtsp_cipher;  ///< AES-GCM cipher used once encrypted RTSP is negotiated.
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
-    std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+    std::string client_cert;  ///< PEM certificate for the paired GameStream client.
     std::string source_address;  ///< Normalized HTTPS peer address authorized to complete this RTSP launch.
     std::uint64_t process_generation {};  ///< Process generation captured before RTSP publication.
     std::uint64_t pending_launch_generation {};  ///< Monotonic pending-slot generation used by timeout removal.
@@ -196,7 +196,7 @@ namespace rtsp_stream {
    */
   bool has_session_or_pending_launch();
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   /** @brief Lifecycle mutation applied after one production-listener test transaction. */
   enum class listener_lifecycle_action_e {
     none,  ///< Preserve the current listener lifecycle.

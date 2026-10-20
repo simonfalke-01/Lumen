@@ -36,7 +36,7 @@ namespace nvhttp {
   /**
    * @brief The protocol version.
    * @details The version of the GameStream protocol we are mocking.
-   * @note The negative 4th number indicates to Moonlight that this is Sunshine.
+   * @note The negative 4th number indicates to the client that this is Lumen.
    */
   constexpr auto VERSION = "7.1.431.-1";
 
@@ -91,17 +91,17 @@ namespace nvhttp {
   bool is_trusted_pairing_source(const boost::asio::ip::address &address);
 
   /**
-   * @brief Simple-Web-Server HTTPS backend configured for Sunshine certificate handling.
+   * @brief Simple-Web-Server HTTPS backend configured for Lumen certificate handling.
    */
-  class SunshineHTTPS: public SimpleWeb::HTTPS {
+  class LumenHTTPS: public SimpleWeb::HTTPS {
   public:
     /**
-     * @brief Construct an HTTPS connection using Sunshine's TLS context.
+     * @brief Construct an HTTPS connection using Lumen's TLS context.
      *
      * @param io_context Boost.Asio context used for network operations.
-     * @param ctx TLS context configured with Sunshine's certificate and key.
+     * @param ctx TLS context configured with Lumen's certificate and key.
      */
-    SunshineHTTPS(boost::asio::io_context &io_context, boost::asio::ssl::context &ctx):
+    LumenHTTPS(boost::asio::io_context &io_context, boost::asio::ssl::context &ctx):
         SimpleWeb::HTTPS(io_context, ctx) {
     }
 
@@ -113,7 +113,7 @@ namespace nvhttp {
       return verified_client_certificate_;
     }
 
-    virtual ~SunshineHTTPS() {
+    virtual ~LumenHTTPS() {
       // Gracefully shutdown the TLS connection
       SimpleWeb::error_code ec;
       shutdown(ec);
@@ -127,15 +127,15 @@ namespace nvhttp {
    * @brief Enumerates supported pAIR PHASE options.
    */
   enum class PAIR_PHASE {
-    NONE,  ///< Sunshine is not in a pairing phase
-    GETSERVERCERT,  ///< Sunshine is in the get server certificate phase
-    CLIENTCHALLENGE,  ///< Sunshine is in the client challenge phase
-    SERVERCHALLENGERESP,  ///< Sunshine is in the server challenge response phase
-    CLIENTPAIRINGSECRET  ///< Sunshine is in the client pairing secret phase
+    NONE,  ///< Lumen is not in a pairing phase
+    GETSERVERCERT,  ///< Lumen is in the get server certificate phase
+    CLIENTCHALLENGE,  ///< Lumen is in the client challenge phase
+    SERVERCHALLENGERESP,  ///< Lumen is in the server challenge response phase
+    CLIENTPAIRINGSECRET  ///< Lumen is in the client pairing secret phase
   };
 
   /**
-   * @brief Pairing handshake state exchanged with a Moonlight client.
+   * @brief Pairing handshake state exchanged with a GameStream client.
    */
   struct pair_session_t {
     struct {
@@ -153,7 +153,7 @@ namespace nvhttp {
     struct {
       util::Either<
         std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response>,
-        std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response>>
+        std::shared_ptr<typename SimpleWeb::ServerBase<LumenHTTPS>::Response>>
         response;
       std::string salt = {};
     } async_insert_pin;  ///< Async insert pin.
@@ -305,7 +305,7 @@ namespace nvhttp {
   /**
    * @brief Pair, phase 1
    *
-   * Moonlight will send a salt and client certificate, we'll also need the user provided pin.
+   * GameStream will send a salt and client certificate, we'll also need the user provided pin.
    *
    * PIN and SALT will be used to derive a shared AES key that needs to be stored
    * in order to be used to decrypt_symmetric in the next phases.
@@ -337,7 +337,7 @@ namespace nvhttp {
   /**
    * @brief Pair, phase 3
    *
-   * Moonlight will send back a `serverchallengeresp`: an AES encrypted client hash,
+   * GameStream will send back a `serverchallengeresp`: an AES encrypted client hash,
    * we have to send back the `pairingsecret`:
    * using our private key we have to sign the certificate_signature + server_secret (generated in phase 2)
    * @param sess Pairing session that owns the request state.
@@ -358,7 +358,7 @@ namespace nvhttp {
    * We'll check that SHA256(server_challenge + client_public_cert_signature + client_secret) == client_hash
    *
    * Then using the client certificate public key we should be able to verify that
-   * the client secret has been signed by Moonlight
+   * the client secret has been signed by the client
    * @param sess Pairing session that owns the request state.
    * @param add_cert Add cert.
    * @param tree XML property tree used for the response body.
@@ -367,7 +367,7 @@ namespace nvhttp {
   void clientpairingsecret(pair_session_t &sess, std::shared_ptr<safe::queue_t<crypto::x509_t>> &add_cert, boost::property_tree::ptree &tree, const std::string &client_pairing_secret);
 
   /**
-   * @brief Compare the user supplied pin to the Moonlight pin.
+   * @brief Compare the user supplied pin to the GameStream pin.
    * @param pin The user supplied pin.
    * @param name The user supplied name.
    * @return `true` if the pin is correct, `false` otherwise.
@@ -413,7 +413,7 @@ namespace nvhttp {
    */
   std::size_t cancel_sessions_and_process_for_client(std::string_view client_certificate);
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   pairing_session_manager_t &pairing_sessions_for_tests();
 
   std::string legacy_pair_challenge_xml_for_tests();
@@ -441,7 +441,7 @@ namespace nvhttp {
   );
   bool paired_client_enabled_for_tests(std::string_view certificate);
   std::string legacy_pairing_source_xml_for_tests(const boost::asio::ip::address &address);
-  std::string verified_transport_certificate_for_tests(const SunshineHTTPS &transport);
+  std::string verified_transport_certificate_for_tests(const LumenHTTPS &transport);
 #endif
 
   /**
@@ -475,6 +475,13 @@ namespace nvhttp {
    * @return Immutable certificate, or no value when missing or persistence fails.
    */
   std::optional<std::string> set_client_enabled_with_certificate(std::string_view uuid, bool enabled);
+  /**
+   * @brief Atomically persist a new display name for one paired client.
+   * @param uuid Paired-client UUID to update.
+   * @param name New nonempty display name.
+   * @return True when the client was found and the change was saved.
+   */
+  bool rename_client(std::string_view uuid, std::string name);
   /**
    * @brief Get cert by UUID.
    *

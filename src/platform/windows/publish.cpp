@@ -246,7 +246,7 @@ namespace platf::publish {
   }
 
   /**
-   * @brief Windows DNS-SD registration lifetime for the advertised Sunshine service.
+   * @brief Windows DNS-SD registration lifetime for the advertised Lumen service.
    */
   class mdns_registration_t: public ::platf::deinit_t {
   public:

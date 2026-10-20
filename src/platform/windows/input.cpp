@@ -17,8 +17,10 @@
 #include <Windows.h>
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -37,6 +39,7 @@
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/utility.h"
 #include "virtual_hid_gamepad.h"
 #include "virtual_hid_input.h"
 
@@ -730,6 +733,82 @@ namespace platf {
     }
   }
 
+  namespace {
+    /** Feedback state of the relative pointer positioning; used only from the input thread. */
+    struct pointer_feedback_t {
+      bool pending {};  ///< A report was sent and its effect has not been observed yet.
+      POINT before {};  ///< Pointer position when the pending report was sent.
+      int sent_x {};  ///< Horizontal counts in the pending report.
+      int sent_y {};  ///< Vertical counts in the pending report.
+      std::chrono::steady_clock::time_point sent_at {};  ///< When the pending report was sent.
+      double gain_x {1.0};  ///< Observed pixels per horizontal count.
+      double gain_y {1.0};  ///< Observed pixels per vertical count.
+    } pointer_feedback;
+
+    double update_gain(const double gain, const int sent, const LONG moved) {
+      if (sent == 0 || moved == 0 || (sent > 0) != (moved > 0)) {
+        return gain;
+      }
+      const auto observed = std::clamp(static_cast<double>(moved) / static_cast<double>(sent), 0.25, 4.0);
+      return gain * 0.5 + observed * 0.5;
+    }
+
+    int counts_for(const LONG distance, const double gain) {
+      if (distance == 0) {
+        return 0;
+      }
+      const auto counts = static_cast<int>(std::lround(static_cast<double>(distance) / gain));
+      return counts != 0 ? counts : (distance > 0 ? 1 : -1);
+    }
+  }  // namespace
+
+  bool move_pointer_toward(input_t &input, float x, float y) noexcept {
+    const auto previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const auto restore_awareness = util::fail_guard([previous]() {
+      if (previous != nullptr) {
+        SetThreadDpiAwarenessContext(previous);
+      }
+    });
+    MONITORINFO info {};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(MonitorFromPoint(POINT {0, 0}, MONITOR_DEFAULTTOPRIMARY), &info) == FALSE) {
+      return false;
+    }
+    const auto &rect = info.rcMonitor;
+    const POINT target {
+      rect.left + static_cast<LONG>(std::lround(std::clamp(x, 0.0f, 1.0f) * static_cast<float>(rect.right - rect.left - 1))),
+      rect.top + static_cast<LONG>(std::lround(std::clamp(y, 0.0f, 1.0f) * static_cast<float>(rect.bottom - rect.top - 1))),
+    };
+    POINT position {};
+    if (GetPhysicalCursorPos(&position) == FALSE) {
+      // The calling thread must be attached to the input desktop.
+      syncThreadDesktop();
+      if (GetPhysicalCursorPos(&position) == FALSE) {
+        return false;
+      }
+    }
+    auto &feedback = pointer_feedback;
+    const auto now = std::chrono::steady_clock::now();
+    if (feedback.pending) {
+      const bool applied = position.x != feedback.before.x || position.y != feedback.before.y;
+      if (!applied && now - feedback.sent_at < std::chrono::milliseconds {10}) {
+        // The input thread has not applied the previous report yet; measuring now would send it twice.
+        return true;
+      }
+      feedback.gain_x = update_gain(feedback.gain_x, feedback.sent_x, position.x - feedback.before.x);
+      feedback.gain_y = update_gain(feedback.gain_y, feedback.sent_y, position.y - feedback.before.y);
+      feedback.pending = false;
+    }
+    const auto counts_x = counts_for(target.x - position.x, feedback.gain_x);
+    const auto counts_y = counts_for(target.y - position.y, feedback.gain_y);
+    if (counts_x == 0 && counts_y == 0) {
+      return true;
+    }
+    move_mouse(input, counts_x, counts_y);
+    feedback = {true, position, counts_x, counts_y, now, feedback.gain_x, feedback.gain_y};
+    return true;
+  }
+
   void move_mouse(input_t &input, int deltaX, int deltaY) {
     auto *raw = (input_raw_t *) input.get();
     const auto result = raw->keyboard_mouse->move_mouse(deltaX, deltaY);
@@ -1394,7 +1473,7 @@ namespace platf {
   }
 
   /**
-   * @brief Update an X360 report from Sunshine gamepad state.
+   * @brief Update an X360 report from Lumen gamepad state.
    * @param gamepad The gamepad to update.
    * @param gamepad_state The gamepad button/axis state sent from the client.
    */
@@ -1446,7 +1525,7 @@ namespace platf {
   }
 
   /**
-   * @brief Submit updated Sunshine gamepad state to the virtual device.
+   * @brief Submit updated Lumen gamepad state to the virtual device.
    * @param vigem Global ViGEm context.
    * @param nr The gamepad index to update.
    * @param gamepad_state The gamepad button/axis state sent from the client.

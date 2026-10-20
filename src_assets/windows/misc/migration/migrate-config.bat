@@ -1,65 +1,9 @@
 @echo off
 
-rem Get Lumen root directory. sunshine.conf is accepted only as a legacy
-rem compatibility input and is moved to the authoritative lumen.conf name.
-for %%I in ("%~dp0\..") do set "OLD_DIR=%%~fI"
-
-rem Create the config directory if it didn't already exist
-set "NEW_DIR=%OLD_DIR%\config"
-if not exist "%NEW_DIR%\" mkdir "%NEW_DIR%"
-
-rem Migrate all files that aren't already present in the config dir
-if exist "%OLD_DIR%\apps.json" (
-    if not exist "%NEW_DIR%\apps.json" (
-        move "%OLD_DIR%\apps.json" "%NEW_DIR%\apps.json"
-    )
-)
-if exist "%OLD_DIR%\lumen.conf" (
-    if not exist "%NEW_DIR%\lumen.conf" (
-        move "%OLD_DIR%\lumen.conf" "%NEW_DIR%\lumen.conf"
-    )
-)
-if exist "%OLD_DIR%\sunshine.conf" (
-    if not exist "%NEW_DIR%\lumen.conf" (
-        move "%OLD_DIR%\sunshine.conf" "%NEW_DIR%\lumen.conf"
-    )
-)
-if exist "%NEW_DIR%\sunshine.conf" (
-    if not exist "%NEW_DIR%\lumen.conf" (
-        move "%NEW_DIR%\sunshine.conf" "%NEW_DIR%\lumen.conf"
-    )
-)
-rem sunshine_state.json remains a compatibility filename so existing pairing
-rem identity is preserved during migration.
-if exist "%OLD_DIR%\sunshine_state.json" (
-    if not exist "%NEW_DIR%\sunshine_state.json" (
-        move "%OLD_DIR%\sunshine_state.json" "%NEW_DIR%\sunshine_state.json"
-    )
-)
-
-rem Migrate the credentials directory
-if exist "%OLD_DIR%\credentials\" (
-    if not exist "%NEW_DIR%\credentials\" (
-        move "%OLD_DIR%\credentials" "%NEW_DIR%\"
-    )
-)
-
-rem Create the credentials directory if it wasn't migrated or already existing
-if not exist "%NEW_DIR%\credentials\" mkdir "%NEW_DIR%\credentials"
+rem Create the configuration directories Lumen expects under its install root.
+for %%I in ("%~dp0\..") do set "ROOT_DIR=%%~fI"
+if not exist "%ROOT_DIR%\config\" mkdir "%ROOT_DIR%\config"
+if not exist "%ROOT_DIR%\config\credentials\" mkdir "%ROOT_DIR%\config\credentials"
 
 rem The shared setup script applies the final per-object SYSTEM and
-rem Administrators ACL after all configuration migration is complete.
-
-rem Migrate the covers directory
-if exist "%OLD_DIR%\covers\" (
-    if not exist "%NEW_DIR%\covers\" (
-        move "%OLD_DIR%\covers" "%NEW_DIR%\"
-
-        rem Fix apps.json image path values that point at the old covers directory
-        powershell -NoProfile -c "(Get-Content '%NEW_DIR%\apps.json').replace('.\/covers\/', '.\/config\/covers\/') | Set-Content '%NEW_DIR%\apps.json'"
-    )
-)
-
-rem Remove log files
-del "%OLD_DIR%\*.txt"
-del "%OLD_DIR%\*.log"
+rem Administrators ACL after this script runs.

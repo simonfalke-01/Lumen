@@ -485,7 +485,7 @@ namespace input {
     input.feedback_context.store(nullptr, std::memory_order_release);
   }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   bool detail::raise_lsp_platform_feedback_for_test(
     lsp_platform_input_t &input,
     const platf::gamepad_feedback_msg_t &message
@@ -617,6 +617,11 @@ namespace input {
     if (horizontal_scroll != 0) {
       platf::hscroll(platf_input, static_cast<int>(horizontal_scroll));
     }
+#ifdef _WIN32
+    if (platf::move_pointer_toward(platf_input, x / coordinate_maximum, y / coordinate_maximum)) {
+      return true;
+    }
+#endif
     platf::abs_mouse(platf_input, normalized_port, x, y);
     return true;
   }
@@ -656,12 +661,12 @@ namespace input {
   }
 
   /**
-   * @brief Map an LSP pointer button (HID button usage) to the platform's Moonlight button code.
+   * @brief Map an LSP pointer button (HID button usage) to the platform's GameStream button code.
    *
-   * LSP numbers buttons by HID usage: 1 primary, 2 secondary, 3 tertiary. Moonlight numbers
+   * LSP numbers buttons by HID usage: 1 primary, 2 secondary, 3 tertiary. GameStream numbers
    * them 1 left, 2 middle, 3 right, so the secondary and tertiary buttons swap.
    */
-  std::uint16_t moonlight_button_from_lsp(const std::uint16_t button) noexcept {
+  std::uint16_t gamestream_button_from_lsp(const std::uint16_t button) noexcept {
     switch (button) {
       case 2:
         return BUTTON_RIGHT;
@@ -676,7 +681,7 @@ namespace input {
     if (button == 0 || button >= input.pointer_buttons.size()) {
       return false;
     }
-    const auto platform_button = moonlight_button_from_lsp(button);
+    const auto platform_button = gamestream_button_from_lsp(button);
     std::lock_guard lock(platform_input_mutex);
     if (input.pointer_buttons[button] == !release) {
       return true;
@@ -705,7 +710,7 @@ namespace input {
       input.keyboard_usages[usage] = false;
     }
     for (std::size_t button = 1; button < input.pointer_buttons.size(); ++button) {
-      const auto platform_button = moonlight_button_from_lsp(static_cast<std::uint16_t>(button));
+      const auto platform_button = gamestream_button_from_lsp(static_cast<std::uint16_t>(button));
       if (input.pointer_buttons[button] && global_mouse_holds.release(platform_button)) {
         platf::button_mouse(platf_input, platform_button, true);
       }
@@ -1168,10 +1173,10 @@ namespace input {
     int id;  ///< Global gamepad slot assigned to this client controller.
 
     // When emulating the HOME button, we may need to artificially release the back button.
-    // Afterwards, the gamepad state on sunshine won't match the state on Moonlight.
-    // To prevent Sunshine from sending erroneous input data to the active application,
-    // Sunshine forces the button to be in a specific state until the gamepad state matches that of
-    // Moonlight once more.
+    // Afterwards, the gamepad state on lumen won't match the state on the client.
+    // To prevent Lumen from sending erroneous input data to the active application,
+    // Lumen forces the button to be in a specific state until the gamepad state matches that of
+    // GameStream once more.
     button_state_e back_button_state;  ///< Back button state.
   };
 
@@ -1241,7 +1246,7 @@ namespace input {
     std::unordered_map<key_press_id_t, bool> key_press;  ///< Pressed keyboard state local to this stream.
     std::array<std::uint8_t, BUTTON_X2 + 1> mouse_press {};  ///< Logical mouse-button state local to this stream.
     std::array<std::uint8_t, BUTTON_X2 + 1> mouse_platform_press {};  ///< Physical held contributions owned by this stream.
-    static_assert(std::tuple_size_v<std::array<std::uint8_t, BUTTON_X2 + 1>> > BUTTON_X2, "Mouse state must include every Moonlight button ID");
+    static_assert(std::tuple_size_v<std::array<std::uint8_t, BUTTON_X2 + 1>> > BUTTON_X2, "Mouse state must include every GameStream button ID");
     dispatcher_t::task_id_t key_press_repeat_id {};  ///< Ordered key-repeat timer.
     dispatcher_t::task_id_t mouse_left_button_timeout {};  ///< Ordered mouse left-button timeout.
     detail::delayed_left_state_t delayed_left_button;  ///< Portable delayed left-button decision state.
@@ -1276,7 +1281,7 @@ namespace input {
    * The caller must hold platform_input_mutex.
    *
    * @param input Session contributing the held state.
-   * @param button Moonlight mouse-button identifier.
+   * @param button GameStream mouse-button identifier.
    * @param release Whether to release the session's physical contribution.
    */
   void update_platform_mouse_locked(input_t &input, int button, bool release) {
@@ -1304,7 +1309,7 @@ namespace input {
    *
    * The caller must hold platform_input_mutex.
    *
-   * @param key_code Moonlight virtual key code.
+   * @param key_code GameStream virtual key code.
    * @param release Whether to release the session's held contribution.
    * @param flags Keyboard packet flags.
    */
@@ -1444,7 +1449,7 @@ namespace input {
    * @param packet Protocol packet being processed.
    */
   void print(PNV_MULTI_CONTROLLER_PACKET packet) {
-    // Moonlight spams controller packet even when not necessary
+    // GameStream spams controller packet even when not necessary
     BOOST_LOG(verbose)
       << "--begin controller packet--"sv << std::endl
       << "controllerNumber ["sv << packet->controllerNumber << ']' << std::endl
@@ -1745,7 +1750,7 @@ namespace input {
     // Prevent divide by zero
     // Don't expect it to happen, but just in case
     if (!packet->width || !packet->height) {
-      BOOST_LOG(warning) << "Moonlight passed invalid dimensions"sv;
+      BOOST_LOG(warning) << "GameStream passed invalid dimensions"sv;
 
       return;
     }
@@ -1815,12 +1820,12 @@ namespace input {
       input->mouse_press[button] = !release;
     }
     /**
-     * When Moonlight sends mouse input through absolute coordinates,
+     * When GameStream sends mouse input through absolute coordinates,
      * it's possible that BUTTON_RIGHT is pressed down immediately after releasing BUTTON_LEFT.
-     * As a result, Sunshine will left-click on hyperlinks in the browser before right-clicking
+     * As a result, Lumen will left-click on hyperlinks in the browser before right-clicking
      *
      * This can be solved by delaying BUTTON_LEFT, however, any delay on input is undesirable during gaming
-     * As a compromise, Sunshine will only put delays on BUTTON_LEFT when
+     * As a compromise, Lumen will only put delays on BUTTON_LEFT when
      * absolute mouse coordinates have been sent.
      *
      * Try to make sure BUTTON_RIGHT gets called before BUTTON_LEFT is released.
@@ -1882,7 +1887,7 @@ namespace input {
    * @brief Update flags for keyboard shortcut combo's
    *
    * @param flags Bit flags that modify the requested operation.
-   * @param keyCode Moonlight keyboard packet key code.
+   * @param keyCode GameStream keyboard packet key code.
    * @param release Whether the key or button event is a release.
    */
   inline void update_shortcutFlags(int *flags, short keyCode, bool release) {
@@ -1920,7 +1925,7 @@ namespace input {
   /**
    * @brief Check whether modifier.
    *
-   * @param keyCode Moonlight keyboard packet key code.
+   * @param keyCode GameStream keyboard packet key code.
    * @return True when the key code is a keyboard modifier.
    */
   bool is_modifier(uint16_t keyCode) {
@@ -1943,7 +1948,7 @@ namespace input {
   /**
    * @brief Send key and modifiers.
    *
-   * @param key_code Moonlight keyboard packet key code.
+   * @param key_code GameStream keyboard packet key code.
    * @param release Whether the key or button event is a release.
    * @param flags Bit flags that modify the requested operation.
    * @param synthetic_modifiers Synthetic modifiers.
@@ -1982,7 +1987,7 @@ namespace input {
   /**
    * @brief Emit one repeat pulse without changing held-state reference counts.
    *
-   * @param key_code Moonlight keyboard packet key code.
+   * @param key_code GameStream keyboard packet key code.
    * @param flags Bit flags that modify the requested operation.
    * @param synthetic_modifiers Synthetic modifiers required for the repeat pulse.
    */
@@ -2015,7 +2020,7 @@ namespace input {
    * @brief Re-emit a held key until its repeat task is cancelled.
    *
    * @param input Session whose dispatcher and held state own the repeat.
-   * @param key_code Moonlight keyboard packet key code.
+   * @param key_code GameStream keyboard packet key code.
    * @param flags Bit flags that modify the requested operation.
    * @param synthetic_modifiers Synthetic modifiers.
    */
@@ -2895,7 +2900,7 @@ namespace input {
     }
   }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   bool detail::batch_relative_mouse_for_test(std::int16_t &dest_x, std::int16_t &dest_y, std::int16_t src_x, std::int16_t src_y) {
     NV_REL_MOUSE_MOVE_PACKET dest {};
     NV_REL_MOUSE_MOVE_PACKET src {};
@@ -3113,7 +3118,7 @@ namespace input {
     }
   }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   bool detail::passthrough_packet_for_test(input_t *input, std::vector<std::uint8_t> packet) {
     return passthrough_next_message(input, std::move(packet));
   }

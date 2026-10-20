@@ -24,7 +24,7 @@ namespace {
     std::tuple("fatal", &fatal),
   };
 
-  constexpr auto log_file = "test_sunshine.log";
+  constexpr auto log_file = "test_lumen.log";
 
   /**
    * @brief Write test content to a log file.
@@ -83,7 +83,7 @@ protected:
     return path;
   }
 
-  const std::filesystem::path test_directory {std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "log_rotation_tests"};  ///< Directory containing log rotation test files.
+  const std::filesystem::path test_directory {std::filesystem::path {LUMEN_TEST_BIN_DIR} / "log_rotation_tests"};  ///< Directory containing log rotation test files.
   const std::filesystem::path log_path {test_directory / "custom.log"};  ///< Path to the current test log.
 };
 

@@ -93,17 +93,17 @@ namespace video {
   int select_h264_profile(std::string_view encoder_name, const config_t &config, int amd_coder);
 
   /**
-   * @brief Map an FFmpeg hardware device type to Sunshine's memory type.
+   * @brief Map an FFmpeg hardware device type to Lumen's memory type.
    *
    * @param type FFmpeg hardware device type reported by the encoder backend.
-   * @return Sunshine memory type used by the capture and encode pipeline.
+   * @return Lumen memory type used by the capture and encode pipeline.
    */
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
   /**
-   * @brief Map an FFmpeg pixel format to Sunshine's pixel format enum.
+   * @brief Map an FFmpeg pixel format to Lumen's pixel format enum.
    *
    * @param fmt FFmpeg pixel format to convert.
-   * @return Sunshine pixel format used by display and encoder backends.
+   * @return Lumen pixel format used by display and encoder backends.
    */
   platf::pix_fmt_e map_pix_fmt(AVPixelFormat fmt);
 
@@ -317,7 +317,7 @@ namespace video {
   };
 
   /**
-   * @brief Encoder name and feature flags advertised by Sunshine.
+   * @brief Encoder name and feature flags advertised by Lumen.
    */
   struct encoder_t {
     std::string_view name;  ///< Encoder name used in logs, configuration, and capability probes.
@@ -664,7 +664,7 @@ namespace video {
     }
 
     /**
-     * @brief Return the FFmpeg packet PTS used as Sunshine's frame index.
+     * @brief Return the FFmpeg packet PTS used as Lumen's frame index.
      *
      * @return Monotonic frame index assigned to this frame.
      */
@@ -698,7 +698,7 @@ namespace video {
    */
   struct packet_raw_generic: packet_raw_t {
     /**
-     * @brief Wrap generic encoded frame bytes in Sunshine packet metadata.
+     * @brief Wrap generic encoded frame bytes in Lumen packet metadata.
      *
      * @param frame_data Encoded frame bytes produced by a non-FFmpeg encoder.
      * @param frame_index Monotonic frame index assigned to the encoded frame.
@@ -861,6 +861,12 @@ namespace video {
    * @return Frozen adapter/output/driver identity only while the chosen probe cache is current.
    */
   [[nodiscard]] std::optional<encoder_probe_device_identity_t> active_encoder_probe_device_identity();
+
+  /**
+   * @brief Return the device identity of the last committed encoder probe, even if displays changed since.
+   * @return Adapter identity of the encoder chosen by the most recent probe, or empty before any probe.
+   */
+  [[nodiscard]] std::optional<encoder_probe_device_identity_t> last_encoder_probe_device_identity();
 
   /**
    * @brief Extract the decoder initialization bytes from one encoded key frame.

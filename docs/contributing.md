@@ -144,13 +144,13 @@ can be disabled by setting the `BUILD_TESTS` CMake option to `OFF`.
 To run the tests, execute the following command.
 
 ```bash
-./build/tests/test_sunshine
+./build/tests/test_lumen
 ```
 
 To see all available options, run the tests with the `--help` flag.
 
 ```bash
-./build/tests/test_sunshine --help
+./build/tests/test_lumen --help
 ```
 
 > [!TIP]

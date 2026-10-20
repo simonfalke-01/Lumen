@@ -22,7 +22,7 @@ struct ExternalCommandTestData {
   std::string platform;  // "windows", "linux", "macos", or "all"
   bool should_succeed;
   std::string description;
-  std::string working_directory;  // Optional: if empty, uses SUNSHINE_SOURCE_DIR
+  std::string working_directory;  // Optional: if empty, uses LUMEN_SOURCE_DIR
   bool xfail_condition = false;  // Optional: condition for expected failure
   std::string xfail_reason = "";  // Optional: reason for expected failure
 
@@ -58,14 +58,14 @@ protected:
   static std::pair<int, std::string> runCommand(const std::string &cmd, const std::string_view &working_dir) {
     const auto env = boost::this_process::environment();
 
-    // Determine the working directory: use the provided working_dir or fall back to SUNSHINE_SOURCE_DIR
+    // Determine the working directory: use the provided working_dir or fall back to LUMEN_SOURCE_DIR
     boost::filesystem::path effective_working_dir;
 
     if (!working_dir.empty()) {
       effective_working_dir = working_dir;
     } else {
-      // Use SUNSHINE_SOURCE_DIR CMake definition as the default working directory
-      effective_working_dir = SUNSHINE_SOURCE_DIR;
+      // Use LUMEN_SOURCE_DIR CMake definition as the default working directory
+      effective_working_dir = LUMEN_SOURCE_DIR;
     }
 
     std::error_code ec;
@@ -149,7 +149,7 @@ constexpr auto SIMPLE_COMMAND = IS_WINDOWS ? "where cmd" : "which sh";
 #ifdef UDEVADM_EXECUTABLE
   #define UDEV_TESTS \
     ExternalCommandTestData { \
-      std::format("{} verify {}/src_assets/linux/misc/60-lumen.rules", UDEVADM_EXECUTABLE, SUNSHINE_TEST_BIN_DIR), \
+      std::format("{} verify {}/src_assets/linux/misc/60-lumen.rules", UDEVADM_EXECUTABLE, LUMEN_TEST_BIN_DIR), \
       "linux", \
       true, \
       "Test udev rules file" \

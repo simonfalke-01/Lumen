@@ -20,7 +20,7 @@ namespace {
    */
   struct nvenc_version_test_case {
     std::uint32_t max_version;  ///< Maximum API version reported by the driver.
-    nvenc::nvenc_sdk_version expected;  ///< SDK implementation Sunshine should select.
+    nvenc::nvenc_sdk_version expected;  ///< SDK implementation Lumen should select.
   };
 
   TEST(NvencVersionTest, DecodesPackedDriverVersion) {

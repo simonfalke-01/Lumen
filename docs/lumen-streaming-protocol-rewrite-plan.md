@@ -26,7 +26,7 @@ Latest confirmed Windows state:
   scoped to the canonical executable, all profiles/remote addresses. Removed
   the two old test-instance UDP rules. A second consolidation run preserved
   the same PID and did not create services. Public-address LSP authentication
-  and both LSP/Moonlight app lists succeeded through the then-active VPN route;
+  and both LSP/GameStream app lists succeeded through the then-active VPN route;
   do not label this a VPN-independent WAN streaming qualification.
 - [x] Removed scheduled tasks `Lumen-LSP-live-20260912`,
   `Lumen-LSP-input-context-20260913`, and `Lumen Protocol V3 Host`.
@@ -93,7 +93,7 @@ Resume work, in order:
 4. Deploy final installer permission/idempotence scripts. Verify a controlled
    service restart still gives one process and both listeners, preserving pairings.
 5. Verify Steam microphone selection, real input, LSP streaming, and legacy
-   Moonlight without running competing streams.
+   GameStream without running competing streams.
 6. Complete requested artifact cleanup on Windows and locally: dated test
    deployments, generated `cmake-build-*`/build outputs, temporary bootstraps,
    and obsolete tasks. Preserve actual source repositories, live dependencies,
@@ -131,7 +131,7 @@ Working/rollback locations (not final runtime dependencies):
 Deliver fully working Lumen and Umbra builds for actual game streaming using
 LSP end to end. The user has cancelled the Svelte/SvelteKit administration
 rewrite: preserve the existing administration interface, and do not treat a
-frontend redesign as a remaining deliverable. Legacy Moonlight compatibility
+frontend redesign as a remaining deliverable. Legacy GameStream compatibility
 remains independent and must not be used to claim the native LSP path works.
 Finish real input, audio/microphone, video, pacing/repair and reconnect wiring;
 verify them together on the Windows host and macOS client, then package and
@@ -174,8 +174,8 @@ smallest decisive verification both pass. Source-only scaffolding remains
 
 ### September 14 resumed runtime repair
 
-The user resumed fixes after Moonlight disconnected normally at 00:12:56.
-GameStream subsequently reported `SUNSHINE_SERVER_FREE`, with no Moonlight or
+The user resumed fixes after GameStream disconnected normally at 00:12:56.
+GameStream subsequently reported `LUMEN_SERVER_FREE`, with no GameStream or
 Umbra client process running. Build/deployment work is resumed; recheck idle
 state before replacing either host. Preserve configurations, pairings, VDD-off
 policy, signing identity, and rollback executables. The earlier failed
@@ -185,7 +185,7 @@ rate-only deployment remains a failure, not a completed reconnect fix.
 - [x] Finish and deploy nonblocking host DTLS output plus worker-owned
   microphone activation/retirement, retaining exact forward/SRTP lifetimes.
 - [x] Deploy first/last-session Virtual HID ownership to **both** daemons.
-  Real Moonlight connected at 00:49:37, acquired Virtual HID, decoded HEVC
+  Real GameStream connected at 00:49:37, acquired Virtual HID, decoded HEVC
   through VideoToolbox/Metal, and shut down normally; the LSP daemon stayed
   idle/running throughout. LSP subsequently acquired the same driver.
 - [x] Build/install real audio underrun/rebuffer counters and bounded
@@ -225,7 +225,7 @@ Live corrections and evidence:
   `DA68E135079081EC585599389CE2BE7167D4826FF0D933A8B6D5A9E486ECEB6E`.
   Both retain adjacent hash-named rollback executables and original configs.
 - AWDL disable/restore worked during initial LSP-only testing. Switching from
-  Moonlight exposed the already-down fast-path skipping lease acquisition;
+  GameStream exposed the already-down fast-path skipping lease acquisition;
   a later external restoration could leave AWDL up during LSP. The client now
   always takes the approved helper lease, and the helper reasserts DOWN while
   leases exist. The same approved job was reloaded with `launchctl kickstart`
@@ -286,7 +286,7 @@ unknown; no reboot/driver-change remedy is claimed.
 
 ### Resumption checkpoint — 2026-09-11
 
-The user reports Moonlight/Sunshine is working normally and has resumed LSP
+The user reports GameStream/Lumen is working normally and has resumed LSP
 development after the pause. Preserve the working Windows installation. A
 read-only check finds `LumenService` running, `lsp_enabled = false`,
 `lumen_vdd_policy = disabled`, `system_tray = false`, and
@@ -341,7 +341,7 @@ The running host must not be overwritten based on the older deployment record.
   Umbra request sends successfully and times out against the stopped host;
   the earlier intermittent `EHOSTUNREACH` cause remains unproven.
 - [ ] Qualify streaming and lifecycle on Windows/macOS while preserving the
-  working Moonlight service; keep VDD disabled unless explicitly re-enabled.
+  working GameStream service; keep VDD disabled unless explicitly re-enabled.
 - [ ] Complete streaming-readiness fixes, qualification, packaging, and final gates.
 
 ### Current live debugging — 2026-09-12
@@ -442,7 +442,7 @@ signed commits after the user unlocks 1Password. Earlier checkpoints are Lumen
 ### Live continuation — September 12, from 03:15
 
 Only the isolated Windows instance is used. Installed Lumen remains PID 10964;
-its last observed Moonlight disconnect is 01:54:24, and VDD remains disabled.
+its last observed GameStream disconnect is 01:54:24, and VDD remains disabled.
 
 - [x] Expose real bounded-window media timings through the existing CLI owner
   IPC, and host frame/pressure/feedback counters through authenticated status.
@@ -577,7 +577,7 @@ At the end of this continuation the isolated task is stopped with its original
 private configuration and permission mask restored. The original private
 configuration backup remains `lumen.conf.before-microphone`. For future
 microphone runs, explicitly re-enable only the isolated setting/grant; neither
-the installed host nor its working Moonlight configuration is a test target.
+the installed host nor its working GameStream configuration is a test target.
 - [ ] Confirm physical picture/audio/input and complete sustained codec/mode,
   congestion/repair, input/controller, and hardware qualification before the
   streaming-readiness fixes and packaging. The admin rewrite is no longer in scope.
@@ -656,7 +656,7 @@ the objective. The installed host is still not a test target.
 
 - [x] Cancel the Svelte/SvelteKit admin rewrite per the latest user request.
   Keep the current admin panel. Delivery is working LSP Lumen/Umbra builds;
-  legacy Moonlight success is not evidence for the LSP acceptance gate.
+  legacy GameStream success is not evidence for the LSP acceptance gate.
 - [ ] Finish input-only/mixed input+microphone RFC 8888 integration. The host
   observation window, shared CCFB send lane/floor, native input sent/tombstone
   ledger, aggregate reverse controller, and client input SR are implemented.
@@ -926,7 +926,7 @@ LSP instance. No Mac restart, privacy-store reset, or filter bypass is authorize
 
 Latest live correction (19:31, supersedes earlier input-cause hypotheses below):
 
-Latest protected-Moonlight follow-up:
+Latest protected-GameStream follow-up:
 
 - The user reports that the deployed reconnect patch did not resolve full
   stream-restart freezes or audio gaps. The rate-only Windows executable was
@@ -937,12 +937,12 @@ Latest protected-Moonlight follow-up:
   Both remove concrete starvation/premature-close risks; neither is live-proven
   as the sole cause. Microphone activation off the UDP owner is still being
   implemented. No further builds/deployments/restarts are permitted while the
-  user is gaming in Moonlight.
-- Moonlight's Virtual HID regression is consistent with the two deployed
+  user is gaming in the client.
+- the client's Virtual HID regression is consistent with the two deployed
   daemons still claiming the globally exclusive driver at startup. The pending
   first/last input-session patch must reach both daemons (or one combined host)
   to fix this durably; current-session ownership must not be disturbed.
-- Read-only investigation of the later Moonlight drop found Windows booted at
+- Read-only investigation of the later GameStream drop found Windows booted at
   `2026-09-13T23:14:16.5000000+08:00`, with Kernel-Power 41 and EventLog 6008.
   BugcheckCode was zero and no planned-restart event appeared in that query;
   the underlying unexpected-shutdown cause remains unknown. No agent restart
@@ -1164,7 +1164,7 @@ Build permission resumed for the reconnect repair:
 - [x] After the user brought Windows back, verify that only the installed
   legacy service (PID 12356) was running; the isolated LSP task was stopped and
   UDP 48030 had no listener. This was a real startup-wiring defect, independent
-  of the GUI connection problem, and explains why legacy Moonlight alone could
+  of the GUI connection problem, and explains why legacy GameStream alone could
   connect immediately after the host returned.
 - [x] Start only the isolated LSP task and add its exact-user logon trigger,
   StartWhenAvailable, and bounded failure restarts. The listener returned at
@@ -1177,7 +1177,7 @@ Build permission resumed for the reconnect repair:
   sends failed with errno 65/32. One idle-GUI restart using the unchanged signed
   binary produced PID 26726 and the same errors; it did not resolve the issue.
   The 17:01:51 trust-file update belongs to the terminal diagnostic, not a GUI
-  recovery. Do not mark this host Ready based only on the terminal or Moonlight.
+  recovery. Do not mark this host Ready based only on the terminal or GameStream.
 
 ### GUI recovery verified; Windows input/media deployment resumed
 
@@ -1208,9 +1208,9 @@ Build permission resumed for the reconnect repair:
 - [ ] Finish the resumed two-job, below-normal-priority Windows build and deploy
   only the isolated host. Deployment now refuses an active LSP media session and
   restores normal task priority for the host. The installed legacy service is
-  independently active; a Moonlight connection was recorded at 18:07:21.
+  independently active; a GameStream connection was recorded at 18:07:21.
 - [ ] Run actual keyboard/mouse and stutter verification with the updated host.
-  Do not start a competing video stream while the user is gaming in Moonlight.
+  Do not start a competing video stream while the user is gaming in the client.
 
 After the successful retry, normal STOP succeeds, the test pairing returns to
 mask 87, the original private microphone configuration is restored with its
@@ -1234,13 +1234,13 @@ an assertion that audits or live streaming qualification are complete.
 | --- | --- | --- | --- |
 | Working branches and pre-rewrite checkpoint | **Done** | Both repositories use `feature/lsp-rewrite`; Lumen checkpoint `2397c28c` | None |
 | Remove retired Lumen native transport | **Done** | Lumen commit `564b1131`; application link, focused legacy/migration checks, packaging check, and diff audit pass | None |
-| Remove retired Umbra native transport | **Done** | Umbra commit `0362c2e`; full Swift tests, warnings-as-errors build, and packaging tests pass | Physical Moonlight smoke test remains part of final hardware validation |
+| Remove retired Umbra native transport | **Done** | Umbra commit `0362c2e`; full Swift tests, warnings-as-errors build, and packaging tests pass | Physical GameStream smoke test remains part of final hardware validation |
 | Select DTLS 1.3 provider | **Done** | Commercial wolfSSL 5.9.2 selected; tag `v5.9.2-stable` pinned | Keep license material external to the repository |
 | macOS DTLS-SRTP provider proof | **Done** | Live DTLS 1.3 exchange proved `TLS_AES_128_GCM_SHA256`, X25519, HRR cookie, ALPN `lumen-stream/1`, `SRTP_AEAD_AES_128_GCM`, and identical 56-byte exporter output | Repeat the exact proof on Windows/UCRT64 |
 | libSRTP wolfCrypt backend | **In progress** | The reviewed libSRTP 2.8.0 patch and CMake target are integrated; AES-128-GCM SRTP/SRTCP protection, encrypted extensions, authentication, replay rejection, exact per-SSRC directional contexts, endpoint-value cache isolation, quiescent context/key retirement, and aggregate-key-safe SRTP/SRTCP lifetime fences pass on macOS. The provider-enabled static Windows/UCRT64 production executable now compiles, links, installs, and starts with process-wide wolfSSL/wolfCrypt initialization before identity RNG use. | Live-prove the 16-byte-tag RTP/SRTCP path and lifetime-to-rekey handoff during the Windows/macOS session. |
 | Shared portable C++23 core | **Done** | Photon is canonical at `git@github.com:simonfalke-01/Photon.git` commit `657833c8fa0cc96f75e248696716d51226ae55f3`, aggregate digest `72b3a260…679db`; Lumen and Umbra's offline lock/manifest/source-identity checks pass with exact RFC 8888 ECN and 1/1024-second ATO, compound RTCP authority, CNAME, and late-overlap feedback primitives | Update Photon first, then advance each product's reviewed lock and source-identical mirror with its normal sync utility |
 | Umbra `CLSPCore` C ABI and mirror | **Done** | ABI v2, digest gate, real UDP/kqueue wolfSSL/libSRTP runtime, exact multi-SSRC policies, token-retained two-frame reassembly, retained complete encoded-access-unit buffers, complete-Opus/timing callbacks, reverse-microphone sender, and warnings-as-errors product builds pass | Extend the ABI only at coarse input, completed-media, lifecycle, and telemetry boundaries |
-| Lumen configuration, build, UI, and discovery foundation | **Done** | LSP config/UI, real runtime factory, active-only `_lumen-stream._udp`, digest gate, application/test builds, web build, and focused config/mDNS/LSP checks pass. The provider-enabled static Windows/UCRT64 production target links and is deployed on the authorized Windows host; the service remains stable, binds UDP 48030 through the installed inbound firewall rule, and registers Lumen mDNS. A real legacy Moonlight session subsequently launched HEVC video and Opus audio and disconnected normally, independently of LSP. | Keep this foundation unchanged while live pairing and streaming exercise the runtime. |
+| Lumen configuration, build, UI, and discovery foundation | **Done** | LSP config/UI, real runtime factory, active-only `_lumen-stream._udp`, digest gate, application/test builds, web build, and focused config/mDNS/LSP checks pass. The provider-enabled static Windows/UCRT64 production target links and is deployed on the authorized Windows host; the service remains stable, binds UDP 48030 through the installed inbound firewall rule, and registers Lumen mDNS. A real legacy GameStream session subsequently launched HEVC video and Opus audio and disconnected normally, independently of LSP. | Keep this foundation unchanged while live pairing and streaming exercise the runtime. |
 | LSP host security/session foundation | **In progress** | Real nonblocking UDP ownership, wolfSSL DTLS 1.3, libSRTP contexts, fresh LSP identity persistence, dedicated-exporter SPAKE2-P256 six-digit PIN pairing, pairing/authentication, LSP-only trust, LSPC reliability, browsing, and trusted-client administration are wired. URI/QR invitations are removed; max-four 120-second sessions use selected-session async scrypt, uniqueness/rate fences, atomic insert-if-absent trust, exact completed-result replay, and persist before success. Shutdown now stops admission, joins control and platform-feedback workers, drains forward completions while their input/media owners remain alive, drains DTLS after an explicit owner handoff, and closes the leased UDP descriptor last. The Windows host now boots the runtime without DXGI error-path null dereferences or pre-initialization wolfCrypt RNG use, creates `lsp_identity_v1.bin`, removes only the retired protocol credentials, exposes authenticated pending-PIN administration, and reports an active listener on UDP 48030. A real macOS Umbra client now discovers the Windows service, completes DTLS 1.3, receives the first SERVER_HELLO through an association-generation-scoped CLIENT_HELLO response cache, completes the six-digit PIN challenge/PAIR_RESULT flow, persists trust, reauthenticates, and lists the real Desktop and Steam Big Picture applications. | Live-prove lost RESULT recovery, permission failures, authentication replay/rollback handling, and certificate rotation before closing the security/session phase. |
 | Frozen input wire/state primitives | **Done** | Ten focused tests pass across pointer/edge wire, device/sensor keys, baseline atomicity, loss/reorder, LSPI, LSPG, rates, and text barriers | Extend only when another input wire or safety invariant is implemented |
 | Remaining input schemas and product integration | **In progress** | Umbra commit `2df4cd2`; native IOHID/GameController input, public touch lifecycle, authenticated retry-safe LSPG ACKs, LED, CoreHaptics rumble, adaptive triggers, and motion commands are wired; Lumen applies all negotiated input classes and sends generation-qualified controller output | Prove the real Lumen↔Umbra path with physical 1/8 kHz pointer, controller, touch, and output devices |
@@ -2000,12 +2000,12 @@ rather than postponing removal until after LSP qualification.
 - competition acceptance targets pass;
 - security and conformance gates pass;
 - packaging includes the reviewed dependencies; and
-- legacy Moonlight behavior remains independently functional.
+- legacy GameStream behavior remains independently functional.
 
 ### Final cutover
 
 - make LSP the only native Lumen/Umbra protocol;
-- keep legacy GameStream only for explicit Moonlight compatibility;
+- keep legacy GameStream only for explicit GameStream compatibility;
 - remove any old-protocol selection from Umbra UI and persistence;
 - remove old discovery advertisements;
 - remove old configuration toggles and packaging dependencies; and
@@ -2045,7 +2045,7 @@ C:\msys64\msys2_shell.cmd -defterm -here -no-start -ucrt64 -c
 ```
 
 Build directories begin with `cmake-build-`. Lumen's gtest executable is
-`tests/test_sunshine` inside the selected build directory.
+`tests/test_lumen` inside the selected build directory.
 
 During development, use the smallest affected build and test target. Full
 Lumen tests, full Umbra tests, warnings-as-errors, formatting, documentation,

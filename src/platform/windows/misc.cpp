@@ -131,7 +131,7 @@ namespace platf {
    */
   using adapteraddrs_t = util::c_ptr<IP_ADAPTER_ADDRESSES>;
 
-  bool enabled_mouse_keys = false;  ///< Tracks whether Windows Mouse Keys was enabled before Sunshine changed it.
+  bool enabled_mouse_keys = false;  ///< Tracks whether Windows Mouse Keys was enabled before Lumen changed it.
   MOUSEKEYS previous_mouse_keys_state;  ///< Previous mouse keys state.
 
   HANDLE qos_handle = nullptr;  ///< QoS handle.
@@ -149,9 +149,9 @@ namespace platf {
   decltype(WlanSetInterface) *fn_WlanSetInterface = nullptr;  ///< Fn wlan set interface.
 
   std::filesystem::path appdata() {
-    WCHAR sunshine_path[MAX_PATH];
-    GetModuleFileNameW(nullptr, sunshine_path, _countof(sunshine_path));
-    return std::filesystem::path {sunshine_path}.remove_filename() / L"config"sv;
+    WCHAR lumen_path[MAX_PATH];
+    GetModuleFileNameW(nullptr, lumen_path, _countof(lumen_path));
+    return std::filesystem::path {lumen_path}.remove_filename() / L"config"sv;
   }
 
   std::string from_sockaddr(const sockaddr *const socket_address) {
@@ -626,7 +626,7 @@ namespace platf {
       startup_info.StartupInfo.hStdError = log_file_handle;
 
       // Allow the log file handle to be inherited by the child process (without inheriting all of
-      // our inheritable handles, such as our own log file handle created by SunshineSvc).
+      // our inheritable handles, such as our own log file handle created by LumenSvc).
       //
       // Note: The value we point to here must be valid for the lifetime of the attribute list,
       // so we need to point into the STARTUPINFO instead of our log_file_variable on the stack.
@@ -1013,28 +1013,28 @@ namespace platf {
     creation_flags |= interactive ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
 
     // Find the PATH variable in our environment block using a case-insensitive search
-    auto sunshine_wenv = boost::this_process::wenvironment();
+    auto lumen_wenv = boost::this_process::wenvironment();
     std::wstring path_var_name {L"PATH"};
     std::wstring old_path_val;
-    auto itr = std::find_if(sunshine_wenv.cbegin(), sunshine_wenv.cend(), [&](const auto &e) {
+    auto itr = std::find_if(lumen_wenv.cbegin(), lumen_wenv.cend(), [&](const auto &e) {
       return boost::iequals(e.get_name(), path_var_name);
     });
-    if (itr != sunshine_wenv.cend()) {
+    if (itr != lumen_wenv.cend()) {
       // Use the existing variable if it exists, since Boost treats these as case-sensitive.
       path_var_name = itr->get_name();
-      old_path_val = sunshine_wenv[path_var_name].to_string();
+      old_path_val = lumen_wenv[path_var_name].to_string();
     }
 
     // Temporarily prepend the specified working directory to PATH to ensure CreateProcess()
     // will (preferentially) find binaries that reside in the working directory.
-    sunshine_wenv[path_var_name].assign(start_dir + L";" + old_path_val);
+    lumen_wenv[path_var_name].assign(start_dir + L";" + old_path_val);
 
     // Restore the old PATH value for our process when we're done here
     auto restore_path = util::fail_guard([&]() {
       if (old_path_val.empty()) {
-        sunshine_wenv[path_var_name].clear();
+        lumen_wenv[path_var_name].clear();
       } else {
-        sunshine_wenv[path_var_name].assign(old_path_val);
+        lumen_wenv[path_var_name].assign(old_path_val);
       }
     });
 
@@ -1043,7 +1043,7 @@ namespace platf {
       // Duplicate the current user's token
       HANDLE user_token = retrieve_users_token(elevated);
       if (!user_token) {
-        // Fail the launch rather than risking launching with Sunshine's permissions unmodified.
+        // Fail the launch rather than risking launching with Lumen's permissions unmodified.
         ec = std::make_error_code(std::errc::permission_denied);
         return bp::child();
       }
@@ -1067,7 +1067,7 @@ namespace platf {
       });
     }
     // Otherwise, launch the process using CreateProcessW()
-    // This will inherit the elevation of whatever the user launched Sunshine with.
+    // This will inherit the elevation of whatever the user launched Lumen with.
     else {
       // Open our current token to resolve environment variables
       HANDLE process_token;
@@ -1215,7 +1215,17 @@ namespace platf {
     // Promote ourselves to high priority class
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
-    // Modify NVIDIA control panel settings again, in case they have been changed externally since sunshine launch
+    // A service can be put under EcoQoS, which runs its threads on efficiency cores at reduced
+    // clocks and coarsens its timers; both show up as capture and encode latency spikes.
+    PROCESS_POWER_THROTTLING_STATE power_throttling {};
+    power_throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    power_throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    power_throttling.StateMask = 0;
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &power_throttling, sizeof(power_throttling))) {
+      BOOST_LOG(warning) << "Unable to opt out of process power throttling: "sv << GetLastError();
+    }
+
+    // Modify NVIDIA control panel settings again, in case they have been changed externally since lumen launch
     if (nvprefs_instance.load()) {
       if (!nvprefs_instance.owning_undo_file()) {
         nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
@@ -1369,7 +1379,7 @@ namespace platf {
     }
 
     // We use an async exit call here because we can't block the HTTP thread or we'll hang shutdown.
-    lifetime::exit_sunshine(0, true);
+    lifetime::exit_lumen(0, true);
   }
 
   /**

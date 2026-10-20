@@ -42,7 +42,7 @@ namespace {
     bool create_encoder(
       const nvenc::nvenc_config &,
       const video::config_t &,
-      const video::sunshine_colorspace_t &,
+      const video::stream_colorspace_t &,
       platf::pix_fmt_e,
       const std::optional<nvenc::hdr_static_metadata_t> &
     ) override {

@@ -62,6 +62,7 @@ namespace lumen::lsp::runtime {
     PermissionSet permissions {};  ///< Effective LSP permissions.
     std::uint32_t revocation_generation {1};  ///< Nonzero trust generation.
     bool enabled {true};  ///< Whether new authentication is allowed.
+    std::string name;  ///< Display name verified at pairing; renamable by the administrator.
 
     /** @brief Return whether every trust field is valid. */
     [[nodiscard]] bool valid() const noexcept;
@@ -853,6 +854,30 @@ namespace lumen::lsp::runtime {
     ) noexcept;
 
     /**
+     * @brief Send the host cursor state to the stream owner that requested a client-drawn cursor.
+     *
+     * Only the newest state is retained while an earlier one is in flight. The shape bundle is
+     * carried only when the client has not confirmed holding that shape on this connection.
+     *
+     * @param peer Exact authenticated association that owns the stream.
+     * @param session_id Active stream-session identifier.
+     * @param visible Whether the host shows its cursor.
+     * @param shape_sha256 SHA-256 of the shape bundle, or null before any shape.
+     * @param shape Valid cursor shape bundle for shape_sha256, or null.
+     * @param now_microseconds Monotonic first-send time.
+     * @return True when the state was sent or retained for sending.
+     */
+    bool send_cursor_state(
+      const PeerEndpoint &peer,
+      const Identifier128 &session_id,
+      bool visible,
+      const std::optional<Digest256> &shape_sha256,
+      std::shared_ptr<const std::vector<std::uint8_t>> shape,
+      std::uint8_t system_cursor,
+      std::uint64_t now_microseconds
+    ) noexcept;
+
+    /**
      * @brief Sign and reliably announce one replacement DTLS certificate SPKI.
      *
      * @param peer Exact authenticated association.
@@ -918,6 +943,9 @@ namespace lumen::lsp::runtime {
 
     /** @brief Cancel and clear every pending LSP PIN pairing session. */
     void cancel_pairings() noexcept;
+
+    /** @brief Cancel one pending PIN pairing session; false when it no longer exists. */
+    bool cancel_pairing(const Identifier128 &session_id) noexcept;
 
     /**
      * @brief Return current nonexpired pending PIN session count.

@@ -22,7 +22,7 @@ if(LUMEN_VERSION_MAJOR GREATER 255 OR LUMEN_VERSION_MINOR GREATER 255 OR
 endif()
 
 project(Lumen VERSION ${LUMEN_VERSION_CORE}
-        DESCRIPTION "Self-hosted game stream host compatible with Moonlight clients"
+        DESCRIPTION "Self-hosted game stream host compatible with GameStream clients"
         HOMEPAGE_URL "https://github.com/simonfalke-01/Lumen")
 
 set(CMAKE_CXX_STANDARD 23)
@@ -37,13 +37,12 @@ set(PROJECT_LICENSE "GPL-3.0-only")
 set(PROJECT_REPOSITORY "simonfalke-01/Lumen")
 set(PROJECT_REPOSITORY_URL "https://github.com/${PROJECT_REPOSITORY}")
 set(PROJECT_FQDN "io.github.simonfalke.Lumen")
-set(PROJECT_LEGACY_FQDN "dev.lizardbyte.app.Sunshine")
 
-set(PROJECT_BRIEF_DESCRIPTION "GameStream host for Moonlight")  # must be <= 35 characters
+set(PROJECT_BRIEF_DESCRIPTION "GameStream host for the client")  # must be <= 35 characters
 
 set(PROJECT_LONG_DESCRIPTION "Offering low latency, cloud gaming server capabilities with support for AMD, Intel, \
 and Nvidia GPUs for hardware encoding. Software encoding is also available. You can connect to Lumen from any \
-Moonlight client on a variety of devices. A web UI is provided to allow configuration, and client pairing, from \
+GameStream client on a variety of devices. A web UI is provided to allow configuration, and client pairing, from \
 your favorite web browser. Pair from the local server or any mobile device.")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -75,7 +74,7 @@ include(${CMAKE_MODULE_PATH}/prep/static_qt.cmake)
 # initial prep
 include(${CMAKE_MODULE_PATH}/prep/init.cmake)
 
-# configure special package files, such as sunshine.desktop, Flatpak manifest, Portfile , etc.
+# configure special package files, such as lumen.desktop, Flatpak manifest, Portfile , etc.
 include(${CMAKE_MODULE_PATH}/prep/special_package_configuration.cmake)
 
 # Exit early if END_BUILD is ON, i.e. when only generating package manifests

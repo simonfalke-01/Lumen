@@ -14,7 +14,7 @@ namespace platf {
   /**
    * @brief Check whether macOS has granted screen-capture permission.
    *
-   * @return True when Sunshine can capture the screen.
+   * @return True when Lumen can capture the screen.
    */
   bool is_screen_capture_allowed();
 }  // namespace platf

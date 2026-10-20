@@ -3,4 +3,4 @@
 
 # Keep the historical CMake target name for downstream build integrations while
 # publishing the application under its Lumen executable identity.
-set_target_properties(sunshine PROPERTIES OUTPUT_NAME "lumen")
+set_target_properties(lumen PROPERTIES OUTPUT_NAME "lumen")

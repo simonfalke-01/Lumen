@@ -8,6 +8,7 @@
 #include "../../protocol_common/cbor.h"
 #include "../core/control.h"
 #include "../security/secure_zero.h"
+#include "src/logging.h"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,8 @@
 #include <new>
 #include <thread>
 #include <utility>
+
+using namespace std::literals;
 
 namespace lumen::lsp::runtime {
   namespace {
@@ -35,6 +38,8 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_application_image_bytes = 512;
     constexpr std::uint64_t response_deadline_microseconds = 1'000'000;
     constexpr std::uint64_t clipboard_response_deadline_microseconds = 5'000'000;
+    constexpr std::uint64_t cursor_response_deadline_microseconds = 5'000'000;
+    constexpr std::size_t maximum_known_cursor_shapes = 64;
     constexpr std::uint64_t path_probe_semantic_deadline_microseconds = 60'000'000;  ///< Covers all legal LSPP retries plus margin.
 
     /** @brief Return local monotonic microseconds for asynchronous terminal responses. */
@@ -427,6 +432,31 @@ namespace lumen::lsp::runtime {
       std::uint64_t next_clipboard_sequence {1};  ///< Next host clipboard sequence.
       std::uint64_t completed_clipboard_request_id {};  ///< Latest accepted clipboard response correlation.
 
+      struct CursorUpdate {
+        Identifier128 session_id {};  ///< Stream session bound into the update.
+        bool visible {};  ///< Host cursor visibility.
+        std::optional<Digest256> shape_sha256;  ///< Current shape identity, or null before any shape.
+        std::shared_ptr<const std::vector<std::uint8_t>> shape;  ///< Shape bundle for shape_sha256.
+        std::uint8_t system_cursor {};  ///< Standard cursor kind drawn natively, or 0 for the shape.
+      };
+
+      struct OutboundCursor {
+        CursorUpdate update;  ///< State being delivered.
+        std::uint64_t sequence {};  ///< Host-local cursor sequence.
+        bool carries_shape {};  ///< Whether this request carries the shape bundle.
+        Identifier128 object_id {};  ///< OBJECT_CHUNK identity for a non-inline shape.
+        std::uint64_t request_id {};  ///< CURSOR_STATE response correlation.
+        std::uint64_t message_id {};  ///< Reliable CURSOR_STATE message identifier.
+        std::uint64_t deadline_microseconds {};  ///< Semantic response deadline.
+        bool awaiting_object {};  ///< Whether the shape object must finish before the request.
+        bool awaiting_response {};  ///< Whether CURSOR_STATE_RESPONSE remains outstanding.
+      } outbound_cursor;  ///< At most one cursor update in flight.
+
+      std::optional<CursorUpdate> queued_cursor;  ///< Latest-wins cursor state behind the in-flight update.
+      std::vector<Digest256> known_cursor_shapes;  ///< Shapes the client confirmed holding, oldest first.
+      std::uint64_t next_cursor_sequence {1};  ///< Next host cursor sequence.
+      std::uint64_t completed_cursor_request_id {};  ///< Latest accepted cursor response correlation.
+
       struct PendingText {
         packet_slab<maximum_control_frame_bytes> request {};  ///< Byte-identical request for terminal caching.
         lspc_header header {};  ///< Exact deferred response correlation.
@@ -447,6 +477,7 @@ namespace lumen::lsp::runtime {
       } pending_input_rate;  ///< At most one deferred rate selection per connection.
 
       bool hello_complete {};  ///< Whether CLIENT_HELLO completed.
+      std::uint64_t outbound_failed_since_microseconds {};  ///< When the outbound window first reported an exhausted operation, or 0.
     };
 
     /** @brief Bounded PIN pairing state owned by one authenticated DTLS association. */
@@ -742,6 +773,8 @@ namespace lumen::lsp::runtime {
         connection.outgoing_object_pending = false;
         connection.outbound_clipboard = {};
         connection.queued_clipboard = {};
+        connection.outbound_cursor = {};
+        connection.queued_cursor.reset();
       }
       text_work_.clear();
       shutdown_complete_ = true;
@@ -899,7 +932,7 @@ namespace lumen::lsp::runtime {
                            status != ControlStatus::success,
                            now
                          )) {
-          transport_.close(work.peer);
+          close_logged(934, work.peer);
         }
       }
     }
@@ -982,7 +1015,7 @@ namespace lumen::lsp::runtime {
         }
       }
       for (std::size_t index = 0; index < count; ++index) {
-        transport_.close(peers[index]);
+        close_logged(1017, peers[index]);
       }
     }
 
@@ -1003,6 +1036,12 @@ namespace lumen::lsp::runtime {
       }
       request_client_disconnects(client_id);
       return true;
+    }
+
+    /** @brief Close one association and log which validation closed it. */
+    void close_logged(const int line, const PeerEndpoint &peer) noexcept {
+      BOOST_LOG(warning) << "LSP control closed an association (control_server.cpp:"sv << line << ")"sv;
+      transport_.close(peer);
     }
 
     bool revoke_trusted_client(const Identifier128 &client_id) noexcept {
@@ -1032,7 +1071,7 @@ namespace lumen::lsp::runtime {
       auto &connection = connections_[index];
       const auto parsed = parse_lspc(frame);
       if (!parsed) {
-        transport_.close(peer);
+        close_logged(1067, peer);
         return false;
       }
       const auto release_path_probe = connection.outbound_path_probe.active &&
@@ -1054,7 +1093,7 @@ namespace lumen::lsp::runtime {
               connection.outbound_path_probe.probe,
               now_microseconds
             )) {
-          transport_.close(peer);
+          close_logged(1089, peer);
           return false;
         }
         connection.outbound_path_probe.datagram_sent = true;
@@ -1064,7 +1103,7 @@ namespace lumen::lsp::runtime {
         const auto observed = connection.inbound.observe(parsed.header.message_id);
         if (observed == receive_id_result::too_far_ahead || observed == receive_id_result::too_old ||
             observed == receive_id_result::zero) {
-          transport_.close(peer);
+          close_logged(1099, peer);
           return false;
         }
         return true;
@@ -1092,11 +1131,14 @@ namespace lumen::lsp::runtime {
         if (message_type == ControlMessageType::clipboard_update_response) {
           return clipboard_update_response(connection, parsed.header, parsed.payload, now_microseconds);
         }
-        transport_.close(peer);
+        if (message_type == ControlMessageType::cursor_state_response) {
+          return cursor_state_response(connection, parsed.header, parsed.payload, now_microseconds);
+        }
+        close_logged(1130, peer);
         return false;
       }
       if (parsed.header.request_id == 0) {
-        transport_.close(peer);
+        close_logged(1134, peer);
         return false;
       }
 
@@ -1111,7 +1153,7 @@ namespace lumen::lsp::runtime {
       };
       wire::write_be<std::uint64_t>(std::span<std::uint8_t> {semantic_identity.semantic_id}.last<8>(), parsed.header.request_id);
       if (!crypto_.sha256(frame, semantic_identity.request_digest)) {
-        transport_.close(peer);
+        close_logged(1149, peer);
         return false;
       }
       const auto cached = connection.responses.lookup(
@@ -1124,7 +1166,7 @@ namespace lumen::lsp::runtime {
         return transport_.send(peer, cached.response);
       }
       if (cached.result == response_cache_result::conflicting_request) {
-        transport_.close(peer);
+        close_logged(1162, peer);
         return false;
       }
 
@@ -1134,7 +1176,7 @@ namespace lumen::lsp::runtime {
             std::ranges::equal(connection.inbound_path_probe.request.bytes(), frame)) {
           return send_acknowledgement_only(connection);
         }
-        transport_.close(peer);
+        close_logged(1172, peer);
         return false;
       }
       if (message_type == ControlMessageType::text_input && connection.pending_text.active &&
@@ -1143,7 +1185,7 @@ namespace lumen::lsp::runtime {
             std::ranges::equal(connection.pending_text.request.bytes(), frame)) {
           return send_acknowledgement_only(connection);
         }
-        transport_.close(peer);
+        close_logged(1181, peer);
         return false;
       }
 
@@ -1152,7 +1194,7 @@ namespace lumen::lsp::runtime {
         if (std::ranges::equal(connection.pending_start.request.bytes(), frame)) {
           return send_acknowledgement_only(connection);
         }
-        transport_.close(peer);
+        close_logged(1190, peer);
         return false;
       }
 
@@ -1161,17 +1203,19 @@ namespace lumen::lsp::runtime {
         if (std::ranges::equal(connection.pending_input_rate.request.bytes(), frame)) {
           return send_acknowledgement_only(connection);
         }
-        transport_.close(peer);
+        close_logged(1199, peer);
         return false;
       }
 
       const auto observed = connection.inbound.observe(parsed.header.message_id);
       if (observed == receive_id_result::duplicate) {
-        transport_.close(peer);
-        return false;
+        // A retransmission of a message already processed (its acknowledgement was lost or late):
+        // acknowledge it again. Requests are answered from the response cache above; responses to
+        // host requests (cursor state, object chunks, clipboard) have no cache and land here.
+        return send_acknowledgement_only(connection);
       }
       if (observed != receive_id_result::accepted) {
-        transport_.close(peer);
+        close_logged(1211, peer);
         return false;
       }
 
@@ -1214,6 +1258,8 @@ namespace lumen::lsp::runtime {
         case ControlMessageType::clipboard_update:
           return clipboard_update(connection, frame, parsed.header, parsed.payload, now_microseconds);
         case ControlMessageType::clipboard_update_response:
+        case ControlMessageType::cursor_state:
+        case ControlMessageType::cursor_state_response:
         case ControlMessageType::certificate_rotate:
         case ControlMessageType::certificate_rotate_ack:
         case ControlMessageType::quit_application_response:
@@ -1263,7 +1309,7 @@ namespace lumen::lsp::runtime {
                 pending.acknowledgement
               )) {
             const auto peer = connection.peer;
-            transport_.close(peer);
+            close_logged(1305, peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
             }
@@ -1295,7 +1341,7 @@ namespace lumen::lsp::runtime {
                 pending.acknowledgement
               )) {
             const auto peer = connection.peer;
-            transport_.close(peer);
+            close_logged(1337, peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
             }
@@ -1326,7 +1372,7 @@ namespace lumen::lsp::runtime {
                 pending.acknowledgement
               )) {
             const auto peer = connection.peer;
-            transport_.close(peer);
+            close_logged(1368, peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
             }
@@ -1344,7 +1390,7 @@ namespace lumen::lsp::runtime {
                 control_monotonic_microseconds()
               )) {
             const auto peer = connection.peer;
-            transport_.close(peer);
+            close_logged(1386, peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
             }
@@ -1362,7 +1408,7 @@ namespace lumen::lsp::runtime {
                 pending.request.bytes().subspan(lspc_header_size),
                 control_monotonic_microseconds()
               )) {
-            transport_.close(peer);
+            close_logged(1404, peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
             }
@@ -1383,7 +1429,7 @@ namespace lumen::lsp::runtime {
                 now_microseconds
               )) {
             const auto peer = connection.peer;
-            transport_.close(peer);
+            close_logged(1425, peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
             }
@@ -1395,7 +1441,7 @@ namespace lumen::lsp::runtime {
           const auto probe = connection.outbound_path_probe.probe;
           if (!start_handler_.path_probe_rejected(connection.peer, probe, ControlStatus::timeout)) {
             const auto peer = connection.peer;
-            transport_.close(peer);
+            close_logged(1437, peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
             }
@@ -1407,15 +1453,36 @@ namespace lumen::lsp::runtime {
             now_microseconds >= connection.outbound_clipboard.deadline_microseconds &&
             !finish_clipboard(connection, now_microseconds)) {
           const auto peer = connection.peer;
-          transport_.close(peer);
+          close_logged(1449, peer);
           if (const auto remaining = find(peer); remaining != connections_.size()) {
             connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
           }
           continue;
         }
-        if (connection.outbound.has_failed(now_microseconds)) {
+        if (connection.outbound_cursor.awaiting_response &&
+            now_microseconds >= connection.outbound_cursor.deadline_microseconds &&
+            !finish_cursor(connection, now_microseconds)) {
           const auto peer = connection.peer;
-          transport_.close(peer);
+          close_logged(1459, peer);
+          if (const auto remaining = find(peer); remaining != connections_.size()) {
+            connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
+          }
+          continue;
+        }
+        // The window gives up after five transmissions, a few hundred milliseconds on a LAN; the
+        // client can briefly stop acknowledging (its control worker busy, or an ACK lost), so allow
+        // a late acknowledgement, which every later client frame carries, before closing.
+        if (connection.outbound.has_failed(now_microseconds)) {
+          if (connection.outbound_failed_since_microseconds == 0) {
+            connection.outbound_failed_since_microseconds = now_microseconds;
+          }
+        } else {
+          connection.outbound_failed_since_microseconds = 0;
+        }
+        if (connection.outbound_failed_since_microseconds != 0 &&
+            now_microseconds - connection.outbound_failed_since_microseconds >= 3'000'000U) {
+          const auto peer = connection.peer;
+          close_logged(1467, peer);
           if (const auto remaining = find(peer); remaining != connections_.size()) {
             connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
           }
@@ -1424,7 +1491,7 @@ namespace lumen::lsp::runtime {
         if (auto *due = connection.outbound.due(now_microseconds); due != nullptr) {
           if (!transport_.send(connection.peer, due->frame.bytes())) {
             const auto peer = connection.peer;
-            transport_.close(peer);
+            close_logged(1476, peer);
             if (const auto remaining = find(peer); remaining != connections_.size()) {
               connections_.erase(connections_.begin() + static_cast<std::ptrdiff_t>(remaining));
             }
@@ -1649,6 +1716,24 @@ namespace lumen::lsp::runtime {
       pairing_work_.clear();
     }
 
+    bool cancel_pairing(const Identifier128 &session_id) noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto pairing = std::ranges::find(pairings_, session_id, &PendingPairing::session_id);
+      if (pairing == pairings_.end()) {
+        return false;
+      }
+      clear_pairing(*pairing);
+      pairings_.erase(pairing);
+      std::erase_if(pairing_work_, [&](PairingWork &work) {
+        if (work.session_id != session_id) {
+          return false;
+        }
+        work.clear();
+        return true;
+      });
+      return true;
+    }
+
     [[nodiscard]] std::size_t pairing_count(const std::uint64_t now_utc_seconds) noexcept {
       std::scoped_lock lock(mutex_);
       retire_expired_pairings(now_utc_seconds);
@@ -1720,6 +1805,35 @@ namespace lumen::lsp::runtime {
         return true;
       }
       return start_clipboard(connection, session_id, std::move(utf8), now_microseconds);
+    }
+
+    bool send_cursor_state(
+      const PeerEndpoint &peer,
+      const Identifier128 &session_id,
+      const bool visible,
+      const std::optional<Digest256> &shape_sha256,
+      std::shared_ptr<const std::vector<std::uint8_t>> shape,
+      const std::uint8_t system_cursor,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      std::scoped_lock lock(mutex_);
+      const auto index = find(peer);
+      if (index == connections_.size() || !connections_[index].authenticated_client || is_zero(session_id) ||
+          shape_sha256.has_value() != (shape != nullptr) || (shape && !valid_cursor_shape(*shape)) ||
+          system_cursor > maximum_system_cursor) {
+        return false;
+      }
+      auto &connection = connections_[index];
+      Connection::CursorUpdate update {session_id, visible, shape_sha256, std::move(shape), system_cursor};
+      if (connection.outbound_cursor.awaiting_object || connection.outbound_cursor.awaiting_response) {
+        try {
+          connection.queued_cursor = std::move(update);
+        } catch (...) {
+          return false;
+        }
+        return true;
+      }
+      return start_cursor(connection, std::move(update), false, now_microseconds);
     }
 
     bool send_stream_ended(
@@ -1959,6 +2073,9 @@ namespace lumen::lsp::runtime {
           return ControlMessageType::object_chunk;
         case ControlMessageType::clipboard_update:
           return ControlMessageType::clipboard_update_response;
+        case ControlMessageType::cursor_state:
+          return ControlMessageType::cursor_state_response;
+        case ControlMessageType::cursor_state_response:
         case ControlMessageType::clipboard_update_response:
         case ControlMessageType::certificate_rotate_ack:
         case ControlMessageType::quit_application_response:
@@ -2004,7 +2121,7 @@ namespace lumen::lsp::runtime {
       const std::uint64_t now_microseconds
     ) noexcept {
       if (connection.next_message_id == 0 || payload.size() > maximum_control_frame_bytes - lspc_header_size) {
-        transport_.close(connection.peer);
+        close_logged(2106, connection.peer);
         return false;
       }
       std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
@@ -2027,7 +2144,7 @@ namespace lumen::lsp::runtime {
       };
       const auto serialized = serialize_lspc(header, payload, storage);
       if (!serialized) {
-        transport_.close(connection.peer);
+        close_logged(2129, connection.peer);
         return false;
       }
       const auto response = std::span<const std::uint8_t> {storage.data(), serialized.bytes_written};
@@ -2045,7 +2162,7 @@ namespace lumen::lsp::runtime {
       };
       wire::write_be<std::uint64_t>(std::span<std::uint8_t> {metadata.identity.semantic_id}.last<8>(), request_header.request_id);
       if (!crypto_.sha256(request, metadata.identity.request_digest)) {
-        transport_.close(connection.peer);
+        close_logged(2147, connection.peer);
         return false;
       }
       const auto cache_result = connection.responses.insert(
@@ -2056,7 +2173,7 @@ namespace lumen::lsp::runtime {
         now_microseconds
       );
       if (cache_result != response_cache_result::stored && cache_result != response_cache_result::hit) {
-        transport_.close(connection.peer);
+        close_logged(2158, connection.peer);
         return false;
       }
       const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
@@ -2065,7 +2182,7 @@ namespace lumen::lsp::runtime {
             response,
             deadline
           ) != outbound_store_result::stored) {
-        transport_.close(connection.peer);
+        close_logged(2167, connection.peer);
         return false;
       }
       const auto message_id = connection.next_message_id++;
@@ -2116,7 +2233,13 @@ namespace lumen::lsp::runtime {
           connection.outgoing_object_index = 0;
           if (connection.outbound_clipboard.awaiting_object) {
             connection.outbound_clipboard.awaiting_object = false;
-            return send_clipboard_request(connection, now_microseconds);
+            if (!send_clipboard_request(connection, now_microseconds)) {
+              return false;
+            }
+          }
+          if (connection.outbound_cursor.awaiting_object) {
+            connection.outbound_cursor.awaiting_object = false;
+            return send_cursor_request(connection, now_microseconds);
           }
           return true;
         }
@@ -2215,7 +2338,10 @@ namespace lumen::lsp::runtime {
         if (!send_acknowledgement_only(connection)) {
           return false;
         }
-        return !connection.outbound_clipboard.awaiting_object || finish_clipboard(connection, now_microseconds);
+        if (connection.outbound_clipboard.awaiting_object && !finish_clipboard(connection, now_microseconds)) {
+          return false;
+        }
+        return !connection.outbound_cursor.awaiting_object || finish_cursor(connection, now_microseconds);
       }
       const auto acknowledgement = decode_object_chunk_ack(payload);
       const auto &object = connection.outgoing_objects[connection.outgoing_object_index];
@@ -2329,31 +2455,33 @@ namespace lumen::lsp::runtime {
                                      std::ranges::equal(connection.pending_video_activation.frame.bytes(), frame);
       const auto observed = connection.inbound.observe(header.message_id);
       if (observed != receive_id_result::accepted) {
-        if (accepted_duplicate != connection.accepted_video_acks.end() || pending_duplicate) {
-          return send_acknowledgement_only(connection);
-        }
-        transport_.close(connection.peer);
-        return false;
+        // A retransmitted ack (its acknowledgement was lost): acknowledge it again.
+        (void) accepted_duplicate;
+        (void) pending_duplicate;
+        return send_acknowledgement_only(connection);
       }
       if (!connection.hello_complete || !connection.authenticated_client ||
           header.connection_generation != connection.generation || header.request_id == 0 ||
-          !connection.pending_video.active || header.request_id != connection.pending_video.request_id ||
           frame.size() > maximum_control_frame_bytes) {
-        transport_.close(connection.peer);
+        close_logged(2448, connection.peer);
         return false;
+      }
+      if (!connection.pending_video.active || header.request_id != connection.pending_video.request_id) {
+        // An ack for a video configuration already superseded (reconnect or reconfiguration).
+        return send_acknowledgement_only(connection);
       }
       const auto acknowledgement = decode_video_config_ack(payload);
       if (!acknowledgement || acknowledgement->session_id != connection.pending_video.session_id ||
           acknowledgement->video_generation != connection.pending_video.video_generation ||
           has_flag(header.flags, lspc_flag::error_response) != (acknowledgement->status != ControlStatus::success) ||
           connection.pending_video_activation.active) {
-        transport_.close(connection.peer);
+        close_logged(2460, connection.peer);
         return false;
       }
       auto &pending = connection.pending_video_activation;
       pending = {};
       if (!pending.frame.assign(frame)) {
-        transport_.close(connection.peer);
+        close_logged(2466, connection.peer);
         return false;
       }
       pending.acknowledgement = *acknowledgement;
@@ -2506,17 +2634,17 @@ namespace lumen::lsp::runtime {
         if (duplicate != connection.accepted_path_probe_acks.end()) {
           return send_acknowledgement_only(connection);
         }
-        transport_.close(connection.peer);
+        close_logged(2619, connection.peer);
         return false;
       }
       if (!connection.authenticated_client || header.request_id == 0) {
-        transport_.close(connection.peer);
+        close_logged(2623, connection.peer);
         return false;
       }
       if (!connection.outbound_path_probe.active) {
         const auto cancelled = std::ranges::find(connection.cancelled_path_probe_request_ids, header.request_id);
         if (cancelled == connection.cancelled_path_probe_request_ids.end()) {
-          transport_.close(connection.peer);
+          close_logged(2629, connection.peer);
           return false;
         }
         *cancelled = 0;
@@ -2530,7 +2658,7 @@ namespace lumen::lsp::runtime {
       }
       if (!connection.outbound_path_probe.datagram_sent ||
           header.request_id != connection.outbound_path_probe.request_id) {
-        transport_.close(connection.peer);
+        close_logged(2643, connection.peer);
         return false;
       }
       const auto rejected = has_flag(header.flags, lspc_flag::error_response);
@@ -2541,14 +2669,14 @@ namespace lumen::lsp::runtime {
                          connection.outbound_path_probe.probe,
                          *status
                        )) {
-          transport_.close(connection.peer);
+          close_logged(2654, connection.peer);
           return false;
         }
       } else {
         const auto decoded = decode_path_probe(payload);
         if (!decoded || *decoded != connection.outbound_path_probe.probe ||
             !start_handler_.path_probe_acknowledged(connection.peer, *decoded)) {
-          transport_.close(connection.peer);
+          close_logged(2661, connection.peer);
           return false;
         }
       }
@@ -2672,14 +2800,14 @@ namespace lumen::lsp::runtime {
         if (accepted_duplicate != connection.accepted_audio_acks.end() || pending_duplicate) {
           return send_acknowledgement_only(connection);
         }
-        transport_.close(connection.peer);
+        close_logged(2785, connection.peer);
         return false;
       }
       if (!connection.hello_complete || !connection.authenticated_client ||
           header.connection_generation != connection.generation || header.request_id == 0 ||
           !connection.pending_audio.active || header.request_id != connection.pending_audio.request_id ||
           frame.size() > maximum_control_frame_bytes) {
-        transport_.close(connection.peer);
+        close_logged(2792, connection.peer);
         return false;
       }
       const auto acknowledgement = decode_audio_config_ack(payload);
@@ -2687,13 +2815,13 @@ namespace lumen::lsp::runtime {
           acknowledgement->audio_generation != connection.pending_audio.payload.audio.audio_generation ||
           has_flag(header.flags, lspc_flag::error_response) == (acknowledgement->status == ControlStatus::success) ||
           connection.pending_audio_activation.active) {
-        transport_.close(connection.peer);
+        close_logged(2800, connection.peer);
         return false;
       }
       auto &pending = connection.pending_audio_activation;
       pending = {};
       if (!pending.frame.assign(frame)) {
-        transport_.close(connection.peer);
+        close_logged(2806, connection.peer);
         return false;
       }
       pending.acknowledgement = *acknowledgement;
@@ -2795,14 +2923,14 @@ namespace lumen::lsp::runtime {
         if (accepted_duplicate != connection.accepted_microphone_acks.end()) {
           return send_acknowledgement_only(connection);
         }
-        transport_.close(connection.peer);
+        close_logged(2908, connection.peer);
         return false;
       }
       if (!connection.hello_complete || !connection.authenticated_client ||
           header.connection_generation != connection.generation || header.request_id == 0 ||
           !connection.pending_microphone.active || header.request_id != connection.pending_microphone.request_id ||
           frame.size() > maximum_control_frame_bytes) {
-        transport_.close(connection.peer);
+        close_logged(2915, connection.peer);
         return false;
       }
       const auto acknowledgement = decode_microphone_config_ack(payload);
@@ -2810,7 +2938,7 @@ namespace lumen::lsp::runtime {
           acknowledgement->microphone_generation != connection.pending_microphone.payload.microphone.microphone_generation ||
           has_flag(header.flags, lspc_flag::error_response) != (acknowledgement->status != ControlStatus::success) ||
           connection.pending_microphone_activation.active) {
-        transport_.close(connection.peer);
+        close_logged(2923, connection.peer);
         return false;
       }
       (void) connection.outbound.acknowledge(
@@ -3095,6 +3223,7 @@ namespace lumen::lsp::runtime {
         .permissions = pairing->effective_permissions,
         .revocation_generation = 1,
         .enabled = true,
+        .name = pairing->client_name,
       };
       const auto pairing_index = static_cast<std::size_t>(std::distance(pairings_.begin(), pairing));
       TrustedClient effective;
@@ -3269,6 +3398,13 @@ namespace lumen::lsp::runtime {
             .bytes = connection.outbound_clipboard.utf8,
           });
         }
+        if (connection.outbound_cursor.awaiting_object) {
+          connection.outgoing_objects.push_back({
+            .object_id = connection.outbound_cursor.object_id,
+            .sha256 = *connection.outbound_cursor.update.shape_sha256,
+            .bytes = *connection.outbound_cursor.update.shape,
+          });
+        }
       } catch (...) {
         return false;
       }
@@ -3407,6 +3543,7 @@ namespace lumen::lsp::runtime {
       }
       connection.pending_input_rate.header = header;
       connection.pending_input_rate.active = true;
+      BOOST_LOG(info) << "LSP input rate: request "sv << header.request_id << " queued"sv;
       return send_acknowledgement_only(connection);
     }
 
@@ -3435,6 +3572,7 @@ namespace lumen::lsp::runtime {
       if (!decoded) {
         return send_error(connection, request, header, ControlMessageType::input_rate_response, ControlStatus::malformed, now_microseconds);
       }
+      const auto selection_started = control_monotonic_microseconds();
       const auto selected = start_handler_.input_rate(
         connection.peer,
         *connection.authenticated_client,
@@ -3443,11 +3581,18 @@ namespace lumen::lsp::runtime {
       );
       // Lock acquisition and selection must not consume the response's retransmission lifetime.
       const auto response_now = control_monotonic_microseconds();
+      BOOST_LOG(info) << "LSP input rate: request "sv << header.request_id << " selection took "sv
+                      << (response_now - selection_started) / 1000U << " ms, status="sv
+                      << (selected ? 0 : static_cast<int>(selected.error()));
       if (!selected) {
         return send_error(connection, request, header, ControlMessageType::input_rate_response, selected.error(), response_now);
       }
       const auto response = encode_input_rate_response(*selected);
-      return response && send_response(connection, request, header, ControlMessageType::input_rate_response, *response, false, response_now);
+      const bool sent = response && send_response(connection, request, header, ControlMessageType::input_rate_response, *response, false, response_now);
+      if (!sent) {
+        BOOST_LOG(warning) << "LSP input rate: response to request "sv << header.request_id << " could not be sent"sv;
+      }
+      return sent;
     }
 
     /** @brief Resolve an inline/object bundle and hand one client clipboard update to the product. */
@@ -3610,6 +3755,182 @@ namespace lumen::lsp::runtime {
       auto queued = std::move(connection.queued_clipboard);
       connection.queued_clipboard = {};
       return start_clipboard(connection, queued.session_id, std::move(queued.utf8), now_microseconds);
+    }
+
+    /**
+     * @brief Begin delivering one cursor state; the shape is carried only when the client lacks it.
+     *
+     * @param force_shape Carry the shape even when the client previously confirmed it.
+     */
+    bool start_cursor(
+      Connection &connection,
+      Connection::CursorUpdate update,
+      const bool force_shape,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      try {
+        auto &outbound = connection.outbound_cursor;
+        outbound = {};
+        outbound.update = std::move(update);
+        outbound.sequence = connection.next_cursor_sequence++;
+        const auto &hash = outbound.update.shape_sha256;
+        outbound.carries_shape = hash && (force_shape || std::ranges::find(connection.known_cursor_shapes, *hash) ==
+                                                           connection.known_cursor_shapes.end());
+        if (!outbound.carries_shape || outbound.update.shape->size() <= maximum_inline_cursor_shape_bytes) {
+          return send_cursor_request(connection, now_microseconds);
+        }
+        if (!crypto_.random(outbound.object_id) || is_zero(outbound.object_id)) {
+          outbound = {};
+          return false;
+        }
+        connection.outgoing_objects.push_back({
+          .object_id = outbound.object_id,
+          .sha256 = *hash,
+          .bytes = *outbound.update.shape,
+        });
+        outbound.awaiting_object = true;
+        return send_next_object_chunk(connection, now_microseconds);
+      } catch (...) {
+        connection.outbound_cursor = {};
+        return false;
+      }
+    }
+
+    /** @brief Reliably send the CURSOR_STATE request for the current outbound state. */
+    bool send_cursor_request(Connection &connection, const std::uint64_t now_microseconds) noexcept {
+      auto &outbound = connection.outbound_cursor;
+      CursorStatePayload state {
+        .session_id = outbound.update.session_id,
+        .sequence = outbound.sequence,
+        .visible = outbound.update.visible,
+        .shape_sha256 = outbound.update.shape_sha256,
+        .system_cursor = outbound.update.system_cursor,
+      };
+      try {
+        if (outbound.carries_shape) {
+          state.shape_length = static_cast<std::uint32_t>(outbound.update.shape->size());
+          if (outbound.update.shape->size() <= maximum_inline_cursor_shape_bytes) {
+            state.inline_shape = *outbound.update.shape;
+          } else {
+            state.object_id = outbound.object_id;
+          }
+        }
+      } catch (...) {
+        return false;
+      }
+      const auto payload = encode_cursor_state(state);
+      std::array<std::uint8_t, 8> request_bytes {};
+      if (!payload || connection.next_message_id == 0 || !crypto_.random(request_bytes)) {
+        return false;
+      }
+      auto request_id = wire::read_be<std::uint64_t>(request_bytes);
+      if (request_id == 0) {
+        request_id = 1;
+      }
+      std::array<std::uint8_t, maximum_control_frame_bytes> storage {};
+      const lspc_header header {
+        .flags = static_cast<std::uint8_t>(lspc_flag::acknowledgement_required),
+        .message_type = static_cast<std::uint16_t>(ControlMessageType::cursor_state),
+        .connection_generation = connection.generation,
+        .payload_length = static_cast<std::uint32_t>(payload->size()),
+        .message_id = connection.next_message_id,
+        .request_id = request_id,
+        .acknowledgement_base = connection.inbound.base(),
+        .acknowledgement_bitmap = connection.inbound.bitmap(),
+      };
+      const auto serialized = serialize_lspc(header, *payload, storage);
+      if (!serialized) {
+        return false;
+      }
+      const auto frame = std::span<const std::uint8_t> {storage}.first(serialized.bytes_written);
+      const auto deadline = saturating_add(now_microseconds, response_deadline_microseconds);
+      if (connection.outbound.reserve(connection.next_message_id, frame, deadline) != outbound_store_result::stored) {
+        return false;
+      }
+      outbound.request_id = request_id;
+      outbound.message_id = connection.next_message_id;
+      outbound.deadline_microseconds = saturating_add(now_microseconds, cursor_response_deadline_microseconds);
+      outbound.awaiting_response = true;
+      const auto message_id = connection.next_message_id++;
+      if (!transport_.send(connection.peer, frame)) {
+        return false;
+      }
+      return connection.outbound.mark_initial_submitted(message_id, now_microseconds, connection.rto) ==
+             outbound_submission_result::submitted;
+    }
+
+    /** @brief Retire the in-flight cursor state and start the newest queued state. */
+    bool finish_cursor(Connection &connection, const std::uint64_t now_microseconds) noexcept {
+      connection.outbound_cursor = {};
+      if (!connection.queued_cursor) {
+        return true;
+      }
+      auto queued = std::move(*connection.queued_cursor);
+      connection.queued_cursor.reset();
+      return start_cursor(connection, std::move(queued), false, now_microseconds);
+    }
+
+    /** @brief Validate the client response to the in-flight cursor state and track its shape cache. */
+    bool cursor_state_response(
+      Connection &connection,
+      const lspc_header &header,
+      const std::span<const std::uint8_t> payload,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      // Cursor states replace each other quickly, so retransmitted, superseded, and previous-session
+      // responses are routine; acknowledge and ignore them instead of failing the association.
+      const auto observed = connection.inbound.observe(header.message_id);
+      BOOST_LOG(info) << "LSP cursor response: message="sv << header.message_id << " request="sv << header.request_id
+                      << " observed="sv << static_cast<int>(observed) << " awaiting="sv
+                      << connection.outbound_cursor.awaiting_response << " outstanding="sv << connection.outbound_cursor.request_id;
+      if (observed != receive_id_result::accepted) {
+        return send_acknowledgement_only(connection);
+      }
+      auto &outbound = connection.outbound_cursor;
+      if (!outbound.awaiting_response || header.request_id != outbound.request_id) {
+        return send_acknowledgement_only(connection);
+      }
+      bool shape_present = true;
+      if (has_flag(header.flags, lspc_flag::error_response)) {
+        const auto error = decode_control_error(payload);
+        if (!error || *error == ControlStatus::success) {
+          return false;
+        }
+      } else {
+        const auto response = decode_cursor_state_response(payload);
+        if (!response) {
+          return false;
+        }
+        if (response->session_id != outbound.update.session_id || response->sequence != outbound.sequence) {
+          return send_acknowledgement_only(connection);
+        }
+        shape_present = response->shape_present;
+      }
+      (void) connection.outbound.acknowledge(outbound.message_id, 0, now_microseconds, connection.rto);
+      connection.completed_cursor_request_id = header.request_id;
+      if (!send_acknowledgement_only(connection)) {
+        return false;
+      }
+      if (const auto &hash = outbound.update.shape_sha256) {
+        auto &known = connection.known_cursor_shapes;
+        std::erase(known, *hash);
+        if (shape_present) {
+          try {
+            if (known.size() == maximum_known_cursor_shapes) {
+              known.erase(known.begin());
+            }
+            known.push_back(*hash);
+          } catch (...) {
+            known.clear();
+          }
+        } else if (!outbound.carries_shape && !connection.queued_cursor) {
+          // The client evicted the shape; resend this state with its pixels.
+          auto update = std::move(outbound.update);
+          outbound = {};
+          return start_cursor(connection, std::move(update), true, now_microseconds);
+        }
+      }
+      return finish_cursor(connection, now_microseconds);
     }
 
     /** @brief Validate one client response to the in-flight host clipboard update. */
@@ -4059,6 +4380,18 @@ namespace lumen::lsp::runtime {
     return impl_ && impl_->send_clipboard_update(peer, session_id, std::move(utf8), now_microseconds);
   }
 
+  bool HostControlServer::send_cursor_state(
+    const PeerEndpoint &peer,
+    const Identifier128 &session_id,
+    const bool visible,
+    const std::optional<Digest256> &shape_sha256,
+    std::shared_ptr<const std::vector<std::uint8_t>> shape,
+    const std::uint8_t system_cursor,
+    const std::uint64_t now_microseconds
+  ) noexcept {
+    return impl_ && impl_->send_cursor_state(peer, session_id, visible, shape_sha256, std::move(shape), system_cursor, now_microseconds);
+  }
+
   bool HostControlServer::start_certificate_rotation(
     const PeerEndpoint &peer,
     const Digest256 &new_spki_sha256,
@@ -4126,6 +4459,10 @@ namespace lumen::lsp::runtime {
     if (impl_) {
       impl_->cancel_pairings();
     }
+  }
+
+  bool HostControlServer::cancel_pairing(const Identifier128 &session_id) noexcept {
+    return impl_ && impl_->cancel_pairing(session_id);
   }
 
   std::size_t HostControlServer::pairing_count(const std::uint64_t now_utc_seconds) noexcept {

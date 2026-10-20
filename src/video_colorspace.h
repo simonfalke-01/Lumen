@@ -22,33 +22,33 @@ namespace video {
   };
 
   /**
-   * @brief Sunshine colorimetry values derived from stream configuration.
+   * @brief Lumen colorimetry values derived from stream configuration.
    */
-  struct sunshine_colorspace_t {
+  struct stream_colorspace_t {
     colorspace_e colorspace;  ///< Colorspace.
     bool full_range;  ///< Whether the video range is full-range instead of limited.
     unsigned bit_depth;  ///< Bit depth.
   };
 
   /**
-   * @brief Check whether a Sunshine colorspace represents HDR video.
+   * @brief Check whether a Lumen colorspace represents HDR video.
    *
    * @param colorspace Colorimetry information used for conversion or encoding.
    * @return True when the colorspace values describe the same metadata.
    */
-  bool colorspace_is_hdr(const sunshine_colorspace_t &colorspace);
+  bool colorspace_is_hdr(const stream_colorspace_t &colorspace);
 
   // Declared in video.h
   struct config_t;
 
   /**
-   * @brief Derive Sunshine colorspace metadata from the negotiated client config.
+   * @brief Derive Lumen colorspace metadata from the negotiated client config.
    *
    * @param config Configuration values to apply.
    * @param hdr_display HDR display.
    * @return Colorspace, range, transfer, and HDR flags used for encoding.
    */
-  sunshine_colorspace_t colorspace_from_client_config(const config_t &config, bool hdr_display);
+  stream_colorspace_t colorspace_from_client_config(const config_t &config, bool hdr_display);
 
   /**
    * @brief FFmpeg colorimetry values used by AVCodec encoders.
@@ -62,15 +62,15 @@ namespace video {
   };
 
   /**
-   * @brief Convert Sunshine colorspace metadata to FFmpeg AVCodec fields.
+   * @brief Convert Lumen colorspace metadata to FFmpeg AVCodec fields.
    *
-   * @param sunshine_colorspace Sunshine colorspace.
+   * @param stream_colorspace Lumen colorspace.
    * @return FFmpeg color range, primaries, transfer, and software format values.
    */
-  avcodec_colorspace_t avcodec_colorspace_from_sunshine_colorspace(const sunshine_colorspace_t &sunshine_colorspace);
+  avcodec_colorspace_t avcodec_colorspace_from_stream_colorspace(const stream_colorspace_t &stream_colorspace);
 
   /**
-   * @brief Pair of Sunshine and AVCodec colorimetry descriptions.
+   * @brief Pair of Lumen and AVCodec colorimetry descriptions.
    */
   struct alignas(16) color_t {
     float color_vec_y[4];  ///< Color vec y.
@@ -90,5 +90,5 @@ namespace video {
    *         Components `range_y` and `range_uv` are there for backwards compatibility
    *         and can be ignored in the computation.
    */
-  const color_t *color_vectors_from_colorspace(const sunshine_colorspace_t &colorspace, bool unorm_output);
+  const color_t *color_vectors_from_colorspace(const stream_colorspace_t &colorspace, bool unorm_output);
 }  // namespace video

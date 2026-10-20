@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(sunshine_tools)
+project(lumen_tools)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +28,7 @@ target_link_libraries(dxgi-info
         libdisplaydevice::display_device  # this is included only for logging
         ${PLATFORM_LIBRARIES}
 )
-target_compile_options(dxgi-info PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_compile_options(dxgi-info PRIVATE ${LUMEN_COMPILE_OPTIONS})
 
 add_executable(audio-info audio.cpp ${TOOL_SOURCES})
 target_link_libraries(audio-info
@@ -39,7 +39,7 @@ target_link_libraries(audio-info
         ksuser
         ${PLATFORM_LIBRARIES}
 )
-target_compile_options(audio-info PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_compile_options(audio-info PRIVATE ${LUMEN_COMPILE_OPTIONS})
 
 add_executable(lumen-clipboard lumen-clipboard.cpp)
 target_link_libraries(lumen-clipboard
@@ -47,15 +47,15 @@ target_link_libraries(lumen-clipboard
         shlwapi
         windowscodecs
         ${PLATFORM_LIBRARIES})
-target_compile_options(lumen-clipboard PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_compile_options(lumen-clipboard PRIVATE ${LUMEN_COMPILE_OPTIONS})
 
-add_executable(sunshinesvc sunshinesvc.cpp)
-target_link_libraries(sunshinesvc
+add_executable(lumensvc lumensvc.cpp)
+target_link_libraries(lumensvc
         ${Boost_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
         wtsapi32
         ${PLATFORM_LIBRARIES})
-target_compile_options(sunshinesvc PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_compile_options(lumensvc PRIVATE ${LUMEN_COMPILE_OPTIONS})
 
 add_executable(lumen-vhidctl
         lumen-vhidctl.cpp
@@ -74,7 +74,7 @@ target_link_libraries(lumen-vhidctl
         setupapi
         shell32
         xinput9_1_0)
-target_compile_options(lumen-vhidctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_compile_options(lumen-vhidctl PRIVATE ${LUMEN_COMPILE_OPTIONS})
 
 # Dedicated Windows device lifecycle helper for the optional capture-only
 # virtual microphone. It dynamically resolves NewDev mutations so the binary
@@ -85,7 +85,7 @@ target_link_libraries(lumen-vmicctl
         ole32
         setupapi
         shell32)
-target_compile_options(lumen-vmicctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_compile_options(lumen-vmicctl PRIVATE ${LUMEN_COMPILE_OPTIONS})
 
 # Dedicated root-device installer for the optional UMDF2 indirect display
 # driver. PnPUtil can stage the package, but it cannot create a new root
@@ -95,7 +95,7 @@ target_link_libraries(lumen-vddctl
         cfgmgr32
         setupapi
         shell32)
-target_compile_options(lumen-vddctl PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_compile_options(lumen-vddctl PRIVATE ${LUMEN_COMPILE_OPTIONS})
 if(MINGW)
     target_link_options(lumen-vddctl PRIVATE -static)
 endif()
@@ -105,4 +105,4 @@ endif()
 add_library(lumen_msica SHARED lumen-msica.c)
 set_target_properties(lumen_msica PROPERTIES PREFIX "" OUTPUT_NAME "lumen_msica")
 target_link_libraries(lumen_msica msi)
-target_compile_options(lumen_msica PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+target_compile_options(lumen_msica PRIVATE ${LUMEN_COMPILE_OPTIONS})

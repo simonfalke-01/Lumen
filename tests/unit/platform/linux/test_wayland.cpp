@@ -2,7 +2,7 @@
  * @file tests/unit/platform/linux/test_wayland.cpp
  * @brief Test Wayland output mode selection.
  */
-#ifdef SUNSHINE_BUILD_WAYLAND
+#ifdef LUMEN_BUILD_WAYLAND
   #include "../../../tests_common.h"
 
   #include <src/platform/linux/wayland.h>

@@ -37,7 +37,6 @@ if %ERRORLEVEL%==0 (
 
 if "!SERVICE_EXISTS!"=="0" exit /b 0
 
-rem Stop and delete only the Lumen-owned service. Legacy Sunshine service names
-rem may belong to an independently installed official Sunshine package.
+rem Stop and delete the Lumen service.
 net stop %SERVICE_NAME% >nul 2>&1
 sc delete %SERVICE_NAME%

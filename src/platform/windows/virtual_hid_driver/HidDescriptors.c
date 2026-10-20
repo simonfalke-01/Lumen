@@ -174,11 +174,9 @@ const BYTE LumenVhidReportDescriptor[] = {
   0x31, /*     Usage (Y) */
   0x15,
   0x00, /*     Logical Minimum (0) */
-  0x27,
+  0x26,
   0xff,
-  0xff,
-  0x00,
-  0x00, /*     Logical Maximum (65535) */
+  0x7f, /*     Logical Maximum (32767): Windows reads 16-bit absolute axes as signed */
   0x75,
   0x10, /*     Report Size (16) */
   0x95,

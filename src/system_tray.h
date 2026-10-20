@@ -39,13 +39,13 @@ namespace system_tray {
   void tray_reset_display_device_config_cb([[maybe_unused]] struct tray_menu *item);
 
   /**
-   * @brief Callback for restarting Sunshine from the system tray.
+   * @brief Callback for restarting Lumen from the system tray.
    * @param item The tray menu item.
    */
   void tray_restart_cb([[maybe_unused]] struct tray_menu *item);
 
   /**
-   * @brief Callback for exiting Sunshine from the system tray.
+   * @brief Callback for exiting Lumen from the system tray.
    * @param item The tray menu item.
    */
   void tray_quit_cb([[maybe_unused]] struct tray_menu *item);
@@ -97,7 +97,7 @@ namespace system_tray {
    */
   int init_tray_threaded();
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   /**
    * @brief Get the tray data used by the system tray implementation.
    *

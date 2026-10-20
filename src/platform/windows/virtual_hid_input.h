@@ -82,7 +82,7 @@ namespace platf::win_input {
   /**
    * @brief Convert a Windows virtual key into a keyboard-page HID usage.
    * @param modcode Windows virtual-key code.
-   * @param flags Moonlight keyboard packet flags.
+   * @param flags GameStream keyboard packet flags.
    * @param always_send_scancodes Current scancode compatibility setting.
    * @return HID usage, or no value when the transition is not representable.
    */

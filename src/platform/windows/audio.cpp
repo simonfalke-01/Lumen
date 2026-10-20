@@ -511,7 +511,7 @@ namespace platf::audio {
      * @brief Ignore endpoint-add notifications.
      *
      * @param pwstrDeviceId Windows endpoint ID for the added device.
-     * @return S_OK because Sunshine does not act on this notification.
+     * @return S_OK because Lumen does not act on this notification.
      */
     HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR pwstrDeviceId) {
       return S_OK;
@@ -521,7 +521,7 @@ namespace platf::audio {
      * @brief Ignore endpoint-removal notifications.
      *
      * @param pwstrDeviceId Windows endpoint ID for the removed device.
-     * @return S_OK because Sunshine does not act on this notification.
+     * @return S_OK because Lumen does not act on this notification.
      */
     HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR pwstrDeviceId) {
       return S_OK;
@@ -590,7 +590,7 @@ namespace platf::audio {
     return true;
   }
 
-#ifdef SUNSHINE_TESTS
+#ifdef LUMEN_TESTS
   /**
    * @brief Exercise virtual-sink endpoint notification filtering for unit tests.
    *
@@ -618,7 +618,7 @@ namespace platf::audio {
   class mic_wasapi_t: public mic_t {
   public:
     /**
-     * @brief Deliver a captured audio sample to Sunshine's audio pipeline.
+     * @brief Deliver a captured audio sample to Lumen's audio pipeline.
      *
      * @param sample_out Sample out.
      * @return Capture status reported to the streaming pipeline.
@@ -895,7 +895,7 @@ namespace platf::audio {
   class audio_control_t: public ::platf::audio_control_t {
   public:
     /**
-     * @brief Query host and virtual sink names available to Sunshine.
+     * @brief Query host and virtual sink names available to Lumen.
      *
      * @return Host and virtual sink names when the backend can report them.
      */
@@ -1409,7 +1409,7 @@ namespace platf::audio {
 
     policy_t policy;  ///< Windows policy configuration interface used to switch default audio devices.
     audio::device_enum_t device_enum;  ///< Device enumerator used to query and watch audio endpoints.
-    std::string assigned_sink;  ///< Virtual sink assigned while Sunshine captures host audio.
+    std::string assigned_sink;  ///< Virtual sink assigned while Lumen captures host audio.
   };
 }  // namespace platf::audio
 

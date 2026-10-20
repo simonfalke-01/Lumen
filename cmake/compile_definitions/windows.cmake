@@ -1,25 +1,25 @@
 # windows specific compile definitions
 
-add_compile_definitions(SUNSHINE_PLATFORM="windows")
+add_compile_definitions(LUMEN_PLATFORM="windows")
 
 enable_language(RC)
 set(CMAKE_RC_COMPILER windres)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
 
 # gcc complains about misleading indentation in some mingw includes
-list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-misleading-indentation)
+list(APPEND LUMEN_COMPILE_OPTIONS -Wno-misleading-indentation)
 
 # Disable warnings for Windows ARM64
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64")
-    list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-dll-attribute-on-redeclaration)  # Boost
-    list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-unknown-warning-option)  # ViGEmClient
-    list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-unused-variable)  # Boost
+    list(APPEND LUMEN_COMPILE_OPTIONS -Wno-dll-attribute-on-redeclaration)  # Boost
+    list(APPEND LUMEN_COMPILE_OPTIONS -Wno-unknown-warning-option)  # ViGEmClient
+    list(APPEND LUMEN_COMPILE_OPTIONS -Wno-unused-variable)  # Boost
 
     # Qt's static qwindows plugin and MinGW's Windowsapp import library both provide the
     # UiaRaiseNotificationEvent import thunk on ARM64. Keep both required libraries while
     # permitting lld to coalesce their identical definitions.
-    if(SUNSHINE_USE_STATIC_QT AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        list(APPEND SUNSHINE_LINK_OPTIONS -Wl,--allow-multiple-definition)
+    if(LUMEN_USE_STATIC_QT AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        list(APPEND LUMEN_LINK_OPTIONS -Wl,--allow-multiple-definition)
     endif()
 endif()
 
@@ -47,25 +47,25 @@ file(GLOB NVPREFS_FILES CONFIGURE_DEPENDS
 # vigem
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include")
 
-# sunshine icon
-if(NOT DEFINED SUNSHINE_ICON_PATH)
-    set(SUNSHINE_ICON_PATH "${CMAKE_SOURCE_DIR}/sunshine.ico")
+# lumen icon
+if(NOT DEFINED LUMEN_ICON_PATH)
+    set(LUMEN_ICON_PATH "${CMAKE_SOURCE_DIR}/lumen.ico")
 endif()
 
 # Create a separate object library for the RC file with minimal includes
-add_library(sunshine_rc_object OBJECT "${CMAKE_SOURCE_DIR}/src/platform/windows/windows.rc")
+add_library(lumen_rc_object OBJECT "${CMAKE_SOURCE_DIR}/src/platform/windows/windows.rc")
 
 # Set minimal properties for RC compilation - only what's needed for the resource file
 # Otherwise compilation can fail due to "line too long" errors
-set_target_properties(sunshine_rc_object PROPERTIES
-    COMPILE_DEFINITIONS "PROJECT_ICON_PATH=${SUNSHINE_ICON_PATH};PROJECT_NAME=${PROJECT_NAME};PROJECT_VENDOR=${SUNSHINE_PUBLISHER_NAME};PROJECT_VERSION=${PROJECT_VERSION};PROJECT_VERSION_MAJOR=${PROJECT_VERSION_MAJOR};PROJECT_VERSION_MINOR=${PROJECT_VERSION_MINOR};PROJECT_VERSION_PATCH=${PROJECT_VERSION_PATCH};RC_VERSION_BUILD=${RC_VERSION_BUILD};RC_VERSION_REVISION=${RC_VERSION_REVISION}"  # cmake-lint: disable=C0301
+set_target_properties(lumen_rc_object PROPERTIES
+    COMPILE_DEFINITIONS "PROJECT_ICON_PATH=${LUMEN_ICON_PATH};PROJECT_NAME=${PROJECT_NAME};PROJECT_VENDOR=${LUMEN_PUBLISHER_NAME};PROJECT_VERSION=${PROJECT_VERSION};PROJECT_VERSION_MAJOR=${PROJECT_VERSION_MAJOR};PROJECT_VERSION_MINOR=${PROJECT_VERSION_MINOR};PROJECT_VERSION_PATCH=${PROJECT_VERSION_PATCH};RC_VERSION_BUILD=${RC_VERSION_BUILD};RC_VERSION_REVISION=${RC_VERSION_REVISION}"  # cmake-lint: disable=C0301
     INCLUDE_DIRECTORIES ""
 )
 
 # ViGEmBus version
 set(VIGEMBUS_PACKAGED_V "1.21.442")
 set(VIGEMBUS_PACKAGED_V_2 "${VIGEMBUS_PACKAGED_V}.0")
-list(APPEND SUNSHINE_DEFINITIONS VIGEMBUS_PACKAGED_VERSION="${VIGEMBUS_PACKAGED_V_2}")
+list(APPEND LUMEN_DEFINITIONS VIGEMBUS_PACKAGED_VERSION="${VIGEMBUS_PACKAGED_V_2}")
 
 set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/publish.cpp"

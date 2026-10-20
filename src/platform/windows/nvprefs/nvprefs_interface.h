@@ -37,14 +37,14 @@ namespace nvprefs {
     bool restore_from_and_delete_undo_file_if_exists();
 
     /**
-     * @brief Apply Sunshine-specific NVIDIA application profile changes.
+     * @brief Apply Lumen-specific NVIDIA application profile changes.
      *
      * @return True when the NVIDIA preferences operation succeeds.
      */
     bool modify_application_profile();
 
     /**
-     * @brief Apply Sunshine-specific NVIDIA global profile changes.
+     * @brief Apply Lumen-specific NVIDIA global profile changes.
      *
      * @return True when the NVIDIA preferences operation succeeds.
      */

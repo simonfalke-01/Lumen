@@ -65,6 +65,8 @@ namespace lumen::lsp::runtime {
     stream_ended = 0x0220,  ///< Notify the client that one generation-bound stream ended.
     clipboard_update = 0x0222,  ///< Replace the peer clipboard with bounded UTF-8 text.
     clipboard_update_response = 0x0223,  ///< Return session- and sequence-bound clipboard disposition.
+    cursor_state = 0x0224,  ///< Host cursor visibility and shape for a client-drawn cursor.
+    cursor_state_response = 0x0225,  ///< Return session- and sequence-bound cursor disposition.
     path_probe = 0x0300,  ///< Establish authenticated intent for one exact-size SRTCP path probe.
     path_probe_ack = 0x0301,  ///< Confirm one authenticated exact-size path probe.
     object_chunk = 0x0400,  ///< Transfer or acknowledge one bounded contiguous object chunk.
@@ -196,6 +198,12 @@ namespace lumen::lsp::runtime {
   };
 
   /** @brief One exact six-key application entry with authoritative process/resume state. */
+  enum class ApplicationKind : std::uint8_t {
+    app = 0,  ///< Any configured program.
+    desktop = 1,  ///< The host desktop with no launched program.
+    steam = 2,  ///< Steam or Steam Big Picture.
+  };
+
   struct ControlApplication {
     std::string id;  ///< Stable configured application ID, at most 128 UTF-8 bytes.
     std::string name;  ///< Human-readable name, at most 256 UTF-8 bytes.
@@ -203,6 +211,7 @@ namespace lumen::lsp::runtime {
     bool running {};  ///< Whether this is the process manager's exact active application.
     bool resume_available {};  ///< Whether the active generation is LSP-owned and may be resumed.
     std::uint64_t process_generation {};  ///< Exact active generation, or zero while not running.
+    ApplicationKind kind {ApplicationKind::app};  ///< What the entry launches, for client default icons.
   };
 
   /** @brief Exact three-key owner-qualified application quit request. */
@@ -414,7 +423,13 @@ namespace lumen::lsp::runtime {
     std::uint32_t maximum_complete_access_unit_bytes {};  ///< Positive complete-AU parser/admission maximum.
   };
 
-  /** @brief Exact START sixteen-key request map including video schema revision three. */
+  /** @brief Who draws the pointer, carried by START key seventeen. */
+  enum class CursorMode : std::uint8_t {
+    host = 0,  ///< The host composes its cursor into video frames.
+    client = 1,  ///< The client draws the cursor from CURSOR_STATE while the host shows one.
+  };
+
+  /** @brief Exact START seventeen-key request map including video schema revision three. */
   struct StartRequestPayload {
     std::string application_id;  ///< Configured application ID selected for input ownership.
     bool resume {};  ///< Whether START must reuse the matching running application instead of launching.
@@ -432,6 +447,7 @@ namespace lumen::lsp::runtime {
     std::uint8_t decoder_surfaces {};  ///< Offered hardware decoder submissions, two through four.
     std::uint8_t render_mailbox {};  ///< Required exact depth one.
     std::uint32_t maximum_capture_to_present_microseconds {};  ///< Positive end-to-end admission budget.
+    CursorMode cursor_mode {CursorMode::host};  ///< Requested cursor drawing side.
   };
 
   /** @brief Exact START_RESPONSE 31-key response map. */
@@ -667,6 +683,67 @@ namespace lumen::lsp::runtime {
 
   /** @brief Largest clipboard bundle carried inline instead of through OBJECT_CHUNK. */
   inline constexpr std::size_t maximum_inline_clipboard_bytes = 768;
+
+  /** @brief Largest cursor width or height. */
+  inline constexpr std::uint32_t maximum_cursor_dimension = 256;
+
+  /** @brief Cursor shape bundle header: big-endian u16 width, height, hotspot X, hotspot Y. */
+  inline constexpr std::size_t cursor_shape_header_bytes = 8;
+
+  /** @brief Largest cursor shape bundle: header plus premultiplied RGBA pixels. */
+  inline constexpr std::uint32_t maximum_cursor_shape_bytes =
+    cursor_shape_header_bytes + maximum_cursor_dimension * maximum_cursor_dimension * 4U;
+
+  /** @brief Largest cursor shape bundle carried inline instead of through OBJECT_CHUNK. */
+  inline constexpr std::size_t maximum_inline_cursor_shape_bytes = 768;
+  /**
+   * Standard system cursors carried by kind instead of image: 1 arrow, 2 I-beam, 3 wait,
+   * 4 app starting, 5 hand, 6 crosshair, 7 resize west-east, 8 resize north-south,
+   * 9 resize northwest-southeast, 10 resize northeast-southwest, 11 move, 12 not allowed,
+   * 13 help, 14 up arrow, 15 pin, 16 person.
+   */
+  inline constexpr std::uint8_t maximum_system_cursor = 16;
+
+  /**
+   * @brief Validate one cursor shape bundle.
+   *
+   * The bundle is an 8-byte header of big-endian u16 width, height, hotspot X, and hotspot Y,
+   * followed by exactly width * height premultiplied RGBA pixels. Dimensions are one through 256
+   * and the hotspot lies inside the image.
+   */
+  [[nodiscard]] bool valid_cursor_shape(std::span<const std::uint8_t> shape) noexcept;
+
+  /** @brief Exact eight-key CURSOR_STATE request. */
+  struct CursorStatePayload {
+    Identifier128 session_id {};  ///< Active stream-session identifier.
+    std::uint64_t sequence {};  ///< Nonzero host sequence, increasing within one connection.
+    bool visible {};  ///< Whether the host currently shows its cursor.
+    std::optional<Digest256> shape_sha256;  ///< SHA-256 of the current shape bundle, or null before any shape.
+    std::uint32_t shape_length {};  ///< Carried shape bundle length, or zero when the shape is not carried.
+    std::vector<std::uint8_t> inline_shape;  ///< Inline shape bundle, or empty.
+    std::optional<Identifier128> object_id;  ///< Completed object carrying a non-inline shape bundle.
+    std::uint8_t system_cursor {};  ///< Standard system cursor kind the client draws natively, or 0 for the shape.
+  };
+
+  /** @brief Exact five-key successful CURSOR_STATE_RESPONSE. */
+  struct CursorStateResponsePayload {
+    ControlStatus status {ControlStatus::success};  ///< Cursor disposition.
+    Identifier128 session_id {};  ///< Exact requested session identifier.
+    std::uint64_t sequence {};  ///< Exact requested sequence.
+    bool shape_present {};  ///< Whether the client holds the referenced shape (true when none was referenced).
+  };
+
+  /** @brief Decode exact eight-key CURSOR_STATE deterministic CBOR. */
+  [[nodiscard]] std::expected<CursorStatePayload, ControlWireError> decode_cursor_state(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact eight-key CURSOR_STATE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_cursor_state(const CursorStatePayload &payload);
+
+  /** @brief Decode exact five-key successful CURSOR_STATE_RESPONSE deterministic CBOR. */
+  [[nodiscard]] std::expected<CursorStateResponsePayload, ControlWireError> decode_cursor_state_response(std::span<const std::uint8_t> payload);
+
+  /** @brief Encode exact five-key successful CURSOR_STATE_RESPONSE deterministic CBOR. */
+  [[nodiscard]] std::expected<std::vector<std::uint8_t>, ControlWireError> encode_cursor_state_response(const CursorStateResponsePayload &payload);
 
   /** @brief Exact four-key generation-bound terminal stream notification. */
   struct StreamEndedPayload {

@@ -687,7 +687,7 @@ struct AmfMaxAuSizeConfigTest: BaseTest, testing::WithParamInterface<AmfMaxAuSiz
   void SetUp() override {
     BaseTest::SetUp();
     config::video.amd.amd_max_au_size.reset();
-    config::stream.file_apps = SUNSHINE_SOURCE_DIR "/tests/unit/test_video.cpp";
+    config::stream.file_apps = LUMEN_SOURCE_DIR "/tests/unit/test_video.cpp";
   }
 
   void TearDown() override {
@@ -696,7 +696,7 @@ struct AmfMaxAuSizeConfigTest: BaseTest, testing::WithParamInterface<AmfMaxAuSiz
     config::stream = original_stream;
     config::nvhttp = original_nvhttp;
     config::input = original_input;
-    config::sunshine = original_sunshine;
+    config::general = original_lumen;
     config::modified_config_settings = original_modified_config_settings;
     BaseTest::TearDown();
   }
@@ -706,7 +706,7 @@ struct AmfMaxAuSizeConfigTest: BaseTest, testing::WithParamInterface<AmfMaxAuSiz
   config::stream_t original_stream {config::stream};  ///< Stream configuration restored after each test.
   config::nvhttp_t original_nvhttp {config::nvhttp};  ///< HTTP configuration restored after each test.
   config::input_t original_input {config::input};  ///< Input configuration restored after each test.
-  config::sunshine_t original_sunshine {config::sunshine};  ///< Core configuration restored after each test.
+  config::general_t original_lumen {config::general};  ///< Core configuration restored after each test.
   decltype(config::modified_config_settings) original_modified_config_settings {config::modified_config_settings};  ///< Modified settings restored after each test.
 };
 

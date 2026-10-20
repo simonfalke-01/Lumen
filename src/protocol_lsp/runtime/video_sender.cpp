@@ -1316,7 +1316,7 @@ namespace lumen::lsp::runtime {
                                                     config_.aggregate_pacing_bits_per_second :
                                                     0,
           .reserved_overhead_bits_per_second = config_.reserved_overhead_bits_per_second,
-          .maximum_rtt_microseconds = 100'000,
+          .rtt_inflation_budget_microseconds = config_.network_profile == VideoNetworkProfile::competition ? 20'000U : 50'000U,
           .queue_delay_budget_microseconds = config_.network_profile == VideoNetworkProfile::competition ? 2'000U : 10'000U,
         }),
         path_mtu_({
@@ -2112,6 +2112,7 @@ namespace lumen::lsp::runtime {
         .smoothed_rtt_microseconds = smoothed_rtt_microseconds_,
         .rtt_variation_microseconds = rtt_variation_microseconds_,
         .queue_delay_trend_microseconds = queue_delay_trend,
+        .report_microseconds = now_microseconds,
       });
       const auto congestion = congestion_.snapshot();
       requested_pacing_bits_per_second_.store(congestion.pacing_bits_per_second, std::memory_order_release);

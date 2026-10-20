@@ -13,7 +13,7 @@
 #include <gtest/gtest.h>
 
 TEST(LibvirtualhidCoreBoundaryTest, WhitelistsOnlyPortableProfileReportAndTypeSources) {
-  const auto source_path = std::filesystem::path {SUNSHINE_SOURCE_DIR} /
+  const auto source_path = std::filesystem::path {LUMEN_SOURCE_DIR} /
                            "cmake/dependencies/libvirtualhid_core.cmake";
   std::ifstream stream {source_path};
   ASSERT_TRUE(stream.is_open()) << source_path;
@@ -38,7 +38,7 @@ TEST(LibvirtualhidCoreBoundaryTest, WhitelistsOnlyPortableProfileReportAndTypeSo
 }
 
 TEST(LibvirtualhidCoreBoundaryTest, NeverImportsUpstreamKeyboardMouseOrSendInputBackend) {
-  const auto source_path = std::filesystem::path {SUNSHINE_SOURCE_DIR} /
+  const auto source_path = std::filesystem::path {LUMEN_SOURCE_DIR} /
                            "cmake/dependencies/libvirtualhid_core.cmake";
   std::ifstream stream {source_path};
   ASSERT_TRUE(stream.is_open()) << source_path;
@@ -55,7 +55,7 @@ TEST(LibvirtualhidCoreBoundaryTest, NeverImportsUpstreamKeyboardMouseOrSendInput
 }
 
 TEST(LibvirtualhidCoreBoundaryTest, WindowsFacadeImportsOnlyApprovedPidHelpers) {
-  const auto source_path = std::filesystem::path {SUNSHINE_SOURCE_DIR} /
+  const auto source_path = std::filesystem::path {LUMEN_SOURCE_DIR} /
                            "cmake/dependencies/libvirtualhid_core.cmake";
   std::ifstream stream {source_path};
   ASSERT_TRUE(stream.is_open()) << source_path;

@@ -1,11 +1,11 @@
 # macos specific packaging
 
-if (SUNSHINE_BUILD_HOMEBREW)
-    install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/assets/"
-            DESTINATION "${SUNSHINE_ASSETS_DIR}")
+if (LUMEN_BUILD_HOMEBREW)
+    install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/macos/assets/"
+            DESTINATION "${LUMEN_ASSETS_DIR}")
 
     # copy assets to build directory, for running without install
-    file(COPY "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/assets/"
+    file(COPY "${LUMEN_SOURCE_ASSETS_DIR}/macos/assets/"
          DESTINATION "${CMAKE_BINARY_DIR}/assets")
 else()
     # .app build
@@ -18,40 +18,40 @@ else()
     set(MAC_BUNDLE_CONTENTS "${MAC_BUNDLE_NAME}/Contents")
     set(MAC_BUNDLE_RESOURCES "${MAC_BUNDLE_CONTENTS}/Resources")
 
-    install(TARGETS sunshine
+    install(TARGETS lumen
         BUNDLE DESTINATION .
         COMPONENT Runtime)
 
-    if(SUNSHINE_ENABLE_TRAY)
+    if(LUMEN_ENABLE_TRAY)
         # Import Qt in this directory so its deployment commands and targets are visible here.
-        set(_sunshine_module_path "${CMAKE_MODULE_PATH}")
+        set(_lumen_module_path "${CMAKE_MODULE_PATH}")
         find_package(Qt6 REQUIRED COMPONENTS Core)
-        set(CMAKE_MODULE_PATH "${_sunshine_module_path}")
-        unset(_sunshine_module_path)
+        set(CMAKE_MODULE_PATH "${_lumen_module_path}")
+        unset(_lumen_module_path)
 
         qt6_generate_deploy_script(
-            TARGET sunshine
-            OUTPUT_SCRIPT SUNSHINE_QT_DEPLOY_SCRIPT
+            TARGET lumen
+            OUTPUT_SCRIPT LUMEN_QT_DEPLOY_SCRIPT
             CONTENT "
 qt6_deploy_runtime_dependencies(
-    EXECUTABLE \"$<TARGET_FILE_NAME:sunshine>.app\"
+    EXECUTABLE \"$<TARGET_FILE_NAME:lumen>.app\"
     NO_APP_STORE_COMPLIANCE
     NO_TRANSLATIONS
     DEPLOY_TOOL_OPTIONS -no-codesign
 )")
-        install(SCRIPT "${SUNSHINE_QT_DEPLOY_SCRIPT}" COMPONENT Runtime)
+        install(SCRIPT "${LUMEN_QT_DEPLOY_SCRIPT}" COMPONENT Runtime)
     endif()
 
     install(FILES "${APPLE_PLIST_FILE}"
             DESTINATION "${MAC_BUNDLE_CONTENTS}"
             COMPONENT Runtime)
 
-    install(FILES "${PROJECT_SOURCE_DIR}/src_assets/macos/build/sunshine.icns"
+    install(FILES "${PROJECT_SOURCE_DIR}/src_assets/macos/build/lumen.icns"
             DESTINATION "${MAC_BUNDLE_RESOURCES}"
             COMPONENT Runtime)
 
     # macOS-specific assets (apps.json, etc.)
-    install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/assets/"
+    install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/macos/assets/"
             DESTINATION "${MAC_BUNDLE_RESOURCES}/assets"
             COMPONENT Runtime
             PATTERN ".DS_Store" EXCLUDE
@@ -143,8 +143,8 @@ qt6_deploy_runtime_dependencies(
     # DragNDrop
     set(CPACK_BUNDLE_NAME "${CMAKE_PROJECT_NAME}")
     set(CPACK_BUNDLE_PLIST "${APPLE_PLIST_FILE}")
-    set(CPACK_BUNDLE_ICON "${PROJECT_SOURCE_DIR}/src_assets/macos/build/sunshine.icns")
+    set(CPACK_BUNDLE_ICON "${PROJECT_SOURCE_DIR}/src_assets/macos/build/lumen.icns")
     set(CPACK_PACKAGING_INSTALL_PREFIX "/")
-    set(CPACK_DMG_BACKGROUND_IMAGE "${PROJECT_SOURCE_DIR}/src_assets/macos/build/sunshine-background-72dpi.jpg")
+    set(CPACK_DMG_BACKGROUND_IMAGE "${PROJECT_SOURCE_DIR}/src_assets/macos/build/lumen-background-72dpi.jpg")
     set(CPACK_DMG_DS_STORE_SETUP_SCRIPT "${PROJECT_SOURCE_DIR}/src_assets/macos/build/dmg-finder-layout.applescript")
 endif()

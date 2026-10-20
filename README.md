@@ -1,24 +1,24 @@
 <div align="center">
-  <img src="sunshine.svg" alt="Lumen project icon" width="192">
+  <img src="lumen.svg" alt="Lumen" width="192">
   <h1>Lumen</h1>
-  <p>A self-hosted game-streaming host compatible with Moonlight.</p>
+  <p>A self-hosted game-streaming host compatible with the client.</p>
 </div>
 
-Lumen is a Sunshine-derived host for Windows, Linux, macOS, and FreeBSD. The
-current production protocol remains compatible with unmodified Moonlight
+Lumen is a GPL-3.0 host for Windows, Linux, macOS, and FreeBSD. The
+current production protocol remains compatible with unmodified GameStream
 clients. The Windows/NVIDIA path also contains opt-in work for bounded input,
 stream policy, encoder startup, packetization, and virtual displays.
 
 ## Stream policies
 
-- **Legacy** preserves Moonlight wire behavior for clients that send no Lumen
+- **Legacy** preserves GameStream wire behavior for clients that send no Lumen
   policy extension.
 - **Latency** selects the P1/ultra-low-latency NVENC profile, immediate packet
   pacing, shorter client decode queues, and immediate presentation.
 - **Quality** selects the P5/high-quality NVENC profile, stable packet pacing,
   bounded larger client decode queues, and display-linked presentation.
 
-Legacy Moonlight packet ordering and reliable input delivery do not change.
+Legacy GameStream packet ordering and reliable input delivery do not change.
 Codec, HDR, and YUV 4:4:4 remain explicit client preferences, not mode aliases.
 
 The separate `codec-lossless-required` request is experimental and fail-closed.
@@ -27,7 +27,7 @@ not mean an end-to-end lossless, HDR-perfect, or HDMI-equivalent stream.
 
 ## Compatibility and modern protocol work
 
-Vanilla Moonlight compatibility remains a release requirement. Existing
+standard GameStream compatibility remains a release requirement. Existing
 clients continue to use GameStream's HTTP(S), RTSP, and UDP listeners.
 
 Performance tuning and measurement boundaries are documented separately:
@@ -52,7 +52,7 @@ fall back to DDA/WGC. See the [VDD source README](src/platform/windows/virtual_d
 
 Do not expose the Web UI or management API directly to the public Internet.
 Use a trusted private network or an authenticated tunnel. Streaming ports and
-management access are separate concerns. Legacy four-digit Moonlight pairing
+management access are separate concerns. Legacy four-digit GameStream pairing
 is accepted only from loopback or private/trusted LAN source addresses; public
 or WAN pairing receives a wire-compatible XML 403 response before state is
 allocated. Pair on the LAN, then use an authenticated tunnel for remote access.
@@ -70,5 +70,5 @@ require deployment and hardware evidence.
 
 ## License and attribution
 
-Lumen remains GPL-3.0 and retains Sunshine and third-party attribution. See
+Lumen remains GPL-3.0 and retains Lumen and third-party attribution. See
 [LICENSE](LICENSE), [NOTICE](NOTICE), and [Legal](docs/legal.md).

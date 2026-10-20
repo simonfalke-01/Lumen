@@ -1,13 +1,13 @@
 # macos specific compile definitions
 
-add_compile_definitions(SUNSHINE_PLATFORM="macos")
+add_compile_definitions(LUMEN_PLATFORM="macos")
 
-if (SUNSHINE_BUILD_HOMEBREW)
-    set(SUNSHINE_ASSETS_DIR "${CMAKE_INSTALL_PREFIX}/${SUNSHINE_ASSETS_DIR}")
+if (LUMEN_BUILD_HOMEBREW)
+    set(LUMEN_ASSETS_DIR "${CMAKE_INSTALL_PREFIX}/${LUMEN_ASSETS_DIR}")
 else()
     # Bundle layout for macOS app builds
-    set(SUNSHINE_ASSETS_DIR "${CMAKE_PROJECT_NAME}.app/Contents/Resources/assets")
-    set(SUNSHINE_ASSETS_DIR_DEF "../Resources/assets")
+    set(LUMEN_ASSETS_DIR "${CMAKE_PROJECT_NAME}.app/Contents/Resources/assets")
+    set(LUMEN_ASSETS_DIR_DEF "../Resources/assets")
 endif()
 
 set(MACOS_LINK_DIRECTORIES
@@ -25,7 +25,7 @@ if(NOT BOOST_USE_STATIC AND NOT FETCH_CONTENT_BOOST_USED)
     ADD_DEFINITIONS(-DBOOST_LOG_DYN_LINK)
 endif()
 
-list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
+list(APPEND LUMEN_EXTERNAL_LIBRARIES
         ${APP_KIT_LIBRARY}
         ${APP_SERVICES_LIBRARY}
         ${AUDIO_TOOLBOX_LIBRARY}
@@ -38,7 +38,7 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${IOKIT_LIBRARY}
         ${VIDEO_TOOLBOX_LIBRARY})
 
-set(APPLE_PLIST_TEMPLATE "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/build/Info.plist.in")
+set(APPLE_PLIST_TEMPLATE "${LUMEN_SOURCE_ASSETS_DIR}/macos/build/Info.plist.in")
 set(APPLE_PLIST_FILE "${CMAKE_BINARY_DIR}/Info.plist")
 configure_file("${APPLE_PLIST_TEMPLATE}" "${APPLE_PLIST_FILE}" @ONLY)
 

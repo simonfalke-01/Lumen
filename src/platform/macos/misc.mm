@@ -114,32 +114,7 @@ namespace platf {
       homedir = getpwuid(geteuid())->pw_dir;
     }
 
-    static std::once_flag migration_flag;
-    static fs::path config_path;
-    std::call_once(migration_flag, [homedir]() {
-      config_path = fs::path {homedir} / ".config/lumen"sv;
-      const auto legacy_path = fs::path {homedir} / ".config/sunshine"sv;
-
-      bool migrate_config = true;
-      if (const char *migrate_envvar = std::getenv("LUMEN_MIGRATE_CONFIG")) {
-        migrate_config = std::string_view {migrate_envvar} == "1"sv;
-      } else if (const char *migrate_envvar = std::getenv("SUNSHINE_MIGRATE_CONFIG")) {
-        migrate_config = std::string_view {migrate_envvar} == "1"sv;
-      }
-
-      std::error_code ec;
-      if (migrate_config && fs::exists(legacy_path, ec) && !fs::exists(config_path, ec)) {
-        std::cout << "Copying legacy Sunshine config from "sv << legacy_path << " to "sv << config_path << std::endl;
-        std::string migration_error;
-        if (!config::copy_legacy_config_directory(legacy_path.string(), config_path.string(), migration_error)) {
-          std::cerr << "Legacy config copy failed: " << migration_error << std::endl;
-        }
-      } else if (migrate_config && fs::exists(legacy_path, ec) && fs::exists(config_path, ec)) {
-        std::cerr << "Config exists in both "sv << legacy_path << " and "sv << config_path << ". Using "sv << config_path << " for Lumen config" << std::endl;
-      }
-    });
-
-    return config_path;
+    return fs::path {homedir} / ".config/lumen"sv;
   }
 
   using ifaddr_t = util::safe_ptr<ifaddrs, freeifaddrs>;
@@ -324,7 +299,7 @@ namespace platf {
   void restart() {
     // Gracefully clean up and restart ourselves instead of exiting
     atexit(restart_on_exit);
-    lifetime::exit_sunshine(0, true);
+    lifetime::exit_lumen(0, true);
   }
 
   bool request_process_group_exit(std::uintptr_t native_handle) {

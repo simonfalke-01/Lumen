@@ -594,7 +594,7 @@ namespace platf {
   tapDescription.name = uniqueName;
   tapDescription.UUID = uniqueUUID;
 
-  const bool publicAudioTap = std::getenv("LUMEN_PUBLIC_AUDIO_TAP") || std::getenv("SUNSHINE_PUBLIC_AUDIO_TAP");
+  const bool publicAudioTap = std::getenv("LUMEN_PUBLIC_AUDIO_TAP");
   if (publicAudioTap) {
     // Shows the tap in Audio MIDI Setup and HALLab where it's easier to inspect
     BOOST_LOG(debug) << "Setting tap as public (visible in Audio MIDI Setup and HALLab)"sv;
@@ -633,7 +633,7 @@ namespace platf {
 
 - (OSStatus)createAggregateDeviceWithTapDescription:(CATapDescription *)tapDescription sampleRate:(UInt32)sampleRate frameSize:(UInt32)frameSize {
   using namespace std::literals;
-  const bool publicAudioTap = std::getenv("LUMEN_PUBLIC_AUDIO_TAP") || std::getenv("SUNSHINE_PUBLIC_AUDIO_TAP");
+  const bool publicAudioTap = std::getenv("LUMEN_PUBLIC_AUDIO_TAP");
 
   // Get Tap UUID string properly
   NSString *tapUIDString = nil;

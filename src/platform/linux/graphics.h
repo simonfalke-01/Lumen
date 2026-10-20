@@ -20,15 +20,15 @@
 #include "src/video_colorspace.h"
 
 /**
- * @def SUNSHINE_STRINGIFY_HELPER(x)
- * @brief Macro for SUNSHINE STRINGIFY HELPER.
+ * @def LUMEN_STRINGIFY_HELPER(x)
+ * @brief Macro for LUMEN STRINGIFY HELPER.
  */
-#define SUNSHINE_STRINGIFY_HELPER(x) #x
+#define LUMEN_STRINGIFY_HELPER(x) #x
 /**
- * @def SUNSHINE_STRINGIFY(x)
- * @brief Macro for SUNSHINE STRINGIFY.
+ * @def LUMEN_STRINGIFY(x)
+ * @brief Macro for LUMEN STRINGIFY.
  */
-#define SUNSHINE_STRINGIFY(x) SUNSHINE_STRINGIFY_HELPER(x)
+#define LUMEN_STRINGIFY(x) LUMEN_STRINGIFY_HELPER(x)
 /**
  * @def gl_drain_errors_helper(x)
  * @brief Macro for gl drain errors helper.
@@ -38,7 +38,7 @@
  * @def gl_drain_errors
  * @brief Macro for gl drain errors.
  */
-#define gl_drain_errors gl_drain_errors_helper(__FILE__ ":" SUNSHINE_STRINGIFY(__LINE__))
+#define gl_drain_errors gl_drain_errors_helper(__FILE__ ":" LUMEN_STRINGIFY(__LINE__))
 
 /**
  * @brief Release the native resource held by the RAII wrapper.
@@ -742,7 +742,7 @@ namespace egl {
      * @param colorspace Colorimetry information used for conversion or encoding.
      * @param is_yuv444 Is YUV444.
      */
-    void apply_colorspace(const video::sunshine_colorspace_t &colorspace, bool is_yuv444);
+    void apply_colorspace(const video::stream_colorspace_t &colorspace, bool is_yuv444);
 
     // The first texture is the monitor image.
     // The second texture is the cursor image

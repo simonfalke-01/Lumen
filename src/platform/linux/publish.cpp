@@ -398,7 +398,7 @@ namespace platf::publish {
   avahi::EntryGroup *group = nullptr;  ///< Active Avahi entry group that owns the published service.
 
   poll_t poll;  ///< Avahi poll loop used while the service is published.
-  client_t client;  ///< Avahi client used to register the Sunshine service.
+  client_t client;  ///< Avahi client used to register the Lumen service.
 
   ptr_t<char> name;  ///< Current service name, updated when Avahi reports a collision.
   std::vector<service_t> services;  ///< Exact legacy/modern records committed in one entry group.
@@ -440,7 +440,7 @@ namespace platf::publish {
   }
 
   /**
-   * @brief Publish Sunshine's mDNS service through Avahi.
+   * @brief Publish Lumen's mDNS service through Avahi.
    */
   void create_services(avahi::Client *c) {
     int ret;

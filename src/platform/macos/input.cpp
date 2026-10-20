@@ -62,20 +62,20 @@ namespace platf {
 
   // A struct to hold a Windows keycode to Mac virtual keycode mapping.
   /**
-   * @brief Mapping from Sunshine key symbols to macOS virtual key codes.
+   * @brief Mapping from Lumen key symbols to macOS virtual key codes.
    */
   struct KeyCodeMap {
-    int win_keycode;  ///< Sunshine/Windows virtual key code received from the client.
+    int win_keycode;  ///< Lumen/Windows virtual key code received from the client.
     int mac_keycode;  ///< macOS virtual key code sent through CoreGraphics.
   };
 
   // Customized less operator for using std::lower_bound() on a KeyCodeMap array.
   /**
-   * @brief Order key mappings by Sunshine key code for binary search.
+   * @brief Order key mappings by Lumen key code for binary search.
    *
    * @param a Left-hand mapping being compared.
    * @param b Right-hand mapping being compared.
-   * @return True when `a` has a lower Sunshine key code than `b`.
+   * @return True when `a` has a lower Lumen key code than `b`.
    */
   bool operator<(const KeyCodeMap &a, const KeyCodeMap &b) {
     return a.win_keycode < b.win_keycode;
@@ -257,10 +257,10 @@ const KeyCodeMap kKeyCodesMap[] = {
   // clang-format on
 
   /**
-   * @brief Translate a platform keycode to a Sunshine key symbol.
+   * @brief Translate a platform keycode to a Lumen key symbol.
    *
    * @param keycode Platform keycode being translated or emitted.
-   * @return Sunshine key symbol, or 0 when the keycode is unmapped.
+   * @return Lumen key symbol, or 0 when the keycode is unmapped.
    */
   int keysym(int keycode) {
     KeyCodeMap key_map {};
@@ -291,7 +291,7 @@ const KeyCodeMap kKeyCodesMap[] = {
   /**
    * @brief Resolve the CoreGraphics modifier masks associated with a key code.
    *
-   * @param key Sunshine key code that may represent a modifier key.
+   * @param key Lumen key code that may represent a modifier key.
    * @param flags Output masks for the matching CoreGraphics modifier.
    * @return True when modifier flags were found for the key.
    */

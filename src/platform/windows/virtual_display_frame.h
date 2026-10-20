@@ -13,6 +13,7 @@
 #include <optional>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 // local includes
 #include "src/platform/common.h"
@@ -759,6 +760,39 @@ namespace platf::virtual_display {
    * @param timeout Bounded driver-resource publication/import deadline.
    * @return Healthy source, or empty when any capability/hardware/import gate fails.
    */
+  /** @brief One client-drawable cursor image in premultiplied RGBA. */
+  struct cursor_image_t {
+    std::uint32_t width {};  ///< Width in pixels.
+    std::uint32_t height {};  ///< Height in pixels.
+    std::uint32_t hot_x {};  ///< Hotspot X from the top-left pixel.
+    std::uint32_t hot_y {};  ///< Hotspot Y from the top-left pixel.
+    std::vector<std::uint8_t> rgba;  ///< width * height premultiplied RGBA pixels.
+  };
+
+  /** @brief Latest hardware-cursor visibility and shape published by the VDD. */
+  struct cursor_snapshot_t {
+    std::uint64_t sequence {};  ///< Changes with visibility or shape; zero before the first report.
+    bool visible {};  ///< Whether Windows currently shows the cursor.
+    std::shared_ptr<const cursor_image_t> image;  ///< Latest shape, or null before the first shape.
+    std::uint8_t system_cursor {};  ///< Standard Windows cursor kind (LSP numbering), or 0 for an app-defined shape.
+  };
+
+  /** @brief Hardware-cursor feed for one VDD generation started with `hardware_cursor`. */
+  class cursor_source_t {
+  public:
+    virtual ~cursor_source_t() = default;
+
+    /** @brief Return the newest cursor state without blocking on the driver. */
+    [[nodiscard]] virtual cursor_snapshot_t latest() const = 0;
+  };
+
+  /**
+   * @brief Open the hardware-cursor feed of an active VDD selection.
+   * @param selection Active selection whose generation requested a hardware cursor.
+   * @return Running feed, or null when the driver refuses it.
+   */
+  [[nodiscard]] std::shared_ptr<cursor_source_t> make_system_cursor_source(const stream_selection_t &selection);
+
   [[nodiscard]] std::shared_ptr<frame_source_t> make_system_frame_source(
     const stream_selection_t &selection,
     std::chrono::milliseconds timeout

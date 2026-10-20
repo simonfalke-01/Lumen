@@ -807,6 +807,7 @@ namespace lumen::lsp::runtime {
         {4, cbor::Value {application.running}},
         {5, cbor::Value {application.resume_available}},
         {6, application.process_generation},
+        {7, static_cast<std::uint8_t>(application.kind)},
       });
     }
     return encode({{1, wire_version}, {2, static_cast<std::uint8_t>(ControlStatus::success)}, {3, std::move(values)}});
@@ -835,7 +836,7 @@ namespace lumen::lsp::runtime {
   }
 
   std::expected<StartRequestPayload, ControlWireError> decode_start(const std::span<const std::uint8_t> payload) {
-    const auto map = decode_map(payload, 16);
+    const auto map = decode_map(payload, 17);
     StartRequestPayload result;
     const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
     const auto *application_intent = map ? std::get_if<cbor::Value::Map>(&(*map)[1].second.storage) : nullptr;
@@ -860,6 +861,7 @@ namespace lumen::lsp::runtime {
     const auto *decoder_surfaces = map ? unsigned_value((*map)[13].second) : nullptr;
     const auto *render_mailbox = map ? unsigned_value((*map)[14].second) : nullptr;
     const auto *capture_to_present = map ? unsigned_value((*map)[15].second) : nullptr;
+    const auto *cursor_mode = map ? unsigned_value((*map)[16].second) : nullptr;
     if (!map || version == nullptr || *version != wire_version || application_intent == nullptr ||
         application_intent->size() != 2 || (*application_intent)[0].first != 1 ||
         (*application_intent)[1].first != 2 || application == nullptr || application->empty() ||
@@ -877,7 +879,8 @@ namespace lumen::lsp::runtime {
         render_mailbox == nullptr || *render_mailbox != 1 ||
         capture_to_present == nullptr || *capture_to_present == 0 ||
         *capture_to_present > video_maximum_frame_age_microseconds ||
-        *capture_to_present > std::numeric_limits<std::uint32_t>::max()) {
+        *capture_to_present > std::numeric_limits<std::uint32_t>::max() ||
+        cursor_mode == nullptr || *cursor_mode > static_cast<std::uint8_t>(CursorMode::client)) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     result.audio_offers.reserve(offers->size());
@@ -1031,6 +1034,7 @@ namespace lumen::lsp::runtime {
       .decoder_surfaces = static_cast<std::uint8_t>(*decoder_surfaces),
       .render_mailbox = static_cast<std::uint8_t>(*render_mailbox),
       .maximum_capture_to_present_microseconds = static_cast<std::uint32_t>(*capture_to_present),
+      .cursor_mode = static_cast<CursorMode>(*cursor_mode),
     };
     return result;
   }
@@ -1844,6 +1848,167 @@ namespace lumen::lsp::runtime {
       {3, bytes(payload.object_id)},
       {4, payload.next_offset},
       {5, payload.total_length},
+    });
+  }
+}  // namespace lumen::lsp::runtime
+
+namespace lumen::lsp::runtime {
+  bool valid_cursor_shape(const std::span<const std::uint8_t> shape) noexcept {
+    if (shape.size() < cursor_shape_header_bytes || shape.size() > maximum_cursor_shape_bytes) {
+      return false;
+    }
+    const auto field = [&](const std::size_t offset) {
+      return static_cast<std::uint32_t>(shape[offset]) << 8U | shape[offset + 1];
+    };
+    const auto width = field(0);
+    const auto height = field(2);
+    return width != 0 && height != 0 && width <= maximum_cursor_dimension && height <= maximum_cursor_dimension &&
+           field(4) < width && field(6) < height &&
+           shape.size() == cursor_shape_header_bytes + static_cast<std::size_t>(width) * height * 4U;
+  }
+
+  std::expected<CursorStatePayload, ControlWireError> decode_cursor_state(const std::span<const std::uint8_t> payload) {
+    const auto map = decode_map(payload, 9);
+    CursorStatePayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *sequence = map ? unsigned_value((*map)[2].second) : nullptr;
+    const auto *visible = map ? boolean_value((*map)[3].second) : nullptr;
+    const auto *shape_length = map ? unsigned_value((*map)[5].second) : nullptr;
+    const auto *system_cursor = map ? unsigned_value((*map)[8].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || system_cursor == nullptr ||
+        *system_cursor > maximum_system_cursor ||
+        !fixed_bytes((*map)[1].second, result.session_id) || is_zero(result.session_id) ||
+        sequence == nullptr || *sequence == 0 || visible == nullptr ||
+        shape_length == nullptr || *shape_length > maximum_cursor_shape_bytes) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.sequence = *sequence;
+    result.visible = *visible;
+    result.shape_length = static_cast<std::uint32_t>(*shape_length);
+    result.system_cursor = static_cast<std::uint8_t>(*system_cursor);
+    if (!null_value((*map)[4].second)) {
+      Digest256 digest;
+      if (!fixed_bytes((*map)[4].second, digest) || is_zero(digest)) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      result.shape_sha256 = digest;
+    }
+    const auto *inline_shape = byte_string((*map)[6].second);
+    if (result.shape_length == 0) {
+      if (!null_value((*map)[6].second) || !null_value((*map)[7].second)) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      return result;
+    }
+    if (!result.shape_sha256) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    if (result.shape_length <= maximum_inline_cursor_shape_bytes) {
+      if (inline_shape == nullptr || inline_shape->size() != result.shape_length || !valid_cursor_shape(*inline_shape) ||
+          !null_value((*map)[7].second)) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      result.inline_shape = *inline_shape;
+      return result;
+    }
+    Identifier128 object_id;
+    if (!null_value((*map)[6].second) || !fixed_bytes((*map)[7].second, object_id) || is_zero(object_id)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.object_id = object_id;
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_cursor_state(const CursorStatePayload &payload) {
+    if (is_zero(payload.session_id) || payload.sequence == 0 || payload.shape_length > maximum_cursor_shape_bytes ||
+        (payload.shape_sha256 && is_zero(*payload.shape_sha256)) || payload.system_cursor > maximum_system_cursor) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    const auto shape_hash = payload.shape_sha256 ? cbor::Value {bytes(*payload.shape_sha256)} : cbor::Value {cbor::Null {}};
+    if (payload.shape_length == 0) {
+      if (!payload.inline_shape.empty() || payload.object_id) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      return encode({
+        {1, wire_version},
+        {2, bytes(payload.session_id)},
+        {3, payload.sequence},
+        {4, cbor::Value {payload.visible}},
+        {5, shape_hash},
+        {6, std::uint64_t {0}},
+        {7, cbor::Value {cbor::Null {}}},
+        {8, cbor::Value {cbor::Null {}}},
+        {9, std::uint64_t {payload.system_cursor}},
+      });
+    }
+    if (!payload.shape_sha256) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    if (payload.shape_length <= maximum_inline_cursor_shape_bytes) {
+      if (payload.inline_shape.size() != payload.shape_length || !valid_cursor_shape(payload.inline_shape) ||
+          payload.object_id) {
+        return std::unexpected(ControlWireError::invalid_field);
+      }
+      return encode({
+        {1, wire_version},
+        {2, bytes(payload.session_id)},
+        {3, payload.sequence},
+        {4, cbor::Value {payload.visible}},
+        {5, shape_hash},
+        {6, payload.shape_length},
+        {7, cbor::Value::Bytes {payload.inline_shape}},
+        {8, cbor::Value {cbor::Null {}}},
+        {9, std::uint64_t {payload.system_cursor}},
+      });
+    }
+    if (!payload.inline_shape.empty() || !payload.object_id || is_zero(*payload.object_id)) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, bytes(payload.session_id)},
+      {3, payload.sequence},
+      {4, cbor::Value {payload.visible}},
+      {5, shape_hash},
+      {6, payload.shape_length},
+      {7, cbor::Value {cbor::Null {}}},
+      {8, bytes(*payload.object_id)},
+      {9, std::uint64_t {payload.system_cursor}},
+    });
+  }
+
+  std::expected<CursorStateResponsePayload, ControlWireError> decode_cursor_state_response(
+    const std::span<const std::uint8_t> payload
+  ) {
+    const auto map = decode_map(payload, 5);
+    CursorStateResponsePayload result;
+    const auto *version = map ? unsigned_value((*map)[0].second) : nullptr;
+    const auto *status = map ? unsigned_value((*map)[1].second) : nullptr;
+    const auto *sequence = map ? unsigned_value((*map)[3].second) : nullptr;
+    const auto *shape_present = map ? boolean_value((*map)[4].second) : nullptr;
+    if (!map || version == nullptr || *version != wire_version || status == nullptr ||
+        *status != static_cast<std::uint8_t>(ControlStatus::success) ||
+        !fixed_bytes((*map)[2].second, result.session_id) || is_zero(result.session_id) ||
+        sequence == nullptr || *sequence == 0 || shape_present == nullptr) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    result.sequence = *sequence;
+    result.shape_present = *shape_present;
+    return result;
+  }
+
+  std::expected<std::vector<std::uint8_t>, ControlWireError> encode_cursor_state_response(
+    const CursorStateResponsePayload &payload
+  ) {
+    if (payload.status != ControlStatus::success || is_zero(payload.session_id) || payload.sequence == 0) {
+      return std::unexpected(ControlWireError::invalid_field);
+    }
+    return encode({
+      {1, wire_version},
+      {2, static_cast<std::uint8_t>(payload.status)},
+      {3, bytes(payload.session_id)},
+      {4, payload.sequence},
+      {5, cbor::Value {payload.shape_present}},
     });
   }
 }  // namespace lumen::lsp::runtime

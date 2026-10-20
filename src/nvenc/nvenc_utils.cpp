@@ -35,9 +35,9 @@ namespace NVENC_NAMESPACE {
 #endif
 
   /**
-   * @brief Convert a Sunshine pixel format to the matching NVENC buffer format.
+   * @brief Convert a Lumen pixel format to the matching NVENC buffer format.
    */
-  NV_ENC_BUFFER_FORMAT nvenc_format_from_sunshine_format(platf::pix_fmt_e format) {
+  NV_ENC_BUFFER_FORMAT nvenc_format_from_stream_format(platf::pix_fmt_e format) {
     switch (format) {
       case platf::pix_fmt_e::nv12:
         return NV_ENC_BUFFER_FORMAT_NV12;
@@ -60,12 +60,12 @@ namespace NVENC_NAMESPACE {
   }
 
   /**
-   * @brief Convert Sunshine colorspace metadata to NVENC VUI metadata.
+   * @brief Convert Lumen colorspace metadata to NVENC VUI metadata.
    */
-  nvenc_colorspace_t nvenc_colorspace_from_sunshine_colorspace(const video::sunshine_colorspace_t &sunshine_colorspace) {
+  nvenc_colorspace_t nvenc_colorspace_from_stream_colorspace(const video::stream_colorspace_t &stream_colorspace) {
     nvenc_colorspace_t colorspace;
 
-    switch (sunshine_colorspace.colorspace) {
+    switch (stream_colorspace.colorspace) {
       case video::colorspace_e::rec601:
         // Rec. 601
         colorspace.primaries = NV_ENC_VUI_COLOR_PRIMARIES_SMPTE170M;
@@ -83,7 +83,7 @@ namespace NVENC_NAMESPACE {
       case video::colorspace_e::bt2020sdr:
         // Rec. 2020
         colorspace.primaries = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
-        assert(sunshine_colorspace.bit_depth == 10);
+        assert(stream_colorspace.bit_depth == 10);
         colorspace.tranfer_function = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT2020_10;
         colorspace.matrix = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
         break;
@@ -91,20 +91,20 @@ namespace NVENC_NAMESPACE {
       case video::colorspace_e::bt2020:
         // Rec. 2020 with ST 2084 perceptual quantizer
         colorspace.primaries = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
-        assert(sunshine_colorspace.bit_depth == 10);
+        assert(stream_colorspace.bit_depth == 10);
         colorspace.tranfer_function = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
         colorspace.matrix = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
         break;
 
       case video::colorspace_e::bt2020hlg:
         colorspace.primaries = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
-        assert(sunshine_colorspace.bit_depth == 10);
+        assert(stream_colorspace.bit_depth == 10);
         colorspace.tranfer_function = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_ARIB_STD_B67;
         colorspace.matrix = NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
         break;
     }
 
-    colorspace.full_range = sunshine_colorspace.full_range;
+    colorspace.full_range = stream_colorspace.full_range;
 
     return colorspace;
   }

@@ -42,7 +42,7 @@ namespace platf {
      * @brief Initialize zero-copy NV12 encoding for an AVFoundation display.
      *
      * @param display Display object or identifier associated with the operation.
-     * @param pix_fmt Sunshine pixel format to convert or allocate for.
+     * @param pix_fmt Lumen pixel format to convert or allocate for.
      * @param resolution_fn Callback used to resize the AVFoundation capture output.
      * @param pixel_format_fn Pixel format.
      * @return 0 on success; nonzero or negative platform status on failure.

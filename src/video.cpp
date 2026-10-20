@@ -94,7 +94,7 @@ namespace video {
         config::video.encoder,
         config::video.hevc_mode,
         config::video.av1_mode,
-        config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE],
+        config::general.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE],
         false,
         std::nullopt,
       };
@@ -451,7 +451,7 @@ namespace video {
   }
 
   void avcodec_software_encode_device_t::apply_colorspace() {
-    auto avcodec_colorspace = avcodec_colorspace_from_sunshine_colorspace(colorspace);
+    auto avcodec_colorspace = avcodec_colorspace_from_stream_colorspace(colorspace);
     sws_setColorspaceDetails(sws.get(), sws_getCoefficients(SWS_CS_DEFAULT), 0, sws_getCoefficients(avcodec_colorspace.software_format), avcodec_colorspace.range - 1, 0, 1 << 16, 1 << 16);
   }
 
@@ -1166,7 +1166,7 @@ namespace video {
         {"async_depth"s, 1},
         {"skip_frame"s, 0},
         {"log_to_dbg"s, []() {
-           return config::sunshine.min_log_level < 2 ? 1 : 0;
+           return config::general.min_log_level < 2 ? 1 : 0;
          }},
         {"preencode"s, &config::video.amd.amd_preanalysis},
         {"quality"s, &config::video.amd.amd_quality_av1},
@@ -1190,7 +1190,7 @@ namespace video {
         {"async_depth"s, 1},
         {"skip_frame"s, 0},
         {"log_to_dbg"s, []() {
-           return config::sunshine.min_log_level < 2 ? 1 : 0;
+           return config::general.min_log_level < 2 ? 1 : 0;
          }},
         {"gops_per_idr"s, 1},
         {"header_insertion_mode"s, "idr"s},
@@ -1230,7 +1230,7 @@ namespace video {
         {"async_depth"s, 1},
         {"frame_skipping"s, 0},
         {"log_to_dbg"s, []() {
-           return config::sunshine.min_log_level < 2 ? 1 : 0;
+           return config::general.min_log_level < 2 ? 1 : 0;
          }},
         {"preencode"s, &config::video.amd.amd_preanalysis},
         {"quality"s, &config::video.amd.amd_quality_h264},
@@ -1356,7 +1356,7 @@ namespace video {
     },
     {
       // x265's Info SEI is so long that it causes the IDR picture data to be
-      // kicked to the 2nd packet in the frame, breaking Moonlight's parsing logic.
+      // kicked to the 2nd packet in the frame, breaking the client's parsing logic.
       // It also looks like gop_size isn't passed on to x265, so we have to set
       // 'keyint=-1' in the parameters ourselves.
       {
@@ -1452,7 +1452,7 @@ namespace video {
     LIMITED_GOP_SIZE | PARALLEL_ENCODING | NO_RC_BUF_LIMIT
   };
 
-  #ifdef SUNSHINE_BUILD_VULKAN
+  #ifdef LUMEN_BUILD_VULKAN
   encoder_t vulkan {
     "vulkan"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
@@ -1521,7 +1521,7 @@ namespace video {
     },
     LIMITED_GOP_SIZE | PARALLEL_ENCODING
   };
-  #endif  // SUNSHINE_BUILD_VULKAN
+  #endif  // LUMEN_BUILD_VULKAN
 #endif  // linux
 
 #ifdef __APPLE__
@@ -1578,7 +1578,7 @@ namespace video {
       // VideoToolbox on Apple Silicon produces all-IDR output when
       // ReferenceBufferCount=1 is set for H.264, causing massive bandwidth
       // inflation (~3x) and frame drops. HEVC and AV1 are unaffected and
-      // retain max_ref_frames=1. See LizardByte/Sunshine#5013.
+      // retain max_ref_frames=1. See LizardByte/Lumen#5013.
       {
         {"allow_sw"s, &config::video.vt.vt_allow_sw},
         {"require_sw"s, &config::video.vt.vt_require_sw},
@@ -1609,7 +1609,7 @@ namespace video {
     &mediafoundation,
 #endif
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
-  #ifdef SUNSHINE_BUILD_VULKAN
+  #ifdef LUMEN_BUILD_VULKAN
     &vulkan,
   #endif
     &vaapi,
@@ -1694,6 +1694,15 @@ namespace video {
       .reference_invalidation = native_nvenc && last_encoder_probe_supported_ref_frames_invalidation,
       .hlg = hlg,
     };
+  }
+
+  std::optional<encoder_probe_device_identity_t> last_encoder_probe_device_identity() {
+    const auto probe_lock = std::lock_guard(encoder_probe_mutex);
+    const auto &committed_identity = chosen_encoder_probe_cache.identity();
+    if (!committed_identity || !committed_identity->device_identity) {
+      return std::nullopt;
+    }
+    return committed_identity->device_identity;
   }
 
   std::optional<encoder_probe_device_identity_t> active_encoder_probe_device_identity() {
@@ -2469,7 +2478,7 @@ namespace video {
 
       ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
-      auto avcodec_colorspace = avcodec_colorspace_from_sunshine_colorspace(colorspace);
+      auto avcodec_colorspace = avcodec_colorspace_from_stream_colorspace(colorspace);
 
       ctx->color_range = avcodec_colorspace.range;
       ctx->color_primaries = avcodec_colorspace.primaries;
@@ -2816,7 +2825,7 @@ namespace video {
     // This will move expensive processing off the encoder thread to allow us
     // to restart encoding as soon as possible. For cases where the NVENC driver
     // hang occurs, this thread may probably never exit, but it will allow
-    // streaming to continue without requiring a full restart of Sunshine.
+    // streaming to continue without requiring a full restart of Lumen.
     auto fail_guard = util::fail_guard([&encoder, &session] {
       if (encoder.flags & ASYNC_TEARDOWN) {
         std::jthread encoder_teardown_thread {[session = std::move(session)]() mutable {
@@ -2934,11 +2943,11 @@ namespace video {
 
       // Break out of the encoding loop if any of the following are true:
       // a) The stream is ending
-      // b) Sunshine is quitting
+      // b) Lumen is quitting
       // c) The capture side is waiting to reinit and we've encoded at least one frame
       //
       // If we have to reinit before we have received any captured frames, we will encode
-      // the blank dummy frame just to let Moonlight know that we're alive.
+      // the blank dummy frame just to let GameStream know that we're alive.
       //
       // Ensure that this check occurs as close as possible to the encode call to prevent packets
       // in flight after encoder teardown.
@@ -3396,7 +3405,7 @@ namespace video {
 
     // Encoding and capture takes place on this thread
     platf::set_thread_name("video::capture_sync");
-    platf::adjust_thread_priority(platf::thread_priority_e::high);
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     std::vector<std::string> display_names;
     int display_p = -1;
@@ -3441,8 +3450,8 @@ namespace video {
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
 
-    // Encoding takes place on this thread
-    platf::adjust_thread_priority(platf::thread_priority_e::high);
+    // Encoding takes place on this thread; a preempted encode is a frame-latency spike.
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     auto wait_for_display_ready = [&]() {
       while (!shutdown_event->peek() && images->running()) {
@@ -4069,8 +4078,8 @@ namespace video {
       test_yuv444_hdr(encoder.av1, 2);
     }
 
-    encoder.h264[encoder_t::VUI_PARAMETERS] = encoder.h264[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
-    encoder.hevc[encoder_t::VUI_PARAMETERS] = encoder.hevc[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
+    encoder.h264[encoder_t::VUI_PARAMETERS] = encoder.h264[encoder_t::VUI_PARAMETERS] && !config::general.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
+    encoder.hevc[encoder_t::VUI_PARAMETERS] = encoder.hevc[encoder_t::VUI_PARAMETERS] && !config::general.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
 
     if (!encoder.h264[encoder_t::VUI_PARAMETERS]) {
       BOOST_LOG(warning) << encoder.name << ": h264 missing sps->vui parameters"sv;
@@ -4107,6 +4116,30 @@ namespace video {
         << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - probe_start).count()
         << " ms"sv;
       return 0;
+    }
+
+    // A display output appearing or disappearing (the Lumen virtual display at every stream start)
+    // invalidates the cache, but encoder support belongs to the adapter. When the adapter, driver,
+    // and encoder policy are unchanged, rebind the cache to the current output instead of running
+    // an exhaustive probe that stalls stream startup and later forces a capture restart.
+    if (const auto &cached = chosen_encoder_probe_cache.identity();
+        chosen_encoder != nullptr && !(chosen_encoder->flags & ALWAYS_REPROBE) && cached &&
+        cached->device_identity && probe_identity.device_identity &&
+        cached->device_identity->adapter_luid == probe_identity.device_identity->adapter_luid &&
+        cached->device_identity->vendor_id == probe_identity.device_identity->vendor_id &&
+        cached->device_identity->device_id == probe_identity.device_identity->device_id &&
+        cached->device_identity->driver_version == probe_identity.device_identity->driver_version &&
+        cached->adapter_name == probe_identity.adapter_name && cached->raw_output_name == probe_identity.raw_output_name &&
+        cached->capture == probe_identity.capture && cached->encoder == probe_identity.encoder &&
+        cached->hevc_mode == probe_identity.hevc_mode && cached->av1_mode == probe_identity.av1_mode &&
+        cached->force_video_header_replace == probe_identity.force_video_header_replace) {
+      auto rebound = probe_identity;
+      if (chosen_encoder_probe_cache.commit(std::move(rebound))) {
+        chosen_codec_initialization_cache.clear();
+        BOOST_LOG(info) << "Encoder probe reused for adapter output ["sv
+                        << probe_identity.device_identity->output_name << "]: same adapter and driver"sv;
+        return 0;
+      }
     }
 
     // The display-device safety check is only required before an actual probe.
@@ -4406,7 +4439,7 @@ namespace video {
     return hw_device_buf;
   }
 
-#ifdef SUNSHINE_BUILD_VULKAN
+#ifdef LUMEN_BUILD_VULKAN
   using vulkan_init_avcodec_hardware_input_buffer_fn = int (*)(platf::avcodec_encode_device_t *encode_device, AVBufferRef **hw_device_buf);
 
   util::Either<avcodec_buffer_t, int> vulkan_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *encode_device) {
@@ -4486,7 +4519,7 @@ void do_nothing(void *) {
 
 namespace video {
   /**
-   * @brief Create an FFmpeg D3D11VA hardware device from Sunshine's DXGI device.
+   * @brief Create an FFmpeg D3D11VA hardware device from Lumen's DXGI device.
    */
   util::Either<avcodec_buffer_t, int> dxgi_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *encode_device) {
     avcodec_buffer_t ctx_buf {av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA)};
@@ -4569,7 +4602,7 @@ namespace video {
         return platf::mem_type_e::dxgi;
       case AV_HWDEVICE_TYPE_VAAPI:
         return platf::mem_type_e::vaapi;
-#ifdef SUNSHINE_BUILD_VULKAN
+#ifdef LUMEN_BUILD_VULKAN
       case AV_HWDEVICE_TYPE_VULKAN:
         return platf::mem_type_e::vulkan;
 #endif

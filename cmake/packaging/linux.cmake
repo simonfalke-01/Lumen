@@ -1,27 +1,27 @@
 # linux specific packaging
 
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/assets/"
-        DESTINATION "${SUNSHINE_ASSETS_DIR}")
+install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/linux/assets/"
+        DESTINATION "${LUMEN_ASSETS_DIR}")
 
 # copy assets (excluding shaders) to build directory, for running without install
-file(COPY "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/assets/"
+file(COPY "${LUMEN_SOURCE_ASSETS_DIR}/linux/assets/"
         DESTINATION "${CMAKE_BINARY_DIR}/assets"
         PATTERN "shaders" EXCLUDE)
 # use symbolic link for shaders directory
-file(CREATE_LINK "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/assets/shaders"
+file(CREATE_LINK "${LUMEN_SOURCE_ASSETS_DIR}/linux/assets/shaders"
         "${CMAKE_BINARY_DIR}/assets/shaders" COPY_ON_ERROR SYMBOLIC)
 
-if(${SUNSHINE_BUILD_APPIMAGE} OR ${SUNSHINE_BUILD_FLATPAK})
-    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
-            DESTINATION "${SUNSHINE_ASSETS_DIR}/udev/rules.d")
-    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
-            DESTINATION "${SUNSHINE_ASSETS_DIR}/modules-load.d")
+if(${LUMEN_BUILD_APPIMAGE} OR ${LUMEN_BUILD_FLATPAK})
+    install(FILES "${LUMEN_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
+            DESTINATION "${LUMEN_ASSETS_DIR}/udev/rules.d")
+    install(FILES "${LUMEN_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
+            DESTINATION "${LUMEN_ASSETS_DIR}/modules-load.d")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
-            DESTINATION "${SUNSHINE_ASSETS_DIR}/systemd/user")
-elseif(${SUNSHINE_BUILD_HOMEBREW})
-    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
+            DESTINATION "${LUMEN_ASSETS_DIR}/systemd/user")
+elseif(${LUMEN_BUILD_HOMEBREW})
+    install(FILES "${LUMEN_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/udev/rules.d")
-    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
+    install(FILES "${LUMEN_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
             DESTINATION "${CMAKE_INSTALL_LIBDIR}/modules-load.d")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
             DESTINATION ".")
@@ -30,13 +30,13 @@ else()
     find_package(Udev)
 
     if(UDEV_FOUND)
-        install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
+        install(FILES "${LUMEN_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.rules"
                 DESTINATION "${UDEV_RULES_INSTALL_DIR}")
     endif()
     if(SYSTEMD_FOUND)
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/app-${PROJECT_FQDN}.service"
                 DESTINATION "${SYSTEMD_USER_UNIT_INSTALL_DIR}")
-        install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
+        install(FILES "${LUMEN_SOURCE_ASSETS_DIR}/linux/misc/60-lumen.conf"
                 DESTINATION "${SYSTEMD_MODULES_LOAD_DIR}")
     endif()
 endif()
@@ -50,8 +50,8 @@ set(CPACK_FREEBSD_PACKAGE_ORIGIN "misc/${CPACK_PACKAGE_NAME}")
 set(CPACK_FREEBSD_PACKAGE_LICENSE "GPLv3")
 
 # Post install
-set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/postinst")
-set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "${SUNSHINE_SOURCE_ASSETS_DIR}/linux/misc/postinst")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${LUMEN_SOURCE_ASSETS_DIR}/linux/misc/postinst")
+set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "${LUMEN_SOURCE_ASSETS_DIR}/linux/misc/postinst")
 
 # FreeBSD post install/deinstall scripts
 if(FREEBSD)
@@ -63,15 +63,15 @@ if(FREEBSD)
     # add the install/deinstall scripts, and repack the package. This ensures they are
     # recognized as package control scripts rather than installed files.
     set(CPACK_FREEBSD_PACKAGE_SCRIPTS
-        "${SUNSHINE_SOURCE_ASSETS_DIR}/bsd/misc/+POST_INSTALL"
-        "${SUNSHINE_SOURCE_ASSETS_DIR}/bsd/misc/+PRE_DEINSTALL"
+        "${LUMEN_SOURCE_ASSETS_DIR}/bsd/misc/+POST_INSTALL"
+        "${LUMEN_SOURCE_ASSETS_DIR}/bsd/misc/+PRE_DEINSTALL"
     )
     list(APPEND CPACK_POST_BUILD_SCRIPTS "${CMAKE_MODULE_PATH}/packaging/freebsd_custom_cpack.cmake")
 endif()
 
 # Apply setcap for RPM
 # https://github.com/coreos/rpm-ostree/discussions/5036#discussioncomment-10291071
-set(CPACK_RPM_USER_FILELIST "%caps(cap_sys_admin,cap_sys_nice+p) ${SUNSHINE_EXECUTABLE_PATH}")
+set(CPACK_RPM_USER_FILELIST "%caps(cap_sys_admin,cap_sys_nice+p) ${LUMEN_EXECUTABLE_PATH}")
 
 # Dependencies
 set(CPACK_DEB_COMPONENT_INSTALL ON)
@@ -142,14 +142,14 @@ set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_RPM_PACKAGE_AUTOREQ ON)
 
 # application icon
-install(FILES "${CMAKE_SOURCE_DIR}/sunshine.svg"
+install(FILES "${CMAKE_SOURCE_DIR}/lumen.svg"
         DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps"
         RENAME "${PROJECT_FQDN}.svg")
 
 # tray icon
-if(${SUNSHINE_TRAY} STREQUAL 1)
+if(${LUMEN_TRAY} STREQUAL 1)
     # Icons used by the Qt tray backend are no longer installed to the hicolor icon theme,
-    # because Qt6 will not allow icons not part of the theme... so we will use icons from our web directory instead
+    # because Qt6 will not allow icons not part of the theme, so the tray loads them from the assets directory
 
     if(TRAY_QT_VERSION EQUAL 6)
         set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
@@ -187,10 +187,10 @@ endif()
 # desktop file
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_FQDN}.desktop"
         DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/applications")
-if(NOT ${SUNSHINE_BUILD_APPIMAGE} AND NOT ${SUNSHINE_BUILD_FLATPAK})
+if(NOT ${LUMEN_BUILD_APPIMAGE} AND NOT ${LUMEN_BUILD_FLATPAK})
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_FQDN}.terminal.desktop"
             DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/applications")
-    if(${SUNSHINE_ENABLE_KWIN})
+    if(${LUMEN_ENABLE_KWIN})
         install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_FQDN}.kwin.desktop"
                 DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/applications")
     endif()

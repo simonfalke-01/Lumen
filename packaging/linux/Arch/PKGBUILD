@@ -142,15 +142,15 @@ build() {
       -D BUILD_DOCS=OFF
       -D BUILD_WERROR=ON
       -D CMAKE_INSTALL_PREFIX=/usr
-      -D SUNSHINE_EXECUTABLE_PATH=/usr/bin/lumen
-      -D SUNSHINE_ASSETS_DIR="share/lumen"
-      -D SUNSHINE_PUBLISHER_NAME='simonfalke'
-      -D SUNSHINE_PUBLISHER_WEBSITE='https://github.com/simonfalke-01/Lumen'
-      -D SUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/simonfalke-01/Lumen/issues'
+      -D LUMEN_EXECUTABLE_PATH=/usr/bin/lumen
+      -D LUMEN_ASSETS_DIR="share/lumen"
+      -D LUMEN_PUBLISHER_NAME='simonfalke'
+      -D LUMEN_PUBLISHER_WEBSITE='https://github.com/simonfalke-01/Lumen'
+      -D LUMEN_PUBLISHER_ISSUE_URL='https://github.com/simonfalke-01/Lumen/issues'
     )
 
     if [[ "${_use_cuda::1}" != "t" ]]; then
-      _cmake_options+=(-DSUNSHINE_ENABLE_CUDA=OFF -DCUDA_FAIL_ON_MISSING=OFF)
+      _cmake_options+=(-DLUMEN_ENABLE_CUDA=OFF -DCUDA_FAIL_ON_MISSING=OFF)
     else
       # If cuda has just been installed, its variables will not be available in the environment
       # therefore, set them manually to the expected values on Arch Linux
@@ -191,7 +191,7 @@ check() {
       export CXX="g++${_gcc_env_suffix}"
 
       cd "${srcdir}/build/tests"
-      ./test_sunshine --gtest_color=yes --gtest_output=xml:test_results.xml
+      ./test_lumen --gtest_color=yes --gtest_output=xml:test_results.xml
 
       # Generate coverage report
       # Run gcovr from the build directory (where all .gcda/.gcno files are)

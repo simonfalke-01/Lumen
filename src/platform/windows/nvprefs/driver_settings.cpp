@@ -269,7 +269,7 @@ namespace nvprefs {
     setting.version = NVDRS_SETTING_VER1;
     status = NvAPI_DRS_GetSetting(session_handle, profile_handle, PREFERRED_PSTATE_ID, &setting);
 
-    if (!get_nvprefs_options().sunshine_high_power_mode) {
+    if (!get_nvprefs_options().lumen_high_power_mode) {
       if (status == NVAPI_OK && setting.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION) {
         // User requested to not use high power mode for Lumen.exe,
         // remove the setting from application profile if it's been set previously

@@ -88,10 +88,10 @@ namespace {
   };
 
   /**
-   * @brief Expected mapping for one Moonlight mouse button transition.
+   * @brief Expected mapping for one GameStream mouse button transition.
    */
   struct mouse_button_case_t {
-    int button;  ///< Moonlight mouse button number.
+    int button;  ///< GameStream mouse button number.
     bool release;  ///< Whether the transition releases the button.
     DWORD flags;  ///< Expected Win32 mouse flags.
     DWORD data;  ///< Expected Win32 mouse data.

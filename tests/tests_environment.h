@@ -1,14 +1,14 @@
 /**
  * @file tests/tests_environment.h
- * @brief Declarations for SunshineEnvironment.
+ * @brief Declarations for LumenEnvironment.
  */
 #pragma once
 #include "tests_common.h"
 
-struct SunshineEnvironment: testing::Environment {
+struct LumenEnvironment: testing::Environment {
   void SetUp() override {
     mail::man = std::make_shared<safe::mail_raw_t>();
-    deinit_log = logging::init(0, "test_sunshine.log");
+    deinit_log = logging::init(0, "test_lumen.log");
   }
 
   void TearDown() override {

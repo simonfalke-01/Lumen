@@ -20,7 +20,7 @@ Umbra MUST capture or resample microphone audio to the negotiated format before 
 
 ## RTSP capability and setup
 
-The normative handshake order is `DESCRIBE`  to  optional microphone `SETUP`  to  `ANNOUNCE`, matching the existing Moonlight RTSP flow.
+The normative handshake order is `DESCRIBE`  to  optional microphone `SETUP`  to  `ANNOUNCE`, matching the existing GameStream RTSP flow.
 
 ### Lumen `DESCRIBE` capability
 
@@ -62,7 +62,7 @@ After accepting the `DESCRIBE` capability and before sending `ANNOUNCE`, Umbra s
 streamid=lumen-mic/1/0
 ```
 
-The request uses the same Moonlight UDP transport syntax as the existing GameStream flows:
+The request uses the same GameStream UDP transport syntax as the existing GameStream flows:
 
 ```http
 Transport: unicast;X-GS-ClientPort=<port>-<port+1>

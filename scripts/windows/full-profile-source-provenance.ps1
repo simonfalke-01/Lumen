@@ -54,8 +54,8 @@ function Test-FullProfileExcludedPath {
     $name = $segments[-1]
     return $name -eq '.git' -or
         $name -eq '.DS_Store' -or
-        $name -eq 'sunshine_state.json' -or
-        $name -like 'test_sunshine.log*' -or
+        $name -eq 'lumen_state.json' -or
+        $name -like 'test_lumen.log*' -or
         $name -like 'write_file_test_*.txt' -or
         $name -like '*.gcda' -or
         $name -like '*.gcno'

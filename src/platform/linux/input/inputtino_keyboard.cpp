@@ -41,7 +41,7 @@ namespace platf::keyboard {
   }
 
   /**
-   * A map of linux scan code -> Moonlight keyboard code
+   * A map of linux scan code -> GameStream keyboard code
    */
   static const std::map<short, short> key_mappings = {
     {KEY_BACKSPACE, 0x08},

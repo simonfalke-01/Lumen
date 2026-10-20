@@ -14,7 +14,7 @@ set(CPACK_PACKAGE_CONTACT "https://github.com/simonfalke-01/Lumen/issues")
 set(CPACK_PACKAGE_DESCRIPTION ${CMAKE_PROJECT_DESCRIPTION})
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/simonfalke-01/Lumen")
 set(CPACK_RESOURCE_FILE_LICENSE ${PROJECT_SOURCE_DIR}/LICENSE)
-set(CPACK_PACKAGE_ICON ${PROJECT_SOURCE_DIR}/sunshine.png)
+set(CPACK_PACKAGE_ICON ${PROJECT_SOURCE_DIR}/lumen.png)
 set(CPACK_PACKAGE_FILE_NAME
         "${CPACK_PACKAGE_NAME}-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_STRIP_FILES YES)
@@ -69,28 +69,21 @@ install(FILES "${CMAKE_SOURCE_DIR}/third-party/libvirtualhid/LICENSES/README.md"
         COMPONENT application)
 
 # install common assets
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/"
-        DESTINATION "${SUNSHINE_ASSETS_DIR}"
+install(DIRECTORY "${LUMEN_SOURCE_ASSETS_DIR}/common/assets/"
+        DESTINATION "${LUMEN_ASSETS_DIR}"
         PATTERN "web" EXCLUDE)
 # copy assets to build directory, for running without install
 file(GLOB_RECURSE ALL_ASSETS
-        RELATIVE "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/" "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/*")
+        RELATIVE "${LUMEN_SOURCE_ASSETS_DIR}/common/assets/" "${LUMEN_SOURCE_ASSETS_DIR}/common/assets/*")
 list(FILTER ALL_ASSETS EXCLUDE REGEX "^web/.*$")  # Filter out the web directory
 foreach(asset ${ALL_ASSETS})  # Copy assets to build directory, excluding the web directory
-    file(COPY "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/${asset}"
+    file(COPY "${LUMEN_SOURCE_ASSETS_DIR}/common/assets/${asset}"
             DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/assets")
 endforeach()
 
-# Copy the primary application icon into the built web assets for the system tray.
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web/images")
-configure_file(
-        "${CMAKE_SOURCE_DIR}/sunshine.svg"
-        "${CMAKE_CURRENT_BINARY_DIR}/assets/web/images/logo-sunshine.svg"
-        COPYONLY)
-
 # install built vite assets
 install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web"
-        DESTINATION "${SUNSHINE_ASSETS_DIR}")
+        DESTINATION "${LUMEN_ASSETS_DIR}")
 
 # platform specific packaging
 if(WIN32)

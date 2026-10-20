@@ -186,8 +186,8 @@ extern "C" {
   typedef struct LUMEN_VHID_ABSOLUTE_MOUSE_REPORT {
     uint8_t report_id;  ///< LUMEN_VHID_REPORT_ID_MOUSE_ABSOLUTE.
     uint8_t buttons;  ///< Complete buttons 1-5 snapshot; high bits must be zero.
-    uint16_t x;  ///< Absolute horizontal coordinate normalized to 0-65535.
-    uint16_t y;  ///< Absolute vertical coordinate normalized to 0-65535.
+    uint16_t x;  ///< Absolute horizontal coordinate normalized to 0-32767.
+    uint16_t y;  ///< Absolute vertical coordinate normalized to 0-32767.
     int16_t vertical_wheel;  ///< Relative vertical HID wheel detents.
     int16_t horizontal_wheel;  ///< Relative Consumer AC Pan HID detents.
   } LUMEN_VHID_ABSOLUTE_MOUSE_REPORT;

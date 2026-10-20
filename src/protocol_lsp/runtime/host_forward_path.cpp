@@ -122,6 +122,22 @@ namespace lumen::lsp::runtime {
       return lane == HostForwardLane::audio;
     }
 
+    /**
+     * @brief Wire rate for one frame's burst, above the controller's average rate.
+     *
+     * Pacing at the average media rate spreads every frame across its whole frame interval, so
+     * the last packet (and decode) lands most of a frame late. The controller still sets the
+     * encoder bitrate; only the per-frame burst drains faster, bounded to gigabit wire speed.
+     */
+    [[nodiscard]] constexpr std::uint64_t frame_burst_rate(const std::uint64_t pacing_bits_per_second) noexcept {
+      constexpr std::uint64_t burst_multiplier = 4;
+      constexpr std::uint64_t wire_ceiling_bits_per_second = 1'000'000'000;
+      if (pacing_bits_per_second >= wire_ceiling_bits_per_second / burst_multiplier) {
+        return std::max(pacing_bits_per_second, wire_ceiling_bits_per_second);
+      }
+      return pacing_bits_per_second * burst_multiplier;
+    }
+
   }  // namespace
 
   bool HostForwardPathConfig::valid() const noexcept {
@@ -187,7 +203,7 @@ namespace lumen::lsp::runtime {
     explicit Impl(HostForwardPathConfig config) noexcept:
         config_ {std::move(config)},
         pacer_ {{
-          .pacing_bits_per_second = config_.pacing_bits_per_second,
+          .pacing_bits_per_second = frame_burst_rate(config_.pacing_bits_per_second),
           .input_reserve_bits_per_second = 0,
           .path_datagram_bytes = static_cast<std::uint16_t>(effective_probe_ceiling(config_) + ip_udp_overhead(config_.peer)),
           .quantum_microseconds = 100,
@@ -361,7 +377,7 @@ namespace lumen::lsp::runtime {
         return false;
       }
       const pacer_config replacement {
-        .pacing_bits_per_second = pacing_bits_per_second,
+        .pacing_bits_per_second = frame_burst_rate(pacing_bits_per_second),
         .input_reserve_bits_per_second = 0,
         .path_datagram_bytes = static_cast<std::uint16_t>(probe_payload_ceiling_ + ip_udp_overhead(config_.peer)),
         .quantum_microseconds = 100,

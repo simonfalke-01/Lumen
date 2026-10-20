@@ -37,7 +37,7 @@
  * @def DEFAULT_APP_IMAGE_PATH
  * @brief Macro for DEFAULT APP IMAGE PATH.
  */
-#define DEFAULT_APP_IMAGE_PATH SUNSHINE_ASSETS_DIR "/box.png"
+#define DEFAULT_APP_IMAGE_PATH LUMEN_ASSETS_DIR "/box.png"
 
 namespace proc {
   /**
@@ -54,7 +54,7 @@ namespace proc {
    * @brief Populate per-session child-process variables from one launch request.
    *
    * `LUMEN_CLIENT_REFRESH_NUMERATOR` and `LUMEN_CLIENT_REFRESH_DENOMINATOR`
-   * preserve exact fractional refresh. Legacy `SUNSHINE_CLIENT_FPS` remains an
+   * preserve exact fractional refresh. Legacy `LUMEN_CLIENT_FPS` remains an
    * integer for existing application scripts.
    *
    * @param env Environment updated in place.
@@ -130,13 +130,13 @@ namespace proc {
 
   /**
    * pre_cmds -- guaranteed to be executed unless any of the commands fail.
-   * detached -- commands detached from Sunshine
+   * detached -- commands detached from Lumen
    * cmd -- Runs indefinitely until:
    *    No session is running and a different set of commands it to be executed
    *    Command exits
    * working_dir -- the process working directory. This is required for some games to run properly.
    * cmd_output --
-   *    empty    -- The output of the commands are appended to the output of sunshine
+   *    empty    -- The output of the commands are appended to the output of lumen
    *    "null"   -- The output of the commands are discarded
    *    filename -- The output of the commands are appended to filename
    */
@@ -165,7 +165,7 @@ namespace proc {
     std::string id;  ///< Stable identifier for the configured application.
     bool elevated;  ///< Whether the process should be launched elevated.
     bool auto_detach;  ///< Whether the process should detach automatically.
-    bool wait_all;  ///< Whether Sunshine waits for all child processes.
+    bool wait_all;  ///< Whether Lumen waits for all child processes.
     std::chrono::seconds exit_timeout;  ///< Exit timeout.
   };
 
@@ -330,6 +330,12 @@ namespace proc {
      */
     std::string get_last_run_app_name();
     /**
+     * @brief Return when the running application was launched.
+     *
+     * @return Wall-clock launch time, or no value when nothing is running.
+     */
+    std::optional<std::chrono::system_clock::time_point> started_at();
+    /**
      * @brief Terminate the launched application process.
      */
     void terminate();
@@ -355,6 +361,7 @@ namespace proc {
     std::vector<ctx_t> _apps;
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;
+    std::chrono::system_clock::time_point _app_started_at;  ///< Wall-clock launch time shown to administrators.
 
     /** @brief Process state serialized with generation-qualified legacy cancel owners. */
     struct lifecycle_state_t {
@@ -388,6 +395,9 @@ namespace proc {
    */
   std::tuple<std::string, std::string> calculate_app_id(const std::string &app_name, std::string app_image_path, int index);
 
+  /** @brief Return whether a string is a positive signed 32-bit decimal, the form GameStream clients accept. */
+  bool is_valid_app_id(std::string_view id);
+
   bool check_valid_png(const std::filesystem::path &path);
   /**
    * @brief Validate app image path.
@@ -396,6 +406,23 @@ namespace proc {
    * @return Existing PNG path, or the default application image when validation fails.
    */
   std::string validate_app_image_path(std::string app_image_path);
+
+  /** @brief What an application launches, used to pick its icon when it has no artwork. */
+  enum class app_kind_e : std::uint8_t {
+    app,  ///< Any other program.
+    desktop,  ///< No command: the stream shows the desktop.
+    steam,  ///< Launches Steam or a Steam URL.
+  };
+
+  /** @brief Classify an application by what it launches, not by its display name. */
+  app_kind_e app_kind(const ctx_t &app);
+
+  /**
+   * @brief Return the application's own artwork.
+   *
+   * @return Validated PNG path, or no value when the app has none or uses artwork shipped with Lumen.
+   */
+  std::optional<std::string> custom_image_path(const ctx_t &app);
   /**
    * @brief Refresh cached platform state from the operating system.
    *

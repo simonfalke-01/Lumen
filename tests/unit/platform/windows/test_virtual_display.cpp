@@ -64,7 +64,7 @@ namespace {
    * @return Complete source contents.
    */
   std::string read_source(const std::filesystem::path &relative) {
-    std::ifstream input {std::filesystem::path {SUNSHINE_SOURCE_DIR} / relative};
+    std::ifstream input {std::filesystem::path {LUMEN_SOURCE_DIR} / relative};
     EXPECT_TRUE(input.is_open());
     return {std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {}};
   }
@@ -117,6 +117,7 @@ namespace {
       delivery_policy_e,
       fidelity_e fidelity,
       const std::uint64_t preferred_render_adapter_luid,
+      bool,
       prepared_mode_t &prepared
     ) override {
       generations.push_back(generation);
@@ -627,10 +628,10 @@ TEST(VirtualDisplayPolicy, OptionalFallbackRejectsUncertainRollback) {
   EXPECT_EQ(rejected.diagnostic, start_error_e::rollback_failed);
 }
 
-TEST(VirtualDisplayPolicy, LSPSessionsRequireVddUnlessExplicitlyDisabled) {
+TEST(VirtualDisplayPolicy, LSPSessionsHonorConfiguredVddPolicy) {
   EXPECT_EQ(
     lsp_activation_policy(activation_policy_e::optional),
-    activation_policy_e::required
+    activation_policy_e::optional
   );
   EXPECT_EQ(
     lsp_activation_policy(activation_policy_e::required),
@@ -680,7 +681,7 @@ TEST(VirtualDisplayPolicy, OptionalLegacySessionAdmitsProvenHdr10TenBitVdd) {
 }
 
 TEST(VirtualDisplayProtocol, UsesBufferedAdminServiceAbiWithStableSizes) {
-  EXPECT_EQ(LUMEN_VDD_ABI_VERSION, 6U);
+  EXPECT_EQ(LUMEN_VDD_ABI_VERSION, 7U);
   EXPECT_EQ(sizeof(LUMEN_VDD_MODE), 20U);
   EXPECT_EQ(sizeof(LUMEN_VDD_QUERY_ABI_RESPONSE), 56U);
   EXPECT_EQ(sizeof(LUMEN_VDD_PREPARE_MODE_REQUEST), 44U);

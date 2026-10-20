@@ -785,10 +785,10 @@ cmake -S . -B '$buildMsys' -G Ninja \
   -DNPM='$npmCmake' \
   -DLUMEN_WINDOWS_FULL_PROFILE=ON \
   $localTestMarkerCmake \
-  -DSUNSHINE_VIRTUAL_HID_DRIVER_PACKAGE_DIR='$vhidCmake' \
-  -DSUNSHINE_VIRTUAL_HID_BUNDLED_CERTIFICATE=OFF \
-  -DSUNSHINE_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR='$vmicCmake' \
-  -DSUNSHINE_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR='$vddCmake'
+  -DLUMEN_VIRTUAL_HID_DRIVER_PACKAGE_DIR='$vhidCmake' \
+  -DLUMEN_VIRTUAL_HID_BUNDLED_CERTIFICATE=OFF \
+  -DLUMEN_VIRTUAL_MICROPHONE_DRIVER_PACKAGE_DIR='$vmicCmake' \
+  -DLUMEN_VIRTUAL_DISPLAY_DRIVER_PACKAGE_DIR='$vddCmake'
 ninja -C '$buildMsys'
 "@
 $buildScript = Join-Path $StagingRoot 'build-full-profile-app.sh'
@@ -805,7 +805,7 @@ set -euo pipefail
 # Physical encoder probes run on the RTX hardware gate. The disposable builder
 # runs the complete nonhardware suite so virtualized DXGI drivers cannot crash
 # the packaging preflight before artifacts are validated.
-'$buildMsys/tests/test_sunshine.exe' --gtest_filter='-EncoderVariants/EncoderTest.*'
+'$buildMsys/tests/test_lumen.exe' --gtest_filter='-EncoderVariants/EncoderTest.*'
 "@
 $testScript = Join-Path $StagingRoot 'test-full-profile-nonhardware.sh'
 [IO.File]::WriteAllText($testScript, $testCommand, [Text.UTF8Encoding]::new($false))

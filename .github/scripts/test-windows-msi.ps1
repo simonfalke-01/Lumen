@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('install-no-vhid', 'install-vhid', 'install-vmic', 'install-vdd', 'driver-reboot', 'upgrade', 'legacy-import')]
+    [ValidateSet('install-no-vhid', 'install-vhid', 'install-vmic', 'install-vdd', 'driver-reboot', 'upgrade')]
     [string]$Scenario
 )
 
@@ -713,47 +713,5 @@ switch ($Scenario) {
             -Arguments @('/x', $finalProductCode, '/qn', '/norestart') `
             -LogName 'lumen-msi-upgrade-uninstall.log' `
             -FailureMessage 'Uninstall after Lumen-to-Lumen upgrade failed.')
-    }
-    'legacy-import' {
-        $fixtureId = '{A6C1CA63-42B6-4F83-AEC7-BCAC48E43CC8}'
-        $fixtureRegistry = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$fixtureId"
-        $fixtureRoot = Join-Path $env:RUNNER_TEMP 'SunshineMigrationFixture'
-        $fixtureConfig = Join-Path $fixtureRoot 'config'
-        $fixtureSentinel = Join-Path $fixtureConfig 'migration-ci-sentinel.txt'
-        try {
-            New-Item -ItemType Directory -Path $fixtureConfig -Force | Out-Null
-            Set-Content -LiteralPath $fixtureSentinel -Value 'preserve-me' -NoNewline
-            New-Item -Path $fixtureRegistry -Force | Out-Null
-            Set-ItemProperty -Path $fixtureRegistry -Name DisplayName -Value 'Sunshine Migration Fixture'
-            Set-ItemProperty -Path $fixtureRegistry -Name InstallLocation -Value $fixtureRoot
-
-            [void](Invoke-Msi `
-                -Arguments @('/i', "`"$msiPath`"", '/qn', '/norestart', 'LUMEN_INSTALL_VHID=0') `
-                -LogName 'lumen-msi-legacy-import.log' `
-                -FailureMessage 'Lumen legacy configuration import failed.')
-
-            $lumenSentinel = 'C:\Program Files\Lumen\config\migration-ci-sentinel.txt'
-            if ((Get-Content -LiteralPath $lumenSentinel -Raw) -ne 'preserve-me') {
-                throw 'Lumen did not copy the legacy Sunshine configuration fixture.'
-            }
-            if ((Get-Content -LiteralPath $fixtureSentinel -Raw) -ne 'preserve-me') {
-                throw 'Lumen modified the legacy Sunshine configuration fixture.'
-            }
-            if (-not (Test-Path -LiteralPath $fixtureRegistry)) {
-                throw 'Lumen removed the legacy Sunshine product fixture.'
-            }
-            if ($null -ne (Get-Service SunshineService -ErrorAction SilentlyContinue)) {
-                throw 'Lumen created or claimed the SunshineService identity.'
-            }
-            Assert-ServiceRunning
-
-            [void](Invoke-Msi `
-                -Arguments @('/x', $productCode, '/qn', '/norestart') `
-                -LogName 'lumen-msi-legacy-import-uninstall.log' `
-                -FailureMessage 'Uninstall after legacy import failed.')
-        } finally {
-            Remove-Item -LiteralPath $fixtureRegistry -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
-        }
     }
 }
