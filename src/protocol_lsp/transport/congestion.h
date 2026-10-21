@@ -406,18 +406,18 @@ namespace lumen::lsp::transport {
     std::uint8_t moderate_loss_windows_ = 0;  ///< Consecutive windows with more than light loss.
   };
 
-  /** @brief IP family used to clamp standard-Ethernet UDP payload ceilings. */
+  /** @brief IP family used to clamp jumbo-frame UDP payload ceilings. */
   enum class path_ip_version : std::uint8_t {
-    ipv4,  ///< Standard 1,500-byte Ethernet ceiling is 1,472 UDP payload bytes.
-    ipv6,  ///< Standard 1,500-byte Ethernet ceiling is 1,452 UDP payload bytes.
+    ipv4,  ///< 9,000-byte jumbo ceiling is 8,972 UDP payload bytes; standard Ethernet is 1,472.
+    ipv6,  ///< 9,000-byte jumbo ceiling is 8,952 UDP payload bytes; standard Ethernet is 1,452.
   };
 
   /** @brief Negotiated RFC 8899 DPLPMTUD payload bounds. */
   struct path_mtu_config {
     path_ip_version ip_version = path_ip_version::ipv4;  ///< Active address family.
-    std::uint16_t sender_interface_limit = 1'472;  ///< Sender interface UDP payload limit.
-    std::uint16_t receiver_advertised_limit = 1'472;  ///< Authenticated peer-advertised UDP payload limit.
-    std::uint16_t operator_configured_limit = 1'472;  ///< Local operator UDP payload limit.
+    std::uint16_t sender_interface_limit = 8'972;  ///< Sender interface UDP payload limit.
+    std::uint16_t receiver_advertised_limit = 8'972;  ///< Authenticated peer-advertised UDP payload limit.
+    std::uint16_t operator_configured_limit = 8'972;  ///< Local operator UDP payload limit.
   };
 
   /** @brief Metadata for the single outstanding authenticated DPLPMTUD probe. */
@@ -460,6 +460,14 @@ namespace lumen::lsp::transport {
     static constexpr std::uint16_t fast_probe_payload_bytes = 1'400;
 
     /**
+     * @brief Probe-size granularity.
+     *
+     * An LSPP probe is an RTCP APP packet whose length is counted in 32-bit words and is
+     * protected with a 20-byte SRTCP trailer, so every probed UDP payload is a multiple of four.
+     */
+    static constexpr std::uint16_t probe_granularity_bytes = 4;
+
+    /**
      * @brief Construct discovery state and clamp the effective non-fragmenting ceiling.
      *
      * @param config Sender, receiver, operator, and IP-family bounds.
@@ -490,7 +498,7 @@ namespace lumen::lsp::transport {
     }
 
     /**
-     * @brief Return the effective standard-Ethernet ceiling.
+     * @brief Return the effective non-fragmenting ceiling.
      *
      * @return Smallest sender, receiver, operator, and address-family limit.
      */
@@ -520,8 +528,15 @@ namespace lumen::lsp::transport {
       if (upper_exclusive_ == static_cast<std::uint32_t>(ceiling_payload_bytes_) + 1U) {
         return ceiling_payload_bytes_;
       }
-      const auto candidate = static_cast<std::uint32_t>(current_payload_bytes_) +
-                             (upper_exclusive_ - current_payload_bytes_) / 2U;
+      // A jumbo ceiling that failed most often means one standard-Ethernet hop. Confirm the
+      // standard ceiling next instead of spending several PROBE_TIMER rounds bisecting toward it.
+      const auto standard = standard_ceiling(config_);
+      if (standard > current_payload_bytes_ && standard < upper_exclusive_ && standard < ceiling_payload_bytes_) {
+        return static_cast<std::uint16_t>(standard);
+      }
+      const auto midpoint = static_cast<std::uint32_t>(current_payload_bytes_) +
+                            (upper_exclusive_ - current_payload_bytes_) / 2U;
+      const auto candidate = midpoint - midpoint % probe_granularity_bytes;
       return candidate > current_payload_bytes_ && candidate < upper_exclusive_ ?
                static_cast<std::uint16_t>(candidate) :
                0;
@@ -662,23 +677,34 @@ namespace lumen::lsp::transport {
      * @brief Compute the non-fragmenting UDP payload ceiling.
      *
      * @param config Negotiated path limits.
-     * @return Smallest configured and standard-Ethernet address-family ceiling.
+     * @return Smallest configured and jumbo address-family ceiling, rounded down to probe granularity.
      */
     [[nodiscard]] static constexpr std::uint16_t effective_ceiling(const path_mtu_config &config) noexcept {
-      const auto family_ceiling = config.ip_version == path_ip_version::ipv4 ? 1'472U : 1'452U;
-      return static_cast<std::uint16_t>(std::min({
+      const auto family_ceiling = config.ip_version == path_ip_version::ipv4 ? 8'972U : 8'952U;
+      const auto ceiling = std::min({
         static_cast<unsigned int>(config.sender_interface_limit),
         static_cast<unsigned int>(config.receiver_advertised_limit),
         static_cast<unsigned int>(config.operator_configured_limit),
         family_ceiling,
-      }));
+      });
+      return static_cast<std::uint16_t>(ceiling - ceiling % probe_granularity_bytes);
+    }
+
+    /**
+     * @brief Return the standard 1,500-byte Ethernet UDP payload ceiling for the active family.
+     *
+     * @param config Negotiated path limits.
+     * @return 1,472 bytes for IPv4 or 1,452 bytes for IPv6.
+     */
+    [[nodiscard]] static constexpr std::uint32_t standard_ceiling(const path_mtu_config &config) noexcept {
+      return config.ip_version == path_ip_version::ipv4 ? 1'472U : 1'452U;
     }
 
     path_mtu_config config_ {};  ///< Negotiated path limits.
     path_probe outstanding_ {};  ///< Single authenticated outstanding probe.
     std::uint64_t last_probe_microseconds_ = 0;  ///< Most recent probe transmission time.
     std::uint16_t current_payload_bytes_ = base_payload_bytes;  ///< Largest confirmed payload.
-    std::uint16_t ceiling_payload_bytes_ = 0;  ///< Effective standard-Ethernet ceiling.
+    std::uint16_t ceiling_payload_bytes_ = 0;  ///< Effective non-fragmenting ceiling.
     std::uint32_t upper_exclusive_ = 0;  ///< First known failing size or ceiling plus one.
     bool fast_search_complete_ = false;  ///< Whether the 1,400-byte fast probe resolved.
     bool has_probed_ = false;  ///< Whether the last-probe timestamp is meaningful.

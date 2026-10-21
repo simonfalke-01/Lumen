@@ -31,6 +31,7 @@ extern "C" {
 
 // local includes
 #include "display.h"
+#include "bc1_encoder.h"
 #include "fused_d3d11_policy.h"
 #include "misc.h"
 #include "src/config.h"
@@ -997,6 +998,33 @@ namespace platf::dxgi {
           fused_d3d11::telemetry().record_keyed_mutex_acquire();
         }
 
+        if (rgb_passthrough) {
+          if (img.format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+            BOOST_LOG(error) << "NVENC BGRA input needs a BGRA capture, got format "sv << static_cast<int>(img.format);
+            if (!fused) {
+              img_ctx.encoder_mutex->ReleaseSync(0);
+            }
+            return -1;
+          }
+          D3D11_TEXTURE2D_DESC source_desc {};
+          img_ctx.encoder_texture->GetDesc(&source_desc);
+          D3D11_TEXTURE2D_DESC target_desc {};
+          output_texture->GetDesc(&target_desc);
+          const D3D11_BOX box {
+            0, 0, 0,
+            std::min(source_desc.Width, target_desc.Width),
+            std::min(source_desc.Height, target_desc.Height),
+            1,
+          };
+          device_ctx->CopySubresourceRegion(output_texture.get(), 0, 0, 0, 0, img_ctx.encoder_texture.get(), 0, &box);
+          if (!fused) {
+            img_ctx.encoder_mutex->ReleaseSync(0);
+          }
+          fused_d3d11::telemetry().finish_conversion_frame(telemetry_trace, fused_d3d11::telemetry_t::now_ns());
+          pending_telemetry_child = std::move(telemetry_child);
+          return 0;
+        }
+
         auto draw = [&](auto &input, auto &y_or_yuv_viewports, auto &uv_viewport) {
           device_ctx->PSSetShaderResources(0, 1, &input);
 
@@ -1129,6 +1157,16 @@ namespace platf::dxgi {
       // The underlying frame pool owns the texture, so we must reference it for ourselves
       frame_texture->AddRef();
       output_texture.reset(frame_texture);
+
+      D3D11_TEXTURE2D_DESC output_desc {};
+      frame_texture->GetDesc(&output_desc);
+      rgb_passthrough = output_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+      if (rgb_passthrough) {
+        format = output_desc.Format;
+        rtvs_cleared = true;
+        BOOST_LOG(info) << "NVENC takes the BGRA capture directly; no conversion draw"sv;
+        return 0;
+      }
 
       HRESULT status = S_OK;
 
@@ -1681,6 +1719,7 @@ namespace platf::dxgi {
     render_target_t out_Y_or_YUV_rtv;  ///< Out y or YUV rtv.
     render_target_t out_UV_rtv;  ///< Out UV rtv.
     bool rtvs_cleared = false;  ///< Whether render-target views have been cleared for the frame.
+    bool rgb_passthrough = false;  ///< Encoder takes BGRA directly; convert() is a copy.
 
     // d3d_img_t::id -> encoder_img_ctx_t
     // These store the encoder textures for each img_t that passes through
@@ -2162,8 +2201,21 @@ namespace platf::dxgi {
 
       base->set_telemetry_session(fused_d3d11::telemetry().begin_frame_session(telemetry_profile(client_config), telemetry_client(client_config)));
 
+      if (client_config.lumen_bc1) {
+        if (fused_path) {
+          BOOST_LOG(error) << "BC1 encoding needs the legacy capture path"sv;
+          return false;
+        }
+        // BC1 replaces NVENC on the same device; the BGRA input makes convert() a plain copy.
+        nvenc_d3d = make_bc1_encoder(base->device.get());
+        failure_proxy.bind(nvenc_d3d.get(), this, &d3d_nvenc_encode_device_t::handle_nvenc_failure_callback);
+      }
+
+      // Direct BGRA input only replaces the legacy cross-device conversion draw.
+      auto nvenc_config = config::video.nv;
+      nvenc_config.rgb_input = nvenc_config.rgb_input && !fused_path;
       if (!nvenc_d3d->create_encoder(
-            config::video.nv,
+            nvenc_config,
             client_config,
             colorspace,
             buffer_format,

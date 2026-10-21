@@ -22,6 +22,9 @@ namespace NVENC_NAMESPACE {
       case NV_ENC_BUFFER_FORMAT_NV12:
         return DXGI_FORMAT_NV12;
 
+      case NV_ENC_BUFFER_FORMAT_ARGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+
       case NV_ENC_BUFFER_FORMAT_AYUV:
         return DXGI_FORMAT_AYUV;
 

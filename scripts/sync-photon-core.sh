@@ -13,8 +13,8 @@ readonly local_digest="${local_source_root}/photon-source-digest.sha256"
 sibling_photon="$(cd -- "${lumen_root}/.." && pwd)/Photon"
 readonly sibling_photon
 readonly pinned_repository="git@github.com:simonfalke-01/Photon.git"
-readonly pinned_commit="6a504910dfeb0489eb33af02e4bd3659e8c11e24"
-readonly pinned_digest="d565644e8c3a00d6c474d6c118b8b8eccd3140d35eda54dbb0bba7c42f1ca7f0"
+readonly pinned_commit="9f8a869f09252930f0b4ea749c2c2be43401a9d0"
+readonly pinned_digest="4269791d293364a451270df9923d64820377a239a17fc1eaa985a57bb58fcc17"
 readonly expected_lock="repository=${pinned_repository}
 commit=${pinned_commit}
 digest=${pinned_digest}"

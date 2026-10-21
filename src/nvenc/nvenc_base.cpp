@@ -708,8 +708,17 @@ namespace NVENC_NAMESPACE {
 #endif
     }
 
-    const auto colorspace = nvenc_colorspace_from_stream_colorspace(stream_colorspace);
-    const auto buffer_format = nvenc_format_from_stream_format(lumen_buffer_format);
+    auto colorspace = nvenc_colorspace_from_stream_colorspace(stream_colorspace);
+    auto buffer_format = nvenc_format_from_stream_format(lumen_buffer_format);
+    if (client_config.nvenc_rgb_input && buffer_format == NV_ENC_BUFFER_FORMAT_NV12 &&
+        transfer == ::nvenc::hdr_transfer_e::sdr) {
+      // NVENC converts packed BGRA itself, so the capture needs no conversion draw on the
+      // graphics engine that a running game keeps busy. Measured on this driver, that internal
+      // conversion is BT.601 limited range whatever the VUI says, so signal exactly that.
+      buffer_format = NV_ENC_BUFFER_FORMAT_ARGB;
+      colorspace.matrix = NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M;
+      colorspace.full_range = false;
+    }
     if (buffer_format == NV_ENC_BUFFER_FORMAT_UNDEFINED) {
       BOOST_LOG(error) << "NvEnc: unsupported input pixel format";
       return false;

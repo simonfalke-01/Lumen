@@ -1693,6 +1693,7 @@ namespace video {
       .verified_low_delay = hardware,
       .reference_invalidation = native_nvenc && last_encoder_probe_supported_ref_frames_invalidation,
       .hlg = hlg,
+      .nvenc = native_nvenc,
     };
   }
 
@@ -2844,6 +2845,13 @@ namespace video {
     const bool target_rate_vdd = static_cast<bool>(config.virtual_display_frame_source);
     const auto target_frame_interval = capture_frame_interval(config);
     auto target_encode_deadline = std::chrono::steady_clock::now() + target_frame_interval;
+    // Repeats for slots with no newly composed frame land on the frame grid anchored to the last
+    // real arrival, plus a little slack for composition jitter. Timing them from the previous
+    // encode instead puts a repeat right next to a slightly late real frame, which the client
+    // sees as a dropped frame and uneven pacing.
+    const auto repeat_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(max_frametime);
+    const auto repeat_slack = repeat_interval / 4;
+    auto repeat_deadline = std::chrono::steady_clock::now() + repeat_interval + repeat_slack;
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto idr_events = mail->event<bool>(mail::idr);
@@ -2925,8 +2933,9 @@ namespace video {
       if (!requested_idr_frame || images->peek()) {
         const auto image_wait = target_rate_vdd ?
                                   target_encode_wait(target_encode_deadline, std::chrono::steady_clock::now()) :
-                                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(max_frametime);
+                                  target_encode_wait(repeat_deadline, std::chrono::steady_clock::now());
         if (auto captured = images->pop(image_wait)) {
+          repeat_deadline = std::chrono::steady_clock::now() + repeat_interval + repeat_slack;
           frame_timestamp = captured->image->frame_timestamp;
           input_watermark = {
             captured->applied_input_state_sequence,
@@ -2938,6 +2947,11 @@ namespace video {
           }
         } else if (!images->running()) {
           break;
+        } else {
+          repeat_deadline += repeat_interval;
+          if (repeat_deadline < std::chrono::steady_clock::now()) {
+            repeat_deadline = std::chrono::steady_clock::now() + repeat_interval;
+          }
         }
       }
 

@@ -23,6 +23,7 @@ namespace lumen::lsp::runtime {
     constexpr std::size_t maximum_inline_object_chunk_bytes = 768;
     constexpr std::uint32_t maximum_object_bytes = 16U * 1'024U * 1'024U;
     constexpr std::uint16_t maximum_text_input_bytes = 16U * 1'024U;
+    constexpr std::uint64_t maximum_udp_payload_bytes = 8'972;  ///< IPv4 jumbo-frame UDP payload ceiling.
 
     template<std::size_t Size>
     cbor::Value::Bytes bytes(const std::array<std::uint8_t, Size> &value) {
@@ -133,7 +134,7 @@ namespace lumen::lsp::runtime {
           static_cast<std::uint16_t>(audio.streams) + audio.coupled_streams != audio.channels ||
           !valid_audio_frame_samples(audio.frame_samples) || audio.bitrate < 6'000 ||
           audio.bitrate > std::min<std::uint32_t>(2'048'000, static_cast<std::uint32_t>(audio.streams) * 512'000U) ||
-          audio.initial_udp_payload_size < 1'200 || audio.initial_udp_payload_size > 1'472 ||
+          audio.initial_udp_payload_size < 1'200 || audio.initial_udp_payload_size > maximum_udp_payload_bytes ||
           audio.initial_preroll_packets != 1) {
         return false;
       }
@@ -205,6 +206,8 @@ namespace lumen::lsp::runtime {
                   (pixel == VideoPixelClass::yuv420_8 || pixel == VideoPixelClass::yuv420_10)) ||
                  (profile == VideoProfile::av1_high &&
                   (pixel == VideoPixelClass::yuv444_8 || pixel == VideoPixelClass::yuv444_10));
+        case VideoCodec::bc1:
+          return profile == VideoProfile::bc1 && pixel == VideoPixelClass::yuv420_8;
       }
       return false;
     }
@@ -231,6 +234,10 @@ namespace lumen::lsp::runtime {
       if (primaries == video_color_bt709 && transfer == video_color_bt709 &&
           matrix == video_color_bt709) {
         return true;
+      }
+      if (primaries == video_color_bt709 && transfer == video_color_bt709 && matrix == video_matrix_bt601 &&
+          pixel == VideoPixelClass::yuv420_8 && !full_range) {
+        return true;  // BT.709 picture coded with NVENC's BT.601 RGB-input conversion.
       }
       const auto ten_bit = pixel == VideoPixelClass::yuv420_10 || pixel == VideoPixelClass::yuv444_10;
       return codec != VideoCodec::h264 && ten_bit && !full_range &&
@@ -504,6 +511,9 @@ namespace lumen::lsp::runtime {
      * @return True only for SPS/PPS, VPS/SPS/PPS, or one canonical AV1 sequence header.
      */
     bool valid_codec_configuration(const VideoCodecConfigurationPayload &configuration) noexcept {
+      if (configuration.kind == VideoCodec::bc1) {
+        return configuration.units.empty();  // BC1 frames are self-describing.
+      }
       const auto expected = configuration.kind == VideoCodec::h264 ? std::size_t {2} :
                             configuration.kind == VideoCodec::hevc ? std::size_t {3} :
                             configuration.kind == VideoCodec::av1  ? std::size_t {1} :
@@ -871,7 +881,7 @@ namespace lumen::lsp::runtime {
         reconciliation == nullptr || *reconciliation < 50 || *reconciliation > 1'000 || budget == nullptr ||
         *budget == 0 || *budget > 32'000'000 || offers == nullptr || offers->empty() ||
         offers->size() > maximum_audio_offers || maximum_udp_payload == nullptr || *maximum_udp_payload < 1'200 ||
-        *maximum_udp_payload > 1'472 || (microphone_null == nullptr && microphone_map == nullptr) ||
+        *maximum_udp_payload > maximum_udp_payload_bytes || (microphone_null == nullptr && microphone_map == nullptr) ||
         network_profile == nullptr || *network_profile > static_cast<std::uint8_t>(VideoNetworkProfile::competition) ||
         video_offers == nullptr || video_offers->empty() || video_offers->size() > maximum_video_offers ||
         receive_batch == nullptr || *receive_batch == 0 || *receive_batch > 64 ||
@@ -1341,7 +1351,7 @@ namespace lumen::lsp::runtime {
   std::expected<std::vector<std::uint8_t>, ControlWireError> encode_path_probe(
     const PathProbePayload &payload
   ) {
-    if (payload.probe_id == 0 || payload.udp_payload_size < 1'200 || payload.udp_payload_size > 1'472) {
+    if (payload.probe_id == 0 || payload.udp_payload_size < 1'200 || payload.udp_payload_size > maximum_udp_payload_bytes) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return encode({
@@ -1359,7 +1369,7 @@ namespace lumen::lsp::runtime {
     const auto *probe_id = map ? unsigned_value((*map)[1].second) : nullptr;
     const auto *udp_payload_size = map ? unsigned_value((*map)[2].second) : nullptr;
     if (!map || version == nullptr || *version != wire_version || probe_id == nullptr || *probe_id == 0 ||
-        udp_payload_size == nullptr || *udp_payload_size < 1'200 || *udp_payload_size > 1'472) {
+        udp_payload_size == nullptr || *udp_payload_size < 1'200 || *udp_payload_size > maximum_udp_payload_bytes) {
       return std::unexpected(ControlWireError::invalid_field);
     }
     return PathProbePayload {

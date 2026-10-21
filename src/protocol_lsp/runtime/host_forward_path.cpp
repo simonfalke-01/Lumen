@@ -69,6 +69,26 @@ namespace lumen::lsp::runtime {
       SlotState state {SlotState::free};
     };
 
+    /**
+     * @brief Reset every slot field except the datagram bytes.
+     *
+     * Slots hold a jumbo-frame payload, so whole-slot value assignment would zero about 9 KB
+     * per datagram under the path mutex. Byte clearing is bounded separately by the caller.
+     */
+    void reset_slot_metadata(Slot &slot) noexcept {
+      slot.ticket = 0;
+      slot.token = 0;
+      slot.deadline_microseconds = 0;
+      slot.retry_at_microseconds = 0;
+      slot.enqueue_ordinal = 0;
+      slot.enqueued_microseconds = 0;
+      slot.protected_bytes = 0;
+      slot.charged_bytes = 0;
+      slot.target = {};
+      slot.lane = HostForwardLane::bulk;
+      slot.state = SlotState::free;
+    }
+
     struct CompletionRecord {
       std::uint64_t token {};
       HostForwardLane lane {HostForwardLane::bulk};
@@ -85,8 +105,10 @@ namespace lumen::lsp::runtime {
     }
 
     [[nodiscard]] constexpr std::uint16_t maximum_payload_for(const PeerEndpoint &peer) noexcept {
-      return peer.family == IpAddressFamily::ipv6 ? 1'452U : 1'472U;
+      return peer.family == IpAddressFamily::ipv6 ? 8'952U : 8'972U;
     }
+
+    static_assert(host_forward_maximum_payload_bytes >= 8'972U, "forward slots must hold a jumbo-frame payload");
 
     [[nodiscard]] constexpr std::uint16_t effective_probe_ceiling(const HostForwardPathConfig &config) noexcept {
       return config.probe_payload_ceiling == 0 ? maximum_payload_for(config.peer) : config.probe_payload_ceiling;
@@ -509,7 +531,15 @@ namespace lumen::lsp::runtime {
       const HostForwardLane lane
     ) noexcept {
       auto &slot = slots_[slot_index];
-      slot = {};
+      reset_slot_metadata(slot);
+      // Producers may rely on zeroed storage; clear only the bytes the lane can commit.
+      const auto writable = lane == HostForwardLane::path_probe ?
+                              static_cast<std::size_t>(probe_payload_ceiling_) :
+                              std::max<std::size_t>(
+                                current_path_payload_bytes_.load(std::memory_order_relaxed),
+                                std::size_t {1'472}
+                              );
+      std::memset(slot.bytes.data(), 0, std::min(slot.bytes.size(), writable));
       slot.state = SlotState::reserved;
       slot.lane = lane;
       slot.ticket = next_ticket_++;
@@ -690,7 +720,11 @@ namespace lumen::lsp::runtime {
 
     static void clear_slot(Slot &slot) noexcept {
       const auto next_ticket = slot.ticket + 1U;
-      slot = {};
+      if (slot.state == SlotState::reserved) {
+        // An uncommitted reservation may still hold unprotected plaintext.
+        slot.bytes.fill(0);
+      }
+      reset_slot_metadata(slot);
       slot.ticket = next_ticket == 0 ? 1 : next_ticket;
     }
 

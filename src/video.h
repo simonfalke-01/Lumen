@@ -67,6 +67,8 @@ namespace video {
     std::shared_ptr<platf::virtual_display::frame_source_t> virtual_display_frame_source;  ///< Production VDD direct-frame source, or empty for DDA/WGC.
     std::function<std::pair<std::uint64_t, std::uint64_t>()> capture_input_watermark;  ///< Applied input watermark sampled at capture submission.
     int hdrTransfer {};  ///< HDR transfer proof: 0 = SDR/legacy auto, 1 = PQ, 2 = HLG.
+    bool lumen_bc1 {};
+    bool nvenc_rgb_input {};  ///< NVENC takes BGRA directly and converts with BT.601 limited range.  ///< Encode intra-only BC1 blocks on the GPU instead of using NVENC.
   };
 
   namespace amf {
@@ -846,6 +848,7 @@ namespace video {
     bool verified_low_delay {};  ///< Hardware tuple passed Lumen's no-B-frame low-delay probe.
     bool reference_invalidation {};  ///< Native reference invalidation is available without forcing IDR.
     bool hlg {};  ///< Exact chosen hardware codec can encode 10-bit HLG after configuration proof.
+    bool nvenc {};  ///< The chosen encoder is NVENC, whose RGB input converts with BT.601.
   };
 
   /**

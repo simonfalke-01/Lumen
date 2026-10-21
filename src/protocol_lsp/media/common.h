@@ -26,11 +26,17 @@ namespace lumen::lsp::media {
   /** @brief Initial path-safe UDP payload used before authenticated DPLPMTUD growth. */
   inline constexpr std::size_t initial_udp_payload_size = 1'200;
 
-  /** @brief Largest conforming UDP payload on a standard 1,500-byte IPv4 path. */
-  inline constexpr std::size_t ipv4_udp_payload_ceiling = 1'472;
+  /** @brief Largest conforming UDP payload on a 9,000-byte jumbo-frame IPv4 path. */
+  inline constexpr std::size_t ipv4_udp_payload_ceiling = 8'972;
 
-  /** @brief Largest conforming UDP payload on a standard 1,500-byte IPv6 path. */
-  inline constexpr std::size_t ipv6_udp_payload_ceiling = 1'452;
+  /** @brief Largest conforming UDP payload on a 9,000-byte jumbo-frame IPv6 path. */
+  inline constexpr std::size_t ipv6_udp_payload_ceiling = 8'952;
+
+  /** @brief Largest UDP payload on a standard 1,500-byte Ethernet IPv4 path. */
+  inline constexpr std::size_t ipv4_standard_udp_payload_ceiling = 1'472;
+
+  /** @brief Largest UDP payload on a standard 1,500-byte Ethernet IPv6 path. */
+  inline constexpr std::size_t ipv6_standard_udp_payload_ceiling = 1'452;
 
   /** @brief Authentication-tag bytes added by the required SRTP AEAD AES-128-GCM profile. */
   inline constexpr std::size_t srtp_aead_tag_size = 16;
@@ -47,15 +53,15 @@ namespace lumen::lsp::media {
 
   /** @brief IP family controlling the conforming LSP/1 path-payload ceiling. */
   enum class ip_family : std::uint8_t {
-    ipv4,  ///< IPv4 with a 1,472-byte standard-Ethernet UDP payload ceiling.
-    ipv6,  ///< IPv6 with a 1,452-byte standard-Ethernet UDP payload ceiling.
+    ipv4,  ///< IPv4 with an 8,972-byte jumbo-frame UDP payload ceiling.
+    ipv6,  ///< IPv6 with an 8,952-byte jumbo-frame UDP payload ceiling.
   };
 
   /** @brief Typed path-payload validation failure. */
   enum class path_payload_error : std::uint8_t {
     none,  ///< The proposed path payload is conforming.
     below_initial_safe_size,  ///< The proposed value is below LSP/1's 1,200-byte payload floor.
-    above_family_ceiling,  ///< The proposed value exceeds the selected IP family's Ethernet ceiling.
+    above_family_ceiling,  ///< The proposed value exceeds the selected IP family's jumbo-frame ceiling.
   };
 
   /** @brief Validated maximum complete UDP payload for one LSP media datagram. */

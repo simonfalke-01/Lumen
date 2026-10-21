@@ -816,7 +816,7 @@ TEST(LspFeedbackWorker, BoundsCopiesAndRejectsRetiredMediaGenerations) {
   EXPECT_EQ(lsp::runtime::next_host_feedback_work_class(1, 32), lsp::runtime::HostFeedbackWorkClass::repair);
   EXPECT_EQ(lsp::runtime::next_host_feedback_work_class(0, 32), lsp::runtime::HostFeedbackWorkClass::congestion);
   EXPECT_TRUE(lsp::runtime::host_feedback_work_is_current(lsp::runtime::maximum_host_feedback_work_bytes, 7, 11, 13, 17, 7, 11, 13, 17));
-  EXPECT_FALSE(lsp::runtime::host_feedback_work_is_current(1'473, 7, 11, 13, 17, 7, 11, 13, 17));
+  EXPECT_FALSE(lsp::runtime::host_feedback_work_is_current(8'973, 7, 11, 13, 17, 7, 11, 13, 17));
   EXPECT_FALSE(lsp::runtime::host_feedback_work_is_current(1'200, 7, 11, 13, 17, 8, 11, 13, 17));
   EXPECT_FALSE(lsp::runtime::host_feedback_work_is_current(1'200, 7, 11, 13, 17, 7, 11, 14, 17));
   EXPECT_FALSE(lsp::runtime::host_feedback_work_is_current(1'200, 7, 11, 13, 17, 7, 11, 13, 18));

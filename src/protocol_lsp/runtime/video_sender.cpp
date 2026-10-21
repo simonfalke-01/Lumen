@@ -850,6 +850,7 @@ namespace lumen::lsp::runtime {
         case VideoCodec::hevc:
           return write_hevc_payload(plan, units, destination);
         case VideoCodec::av1:
+        case VideoCodec::bc1:
           return write_av1_payload(plan, units, destination);
       }
       return false;
@@ -1090,6 +1091,9 @@ namespace lumen::lsp::runtime {
 
     /** @brief Clamp the initial aggregate rate to selected video plus reserved overhead. */
     [[nodiscard]] std::uint64_t initial_pacing_rate(const HostVideoSenderConfig &config) noexcept {
+      if (config.video.codec == VideoCodec::bc1) {
+        return config.aggregate_pacing_bits_per_second;  // Fixed-rate; the wire bitrate field caps at 1 Gbit/s.
+      }
       const auto media_rate = config.video.selected_bits_per_second >
                                   std::numeric_limits<std::uint64_t>::max() - config.reserved_overhead_bits_per_second ?
                                 std::numeric_limits<std::uint64_t>::max() :
@@ -1235,12 +1239,17 @@ namespace lumen::lsp::runtime {
         video.pixel_format == VideoPixelClass::yuv420_10)) ||
       (video.codec == VideoCodec::av1 && video.profile == VideoProfile::av1_high &&
        (video.pixel_format == VideoPixelClass::yuv444_8 ||
-        video.pixel_format == VideoPixelClass::yuv444_10));
+        video.pixel_format == VideoPixelClass::yuv444_10)) ||
+      (video.codec == VideoCodec::bc1 && video.profile == VideoProfile::bc1 &&
+       video.pixel_format == VideoPixelClass::yuv420_8);
     const auto ten_bit = video.pixel_format == VideoPixelClass::yuv420_10 ||
                          video.pixel_format == VideoPixelClass::yuv444_10;
     const auto color_valid =
       (video.color_primaries == video_color_bt709 && video.transfer_function == video_color_bt709 &&
        video.matrix_coefficients == video_color_bt709) ||
+      (video.color_primaries == video_color_bt709 && video.transfer_function == video_color_bt709 &&
+       video.matrix_coefficients == video_matrix_bt601 && video.pixel_format == VideoPixelClass::yuv420_8 &&
+       !video.full_range) ||
       (ten_bit && video.color_primaries == video_color_primaries_bt2020 &&
        (video.transfer_function == video_transfer_pq || video.transfer_function == video_transfer_hlg) &&
        video.matrix_coefficients == video_matrix_bt2020_ncl && !video.full_range);
@@ -1288,7 +1297,8 @@ namespace lumen::lsp::runtime {
            video.maximum_frame_age_microseconds <= video_maximum_frame_age_microseconds &&
            aggregate_pacing_bits_per_second > reserved_overhead_bits_per_second &&
            path_payload_ceiling >= 1'200 &&
-           path_payload_ceiling <= (family == media::ip_family::ipv4 ? 1'472U : 1'452U) &&
+           path_payload_ceiling <= (family == media::ip_family::ipv4 ? media::ipv4_udp_payload_ceiling :
+                                                                       media::ipv6_udp_payload_ceiling) &&
            feedback_sender_ssrc != 0 && audio_feedback_ssrc != 0 &&
            audio_feedback_ssrc != video.primary_ssrc && rtcp_cname.valid() && capture_mail;
   }
@@ -1523,11 +1533,9 @@ namespace lumen::lsp::runtime {
       const auto media_probe_interval = smoothed_rtt_microseconds_ == 0 ?
                                           probe_interval_microseconds :
                                           smoothed_rtt_microseconds_;
-      const auto result = path_mtu_.start_probe(
-        probe_id,
-        now_microseconds,
-        std::max(minimum_probe_timer_microseconds, media_probe_interval)
-      );
+      // Spacing between probes only needs one RTT; the 15 s PROBE_TIMER governs retrying a lost
+      // probe, not stepping up after a confirmed one, so search reaches the ceiling in seconds.
+      const auto result = path_mtu_.start_probe(probe_id, now_microseconds, media_probe_interval);
       if (result != transport::path_mtu_result::accepted) {
         return std::nullopt;
       }
@@ -1566,6 +1574,8 @@ namespace lumen::lsp::runtime {
       path_probe_ = {};
       path_mtu_before_probe_.reset();
       requested_path_payload_.store(probe.udp_payload_size, std::memory_order_release);
+      BOOST_LOG(info) << "LSP DPLPMTUD confirmed " << probe.udp_payload_size << "-byte UDP payload (ceiling "
+                      << path_mtu_.ceiling_payload_bytes() << ")";
       return true;
     }
 
@@ -1606,6 +1616,8 @@ namespace lumen::lsp::runtime {
             path_mtu_.probe_timed_out() != transport::path_mtu_result::accepted) {
           return false;
         }
+        BOOST_LOG(info) << "LSP DPLPMTUD " << path_probe_.probe.udp_payload_size
+                        << "-byte probe exceeds the local interface MTU";
         path_probe_ = {};
         path_mtu_before_probe_.reset();
         next_path_raise_microseconds_.store(
@@ -1657,6 +1669,9 @@ namespace lumen::lsp::runtime {
       if (path_mtu_.probe_timed_out() != transport::path_mtu_result::accepted) {
         return false;
       }
+      BOOST_LOG(info) << "LSP DPLPMTUD " << path_probe_.probe.udp_payload_size
+                      << "-byte probe unacknowledged after " << static_cast<unsigned>(maximum_probe_attempts)
+                      << " attempts";
       path_probe_ = {};
       path_mtu_before_probe_.reset();
       next_path_raise_microseconds_.store(
@@ -4548,7 +4563,7 @@ namespace lumen::lsp::runtime {
       std::array<std::span<const std::uint8_t>, maximum_nal_units_per_access_unit> unit_storage {};
       auto access_unit = std::span<std::uint8_t> {retained_frame.bytes}.first(access_unit_bytes);
       std::size_t unit_count = 0;
-      if (config_.video.codec == VideoCodec::av1) {
+      if (config_.video.codec == VideoCodec::av1 || config_.video.codec == VideoCodec::bc1) {
         std::size_t normalized_bytes = 0;
         unit_count = normalize_av1_obus(access_unit, unit_storage, normalized_bytes);
         access_unit_bytes = normalized_bytes;
@@ -4642,6 +4657,9 @@ namespace lumen::lsp::runtime {
           break;
         case VideoCodec::hevc:
           plan_count = plan_hevc_packets(units, boundary_capacity, middle_capacity, plans);
+          break;
+        case VideoCodec::bc1:
+          plan_count = plan_av1_packets(units, false, boundary_capacity, middle_capacity, plans);
           break;
         case VideoCodec::av1:
           plan_count = plan_av1_packets(

@@ -1982,12 +1982,18 @@ namespace lumen::lsp::runtime {
         }
         owner->slot = static_cast<std::uint8_t>(std::distance(forward_paths_.begin(), free));
       }
+      // DPLPMTUD sender interface limit: the local interface MTU toward this peer minus IP/UDP
+      // headers, so jumbo-frame links (Thunderbolt/USB4, MTU 9000) can grow past 1,472 bytes
+      // while a standard 1,500-byte interface keeps the 1,472/1,452 ceiling.
+      const auto interface_payload_limit = local_interface_udp_payload_limit(peer);
+      BOOST_LOG(info) << "LSP path interface UDP payload limit "sv << interface_payload_limit << " bytes for "sv
+                      << peer.remote_address;
       owner->path = std::shared_ptr<HostForwardPath> {new (std::nothrow) HostForwardPath({
         .peer = peer,
         .generation = generation,
         .pacing_bits_per_second = 20'000'000,
         .path_payload_bytes = 1'200,
-        .probe_payload_ceiling = 0,
+        .probe_payload_ceiling = interface_payload_limit,
         .callbacks = {
           .context = owner.get(),
           .send_datagram = forward_send_callback,
@@ -2294,10 +2300,25 @@ namespace lumen::lsp::runtime {
         }
       }
       const auto competition_capacity = static_cast<std::uint64_t>(config_.host.competition_capacity_mbps) * 1'000'000ULL;
+      // NVENC's internal RGB conversion is BT.601 limited range, so RGB input is used only when
+      // the client offers that description and the encode runs on the legacy capture path.
+      const bool client_offers_bt601 = std::ranges::any_of(request.video_offers, [](const auto &candidate) {
+        return candidate.matrix_coefficients == video_matrix_bt601;
+      });
+      // Only NVENC converts RGB input itself; any other encoder keeps Lumen's BT.709 conversion.
+      const bool nvenc_encoder = video::probe_encoders() == 0 && video::active_lsp_sdr_encoder_capability(1).nvenc;
+      bool direct_frame_capture = request.cursor_mode == CursorMode::client;
+  #ifdef _WIN32
+      direct_frame_capture = direct_frame_capture ||
+                             config::video.dd.virtual_display_policy == config::video_t::dd_t::virtual_display_policy_e::required;
+  #endif
       for (const auto &offer : request.video_offers) {
-        const auto video_format = offer.codec == VideoCodec::h264 ? 0 :
-                                  offer.codec == VideoCodec::hevc ? 1 :
-                                                                    2;
+        // BC1 runs through the HEVC capture/encoder capability checks; the encode device then
+        // swaps NVENC for the GPU BC1 encoder.
+        const bool bc1 = offer.codec == VideoCodec::bc1;
+        const auto video_format = offer.codec == VideoCodec::h264                ? 0 :
+                                  offer.codec == VideoCodec::hevc || bc1 ? 1 :
+                                                                           2;
         const auto ten_bit = offer.pixel_format == VideoPixelClass::yuv420_10 ||
                              offer.pixel_format == VideoPixelClass::yuv444_10;
         const auto yuv444 = offer.pixel_format == VideoPixelClass::yuv444_8 ||
@@ -2313,8 +2334,22 @@ namespace lumen::lsp::runtime {
           BOOST_LOG(warning) << "LSP START rejected an offer at check 1"sv;
           continue;
         }
+        const bool rgb_input = config::video.nv.rgb_input && nvenc_encoder && client_offers_bt601 && !direct_frame_capture &&
+                               offer.codec != VideoCodec::bc1 && offer.pixel_format == VideoPixelClass::yuv420_8 &&
+                               !offer.full_range;
+        if ((offer.matrix_coefficients == video_matrix_bt601) != rgb_input) {
+          continue;  // Take the twin offer whose matrix matches the conversion actually used.
+        }
         auto selected_bitrate = offer.preferred_bits_per_second;
         auto pacing_ceiling = offer.maximum_bits_per_second;
+        if (bc1 && offer.refresh_denominator != 0) {
+          // BC1 is fixed-rate and far above the wire bitrate fields, so pace at what its blocks
+          // need plus headroom for repair and headers.
+          const auto block_bits = ((static_cast<std::uint64_t>(offer.width) + 3U) / 4U) *
+                                  ((static_cast<std::uint64_t>(offer.height) + 3U) / 4U) * 64U;
+          const auto bc1_bits_per_second = block_bits * offer.refresh_numerator / offer.refresh_denominator;
+          pacing_ceiling = std::max(pacing_ceiling, bc1_bits_per_second + bc1_bits_per_second / 4U);
+        }
         if (request.network_profile == VideoNetworkProfile::competition) {
           if (competition_capacity == 0) {
             BOOST_LOG(warning) << "LSP START failed at check 13"sv;
@@ -2413,21 +2448,7 @@ namespace lumen::lsp::runtime {
           encoder_limits.maximum_height = 4'096;
           encoder_limits.maximum_pixels = 4'096ULL * 4'096ULL;
         }
-        // Capture wakes at the stream rate and grabs the newest composed frame, so that frame is
-        // up to one VDD refresh old. Composing at the highest whole multiple of the stream rate
-        // cuts that age (8.3 ms at 120 Hz to 2.1 ms at 480 Hz) without raising the encoded rate.
-        auto composition_refresh = *refresh_ratio;
-        if (const auto multiple = (static_cast<std::uint64_t>(LUMEN_START_MODE_MAX_REFRESH_HZ) * refresh_ratio->denominator) /
-                                  refresh_ratio->numerator;
-            multiple > 1) {
-          if (const auto boosted = platf::virtual_display::rational_t {
-                static_cast<std::uint32_t>(refresh_ratio->numerator * multiple),
-                refresh_ratio->denominator,
-              }
-                                     .normalized()) {
-            composition_refresh = *boosted;
-          }
-        }
+        const auto composition_refresh = *refresh_ratio;
         const auto prepare_display = [&](const platf::virtual_display::rational_t &refresh) {
           return platf::virtual_display::prepare_system_stream_session(
             activation,
@@ -2601,13 +2622,17 @@ namespace lumen::lsp::runtime {
         // Reference invalidation and cyclic intra-refresh are independent
         // encoder features. RFI support must not implicitly enable an
         // overlapping intra-refresh wave that can reject invalidation.
-        auto initialization = video::codec_initialization(selected.capture);
+        selected.capture.lumen_bc1 = bc1;
+        selected.capture.nvenc_rgb_input = rgb_input;
+        auto initialization = bc1 ? std::optional<std::vector<std::uint8_t>> {std::vector<std::uint8_t> {}} :
+                                    video::codec_initialization(selected.capture);
         if (!initialization) {
           rollback_process();
           BOOST_LOG(warning) << "LSP START failed at check 19"sv;
           return std::unexpected(ControlStatus::unsupported_media_tuple);
         }
-        auto codec_units = split_video_codec_units(*initialization, offer.codec);
+        auto codec_units = bc1 ? std::optional<std::vector<std::vector<std::uint8_t>>> {std::vector<std::vector<std::uint8_t>> {}} :
+                                 split_video_codec_units(*initialization, offer.codec);
         if (!codec_units) {
           rollback_process();
           BOOST_LOG(warning) << "LSP START failed at check 20"sv;
@@ -3581,7 +3606,8 @@ namespace lumen::lsp::runtime {
           .maximum_capture_to_present_microseconds = selection.wire.video.maximum_frame_age_microseconds,
           .aggregate_pacing_bits_per_second = selection.aggregate_pacing_bits_per_second,
           .reserved_overhead_bits_per_second = selection.reserved_overhead_bits_per_second,
-          .path_payload_ceiling = selection.path_payload_ceiling,
+          // An ATTACH can move the association to an interface with a smaller MTU than START saw.
+          .path_payload_ceiling = std::min(selection.path_payload_ceiling, forward->path->snapshot().probe_payload_ceiling),
           .feedback_sender_ssrc = selection.feedback_sender_ssrc,
           .audio_feedback_ssrc = selection.audio_feedback_ssrc,
           .rtcp_cname = *rtcp_cname,
@@ -3980,14 +4006,21 @@ namespace lumen::lsp::runtime {
       const auto family = peer.family == IpAddressFamily::ipv6 ? input_plane::ip_family::ipv6 : input_plane::ip_family::ipv4;
       const auto media_family = peer.family == IpAddressFamily::ipv6 ? media::ip_family::ipv6 : media::ip_family::ipv4;
       // A receive-capacity offer is an upper bound, not a request to send that
-      // size on every address family. The default 1,472-byte capacity must
-      // still negotiate the 1,452-byte Ethernet ceiling on IPv6.
+      // size on every address family: an IPv4-sized offer still negotiates the
+      // smaller IPv6 ceiling. The DPLPMTUD ceiling is the smallest of the
+      // client's authenticated receive limit, the family jumbo-frame ceiling,
+      // and this host's local interface limit toward the peer.
       const auto family_ceiling = media_family == media::ip_family::ipv6 ?
                                     media::ipv6_udp_payload_ceiling :
                                     media::ipv4_udp_payload_ceiling;
+      const auto interface_ceiling = forward->path->snapshot().probe_payload_ceiling;
       const auto path_limit = media::make_path_payload_limit(
         media_family,
-        std::min<std::size_t>(request.offered_maximum_udp_payload, family_ceiling)
+        std::min({
+          static_cast<std::size_t>(request.offered_maximum_udp_payload),
+          family_ceiling,
+          static_cast<std::size_t>(interface_ceiling),
+        })
       );
       if (!path_limit) {
         return std::unexpected(ControlStatus::malformed);

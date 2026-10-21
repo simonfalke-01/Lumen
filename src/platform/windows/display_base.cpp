@@ -365,12 +365,16 @@ namespace platf::dxgi {
           frame_pacing_group_frames = 0;
           status = capture_e::timeout;
         } else {
-          timer->sleep_for(sleep_period);
-          sleep_overshoot_logger.first_point(sleep_target);
-          sleep_overshoot_logger.second_point_now_and_log();
-
+          // Wait on the next composed frame rather than sleeping to a fixed schedule. A timer is
+          // not phase-aligned with composition, so it adds up to a full frame of age; the
+          // duplication wait returns the moment Windows presents a new frame.
           capture_boundary();
-          status = snapshot(pull_free_image_cb, img_out, 0ms, *cursor);
+          status = snapshot(
+            pull_free_image_cb,
+            img_out,
+            std::chrono::ceil<std::chrono::milliseconds>(sleep_period) + capture_resynchronization_timeout,
+            *cursor
+          );
 
           if (status == capture_e::ok && img_out) {
             frame_pacing_group_frames += 1;

@@ -19,7 +19,7 @@
 #include <vector>
 
 namespace lumen::lsp::runtime {
-  inline constexpr std::size_t maximum_host_feedback_work_bytes = 1'472;  ///< Confirmed LSP/1 UDP payload ceiling.
+  inline constexpr std::size_t maximum_host_feedback_work_bytes = 8'972;  ///< LSP/1 jumbo-frame UDP payload ceiling.
 
   /** @brief Priority class selected by the shared feedback worker. */
   enum class HostFeedbackWorkClass : std::uint8_t {

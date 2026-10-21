@@ -31,7 +31,7 @@
 
 namespace lumen::lsp::runtime {
   namespace {
-    [[maybe_unused]] constexpr std::size_t maximum_protected_packet_bytes = 2'048;  ///< Provider-wide bounded UDP payload slab.
+    [[maybe_unused]] constexpr std::size_t maximum_protected_packet_bytes = 9'216;  ///< Provider-wide bound; covers the 8,972-byte jumbo-frame forward slab.
 #if LUMEN_LSP_LIBSRTP_AVAILABLE
     constexpr std::size_t srtp_master_material_size = srtp_aes_128_key_size + srtp_aead_salt_size;
     constexpr std::size_t maximum_streams_per_direction = 32;

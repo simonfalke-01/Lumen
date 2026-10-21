@@ -17,7 +17,7 @@ namespace lumen::lsp {
   struct dplpmtud_config {
     std::uint16_t base_payload = 1'200;  ///< Conservatively usable starting UDP payload.
     std::uint16_t fast_probe_payload = 1'400;  ///< First fast-search target.
-    std::uint16_t ceiling_payload = 1'472;  ///< Interface/path ceiling without IP fragmentation.
+    std::uint16_t ceiling_payload = 8'972;  ///< Interface/path ceiling without IP fragmentation (IPv4 jumbo frame).
   };
 
   /** @brief State of the single outstanding authenticated path probe. */

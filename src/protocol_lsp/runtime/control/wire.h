@@ -288,6 +288,7 @@ namespace lumen::lsp::runtime {
     h264 = 1,  ///< RFC 6184 H.264 non-interleaved mode.
     hevc = 2,  ///< RFC 7798 HEVC single-stream mode.
     av1 = 3,  ///< AOM AV1 RTP payload-format version 1.0.0.
+    bc1 = 4,  ///< Intra-only BC1 blocks in one AV1 padding OBU, for 10 Gbit/s or faster links.
   };
 
   /** @brief Exact codec-profile values for the LSP video schema. */
@@ -299,6 +300,7 @@ namespace lumen::lsp::runtime {
     hevc_range_extensions = 5,  ///< HEVC Range Extensions profile; pixel class selects depth.
     av1_main = 6,  ///< AV1 Main profile; pixel class selects 8-bit or 10-bit 4:2:0.
     av1_high = 7,  ///< AV1 High profile; pixel class selects 8-bit or 10-bit 4:4:4.
+    bc1 = 8,  ///< BC1 4-bit-per-pixel RGB blocks; carried with the 8-bit 4:2:0 pixel class.
   };
 
   /** @brief Exact decoded pixel classes carried by video offers and selections. */
@@ -320,6 +322,7 @@ namespace lumen::lsp::runtime {
 
   /** @brief H.273 value for BT.2020 non-constant-luminance matrix coefficients. */
   inline constexpr std::uint8_t video_matrix_bt2020_ncl = 9;
+  inline constexpr std::uint8_t video_matrix_bt601 = 6;  ///< SMPTE 170M; NVENC's RGB-input conversion.
 
   /** @brief H.273 value for SMPTE ST 2084 perceptual-quantizer transfer. */
   inline constexpr std::uint8_t video_transfer_pq = 16;

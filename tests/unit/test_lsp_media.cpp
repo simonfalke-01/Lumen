@@ -85,10 +85,10 @@ TEST(LspMediaCommon, EnforcesClockPathAndBoundaryExtensionContracts) {
   EXPECT_EQ(audio_clock_rate, 48'000U);
   EXPECT_FALSE(make_path_payload_limit(ip_family::ipv4, 1'199));
   EXPECT_TRUE(make_path_payload_limit(ip_family::ipv4, 1'200));
-  EXPECT_TRUE(make_path_payload_limit(ip_family::ipv4, 1'472));
-  EXPECT_FALSE(make_path_payload_limit(ip_family::ipv4, 1'473));
-  EXPECT_TRUE(make_path_payload_limit(ip_family::ipv6, 1'452));
-  EXPECT_FALSE(make_path_payload_limit(ip_family::ipv6, 1'453));
+  EXPECT_TRUE(make_path_payload_limit(ip_family::ipv4, 8'972));
+  EXPECT_FALSE(make_path_payload_limit(ip_family::ipv4, 8'973));
+  EXPECT_TRUE(make_path_payload_limit(ip_family::ipv6, 8'952));
+  EXPECT_FALSE(make_path_payload_limit(ip_family::ipv6, 8'953));
   EXPECT_EQ(make_path_payload_limit(ip_family::ipv4, 1'200).limit.plaintext_rtp_capacity(), 1'184U);
 
   for (std::size_t count = 1; count <= 7; ++count) {

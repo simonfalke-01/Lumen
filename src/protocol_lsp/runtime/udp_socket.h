@@ -353,6 +353,18 @@ namespace lumen::lsp::runtime {
   };
 
   /**
+   * @brief Return the largest non-fragmenting UDP payload the local interface toward a peer can send.
+   *
+   * The interface IP MTU minus the IP/UDP header (28 bytes IPv4, 48 bytes IPv6), clamped to
+   * 1,200 through the address family's jumbo-frame ceiling. Falls back to the standard
+   * 1,500-byte Ethernet ceiling (1,472 IPv4, 1,452 IPv6) when the MTU cannot be determined.
+   *
+   * @param peer Exact association endpoint, including its receiving interface when known.
+   * @return DPLPMTUD sender interface limit in protected UDP payload bytes.
+   */
+  [[nodiscard]] std::uint16_t local_interface_udp_payload_limit(const PeerEndpoint &peer) noexcept;
+
+  /**
    * @brief Read the local monotonic clock in whole microseconds.
    *
    * @return Nondecreasing process-local timestamp.

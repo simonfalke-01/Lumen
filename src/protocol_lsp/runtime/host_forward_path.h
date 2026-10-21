@@ -17,8 +17,8 @@
 namespace lumen::lsp::runtime {
   enum class UdpSendResult : std::uint8_t;
 
-  /** @brief Maximum protected UDP payload retained by the host forward path. */
-  inline constexpr std::size_t host_forward_maximum_payload_bytes = 1'472;
+  /** @brief Maximum protected UDP payload retained by the host forward path (IPv4 jumbo-frame ceiling). */
+  inline constexpr std::size_t host_forward_maximum_payload_bytes = 8'972;
 
   /** @brief Scheduler priority classes for host-to-client LSP datagrams. */
   enum class HostForwardLane : std::uint8_t {
@@ -99,7 +99,7 @@ namespace lumen::lsp::runtime {
     std::uint32_t generation {};  ///< Nonzero connection/path authority generation.
     std::uint64_t pacing_bits_per_second {};  ///< Aggregate complete IP-layer ceiling.
     std::uint16_t path_payload_bytes {1'200};  ///< Current protected UDP payload ceiling.
-    std::uint16_t probe_payload_ceiling {};  ///< Authenticated DPLPMTUD ceiling, or zero for the family maximum.
+    std::uint16_t probe_payload_ceiling {};  ///< Local interface DPLPMTUD ceiling, or zero for the jumbo family maximum.
     HostForwardCallbacks callbacks {};  ///< Required final-send and optional observation callbacks.
 
     /** @brief Validate peer, generation, path size, rate, and callback invariants. */

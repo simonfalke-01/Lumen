@@ -138,6 +138,9 @@ namespace nvenc {
 
     // Enable split-frame encoding if the gpu has multiple NVENC hardware clusters
     nvenc_split_frame_encoding split_frame_encoding = nvenc_split_frame_encoding::driver_decides;  ///< Split frame encoding.
+
+    // Hand the BGRA capture straight to NVENC for SDR 4:2:0, skipping Lumen's conversion draw
+    bool rgb_input = true;  ///< Feed BGRA capture directly to NVENC instead of converting to NV12 first.
   };
 
 }  // namespace nvenc

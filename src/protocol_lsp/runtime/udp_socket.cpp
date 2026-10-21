@@ -11,20 +11,27 @@
 
 #include "udp_socket.h"
 
+#include "../media/common.h"
+
 #ifdef _WIN32
   #include <mswsock.h>
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  // iphlpapi.h must follow winsock2.h; it provides GetBestInterfaceEx and GetIpInterfaceEntry.
+  #include <iphlpapi.h>
 #else
   #include <arpa/inet.h>
   #include <cerrno>
   #include <fcntl.h>
+  #include <net/if.h>
   #include <netinet/in.h>
   #include <poll.h>
+  #include <sys/ioctl.h>
   #include <sys/socket.h>
   #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -353,7 +360,85 @@ namespace lumen::lsp::runtime {
       }
       return false;
     }
+
+    /**
+     * @brief Read the IP MTU of the local interface that carries traffic to one peer.
+     *
+     * The receiving interface recorded for the association is preferred because replies are
+     * sourced from it; otherwise the routing table's best interface for the peer is used.
+     *
+     * @param peer Exact association endpoint.
+     * @return Interface IP MTU in bytes, or no value when it cannot be determined.
+     */
+    std::optional<std::uint32_t> local_interface_mtu(const PeerEndpoint &peer) noexcept {
+#ifdef _WIN32
+      NET_IFINDEX index = peer.interface_index;
+      if (index == 0) {
+        sockaddr_storage destination {};
+        SocketLength size = 0;
+        if (!encode_destination(peer, destination, size, true)) {
+          return std::nullopt;
+        }
+        DWORD best = 0;
+        if (GetBestInterfaceEx(reinterpret_cast<sockaddr *>(&destination), &best) != NO_ERROR || best == 0) {
+          return std::nullopt;
+        }
+        index = static_cast<NET_IFINDEX>(best);
+      }
+      MIB_IPINTERFACE_ROW row {};
+      InitializeIpInterfaceEntry(&row);
+      row.Family = static_cast<ADDRESS_FAMILY>(peer.family == IpAddressFamily::ipv6 ? AF_INET6 : AF_INET);
+      row.InterfaceIndex = index;
+      if (GetIpInterfaceEntry(&row) != NO_ERROR || row.NlMtu == 0) {
+        return std::nullopt;
+      }
+      return static_cast<std::uint32_t>(row.NlMtu);
+#else
+      if (peer.interface_index == 0) {
+        return std::nullopt;
+      }
+      std::array<char, IF_NAMESIZE> name {};
+      if (if_indextoname(peer.interface_index, name.data()) == nullptr) {
+        return std::nullopt;
+      }
+      const auto query = ::socket(AF_INET, SOCK_DGRAM, 0);
+      if (query < 0) {
+        return std::nullopt;
+      }
+      ifreq request {};
+      std::memcpy(request.ifr_name, name.data(), std::min(sizeof(request.ifr_name) - 1U, std::strlen(name.data())));
+      const auto result = ioctl(query, SIOCGIFMTU, &request);
+      ::close(query);
+      if (result != 0 || request.ifr_mtu <= 0) {
+        return std::nullopt;
+      }
+      return static_cast<std::uint32_t>(request.ifr_mtu);
+#endif
+    }
   }  // namespace
+
+  std::uint16_t local_interface_udp_payload_limit(const PeerEndpoint &peer) noexcept {
+    const auto ipv6 = peer.family == IpAddressFamily::ipv6;
+    const std::uint32_t overhead = ipv6 ? 48U : 28U;
+    const auto jumbo = static_cast<std::uint32_t>(
+      ipv6 ? media::ipv6_udp_payload_ceiling : media::ipv4_udp_payload_ceiling
+    );
+    const auto standard = static_cast<std::uint16_t>(
+      ipv6 ? media::ipv6_standard_udp_payload_ceiling : media::ipv4_standard_udp_payload_ceiling
+    );
+    if (!initialize_winsock()) {
+      return standard;
+    }
+    const auto mtu = local_interface_mtu(peer);
+    if (!mtu || *mtu <= overhead) {
+      return standard;
+    }
+    return static_cast<std::uint16_t>(std::clamp<std::uint32_t>(
+      *mtu - overhead,
+      static_cast<std::uint32_t>(media::initial_udp_payload_size),
+      jumbo
+    ));
+  }
 
   NativeUdpSocket::NativeUdpSocket() noexcept = default;
 
