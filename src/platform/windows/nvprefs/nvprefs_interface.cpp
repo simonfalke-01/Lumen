@@ -195,6 +195,96 @@ namespace nvprefs {
     return true;
   }
 
+  bool nvprefs_interface::apply_stream_frame_limiter(unsigned int fps, bool &applied) {
+    applied = false;
+    if (!pimpl->loaded) {
+      return false;
+    }
+
+    std::optional<undo_data_t> undo_data;
+    if (!pimpl->driver_settings.apply_global_frame_limiter(fps, undo_data)) {
+      error_message("Couldn't apply the stream frame limiter");
+      pimpl->driver_settings.load_settings();
+      return false;
+    }
+    if (!undo_data) {
+      return true;
+    }
+
+    // A cap left by an earlier stream whose restore failed is ours, not the user's value
+    if (pimpl->undo_data) {
+      if (const auto previous = pimpl->undo_data->get_frame_limiter()) {
+        undo_data->set_frame_limiter(fps, previous->undo_value);
+      }
+    }
+
+    if (!pimpl->undo_file) {
+      if (!CreateDirectoryW(pimpl->undo_folder_path.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        error_message("Couldn't create undo folder");
+        pimpl->driver_settings.load_settings();
+        return false;
+      }
+      pimpl->undo_file = undo_file_t::create_new_file(pimpl->undo_file_path);
+      if (!pimpl->undo_file) {
+        error_message("Couldn't create undo file");
+        pimpl->driver_settings.load_settings();
+        return false;
+      }
+    }
+
+    if (pimpl->undo_data) {
+      pimpl->undo_data->merge(*undo_data);
+    } else {
+      pimpl->undo_data = undo_data;
+    }
+
+    // The undo record must reach disk before the driver setting does
+    if (!pimpl->undo_file->write_undo_data(*pimpl->undo_data)) {
+      error_message("Couldn't write to undo file");
+      pimpl->undo_data->clear_frame_limiter();
+      pimpl->driver_settings.load_settings();
+      return false;
+    }
+
+    if (!pimpl->driver_settings.save_settings()) {
+      error_message("Couldn't save the stream frame limiter");
+      pimpl->driver_settings.load_settings();
+      return false;
+    }
+
+    applied = true;
+    return true;
+  }
+
+  bool nvprefs_interface::restore_stream_frame_limiter() {
+    if (!pimpl->loaded) {
+      return false;
+    }
+    if (!pimpl->undo_data || !pimpl->undo_data->get_frame_limiter() || !pimpl->undo_file) {
+      return true;
+    }
+
+    if (!pimpl->driver_settings.restore_global_frame_limiter(*pimpl->undo_data) || !pimpl->driver_settings.save_settings()) {
+      error_message("Couldn't restore the stream frame limiter");
+      return false;
+    }
+
+    pimpl->undo_data->clear_frame_limiter();
+    if (pimpl->undo_data->empty()) {
+      if (!pimpl->undo_file->delete_file()) {
+        error_message("Couldn't delete undo file");
+        return false;
+      }
+      pimpl->undo_data = std::nullopt;
+      pimpl->undo_file = std::nullopt;
+    } else if (!pimpl->undo_file->write_undo_data(*pimpl->undo_data)) {
+      error_message("Couldn't write to undo file");
+      return false;
+    }
+
+    return true;
+  }
+
   bool nvprefs_interface::owning_undo_file() {
     return pimpl->undo_file.has_value();
   }

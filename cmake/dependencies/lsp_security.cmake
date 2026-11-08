@@ -52,6 +52,18 @@ set(WOLFSSL_SYS_CA_CERTS no CACHE STRING "LSP uses explicit SPKI trust" FORCE)
 set(WOLFSSL_MLKEM no CACHE STRING "Disable unused post-quantum groups" FORCE)
 set(WOLFSSL_PQC_HYBRIDS no CACHE STRING "Disable unused hybrid groups" FORCE)
 
+# SRTP seals every video datagram with wolfCrypt AES-GCM on the sender thread. The portable C
+# GCM manages a few hundred MB/s, so x86-64 GCC/Clang builds use AES-NI with PCLMULQDQ and the
+# AVX/AVX2 GCM kernels, chosen per CPU at run time with the C code as fallback. Cipher suites
+# and protocol are unchanged. wolfSSL's CMake only selects the AES-NI assembly sources from this
+# variable; the macros and flags configure would add are applied to the target below.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64" AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set(_lumen_wolfssl_aesni ON)
+    set(WOLFSSL_AESNI yes)
+else()
+    set(_lumen_wolfssl_aesni OFF)
+endif()
+
 FetchContent_Declare(
         lumen_wolfssl
         GIT_REPOSITORY https://github.com/wolfSSL/wolfssl.git
@@ -86,6 +98,42 @@ target_compile_definitions(wolfssl PUBLIC
         WOLFSSL_SP_MATH_ALL)
 target_include_directories(wolfssl PUBLIC
         "$<BUILD_INTERFACE:${_lumen_wolfssl_spake2_include}>")
+if(_lumen_wolfssl_aesni)
+    # Public so every consumer sees the AES-NI Aes layout and 16-byte alignment.
+    target_compile_definitions(wolfssl PUBLIC WOLFSSL_AESNI)
+    # The AVX GCM kernels are gated on USE_INTEL_SPEEDUP inside aes.c. Defining it library-wide
+    # would also select SHA, ChaCha and curve assembly that is not built.
+    set_source_files_properties("${lumen_wolfssl_SOURCE_DIR}/wolfcrypt/src/aes.c"
+            TARGET_DIRECTORY wolfssl
+            PROPERTIES COMPILE_DEFINITIONS USE_INTEL_SPEEDUP)
+    target_compile_options(wolfssl PRIVATE
+            "$<$<COMPILE_LANGUAGE:C>:-maes;-msse4.2;-mpclmul>")
+    if(WIN32)
+        # The AES-NI assembly is written for the System V calling convention, which x64 Windows
+        # does not use; declaring its entry points sysv_abi makes GCC pass arguments in the
+        # right registers and preserve xmm6-xmm15 around each call.
+        set(_lumen_wolfssl_win64_asm "${lumen_wolfssl_BINARY_DIR}/lsp-win64-asm")
+        file(MAKE_DIRECTORY "${_lumen_wolfssl_win64_asm}")
+        file(WRITE "${_lumen_wolfssl_win64_asm}/lsp_xasm_link.h"
+                "#pragma once\n"
+                "#define XASM_LINK(f) __asm__(f) __attribute__((sysv_abi))\n")
+        target_compile_options(wolfssl PRIVATE
+                "$<$<COMPILE_LANGUAGE:C>:-include;${_lumen_wolfssl_win64_asm}/lsp_xasm_link.h>")
+        # The GCM assembly carries ELF .type/.size symbol metadata that the PE/COFF assembler
+        # rejects. Build a copy without those lines; the instructions are untouched.
+        file(READ "${lumen_wolfssl_SOURCE_DIR}/wolfcrypt/src/aes_gcm_asm.S" _lumen_gcm_asm)
+        string(REGEX REPLACE "\n[ \t]*\\.(type|size)[ \t][^\n]*" "" _lumen_gcm_asm "${_lumen_gcm_asm}")
+        file(WRITE "${_lumen_wolfssl_win64_asm}/aes_gcm_asm.S" "${_lumen_gcm_asm}")
+        get_target_property(_lumen_wolfssl_sources wolfssl SOURCES)
+        list(TRANSFORM _lumen_wolfssl_sources
+                REPLACE "^(.*/)?wolfcrypt/src/aes_gcm_asm\\.S$" "${_lumen_wolfssl_win64_asm}/aes_gcm_asm.S")
+        set_property(TARGET wolfssl PROPERTY SOURCES ${_lumen_wolfssl_sources})
+        target_include_directories(wolfssl PRIVATE "${lumen_wolfssl_SOURCE_DIR}")
+        unset(_lumen_gcm_asm)
+        unset(_lumen_wolfssl_sources)
+        unset(_lumen_wolfssl_win64_asm)
+    endif()
+endif()
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     # GCC 15 diagnoses wolfSSL's size-checked GCM counter helper as an
     # out-of-bounds write after inlining even though the runtime size is the
@@ -163,3 +211,4 @@ unset(_lumen_libsrtp_patch_check)
 unset(_lumen_libsrtp_patch_result)
 unset(_lumen_libsrtp_reverse_check)
 unset(_lumen_wolfssl_spake2_include)
+unset(_lumen_wolfssl_aesni)

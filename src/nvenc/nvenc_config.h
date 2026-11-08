@@ -139,8 +139,14 @@ namespace nvenc {
     // Enable split-frame encoding if the gpu has multiple NVENC hardware clusters
     nvenc_split_frame_encoding split_frame_encoding = nvenc_split_frame_encoding::driver_decides;  ///< Split frame encoding.
 
-    // Hand the BGRA capture straight to NVENC for SDR 4:2:0, skipping Lumen's conversion draw
-    bool rgb_input = true;  ///< Feed BGRA capture directly to NVENC instead of converting to NV12 first.
+    // Hand the BGRA capture straight to NVENC for SDR 4:2:0, skipping Lumen's conversion draw.
+    // Off by default: NVENC converts RGB with CUDA at normal priority, which a game holding the
+    // GPU starves into 30+ ms encodes, while the conversion draw runs at realtime GPU priority.
+    bool rgb_input = false;  ///< Feed BGRA capture directly to NVENC instead of converting to NV12 first.
+
+    // Convert and hand frames to NVENC on a D3D12 compute queue instead of the D3D11 graphics
+    // queue a running game keeps full. SDR 8-bit 4:2:0 desktop duplication only; falls back to D3D11.
+    bool d3d12_compute = true;  ///< `nvenc_d3d12_compute`: `auto` (true) or `disabled`.
   };
 
 }  // namespace nvenc

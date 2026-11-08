@@ -150,9 +150,12 @@ namespace lumen::lsp::runtime {
      * Pacing at the average media rate spreads every frame across its whole frame interval, so
      * the last packet (and decode) lands most of a frame late. The controller still sets the
      * encoder bitrate; only the per-frame burst drains faster, bounded to gigabit wire speed.
+     * Twice the average rate drains an average frame in about half its interval. Draining at
+     * full wire speed instead lands each frame as one line-rate train that a client receive
+     * buffer must absorb whole whenever its reader is descheduled, for little latency gain.
      */
     [[nodiscard]] constexpr std::uint64_t frame_burst_rate(const std::uint64_t pacing_bits_per_second) noexcept {
-      constexpr std::uint64_t burst_multiplier = 4;
+      constexpr std::uint64_t burst_multiplier = 2;
       constexpr std::uint64_t wire_ceiling_bits_per_second = 1'000'000'000;
       if (pacing_bits_per_second >= wire_ceiling_bits_per_second / burst_multiplier) {
         return std::max(pacing_bits_per_second, wire_ceiling_bits_per_second);

@@ -90,6 +90,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_vram.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/bc1_encoder.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/bc1_encoder.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/d3d12_nv12_converter.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/d3d12_nv12_converter.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_ram.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_wgc.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
@@ -125,6 +127,7 @@ list(PREPEND PLATFORM_LIBRARIES
         ${CURL_STATIC_LIBRARIES}
         avrt
         d3d11
+        d3d12
         D3DCompiler
         dwmapi
         dxgi

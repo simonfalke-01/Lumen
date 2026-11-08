@@ -3,11 +3,13 @@
  * @brief Miscellaneous definitions for Windows.
  */
 // standard includes
+#include <algorithm>
 #include <csignal>
 #include <filesystem>
 #include <iomanip>
 #include <iterator>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -46,6 +48,7 @@
 // local includes
 #include "misc.h"
 #include "nvprefs/nvprefs_interface.h"
+#include "src/config.h"
 #include "src/entry_handler.h"
 #include "src/globals.h"
 #include "src/logging.h"
@@ -100,6 +103,39 @@ namespace {
   std::mutex streaming_lease_mutex;  ///< Serializes process-wide streaming platform-state ownership.
   std::uint32_t streaming_lease_count {};  ///< Active legacy and LSP owners of streaming platform state.
   HANDLE streaming_power_request {};  ///< Process-owned system-sleep inhibitor held by the first streaming lease.
+  std::uint32_t stream_frame_cap_count {};  ///< Active LSP owners of the driver frame cap.
+  std::optional<unsigned int> stream_frame_cap_applied;  ///< FRL_FPS value Lumen set, if any.
+
+  /**
+   * @brief Resolve the `lsp_frame_cap` option against one stream rate.
+   *
+   * `auto` stays a little under the stream rate so a capped game never outruns the display
+   * grid: about 2 fps at 120 and 1 fps at 60, never less than 1.
+   *
+   * @param setting Configured option value.
+   * @param framerate_x100 Stream frame rate in hundredths of a frame per second.
+   * @return FRL_FPS value to apply, or none when the cap is off.
+   */
+  std::optional<unsigned int> stream_frame_cap_target(const std::string &setting, const int framerate_x100) {
+    const int stream_fps = framerate_x100 / 100;
+    if (stream_fps <= 0 || setting == "disabled" || setting == "off") {
+      return std::nullopt;
+    }
+    int target = stream_fps - std::max(1, stream_fps / 60);
+    if (!setting.empty() && setting != "auto") {
+      try {
+        std::size_t parsed = 0;
+        const int value = std::stoi(setting, &parsed);
+        if (parsed != setting.size()) {
+          throw std::invalid_argument(setting);
+        }
+        target = value < 0 ? stream_fps + value : value;
+      } catch (const std::exception &) {
+        BOOST_LOG(warning) << "Ignoring invalid lsp_frame_cap value ["sv << setting << "]; using auto"sv;
+      }
+    }
+    return static_cast<unsigned int>(std::clamp(target, 1, 1023));
+  }
 
   bool nt_set_timer_resolution_max() {
     ULONG maximum;
@@ -1348,6 +1384,39 @@ namespace platf {
     }
   }
 
+  void stream_frame_cap_will_start(const int framerate_x100) {
+    std::scoped_lock lock(streaming_lease_mutex);
+    ++stream_frame_cap_count;
+    const auto target = stream_frame_cap_target(config::lsp.frame_cap, framerate_x100);
+    if (!target || stream_frame_cap_applied == target) {
+      return;
+    }
+    if (!nvprefs_instance.load()) {
+      BOOST_LOG(info) << "Driver frame cap unavailable: the GPU driver has no NVIDIA profile settings"sv;
+      return;
+    }
+    bool applied = false;
+    if (nvprefs_instance.apply_stream_frame_limiter(*target, applied) && applied) {
+      stream_frame_cap_applied = target;
+      BOOST_LOG(info) << "Driver frame cap set to "sv << *target << " fps for a "sv << framerate_x100 / 100.0 << " fps stream"sv;
+    }
+    nvprefs_instance.unload();
+  }
+
+  void stream_frame_cap_will_stop() {
+    std::scoped_lock lock(streaming_lease_mutex);
+    if (stream_frame_cap_count == 0 || --stream_frame_cap_count != 0 || !stream_frame_cap_applied) {
+      return;
+    }
+    stream_frame_cap_applied = std::nullopt;
+    if (nvprefs_instance.load()) {
+      if (nvprefs_instance.restore_stream_frame_limiter()) {
+        BOOST_LOG(info) << "Driver frame cap restored"sv;
+      }
+      nvprefs_instance.unload();
+    }
+  }
+
   void restart_on_exit() {
     STARTUPINFOEXW startup_info {};
     startup_info.StartupInfo.cb = sizeof(startup_info);
@@ -1839,7 +1908,9 @@ namespace platf {
     };
     static const double frequency = get_frequency();
     if (frequency) {
-      return std::chrono::nanoseconds((int64_t) ((performance_counter1 - performance_counter2) * frequency / std::nano::den));
+      // Ticks over ticks-per-second is seconds. The inverted ratio made every result about 10^4
+      // too small, so frame timestamps collapsed to the snapshot time instead of the present time.
+      return std::chrono::nanoseconds((int64_t) ((performance_counter1 - performance_counter2) * (std::nano::den / frequency)));
     }
     return {};
   }

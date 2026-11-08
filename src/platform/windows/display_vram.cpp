@@ -3,6 +3,7 @@
  * @brief Definitions for handling video ram.
  */
 // standard includes
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -32,11 +34,13 @@ extern "C" {
 // local includes
 #include "display.h"
 #include "bc1_encoder.h"
+#include "d3d12_nv12_converter.h"
 #include "fused_d3d11_policy.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/nvenc/nvenc_config.h"
+#include "src/nvenc/nvenc_d3d12_interface.h"
 #include "src/nvenc/nvenc_dynamic_factory.h"
 #include "src/nvenc/nvenc_hdr_metadata.h"
 #include "src/stream_policy.h"
@@ -477,6 +481,9 @@ namespace platf::dxgi {
 
     // True when capture and encode use this texture through the same D3D11 device.
     bool fused_resource = false;  ///< Whether legacy shared-handle and keyed-mutex boundaries are absent.
+    bool fence_synced = false;  ///< Whether a D3D12 encoder shares this texture through fences instead of a keyed mutex.
+    std::atomic<std::uint64_t> capture_fence_value {};  ///< Capture-fence value that marks the latest write as done.
+    std::atomic<std::uint64_t> consumed_fence_value {};  ///< Consumption-fence value of the latest D3D12 read.
     std::shared_ptr<const virtual_display::color_transform_t> color_transform;  ///< ABI5 transform retained with the slot lease.
     virtual_display::frame_color_metadata_t color_metadata;  ///< ABI5 resolved frame color/HDR state.
     fused_d3d11::frame_trace_token_t telemetry_capture_token;  ///< Image-owned parent trace for bounded encoder children.
@@ -940,6 +947,11 @@ namespace platf::dxgi {
       }
 
       auto &img = (img_d3d_t &) img_base;
+      // A texture still shared through fences with an ended D3D12 encoder has no keyed mutex to
+      // open; keep the previous picture until the capture side recreates it for this encoder.
+      if (!fused && img.fence_synced) {
+        return 0;
+      }
       if (!img.blank) {
         auto telemetry_child = fused_d3d11::frame_trace_owner_t {
           fused_d3d11::telemetry(),
@@ -1070,7 +1082,9 @@ namespace platf::dxgi {
         }
 
         // Draw captured frame
+        auto *timing_slot = begin_conversion_timing();
         draw(img_ctx.encoder_input_res, out_Y_or_YUV_viewports, out_UV_viewport);
+        end_conversion_timing(timing_slot);
 
         // Release the legacy cross-device mutex after source reads are submitted.
         if (!fused) {
@@ -1525,6 +1539,7 @@ namespace platf::dxgi {
       if (FAILED(status)) {
         BOOST_LOG(warning) << "Failed to increase encoding GPU thread priority. Please run application as administrator for optimal performance.";
       }
+      init_conversion_timing();
 
       auto default_color_vectors = ::video::color_vectors_from_colorspace({::video::colorspace_e::rec601, false, 8}, true);
       if (!default_color_vectors) {
@@ -1703,6 +1718,149 @@ namespace platf::dxgi {
 
       return resource_view;
     }
+
+    /** @brief GPU timestamps around one conversion draw, read back a few frames later. */
+    struct conversion_timing_slot_t {
+      query_t disjoint;  ///< Timestamp-frequency bracket.
+      query_t begin;  ///< GPU time the draw started.
+      query_t end;  ///< GPU time the draw finished.
+      std::chrono::steady_clock::time_point submitted;  ///< CPU time the draw was issued.
+      bool pending {};  ///< Whether the queries await readback.
+    };
+
+    /**
+     * @brief Read finished conversion timestamps and issue the start of a new measurement.
+     *
+     * Readback never waits: a slot whose queries are still in flight skips this frame's
+     * measurement. Queue wait is the GPU-start-minus-CPU-issue offset above the smallest offset
+     * of the window, so it reads as time spent queued behind other GPU work (the game) while the
+     * draw span is the conversion itself. Logged every ten seconds.
+     *
+     * @return Slot to close after the draw, or null when this frame is not measured.
+     */
+    conversion_timing_slot_t *begin_conversion_timing() {
+      if (!conversion_timing_available) {
+        return nullptr;
+      }
+      for (auto &slot : conversion_timing_slots) {
+        if (!slot.pending) {
+          continue;
+        }
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint {};
+        UINT64 begin_ticks = 0;
+        UINT64 end_ticks = 0;
+        if (device_ctx->GetData(slot.disjoint.get(), &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            device_ctx->GetData(slot.begin.get(), &begin_ticks, sizeof(begin_ticks), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            device_ctx->GetData(slot.end.get(), &end_ticks, sizeof(end_ticks), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+          continue;
+        }
+        slot.pending = false;
+        if (disjoint.Disjoint || disjoint.Frequency == 0 || end_ticks < begin_ticks) {
+          ++conversion_timing_disjoint;
+          continue;
+        }
+        const auto ticks_to_ns = [frequency = disjoint.Frequency](const UINT64 ticks) {
+          return static_cast<std::int64_t>((ticks / frequency) * 1'000'000'000ULL + (ticks % frequency) * 1'000'000'000ULL / frequency);
+        };
+        if (conversion_timing_count < conversion_draw_samples.size()) {
+          conversion_draw_samples[conversion_timing_count] =
+            static_cast<std::uint32_t>(std::min<std::int64_t>((ticks_to_ns(end_ticks) - ticks_to_ns(begin_ticks)) / 1'000, UINT32_MAX));
+          conversion_offset_samples[conversion_timing_count] =
+            ticks_to_ns(begin_ticks) - std::chrono::duration_cast<std::chrono::nanoseconds>(slot.submitted.time_since_epoch()).count();
+          ++conversion_timing_count;
+        }
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (conversion_timing_window_start == std::chrono::steady_clock::time_point {}) {
+        conversion_timing_window_start = now;
+      } else if (now - conversion_timing_window_start >= std::chrono::seconds {10}) {
+        log_conversion_timing();
+        conversion_timing_window_start = now;
+      }
+
+      auto &slot = conversion_timing_slots[conversion_timing_next++ % conversion_timing_slots.size()];
+      if (slot.pending) {
+        ++conversion_timing_unready;
+        return nullptr;
+      }
+      device_ctx->Begin(slot.disjoint.get());
+      device_ctx->End(slot.begin.get());
+      slot.submitted = now;
+      return &slot;
+    }
+
+    /**
+     * @brief Close the measurement started by `begin_conversion_timing()`.
+     *
+     * @param slot Slot returned for this frame, or null.
+     */
+    void end_conversion_timing(conversion_timing_slot_t *slot) {
+      if (!slot) {
+        return;
+      }
+      device_ctx->End(slot->end.get());
+      device_ctx->End(slot->disjoint.get());
+      slot->pending = true;
+    }
+
+    /**
+     * @brief Log one window of conversion draw and queue-wait percentiles and reset it.
+     */
+    void log_conversion_timing() {
+      const auto count = conversion_timing_count;
+      auto draws = std::span {conversion_draw_samples}.first(count);
+      auto offsets = std::span {conversion_offset_samples}.first(count);
+      std::ranges::sort(draws);
+      std::ranges::sort(offsets);
+      const auto at = [count](const auto &samples, const std::size_t permille) {
+        return samples[std::min(count - 1, count * permille / 1000U)];
+      };
+      if (count == 0) {
+        BOOST_LOG(info) << "Conversion GPU timing: frames=0 disjoint="sv << conversion_timing_disjoint
+                        << " unready="sv << conversion_timing_unready;
+      } else {
+        const auto queue_us = [&](const std::size_t permille) {
+          return (at(offsets, permille) - offsets.front()) / 1'000;
+        };
+        BOOST_LOG(info) << "Conversion GPU timing: frames="sv << count
+                        << " draw_p50_us="sv << at(draws, 500) << " draw_p99_us="sv << at(draws, 990)
+                        << " draw_max_us="sv << draws.back()
+                        << " queue_p50_us="sv << queue_us(500) << " queue_p99_us="sv << queue_us(990)
+                        << " queue_max_us="sv << queue_us(1000)
+                        << " disjoint="sv << conversion_timing_disjoint << " unready="sv << conversion_timing_unready;
+      }
+      conversion_timing_count = 0;
+      conversion_timing_disjoint = 0;
+      conversion_timing_unready = 0;
+    }
+
+    /**
+     * @brief Create the conversion timestamp queries; timing stays off if any creation fails.
+     */
+    void init_conversion_timing() {
+      D3D11_QUERY_DESC disjoint_desc {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+      D3D11_QUERY_DESC timestamp_desc {D3D11_QUERY_TIMESTAMP, 0};
+      for (auto &slot : conversion_timing_slots) {
+        if (FAILED(device->CreateQuery(&disjoint_desc, &slot.disjoint)) ||
+            FAILED(device->CreateQuery(&timestamp_desc, &slot.begin)) ||
+            FAILED(device->CreateQuery(&timestamp_desc, &slot.end))) {
+          BOOST_LOG(warning) << "Conversion GPU timing unavailable: timestamp queries could not be created"sv;
+          return;
+        }
+      }
+      conversion_timing_available = true;
+    }
+
+    std::array<conversion_timing_slot_t, 4> conversion_timing_slots;  ///< Readback ring a few frames deep.
+    std::size_t conversion_timing_next {};  ///< Next slot to issue.
+    bool conversion_timing_available {};  ///< Whether every timestamp query was created.
+    std::array<std::uint32_t, 2048> conversion_draw_samples {};  ///< Draw GPU spans this window.
+    std::array<std::int64_t, 2048> conversion_offset_samples {};  ///< GPU start minus CPU issue this window.
+    std::size_t conversion_timing_count {};  ///< Valid samples this window.
+    std::uint64_t conversion_timing_disjoint {};  ///< Samples lost to a disjoint GPU clock this window.
+    std::uint64_t conversion_timing_unready {};  ///< Frames skipped because readback was still in flight.
+    std::chrono::steady_clock::time_point conversion_timing_window_start;  ///< Start of the logging window.
 
     ::video::color_t *color_p;  ///< Color p.
 
@@ -2316,6 +2474,232 @@ namespace platf::dxgi {
   };
 
   /**
+   * @brief NVENC encode device that converts on a D3D12 compute queue, with the D3D11 path as fallback.
+   *
+   * A running game and DWM keep the D3D11 graphics queue full, and the D3D11 conversion draw and
+   * NVENC's wait on it queue behind that work. Here the desktop-duplication copy is the only
+   * graphics-queue step: the conversion runs on a high-priority compute queue, NVENC waits for it
+   * through a fence on the GPU, and the capture side waits for the conversion through another
+   * fence before reusing a texture. SDR 8-bit 4:2:0 on desktop duplication only; anything else,
+   * or any failed creation step, uses the D3D11 device exactly as before.
+   */
+  class d3d12_nvenc_encode_device_t final: public nvenc_encode_device_t {
+  public:
+    ~d3d12_nvenc_encode_device_t() override {
+      if (!active_) {
+        return;
+      }
+      // Finish every conversion before the capture side stops waiting on them.
+      converter_->wait_idle();
+      if (auto display = display_.lock()) {
+        display->set_d3d12_capture_sync(false);
+        auto context_lock = std::lock_guard(display->fused_context_mutex);
+        display->release_legacy_encoder();
+      }
+      nvenc = nullptr;
+      encoder_.reset();
+      converter_.reset();
+    }
+
+    /**
+     * @brief Record the capture display; D3D12 resources are created with the encoder.
+     *
+     * @param display Desktop-duplication display that owns the capture textures.
+     * @param pix_fmt Lumen pixel format to encode.
+     */
+    void init_device(std::shared_ptr<display_vram_t> display, pix_fmt_e pix_fmt) {
+      display_ = display;
+      buffer_format_ = pix_fmt;
+    }
+
+    /** @copydoc nvenc_encode_device_t::init_encoder() */
+    bool init_encoder(const ::video::config_t &client_config, const ::video::stream_colorspace_t &stream_colorspace) override {
+      if (eligible(client_config, stream_colorspace) && init_d3d12(client_config, stream_colorspace)) {
+        return true;
+      }
+
+      auto display = display_.lock();
+      if (!display) {
+        return false;
+      }
+      auto legacy = std::make_unique<d3d_nvenc_encode_device_t>();
+      if (!legacy->init_device(display, display->adapter.get(), buffer_format_)) {
+        return false;
+      }
+      legacy->colorspace = stream_colorspace;
+      if (!legacy->init_encoder(client_config, stream_colorspace)) {
+        return false;
+      }
+      fallback_ = std::move(legacy);
+      nvenc = fallback_->nvenc;
+      return true;
+    }
+
+    /** @copydoc nvenc_encode_device_t::convert() */
+    int convert(platf::img_t &img_base) override {
+      if (fallback_) {
+        return fallback_->convert(img_base);
+      }
+      if (!active_) {
+        return -1;
+      }
+
+      auto &img = static_cast<img_d3d_t &>(img_base);
+      // An image still shared the D3D11 way predates this encoder; the next capture replaces it.
+      if (img.blank || !img.fence_synced || !img.encoder_texture_handle) {
+        return 0;
+      }
+
+      for (auto it = sources_.begin(); it != sources_.end();) {
+        it = it->second.image.expired() ? sources_.erase(it) : std::next(it);
+      }
+      auto &source = sources_[img.id];
+      if (!source.resource || source.capture_texture != img.capture_texture.get()) {
+        source.resource = converter_->open_shared_texture(img.encoder_texture_handle);
+        source.capture_texture = img.capture_texture.get();
+        source.image = img.weak_from_this();
+        if (!source.resource) {
+          return -1;
+        }
+      }
+
+      auto display = display_.lock();
+      if (!display) {
+        return -1;
+      }
+      const auto value = ++display->d3d12_fences->consumption_value;
+      if (!converter_->convert(source.resource.Get(), img.format, img.capture_fence_value.load(std::memory_order_acquire), value)) {
+        return -1;
+      }
+      img.consumed_fence_value.store(value, std::memory_order_release);
+      encoder_->set_input_fence_point(converter_->consumption_fence(), value);
+      last_value_ = value;
+      return 0;
+    }
+
+    /** @copydoc nvenc_encode_device_t::gpu_timing() */
+    std::optional<gpu_timing_t> gpu_timing() override {
+      // Repeats and skipped images reuse the last conversion; report each conversion once.
+      if (!active_ || last_value_ == timed_value_) {
+        return std::nullopt;
+      }
+      timed_value_ = last_value_;
+      const auto timing = converter_->timing(last_value_);
+      if (!timing) {
+        return std::nullopt;
+      }
+      return gpu_timing_t {
+        .copy_wait_us = timing->copy_wait_us,
+        .convert_gpu_us = timing->convert_gpu_us,
+        .convert_end = timing->convert_end,
+      };
+    }
+
+  private:
+    /** @brief Return whether this stream can take the D3D12 path at all. */
+    bool eligible(const ::video::config_t &client_config, const ::video::stream_colorspace_t &stream_colorspace) const {
+      auto display = display_.lock();
+      return display && config::video.nv.d3d12_compute && buffer_format_ == pix_fmt_e::nv12 &&
+             client_config.dynamicRange == 0 && client_config.chromaSamplingType == 0 && !client_config.lumen_bc1 &&
+             !client_config.nvenc_rgb_input && stream_colorspace.bit_depth == 8 &&
+             stream_colorspace.colorspace != ::video::colorspace_e::bt2020 &&
+             stream_colorspace.colorspace != ::video::colorspace_e::bt2020hlg &&
+             (display->display_rotation == DXGI_MODE_ROTATION_UNSPECIFIED || display->display_rotation == DXGI_MODE_ROTATION_IDENTITY);
+    }
+
+    /** @brief Create every D3D12 piece; any failure leaves nothing behind for the fallback. */
+    bool init_d3d12(const ::video::config_t &client_config, const ::video::stream_colorspace_t &stream_colorspace) {
+      auto display = display_.lock();
+      auto fail = [](std::string_view step) {
+        BOOST_LOG(warning) << "NVENC D3D12 compute conversion unavailable ("sv << step << "); using the D3D11 conversion"sv;
+        return false;
+      };
+
+      auto factory = nvenc::nvenc_dynamic_factory::get();
+      if (!factory) {
+        return fail("no NVENC driver"sv);
+      }
+      auto *fences = display->ensure_d3d12_capture_fences();
+      if (!fences) {
+        return fail("no shared D3D11 fences"sv);
+      }
+      auto converter = d3d12_nv12_converter_t::create(display->adapter.get(), fences->capture_handle.get(), fences->consumption_handle.get());
+      if (!converter) {
+        return fail("compute queue setup failed"sv);
+      }
+      auto encoder = factory->create_nvenc_d3d12(converter->device());
+      if (!encoder) {
+        return fail("the NVENC driver has no D3D12 interface"sv);
+      }
+
+      auto nvenc_config = config::video.nv;
+      nvenc_config.rgb_input = false;
+      if (!encoder->create_encoder(nvenc_config, client_config, stream_colorspace, buffer_format_, std::nullopt)) {
+        return fail("NVENC D3D12 session failed"sv);
+      }
+      const auto *color = ::video::color_vectors_from_colorspace(stream_colorspace, true);
+      const auto fill_value = ++fences->consumption_value;
+      if (!color ||
+          !converter->init_output(
+            encoder->get_input_resource(),
+            static_cast<std::uint32_t>(client_config.width),
+            static_cast<std::uint32_t>(client_config.height),
+            static_cast<std::uint32_t>(display->width),
+            static_cast<std::uint32_t>(display->height),
+            *color,
+            fill_value
+          )) {
+        return fail("NV12 output setup failed"sv);
+      }
+      encoder->set_input_fence_point(converter->consumption_fence(), fill_value);
+
+      {
+        // The capture textures stay cross-device resources, as for the legacy D3D11 encoder.
+        auto context_lock = std::lock_guard(display->fused_context_mutex);
+        const auto transition = display->encode_resource_ownership->begin_transition(fused_d3d11::resource_mode_e::legacy);
+        if (transition == fused_d3d11::transition_result_e::rejected) {
+          return fail("the display's capture resources are fused"sv);
+        }
+        if (transition == fused_d3d11::transition_result_e::started &&
+            !display->encode_resource_ownership->commit_transition(fused_d3d11::resource_mode_e::legacy)) {
+          return fail("capture resource ownership"sv);
+        }
+        if (!display->acquire_legacy_encoder()) {
+          return fail("capture resource ownership"sv);
+        }
+      }
+
+      display->set_d3d12_capture_sync(true);
+      converter_ = std::move(converter);
+      encoder_ = std::move(encoder);
+      nvenc = encoder_.get();
+      last_value_ = fill_value;
+      timed_value_ = fill_value;
+      active_ = true;
+      BOOST_LOG(info) << "NVENC D3D12 compute conversion active: "sv << converter_->queue_priority()
+                      << " priority compute queue, fence-ordered capture copy, GPU-side NVENC input wait"sv;
+      return true;
+    }
+
+    /** @brief One capture texture opened on the D3D12 device. */
+    struct shared_source_t {
+      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      ID3D11Texture2D *capture_texture = nullptr;  ///< Identity of the texture the resource was opened from.
+      std::weak_ptr<platf::img_t> image;  ///< Capture image that owns the texture.
+    };
+
+    std::weak_ptr<display_vram_t> display_;
+    pix_fmt_e buffer_format_ = pix_fmt_e::unknown;
+    std::unique_ptr<d3d12_nv12_converter_t> converter_;
+    std::unique_ptr<nvenc::nvenc_d3d12_interface> encoder_;
+    std::unique_ptr<d3d_nvenc_encode_device_t> fallback_;  ///< D3D11 device used when the D3D12 path is unavailable.
+    std::map<std::uint32_t, shared_source_t> sources_;  ///< Opened capture textures by image ID.
+    std::uint64_t last_value_ = 0;  ///< Consumption value of the latest conversion.
+    std::uint64_t timed_value_ = 0;  ///< Conversion whose timings were already reported.
+    bool active_ = false;  ///< Whether the D3D12 path owns the encoder.
+  };
+
+  /**
    * @brief Set cursor texture.
    *
    * @param device D3D, audio, or platform device used by the operation.
@@ -2561,6 +2945,11 @@ namespace platf::dxgi {
       return true;
     };
 
+    // Images shared with a D3D12 encoder are ordered by fences: wait for its last read before
+    // writing, and signal once all of this capture's writes are queued.
+    auto *const fences = d3d12_capture_sync.load(std::memory_order_acquire) ? d3d12_fences.get() : nullptr;
+    std::vector<std::shared_ptr<img_d3d_t>> fence_written;
+
     auto get_locked_d3d_img = [&](std::shared_ptr<platf::img_t> &img, bool dummy = false) -> std::tuple<std::shared_ptr<img_d3d_t>, texture_lock_helper> {
       auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
 
@@ -2568,6 +2957,18 @@ namespace platf::dxgi {
       // also creates synchronization primitives for shared access from multiple direct3d devices.
       if (complete_img(d3d_img.get(), dummy)) {
         return {nullptr, nullptr};
+      }
+
+      if (d3d_img->fence_synced && fences) {
+        // A GPU-side wait: the copy queues behind the conversion still reading this texture.
+        if (const auto consumed = d3d_img->consumed_fence_value.load(std::memory_order_acquire)) {
+          auto context_lock = lock_fused_context();
+          if (FAILED(fences->context->Wait(fences->consumption.get(), consumed))) {
+            BOOST_LOG(error) << "Failed to queue the capture wait on the D3D12 conversion fence";
+            return {nullptr, nullptr};
+          }
+        }
+        fence_written.push_back(d3d_img);
       }
 
       // This image is shared between capture direct3d device and encoders direct3d devices,
@@ -2809,6 +3210,20 @@ namespace platf::dxgi {
     // Perform delayed destruction of the unused surface if the time is due.
     if (old_surface_delayed_destruction && old_surface_timestamp + 10s < std::chrono::steady_clock::now()) {
       old_surface_delayed_destruction.reset();
+    }
+
+    if (!fence_written.empty()) {
+      auto context_lock = lock_fused_context();
+      const auto value = ++fences->capture_value;
+      if (FAILED(fences->context->Signal(fences->capture.get(), value))) {
+        BOOST_LOG(error) << "Failed to signal the D3D12 capture fence";
+        return capture_e::error;
+      }
+      // Submit now so the copy never waits in the context's batch for unrelated work.
+      device_ctx->Flush();
+      for (const auto &written : fence_written) {
+        written->capture_fence_value.store(value, std::memory_order_release);
+      }
     }
 
     if (img_out) {
@@ -3356,6 +3771,7 @@ namespace platf::dxgi {
     }
     const auto resource_mode = encode_resource_ownership->mode();
     const bool fused_resource = resource_mode == fused_d3d11::resource_mode_e::fused;
+    const bool fence_synced = !fused_resource && d3d12_capture_sync.load(std::memory_order_acquire);
     bool fused_completion_failed = fused_resource;
     auto fused_completion_guard = util::fail_guard([&]() {
       if (fused_completion_failed) {
@@ -3364,7 +3780,8 @@ namespace platf::dxgi {
     });
 
     // Recreate the image when switching between legacy shared and fused same-device ownership.
-    if (img->capture_texture && img->dummy == dummy && img->fused_resource == fused_resource) {
+    if (img->capture_texture && img->dummy == dummy && img->fused_resource == fused_resource &&
+        img->fence_synced == fence_synced) {
       fused_completion_failed = false;
       fused_completion_guard.disable();
       return 0;
@@ -3391,6 +3808,9 @@ namespace platf::dxgi {
     img->row_pitch = img->pixel_pitch * img->width;
     img->dummy = dummy;
     img->fused_resource = fused_resource;
+    img->fence_synced = fence_synced;
+    img->capture_fence_value.store(0, std::memory_order_relaxed);
+    img->consumed_fence_value.store(0, std::memory_order_relaxed);
     img->format = (capture_format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_B8G8R8A8_UNORM : capture_format;
 
     D3D11_TEXTURE2D_DESC t {};
@@ -3402,7 +3822,10 @@ namespace platf::dxgi {
     t.Usage = D3D11_USAGE_DEFAULT;
     t.Format = img->format;
     t.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    t.MiscFlags = fused_resource ? 0 : D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    // D3D12 cannot use keyed mutexes, so a fence-synced texture is plainly shared.
+    t.MiscFlags = fused_resource ? 0 :
+                  fence_synced   ? D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED :
+                                   D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
     auto status = device->CreateTexture2D(&t, nullptr, &img->capture_texture);
     if (FAILED(status)) {
@@ -3418,10 +3841,12 @@ namespace platf::dxgi {
 
     if (!fused_resource) {
       // Get the keyed mutex to synchronize with the legacy encoder device.
-      status = img->capture_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &img->capture_mutex);
-      if (FAILED(status)) {
-        BOOST_LOG(error) << "Failed to query IDXGIKeyedMutex [0x"sv << util::hex(status).to_string_view() << ']';
-        return -1;
+      if (!fence_synced) {
+        status = img->capture_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &img->capture_mutex);
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "Failed to query IDXGIKeyedMutex [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
       }
 
       resource1_t resource;
@@ -3432,7 +3857,12 @@ namespace platf::dxgi {
       }
 
       // Create a handle for the legacy encoder device to open this texture.
-      status = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &img->encoder_texture_handle);
+      status = resource->CreateSharedHandle(
+        nullptr,
+        fence_synced ? DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE : DXGI_SHARED_RESOURCE_READ,
+        nullptr,
+        &img->encoder_texture_handle
+      );
       if (FAILED(status)) {
         BOOST_LOG(error) << "Failed to create shared texture handle [0x"sv << util::hex(status).to_string_view() << ']';
         return -1;
@@ -3596,7 +4026,45 @@ namespace platf::dxgi {
     return device;
   }
 
+  display_vram_t::d3d12_capture_fences_t *display_vram_t::ensure_d3d12_capture_fences() {
+    auto context_lock = lock_fused_context();
+    if (d3d12_fences) {
+      return d3d12_fences.get();
+    }
+    auto fences = std::make_unique<d3d12_capture_fences_t>();
+    device5_t device5;
+    if (FAILED(device->QueryInterface(__uuidof(ID3D11Device5), (void **) &device5)) ||
+        FAILED(device_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **) &fences->context))) {
+      BOOST_LOG(warning) << "The capture device has no D3D11.4 fences"sv;
+      return nullptr;
+    }
+    HANDLE capture_handle = nullptr;
+    HANDLE consumption_handle = nullptr;
+    if (FAILED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void **) &fences->capture)) ||
+        FAILED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void **) &fences->consumption)) ||
+        FAILED(fences->capture->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &capture_handle))) {
+      BOOST_LOG(warning) << "Failed to create the shared capture fences"sv;
+      return nullptr;
+    }
+    fences->capture_handle.reset(capture_handle);
+    if (FAILED(fences->consumption->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &consumption_handle))) {
+      BOOST_LOG(warning) << "Failed to share the D3D12 conversion fence"sv;
+      return nullptr;
+    }
+    fences->consumption_handle.reset(consumption_handle);
+    d3d12_fences = std::move(fences);
+    return d3d12_fences.get();
+  }
+
   std::unique_ptr<nvenc_encode_device_t> display_vram_t::make_nvenc_encode_device(pix_fmt_e pix_fmt) {
+    // Desktop duplication without the direct VDD source can convert on a D3D12 compute queue;
+    // that device decides per stream and falls back to the D3D11 device below on its own.
+    if (config::video.nv.d3d12_compute && pix_fmt == pix_fmt_e::nv12 && !direct_vdd_is_active() &&
+        dynamic_cast<display_ddup_vram_t *>(this)) {
+      auto device = std::make_unique<d3d12_nvenc_encode_device_t>();
+      device->init_device(shared_from_this(), pix_fmt);
+      return device;
+    }
     auto device = std::make_unique<d3d_nvenc_encode_device_t>();
     if (!device->init_device(shared_from_this(), adapter.get(), pix_fmt)) {
       return nullptr;

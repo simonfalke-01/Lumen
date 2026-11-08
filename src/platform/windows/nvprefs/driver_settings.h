@@ -86,6 +86,23 @@ namespace nvprefs {
     bool check_and_modify_global_profile(std::optional<undo_data_t> &undo_data);
 
     /**
+     * @brief Cap the global frame rate for a stream, keeping any lower global cap already set.
+     *
+     * @param fps FRL_FPS value to apply.
+     * @param undo_data Receives the value to restore when the cap was changed.
+     * @return True when the cap was applied or a lower existing cap was kept.
+     */
+    bool apply_global_frame_limiter(uint32_t fps, std::optional<undo_data_t> &undo_data);
+
+    /**
+     * @brief Restore the global frame rate cap from undo data.
+     *
+     * @param undo_data Driver settings captured before Lumen modified them.
+     * @return True when the NVIDIA driver-settings operation succeeds.
+     */
+    bool restore_global_frame_limiter(const undo_data_t &undo_data);
+
+    /**
      * @brief Compare and update Lumen NVIDIA application profile settings.
      *
      * @param modified Whether NVIDIA driver settings were changed and need saving.

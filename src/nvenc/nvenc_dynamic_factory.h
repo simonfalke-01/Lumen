@@ -11,6 +11,7 @@
 
   // local includes
   #include "nvenc_d3d11_interface.h"
+  #include "nvenc_d3d12_interface.h"
   #include "nvenc_shared_dll.h"
   #include "nvenc_version.h"
 
@@ -43,18 +44,26 @@ namespace nvenc {
       std::function<std::unique_ptr<nvenc_d3d11_interface>(ID3D11Device *, shared_dll)>;
 
     /**
+     * @brief SDK-specific Direct3D12 encoder constructor.
+     */
+    using create_d3d12_encoder_fn =
+      std::function<std::unique_ptr<nvenc_d3d12_interface>(ID3D12Device *, shared_dll)>;
+
+    /**
      * @brief Construct a factory bound to one NVENC SDK implementation.
      *
      * @param dll Shared NVENC driver module.
      * @param sdk_version Selected SDK version.
      * @param create_native Native Direct3D11 encoder constructor.
      * @param create_on_cuda CUDA-interoperability encoder constructor.
+     * @param create_d3d12 Direct3D12 encoder constructor, empty when the SDK has no D3D12 interface.
      */
     nvenc_dynamic_factory(
       shared_dll dll,
       nvenc_sdk_version sdk_version,
       create_encoder_fn create_native,
-      create_encoder_fn create_on_cuda
+      create_encoder_fn create_on_cuda,
+      create_d3d12_encoder_fn create_d3d12 = {}
     );
 
     /**
@@ -89,6 +98,14 @@ namespace nvenc {
     std::unique_ptr<nvenc_d3d11_interface> create_nvenc_d3d11_on_cuda(ID3D11Device *d3d_device) const;
 
     /**
+     * @brief Create a Direct3D12 NVENC encoder.
+     *
+     * @param d3d_device Direct3D12 device that owns the input texture.
+     * @return SDK-neutral encoder instance, or empty when the selected SDK has no D3D12 interface.
+     */
+    std::unique_ptr<nvenc_d3d12_interface> create_nvenc_d3d12(ID3D12Device *d3d_device) const;
+
+    /**
      * @brief Get the SDK implementation selected for this factory.
      *
      * @return Selected NVENC SDK version.
@@ -100,6 +117,7 @@ namespace nvenc {
     nvenc_sdk_version selected_sdk_version;
     create_encoder_fn create_native;
     create_encoder_fn create_on_cuda;
+    create_d3d12_encoder_fn create_d3d12;
   };
 
 }  // namespace nvenc

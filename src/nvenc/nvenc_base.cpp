@@ -584,7 +584,20 @@ namespace NVENC_NAMESPACE {
 
   bool nvenc_base::initialize_encoder_resources(NV_ENC_INITIALIZE_PARAMS &init_params) {
     if (nvenc_failed(nvenc->nvEncInitializeEncoder(encoder, &init_params))) {
-      BOOST_LOG(error) << "NvEnc: NvEncInitializeEncoder() failed: " << last_nvenc_error_string;
+      // The driver's detail string names the rejected parameter. It can carry stray bytes, so
+      // only its printable characters are kept.
+      std::string detail;
+      if (const char *driver_detail = nvenc->nvEncGetLastErrorString(encoder)) {
+        for (const char *c = driver_detail; *c && detail.size() < 256; ++c) {
+          if (*c >= 0x20 && *c < 0x7f) {
+            detail.push_back(*c);
+          }
+        }
+      }
+      BOOST_LOG(error) << "NvEnc: NvEncInitializeEncoder() failed: " << last_nvenc_error_string
+                       << (detail.empty() ? "" : " (") << detail << (detail.empty() ? "" : ")")
+                       << " encode=" << init_params.encodeWidth << 'x' << init_params.encodeHeight
+                       << " max=" << init_params.maxEncodeWidth << 'x' << init_params.maxEncodeHeight;
       return false;
     }
     if (async_event_handle) {
@@ -596,13 +609,29 @@ namespace NVENC_NAMESPACE {
       }
     }
 
+    if (!create_output_bitstream()) {
+      return false;
+    }
+    return create_and_register_input_buffer();
+  }
+
+  bool nvenc_base::create_output_bitstream() {
     NV_ENC_CREATE_BITSTREAM_BUFFER create_bitstream_buffer = {NV_ENC_CREATE_BITSTREAM_BUFFER_VER};
     if (nvenc_failed(nvenc->nvEncCreateBitstreamBuffer(encoder, &create_bitstream_buffer))) {
       BOOST_LOG(error) << "NvEnc: NvEncCreateBitstreamBuffer() failed: " << last_nvenc_error_string;
       return false;
     }
     output_bitstream = create_bitstream_buffer.bitstreamBuffer;
-    return create_and_register_input_buffer();
+    return true;
+  }
+
+  void nvenc_base::destroy_output_bitstream() {
+    if (output_bitstream) {
+      if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
+        BOOST_LOG(error) << "NvEnc: NvEncDestroyBitstreamBuffer() failed: " << last_nvenc_error_string;
+      }
+      output_bitstream = nullptr;
+    }
   }
 
   void nvenc_base::log_created_encoder(
@@ -787,7 +816,7 @@ namespace NVENC_NAMESPACE {
     }
     init_params.enablePTD = 1;
     init_params.enableEncodeAsync = async_event_handle ? 1 : 0;
-    init_params.enableWeightedPrediction = effective_nvenc.weighted_prediction &&
+    init_params.enableWeightedPrediction = effective_nvenc.weighted_prediction && supports_weighted_prediction() &&
                                            get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_WEIGHTED_PREDICTION);
     init_params.encodeWidth = encoder_params.width;
     init_params.darWidth = encoder_params.width;
@@ -796,6 +825,15 @@ namespace NVENC_NAMESPACE {
     const AVRational fps = video::framerate_to_rational(client_config);
     init_params.frameRateNum = fps.num;
     init_params.frameRateDen = fps.den;
+#if NVENCAPI_MAJOR_VERSION >= 12
+    // Only the D3D12 interface reads this; it fails initialization with INVALID_PARAM when unset.
+    // Its H.264 encoder also takes a zero maximum size literally instead of as the encode size.
+    if (requires_initialize_buffer_format()) {
+      init_params.bufferFormat = buffer_format;
+      init_params.maxEncodeWidth = init_params.encodeWidth;
+      init_params.maxEncodeHeight = init_params.encodeHeight;
+    }
+#endif
     configure_split_frame(init_params, effective_nvenc, client_config);
 
     NV_ENC_PRESET_CONFIG preset_config = {
@@ -855,11 +893,8 @@ namespace NVENC_NAMESPACE {
 #ifdef _WIN32
     frame_trace_owner_.reset();
 #endif
-    if (output_bitstream) {
-      if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
-        BOOST_LOG(error) << "NvEnc: NvEncDestroyBitstreamBuffer() failed: " << last_nvenc_error_string;
-      }
-      output_bitstream = nullptr;
+    if (encoder) {
+      destroy_output_bitstream();
     }
     if (encoder && async_event_handle) {
       NV_ENC_EVENT_PARAMS event_params = {NV_ENC_EVENT_PARAMS_VER};
@@ -898,7 +933,7 @@ namespace NVENC_NAMESPACE {
     }
 
     assert(registered_input_buffer);
-    assert(output_bitstream);
+    assert(picture_output_bitstream());
 
     if (!synchronize_input_buffer()) {
       BOOST_LOG(error) << "NvEnc: failed to synchronize input buffer";
@@ -943,9 +978,9 @@ namespace NVENC_NAMESPACE {
     pic_params.encodePicFlags = encode_idr ? NV_ENC_PIC_FLAG_FORCEIDR : 0;
     pic_params.inputTimeStamp = frame_index;
     pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-    pic_params.inputBuffer = mapped_input_buffer.mappedResource;
+    pic_params.inputBuffer = picture_input_buffer(mapped_input_buffer.mappedResource);
     pic_params.bufferFmt = mapped_input_buffer.mappedBufferFmt;
-    pic_params.outputBitstream = output_bitstream;
+    pic_params.outputBitstream = picture_output_bitstream();
     pic_params.completionEvent = async_event_handle;
 
 #if NVENC_SDK_VERSION >= 1300
@@ -967,13 +1002,16 @@ namespace NVENC_NAMESPACE {
       return {};
     }
     NV_ENC_LOCK_BITSTREAM lock_bitstream = {NV_ENC_LOCK_BITSTREAM_VER};
-    lock_bitstream.outputBitstream = output_bitstream;
+    lock_bitstream.outputBitstream = picture_output_bitstream();
     lock_bitstream.doNotWait = async_event_handle ? 1 : 0;
 
 #ifdef _WIN32
     const auto telemetry_wait_lock_begin_ns = platf::dxgi::fused_d3d11::telemetry_t::now_ns();
 #endif
-    if (async_event_handle && !wait_for_async_event(100)) {
+    // A game holding the GPU can delay one frame past 100 ms. Giving up then tears the whole
+    // encoder down and restarts it with an IDR, a far longer freeze than the late frame itself,
+    // so only a frame missing for a full second counts as a hung encoder.
+    if (async_event_handle && !wait_for_async_event(1000)) {
 #ifdef _WIN32
       platf::dxgi::fused_d3d11::telemetry().record_nvenc_wait_timeout(telemetry_trace);
 #endif

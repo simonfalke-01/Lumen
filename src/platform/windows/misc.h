@@ -52,4 +52,20 @@ namespace platf {
    * @return true if version info was successfully extracted, false otherwise.
    */
   bool getFileVersionInfo(const std::filesystem::path &file_path, std::string &version_str);
+
+  /**
+   * @brief Cap the GPU driver frame rate just below an LSP stream's rate while it runs.
+   *
+   * Nested calls are reference counted; the newest stream rate sets the cap. Controlled by the
+   * `lsp_frame_cap` option, NVIDIA only, and recorded in the nvprefs undo file so a crash or
+   * service stop restores the previous value.
+   *
+   * @param framerate_x100 Stream frame rate in hundredths of a frame per second.
+   */
+  void stream_frame_cap_will_start(int framerate_x100);
+
+  /**
+   * @brief Release one `stream_frame_cap_will_start()` and restore the cap after the last one.
+   */
+  void stream_frame_cap_will_stop();
 }  // namespace platf

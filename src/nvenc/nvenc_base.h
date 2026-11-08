@@ -116,6 +116,58 @@ namespace NVENC_NAMESPACE {
       return true;
     }
 
+    /**
+     * @brief Create the output bitstream buffer.
+     *
+     * D3D11 and CUDA sessions let NVENC allocate it; a D3D12 session must register its own
+     * readback buffer instead.
+     *
+     * @return True when the output buffer is ready.
+     */
+    virtual bool create_output_bitstream();
+
+    /**
+     * @brief Release what `create_output_bitstream()` created.
+     */
+    virtual void destroy_output_bitstream();
+
+    /**
+     * @brief Return the value for `NV_ENC_PIC_PARAMS::inputBuffer`.
+     *
+     * @param mapped_input Input surface mapped for this picture.
+     * @return The mapped surface itself, or a D3D12 resource description that wraps it.
+     */
+    virtual void *picture_input_buffer(NV_ENC_INPUT_PTR mapped_input) {
+      return mapped_input;
+    }
+
+    /**
+     * @brief Return the value for `NV_ENC_PIC_PARAMS::outputBitstream` and `NV_ENC_LOCK_BITSTREAM::outputBitstream`.
+     *
+     * @return The output buffer, or a D3D12 resource description that wraps it.
+     */
+    virtual void *picture_output_bitstream() {
+      return output_bitstream;
+    }
+
+    /**
+     * @brief Return whether this device interface can encode with weighted prediction.
+     *
+     * @return False for D3D12, whose NVENC interface has no weighted prediction.
+     */
+    virtual bool supports_weighted_prediction() const {
+      return true;
+    }
+
+    /**
+     * @brief Return whether NV_ENC_INITIALIZE_PARAMS must name the input buffer format.
+     *
+     * @return True for D3D12, whose NVENC interface rejects initialization without it.
+     */
+    virtual bool requires_initialize_buffer_format() const {
+      return false;
+    }
+
 #ifdef _WIN32
     void set_frame_trace_owner(
       platf::dxgi::fused_d3d11::frame_trace_owner_t owner

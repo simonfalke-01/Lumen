@@ -30,6 +30,16 @@ namespace nvprefs {
       };
 
       std::optional<opengl_swapchain_t> opengl_swapchain;  ///< Opengl swapchain.
+
+      /**
+       * @brief Global frame rate limiter values applied for one streaming session.
+       */
+      struct frame_limiter_t {
+        uint32_t our_value;  ///< FRL_FPS value applied by Lumen.
+        std::optional<uint32_t> undo_value;  ///< Previous FRL_FPS value to restore, if present.
+      };
+
+      std::optional<frame_limiter_t> frame_limiter;  ///< Stream frame limiter.
     };
 
     /**
@@ -46,6 +56,33 @@ namespace nvprefs {
      * @return Stored OpenGL swapchain override and optional restore setting.
      */
     std::optional<data_t::opengl_swapchain_t> get_opengl_swapchain() const;
+
+    /**
+     * @brief Set the stream frame limiter record.
+     *
+     * @param our_value FRL_FPS value applied by Lumen.
+     * @param undo_value Previous FRL_FPS value to restore, if present.
+     */
+    void set_frame_limiter(uint32_t our_value, std::optional<uint32_t> undo_value);
+
+    /**
+     * @brief Forget the stream frame limiter record after it has been restored.
+     */
+    void clear_frame_limiter();
+
+    /**
+     * @brief Get the stream frame limiter record.
+     *
+     * @return Stored frame limiter override and optional restore value.
+     */
+    std::optional<data_t::frame_limiter_t> get_frame_limiter() const;
+
+    /**
+     * @brief Return whether any setting still needs restoring.
+     *
+     * @return True when the record holds no setting.
+     */
+    bool empty() const;
 
     /**
      * @brief Serialize undo data to its JSON representation.

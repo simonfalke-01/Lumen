@@ -64,6 +64,22 @@ namespace nvprefs {
      */
     bool restore_global_profile();
 
+    /**
+     * @brief Cap the global frame rate for a stream and record the previous value in the undo file.
+     *
+     * @param fps FRL_FPS value to apply.
+     * @param applied Set when the cap was changed rather than a lower existing cap kept.
+     * @return True when the cap was applied or a lower existing cap was kept.
+     */
+    bool apply_stream_frame_limiter(unsigned int fps, bool &applied);
+
+    /**
+     * @brief Restore the global frame rate cap applied by `apply_stream_frame_limiter()`.
+     *
+     * @return True when nothing needed restoring or the restore succeeded.
+     */
+    bool restore_stream_frame_limiter();
+
   private:
     struct impl;
     std::unique_ptr<impl> pimpl;

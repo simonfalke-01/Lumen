@@ -33,6 +33,7 @@
 #include "video_sender.h"
 
 #ifdef _WIN32
+  #include "../../platform/windows/misc.h"
   #include "../../platform/windows/virtual_display.h"
   #include "../../platform/windows/virtual_display_frame.h"
   #include "../../platform/windows/virtual_microphone.h"
@@ -1355,7 +1356,7 @@ namespace lumen::lsp::runtime {
       std::jthread capture_thread;  ///< Existing capture/VDD/hardware encoder owner.
       std::shared_ptr<platf::virtual_display::session_lease_t> display_lease;  ///< Active exact VDD generation owner.
   #ifdef _WIN32
-      bool platform_streaming_lease {};  ///< Whether this capture owns one Windows streaming-performance lease.
+      bool platform_streaming_lease {};  ///< Whether this capture owns one Windows streaming-performance lease and driver frame cap.
   #endif
       bool retirement_claimed {};  ///< Background worker borrowed this queued owner under the session lock.
       std::atomic<bool> retirement_complete {};  ///< Release-published after the worker's last owner access.
@@ -2448,7 +2449,24 @@ namespace lumen::lsp::runtime {
           encoder_limits.maximum_height = 4'096;
           encoder_limits.maximum_pixels = 4'096ULL * 4'096ULL;
         }
-        const auto composition_refresh = *refresh_ratio;
+        // Compose at twice the stream rate so DWM latches each capped game frame within half a
+        // stream interval instead of beating against a vblank at the stream rate. Twice is the
+        // only multiple worth asking for: a larger one only raises composition cost, and a
+        // fractional one would latch evenly paced frames unevenly. The encoder keeps the stream
+        // rate. Validation rejects a mode beyond the driver or GPU limits before any display
+        // change, and the stream rate is the fallback. Direct VDD frames are paced on their own
+        // stream-rate schedule, so only desktop-duplication capture composes faster.
+        auto composition_refresh = *refresh_ratio;
+        if (config::lsp.vdd_refresh_multiple != "1" &&
+            request.cursor_mode != CursorMode::client &&
+            activation != platf::virtual_display::activation_policy_e::required &&
+            static_cast<std::uint64_t>(refresh_ratio->numerator) * 2U <=
+            static_cast<std::uint64_t>(LUMEN_START_MODE_MAX_REFRESH_HZ) * refresh_ratio->denominator) {
+          if (const auto doubled = platf::virtual_display::rational_t {refresh_ratio->numerator * 2U, refresh_ratio->denominator}
+                                     .normalized()) {
+            composition_refresh = *doubled;
+          }
+        }
         const auto prepare_display = [&](const platf::virtual_display::rational_t &refresh) {
           return platf::virtual_display::prepare_system_stream_session(
             activation,
@@ -2471,11 +2489,17 @@ namespace lumen::lsp::runtime {
             selected.capture.output_name
           );
         };
-        auto prepared = prepare_display(composition_refresh);
-        if (prepared.outcome != platf::virtual_display::session_prepare_e::virtual_display &&
+        auto prepared = activation == platf::virtual_display::activation_policy_e::disabled ?
+                          prepare_display(*refresh_ratio) :
+                          prepare_display(composition_refresh);
+        if (activation != platf::virtual_display::activation_policy_e::disabled &&
+            prepared.outcome != platf::virtual_display::session_prepare_e::virtual_display &&
             !(composition_refresh == *refresh_ratio)) {
           BOOST_LOG(warning) << "LSP START: Lumen virtual display rejected "sv << composition_refresh.numerator << "/"sv
                              << composition_refresh.denominator << " Hz composition; using the stream rate"sv;
+          if (prepared.lease) {
+            (void) prepared.lease->release();
+          }
           prepared = prepare_display(*refresh_ratio);
         }
         if (prepared.outcome == platf::virtual_display::session_prepare_e::rejected) {
@@ -2500,6 +2524,14 @@ namespace lumen::lsp::runtime {
             activation == platf::virtual_display::activation_policy_e::required;
           selected.capture.virtual_display_generation = prepared.selection->generation;
           selected.capture.virtual_display_desktop_fallback_permitted = false;
+          const auto &applied_refresh = prepared.selection->selected_mode.refresh;
+          if (static_cast<std::uint64_t>(applied_refresh.numerator) * refresh_ratio->denominator ==
+              static_cast<std::uint64_t>(refresh_ratio->numerator) * applied_refresh.denominator * 2U) {
+            selected.capture.composition_refresh_multiple = 2;
+          }
+          BOOST_LOG(info) << "LSP START: Lumen virtual display composes at "sv << applied_refresh.numerator << "/"sv
+                          << applied_refresh.denominator << " Hz for a "sv << refresh_ratio->numerator << "/"sv
+                          << refresh_ratio->denominator << " fps stream"sv;
           // Direct VDD frames are the raw swap-chain surfaces and never contain the cursor, so a
           // host-drawn cursor needs desktop duplication, which composites it into each frame.
           if (request.cursor_mode == CursorMode::client || selected.capture.virtual_display_direct_required) {
@@ -2913,6 +2945,7 @@ namespace lumen::lsp::runtime {
   #ifdef _WIN32
       if (runtime.platform_streaming_lease) {
         runtime.platform_streaming_lease = false;
+        platf::stream_frame_cap_will_stop();
         platf::streaming_will_stop();
       }
   #else
@@ -3643,6 +3676,9 @@ namespace lumen::lsp::runtime {
   #ifdef _WIN32
         runtime.platform_streaming_lease = true;
         platf::streaming_will_start();
+        platf::stream_frame_cap_will_start(
+          selection.capture.framerateX100 > 0 ? selection.capture.framerateX100 : selection.capture.framerate * 100
+        );
   #endif
         const auto mail = runtime.mail;
         const auto sender = runtime.sender;

@@ -25,6 +25,10 @@ namespace nlohmann {
    * @brief Serialized OpenGL swapchain profile settings.
    */
   using opengl_swapchain_t = data_t::opengl_swapchain_t;
+  /**
+   * @brief Serialized stream frame limiter setting.
+   */
+  using frame_limiter_t = data_t::frame_limiter_t;
 
   /**
    * @brief Helper specialization for optional values.
@@ -72,7 +76,10 @@ namespace nlohmann {
      * @param data Payload or state data to serialize, deserialize, or forward.
      */
     static void to_json(json &j, const data_t &data) {
-      j = json {{"opengl_swapchain", data.opengl_swapchain}};
+      j = json {
+        {"opengl_swapchain", data.opengl_swapchain},
+        {"frame_limiter", data.frame_limiter}
+      };
     }
 
     /**
@@ -83,6 +90,10 @@ namespace nlohmann {
      */
     static void from_json(const json &j, data_t &data) {
       j.at("opengl_swapchain").get_to(data.opengl_swapchain);
+      // Undo files written before the stream frame limiter existed have no such key.
+      if (j.contains("frame_limiter")) {
+        j.at("frame_limiter").get_to(data.frame_limiter);
+      }
     }
   };
 
@@ -115,6 +126,36 @@ namespace nlohmann {
       j.at("undo_value").get_to(opengl_swapchain.undo_value);
     }
   };
+
+  /**
+   * @brief JSON serializer specialization for the stream frame limiter.
+   */
+  template<>
+  struct adl_serializer<frame_limiter_t> {
+    /**
+     * @brief Serialize the undo-data object to JSON.
+     *
+     * @param j JSON value being read from or written to.
+     * @param frame_limiter Stream frame limiter.
+     */
+    static void to_json(json &j, const frame_limiter_t &frame_limiter) {
+      j = json {
+        {"our_value", frame_limiter.our_value},
+        {"undo_value", frame_limiter.undo_value}
+      };
+    }
+
+    /**
+     * @brief Deserialize the undo-data object from JSON.
+     *
+     * @param j JSON value being read from or written to.
+     * @param frame_limiter Stream frame limiter.
+     */
+    static void from_json(const json &j, frame_limiter_t &frame_limiter) {
+      j.at("our_value").get_to(frame_limiter.our_value);
+      j.at("undo_value").get_to(frame_limiter.undo_value);
+    }
+  };
 }  // namespace nlohmann
 
 namespace nvprefs {
@@ -128,6 +169,25 @@ namespace nvprefs {
 
   std::optional<undo_data_t::data_t::opengl_swapchain_t> undo_data_t::get_opengl_swapchain() const {
     return data.opengl_swapchain;
+  }
+
+  void undo_data_t::set_frame_limiter(uint32_t our_value, std::optional<uint32_t> undo_value) {
+    data.frame_limiter = data_t::frame_limiter_t {
+      our_value,
+      undo_value
+    };
+  }
+
+  void undo_data_t::clear_frame_limiter() {
+    data.frame_limiter = std::nullopt;
+  }
+
+  std::optional<undo_data_t::data_t::frame_limiter_t> undo_data_t::get_frame_limiter() const {
+    return data.frame_limiter;
+  }
+
+  bool undo_data_t::empty() const {
+    return !data.opengl_swapchain && !data.frame_limiter;
   }
 
   std::string undo_data_t::write() const {
@@ -155,6 +215,10 @@ namespace nvprefs {
     const auto &swapchain_data = newer_data.get_opengl_swapchain();
     if (swapchain_data) {
       set_opengl_swapchain(swapchain_data->our_value, swapchain_data->undo_value);
+    }
+    const auto &frame_limiter_data = newer_data.get_frame_limiter();
+    if (frame_limiter_data) {
+      set_frame_limiter(frame_limiter_data->our_value, frame_limiter_data->undo_value);
     }
   }
 

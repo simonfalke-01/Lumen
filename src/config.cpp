@@ -849,6 +849,8 @@ namespace config {
     "adaptive-low-latency",  // congestion-safe default profile
     0,  // competition is unavailable until a capacity ceiling is configured
     0xd7U,  // browse, start/attach, input, stop-own-stream, controller output, and clipboard
+    "auto",  // cap the GPU driver just below the stream rate while streaming
+    "auto",  // compose the Lumen VDD at twice the stream rate when it accepts that mode
   };
 
   /**
@@ -1648,6 +1650,11 @@ namespace config {
     bool_f(vars, "nvenc_h264_cavlc", video.nv.h264_cavlc);
     generic_f(vars, "nvenc_split_encode", video.nv.split_frame_encoding, nv::split_encode_from_view);
     bool_f(vars, "nvenc_rgb_input", video.nv.rgb_input);
+    {
+      std::string d3d12_compute = video.nv.d3d12_compute ? "auto" : "disabled";
+      string_restricted_f(vars, "nvenc_d3d12_compute", d3d12_compute, {"auto"sv, "disabled"sv});
+      video.nv.d3d12_compute = d3d12_compute == "auto";
+    }
     bool_f(vars, "nvenc_realtime_hags", video.nv_realtime_hags);
     bool_f(vars, "nvenc_opengl_vulkan_on_dxgi", video.nv_opengl_vulkan_on_dxgi);
     bool_f(vars, "nvenc_latency_over_power", video.nv_high_power_mode);
@@ -1842,6 +1849,13 @@ namespace config {
       int_between_f(vars, "lsp_pairing_permissions", pairing_permissions, {0, 0xff});
       lsp.pairing_permissions = static_cast<std::uint32_t>(pairing_permissions);
     }
+    string_f(vars, "lsp_frame_cap", lsp.frame_cap);
+    string_restricted_f(
+      vars,
+      "lsp_vdd_refresh_multiple",
+      lsp.vdd_refresh_multiple,
+      {"auto"sv, "1"sv}
+    );
 #if !LUMEN_LSP_RUNTIME_AVAILABLE
     if (lsp.enabled) {
       BOOST_LOG(warning) << "LSP was requested but is unavailable in this build profile"sv;

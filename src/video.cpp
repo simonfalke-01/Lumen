@@ -784,6 +784,15 @@ namespace video {
       return result;
     }
 
+    /**
+     * @brief Return the GPU stage timings of the picture just encoded, when the device measures them.
+     *
+     * @return Timings, or empty.
+     */
+    std::optional<platf::nvenc_encode_device_t::gpu_timing_t> gpu_timing() {
+      return device ? device->gpu_timing() : std::nullopt;
+    }
+
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     std::shared_ptr<platf::deinit_t> pending_source_lifetime;  ///< Direct VDD slot retained through NVENC completion.
@@ -2248,6 +2257,17 @@ namespace video {
     packet->frame_timestamp = frame_timestamp;
     packet->encoder_submit_timestamp = encoder_submit_timestamp;
     packet->encoder_complete_timestamp = encoder_complete_timestamp;
+    // NVENC waited on the conversion fence, so the conversion's timestamps are already readable.
+    if (const auto gpu = session.gpu_timing()) {
+      packet->gpu_copy_wait_us = gpu->copy_wait_us;
+      packet->gpu_convert_us = gpu->convert_gpu_us;
+      packet->nvenc_us = encoder_complete_timestamp > gpu->convert_end ?
+                           static_cast<std::uint32_t>(std::min<std::int64_t>(
+                             std::chrono::duration_cast<std::chrono::microseconds>(encoder_complete_timestamp - gpu->convert_end).count(),
+                             std::numeric_limits<std::uint32_t>::max()
+                           )) :
+                           0U;
+    }
     packet->applied_input_state_sequence = input_watermark.first;
     packet->applied_input_edge_id = input_watermark.second;
     if (egress.push(channel_data, std::move(packet)) == egress_queue_t::enqueue_e::recovery_callback_failed) {
@@ -2849,9 +2869,33 @@ namespace video {
     // real arrival, plus a little slack for composition jitter. Timing them from the previous
     // encode instead puts a repeat right next to a slightly late real frame, which the client
     // sees as a dropped frame and uneven pacing.
-    const auto repeat_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(max_frametime);
+    //
+    // A VDD composing at a multiple of the stream rate latches a capped game's frames on a finer
+    // grid, so real frames arrive one or two composition intervals apart around the stream
+    // interval. Repeats then wait two stream intervals, past that jitter, and only fill in for
+    // content that has actually stopped.
+    const bool composition_above_stream = config.composition_refresh_multiple > 1 && !target_rate_vdd;
+    const auto repeat_interval = composition_above_stream ?
+                                   std::max(
+                                     std::chrono::duration_cast<std::chrono::steady_clock::duration>(max_frametime),
+                                     std::chrono::duration_cast<std::chrono::steady_clock::duration>(2 * target_frame_interval)
+                                   ) :
+                                   std::chrono::duration_cast<std::chrono::steady_clock::duration>(max_frametime);
     const auto repeat_slack = repeat_interval / 4;
     auto repeat_deadline = std::chrono::steady_clock::now() + repeat_interval + repeat_slack;
+    // Desktop duplication hands over every composition, so at a multiple of the stream rate it no
+    // longer bounds the encode rate. A cell-rate budget at the stream interval passes content at
+    // or below the stream rate untouched and holds anything faster (an uncapped game, a dragged
+    // window) to the stream rate, encoding the newest composition when the budget allows.
+    const auto encode_burst_tolerance = std::chrono::duration_cast<std::chrono::steady_clock::duration>(target_frame_interval / 2);
+    auto theoretical_encode_time = std::chrono::steady_clock::time_point {};
+    if (composition_above_stream) {
+      BOOST_LOG(info) << "Lumen VDD composes at "sv << config.composition_refresh_multiple
+                      << "x the stream rate; encoding new frames up to "sv << config.framerate
+                      << " fps, repeats after "sv
+                      << std::chrono::duration_cast<std::chrono::microseconds>(repeat_interval + repeat_slack).count()
+                      << " us without a new frame"sv;
+    }
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto idr_events = mail->event<bool>(mail::idr);
@@ -2935,6 +2979,18 @@ namespace video {
                                   target_encode_wait(target_encode_deadline, std::chrono::steady_clock::now()) :
                                   target_encode_wait(repeat_deadline, std::chrono::steady_clock::now());
         if (auto captured = images->pop(image_wait)) {
+          if (composition_above_stream) {
+            const auto earliest = theoretical_encode_time - encode_burst_tolerance;
+            for (auto now = std::chrono::steady_clock::now(); now < earliest; now = std::chrono::steady_clock::now()) {
+              if (auto newer = images->pop(earliest - now)) {
+                captured = std::move(newer);
+              } else if (!images->running()) {
+                break;
+              }
+            }
+            theoretical_encode_time = std::max(theoretical_encode_time, std::chrono::steady_clock::now()) +
+                                      std::chrono::duration_cast<std::chrono::steady_clock::duration>(target_frame_interval);
+          }
           repeat_deadline = std::chrono::steady_clock::now() + repeat_interval + repeat_slack;
           frame_timestamp = captured->image->frame_timestamp;
           input_watermark = {

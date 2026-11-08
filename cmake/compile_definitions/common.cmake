@@ -52,7 +52,7 @@ set(LUMEN_PHOTON_LOCK "${LUMEN_PHOTON_DIRECTORY}/photon.lock")
 set(LUMEN_PHOTON_MANIFEST "${LUMEN_PHOTON_DIRECTORY}/photon-source-manifest.txt")
 set(LUMEN_PHOTON_DIGEST "${LUMEN_PHOTON_DIRECTORY}/photon-source-digest.sha256")
 set(LUMEN_PHOTON_EXPECTED_LOCK
-        "repository=git@github.com:simonfalke-01/Photon.git\ncommit=9f8a869f09252930f0b4ea749c2c2be43401a9d0\ndigest=4269791d293364a451270df9923d64820377a239a17fc1eaa985a57bb58fcc17\n")
+        "repository=git@github.com:simonfalke-01/Photon.git\ncommit=d8c8ffc3269f6215fbdfd8b5c8b333055048b549\ndigest=d0d20817c74968bc0ac0a5104f9eb2be7794e5156a36fbc34ad1857c2ab02496\n")
 file(READ "${LUMEN_PHOTON_LOCK}" LUMEN_PHOTON_ACTUAL_LOCK)
 if(NOT LUMEN_PHOTON_ACTUAL_LOCK STREQUAL LUMEN_PHOTON_EXPECTED_LOCK)
     message(FATAL_ERROR "Lumen's Photon lock does not match the reviewed repository, commit, and digest")
@@ -92,7 +92,7 @@ string(SHA256 LUMEN_PHOTON_ACTUAL_DIGEST "${LUMEN_PHOTON_DIGEST_INPUT}")
 file(READ "${LUMEN_PHOTON_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
 string(STRIP "${LUMEN_PHOTON_EXPECTED_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
 string(TOLOWER "${LUMEN_PHOTON_EXPECTED_DIGEST}" LUMEN_PHOTON_EXPECTED_DIGEST)
-if(NOT LUMEN_PHOTON_EXPECTED_DIGEST STREQUAL "4269791d293364a451270df9923d64820377a239a17fc1eaa985a57bb58fcc17")
+if(NOT LUMEN_PHOTON_EXPECTED_DIGEST STREQUAL "d0d20817c74968bc0ac0a5104f9eb2be7794e5156a36fbc34ad1857c2ab02496")
     message(FATAL_ERROR "Lumen's Photon digest file differs from photon.lock")
 endif()
 if(NOT LUMEN_PHOTON_ACTUAL_DIGEST STREQUAL LUMEN_PHOTON_EXPECTED_DIGEST)
@@ -123,6 +123,7 @@ endif()
 set(NVENC_PUBLIC_SOURCES
         "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_config.h"
         "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_d3d11_interface.h"
+        "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_d3d12_interface.h"
         "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_dynamic_factory.cpp"
         "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_dynamic_factory.h"
         "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_dynamic_factory_versions.h"
@@ -140,6 +141,7 @@ if(WIN32)
             "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_d3d11.cpp"
             "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_d3d11_native.cpp"
             "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_d3d11_on_cuda.cpp"
+            "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_d3d12.cpp"
             "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_dynamic_factory_impl.cpp"
             "${CMAKE_SOURCE_DIR}/src/nvenc/nvenc_utils.cpp"
     )

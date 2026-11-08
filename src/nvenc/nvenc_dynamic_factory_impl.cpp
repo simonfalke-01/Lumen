@@ -18,6 +18,7 @@
   // local includes
   #include "nvenc_d3d11_native.h"
   #include "nvenc_d3d11_on_cuda.h"
+  #include "nvenc_d3d12.h"
   #include "nvenc_dynamic_factory_versions.h"
 
   #ifndef DOXYGEN
@@ -39,6 +40,15 @@ namespace nvenc::detail {
   ) {
     return std::make_unique<NVENC_NAMESPACE::nvenc_d3d11_on_cuda>(device, std::move(dll));
   }
+
+    #if NVENC_SDK_VERSION >= 1200
+  std::unique_ptr<nvenc_d3d12_interface> NVENC_CONCAT(create_nvenc_d3d12_, NVENC_FACTORY_SUFFIX)(
+    ID3D12Device *device,
+    shared_dll dll
+  ) {
+    return std::make_unique<NVENC_NAMESPACE::nvenc_d3d12>(device, std::move(dll));
+  }
+    #endif
 
 }  // namespace nvenc::detail
 

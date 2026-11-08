@@ -269,6 +269,8 @@ namespace config {
     std::string profile;  ///< Initial congestion profile: `adaptive-low-latency` or `competition`.
     std::uint32_t competition_capacity_mbps;  ///< Explicit competition-mode capacity ceiling; zero disables that profile.
     std::uint32_t pairing_permissions;  ///< Maximum LSP/1 permission mask offered to newly paired clients.
+    std::string frame_cap;  ///< Driver frame cap while streaming: `auto`, `disabled`, an fps, or `-N` below the stream rate.
+    std::string vdd_refresh_multiple;  ///< Lumen VDD refresh for DDA capture: `auto` (twice the stream rate, else the stream rate) or `1`.
   };
 
   /**

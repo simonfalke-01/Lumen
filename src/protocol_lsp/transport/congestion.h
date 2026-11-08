@@ -63,6 +63,9 @@ namespace lumen::lsp::transport {
     std::uint32_t rtt_variation_microseconds = 0;  ///< Latest RTT variation.
     std::int32_t queue_delay_trend_microseconds = 0;  ///< Latest signed delay trend.
     bool minimum_unsustainable = false;  ///< Impairment persisted at the minimum viable aggregate rate.
+    std::uint8_t last_decrease_causes = 0;  ///< Bitmask of the most recent cut: 1 loss, 2 ECN, 4 queue delay, 8 RTT.
+    std::uint32_t last_decrease_loss_permille = 0;  ///< Window loss when the most recent cut happened.
+    std::uint64_t decreases = 0;  ///< Cumulative rate cuts.
   };
 
   /** @brief Deterministic adaptive-low-latency and explicit competition-LAN controller state. */
@@ -210,6 +213,10 @@ namespace lumen::lsp::transport {
                                  pacing_bits_per_second_ == config_.minimum_pacing_bits_per_second;
         has_decreased_ = true;
         last_decrease_microseconds_ = now;
+        last_decrease_causes_ = static_cast<std::uint8_t>((heavy_loss ? 1U : 0U) | (ecn ? 2U : 0U) |
+                                                          (positive_delay ? 4U : 0U) | (rtt_inflated ? 8U : 0U));
+        last_decrease_loss_permille_ = window_loss_permille_;
+        ++decreases_;
         last_increase_microseconds_ = now;
         if (positive_delay) {
           accumulated_queue_growth_microseconds_ /= 2U;
@@ -270,6 +277,9 @@ namespace lumen::lsp::transport {
         .rtt_variation_microseconds = rtt_variation_microseconds_,
         .queue_delay_trend_microseconds = queue_delay_trend_microseconds_,
         .minimum_unsustainable = minimum_unsustainable_,
+        .last_decrease_causes = last_decrease_causes_,
+        .last_decrease_loss_permille = last_decrease_loss_permille_,
+        .decreases = decreases_,
       };
     }
 
@@ -402,6 +412,9 @@ namespace lumen::lsp::transport {
     std::uint64_t last_decrease_microseconds_ = 0;  ///< Time of the last rate cut.
     std::uint64_t last_increase_microseconds_ = 0;  ///< Time clean growth was last credited.
     bool has_decreased_ = false;  ///< Whether any cut has happened.
+    std::uint8_t last_decrease_causes_ = 0;  ///< Cause bitmask of the most recent cut.
+    std::uint32_t last_decrease_loss_permille_ = 0;  ///< Window loss at the most recent cut.
+    std::uint64_t decreases_ = 0;  ///< Cumulative cuts.
     bool loss_window_open_ = false;  ///< Whether the first loss window has started.
     std::uint8_t moderate_loss_windows_ = 0;  ///< Consecutive windows with more than light loss.
   };

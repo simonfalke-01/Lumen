@@ -152,6 +152,120 @@ namespace nvprefs {
       }
     }
 
+    return restore_global_frame_limiter(undo_data);
+  }
+
+  bool driver_settings_t::apply_global_frame_limiter(uint32_t fps, std::optional<undo_data_t> &undo_data) {
+    if (!session_handle) {
+      return false;
+    }
+
+    undo_data.reset();
+    NvAPI_Status status;
+
+    NvDRSProfileHandle profile_handle = nullptr;
+    status = NvAPI_DRS_GetBaseProfile(session_handle, &profile_handle);
+    if (status != NVAPI_OK) {
+      nvapi_error_message(status);
+      error_message("NvAPI_DRS_GetBaseProfile() failed");
+      return false;
+    }
+
+    NVDRS_SETTING setting = {};
+    setting.version = NVDRS_SETTING_VER;
+    status = NvAPI_DRS_GetSetting(session_handle, profile_handle, FRL_FPS_ID, &setting);
+    if (status != NVAPI_OK && status != NVAPI_SETTING_NOT_FOUND) {
+      nvapi_error_message(status);
+      error_message("NvAPI_DRS_GetSetting() FRL_FPS failed");
+      return false;
+    }
+
+    const bool user_value = status == NVAPI_OK && setting.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION;
+    if (user_value && setting.u32CurrentValue != FRL_FPS_DISABLED && setting.u32CurrentValue <= fps) {
+      // Never raise a cap the user chose
+      info_message("Global Max Frame Rate " + std::to_string(setting.u32CurrentValue) + " is already at or below " + std::to_string(fps) + ", keeping it");
+      return true;
+    }
+
+    undo_data = undo_data_t();
+    undo_data->set_frame_limiter(fps, user_value ? std::optional<uint32_t> {setting.u32CurrentValue} : std::nullopt);
+
+    setting = {};
+    setting.version = NVDRS_SETTING_VER1;
+    setting.settingId = FRL_FPS_ID;
+    setting.settingType = NVDRS_DWORD_TYPE;
+    setting.settingLocation = NVDRS_CURRENT_PROFILE_LOCATION;
+    setting.u32CurrentValue = fps;
+
+    status = NvAPI_DRS_SetSetting(session_handle, profile_handle, &setting);
+    if (status != NVAPI_OK) {
+      nvapi_error_message(status);
+      error_message("NvAPI_DRS_SetSetting() FRL_FPS failed");
+      undo_data.reset();
+      return false;
+    }
+
+    return true;
+  }
+
+  bool driver_settings_t::restore_global_frame_limiter(const undo_data_t &undo_data) {
+    if (!session_handle) {
+      return false;
+    }
+
+    const auto &frame_limiter_data = undo_data.get_frame_limiter();
+    if (!frame_limiter_data) {
+      return true;
+    }
+
+    NvAPI_Status status;
+
+    NvDRSProfileHandle profile_handle = nullptr;
+    status = NvAPI_DRS_GetBaseProfile(session_handle, &profile_handle);
+    if (status != NVAPI_OK) {
+      nvapi_error_message(status);
+      error_message("NvAPI_DRS_GetBaseProfile() failed");
+      return false;
+    }
+
+    NVDRS_SETTING setting = {};
+    setting.version = NVDRS_SETTING_VER;
+    status = NvAPI_DRS_GetSetting(session_handle, profile_handle, FRL_FPS_ID, &setting);
+
+    if (status == NVAPI_OK && setting.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION && setting.u32CurrentValue == frame_limiter_data->our_value) {
+      if (frame_limiter_data->undo_value) {
+        setting = {};
+        setting.version = NVDRS_SETTING_VER1;
+        setting.settingId = FRL_FPS_ID;
+        setting.settingType = NVDRS_DWORD_TYPE;
+        setting.settingLocation = NVDRS_CURRENT_PROFILE_LOCATION;
+        setting.u32CurrentValue = *frame_limiter_data->undo_value;
+
+        status = NvAPI_DRS_SetSetting(session_handle, profile_handle, &setting);
+
+        if (status != NVAPI_OK) {
+          nvapi_error_message(status);
+          error_message("NvAPI_DRS_SetSetting() FRL_FPS failed");
+          return false;
+        }
+      } else {
+        status = NvAPI_DRS_DeleteProfileSetting(session_handle, profile_handle, FRL_FPS_ID);
+
+        if (status != NVAPI_OK && status != NVAPI_SETTING_NOT_FOUND) {
+          nvapi_error_message(status);
+          error_message("NvAPI_DRS_DeleteProfileSetting() FRL_FPS failed");
+          return false;
+        }
+      }
+
+      info_message("Restored FRL_FPS for base profile");
+    } else if (status == NVAPI_OK || status == NVAPI_SETTING_NOT_FOUND) {
+      info_message("FRL_FPS has been changed from our value in base profile, not restoring");
+    } else {
+      error_message("NvAPI_DRS_GetSetting() FRL_FPS failed");
+      return false;
+    }
+
     return true;
   }
 

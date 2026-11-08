@@ -2130,6 +2130,16 @@ namespace lumen::lsp::runtime {
         .report_microseconds = now_microseconds,
       });
       const auto congestion = congestion_.snapshot();
+      if (congestion.decreases != logged_congestion_decreases_) {
+        logged_congestion_decreases_ = congestion.decreases;
+        BOOST_LOG(info) << "LSP congestion cut: causes=" << static_cast<unsigned int>(congestion.last_decrease_causes)
+                        << " loss_permille=" << congestion.last_decrease_loss_permille
+                        << " pacing_kbps=" << congestion.pacing_bits_per_second / 1'000U
+                        << " encoder_kbps=" << congestion.encoder_bits_per_second / 1'000U
+                        << " srtt_us=" << congestion.smoothed_rtt_microseconds
+                        << " rttvar_us=" << congestion.rtt_variation_microseconds
+                        << " delay_trend_us=" << congestion.queue_delay_trend_microseconds;
+      }
       requested_pacing_bits_per_second_.store(congestion.pacing_bits_per_second, std::memory_order_release);
       requested_encoder_bits_per_second_.store(
         std::min<std::uint64_t>(congestion.encoder_bits_per_second, std::numeric_limits<std::uint32_t>::max()),
@@ -2525,6 +2535,7 @@ namespace lumen::lsp::runtime {
       std::uint64_t incarnation {};  ///< Slot incarnation encoded into `ticket`.
       std::uint64_t frame_id {};  ///< Nonzero protocol frame identity used by recovery epochs.
       std::uint64_t terminal_microseconds {};  ///< Latest packet terminal time for recovery deadlines.
+      std::uint64_t encoder_complete_microseconds {};  ///< Encoder output time, origin of the egress span.
       std::size_t committed_packets {};  ///< Packets successfully admitted to the path.
       std::size_t completed_packets {};  ///< Terminal callbacks already received.
       std::int64_t frame_index {};  ///< Capture frame identity used for asynchronous recovery.
@@ -2691,6 +2702,7 @@ namespace lumen::lsp::runtime {
      * @param dependency_generation Reserved dependency-break generation.
      * @param storage_index Fixed staging/current AU slot.
      * @param storage_incarnation Exact AU slot reuse generation.
+     * @param encoder_complete_microseconds Monotonic encoder output time.
      * @return Nonzero pending-frame ticket, or zero when bounded state is unavailable.
      */
     [[nodiscard]] std::uint64_t begin_pending_frame(
@@ -2701,7 +2713,8 @@ namespace lumen::lsp::runtime {
       const std::uint64_t reference_invalidation_generation,
       const std::uint64_t dependency_generation,
       const std::size_t storage_index,
-      const std::uint64_t storage_incarnation
+      const std::uint64_t storage_incarnation,
+      const std::uint64_t encoder_complete_microseconds
     ) noexcept {
       std::scoped_lock lock(pending_mutex_);
       if (closed_.load(std::memory_order_acquire) || free_pending_frame_count_ == 0) {
@@ -2718,6 +2731,7 @@ namespace lumen::lsp::runtime {
         .ticket = ticket,
         .incarnation = incarnation,
         .frame_id = frame_id,
+        .encoder_complete_microseconds = encoder_complete_microseconds,
         .frame_index = frame_index,
         .reference_invalidation_generation = reference_invalidation_generation,
         .dependency_generation = dependency_generation,
@@ -3541,6 +3555,13 @@ namespace lumen::lsp::runtime {
       }
       if (!frame.failed) {
         submitted_frames_.fetch_add(1, std::memory_order_relaxed);
+        if (egress_sample_count_ < egress_samples_.size() &&
+            frame.terminal_microseconds >= frame.encoder_complete_microseconds) {
+          egress_samples_[egress_sample_count_++] = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            frame.terminal_microseconds - frame.encoder_complete_microseconds,
+            std::numeric_limits<std::uint32_t>::max()
+          ));
+        }
         latest_sent_frame_id_.store(frame.frame_id, std::memory_order_release);
         if (frame.independent) {
           std::scoped_lock dependency_lock(dependency_state_mutex_);
@@ -4331,6 +4352,126 @@ namespace lumen::lsp::runtime {
     }
 
     /**
+     * @brief Return one percentile of samples sorted in place.
+     *
+     * @param samples Window samples, sorted by this call.
+     * @param permille Requested percentile in thousandths.
+     * @return Sample at the percentile, or zero for an empty window.
+     */
+    [[nodiscard]] static std::uint32_t sorted_percentile(
+      const std::span<std::uint32_t> samples,
+      const std::size_t permille
+    ) noexcept {
+      return samples.empty() ? 0U : samples[std::min(samples.size() - 1, samples.size() * permille / 1000U)];
+    }
+
+    /**
+     * @brief Summarize capture cadence, capture queueing, encode, and egress times every ten seconds.
+     *
+     * Capture intervals use only newly captured frames; repeats of the last image carry no
+     * capture timestamp. Read together, the fields place a client arrival gap in capture (DWM or
+     * the game), the encoder, or the send path.
+     *
+     * @param capture_time Capture timestamp, absent for a repeat encode.
+     * @param submit_time Encoder submission time.
+     * @param encoder_complete_time Encoder output availability time.
+     * @param packet Encoded access unit, for the D3D12 path's GPU stage timings.
+     * @param now_microseconds Monotonic observation time.
+     */
+    void record_encode_timing(
+      const std::optional<std::chrono::steady_clock::time_point> capture_time,
+      const std::chrono::steady_clock::time_point submit_time,
+      const std::chrono::steady_clock::time_point encoder_complete_time,
+      const video::packet_raw_t &packet,
+      const std::uint64_t now_microseconds
+    ) noexcept {
+      constexpr std::uint64_t window_microseconds = 10'000'000;
+      const std::uint64_t frame_interval_microseconds =
+        config_.video.refresh_numerator == 0 ?
+          8'333U :
+          std::uint64_t {config_.video.refresh_denominator} * 1'000'000U / config_.video.refresh_numerator;
+      if (encode_window_start_microseconds_ == 0) {
+        encode_window_start_microseconds_ = now_microseconds;
+      }
+      if (encode_sample_count_ < encode_samples_.size()) {
+        encode_samples_[encode_sample_count_++] = saturated_microseconds(encoder_complete_time - submit_time);
+      }
+      ++encode_window_frames_;
+      if (capture_time) {
+        if (last_capture_time_) {
+          const auto interval = saturated_microseconds(*capture_time - *last_capture_time_);
+          capture_interval_max_microseconds_ = std::max(capture_interval_max_microseconds_, interval);
+          if (std::uint64_t {interval} * 2U > frame_interval_microseconds * 3U) {
+            ++capture_gaps_;
+          }
+        }
+        last_capture_time_ = capture_time;
+        if (capture_queue_sample_count_ < capture_queue_samples_.size()) {
+          capture_queue_samples_[capture_queue_sample_count_++] = saturated_microseconds(submit_time - *capture_time);
+        }
+      } else {
+        ++repeat_frames_;
+      }
+      if (packet.gpu_copy_wait_us && packet.gpu_convert_us && packet.nvenc_us &&
+          gpu_sample_count_ < copy_wait_samples_.size()) {
+        copy_wait_samples_[gpu_sample_count_] = *packet.gpu_copy_wait_us;
+        convert_gpu_samples_[gpu_sample_count_] = *packet.gpu_convert_us;
+        nvenc_samples_[gpu_sample_count_] = *packet.nvenc_us;
+        ++gpu_sample_count_;
+      }
+      if (now_microseconds - encode_window_start_microseconds_ < window_microseconds) {
+        return;
+      }
+      const auto samples = std::span {encode_samples_}.first(encode_sample_count_);
+      std::ranges::sort(samples);
+      const auto over_frame = std::ranges::count_if(samples, [frame_interval_microseconds](const auto value) {
+        return value > frame_interval_microseconds;
+      });
+      const auto capture_queue = std::span {capture_queue_samples_}.first(capture_queue_sample_count_);
+      std::ranges::sort(capture_queue);
+      std::size_t egress_count = 0;
+      {
+        std::scoped_lock lock(pending_mutex_);
+        egress_count = egress_sample_count_;
+        std::copy_n(egress_samples_.begin(), egress_count, egress_window_samples_.begin());
+        egress_sample_count_ = 0;
+      }
+      const auto egress = std::span {egress_window_samples_}.first(egress_count);
+      std::ranges::sort(egress);
+      const auto copy_wait = std::span {copy_wait_samples_}.first(gpu_sample_count_);
+      const auto convert_gpu = std::span {convert_gpu_samples_}.first(gpu_sample_count_);
+      const auto nvenc_time = std::span {nvenc_samples_}.first(gpu_sample_count_);
+      std::ranges::sort(copy_wait);
+      std::ranges::sort(convert_gpu);
+      std::ranges::sort(nvenc_time);
+      BOOST_LOG(info) << "LSP video encode timing: frames=" << encode_window_frames_
+                      << " fps=" << encode_window_frames_ * 1'000'000U / (now_microseconds - encode_window_start_microseconds_)
+                      << " p50_us=" << sorted_percentile(samples, 500) << " p99_us=" << sorted_percentile(samples, 990)
+                      << " max_us=" << sorted_percentile(samples, 1000) << " over_frame=" << over_frame
+                      << " repeats=" << repeat_frames_
+                      << " capture_gap_max_us=" << capture_interval_max_microseconds_ << " capture_gaps=" << capture_gaps_
+                      << " capture_to_submit_p99_us=" << sorted_percentile(capture_queue, 990)
+                      << " capture_to_submit_max_us=" << sorted_percentile(capture_queue, 1000)
+                      << " egress_p99_us=" << sorted_percentile(egress, 990)
+                      << " egress_max_us=" << sorted_percentile(egress, 1000)
+                      << " gpu_frames=" << gpu_sample_count_
+                      << " copy_wait_p99_us=" << sorted_percentile(copy_wait, 990)
+                      << " copy_wait_max_us=" << sorted_percentile(copy_wait, 1000)
+                      << " convert_gpu_p99_us=" << sorted_percentile(convert_gpu, 990)
+                      << " convert_gpu_max_us=" << sorted_percentile(convert_gpu, 1000)
+                      << " nvenc_p99_us=" << sorted_percentile(nvenc_time, 990)
+                      << " nvenc_max_us=" << sorted_percentile(nvenc_time, 1000);
+      encode_window_start_microseconds_ = now_microseconds;
+      encode_window_frames_ = 0;
+      encode_sample_count_ = 0;
+      capture_queue_sample_count_ = 0;
+      capture_interval_max_microseconds_ = 0;
+      capture_gaps_ = 0;
+      repeat_frames_ = 0;
+      gpu_sample_count_ = 0;
+    }
+
+    /**
      * @brief Rate-limit one exact capture-relative deadline diagnostic.
      *
      * @param stage Admission or submission stage that exhausted the deadline.
@@ -4588,6 +4729,7 @@ namespace lumen::lsp::runtime {
       const auto capture_time = packet.frame_timestamp.value_or(complete_time);
       const auto submit_time = packet.encoder_submit_timestamp.value_or(capture_time);
       const auto encoder_complete_time = packet.encoder_complete_timestamp.value_or(complete_time);
+      record_encode_timing(packet.frame_timestamp, submit_time, encoder_complete_time, packet, boundary_now);
       const auto capture_us_count = std::chrono::duration_cast<std::chrono::microseconds>(capture_time.time_since_epoch()).count();
       if (capture_us_count < 0 || next_frame_id_ == 0) {
         return false;
@@ -4855,7 +4997,11 @@ namespace lumen::lsp::runtime {
         packet.reference_invalidation_generation,
         *dependency_generation,
         retained_frame_index,
-        retained_frame.incarnation
+        retained_frame.incarnation,
+        static_cast<std::uint64_t>(std::max<std::int64_t>(
+          0,
+          std::chrono::duration_cast<std::chrono::microseconds>(encoder_complete_time.time_since_epoch()).count()
+        ))
       );
       if (frame_ticket == 0) {
         abort_retained_frame(retained_frame_index, retained_frame.incarnation);
@@ -5179,6 +5325,24 @@ namespace lumen::lsp::runtime {
     bool has_feedback_receive_time_ {};  ///< Whether local CCFB cadence has an origin.
     bool has_fir_command_ {};  ///< Whether one FIR command tuple is retained for idempotence.
     bool has_delay_sample_ {};  ///< Whether delay-trend differencing has an origin.
+    std::uint64_t logged_congestion_decreases_ {};  ///< Congestion cuts already logged.
+    std::array<std::uint32_t, 4096> encode_samples_ {};  ///< Encoder durations in the current timing window.
+    std::size_t encode_sample_count_ {};  ///< Valid entries in `encode_samples_`.
+    std::uint64_t encode_window_frames_ {};  ///< Frames seen in the current timing window.
+    std::uint64_t encode_window_start_microseconds_ {};  ///< Start of the current timing window.
+    std::array<std::uint32_t, 4096> capture_queue_samples_ {};  ///< Capture-to-submit times of captured frames.
+    std::size_t capture_queue_sample_count_ {};  ///< Valid entries in `capture_queue_samples_`.
+    std::optional<std::chrono::steady_clock::time_point> last_capture_time_;  ///< Previous captured frame's timestamp.
+    std::uint32_t capture_interval_max_microseconds_ {};  ///< Longest capture-to-capture interval this window.
+    std::uint64_t capture_gaps_ {};  ///< Capture intervals over 1.5 frame intervals this window.
+    std::uint64_t repeat_frames_ {};  ///< Encodes of a repeated image this window.
+    std::array<std::uint32_t, 4096> egress_samples_ {};  ///< Encoder-complete-to-last-send times, under `pending_mutex_`.
+    std::size_t egress_sample_count_ {};  ///< Valid entries in `egress_samples_`, under `pending_mutex_`.
+    std::array<std::uint32_t, 4096> egress_window_samples_ {};  ///< Sender-thread copy of one window's egress samples.
+    std::array<std::uint32_t, 4096> copy_wait_samples_ {};  ///< D3D12 path: conversion submission-to-start times.
+    std::array<std::uint32_t, 4096> convert_gpu_samples_ {};  ///< D3D12 path: conversion GPU durations.
+    std::array<std::uint32_t, 4096> nvenc_samples_ {};  ///< D3D12 path: conversion-end-to-output times.
+    std::size_t gpu_sample_count_ {};  ///< Valid entries in the three D3D12 sample arrays.
     bool sender_report_pending_ {};  ///< Whether one protected periodic SR awaits terminal completion.
     bool ready_ {};  ///< Constructor validation and fixed-slab allocation status.
     bool registered_ {};  ///< Whether egress retains this session key.

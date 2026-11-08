@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 
 // platform includes
 #include <d3d11.h>
@@ -70,6 +71,18 @@ namespace platf::dxgi {
    * @brief Owning COM pointer for the immediate D3D11 device context.
    */
   using device_ctx_t = util::safe_ptr<ID3D11DeviceContext, Release<ID3D11DeviceContext>>;
+  /**
+   * @brief Owning COM pointer for the D3D11.4 immediate context, which can wait on and signal fences.
+   */
+  using device_ctx4_t = util::safe_ptr<ID3D11DeviceContext4, Release<ID3D11DeviceContext4>>;
+  /**
+   * @brief Owning COM pointer for the D3D11.5 device interface, which creates shared fences.
+   */
+  using device5_t = util::safe_ptr<ID3D11Device5, Release<ID3D11Device5>>;
+  /**
+   * @brief Owning COM pointer for a D3D11 fence.
+   */
+  using fence_t = util::safe_ptr<ID3D11Fence, Release<ID3D11Fence>>;
   /**
    * @brief Owning COM pointer for a DXGI display adapter.
    */
@@ -142,6 +155,10 @@ namespace platf::dxgi {
    * @brief Owning COM pointer for a D3D11 buffer.
    */
   using buf_t = util::safe_ptr<ID3D11Buffer, Release<ID3D11Buffer>>;
+  /**
+   * @brief Owning COM pointer for a D3D11 query.
+   */
+  using query_t = util::safe_ptr<ID3D11Query, Release<ID3D11Query>>;
   /**
    * @brief D3D rasterizer state handle type.
    */
@@ -677,6 +694,44 @@ namespace platf::dxgi {
     std::atomic<uint32_t> next_image_id;  ///< Next image ID.
     std::shared_ptr<fused_d3d11::resource_ownership_t> encode_resource_ownership = std::make_shared<fused_d3d11::resource_ownership_t>();  ///< Shared transition state retained by capture images.
     std::mutex fused_context_mutex;  ///< Serializes complete immediate-context transactions across capture and encode threads.
+
+    /**
+     * @brief Shared fences that order capture copies against a D3D12 encoder without keyed mutexes.
+     *
+     * The capture copy signals `capture`; the D3D12 conversion waits on it, then signals
+     * `consumption`, which the capture side waits on before it writes the same texture again.
+     * Both live as long as the display so their values only grow across encoder sessions.
+     */
+    struct d3d12_capture_fences_t {
+      fence_t capture;  ///< Signalled by the capture context after each written image.
+      fence_t consumption;  ///< Signalled by the D3D12 conversion of each image.
+      std::unique_ptr<std::remove_pointer_t<HANDLE>, decltype(&CloseHandle)> capture_handle {nullptr, &CloseHandle};  ///< NT handle of `capture`.
+      std::unique_ptr<std::remove_pointer_t<HANDLE>, decltype(&CloseHandle)> consumption_handle {nullptr, &CloseHandle};  ///< NT handle of `consumption`.
+      device_ctx4_t context;  ///< Capture context interface that waits and signals.
+      std::uint64_t capture_value {};  ///< Last capture value signalled; capture thread only.
+      std::atomic<std::uint64_t> consumption_value {};  ///< Last consumption value handed to a conversion.
+    };
+
+    /**
+     * @brief Create the shared capture fences once; does not change how images are shared.
+     *
+     * @return Fences, or null when the device lacks D3D11.4 fences.
+     */
+    d3d12_capture_fences_t *ensure_d3d12_capture_fences();
+
+    /**
+     * @brief Share new capture images through fences instead of keyed mutexes, or stop doing so.
+     *
+     * Images are recreated in the selected mode the next time the capture side completes them.
+     *
+     * @param enabled Whether a D3D12 encoder consumes the images.
+     */
+    void set_d3d12_capture_sync(bool enabled) noexcept {
+      d3d12_capture_sync.store(enabled, std::memory_order_release);
+    }
+
+    std::unique_ptr<d3d12_capture_fences_t> d3d12_fences;  ///< Created on the first D3D12 encoder.
+    std::atomic<bool> d3d12_capture_sync {};  ///< Whether new capture images use fence synchronization.
   };
 
   /** @brief Production one-copy VDD capture backend using driver-owned shared slots. */

@@ -1726,6 +1726,59 @@ The key retains its upstream name for compatibility with existing configuration 
     </tr>
 </table>
 
+### lsp_frame_cap
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Caps every game through the NVIDIA driver's global Max Frame Rate while an LSP stream runs, and restores
+            the previous value when the stream ends, the service stops, or after a crash. `auto` stays slightly under
+            the stream rate (118 fps for a 120 fps stream, 59 for 60). A number sets that cap in frames per second;
+            `-N` caps N fps below the stream rate; `disabled` leaves the driver alone. A lower global cap the user
+            already set is kept, and per-application caps still take precedence. NVIDIA GPUs only.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lsp_frame_cap = -3
+            @endcode</td>
+    </tr>
+</table>
+
+### lsp_vdd_refresh_multiple
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Sets the Lumen virtual display refresh rate for LSP streams captured through desktop duplication.
+            `auto` runs the display at twice the stream rate so each game frame is composed within half a frame
+            interval, falling back to the stream rate when the display or GPU rejects that mode; the encoder still
+            sends the stream rate. `1` always runs the display at the stream rate.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lsp_vdd_refresh_multiple = 1
+            @endcode</td>
+    </tr>
+</table>
+
 ### lsp_competition_capacity_mbps
 
 <table>
@@ -2715,6 +2768,34 @@ The key retains its upstream name for compatibility with existing configuration 
         <td>Example</td>
         <td colspan="2">@code{}
             nvenc_vbv_increase = 0
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_d3d12_compute
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Converts captured frames to NV12 on a Direct3D 12 compute queue and hands them to NVENC through GPU
+            fences, instead of drawing the conversion on the Direct3D 11 graphics queue that a running game keeps
+            busy. The desktop-duplication copy is then the only work left on the graphics queue. `auto` uses it for
+            SDR 8-bit 4:2:0 streams captured with desktop duplication on NVIDIA GPUs and falls back to the Direct3D 11
+            conversion, with a log line, whenever a step is unavailable. `disabled` always uses Direct3D 11.
+            HDR, 10-bit, 4:4:4 and the Lumen virtual display's direct frame source always use Direct3D 11.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_d3d12_compute = disabled
             @endcode</td>
     </tr>
 </table>

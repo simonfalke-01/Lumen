@@ -10,6 +10,7 @@
 
   // local includes
   #include "nvenc_d3d11_interface.h"
+  #include "nvenc_d3d12_interface.h"
   #include "nvenc_shared_dll.h"
 
 namespace nvenc::detail {
@@ -62,6 +63,22 @@ namespace nvenc::detail {
    * @return SDK-neutral encoder instance.
    */
   std::unique_ptr<nvenc_d3d11_interface> create_nvenc_d3d11_on_cuda_1300(ID3D11Device *device, shared_dll dll);
+  /**
+   * @brief Create an SDK 12.0 Direct3D12 encoder.
+   *
+   * @param device Direct3D12 device that owns the input texture.
+   * @param dll Shared NVENC driver module.
+   * @return SDK-neutral encoder instance.
+   */
+  std::unique_ptr<nvenc_d3d12_interface> create_nvenc_d3d12_1200(ID3D12Device *device, shared_dll dll);
+  /**
+   * @brief Create an SDK 13.0 Direct3D12 encoder.
+   *
+   * @param device Direct3D12 device that owns the input texture.
+   * @param dll Shared NVENC driver module.
+   * @return SDK-neutral encoder instance.
+   */
+  std::unique_ptr<nvenc_d3d12_interface> create_nvenc_d3d12_1300(ID3D12Device *device, shared_dll dll);
 
 }  // namespace nvenc::detail
 #endif

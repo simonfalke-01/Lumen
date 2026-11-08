@@ -35,12 +35,14 @@ namespace nvenc {
     shared_dll dll,
     nvenc_sdk_version sdk_version,
     create_encoder_fn create_native,
-    create_encoder_fn create_on_cuda
+    create_encoder_fn create_on_cuda,
+    create_d3d12_encoder_fn create_d3d12
   ):
       dll(std::move(dll)),
       selected_sdk_version(sdk_version),
       create_native(std::move(create_native)),
-      create_on_cuda(std::move(create_on_cuda)) {
+      create_on_cuda(std::move(create_on_cuda)),
+      create_d3d12(std::move(create_d3d12)) {
   }
 
   std::shared_ptr<nvenc_dynamic_factory> nvenc_dynamic_factory::get() {
@@ -83,7 +85,8 @@ namespace nvenc {
           std::move(dll),
           sdk_version,
           detail::create_nvenc_d3d11_native_1300,
-          detail::create_nvenc_d3d11_on_cuda_1300
+          detail::create_nvenc_d3d11_on_cuda_1300,
+          detail::create_nvenc_d3d12_1300
         );
 
       case nvenc_sdk_version::sdk_12_0:
@@ -91,7 +94,8 @@ namespace nvenc {
           std::move(dll),
           sdk_version,
           detail::create_nvenc_d3d11_native_1200,
-          detail::create_nvenc_d3d11_on_cuda_1200
+          detail::create_nvenc_d3d11_on_cuda_1200,
+          detail::create_nvenc_d3d12_1200
         );
 
       case nvenc_sdk_version::sdk_11_0:
@@ -119,6 +123,12 @@ namespace nvenc {
     ID3D11Device *d3d_device
   ) const {
     return create_on_cuda(d3d_device, dll);
+  }
+
+  std::unique_ptr<nvenc_d3d12_interface> nvenc_dynamic_factory::create_nvenc_d3d12(
+    ID3D12Device *d3d_device
+  ) const {
+    return create_d3d12 ? create_d3d12(d3d_device, dll) : nullptr;
   }
 
   nvenc_sdk_version nvenc_dynamic_factory::sdk_version() const {

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -664,6 +665,24 @@ namespace platf {
      * @return True when the backend successfully completes the requested action.
      */
     virtual bool init_encoder(const video::config_t &client_config, const video::stream_colorspace_t &colorspace) = 0;
+
+    /**
+     * @brief GPU stage timings of one picture, for devices that convert on their own queue.
+     */
+    struct gpu_timing_t {
+      std::uint32_t copy_wait_us {};  ///< Conversion submission to conversion start.
+      std::uint32_t convert_gpu_us {};  ///< Conversion duration on the GPU.
+      std::chrono::steady_clock::time_point convert_end;  ///< CPU time the conversion finished.
+    };
+
+    /**
+     * @brief Return the GPU timings of the picture NVENC just finished, without waiting.
+     *
+     * @return Timings, or empty when the device does not measure them.
+     */
+    virtual std::optional<gpu_timing_t> gpu_timing() {
+      return std::nullopt;
+    }
 
     nvenc::nvenc_encoder *nvenc = nullptr;  ///< NVENC encoder instance owned by the encode device.
   };

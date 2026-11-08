@@ -69,6 +69,7 @@ namespace video {
     int hdrTransfer {};  ///< HDR transfer proof: 0 = SDR/legacy auto, 1 = PQ, 2 = HLG.
     bool lumen_bc1 {};
     bool nvenc_rgb_input {};  ///< NVENC takes BGRA directly and converts with BT.601 limited range.  ///< Encode intra-only BC1 blocks on the GPU instead of using NVENC.
+    int composition_refresh_multiple {1};  ///< Lumen VDD refresh as a whole multiple of `framerate`; 1 when they match.
   };
 
   namespace amf {
@@ -585,6 +586,9 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
     std::optional<std::chrono::steady_clock::time_point> encoder_submit_timestamp;  ///< Actual encoder submission time.
     std::optional<std::chrono::steady_clock::time_point> encoder_complete_timestamp;  ///< Encoded output availability time.
+    std::optional<std::uint32_t> gpu_copy_wait_us;  ///< D3D12 path: conversion submission to start (capture copy and queue wait).
+    std::optional<std::uint32_t> gpu_convert_us;  ///< D3D12 path: conversion duration on the compute queue.
+    std::optional<std::uint32_t> nvenc_us;  ///< D3D12 path: conversion end to encoded output.
     std::uint64_t applied_input_state_sequence {};  ///< Input state watermark sampled at capture submission.
     std::uint64_t applied_input_edge_id {};  ///< Input edge watermark sampled at capture submission.
   };
