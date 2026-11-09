@@ -513,6 +513,12 @@ namespace platf {
   }
 
   /**
+   * @brief Ignore genlock changes; Linux has no driver frame cap.
+   */
+  void stream_frame_cap_genlock_changed(bool) {
+  }
+
+  /**
    * @brief Request a Lumen process restart on exit.
    */
   void restart_on_exit() {

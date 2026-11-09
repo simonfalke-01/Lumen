@@ -155,7 +155,7 @@ namespace nvprefs {
     return restore_global_frame_limiter(undo_data);
   }
 
-  bool driver_settings_t::apply_global_frame_limiter(uint32_t fps, std::optional<undo_data_t> &undo_data) {
+  bool driver_settings_t::apply_global_frame_limiter(uint32_t fps, std::optional<undo_data_t> &undo_data, std::optional<uint32_t> lumen_value) {
     if (!session_handle) {
       return false;
     }
@@ -180,7 +180,8 @@ namespace nvprefs {
       return false;
     }
 
-    const bool user_value = status == NVAPI_OK && setting.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION;
+    const bool user_value = status == NVAPI_OK && setting.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION &&
+                            setting.u32CurrentValue != lumen_value;
     if (user_value && setting.u32CurrentValue != FRL_FPS_DISABLED && setting.u32CurrentValue <= fps) {
       // Never raise a cap the user chose
       info_message("Global Max Frame Rate " + std::to_string(setting.u32CurrentValue) + " is already at or below " + std::to_string(fps) + ", keeping it");

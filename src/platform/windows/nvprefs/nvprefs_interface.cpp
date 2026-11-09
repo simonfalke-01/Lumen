@@ -201,8 +201,15 @@ namespace nvprefs {
       return false;
     }
 
+    // A cap Lumen set earlier in this stream may be moved freely; only a user's cap is kept.
+    std::optional<uint32_t> lumen_value;
+    if (pimpl->undo_data) {
+      if (const auto previous = pimpl->undo_data->get_frame_limiter()) {
+        lumen_value = previous->our_value;
+      }
+    }
     std::optional<undo_data_t> undo_data;
-    if (!pimpl->driver_settings.apply_global_frame_limiter(fps, undo_data)) {
+    if (!pimpl->driver_settings.apply_global_frame_limiter(fps, undo_data, lumen_value)) {
       error_message("Couldn't apply the stream frame limiter");
       pimpl->driver_settings.load_settings();
       return false;

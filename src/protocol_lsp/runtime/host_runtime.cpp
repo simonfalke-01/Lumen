@@ -128,6 +128,17 @@ namespace lumen::lsp::runtime {
     constexpr std::uint64_t compound_rtcp_freshness_microseconds = 5U * 1'000'000U;
     constexpr std::size_t maximum_repair_feedback_bytes = 160;
     constexpr std::array<std::uint8_t, 4> lspp_app_name {'L', 'S', 'P', 'P'};  ///< Exact path-probe APP name.
+    constexpr std::array<std::uint8_t, 4> lspt_app_name {'L', 'S', 'P', 'T'};  ///< Exact client genlock APP name.
+    constexpr std::size_t lspt_packet_bytes = 44;  ///< 12-byte APP header plus the 32-byte genlock body.
+
+    /** @brief Fields of one client genlock update. */
+    struct LsptUpdate {
+      std::uint32_t sequence {};  ///< Client update sequence.
+      std::uint64_t period_ns {};  ///< Client refresh period.
+      std::int64_t correction_ns {};  ///< Release-phase change; positive releases later.
+      std::uint32_t reference_frame_id {};  ///< Latest frame the client measured.
+      bool active {};  ///< Whether genlock is requested.
+    };
 
     /**
      * @brief Normalize an SSRC to a deterministic nonzero value outside a reserved set.
@@ -754,6 +765,43 @@ namespace lumen::lsp::runtime {
       return transport::validate_lspv_status(status) == transport::lspv_status_error::none ?
                std::optional {status} :
                std::nullopt;
+    }
+
+    /**
+     * @brief Parse the frozen 44-byte plaintext SRTCP APP `LSPT` genlock update.
+     *
+     * Layout after the APP header, big-endian: version u8 = 1, flags u8 (bit 0 genlock active),
+     * reserved u16 = 0, sequence u32, client refresh period u64 ns, phase correction s64 ns,
+     * reference frame ID u32, reserved u32 = 0.
+     */
+    std::optional<LsptUpdate> parse_lspt_update(
+      const std::span<const std::uint8_t> packet,
+      const std::uint32_t expected_sender_ssrc
+    ) noexcept {
+      constexpr std::uint64_t minimum_period_ns = 2'000'000;
+      constexpr std::uint64_t maximum_period_ns = 50'000'000;
+      constexpr std::int64_t maximum_correction_ns = 50'000'000;
+      if (packet.size() != lspt_packet_bytes || packet[0] != 0x80U || packet[1] != 204U ||
+          wire::read_be<std::uint16_t>(packet.subspan<2, 2>()) != lspt_packet_bytes / 4U - 1U ||
+          wire::read_be<std::uint32_t>(packet.subspan<4, 4>()) != expected_sender_ssrc ||
+          !std::ranges::equal(lspt_app_name, packet.subspan<8, 4>()) ||
+          packet[12] != 1U || (packet[13] & ~0x01U) != 0 ||
+          wire::read_be<std::uint16_t>(packet.subspan<14, 2>()) != 0 ||
+          wire::read_be<std::uint32_t>(packet.subspan<40, 4>()) != 0) {
+        return std::nullopt;
+      }
+      const LsptUpdate update {
+        .sequence = wire::read_be<std::uint32_t>(packet.subspan<16, 4>()),
+        .period_ns = wire::read_be<std::uint64_t>(packet.subspan<20, 8>()),
+        .correction_ns = static_cast<std::int64_t>(wire::read_be<std::uint64_t>(packet.subspan<28, 8>())),
+        .reference_frame_id = wire::read_be<std::uint32_t>(packet.subspan<36, 4>()),
+        .active = (packet[13] & 0x01U) != 0,
+      };
+      if (update.period_ns < minimum_period_ns || update.period_ns > maximum_period_ns ||
+          update.correction_ns <= -maximum_correction_ns || update.correction_ns >= maximum_correction_ns) {
+        return std::nullopt;
+      }
+      return update;
     }
   }  // namespace
 
@@ -6346,6 +6394,45 @@ namespace lumen::lsp::runtime {
           return true;
         }
         (void) sender->receive_video_status(*status, monotonic_microseconds());
+        return true;
+      }
+      if (packet_class == SecurePacketClass::rtcp && plaintext.size() >= 12U &&
+          std::ranges::equal(lspt_app_name, plaintext.subspan<8, 4>())) {
+        if (!config::lsp.genlock) {
+          return true;
+        }
+        safe::mail_t mail;
+        std::optional<InputSessionMapping> mapping;
+        {
+          std::scoped_lock session_lock(runtime.session_mutex_);
+          if (!runtime.input_owner_ || !runtime.video_runtime_ || runtime.video_runtime_->peer != peer ||
+              !runtime.video_runtime_->mail) {
+            return true;
+          }
+          mapping = runtime.input_owner_->mapping();
+          if (!mapping || mapping->peer != peer) {
+            return true;
+          }
+          mail = runtime.video_runtime_->mail;
+        }
+        const auto update = parse_lspt_update(plaintext, mapping->input_ssrc);
+        if (!update) {
+          static std::atomic<std::uint64_t> last_rejection_log_microseconds {};
+          const auto now = monotonic_microseconds();
+          auto previous = last_rejection_log_microseconds.load(std::memory_order_relaxed);
+          if (now - previous >= 5'000'000U &&
+              last_rejection_log_microseconds.compare_exchange_strong(previous, now, std::memory_order_relaxed)) {
+            BOOST_LOG(warning) << "LSP genlock: ignored a malformed LSPT update ("sv << plaintext.size() << " bytes)"sv;
+          }
+          return true;
+        }
+        mail->event<video::lsp_genlock_update_t>(mail::lsp_genlock)->raise(video::lsp_genlock_update_t {
+          .period_ns = update->period_ns,
+          .correction_ns = update->correction_ns,
+          .sequence = update->sequence,
+          .active = update->active,
+          .received = std::chrono::steady_clock::now(),
+        });
         return true;
       }
       if (packet_class == SecurePacketClass::rtcp && plaintext.size() >= 12U &&

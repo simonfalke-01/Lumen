@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <csignal>
 #include <filesystem>
 #include <iomanip>
@@ -12,6 +13,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 // lib includes
@@ -105,23 +107,29 @@ namespace {
   HANDLE streaming_power_request {};  ///< Process-owned system-sleep inhibitor held by the first streaming lease.
   std::uint32_t stream_frame_cap_count {};  ///< Active LSP owners of the driver frame cap.
   std::optional<unsigned int> stream_frame_cap_applied;  ///< FRL_FPS value Lumen set, if any.
+  int stream_frame_cap_rate_x100 {};  ///< Stream rate of the newest frame-cap owner.
+  bool stream_frame_cap_genlock {};  ///< Whether the cap currently follows an active client genlock.
 
   /**
    * @brief Resolve the `lsp_frame_cap` option against one stream rate.
    *
    * `auto` stays a little under the stream rate so a capped game never outruns the display
-   * grid: about 2 fps at 120 and 1 fps at 60, never less than 1.
+   * grid: about 2 fps at 120 and 1 fps at 60, never less than 1. Under client genlock the host
+   * picks the newest frame at its own release time, so `auto` allows twice that rate instead to
+   * keep a fresh frame ready (236 at 120).
    *
    * @param setting Configured option value.
    * @param framerate_x100 Stream frame rate in hundredths of a frame per second.
+   * @param genlock Whether client genlock is active.
    * @return FRL_FPS value to apply, or none when the cap is off.
    */
-  std::optional<unsigned int> stream_frame_cap_target(const std::string &setting, const int framerate_x100) {
+  std::optional<unsigned int> stream_frame_cap_target(const std::string &setting, const int framerate_x100, const bool genlock) {
     const int stream_fps = framerate_x100 / 100;
     if (stream_fps <= 0 || setting == "disabled" || setting == "off") {
       return std::nullopt;
     }
-    int target = stream_fps - std::max(1, stream_fps / 60);
+    const int margin = std::max(1, stream_fps / 60);
+    int target = genlock ? 2 * (stream_fps - margin) : stream_fps - margin;
     if (!setting.empty() && setting != "auto") {
       try {
         std::size_t parsed = 0;
@@ -1387,7 +1395,11 @@ namespace platf {
   void stream_frame_cap_will_start(const int framerate_x100) {
     std::scoped_lock lock(streaming_lease_mutex);
     ++stream_frame_cap_count;
-    const auto target = stream_frame_cap_target(config::lsp.frame_cap, framerate_x100);
+    stream_frame_cap_rate_x100 = framerate_x100;
+    // NVIDIA applies a frame-cap change only when a game starts, so a cap raised once genlock
+    // engages mid-game never takes effect. With genlock enabled, start with the genlock cap.
+    stream_frame_cap_genlock = config::lsp.genlock;
+    const auto target = stream_frame_cap_target(config::lsp.frame_cap, framerate_x100, stream_frame_cap_genlock);
     if (!target || stream_frame_cap_applied == target) {
       return;
     }
@@ -1405,7 +1417,11 @@ namespace platf {
 
   void stream_frame_cap_will_stop() {
     std::scoped_lock lock(streaming_lease_mutex);
-    if (stream_frame_cap_count == 0 || --stream_frame_cap_count != 0 || !stream_frame_cap_applied) {
+    if (stream_frame_cap_count == 0 || --stream_frame_cap_count != 0) {
+      return;
+    }
+    stream_frame_cap_genlock = false;
+    if (!stream_frame_cap_applied) {
       return;
     }
     stream_frame_cap_applied = std::nullopt;
@@ -1415,6 +1431,38 @@ namespace platf {
       }
       nvprefs_instance.unload();
     }
+  }
+
+  void stream_frame_cap_genlock_changed(const bool active) {
+    // With genlock enabled the stream starts at the genlock cap and keeps it: NVIDIA only applies
+    // a cap when a game launches, and lowering it whenever genlock blips inactive both risks a
+    // game launching capped below the release rate and races the undo bookkeeping.
+    if (config::lsp.genlock) {
+      return;
+    }
+    // NvAPI settings take tens of milliseconds to load and save; keep that off the encode thread.
+    // Each worker applies whatever the newest request was, so out-of-order workers are harmless.
+    static std::atomic<bool> requested {};
+    requested.store(active, std::memory_order_release);
+    std::thread([]() {
+      std::scoped_lock lock(streaming_lease_mutex);
+      const auto genlock = requested.load(std::memory_order_acquire);
+      if (stream_frame_cap_count == 0 || stream_frame_cap_genlock == genlock) {
+        return;
+      }
+      stream_frame_cap_genlock = genlock;
+      const auto target = stream_frame_cap_target(config::lsp.frame_cap, stream_frame_cap_rate_x100, genlock);
+      if (!target || stream_frame_cap_applied == target || !nvprefs_instance.load()) {
+        return;
+      }
+      bool applied = false;
+      if (nvprefs_instance.apply_stream_frame_limiter(*target, applied) && applied) {
+        stream_frame_cap_applied = target;
+        BOOST_LOG(info) << "Driver frame cap set to "sv << *target << " fps while client genlock is "sv
+                        << (genlock ? "active"sv : "inactive"sv);
+      }
+      nvprefs_instance.unload();
+    }).detach();
   }
 
   void restart_on_exit() {

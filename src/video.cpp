@@ -2811,6 +2811,240 @@ namespace video {
   }
 
   /**
+   * @brief Release clock phase-locked to an LSP client's refresh.
+   *
+   * The client measures when each frame finishes decoding against its own vblank and sends a
+   * phase correction about 20 times a second. The host releases (converts and encodes) one frame
+   * per client refresh at that phase, from the newest composition, so the frame lands just
+   * before the client scans out. Half of each correction is applied, at most 1 ms per update,
+   * which settles in a few updates without chasing measurement noise.
+   */
+  class lsp_genlock_clock_t {
+  public:
+    lsp_genlock_clock_t() = default;
+    lsp_genlock_clock_t(const lsp_genlock_clock_t &) = delete;
+    lsp_genlock_clock_t &operator=(const lsp_genlock_clock_t &) = delete;
+
+    ~lsp_genlock_clock_t() {
+      if (active_) {
+        platf::stream_frame_cap_genlock_changed(false);
+      }
+    }
+
+    /** @brief Return whether releases follow the client's clock. */
+    [[nodiscard]] bool active() const noexcept {
+      return active_;
+    }
+
+    /**
+     * @brief Fold one client update into the release clock.
+     *
+     * @param update Validated LSPT update.
+     */
+    void apply(const lsp_genlock_update_t &update) {
+      if (!update.active) {
+        deactivate("the client stopped it"sv);
+        return;
+      }
+      ++updates_;
+      last_update_ = update.received;
+      const auto period_sample = std::chrono::nanoseconds(static_cast<std::int64_t>(update.period_ns));
+      period_ = active_ ? period_ + (period_sample - period_) / 16 : period_sample;
+      if (!active_) {
+        active_ = true;
+        release_deadline_ = std::chrono::steady_clock::now() + period_;
+        last_sequence_.reset();
+        if (!timer_) {
+          timer_ = platf::create_high_precision_timer();
+        }
+        platf::stream_frame_cap_genlock_changed(true);
+        BOOST_LOG(info) << "LSP genlock engaged: client refresh "sv
+                        << std::chrono::duration_cast<std::chrono::microseconds>(period_).count() << " us"sv;
+      }
+      if (last_sequence_ == update.sequence) {
+        return;
+      }
+      last_sequence_ = update.sequence;
+      constexpr auto maximum_step = std::chrono::nanoseconds(1ms);
+      const auto step = std::clamp(std::chrono::nanoseconds(update.correction_ns / 2), -maximum_step, maximum_step);
+      release_deadline_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(step);
+      last_correction_ = std::chrono::nanoseconds(update.correction_ns);
+      applied_correction_ += step;
+    }
+
+    /**
+     * @brief Drop out of genlock when the client has gone quiet for a second.
+     *
+     * @param now Current time.
+     * @return True when genlock just ended.
+     */
+    bool expire(const std::chrono::steady_clock::time_point now) {
+      if (!active_ || now - last_update_ < 1s) {
+        return false;
+      }
+      deactivate("no client update for 1 s"sv);
+      return true;
+    }
+
+    /**
+     * @brief Wait until the release deadline: timer sleep, then a short spin.
+     *
+     * The waitable timer wakes late by a few hundred microseconds; the margin it sleeps short by
+     * follows its measured lateness so the spin stays brief.
+     *
+     * @return Release time.
+     */
+    std::chrono::steady_clock::time_point wait_for_release() {
+      const auto deadline = release_deadline_;
+      auto now = std::chrono::steady_clock::now();
+      if (timer_ && *timer_ && deadline - now > timer_margin_) {
+        const auto planned = deadline - timer_margin_;
+        timer_->sleep_for(planned - now);
+        const auto woke = std::chrono::steady_clock::now();
+        const auto lateness = std::max(woke - planned, std::chrono::steady_clock::duration::zero());
+        // Margin tracks lateness plus 100 us of headroom, between 200 us and 2 ms.
+        const auto wanted = lateness + std::chrono::duration_cast<std::chrono::steady_clock::duration>(100us);
+        timer_margin_ = std::clamp(
+          timer_margin_ + (wanted - timer_margin_) / 8,
+          std::chrono::steady_clock::duration(200us),
+          std::chrono::steady_clock::duration(2ms)
+        );
+      }
+      while ((now = std::chrono::steady_clock::now()) < deadline) {
+        std::this_thread::yield();
+      }
+      record(jitter_, now - deadline);
+      return now;
+    }
+
+    /**
+     * @brief Account one release and schedule the next.
+     *
+     * @param released_at Release time.
+     * @param frame_timestamp Present time of the released image, if a new one was taken.
+     * @param new_image Whether a new composition was released.
+     */
+    void advance(
+      const std::chrono::steady_clock::time_point released_at,
+      const std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
+      const bool new_image
+    ) {
+      if (new_image) {
+        ++released_;
+        if (frame_timestamp) {
+          record(content_age_, released_at - *frame_timestamp);
+        }
+      } else {
+        ++skipped_;
+      }
+      release_deadline_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period_);
+      const auto now = std::chrono::steady_clock::now();
+      if (release_deadline_ <= now) {
+        // Behind after a long encode or a stall: skip whole periods so the next release keeps the
+        // client-locked phase. Restarting the grid at now + period threw that phase away and made
+        // the client re-converge several times a second. Never burst missed releases.
+        const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(period_);
+        if (step.count() > 0) {
+          const auto behind = now - release_deadline_;
+          release_deadline_ += step * (behind / step + 1);
+        }
+        ++resyncs_;
+      }
+      log_window(released_at);
+    }
+
+    /**
+     * @brief Record capture-to-submit for a frame about to be encoded under genlock.
+     *
+     * @param frame_timestamp Present time of the image being encoded, if any.
+     */
+    void record_submit(const std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+      if (active_ && frame_timestamp) {
+        record(capture_to_submit_, std::chrono::steady_clock::now() - *frame_timestamp);
+      }
+    }
+
+  private:
+    /** @brief Append one non-negative duration in microseconds to a window, bounded. */
+    static void record(std::vector<std::uint32_t> &samples, const std::chrono::steady_clock::duration value) {
+      if (samples.size() < 4096) {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(value).count();
+        samples.push_back(static_cast<std::uint32_t>(std::clamp<std::int64_t>(us, 0, UINT32_MAX)));
+      }
+    }
+
+    /** @brief Return one percentile of samples sorted in place. */
+    static std::uint32_t percentile(std::vector<std::uint32_t> &samples, const std::size_t permille) {
+      if (samples.empty()) {
+        return 0;
+      }
+      std::ranges::sort(samples);
+      return samples[std::min(samples.size() - 1, samples.size() * permille / 1000U)];
+    }
+
+    void deactivate(const std::string_view reason) {
+      if (!active_) {
+        return;
+      }
+      active_ = false;
+      platf::stream_frame_cap_genlock_changed(false);
+      BOOST_LOG(info) << "LSP genlock released: "sv << reason;
+    }
+
+    /** @brief Log and reset the 10 s diagnostics window. */
+    void log_window(const std::chrono::steady_clock::time_point now) {
+      if (window_start_ == std::chrono::steady_clock::time_point {}) {
+        window_start_ = now;
+        return;
+      }
+      if (now - window_start_ < 10s) {
+        return;
+      }
+      BOOST_LOG(info) << "LSP genlock: active="sv << active_
+                      << " period_us="sv << std::chrono::duration_cast<std::chrono::microseconds>(period_).count()
+                      << " updates="sv << updates_
+                      << " last_correction_us="sv << std::chrono::duration_cast<std::chrono::microseconds>(last_correction_).count()
+                      << " applied_correction_us="sv << std::chrono::duration_cast<std::chrono::microseconds>(applied_correction_).count()
+                      << " release_jitter_p50_us="sv << percentile(jitter_, 500)
+                      << " release_jitter_p99_us="sv << percentile(jitter_, 990)
+                      << " release_jitter_max_us="sv << percentile(jitter_, 1000)
+                      << " released="sv << released_ << " skipped="sv << skipped_ << " resyncs="sv << resyncs_
+                      << " content_age_p50_us="sv << percentile(content_age_, 500)
+                      << " content_age_p99_us="sv << percentile(content_age_, 990)
+                      << " capture_to_submit_p50_us="sv << percentile(capture_to_submit_, 500)
+                      << " capture_to_submit_p99_us="sv << percentile(capture_to_submit_, 990)
+                      << " timer_margin_us="sv << std::chrono::duration_cast<std::chrono::microseconds>(timer_margin_).count();
+      window_start_ = now;
+      updates_ = 0;
+      released_ = 0;
+      skipped_ = 0;
+      resyncs_ = 0;
+      applied_correction_ = {};
+      jitter_.clear();
+      content_age_.clear();
+      capture_to_submit_.clear();
+    }
+
+    bool active_ = false;
+    std::chrono::nanoseconds period_ {};  ///< Smoothed client refresh period.
+    std::chrono::steady_clock::time_point release_deadline_;  ///< Next release time.
+    std::chrono::steady_clock::time_point last_update_;  ///< Receive time of the latest active update.
+    std::optional<std::uint32_t> last_sequence_;  ///< Latest update whose correction was applied.
+    std::unique_ptr<platf::high_precision_timer> timer_;
+    std::chrono::steady_clock::duration timer_margin_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(500us);
+    std::chrono::nanoseconds last_correction_ {};
+    std::chrono::nanoseconds applied_correction_ {};
+    std::chrono::steady_clock::time_point window_start_;
+    std::uint64_t updates_ = 0;
+    std::uint64_t released_ = 0;
+    std::uint64_t skipped_ = 0;
+    std::uint64_t resyncs_ = 0;
+    std::vector<std::uint32_t> jitter_;
+    std::vector<std::uint32_t> content_age_;
+    std::vector<std::uint32_t> capture_to_submit_;
+  };
+
+  /**
    * @brief Run one encode loop for a display capture stream.
    *
    * @param frame_nr Frame counter updated as frames are encoded.
@@ -2903,6 +3137,8 @@ namespace video {
     auto lsp_invalidate_ref_frames_events = mail->event<reference_invalidation_request_t>(mail::lsp_invalidate_ref_frames);
     auto invalidate_ref_frames_result_events = mail->event<reference_invalidation_result_t>(mail::invalidate_ref_frames_result);
     auto bitrate_events = mail->event<std::uint32_t>(mail::lsp_bitrate);
+    auto genlock_events = mail->event<lsp_genlock_update_t>(mail::lsp_genlock);
+    lsp_genlock_clock_t genlock;
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2962,6 +3198,13 @@ namespace video {
         }
       }
 
+      if (auto update = genlock_events->try_pop()) {
+        genlock.apply(*update);
+      }
+      if (genlock.expire(std::chrono::steady_clock::now()) && target_rate_vdd) {
+        target_encode_deadline = std::chrono::steady_clock::now() + target_frame_interval;
+      }
+
       if (idr_events->peek()) {
         requested_idr_frame = true;
         idr_events->pop();
@@ -2973,8 +3216,44 @@ namespace video {
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
 
-      // Encode at a minimum FPS to avoid image quality issues with static content
-      if (!requested_idr_frame || images->peek()) {
+      if (genlock.active()) {
+        // Release on the client's refresh phase from the newest composition. The cell-rate
+        // budget and the direct-frame deadline do not apply; the client's clock sets the rate.
+        const auto released_at = genlock.wait_for_release();
+        auto captured = images->try_pop();
+        if (!captured) {
+          // A composition landing just after the release is still worth sending this refresh;
+          // a skipped release is a missing frame on the client.
+          captured = images->pop(std::chrono::microseconds {1500});
+        }
+        const bool repeat_due = released_at >= repeat_deadline;
+        if (captured) {
+          repeat_deadline = released_at + repeat_interval + repeat_slack;
+          frame_timestamp = captured->image->frame_timestamp;
+          input_watermark = {
+            captured->applied_input_state_sequence,
+            captured->applied_input_edge_id,
+          };
+          if (session->convert(*captured->image)) {
+            BOOST_LOG(error) << "Could not convert image"sv;
+            return;
+          }
+        } else if (!images->running()) {
+          break;
+        } else if (repeat_due) {
+          repeat_deadline = released_at + repeat_interval;
+        }
+        genlock.advance(released_at, frame_timestamp, static_cast<bool>(captured));
+        if (!captured && !repeat_due && !requested_idr_frame) {
+          // Nothing newer to show; skipping keeps the client's last frame on screen without a
+          // duplicate that would cost a whole encode and delivery slot.
+          if (shutdown_event->peek() || (reinit_event.peek() && frame_nr > 1)) {
+            break;
+          }
+          continue;
+        }
+      } else if (!requested_idr_frame || images->peek()) {
+        // Encode at a minimum FPS to avoid image quality issues with static content
         const auto image_wait = target_rate_vdd ?
                                   target_encode_wait(target_encode_deadline, std::chrono::steady_clock::now()) :
                                   target_encode_wait(repeat_deadline, std::chrono::steady_clock::now());
@@ -3025,6 +3304,7 @@ namespace video {
         break;
       }
 
+      genlock.record_submit(frame_timestamp);
       if (encode(
             frame_nr++,
             *session,
@@ -3039,7 +3319,7 @@ namespace video {
       }
       reference_invalidation_generation = 0;
 
-      if (target_rate_vdd) {
+      if (target_rate_vdd && !genlock.active()) {
         target_encode_deadline = advance_target_encode_deadline(
           target_encode_deadline,
           target_frame_interval,

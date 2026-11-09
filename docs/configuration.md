@@ -1779,6 +1779,33 @@ The key retains its upstream name for compatibility with existing configuration 
     </tr>
 </table>
 
+### lsp_genlock
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Lets an LSP client phase-lock frame release to its own display. The client measures its scanout and sends
+            `LSPT` updates; the host then encodes one frame per client refresh at that phase, always from the newest
+            captured frame, so each frame finishes decoding just before the client's next refresh. While genlock is
+            active on an NVIDIA GPU, the `auto` driver frame cap rises to twice the stream rate so a fresh frame is
+            always ready. `auto` follows client requests; `disabled` ignores them and keeps the regular pacing.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            auto
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            lsp_genlock = disabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### lsp_competition_capacity_mbps
 
 <table>

@@ -275,6 +275,10 @@ namespace platf {
     // Nothing to do
   }
 
+  void stream_frame_cap_genlock_changed(bool) {
+    // No driver frame cap on this platform
+  }
+
   void restart_on_exit() {
     char executable[2048];
     uint32_t size = sizeof(executable);

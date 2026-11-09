@@ -271,6 +271,7 @@ namespace config {
     std::uint32_t pairing_permissions;  ///< Maximum LSP/1 permission mask offered to newly paired clients.
     std::string frame_cap;  ///< Driver frame cap while streaming: `auto`, `disabled`, an fps, or `-N` below the stream rate.
     std::string vdd_refresh_multiple;  ///< Lumen VDD refresh for DDA capture: `auto` (twice the stream rate, else the stream rate) or `1`.
+    bool genlock;  ///< `lsp_genlock`: release frames on the client's refresh phase when it asks (`auto`), or ignore LSPT (`disabled`).
   };
 
   /**

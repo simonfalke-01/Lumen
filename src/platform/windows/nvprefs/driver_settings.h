@@ -90,9 +90,10 @@ namespace nvprefs {
      *
      * @param fps FRL_FPS value to apply.
      * @param undo_data Receives the value to restore when the cap was changed.
+     * @param lumen_value FRL_FPS value Lumen itself set earlier, which is not a user cap.
      * @return True when the cap was applied or a lower existing cap was kept.
      */
-    bool apply_global_frame_limiter(uint32_t fps, std::optional<undo_data_t> &undo_data);
+    bool apply_global_frame_limiter(uint32_t fps, std::optional<undo_data_t> &undo_data, std::optional<uint32_t> lumen_value = std::nullopt);
 
     /**
      * @brief Restore the global frame rate cap from undo data.

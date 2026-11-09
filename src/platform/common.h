@@ -1018,6 +1018,15 @@ namespace platf {
    */
   void streaming_will_stop();
 
+  /**
+   * @brief Tell the driver frame cap whether client genlock is active for the current stream.
+   * @note Windows NVIDIA hosts allow about twice the stream rate while it is, so a newer frame
+   *       is ready at each release; other platforms do nothing.
+   *
+   * @param active Whether genlock is active.
+   */
+  void stream_frame_cap_genlock_changed(bool active);
+
   void restart();
 
   /**

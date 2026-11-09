@@ -851,6 +851,7 @@ namespace config {
     0xd7U,  // browse, start/attach, input, stop-own-stream, controller output, and clipboard
     "auto",  // cap the GPU driver just below the stream rate while streaming
     "auto",  // compose the Lumen VDD at twice the stream rate when it accepts that mode
+    true,  // follow client genlock requests
   };
 
   /**
@@ -1856,6 +1857,11 @@ namespace config {
       lsp.vdd_refresh_multiple,
       {"auto"sv, "1"sv}
     );
+    {
+      std::string genlock = lsp.genlock ? "auto" : "disabled";
+      string_restricted_f(vars, "lsp_genlock", genlock, {"auto"sv, "disabled"sv});
+      lsp.genlock = genlock == "auto";
+    }
 #if !LUMEN_LSP_RUNTIME_AVAILABLE
     if (lsp.enabled) {
       BOOST_LOG(warning) << "LSP was requested but is unavailable in this build profile"sv;

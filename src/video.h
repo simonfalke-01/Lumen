@@ -600,6 +600,20 @@ namespace video {
     std::int64_t last_frame {};  ///< Last encoder frame index to invalidate.
   };
 
+  /**
+   * @brief One validated LSPT genlock update from the client.
+   *
+   * The client measures its own scanout and asks the host to move frame release so each frame
+   * finishes decoding just before the next client refresh.
+   */
+  struct lsp_genlock_update_t {
+    std::uint64_t period_ns {};  ///< Client refresh period.
+    std::int64_t correction_ns {};  ///< Release-phase change requested; positive releases later.
+    std::uint32_t sequence {};  ///< Client update sequence; each is applied once.
+    bool active {};  ///< Whether the client requests genlock.
+    std::chrono::steady_clock::time_point received;  ///< Host receive time.
+  };
+
   /** @brief Terminal result for one local encoder reference-invalidation request. */
   struct reference_invalidation_result_t {
     std::uint64_t generation {};  ///< Exact request generation being completed.
