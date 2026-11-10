@@ -1855,7 +1855,7 @@ namespace config {
       vars,
       "lsp_vdd_refresh_multiple",
       lsp.vdd_refresh_multiple,
-      {"auto"sv, "1"sv}
+      {"auto"sv, "1"sv, "4"sv}
     );
     {
       std::string genlock = lsp.genlock ? "auto" : "disabled";

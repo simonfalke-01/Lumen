@@ -2497,22 +2497,26 @@ namespace lumen::lsp::runtime {
           encoder_limits.maximum_height = 4'096;
           encoder_limits.maximum_pixels = 4'096ULL * 4'096ULL;
         }
-        // Compose at twice the stream rate so DWM latches each capped game frame within half a
-        // stream interval instead of beating against a vblank at the stream rate. Twice is the
-        // only multiple worth asking for: a larger one only raises composition cost, and a
-        // fractional one would latch evenly paced frames unevenly. The encoder keeps the stream
-        // rate. Validation rejects a mode beyond the driver or GPU limits before any display
-        // change, and the stream rate is the fallback. Direct VDD frames are paced on their own
-        // stream-rate schedule, so only desktop-duplication capture composes faster.
+        // Compose at a multiple of the stream rate so DWM latches each capped game frame soon
+        // after the game presents it instead of beating against a vblank at the stream rate.
+        // `auto` doubles the rate; `4` quadruples it, which halves the average wait a finished
+        // game frame spends before composition again at the cost of more composition work. An
+        // integer multiple keeps evenly paced frames latching evenly. The encoder keeps the
+        // stream rate. Validation rejects a mode beyond the driver or GPU limits before any
+        // display change, and the stream rate is the fallback. Direct VDD frames are paced on
+        // their own stream-rate schedule, so only desktop-duplication capture composes faster.
         auto composition_refresh = *refresh_ratio;
-        if (config::lsp.vdd_refresh_multiple != "1" &&
+        const std::uint32_t composition_multiple = config::lsp.vdd_refresh_multiple == "4" ? 4U :
+                                                   config::lsp.vdd_refresh_multiple == "1" ? 1U :
+                                                                                             2U;
+        if (composition_multiple > 1U &&
             request.cursor_mode != CursorMode::client &&
             activation != platf::virtual_display::activation_policy_e::required &&
-            static_cast<std::uint64_t>(refresh_ratio->numerator) * 2U <=
+            static_cast<std::uint64_t>(refresh_ratio->numerator) * composition_multiple <=
             static_cast<std::uint64_t>(LUMEN_START_MODE_MAX_REFRESH_HZ) * refresh_ratio->denominator) {
-          if (const auto doubled = platf::virtual_display::rational_t {refresh_ratio->numerator * 2U, refresh_ratio->denominator}
-                                     .normalized()) {
-            composition_refresh = *doubled;
+          if (const auto multiplied = platf::virtual_display::rational_t {refresh_ratio->numerator * composition_multiple, refresh_ratio->denominator}
+                                        .normalized()) {
+            composition_refresh = *multiplied;
           }
         }
         const auto prepare_display = [&](const platf::virtual_display::rational_t &refresh) {
